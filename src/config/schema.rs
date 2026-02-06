@@ -351,7 +351,10 @@ impl Config {
         None
     }
 
-    /// Get the API base URL if using OpenRouter, Zhipu or vLLM.
+    /// Get the API base URL for the active provider.
+    ///
+    /// Detection order matches `get_api_key()` priority so that the key and
+    /// base always refer to the same provider.
     pub fn get_api_base(&self) -> Option<String> {
         if !self.providers.openrouter.api_key.is_empty() {
             return Some(
@@ -362,8 +365,23 @@ impl Config {
                     .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
             );
         }
+        if !self.providers.deepseek.api_key.is_empty() {
+            return Some("https://api.deepseek.com".to_string());
+        }
+        if !self.providers.anthropic.api_key.is_empty() {
+            return Some("https://api.anthropic.com/v1".to_string());
+        }
+        if !self.providers.openai.api_key.is_empty() {
+            return Some("https://api.openai.com/v1".to_string());
+        }
+        if !self.providers.gemini.api_key.is_empty() {
+            return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+        }
         if !self.providers.zhipu.api_key.is_empty() {
             return self.providers.zhipu.api_base.clone();
+        }
+        if !self.providers.groq.api_key.is_empty() {
+            return Some("https://api.groq.com/openai/v1".to_string());
         }
         if self.providers.vllm.api_base.is_some() {
             return self.providers.vllm.api_base.clone();
@@ -434,5 +452,64 @@ mod tests {
         let cfg = Config::default();
         let ws = cfg.workspace_path();
         assert!(ws.ends_with(".nanoclaw/workspace"));
+    }
+
+    #[test]
+    fn test_api_base_anthropic() {
+        let mut cfg = Config::default();
+        cfg.providers.anthropic.api_key = "sk-ant-key".to_string();
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("https://api.anthropic.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_api_base_openai() {
+        let mut cfg = Config::default();
+        cfg.providers.openai.api_key = "sk-key".to_string();
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("https://api.openai.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_api_base_groq() {
+        let mut cfg = Config::default();
+        cfg.providers.groq.api_key = "gsk_key".to_string();
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("https://api.groq.com/openai/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_api_base_deepseek() {
+        let mut cfg = Config::default();
+        cfg.providers.deepseek.api_key = "sk-ds-key".to_string();
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("https://api.deepseek.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_api_base_none_when_no_provider() {
+        let cfg = Config::default();
+        assert_eq!(cfg.get_api_base(), None);
+    }
+
+    #[test]
+    fn test_api_base_priority_matches_key_priority() {
+        // When both OpenRouter and Anthropic keys are set, OpenRouter wins
+        // (matching get_api_key priority).
+        let mut cfg = Config::default();
+        cfg.providers.openrouter.api_key = "or-key".to_string();
+        cfg.providers.anthropic.api_key = "ant-key".to_string();
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("https://openrouter.ai/api/v1".to_string())
+        );
     }
 }

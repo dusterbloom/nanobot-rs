@@ -39,22 +39,22 @@ impl OpenAICompatProvider {
             .unwrap_or("anthropic/claude-opus-4-5")
             .to_string();
 
-        let is_openrouter = api_key.starts_with("sk-or-")
-            || api_base
-                .map(|b| b.contains("openrouter"))
-                .unwrap_or(false);
-
         let resolved_base = if let Some(base) = api_base {
             // Use whatever was explicitly provided.
             base.trim_end_matches('/').to_string()
-        } else if is_openrouter {
+        } else if api_key.starts_with("sk-or-") {
             "https://openrouter.ai/api/v1".to_string()
+        } else if api_key.starts_with("sk-ant-") {
+            "https://api.anthropic.com/v1".to_string()
         } else if default_model.contains("deepseek") {
             "https://api.deepseek.com".to_string()
-        } else if default_model.contains("groq") {
+        } else if api_key.starts_with("gsk_") || default_model.contains("groq") {
             "https://api.groq.com/openai/v1".to_string()
+        } else if api_key.starts_with("sk-") && !default_model.contains('/') {
+            // Bare "sk-" prefix with a non-routed model name -> likely OpenAI direct.
+            "https://api.openai.com/v1".to_string()
         } else {
-            // Sensible default: OpenRouter.
+            // Fallback: OpenRouter (supports routed model names like "anthropic/claude-...").
             "https://openrouter.ai/api/v1".to_string()
         };
 
@@ -491,9 +491,32 @@ mod tests {
 
     #[test]
     fn test_new_default_fallback_is_openrouter() {
-        // Unknown key prefix + no api_base + model doesn't match known patterns.
+        // Unknown key prefix + no api_base + routed model name -> OpenRouter.
         let provider =
-            OpenAICompatProvider::new("random-key", None, Some("some-unknown-model"));
+            OpenAICompatProvider::new("random-key", None, Some("anthropic/claude-opus-4-5"));
+        assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn test_new_anthropic_key_detection() {
+        let provider =
+            OpenAICompatProvider::new("sk-ant-abc123", None, Some("claude-sonnet-4-5-20250929"));
+        assert_eq!(provider.api_base, "https://api.anthropic.com/v1");
+    }
+
+    #[test]
+    fn test_new_openai_key_with_bare_model() {
+        // sk- prefix with a non-routed model -> OpenAI direct.
+        let provider =
+            OpenAICompatProvider::new("sk-abc123", None, Some("gpt-4o"));
+        assert_eq!(provider.api_base, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_new_sk_key_with_routed_model_is_openrouter() {
+        // sk- prefix but model has "/" -> OpenRouter.
+        let provider =
+            OpenAICompatProvider::new("sk-abc123", None, Some("anthropic/claude-opus-4-5"));
         assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
     }
 
