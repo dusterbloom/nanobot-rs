@@ -77,7 +77,14 @@ impl LLMProvider for OpenAICompatProvider {
         max_tokens: u32,
         temperature: f64,
     ) -> Result<LLMResponse> {
-        let model = model.unwrap_or(&self.default_model);
+        let raw_model = model.unwrap_or(&self.default_model);
+        // Strip "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
+        // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
+        let model = if !self.api_base.contains("openrouter") {
+            raw_model.split('/').last().unwrap_or(raw_model)
+        } else {
+            raw_model
+        };
         let url = format!("{}/chat/completions", self.api_base);
 
         // Build request body.
