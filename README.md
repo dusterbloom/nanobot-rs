@@ -1,4 +1,11 @@
-# nanoclaw
+# nanobot
+
+```
+ _____             _       _
+|   | |___ ___ ___| |_ ___| |_
+| | | | .'|   | . | . | . |  _|
+|_|___|__,|_|_|___|___|___|_|
+```
 
 A personal AI assistant that runs on your terms. Cloud or local. Text or voice. Your machine, your models, your data.
 
@@ -6,7 +13,7 @@ Rust port of [nanobot](https://github.com/HKUDS/nanobot) by HKUDS -- rebuilt fro
 
 ## Why
 
-Most AI assistants are cloud-locked SaaS products. nanoclaw is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a GGUF running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
+Most AI assistants are cloud-locked SaaS products. nanobot is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a GGUF running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
 
 No containers. No Python. No dependencies beyond what `cargo build` pulls in.
 
@@ -38,12 +45,15 @@ You: What's the weather like?
 
 ### Go local with `/local`
 
-Toggle between cloud and local inference mid-conversation. nanoclaw auto-spawns a llama.cpp server, waits for it to be ready, and switches over.
+Toggle between cloud and local inference mid-conversation. nanobot auto-spawns a llama.cpp server with a progress bar, waits for it to be ready, and switches over.
 
 ```
 You: /local
-Starting llama.cpp server on port 8080...
-LOCAL MODE - Using Nemotron-Nano-9B on port 8080
+  Starting llama.cpp server on port 8080...
+  Loading model [████████████████░░░░░░░░] 32s
+
+  LOCAL MODE llama.cpp on port 8080
+  Model: NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf
 
 You: /model
 Available models:
@@ -54,7 +64,7 @@ Available models:
 Select model [1-12] or Enter to cancel:
 ```
 
-Switch models on the fly. Stale servers from previous sessions are cleaned up automatically.
+Switch models on the fly. The server process is monitored -- if it crashes during loading, you get the error immediately instead of waiting for a timeout. Stale servers from previous sessions are cleaned up automatically.
 
 ### Voice mode
 
@@ -167,6 +177,8 @@ User --> CLI / Voice --> AgentLoop --> LLM Provider
 ```
 
 Single-binary. No microservices. The agent loop is the core -- it takes a message, builds context (identity + memory + skills + history), calls the LLM, executes any tool calls, and returns a response. Voice mode wraps this with STT on input and streaming TTS on output.
+
+On startup, the TUI clears the terminal, shows an ASCII splash with mode info, and renders LLM responses as styled markdown (headers, code blocks, bold/italic) via termimad. Input uses rustyline with arrow-key history.
 
 ## Attribution
 
