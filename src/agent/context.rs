@@ -120,12 +120,15 @@ impl ContextBuilder {
                 .push_str(&format!("\n\n## Current Session\nChannel: {}\nChat ID: {}", ch, cid));
             if ch == "voice" {
                 system_prompt.push_str(concat!(
-                    "\n\n## Voice Mode\n",
-                    "The user is speaking to you via microphone (speech-to-text). ",
-                    "Your response will be read aloud via text-to-speech (TTS). ",
-                    "Keep responses short, natural, and conversational. ",
-                    "Do NOT use markdown formatting, code blocks, bullet points, ",
-                    "numbered lists, or emoji. Write plain spoken sentences only.",
+                    "\n\n## Voice Mode (IMPORTANT)\n",
+                    "The user is speaking via microphone and your response will be read aloud by TTS. ",
+                    "STRICT RULES:\n",
+                    "- Keep responses to 1-3 sentences. Be concise.\n",
+                    "- Use plain spoken language only.\n",
+                    "- NEVER use emoji, emoticons, or unicode symbols.\n",
+                    "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
+                    "- NEVER output code blocks or technical formatting.\n",
+                    "- If asked a complex question, give a brief spoken answer, not a written essay.",
                 ));
             }
         }
