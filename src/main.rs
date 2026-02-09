@@ -284,6 +284,8 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
             println!("Type /local to toggle local/cloud mode, Ctrl+C to exit\n");
 
             let mut llama_process: Option<std::process::Child> = None;
+            let default_model = dirs::home_dir().unwrap().join("models").join(DEFAULT_LOCAL_MODEL);
+            let mut current_model_path: std::path::PathBuf = default_model;
             #[cfg(feature = "voice")]
             let mut voice_session: Option<voice::VoiceSession> = None;
 
@@ -351,23 +353,28 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 if do_record {
                     if let Some(ref mut vs) = voice_session {
                         vs.stop_playback();
-                        match vs.record_and_transcribe() {
-                            Ok(Some(text)) => {
-                                println!();
-                                let response = agent_loop
-                                    .process_direct(&text, &session_id, "voice", "direct")
-                                    .await;
-                                let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
-                                println!("\n{} {}\n", logo, response);
-                                let tts_text = strip_markdown_for_tts(&response);
-                                if !tts_text.is_empty() {
-                                    if let Err(e) = vs.speak(&tts_text) {
-                                        eprintln!("TTS error: {}", e);
+                        let mut keep_recording = true;
+                        while keep_recording {
+                            keep_recording = false;
+                            match vs.record_and_transcribe() {
+                                Ok(Some(text)) => {
+                                    println!();
+                                    let response = agent_loop
+                                        .process_direct(&text, &session_id, "voice", "direct")
+                                        .await;
+                                    let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
+                                    println!("\n{} {}\n", logo, response);
+                                    let tts_text = strip_markdown_for_tts(&response);
+                                    if !tts_text.is_empty() {
+                                        if speak_interruptible(vs, &tts_text) {
+                                            // User interrupted TTS — loop back to record
+                                            keep_recording = true;
+                                        }
                                     }
                                 }
+                                Ok(None) => println!("(no speech detected)\n"),
+                                Err(e) => eprintln!("Recording error: {}\n", e),
                             }
-                            Ok(None) => println!("(no speech detected)\n"),
-                            Err(e) => eprintln!("Recording error: {}\n", e),
                         }
                         drain_stdin();
                     }
@@ -404,11 +411,12 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             agent_loop = new_loop;
                             print_mode_banner(&local_port);
                         } else {
-                            // Spawn new server
+                            // Kill any orphaned servers from previous runs
+                            kill_stale_llama_servers();
                             let port = find_available_port(8080);
                             println!("\nStarting llama.cpp server on port {}...", port);
 
-                            match spawn_llama_server(port) {
+                            match spawn_llama_server(port, &current_model_path) {
                                 Ok(child) => {
                                     llama_process = Some(child);
                                     if wait_for_server_ready(port, 30).await {
@@ -448,6 +456,89 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     continue;
                 }
 
+                // Handle model selection
+                if input == "/model" || input == "/m" {
+                    let models = list_local_models();
+                    if models.is_empty() {
+                        println!("\nNo .gguf models found in ~/models/\n");
+                        continue;
+                    }
+
+                    println!("\nAvailable models:");
+                    for (i, path) in models.iter().enumerate() {
+                        let name = path.file_name().unwrap().to_string_lossy();
+                        let size_mb = std::fs::metadata(path)
+                            .map(|m| m.len() / 1_048_576)
+                            .unwrap_or(0);
+                        let marker = if *path == current_model_path { " (active)" } else { "" };
+                        println!("  [{}] {} ({} MB){}", i + 1, name, size_mb, marker);
+                    }
+                    print!("\nSelect model [1-{}] or Enter to cancel: ", models.len());
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+                    let mut choice = String::new();
+                    if std::io::stdin().read_line(&mut choice).is_err() {
+                        continue;
+                    }
+                    let choice = choice.trim();
+                    if choice.is_empty() {
+                        continue;
+                    }
+                    let idx: usize = match choice.parse::<usize>() {
+                        Ok(n) if n >= 1 && n <= models.len() => n - 1,
+                        _ => {
+                            println!("Invalid selection.\n");
+                            continue;
+                        }
+                    };
+
+                    let selected = &models[idx];
+                    current_model_path = selected.clone();
+                    let name = selected.file_name().unwrap().to_string_lossy();
+                    println!("\nSelected: {}", name);
+
+                    // If local mode is active, restart the server with the new model
+                    if LOCAL_MODE.load(Ordering::SeqCst) {
+                        // Kill existing server we spawned + any orphans
+                        if let Some(ref mut child) = llama_process {
+                            println!("Stopping current llama.cpp server...");
+                            child.kill().ok();
+                            child.wait().ok();
+                        }
+                        llama_process = None;
+                        kill_stale_llama_servers();
+
+                        let port = find_available_port(8080);
+                        println!("Starting llama.cpp server on port {}...", port);
+
+                        match spawn_llama_server(port, &current_model_path) {
+                            Ok(child) => {
+                                llama_process = Some(child);
+                                if wait_for_server_ready(port, 30).await {
+                                    local_port = port.to_string();
+                                    let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                                    agent_loop = new_loop;
+                                    print_mode_banner(&local_port);
+                                } else {
+                                    eprintln!("\n\u{26a0}\u{fe0f}  Server failed to start within 30 seconds");
+                                    if let Some(ref mut child) = llama_process {
+                                        child.kill().ok();
+                                        child.wait().ok();
+                                    }
+                                    llama_process = None;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("\n\u{26a0}\u{fe0f}  Failed to start llama.cpp server: {}", e);
+                            }
+                        }
+                    } else {
+                        println!("Model will be used next time you toggle /local on.\n");
+                    }
+
+                    continue;
+                }
+
                 // Handle voice toggle
                 #[cfg(feature = "voice")]
                 if input == "/voice" || input == "/v" {
@@ -473,6 +564,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 if input == "/help" || input == "/h" || input == "/?" {
                     println!("\nCommands:");
                     println!("  /local, /l  - Toggle between local and cloud mode");
+                    println!("  /model, /m  - Select local model from ~/models/");
                     println!("  /voice, /v  - Toggle voice mode (Ctrl+Space or Enter to speak)");
                     println!("  /status     - Show current mode and model info");
                     println!("  /help, /h   - Show this help");
@@ -499,9 +591,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 if let Some(ref mut vs) = voice_session {
                     let tts_text = strip_markdown_for_tts(&response);
                     if !tts_text.is_empty() {
-                        if let Err(e) = vs.speak(&tts_text) {
-                            eprintln!("TTS error: {}", e);
-                        }
+                        speak_interruptible(vs, &tts_text);
                     }
                 }
             }
@@ -888,10 +978,41 @@ fn find_available_port(start: u16) -> u16 {
     start // fallback
 }
 
-fn spawn_llama_server(port: u16) -> Result<std::process::Child, String> {
+fn list_local_models() -> Vec<std::path::PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return vec![],
+    };
+    let models_dir = home.join("models");
+    let mut models: Vec<std::path::PathBuf> = std::fs::read_dir(&models_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+        .collect();
+    models.sort_by(|a, b| {
+        a.file_name().cmp(&b.file_name())
+    });
+    models
+}
+
+const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
+
+fn kill_stale_llama_servers() {
+    // Kill any orphaned llama-server processes from previous runs
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "llama-server"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Brief pause to let ports be released
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+fn spawn_llama_server(port: u16, model_path: &std::path::Path) -> Result<std::process::Child, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     let server_path = home.join("llama.cpp/build/bin/llama-server");
-    let model_path = home.join("models/NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf");
 
     if !server_path.exists() {
         return Err(format!("llama-server not found at {}", server_path.display()));
@@ -902,7 +1023,7 @@ fn spawn_llama_server(port: u16) -> Result<std::process::Child, String> {
 
     std::process::Command::new(&server_path)
         .arg("--model")
-        .arg(&model_path)
+        .arg(model_path)
         .arg("--port")
         .arg(port.to_string())
         .arg("--ctx-size")
@@ -973,6 +1094,57 @@ fn drain_stdin() {
         let fd = std::io::stdin().as_raw_fd();
         unsafe { libc::tcflush(fd, libc::TCIFLUSH); }
     }
+}
+
+/// Speak with TTS while watching for user interrupt (Enter or Ctrl+Space).
+/// Returns true if the user interrupted (wants to speak next).
+#[cfg(feature = "voice")]
+fn speak_interruptible(vs: &mut voice::VoiceSession, text: &str) -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    vs.clear_cancel();
+    let cancel = vs.cancel_flag();
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = done.clone();
+
+    // Spawn thread to watch for keypress during TTS
+    let watcher = std::thread::spawn(move || {
+        terminal::enable_raw_mode().ok();
+        let mut interrupted = false;
+        while !done2.load(Ordering::Relaxed) {
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    let is_interrupt = key.code == KeyCode::Enter
+                        || (key.code == KeyCode::Char(' ')
+                            && key.modifiers.contains(KeyModifiers::CONTROL));
+                    if is_interrupt {
+                        cancel.store(true, Ordering::Relaxed);
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        terminal::disable_raw_mode().ok();
+        interrupted
+    });
+
+    if let Err(e) = vs.speak(text) {
+        eprintln!("TTS error: {}", e);
+    }
+
+    // Signal watcher to stop and collect result
+    done.store(true, Ordering::Relaxed);
+    let interrupted = watcher.join().unwrap_or(false);
+
+    if interrupted {
+        vs.stop_playback();
+    }
+
+    interrupted
 }
 
 #[cfg(feature = "voice")]
@@ -1135,7 +1307,8 @@ mod tests {
         let server_path = home.join("llama.cpp/build/bin/llama-server");
 
         if !server_path.exists() {
-            let result = spawn_llama_server(19876);
+            let fake_model = home.join("models/nonexistent.gguf");
+            let result = spawn_llama_server(19876, &fake_model);
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("llama-server not found"),
@@ -1148,10 +1321,10 @@ mod tests {
     fn test_spawn_server_errors_when_model_missing() {
         let home = dirs::home_dir().unwrap();
         let server_path = home.join("llama.cpp/build/bin/llama-server");
-        let model_path = home.join("models/NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf");
+        let model_path = home.join("models/nonexistent-test-model.gguf");
 
-        if server_path.exists() && !model_path.exists() {
-            let result = spawn_llama_server(19877);
+        if server_path.exists() {
+            let result = spawn_llama_server(19877, &model_path);
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("Model not found"),

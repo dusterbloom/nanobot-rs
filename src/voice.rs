@@ -48,6 +48,7 @@ pub struct VoiceSession {
     stt: SpeechToText,
     tts: TextToSpeech,
     playback: Option<Child>,
+    cancel: Arc<AtomicBool>,
 }
 
 fn pulse_server() -> String {
@@ -152,6 +153,7 @@ impl VoiceSession {
             stt,
             tts,
             playback: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -264,10 +266,16 @@ impl VoiceSession {
         let pcm = samples_to_s16le_stereo(&first.samples);
         stdin.write_all(&pcm).map_err(|e| format!("Write to paplay failed: {e}"))?;
 
-        // Stream remaining sentences
+        // Stream remaining sentences, checking cancel between each
         for sentence in &sentences[1..] {
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let output = self.tts.synthesize(sentence)
                 .map_err(|e| format!("TTS failed: {e}"))?;
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let pcm = samples_to_s16le_stereo(&output.samples);
             stdin.write_all(&pcm).map_err(|e| format!("Write to paplay failed: {e}"))?;
         }
@@ -276,6 +284,14 @@ impl VoiceSession {
         drop(stdin);
         self.playback = Some(child);
         Ok(())
+    }
+
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    pub fn clear_cancel(&self) {
+        self.cancel.store(false, Ordering::Relaxed);
     }
 
     pub fn stop_playback(&mut self) {
