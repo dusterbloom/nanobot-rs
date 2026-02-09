@@ -203,9 +203,13 @@ impl ContextBuilder {
 
         let model_section = if self.model_name.is_empty() {
             String::new()
-        } else if self.model_name == "local-model" {
-            "\n\n## Model\nYou are running locally via llama.cpp. You are NOT Claude or any cloud AI. \
-             Respond as nanoclaw powered by a local model.".to_string()
+        } else if let Some(gguf_name) = self.model_name.strip_prefix("local:") {
+            format!(
+                "\n\n## Model\nYou are running locally via llama.cpp. \
+                 Your model file: {}. You are NOT Claude or any cloud AI. \
+                 Respond as nanobot powered by this local model.",
+                gguf_name
+            )
         } else {
             format!("\n\n## Model\nYou are powered by: {}", self.model_name)
         };

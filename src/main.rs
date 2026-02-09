@@ -323,7 +323,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 
     runtime.block_on(async {
         // Create initial agent loop
-        let (mut agent_loop, config) = create_agent_loop(&config, &local_port).await;
+        let (mut agent_loop, config) = create_agent_loop(&config, &local_port, Some(DEFAULT_LOCAL_MODEL)).await;
 
         if let Some(msg) = message {
             let skin = make_skin();
@@ -469,7 +469,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             println!("\n  {}{}Reusing{} llama.cpp server on port {}", tui::BOLD, tui::YELLOW, tui::RESET, port);
                             local_port = port.to_string();
                             LOCAL_MODE.store(true, Ordering::SeqCst);
-                            let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                            let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
                             agent_loop = new_loop;
                             print_mode_banner(&local_port);
                         } else {
@@ -484,7 +484,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                                     if wait_for_server_ready(port, 120, &mut llama_process).await {
                                         local_port = port.to_string();
                                         LOCAL_MODE.store(true, Ordering::SeqCst);
-                                        let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                                        let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
                                         agent_loop = new_loop;
                                         print_mode_banner(&local_port);
                                     } else {
@@ -512,7 +512,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         }
                         llama_process = None;
                         LOCAL_MODE.store(false, Ordering::SeqCst);
-                        let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                        let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
                         agent_loop = new_loop;
                         print_mode_banner(&local_port);
                     }
@@ -578,7 +578,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                                 llama_process = Some(child);
                                 if wait_for_server_ready(port, 120, &mut llama_process).await {
                                     local_port = port.to_string();
-                                    let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                                    let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
                                     agent_loop = new_loop;
                                     print_mode_banner(&local_port);
                                 } else {
@@ -674,7 +674,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 }
 
 /// Create an agent loop with the appropriate provider based on local mode.
-async fn create_agent_loop(config: &Config, local_port: &str) -> (AgentLoop, Config) {
+async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: Option<&str>) -> (AgentLoop, Config) {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
@@ -689,9 +689,10 @@ async fn create_agent_loop(config: &Config, local_port: &str) -> (AgentLoop, Con
     } else {
         create_provider(config)
     };
-    
+
     let model = if is_local {
-        "local-model".to_string()
+        // Pass the actual GGUF filename so the LLM knows what model it is.
+        format!("local:{}", local_model_name.unwrap_or("local-model"))
     } else {
         config.agents.defaults.model.clone()
     };
