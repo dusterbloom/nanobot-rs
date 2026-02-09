@@ -1,6 +1,6 @@
 //! Tool registry for dynamic tool management.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::base::Tool;
 
@@ -64,6 +64,88 @@ impl ToolRegistry {
         {
             result => result,
         }
+    }
+
+    /// Core tools that are always included in tool definitions.
+    const CORE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "exec",
+    ];
+
+    /// Keyword-to-tool mapping for context-triggered tool selection.
+    const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
+        (&["search", "find online", "look up", "google"], "web_search"),
+        (&["http", "url", "fetch", "website", "webpage", "download"], "web_fetch"),
+        (&["schedule", "cron", "every", "timer", "periodic"], "cron"),
+        (&["send", "message", "notify", "tell", "reply to"], "message"),
+        (&["spawn", "agent", "background", "subagent", "delegate"], "spawn"),
+    ];
+
+    /// Get tool definitions filtered by relevance to the current context.
+    ///
+    /// Core tools (filesystem, exec) are always included. Other tools are
+    /// included if they were previously used in the conversation or if
+    /// relevant keywords appear in recent messages.
+    pub fn get_relevant_definitions(
+        &self,
+        messages: &[serde_json::Value],
+        used_tools: &HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut relevant: HashSet<String> = HashSet::new();
+
+        // Always include core tools.
+        for name in Self::CORE_TOOLS {
+            if self.tools.contains_key(*name) {
+                relevant.insert(name.to_string());
+            }
+        }
+
+        // Include any tools already used in this conversation.
+        for name in used_tools {
+            if self.tools.contains_key(name) {
+                relevant.insert(name.clone());
+            }
+        }
+
+        // Scan recent messages for keyword triggers.
+        let recent_text = Self::extract_recent_text(messages, 5);
+        let lower_text = recent_text.to_lowercase();
+
+        for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
+            if self.tools.contains_key(*tool_name) {
+                for kw in *keywords {
+                    if lower_text.contains(kw) {
+                        relevant.insert(tool_name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If we end up with all tools anyway, just return everything.
+        if relevant.len() >= self.tools.len() {
+            return self.get_definitions();
+        }
+
+        self.tools
+            .iter()
+            .filter(|(name, _)| relevant.contains(name.as_str()))
+            .map(|(_, tool)| tool.to_schema())
+            .collect()
+    }
+
+    /// Extract text content from the last N messages for keyword scanning.
+    fn extract_recent_text(messages: &[serde_json::Value], n: usize) -> String {
+        messages
+            .iter()
+            .rev()
+            .take(n)
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .collect::<Vec<&str>>()
+            .join(" ")
     }
 
     /// Get list of registered tool names.
@@ -274,5 +356,69 @@ mod tests {
         assert!(result.contains("Error"));
         assert!(result.contains("nonexistent"));
         assert!(result.contains("not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_relevant_definitions tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_relevant_defs_always_includes_core_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(MockTool::new("write_file")));
+        registry.register(Box::new(MockTool::new("exec")));
+        registry.register(Box::new(MockTool::new("web_search")));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+        let defs = registry.get_relevant_definitions(&messages, &used);
+
+        // Core tools should be included; web_search should not (no keyword).
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"exec".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn test_relevant_defs_keyword_trigger() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(MockTool::new("web_search")));
+
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "search for Rust async patterns"}),
+        ];
+        let used = HashSet::new();
+        let defs = registry.get_relevant_definitions(&messages, &used);
+
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn test_relevant_defs_includes_used_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(MockTool::new("web_fetch")));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let mut used = HashSet::new();
+        used.insert("web_fetch".to_string());
+
+        let defs = registry.get_relevant_definitions(&messages, &used);
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"web_fetch".to_string()));
     }
 }

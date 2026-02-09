@@ -123,6 +123,8 @@ pub struct AgentDefaults {
     pub temperature: f64,
     #[serde(default = "default_max_tool_iterations")]
     pub max_tool_iterations: u32,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: usize,
 }
 
 fn default_workspace() -> String {
@@ -145,6 +147,10 @@ fn default_max_tool_iterations() -> u32 {
     20
 }
 
+fn default_max_context_tokens() -> usize {
+    128000
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -153,6 +159,7 @@ impl Default for AgentDefaults {
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             max_tool_iterations: default_max_tool_iterations(),
+            max_context_tokens: default_max_context_tokens(),
         }
     }
 }

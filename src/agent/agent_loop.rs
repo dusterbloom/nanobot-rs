@@ -13,7 +13,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::context::ContextBuilder;
+use crate::agent::learning::LearningStore;
 use crate::agent::subagent::SubagentManager;
+use crate::agent::thread_repair;
+use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CronScheduleTool, ExecTool, ListDirTool, MessageTool, ReadFileTool, SendCallback,
     SpawnCallback, SpawnTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
@@ -36,6 +39,8 @@ pub struct AgentLoop {
     workspace: PathBuf,
     model: String,
     max_iterations: u32,
+    max_tokens: u32,
+    temperature: f64,
     context: ContextBuilder,
     sessions: SessionManager,
     tools: ToolRegistry,
@@ -45,6 +50,8 @@ pub struct AgentLoop {
     spawn_tool: Arc<SpawnTool>,
     cron_tool: Option<Arc<CronScheduleTool>>,
     running: Arc<AtomicBool>,
+    token_budget: TokenBudget,
+    learning: LearningStore,
 }
 
 impl AgentLoop {
@@ -58,6 +65,9 @@ impl AgentLoop {
         workspace: PathBuf,
         model: String,
         max_iterations: u32,
+        max_tokens: u32,
+        temperature: f64,
+        max_context_tokens: usize,
         brave_api_key: Option<String>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
@@ -137,6 +147,9 @@ impl AgentLoop {
             ct
         });
 
+        let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+        let learning = LearningStore::new(&workspace);
+
         Self {
             bus_inbound_rx,
             bus_outbound_tx,
@@ -145,6 +158,8 @@ impl AgentLoop {
             workspace,
             model,
             max_iterations,
+            max_tokens,
+            temperature,
             context,
             sessions,
             tools,
@@ -153,6 +168,8 @@ impl AgentLoop {
             spawn_tool,
             cron_tool,
             running: Arc::new(AtomicBool::new(false)),
+            token_budget,
+            learning,
         }
     }
 
@@ -285,12 +302,8 @@ impl AgentLoop {
             Some(&msg.chat_id),
         );
 
-        let tool_defs = self.tools.get_definitions();
-        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-            None
-        } else {
-            Some(&tool_defs)
-        };
+        // Track which tools have been used for smart tool selection.
+        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let mut final_content = String::new();
 
@@ -298,9 +311,34 @@ impl AgentLoop {
         for iteration in 0..self.max_iterations {
             debug!("Agent iteration {}/{}", iteration + 1, self.max_iterations);
 
+            // Phase 3: Filter tool definitions to relevant tools.
+            let tool_defs = self
+                .tools
+                .get_relevant_definitions(&messages, &used_tools);
+            let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+                None
+            } else {
+                Some(&tool_defs)
+            };
+
+            // Phase 1: Trim messages to fit context budget.
+            let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(
+                tool_defs_opt.unwrap_or(&[]),
+            );
+            messages = self.token_budget.trim_to_fit(&messages, tool_def_tokens);
+
+            // Phase 2: Repair any protocol violations before calling the LLM.
+            thread_repair::repair_messages(&mut messages);
+
             let response = match self
                 .provider
-                .chat(&messages, tool_defs_opt, Some(&self.model), 8192, 0.7)
+                .chat(
+                    &messages,
+                    tool_defs_opt,
+                    Some(&self.model),
+                    self.max_tokens,
+                    self.temperature,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -349,6 +387,27 @@ impl AgentLoop {
                         &tc.id,
                         &tc.name,
                         &result,
+                    );
+
+                    // Phase 3: Track used tools.
+                    used_tools.insert(tc.name.clone());
+
+                    // Phase 4: Record tool outcome for learning.
+                    let context_str: String = tc
+                        .arguments
+                        .values()
+                        .filter_map(|v| v.as_str())
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(100)
+                        .collect();
+                    let succeeded = !result.starts_with("Error:");
+                    self.learning.record(
+                        &tc.name,
+                        succeeded,
+                        &context_str,
+                        if succeeded { None } else { Some(&result) },
                     );
                 }
             } else {

@@ -1,6 +1,9 @@
 pub mod tools;
 pub mod context;
+pub mod learning;
 pub mod memory;
 pub mod skills;
 pub mod subagent;
+pub mod thread_repair;
+pub mod token_budget;
 pub mod agent_loop;

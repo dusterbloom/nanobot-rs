@@ -10,6 +10,7 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{json, Value};
 
+use crate::agent::learning::LearningStore;
 use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
 
@@ -62,6 +63,13 @@ impl ContextBuilder {
         let memory = self.memory.get_memory_context();
         if !memory.is_empty() {
             parts.push(format!("# Memory\n\n{}", memory));
+        }
+
+        // Learning context (tool outcome patterns).
+        let learning = LearningStore::new(&self.workspace);
+        let learning_context = learning.get_learning_context();
+        if !learning_context.is_empty() {
+            parts.push(format!("# Recent Tool Patterns\n\n{}", learning_context));
         }
 
         // Skills -- progressive loading:

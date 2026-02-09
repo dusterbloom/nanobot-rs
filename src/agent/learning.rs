@@ -1,0 +1,265 @@
+//! Lightweight tool outcome tracking for agent learning.
+//!
+//! Records whether each tool invocation succeeded or failed, and provides
+//! a short summary for injection into the system prompt.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+/// Stores and retrieves tool outcome data.
+pub struct LearningStore {
+    file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LearningEntry {
+    timestamp: String,
+    tool_name: String,
+    succeeded: bool,
+    /// Brief description (first 100 chars of command/query).
+    context: String,
+    error: Option<String>,
+}
+
+impl LearningStore {
+    /// Create a new learning store rooted at the given workspace.
+    ///
+    /// Data is stored at `{workspace}/memory/learnings.json`.
+    pub fn new(workspace: &Path) -> Self {
+        let file_path = workspace.join("memory").join("learnings.json");
+        Self { file_path }
+    }
+
+    /// Record a tool outcome.
+    pub fn record(
+        &self,
+        tool_name: &str,
+        succeeded: bool,
+        context: &str,
+        error: Option<&str>,
+    ) {
+        let entry = LearningEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            tool_name: tool_name.to_string(),
+            succeeded,
+            context: context.chars().take(100).collect(),
+            error: error.map(|e| e.chars().take(200).collect()),
+        };
+
+        let mut entries = self.load_entries();
+        entries.push(entry);
+        self.save_entries(&entries);
+    }
+
+    /// Get a learning context summary for injection into the system prompt.
+    ///
+    /// Returns a short summary of recent tool success/failure patterns.
+    /// Empty string if no data or no interesting patterns.
+    pub fn get_learning_context(&self) -> String {
+        let entries = self.load_entries();
+        if entries.is_empty() {
+            return String::new();
+        }
+
+        // Only look at the last 50 entries.
+        let recent: Vec<&LearningEntry> = entries.iter().rev().take(50).collect();
+
+        // Aggregate by tool name.
+        let mut tool_stats: std::collections::HashMap<&str, (u32, u32)> =
+            std::collections::HashMap::new();
+
+        for entry in &recent {
+            let stat = tool_stats.entry(&entry.tool_name).or_insert((0, 0));
+            if entry.succeeded {
+                stat.0 += 1;
+            } else {
+                stat.1 += 1;
+            }
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+
+        // Only report tools with failures or notable patterns.
+        let mut sorted_tools: Vec<(&&str, &(u32, u32))> = tool_stats.iter().collect();
+        sorted_tools.sort_by_key(|(name, _)| name.to_string());
+
+        for (tool_name, (success, failure)) in sorted_tools {
+            let total = success + failure;
+            if total < 2 {
+                continue; // not enough data
+            }
+            if *failure > 0 {
+                lines.push(format!(
+                    "- {}: {}/{} succeeded recently",
+                    tool_name, success, total
+                ));
+            }
+        }
+
+        // Add recent errors (last 3 unique).
+        let mut seen_errors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut error_lines: Vec<String> = Vec::new();
+        for entry in &recent {
+            if let Some(ref err) = entry.error {
+                if seen_errors.insert(err.clone()) && error_lines.len() < 3 {
+                    error_lines.push(format!(
+                        "- {} failed: {}",
+                        entry.tool_name,
+                        err.chars().take(80).collect::<String>()
+                    ));
+                }
+            }
+        }
+
+        if lines.is_empty() && error_lines.is_empty() {
+            return String::new();
+        }
+
+        let mut result = String::new();
+        if !lines.is_empty() {
+            result.push_str("Tool success rates:\n");
+            result.push_str(&lines.join("\n"));
+        }
+        if !error_lines.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str("Recent errors:\n");
+            result.push_str(&error_lines.join("\n"));
+        }
+
+        result
+    }
+
+    /// Prune entries older than 30 days.
+    pub fn prune(&self) {
+        let mut entries = self.load_entries();
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        entries.retain(|e| e.timestamp >= cutoff_str);
+        self.save_entries(&entries);
+    }
+
+    // ---------------------------------------------------------------
+    // Private helpers
+    // ---------------------------------------------------------------
+
+    fn load_entries(&self) -> Vec<LearningEntry> {
+        match fs::read_to_string(&self.file_path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn save_entries(&self, entries: &[LearningEntry]) {
+        // Ensure parent directory exists.
+        if let Some(parent) = self.file_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(entries) {
+            let _ = fs::write(&self.file_path, json);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_store() -> (TempDir, LearningStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = LearningStore::new(tmp.path());
+        (tmp, store)
+    }
+
+    #[test]
+    fn test_record_and_load() {
+        let (_tmp, store) = make_store();
+        store.record("read_file", true, "/tmp/test.txt", None);
+        store.record("exec", false, "ls /nonexistent", Some("No such file"));
+
+        let entries = store.load_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].succeeded);
+        assert!(!entries[1].succeeded);
+        assert_eq!(entries[1].error.as_deref(), Some("No such file"));
+    }
+
+    #[test]
+    fn test_get_learning_context_empty() {
+        let (_tmp, store) = make_store();
+        assert_eq!(store.get_learning_context(), "");
+    }
+
+    #[test]
+    fn test_get_learning_context_with_failures() {
+        let (_tmp, store) = make_store();
+
+        // Record some mixed outcomes.
+        for _ in 0..3 {
+            store.record("exec", true, "ls", None);
+        }
+        for _ in 0..2 {
+            store.record("exec", false, "bad_cmd", Some("command not found"));
+        }
+
+        let context = store.get_learning_context();
+        assert!(context.contains("exec"));
+        assert!(context.contains("3/5 succeeded"));
+    }
+
+    #[test]
+    fn test_get_learning_context_all_success_no_report() {
+        let (_tmp, store) = make_store();
+
+        for _ in 0..5 {
+            store.record("read_file", true, "/tmp/a.txt", None);
+        }
+
+        // All successes → nothing interesting to report.
+        let context = store.get_learning_context();
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_context_truncation() {
+        let (_tmp, store) = make_store();
+        let long_context = "x".repeat(500);
+        store.record("exec", true, &long_context, None);
+
+        let entries = store.load_entries();
+        assert_eq!(entries[0].context.len(), 100);
+    }
+
+    #[test]
+    fn test_prune_removes_old() {
+        let (_tmp, store) = make_store();
+
+        // Manually insert an old entry.
+        let old_entry = LearningEntry {
+            timestamp: "2020-01-01T00:00:00+00:00".to_string(),
+            tool_name: "exec".to_string(),
+            succeeded: true,
+            context: "old".to_string(),
+            error: None,
+        };
+        let new_entry = LearningEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            tool_name: "exec".to_string(),
+            succeeded: true,
+            context: "new".to_string(),
+            error: None,
+        };
+        store.save_entries(&[old_entry, new_entry]);
+
+        store.prune();
+        let entries = store.load_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].context, "new");
+    }
+}
