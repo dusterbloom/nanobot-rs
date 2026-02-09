@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
+use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -40,6 +41,57 @@ const LOGO: &str = "\u{1F408}"; // cat emoji
 const LOCAL_LOGO: &str = "\u{1F3E0}"; // house emoji for local mode
 #[cfg(feature = "voice")]
 const VOICE_LOGO: &str = "\u{1F3A4}"; // microphone emoji for voice mode
+
+/// Build a styled termimad skin for rendering LLM markdown responses.
+fn make_skin() -> termimad::MadSkin {
+    use termimad::crossterm::style::Color;
+    let mut skin = termimad::MadSkin::default_dark();
+    skin.headers[0].set_fg(Color::Cyan);
+    skin.headers[1].set_fg(Color::Cyan);
+    skin.bold.set_fg(Color::White);
+    skin.italic.set_fg(Color::Magenta);
+    skin.inline_code.set_fg(Color::Green);
+    skin.code_block.set_fg(Color::Green);
+    skin
+}
+
+/// ANSI escape helpers for colored terminal output.
+mod tui {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const MAGENTA: &str = "\x1b[35m";
+    pub const WHITE: &str = "\x1b[97m";
+    pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+    pub const HIDE_CURSOR: &str = "\x1b[?25l";
+    pub const SHOW_CURSOR: &str = "\x1b[?25h";
+
+    /// Print the nanobot demoscene-style ASCII logo.
+    pub fn print_logo() {
+        println!("  {BOLD}{CYAN} _____             _       _   {RESET}");
+        println!("  {BOLD}{WHITE}|   | |___ ___ ___| |_ ___| |_ {RESET}");
+        println!("  {BOLD}{WHITE}| | | | .'|   | . | . | . |  _|{RESET}");
+        println!("  {BOLD}{CYAN}|_|___|__,|_|_|___|___|___|_|  {RESET}");
+    }
+
+    /// Animated loading sequence.
+    pub fn loading_animation(message: &str) {
+        use std::io::Write;
+        let frames = ["   ", ".  ", ".. ", "..."];
+        print!("{HIDE_CURSOR}");
+        for i in 0..8 {
+            print!("\r  {DIM}{}{}{RESET}  ", message, frames[i % frames.len()]);
+            std::io::stdout().flush().ok();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        print!("\r{}\r", " ".repeat(60)); // clear the line
+        print!("{SHOW_CURSOR}");
+        std::io::stdout().flush().ok();
+    }
+}
 
 // Global flag for local mode
 static LOCAL_MODE: AtomicBool = AtomicBool::new(false);
@@ -274,20 +326,29 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
         let (mut agent_loop, config) = create_agent_loop(&config, &local_port).await;
 
         if let Some(msg) = message {
-            let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
+            let skin = make_skin();
             let response = agent_loop
                 .process_direct(&msg, &session_id, "cli", "direct")
                 .await;
-            println!("\n{} {}", logo, response);
+            println!();
+            skin.print_text(&response);
         } else {
-            print_mode_banner(&local_port);
-            println!("Type /local to toggle local/cloud mode, Ctrl+C to exit\n");
+            print_startup_splash(&local_port);
 
             let mut llama_process: Option<std::process::Child> = None;
             let default_model = dirs::home_dir().unwrap().join("models").join(DEFAULT_LOCAL_MODEL);
             let mut current_model_path: std::path::PathBuf = default_model;
             #[cfg(feature = "voice")]
             let mut voice_session: Option<voice::VoiceSession> = None;
+
+            // Readline editor with history
+            let history_path = get_data_dir().join("history.txt");
+            let mut rl = rustyline::DefaultEditor::new()
+                .expect("Failed to create line editor");
+            let _ = rl.load_history(&history_path);
+
+            // Markdown skin for rendering LLM responses
+            let skin = make_skin();
 
             loop {
                 let is_local = LOCAL_MODE.load(Ordering::SeqCst);
@@ -298,13 +359,13 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 
                 let prompt = if voice_on {
                     #[cfg(feature = "voice")]
-                    { format!("{} You: ", VOICE_LOGO) }
+                    { format!("{} {}{}You:{} ", VOICE_LOGO, tui::BOLD, tui::MAGENTA, tui::RESET) }
                     #[cfg(not(feature = "voice"))]
-                    { "You: ".to_string() }
+                    { format!("{}{}You:{} ", tui::BOLD, tui::GREEN, tui::RESET) }
                 } else if is_local {
-                    format!("{} You: ", LOCAL_LOGO)
+                    format!("{} {}{}You:{} ", LOCAL_LOGO, tui::BOLD, tui::YELLOW, tui::RESET)
                 } else {
-                    "You: ".to_string()
+                    format!("{}{}You:{} ", tui::BOLD, tui::GREEN, tui::RESET)
                 };
 
                 // === GET INPUT ===
@@ -326,26 +387,26 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         VoiceAction::Exit => break,
                     }
                 } else {
-                    print!("{}", prompt);
-                    io::stdout().flush().ok();
-                    let mut line = String::new();
-                    match io::stdin().read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        _ => {}
+                    match rl.readline(&prompt) {
+                        Ok(line) => {
+                            let _ = rl.add_history_entry(&line);
+                            input_text = line;
+                        }
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                        Err(_) => break,
                     }
-                    input_text = line.trim().to_string();
                 }
 
                 #[cfg(not(feature = "voice"))]
                 {
-                    print!("{}", prompt);
-                    io::stdout().flush().ok();
-                    let mut line = String::new();
-                    match io::stdin().read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        _ => {}
+                    match rl.readline(&prompt) {
+                        Ok(line) => {
+                            let _ = rl.add_history_entry(&line);
+                            input_text = line;
+                        }
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                        Err(_) => break,
                     }
-                    input_text = line.trim().to_string();
                 }
 
                 // === VOICE RECORDING ===
@@ -362,8 +423,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                                     let response = agent_loop
                                         .process_direct(&text, &session_id, "voice", "direct")
                                         .await;
-                                    let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
-                                    println!("\n{} {}\n", logo, response);
+                                    println!();
+                                    skin.print_text(&response);
+                                    println!();
                                     let tts_text = strip_markdown_for_tts(&response);
                                     if !tts_text.is_empty() {
                                         if speak_interruptible(vs, &tts_text) {
@@ -404,7 +466,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 
                         if let Some(port) = found_port {
                             // Reuse existing server
-                            println!("\nReusing llama.cpp server already running on port {}...", port);
+                            println!("\n  {}{}Reusing{} llama.cpp server on port {}", tui::BOLD, tui::YELLOW, tui::RESET, port);
                             local_port = port.to_string();
                             LOCAL_MODE.store(true, Ordering::SeqCst);
                             let (new_loop, _) = create_agent_loop(&config, &local_port).await;
@@ -414,35 +476,37 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             // Kill any orphaned servers from previous runs
                             kill_stale_llama_servers();
                             let port = find_available_port(8080);
-                            println!("\nStarting llama.cpp server on port {}...", port);
+                            println!("\n  {}{}Starting{} llama.cpp server on port {}...", tui::BOLD, tui::YELLOW, tui::RESET, port);
 
                             match spawn_llama_server(port, &current_model_path) {
                                 Ok(child) => {
                                     llama_process = Some(child);
-                                    if wait_for_server_ready(port, 30).await {
+                                    if wait_for_server_ready(port, 120, &mut llama_process).await {
                                         local_port = port.to_string();
                                         LOCAL_MODE.store(true, Ordering::SeqCst);
                                         let (new_loop, _) = create_agent_loop(&config, &local_port).await;
                                         agent_loop = new_loop;
                                         print_mode_banner(&local_port);
                                     } else {
-                                        eprintln!("\n\u{26a0}\u{fe0f}  Server failed to start within 30 seconds");
+                                        println!("  {}{}Server failed to start{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                         if let Some(ref mut child) = llama_process {
                                             child.kill().ok();
                                             child.wait().ok();
                                         }
                                         llama_process = None;
+                                        println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("\n\u{26a0}\u{fe0f}  Failed to start llama.cpp server: {}", e);
+                                    println!("\n  {}{}Failed to start server:{} {}", tui::BOLD, tui::YELLOW, tui::RESET, e);
+                                    println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
                                 }
                             }
                         }
                     } else {
                         // Toggle OFF: kill server and switch to cloud
                         if let Some(ref mut child) = llama_process {
-                            println!("\nStopping llama.cpp server...");
+                            println!("\n  {}Stopping llama.cpp server...{}", tui::DIM, tui::RESET);
                             child.kill().ok();
                             child.wait().ok();
                         }
@@ -473,13 +537,11 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         let marker = if *path == current_model_path { " (active)" } else { "" };
                         println!("  [{}] {} ({} MB){}", i + 1, name, size_mb, marker);
                     }
-                    print!("\nSelect model [1-{}] or Enter to cancel: ", models.len());
-                    std::io::Write::flush(&mut std::io::stdout()).ok();
-
-                    let mut choice = String::new();
-                    if std::io::stdin().read_line(&mut choice).is_err() {
-                        continue;
-                    }
+                    let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", models.len());
+                    let choice = match rl.readline(&model_prompt) {
+                        Ok(line) => line,
+                        Err(_) => { continue; }
+                    };
                     let choice = choice.trim();
                     if choice.is_empty() {
                         continue;
@@ -501,7 +563,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     if LOCAL_MODE.load(Ordering::SeqCst) {
                         // Kill existing server we spawned + any orphans
                         if let Some(ref mut child) = llama_process {
-                            println!("Stopping current llama.cpp server...");
+                            println!("  {}Stopping current server...{}", tui::DIM, tui::RESET);
                             child.kill().ok();
                             child.wait().ok();
                         }
@@ -509,18 +571,18 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         kill_stale_llama_servers();
 
                         let port = find_available_port(8080);
-                        println!("Starting llama.cpp server on port {}...", port);
+                        println!("  {}{}Starting{} llama.cpp server on port {}...", tui::BOLD, tui::YELLOW, tui::RESET, port);
 
                         match spawn_llama_server(port, &current_model_path) {
                             Ok(child) => {
                                 llama_process = Some(child);
-                                if wait_for_server_ready(port, 30).await {
+                                if wait_for_server_ready(port, 120, &mut llama_process).await {
                                     local_port = port.to_string();
                                     let (new_loop, _) = create_agent_loop(&config, &local_port).await;
                                     agent_loop = new_loop;
                                     print_mode_banner(&local_port);
                                 } else {
-                                    eprintln!("\n\u{26a0}\u{fe0f}  Server failed to start within 30 seconds");
+                                    println!("  {}{}Server failed to start{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                     if let Some(ref mut child) = llama_process {
                                         child.kill().ok();
                                         child.wait().ok();
@@ -529,7 +591,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("\n\u{26a0}\u{fe0f}  Failed to start llama.cpp server: {}", e);
+                                println!("\n  {}{}Failed to start server:{} {}", tui::BOLD, tui::YELLOW, tui::RESET, e);
                             }
                         }
                     } else {
@@ -584,8 +646,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     .process_direct(input, &session_id, channel, "direct")
                     .await;
 
-                let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
-                println!("\n{} {}\n", logo, response);
+                println!();
+                skin.print_text(&response);
+                println!();
 
                 #[cfg(feature = "voice")]
                 if let Some(ref mut vs) = voice_session {
@@ -596,6 +659,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 }
             }
             // Cleanup: kill llama.cpp server if still running
+            // Save readline history
+            let _ = rl.save_history(&history_path);
+
             if let Some(ref mut child) = llama_process {
                 println!("Stopping llama.cpp server...");
                 child.kill().ok();
@@ -659,32 +725,56 @@ async fn create_agent_loop(config: &Config, local_port: &str) -> (AgentLoop, Con
     (agent_loop, config.clone())
 }
 
-/// Print the current mode banner.
+/// Print the current mode banner (compact, for mode switches mid-session).
 fn print_mode_banner(local_port: &str) {
+    use tui::*;
     let is_local = LOCAL_MODE.load(Ordering::SeqCst);
+    println!();
     if is_local {
-        println!("\n{} LOCAL MODE - Using llama.cpp server on port {}", LOCAL_LOGO, local_port);
-        // Try to get model info
+        println!("  {BOLD}{YELLOW}LOCAL MODE{RESET} {DIM}llama.cpp on port {local_port}{RESET}");
         let props_url = format!("http://localhost:{}/props", local_port);
         if let Ok(resp) = reqwest::blocking::get(&props_url) {
             if let Ok(json) = resp.json::<serde_json::Value>() {
                 if let Some(model) = json.get("default_generation_settings")
                     .and_then(|s| s.get("model"))
-                    .and_then(|m| m.as_str()) 
+                    .and_then(|m| m.as_str())
                 {
                     let model_name = std::path::Path::new(model)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(model);
-                    println!("   Model: {}", model_name);
+                    println!("  {DIM}Model: {RESET}{GREEN}{model_name}{RESET}");
                 }
             }
         }
     } else {
         let config = load_config(None);
-        println!("\n{} CLOUD MODE - Using {} via API", LOGO, config.agents.defaults.model);
+        println!("  {BOLD}{CYAN}CLOUD MODE{RESET} {DIM}{}{RESET}", config.agents.defaults.model);
     }
     println!();
+}
+
+/// Full startup splash: clear screen, ASCII logo, mode info, hints.
+fn print_startup_splash(local_port: &str) {
+    use tui::*;
+    // Clear the terminal for a fresh start.
+    print!("{CLEAR_SCREEN}");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    tui::print_logo();
+
+    let is_local = LOCAL_MODE.load(Ordering::SeqCst);
+    if is_local {
+        println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}llama.cpp :{local_port}{RESET}");
+    } else {
+        let config = load_config(None);
+        println!("  {BOLD}{CYAN}CLOUD{RESET} {DIM}{}{RESET}", config.agents.defaults.model);
+    }
+    println!("  {DIM}v{VERSION}  |  /local  /model  /voice  Ctrl+C quit{RESET}");
+    println!();
+
+    // Brief loading animation
+    tui::loading_animation("Initializing agent");
 }
 
 // ============================================================================
@@ -1036,25 +1126,93 @@ fn spawn_llama_server(port: u16, model_path: &std::path::Path) -> Result<std::pr
         .arg("16384")
         .arg("--n-gpu-layers")
         .arg("99")
+        .arg("--flash-attn")
+        .arg("on")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn llama-server: {}", e))
 }
 
-async fn wait_for_server_ready(port: u16, timeout_secs: u64) -> bool {
+async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut Option<std::process::Child>) -> bool {
+    use std::io::Write;
+
+    // Drain stderr in a background thread so the pipe buffer doesn't block the server.
+    let stderr_lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Some(ref mut child) = llama_process {
+        if let Some(stderr) = child.stderr.take() {
+            let lines = stderr_lines.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        lines.lock().unwrap().push(l);
+                    }
+                }
+            });
+        }
+    }
+
     let client = reqwest::Client::new();
     let url = format!("http://localhost:{}/health", port);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(timeout_secs);
+    let bar_width = 24usize;
+
+    print!("{}", tui::HIDE_CURSOR);
+    std::io::stdout().flush().ok();
 
     while std::time::Instant::now() < deadline {
+        // Check if server process crashed
+        if let Some(ref mut child) = llama_process {
+            if let Ok(Some(_)) = child.try_wait() {
+                // Clear the bar line, show error
+                print!("\r{}{}{}  ", tui::SHOW_CURSOR, tui::RESET, " ".repeat(bar_width + 30));
+                print!("\r  {}Server exited unexpectedly{}\n", tui::YELLOW, tui::RESET);
+                // Show last few stderr lines as hint
+                let lines = stderr_lines.lock().unwrap();
+                if let Some(last) = lines.last() {
+                    println!("  {}{}{}", tui::DIM, last, tui::RESET);
+                }
+                std::io::stdout().flush().ok();
+                return false;
+            }
+        }
+
+        // Draw progress bar
+        let elapsed = start.elapsed().as_secs_f64();
+        let frac = (elapsed / timeout_secs as f64).min(1.0);
+        let filled = (frac * bar_width as f64) as usize;
+        let empty = bar_width - filled;
+        print!(
+            "\r  {}Loading model [{}{}{}{}{}] {:.0}s{}",
+            tui::DIM, tui::RESET, tui::CYAN,
+            "\u{2588}".repeat(filled),   // █
+            "\u{2591}".repeat(empty),    // ░
+            tui::DIM, elapsed, tui::RESET,
+        );
+        std::io::stdout().flush().ok();
+
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
+                // Fill bar to 100% briefly
+                print!(
+                    "\r  {}Loading model [{}{}{}] done{}",
+                    tui::DIM, tui::RESET, tui::CYAN,
+                    "\u{2588}".repeat(bar_width), tui::RESET,
+                );
+                std::io::stdout().flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                print!("\r{}{}\r", tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+                std::io::stdout().flush().ok();
                 return true;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    print!("\r{}{}\r", tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+    std::io::stdout().flush().ok();
     false
 }
 
@@ -1345,13 +1503,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_timeout_when_no_server() {
-        let result = wait_for_server_ready(19999, 1).await;
+        let mut proc = None;
+        let result = wait_for_server_ready(19999, 1, &mut proc).await;
         assert!(!result, "Should return false when no server running");
     }
 
     #[tokio::test]
     async fn test_wait_zero_timeout_returns_false() {
-        let result = wait_for_server_ready(19998, 0).await;
+        let mut proc = None;
+        let result = wait_for_server_ready(19998, 0, &mut proc).await;
         assert!(!result, "Should return false immediately with zero timeout");
     }
 
@@ -1373,7 +1533,8 @@ mod tests {
             }
         });
 
-        let result = wait_for_server_ready(port, 5).await;
+        let mut proc = None;
+        let result = wait_for_server_ready(port, 5, &mut proc).await;
         assert!(result, "Should detect the healthy server");
     }
 
@@ -1404,7 +1565,8 @@ mod tests {
             }
         });
 
-        let result = wait_for_server_ready(port, 10).await;
+        let mut proc = None;
+        let result = wait_for_server_ready(port, 10, &mut proc).await;
         assert!(result, "Should succeed after retries");
         assert!(
             request_count.load(Ordering::SeqCst) >= 3,

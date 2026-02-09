@@ -61,6 +61,12 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "1"
 
+# REPL
+rustyline = "15"
+
+# Terminal markdown rendering
+termimad = "0.30"
+
 # Unix terminal control (stdin flush after voice recording)
 libc = "0.2"
 
