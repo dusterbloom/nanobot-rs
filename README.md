@@ -113,6 +113,14 @@ Deploy as a bot on your messaging platforms:
 | WhatsApp | WebSocket bridge |
 | Feishu (Lark) | WebSocket |
 
+### Context compaction
+
+Long conversations don't lose context. When history exceeds the token budget, nanoclaw summarizes older messages via a cheap LLM call instead of silently dropping them. The summary preserves key facts, decisions, and pending actions. Falls back to hard truncation if summarization fails.
+
+### Concurrent message processing
+
+In gateway mode, messages from different chats are processed in parallel (up to `maxConcurrentChats`, default 4). A WhatsApp user and a Telegram user get responses simultaneously instead of waiting in a queue. Messages within the same conversation stay serialized to preserve ordering.
+
 ### Memory and skills
 
 - **Memory**: Daily notes + long-term MEMORY.md, loaded into every prompt
@@ -159,6 +167,15 @@ RUST_LOG=debug cargo run -- agent -m "Hello"
 ## Configuration
 
 Config lives at `~/.nanoclaw/config.json` (camelCase keys). Workspace defaults to `~/.nanoclaw/workspace/`.
+
+Key agent settings in `config.json`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `agents.defaults.model` | `anthropic/claude-opus-4-5` | LLM model |
+| `agents.defaults.maxTokens` | `8192` | Max response tokens |
+| `agents.defaults.maxContextTokens` | `128000` | Context window size |
+| `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
 
 For local mode, place GGUF models in `~/models/` and ensure llama.cpp is built at `~/llama.cpp/build/bin/llama-server`.
 

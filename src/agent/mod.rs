@@ -1,4 +1,5 @@
 pub mod tools;
+pub mod compaction;
 pub mod context;
 pub mod learning;
 pub mod memory;

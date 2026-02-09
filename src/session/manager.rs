@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::utils::helpers::{ensure_dir, safe_filename};
@@ -92,10 +93,12 @@ impl Session {
 /// Manages conversation sessions.
 ///
 /// Sessions are stored as JSONL files in `~/.nanoclaw/sessions`.
+/// Thread-safe: the cache is protected by a Mutex so multiple tasks can
+/// access sessions concurrently.
 pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
-    cache: HashMap<String, Session>,
+    cache: Mutex<HashMap<String, Session>>,
 }
 
 impl SessionManager {
@@ -107,17 +110,33 @@ impl SessionManager {
         Self {
             workspace: workspace.to_path_buf(),
             sessions_dir,
-            cache: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Get an existing session or create a new one.
-    pub fn get_or_create(&mut self, key: &str) -> &mut Session {
-        if !self.cache.contains_key(key) {
-            let session = self._load(key).unwrap_or_else(|| Session::new(key));
-            self.cache.insert(key.to_string(), session);
+    /// Get the history for a session, creating it if needed.
+    pub async fn get_history(&self, key: &str, max_messages: usize) -> Vec<Value> {
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        session.get_history(max_messages)
+    }
+
+    /// Add a message to a session and persist it.
+    pub async fn add_message_and_save(&self, key: &str, role: &str, content: &str) {
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        session.add_message(role, content);
+        Self::save_session(session, &self.sessions_dir);
+    }
+
+    /// Add multiple messages to a session and persist it.
+    pub async fn add_messages_and_save(&self, key: &str, messages: &[(&str, &str)]) {
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        for &(role, content) in messages {
+            session.add_message(role, content);
         }
-        self.cache.get_mut(key).expect("session must exist in cache")
+        Self::save_session(session, &self.sessions_dir);
     }
 
     /// Persist a session to disk as JSONL.
@@ -125,50 +144,25 @@ impl SessionManager {
     /// The first line is a metadata header (`_type: "metadata"`), followed by
     /// one JSON object per message.
     pub fn save(&self, session: &Session) {
-        let path = self._get_session_path(&session.key);
-
-        let metadata_line = json!({
-            "_type": "metadata",
-            "created_at": session.created_at.to_rfc3339(),
-            "updated_at": session.updated_at.to_rfc3339(),
-            "metadata": Value::Object(
-                session.metadata.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            ),
-        });
-
-        let mut lines = Vec::with_capacity(session.messages.len() + 1);
-        lines.push(serde_json::to_string(&metadata_line).unwrap_or_default());
-        for msg in &session.messages {
-            lines.push(serde_json::to_string(msg).unwrap_or_default());
-        }
-
-        let content = lines.join("\n") + "\n";
-        if let Err(e) = fs::write(&path, content) {
-            warn!("Failed to save session {}: {}", session.key, e);
-        }
-    }
-
-    /// Get a reference to a cached session (immutable).
-    pub fn get_cached(&self, key: &str) -> Option<&Session> {
-        self.cache.get(key)
+        Self::save_session(session, &self.sessions_dir);
     }
 
     /// Save a session that is already in the cache by its key.
-    pub fn save_cached(&self, key: &str) {
-        if let Some(session) = self.cache.get(key) {
-            self.save(session);
+    pub async fn save_cached(&self, key: &str) {
+        let cache = self.cache.lock().await;
+        if let Some(session) = cache.get(key) {
+            Self::save_session(session, &self.sessions_dir);
         }
     }
 
     /// Delete a session from cache and disk.
     ///
     /// Returns `true` if the file was actually removed.
-    pub fn delete(&mut self, key: &str) -> bool {
-        self.cache.remove(key);
+    pub async fn delete(&self, key: &str) -> bool {
+        let mut cache = self.cache.lock().await;
+        cache.remove(key);
 
-        let path = self._get_session_path(key);
+        let path = Self::session_path(key, &self.sessions_dir);
         if path.exists() {
             let _ = fs::remove_file(&path);
             return true;
@@ -231,12 +225,53 @@ impl SessionManager {
     }
 
     // -----------------------------------------------------------------------
-    // Private helpers
+    // Private/internal helpers
     // -----------------------------------------------------------------------
 
+    /// Get or create a session within an already-locked cache.
+    fn get_or_create_inner<'a>(
+        cache: &'a mut HashMap<String, Session>,
+        key: &str,
+        sessions_dir: &Path,
+    ) -> &'a mut Session {
+        if !cache.contains_key(key) {
+            let session = Self::load_from_disk(key, sessions_dir)
+                .unwrap_or_else(|| Session::new(key));
+            cache.insert(key.to_string(), session);
+        }
+        cache.get_mut(key).expect("session must exist in cache")
+    }
+
+    /// Save a session to its JSONL file.
+    fn save_session(session: &Session, sessions_dir: &Path) {
+        let path = Self::session_path(&session.key, sessions_dir);
+
+        let metadata_line = json!({
+            "_type": "metadata",
+            "created_at": session.created_at.to_rfc3339(),
+            "updated_at": session.updated_at.to_rfc3339(),
+            "metadata": Value::Object(
+                session.metadata.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            ),
+        });
+
+        let mut lines = Vec::with_capacity(session.messages.len() + 1);
+        lines.push(serde_json::to_string(&metadata_line).unwrap_or_default());
+        for msg in &session.messages {
+            lines.push(serde_json::to_string(msg).unwrap_or_default());
+        }
+
+        let content = lines.join("\n") + "\n";
+        if let Err(e) = fs::write(&path, content) {
+            warn!("Failed to save session {}: {}", session.key, e);
+        }
+    }
+
     /// Load a session from its JSONL file on disk.
-    fn _load(&self, key: &str) -> Option<Session> {
-        let path = self._get_session_path(key);
+    fn load_from_disk(key: &str, sessions_dir: &Path) -> Option<Session> {
+        let path = Self::session_path(key, sessions_dir);
         if !path.exists() {
             return None;
         }
@@ -292,9 +327,9 @@ impl SessionManager {
     }
 
     /// Compute the filesystem path for a given session key.
-    fn _get_session_path(&self, key: &str) -> PathBuf {
+    fn session_path(key: &str, sessions_dir: &Path) -> PathBuf {
         let safe_key = safe_filename(&key.replace(':', "_"));
-        self.sessions_dir.join(format!("{}.jsonl", safe_key))
+        sessions_dir.join(format!("{}.jsonl", safe_key))
     }
 }
 
@@ -335,7 +370,30 @@ mod tests {
     fn test_session_path() {
         let tmp = std::env::temp_dir().join("nanoclaw_test_session_path");
         let mgr = SessionManager::new(&tmp);
-        let path = mgr._get_session_path("telegram:12345");
+        let path = SessionManager::session_path("telegram:12345", &mgr.sessions_dir);
         assert!(path.to_string_lossy().ends_with("telegram_12345.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn test_get_history_creates_session() {
+        let tmp = std::env::temp_dir().join("nanoclaw_test_get_history");
+        let mgr = SessionManager::new(&tmp);
+        let history = mgr.get_history("new:session", 100).await;
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_message_and_save() {
+        let tmp = std::env::temp_dir().join("nanoclaw_test_add_msg");
+        let mgr = SessionManager::new(&tmp);
+        // Use a unique key to avoid interference from previous test runs.
+        let key = format!("test:add_{}", uuid::Uuid::new_v4());
+        mgr.add_message_and_save(&key, "user", "hello").await;
+        let history = mgr.get_history(&key, 100).await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].get("content").and_then(|v| v.as_str()),
+            Some("hello")
+        );
     }
 }

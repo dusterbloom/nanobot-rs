@@ -138,6 +138,8 @@ pub struct AgentDefaults {
     pub max_tool_iterations: u32,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    #[serde(default = "default_max_concurrent_chats")]
+    pub max_concurrent_chats: usize,
 }
 
 fn default_workspace() -> String {
@@ -164,6 +166,10 @@ fn default_max_context_tokens() -> usize {
     128000
 }
 
+fn default_max_concurrent_chats() -> usize {
+    4
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -173,6 +179,7 @@ impl Default for AgentDefaults {
             temperature: default_temperature(),
             max_tool_iterations: default_max_tool_iterations(),
             max_context_tokens: default_max_context_tokens(),
+            max_concurrent_chats: default_max_concurrent_chats(),
         }
     }
 }

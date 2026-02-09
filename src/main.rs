@@ -801,6 +801,7 @@ async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: 
         config.tools.exec_.timeout,
         config.tools.exec_.restrict_to_workspace,
         Some(cron_service),
+        config.agents.defaults.max_concurrent_chats,
     );
 
     (agent_loop, config.clone())
@@ -911,6 +912,7 @@ async fn run_gateway_async(config: &Config) {
         config.tools.exec_.timeout,
         config.tools.exec_.restrict_to_workspace,
         Some(cron_arc),
+        config.agents.defaults.max_concurrent_chats,
     );
 
     let channel_manager = ChannelManager::new(config, inbound_tx, outbound_rx);

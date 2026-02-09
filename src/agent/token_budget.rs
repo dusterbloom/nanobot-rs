@@ -83,7 +83,7 @@ impl TokenBudget {
     }
 
     /// Available budget for messages (after reserving response + tool defs).
-    fn available_budget(&self, tool_def_tokens: usize) -> usize {
+    pub fn available_budget(&self, tool_def_tokens: usize) -> usize {
         self.max_context
             .saturating_sub(self.reserve_response)
             .saturating_sub(tool_def_tokens)
