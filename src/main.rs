@@ -12,6 +12,8 @@ mod heartbeat;
 mod providers;
 mod session;
 mod utils;
+#[cfg(feature = "voice")]
+mod voice;
 
 use std::io::{self, BufRead, Write as _};
 use std::net::TcpListener;
@@ -36,6 +38,8 @@ use crate::utils::helpers::get_workspace_path;
 const VERSION: &str = "0.1.0";
 const LOGO: &str = "\u{1F408}"; // cat emoji
 const LOCAL_LOGO: &str = "\u{1F3E0}"; // house emoji for local mode
+#[cfg(feature = "voice")]
+const VOICE_LOGO: &str = "\u{1F3A4}"; // microphone emoji for voice mode
 
 // Global flag for local mode
 static LOCAL_MODE: AtomicBool = AtomicBool::new(false);
@@ -145,7 +149,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,nanoclaw=info,ort=off,supertonic=off")),
         )
         .init();
 
@@ -280,57 +284,151 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
             println!("Type /local to toggle local/cloud mode, Ctrl+C to exit\n");
 
             let mut llama_process: Option<std::process::Child> = None;
+            #[cfg(feature = "voice")]
+            let mut voice_session: Option<voice::VoiceSession> = None;
 
             loop {
                 let is_local = LOCAL_MODE.load(Ordering::SeqCst);
-                let prompt = if is_local {
+                #[cfg(feature = "voice")]
+                let voice_on = voice_session.is_some();
+                #[cfg(not(feature = "voice"))]
+                let voice_on = false;
+
+                let prompt = if voice_on {
+                    #[cfg(feature = "voice")]
+                    { format!("{} You: ", VOICE_LOGO) }
+                    #[cfg(not(feature = "voice"))]
+                    { "You: ".to_string() }
+                } else if is_local {
                     format!("{} You: ", LOCAL_LOGO)
                 } else {
                     "You: ".to_string()
                 };
-                print!("{}", prompt);
-                io::stdout().flush().ok();
-                
-                let mut input = String::new();
-                match io::stdin().read_line(&mut input) {
-                    Ok(0) | Err(_) => break,
-                    _ => {}
+
+                // === GET INPUT ===
+                let input_text: String;
+                let mut do_record = false;
+
+                #[cfg(feature = "voice")]
+                if voice_on {
+                    print!("{}", prompt);
+                    io::stdout().flush().ok();
+                    match voice_read_input() {
+                        VoiceAction::Record => {
+                            do_record = true;
+                            input_text = String::new();
+                        }
+                        VoiceAction::Text(t) => {
+                            input_text = t;
+                        }
+                        VoiceAction::Exit => break,
+                    }
+                } else {
+                    print!("{}", prompt);
+                    io::stdout().flush().ok();
+                    let mut line = String::new();
+                    match io::stdin().read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        _ => {}
+                    }
+                    input_text = line.trim().to_string();
                 }
-                
-                let input = input.trim();
-                if input.is_empty() {
+
+                #[cfg(not(feature = "voice"))]
+                {
+                    print!("{}", prompt);
+                    io::stdout().flush().ok();
+                    let mut line = String::new();
+                    match io::stdin().read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        _ => {}
+                    }
+                    input_text = line.trim().to_string();
+                }
+
+                // === VOICE RECORDING ===
+                #[cfg(feature = "voice")]
+                if do_record {
+                    if let Some(ref mut vs) = voice_session {
+                        vs.stop_playback();
+                        match vs.record_and_transcribe() {
+                            Ok(Some(text)) => {
+                                println!();
+                                let response = agent_loop
+                                    .process_direct(&text, &session_id, "voice", "direct")
+                                    .await;
+                                let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
+                                println!("\n{} {}\n", logo, response);
+                                let tts_text = strip_markdown_for_tts(&response);
+                                if !tts_text.is_empty() {
+                                    if let Err(e) = vs.speak(&tts_text) {
+                                        eprintln!("TTS error: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(None) => println!("(no speech detected)\n"),
+                            Err(e) => eprintln!("Recording error: {}\n", e),
+                        }
+                        drain_stdin();
+                    }
                     continue;
                 }
-                
+
+                // === TEXT INPUT ===
+                let input = input_text.trim();
+                if input.is_empty() { continue; }
+
                 // Handle mode toggle commands
                 if input == "/local" || input == "/l" {
                     let currently_local = LOCAL_MODE.load(Ordering::SeqCst);
 
                     if !currently_local {
-                        // Toggle ON: spawn llama.cpp server
-                        let port = find_available_port(8080);
-                        println!("\nStarting llama.cpp server on port {}...", port);
-
-                        match spawn_llama_server(port) {
-                            Ok(child) => {
-                                llama_process = Some(child);
-                                if wait_for_server_ready(port, 30).await {
-                                    local_port = port.to_string();
-                                    LOCAL_MODE.store(true, Ordering::SeqCst);
-                                    let (new_loop, _) = create_agent_loop(&config, &local_port).await;
-                                    agent_loop = new_loop;
-                                    print_mode_banner(&local_port);
-                                } else {
-                                    eprintln!("\n\u{26a0}\u{fe0f}  Server failed to start within 30 seconds");
-                                    if let Some(ref mut child) = llama_process {
-                                        child.kill().ok();
-                                        child.wait().ok();
-                                    }
-                                    llama_process = None;
+                        // Toggle ON: check if a llama.cpp server is already running
+                        let mut found_port: Option<u16> = None;
+                        for port in 8080..=8089 {
+                            let url = format!("http://localhost:{}/health", port);
+                            if let Ok(resp) = reqwest::blocking::get(&url) {
+                                if resp.status().is_success() {
+                                    found_port = Some(port);
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("\n\u{26a0}\u{fe0f}  Failed to start llama.cpp server: {}", e);
+                        }
+
+                        if let Some(port) = found_port {
+                            // Reuse existing server
+                            println!("\nReusing llama.cpp server already running on port {}...", port);
+                            local_port = port.to_string();
+                            LOCAL_MODE.store(true, Ordering::SeqCst);
+                            let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                            agent_loop = new_loop;
+                            print_mode_banner(&local_port);
+                        } else {
+                            // Spawn new server
+                            let port = find_available_port(8080);
+                            println!("\nStarting llama.cpp server on port {}...", port);
+
+                            match spawn_llama_server(port) {
+                                Ok(child) => {
+                                    llama_process = Some(child);
+                                    if wait_for_server_ready(port, 30).await {
+                                        local_port = port.to_string();
+                                        LOCAL_MODE.store(true, Ordering::SeqCst);
+                                        let (new_loop, _) = create_agent_loop(&config, &local_port).await;
+                                        agent_loop = new_loop;
+                                        print_mode_banner(&local_port);
+                                    } else {
+                                        eprintln!("\n\u{26a0}\u{fe0f}  Server failed to start within 30 seconds");
+                                        if let Some(ref mut child) = llama_process {
+                                            child.kill().ok();
+                                            child.wait().ok();
+                                        }
+                                        llama_process = None;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("\n\u{26a0}\u{fe0f}  Failed to start llama.cpp server: {}", e);
+                                }
                             }
                         }
                     } else {
@@ -349,29 +447,63 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 
                     continue;
                 }
-                
+
+                // Handle voice toggle
+                #[cfg(feature = "voice")]
+                if input == "/voice" || input == "/v" {
+                    if voice_session.is_some() {
+                        if let Some(ref mut vs) = voice_session {
+                            vs.stop_playback();
+                        }
+                        voice_session = None;
+                        println!("\nVoice mode OFF\n");
+                    } else {
+                        match voice::VoiceSession::new().await {
+                            Ok(vs) => {
+                                voice_session = Some(vs);
+                                println!("\nVoice mode ON. Ctrl+Space or Enter to speak, type for text.\n");
+                            }
+                            Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
+                        }
+                    }
+                    continue;
+                }
+
                 // Handle help command
                 if input == "/help" || input == "/h" || input == "/?" {
                     println!("\nCommands:");
                     println!("  /local, /l  - Toggle between local and cloud mode");
+                    println!("  /voice, /v  - Toggle voice mode (Ctrl+Space or Enter to speak)");
                     println!("  /status     - Show current mode and model info");
                     println!("  /help, /h   - Show this help");
                     println!("  Ctrl+C      - Exit\n");
                     continue;
                 }
-                
+
                 // Handle status command
                 if input == "/status" || input == "/s" {
                     print_mode_banner(&local_port);
                     continue;
                 }
-                
+
+                // Process message
+                let channel = if voice_on { "voice" } else { "cli" };
                 let response = agent_loop
-                    .process_direct(input, &session_id, "cli", "direct")
+                    .process_direct(input, &session_id, channel, "direct")
                     .await;
-                
+
                 let logo = if LOCAL_MODE.load(Ordering::SeqCst) { LOCAL_LOGO } else { LOGO };
                 println!("\n{} {}\n", logo, response);
+
+                #[cfg(feature = "voice")]
+                if let Some(ref mut vs) = voice_session {
+                    let tts_text = strip_markdown_for_tts(&response);
+                    if !tts_text.is_empty() {
+                        if let Err(e) = vs.speak(&tts_text) {
+                            eprintln!("TTS error: {}", e);
+                        }
+                    }
+                }
             }
             // Cleanup: kill llama.cpp server if still running
             if let Some(ref mut child) = llama_process {
@@ -759,7 +891,7 @@ fn find_available_port(start: u16) -> u16 {
 fn spawn_llama_server(port: u16) -> Result<std::process::Child, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     let server_path = home.join("llama.cpp/build/bin/llama-server");
-    let model_path = home.join("models/NVIDIA-Nemotron-Nano-8B-v1-Q4_K_M.gguf");
+    let model_path = home.join("models/NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf");
 
     if !server_path.exists() {
         return Err(format!("llama-server not found at {}", server_path.display()));
@@ -797,6 +929,132 @@ async fn wait_for_server_ready(port: u16, timeout_secs: u64) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     false
+}
+
+/// Strip markdown formatting, code blocks, emojis, and special characters
+/// so that TTS receives only clean natural language text.
+#[cfg(feature = "voice")]
+fn strip_markdown_for_tts(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block { continue; }
+
+        let line = trimmed.trim_start_matches('#').trim();
+        if line.is_empty() { continue; }
+
+        for c in line.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' => out.push(c),
+                ' ' | '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')' => out.push(c),
+                '*' | '_' | '`' | '~' | '[' | ']' | '|' | '#' => {} // strip markdown syntax
+                _ if c.is_alphabetic() => out.push(c), // keep non-English letters
+                _ => {} // strip emojis, arrows, etc.
+            }
+        }
+        out.push(' ');
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Flush any buffered terminal input (e.g. extra Enter keypresses during recording).
+#[cfg(feature = "voice")]
+fn drain_stdin() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        unsafe { libc::tcflush(fd, libc::TCIFLUSH); }
+    }
+}
+
+#[cfg(feature = "voice")]
+enum VoiceAction {
+    Record,
+    Text(String),
+    Exit,
+}
+
+/// Read input in voice mode using crossterm raw terminal.
+/// Ctrl+Space or Enter (empty) → Record, typed text + Enter → Text, Ctrl+C → Exit.
+#[cfg(feature = "voice")]
+fn voice_read_input() -> VoiceAction {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal;
+
+    if terminal::enable_raw_mode().is_err() {
+        // Fallback: just use regular read_line
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => VoiceAction::Exit,
+            _ => {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() { VoiceAction::Record } else { VoiceAction::Text(trimmed) }
+            }
+        };
+    }
+
+    let mut buffer = String::new();
+
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                // Ctrl+Space → record
+                if (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('\0'))
+                {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    break VoiceAction::Record;
+                }
+                // Ctrl+C → exit
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    break VoiceAction::Exit;
+                }
+                // Enter
+                if key.code == KeyCode::Enter {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    if buffer.is_empty() {
+                        break VoiceAction::Record;
+                    }
+                    break VoiceAction::Text(buffer);
+                }
+                // Backspace
+                if key.code == KeyCode::Backspace {
+                    if buffer.pop().is_some() {
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
+                    }
+                    continue;
+                }
+                // Regular character (no ctrl/alt modifier)
+                if let KeyCode::Char(c) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        buffer.push(c);
+                        print!("{}", c);
+                        io::stdout().flush().ok();
+                    }
+                }
+            }
+            Ok(_) => {} // ignore mouse, resize, etc.
+            Err(_) => break VoiceAction::Exit,
+        }
+    };
+
+    terminal::disable_raw_mode().ok();
+    result
 }
 
 fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
@@ -890,7 +1148,7 @@ mod tests {
     fn test_spawn_server_errors_when_model_missing() {
         let home = dirs::home_dir().unwrap();
         let server_path = home.join("llama.cpp/build/bin/llama-server");
-        let model_path = home.join("models/NVIDIA-Nemotron-Nano-8B-v1-Q4_K_M.gguf");
+        let model_path = home.join("models/NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf");
 
         if server_path.exists() && !model_path.exists() {
             let result = spawn_llama_server(19877);

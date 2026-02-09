@@ -27,6 +27,7 @@ pub struct ContextBuilder {
     pub workspace: PathBuf,
     pub memory: MemoryStore,
     pub skills: SkillsLoader,
+    pub model_name: String,
 }
 
 impl ContextBuilder {
@@ -36,6 +37,7 @@ impl ContextBuilder {
             workspace: workspace.to_path_buf(),
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
+            model_name: String::new(),
         }
     }
 
@@ -116,6 +118,16 @@ impl ContextBuilder {
         if let (Some(ch), Some(cid)) = (channel, chat_id) {
             system_prompt
                 .push_str(&format!("\n\n## Current Session\nChannel: {}\nChat ID: {}", ch, cid));
+            if ch == "voice" {
+                system_prompt.push_str(concat!(
+                    "\n\n## Voice Mode\n",
+                    "The user is speaking to you via microphone (speech-to-text). ",
+                    "Your response will be read aloud via text-to-speech (TTS). ",
+                    "Keep responses short, natural, and conversational. ",
+                    "Do NOT use markdown formatting, code blocks, bullet points, ",
+                    "numbered lists, or emoji. Write plain spoken sentences only.",
+                ));
+            }
         }
         messages.push(json!({"role": "system", "content": system_prompt}));
 
@@ -178,6 +190,15 @@ impl ContextBuilder {
             .to_string_lossy()
             .to_string();
 
+        let model_section = if self.model_name.is_empty() {
+            String::new()
+        } else if self.model_name == "local-model" {
+            "\n\n## Model\nYou are running locally via llama.cpp. You are NOT Claude or any cloud AI. \
+             Respond as nanoclaw powered by a local model.".to_string()
+        } else {
+            format!("\n\n## Model\nYou are powered by: {}", self.model_name)
+        };
+
         format!(
             r#"# nanoclaw
 
@@ -189,7 +210,7 @@ You are nanoclaw, a helpful AI assistant. You have access to tools that allow yo
 - Spawn subagents for complex background tasks
 
 ## Current Time
-{now}
+{now}{model_section}
 
 ## Workspace
 Your workspace is at: {workspace_path}

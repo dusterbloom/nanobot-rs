@@ -63,7 +63,8 @@ impl AgentLoop {
         restrict_to_workspace: bool,
         cron_service: Option<Arc<CronService>>,
     ) -> Self {
-        let context = ContextBuilder::new(&workspace);
+        let mut context = ContextBuilder::new(&workspace);
+        context.model_name = model.clone();
         let sessions = SessionManager::new(&workspace);
 
         // Create the subagent manager.

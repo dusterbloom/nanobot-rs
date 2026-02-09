@@ -61,6 +61,9 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "1"
 
+# Unix terminal control (stdin flush after voice recording)
+libc = "0.2"
+
 # URL parsing
 url = "2"
 
@@ -69,3 +72,15 @@ mime_guess = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+voice = ["dep:jack-voice", "dep:crossterm"]
+
+[dependencies.jack-voice]
+path = "../jack-voice/jack-voice"
+optional = true
+
+[dependencies.crossterm]
+version = "0.28"
+optional = true
