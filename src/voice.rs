@@ -1,5 +1,6 @@
 #![cfg(feature = "voice")]
 
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,39 @@ use jack_voice::{
     SpeechToText, TextToSpeech, SttMode,
     models::{self, ModelProgressCallback},
 };
+
+fn split_tts_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'.' || b == b'!' || b == b'?' {
+            // Include the punctuation, skip trailing whitespace for the boundary
+            let end = i + 1;
+            let s = text[start..end].trim().to_string();
+            if !s.is_empty() {
+                sentences.push(s);
+            }
+            start = end;
+        }
+    }
+    // Remainder (text after last punctuation)
+    let remainder = text[start..].trim().to_string();
+    if !remainder.is_empty() {
+        sentences.push(remainder);
+    }
+    sentences
+}
+
+fn samples_to_s16le_stereo(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|&s| {
+        let clamped = s.clamp(-1.0, 1.0);
+        let i16_val = (clamped * 32767.0) as i16;
+        let bytes = i16_val.to_le_bytes();
+        // Duplicate mono → stereo (left = right)
+        [bytes[0], bytes[1], bytes[0], bytes[1]]
+    }).collect()
+}
 
 pub struct VoiceSession {
     stt: SpeechToText,
@@ -53,15 +87,7 @@ fn start_parec(sample_tx: std_mpsc::Sender<Vec<f32>>) -> Result<Child, String> {
 }
 
 fn start_playback(samples: Vec<f32>, sample_rate: u32) -> Result<Child, String> {
-    // Convert float32 mono → s16le stereo to match the PulseAudio sink exactly
-    // (RDPSink: s16le 2ch 44100Hz). This avoids any PulseAudio format conversion.
-    let pcm: Vec<u8> = samples.iter().flat_map(|&s| {
-        let clamped = s.clamp(-1.0, 1.0);
-        let i16_val = (clamped * 32767.0) as i16;
-        let bytes = i16_val.to_le_bytes();
-        // Duplicate mono → stereo (left = right)
-        [bytes[0], bytes[1], bytes[0], bytes[1]]
-    }).collect();
+    let pcm = samples_to_s16le_stereo(&samples);
 
     let mut child = Command::new("paplay")
         .args([
@@ -78,7 +104,6 @@ fn start_playback(samples: Vec<f32>, sample_rate: u32) -> Result<Child, String> 
 
     let mut stdin = child.stdin.take().unwrap();
     std::thread::spawn(move || {
-        use std::io::Write;
         let _ = stdin.write_all(&pcm);
     });
 
@@ -210,11 +235,46 @@ impl VoiceSession {
     }
 
     pub fn speak(&mut self, text: &str) -> Result<(), String> {
-        let output = self
-            .tts
-            .synthesize(text)
+        let sentences = split_tts_sentences(text);
+        if sentences.is_empty() {
+            return Ok(());
+        }
+
+        // Synthesize first sentence to get sample_rate, then spawn paplay
+        let first = self.tts.synthesize(&sentences[0])
             .map_err(|e| format!("TTS failed: {e}"))?;
-        self.playback = Some(start_playback(output.samples, output.sample_rate)?);
+        let sample_rate = first.sample_rate;
+
+        let mut child = Command::new("paplay")
+            .args([
+                "--raw",
+                "--format=s16le",
+                "--channels=2",
+                &format!("--rate={}", sample_rate),
+            ])
+            .env("PULSE_SERVER", pulse_server())
+            .stdin(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils"))?;
+
+        let mut stdin = child.stdin.take().unwrap();
+
+        // Write first sentence immediately
+        let pcm = samples_to_s16le_stereo(&first.samples);
+        stdin.write_all(&pcm).map_err(|e| format!("Write to paplay failed: {e}"))?;
+
+        // Stream remaining sentences
+        for sentence in &sentences[1..] {
+            let output = self.tts.synthesize(sentence)
+                .map_err(|e| format!("TTS failed: {e}"))?;
+            let pcm = samples_to_s16le_stereo(&output.samples);
+            stdin.write_all(&pcm).map_err(|e| format!("Write to paplay failed: {e}"))?;
+        }
+
+        // Drop stdin to signal EOF — paplay plays remaining buffer then exits
+        drop(stdin);
+        self.playback = Some(child);
         Ok(())
     }
 
