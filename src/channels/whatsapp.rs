@@ -1,12 +1,18 @@
 //! WhatsApp channel implementation using a Node.js WebSocket bridge.
 //!
-//! The bridge uses `@whiskeysockets/baileys` to handle the WhatsApp Web protocol.
+//! The bridge uses `whatsapp-web.js` to handle the WhatsApp Web protocol.
 //! Communication between Rust and Node.js is via WebSocket.
+//!
+//! On startup, the channel auto-spawns the Node.js bridge as a child process.
+//! Bridge files are embedded at compile time and extracted to
+//! `~/.nanoclaw/bridge/whatsapp/` on first run.
 
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -19,6 +25,10 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::WhatsAppConfig;
 
+/// Embedded bridge files (baked in at compile time for `cargo install` support).
+const BRIDGE_INDEX_JS: &str = include_str!("../../bridge/whatsapp/index.js");
+const BRIDGE_PACKAGE_JSON: &str = include_str!("../../bridge/whatsapp/package.json");
+
 /// WhatsApp channel that connects to a Node.js bridge via WebSocket.
 pub struct WhatsAppChannel {
     config: WhatsAppConfig,
@@ -26,6 +36,17 @@ pub struct WhatsAppChannel {
     running: Arc<AtomicBool>,
     /// Sender for outgoing WebSocket messages (set once connected).
     ws_tx: Arc<TokioMutex<Option<UnboundedSender<String>>>>,
+    /// Child bridge process (auto-spawned).
+    bridge_process: Option<Child>,
+}
+
+impl Drop for WhatsAppChannel {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.bridge_process {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl WhatsAppChannel {
@@ -36,7 +57,72 @@ impl WhatsAppChannel {
             bus_tx,
             running: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(TokioMutex::new(None)),
+            bridge_process: None,
         }
+    }
+
+    /// Resolve the bridge directory. Checks dev path first, then installed path.
+    /// If neither has files, extracts embedded files to the installed path.
+    fn resolve_bridge_dir() -> Result<PathBuf> {
+        // Dev path: ./bridge/whatsapp/ (when running from repo checkout).
+        let dev_path = PathBuf::from("bridge/whatsapp");
+        if dev_path.join("index.js").exists() && dev_path.join("package.json").exists() {
+            info!("Using dev bridge at {}", dev_path.display());
+            return Ok(dev_path);
+        }
+
+        // Installed path: ~/.nanoclaw/bridge/whatsapp/
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let installed_path = home.join(".nanoclaw").join("bridge").join("whatsapp");
+
+        if !installed_path.join("index.js").exists() {
+            info!("Extracting embedded WhatsApp bridge to {}", installed_path.display());
+            std::fs::create_dir_all(&installed_path)?;
+            std::fs::write(installed_path.join("index.js"), BRIDGE_INDEX_JS)?;
+            std::fs::write(installed_path.join("package.json"), BRIDGE_PACKAGE_JSON)?;
+        }
+
+        Ok(installed_path)
+    }
+
+    /// Run `npm install` in the bridge directory if `node_modules/` doesn't exist.
+    fn ensure_npm_deps(bridge_dir: &PathBuf) -> Result<()> {
+        if bridge_dir.join("node_modules").exists() {
+            return Ok(());
+        }
+
+        info!("Installing WhatsApp bridge dependencies...");
+        let status = Command::new("npm")
+            .arg("install")
+            .arg("--no-audit")
+            .arg("--no-fund")
+            .current_dir(bridge_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("Failed to run npm install — is Node.js installed?")?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!("npm install failed with status {}", status));
+        }
+
+        Ok(())
+    }
+
+    /// Spawn the Node.js bridge process.
+    fn spawn_bridge(bridge_dir: &PathBuf, port: u16) -> Result<Child> {
+        info!("Starting WhatsApp bridge on port {}...", port);
+        let child = Command::new("node")
+            .arg("index.js")
+            .arg("--port")
+            .arg(port.to_string())
+            .current_dir(bridge_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("Failed to spawn bridge process — is Node.js installed?")?;
+
+        Ok(child)
     }
 
     /// Handle a JSON message from the bridge.
@@ -132,7 +218,15 @@ impl Channel for WhatsAppChannel {
     async fn start(&mut self) -> Result<()> {
         self.running.store(true, Ordering::SeqCst);
 
-        let bridge_url = self.config.bridge_url.clone();
+        // Auto-spawn the bridge if no explicit bridge_url is configured.
+        if self.config.bridge_url.is_none() {
+            let bridge_dir = Self::resolve_bridge_dir()?;
+            Self::ensure_npm_deps(&bridge_dir)?;
+            let child = Self::spawn_bridge(&bridge_dir, self.config.bridge_port)?;
+            self.bridge_process = Some(child);
+        }
+
+        let bridge_url = self.config.effective_bridge_url();
         let bus_tx = self.bus_tx.clone();
         let running = self.running.clone();
         let ws_tx_slot = self.ws_tx.clone();
@@ -232,6 +326,13 @@ impl Channel for WhatsAppChannel {
         {
             let mut slot = self.ws_tx.lock().await;
             *slot = None;
+        }
+        // Kill the bridge child process if we spawned it.
+        if let Some(ref mut child) = self.bridge_process {
+            info!("Stopping WhatsApp bridge process...");
+            let _ = child.kill();
+            let _ = child.wait();
+            self.bridge_process = None;
         }
         info!("WhatsApp channel stopped");
         Ok(())

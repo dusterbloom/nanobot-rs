@@ -17,21 +17,34 @@ use serde::{Deserialize, Serialize};
 pub struct WhatsAppConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_whatsapp_bridge_url")]
-    pub bridge_url: String,
+    /// Explicit bridge URL. If not set, derived from `bridge_port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_url: Option<String>,
+    #[serde(default = "default_whatsapp_bridge_port")]
+    pub bridge_port: u16,
     #[serde(default)]
     pub allow_from: Vec<String>,
 }
 
-fn default_whatsapp_bridge_url() -> String {
-    "ws://localhost:3001".to_string()
+fn default_whatsapp_bridge_port() -> u16 {
+    3001
+}
+
+impl WhatsAppConfig {
+    /// Get the effective bridge WebSocket URL.
+    pub fn effective_bridge_url(&self) -> String {
+        self.bridge_url
+            .clone()
+            .unwrap_or_else(|| format!("ws://localhost:{}", self.bridge_port))
+    }
 }
 
 impl Default for WhatsAppConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bridge_url: default_whatsapp_bridge_url(),
+            bridge_url: None,
+            bridge_port: default_whatsapp_bridge_port(),
             allow_from: Vec::new(),
         }
     }

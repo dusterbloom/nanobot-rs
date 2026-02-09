@@ -140,6 +140,15 @@ enum Commands {
         #[command(subcommand)]
         action: CronAction,
     },
+    /// Quick-start WhatsApp channel (zero config).
+    #[command(name = "whatsapp", alias = "wa")]
+    WhatsApp,
+    /// Quick-start Telegram channel.
+    Telegram {
+        /// Bot token (prompted interactively if not provided).
+        #[arg(short, long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -201,7 +210,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,nanoclaw=info,ort=off,supertonic=off")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ort=off,supertonic=off")),
         )
         .init();
 
@@ -221,6 +230,8 @@ fn main() {
             CronAction::Remove { job_id } => cmd_cron_remove(job_id),
             CronAction::Enable { job_id, disable } => cmd_cron_enable(job_id, disable),
         },
+        Commands::WhatsApp => cmd_whatsapp(),
+        Commands::Telegram { token } => cmd_telegram(token),
     }
 }
 
@@ -622,15 +633,84 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     continue;
                 }
 
+                // Handle WhatsApp quick-start from REPL
+                if input == "/whatsapp" || input == "/wa" {
+                    println!("\n  Switching to WhatsApp gateway mode...\n");
+                    let mut gw_config = load_config(None);
+                    check_api_key(&gw_config);
+                    gw_config.channels.whatsapp.enabled = true;
+                    gw_config.channels.telegram.enabled = false;
+                    gw_config.channels.feishu.enabled = false;
+                    println!("  Scan the QR code when it appears");
+                    println!("  Press Ctrl+C to stop\n");
+                    run_gateway_async(&gw_config).await;
+                    println!("\n  {}Back to chat mode.{}\n", tui::DIM, tui::RESET);
+                    continue;
+                }
+
+                // Handle Telegram quick-start from REPL
+                if input == "/telegram" || input == "/tg" {
+                    println!();
+                    let mut gw_config = load_config(None);
+                    check_api_key(&gw_config);
+                    let saved_token = &gw_config.channels.telegram.token;
+                    let token = if !saved_token.is_empty() {
+                        println!("  Using saved bot token");
+                        saved_token.clone()
+                    } else {
+                        println!("  No Telegram bot token found.");
+                        println!("  Get one from @BotFather on Telegram.\n");
+                        let tok_prompt = "  Enter bot token: ";
+                        let t = match rl.readline(tok_prompt) {
+                            Ok(line) => line.trim().to_string(),
+                            Err(_) => { continue; }
+                        };
+                        if t.is_empty() {
+                            println!("  Cancelled.\n");
+                            continue;
+                        }
+                        print!("  Validating token... ");
+                        io::stdout().flush().ok();
+                        if validate_telegram_token(&t) {
+                            println!("valid!\n");
+                        } else {
+                            println!("invalid!");
+                            println!("  Check the token and try again.\n");
+                            continue;
+                        }
+                        let save_prompt = "  Save token to config for next time? [Y/n] ";
+                        if let Ok(answer) = rl.readline(save_prompt) {
+                            if !answer.trim().eq_ignore_ascii_case("n") {
+                                let mut save_cfg = load_config(None);
+                                save_cfg.channels.telegram.token = t.clone();
+                                save_config(&save_cfg, None);
+                                println!("  Token saved to ~/.nanoclaw/config.json\n");
+                            }
+                        }
+                        t
+                    };
+                    println!("  Switching to Telegram gateway mode...");
+                    gw_config.channels.telegram.token = token;
+                    gw_config.channels.telegram.enabled = true;
+                    gw_config.channels.whatsapp.enabled = false;
+                    gw_config.channels.feishu.enabled = false;
+                    println!("  Press Ctrl+C to stop\n");
+                    run_gateway_async(&gw_config).await;
+                    println!("\n  {}Back to chat mode.{}\n", tui::DIM, tui::RESET);
+                    continue;
+                }
+
                 // Handle help command
                 if input == "/help" || input == "/h" || input == "/?" {
                     println!("\nCommands:");
-                    println!("  /local, /l  - Toggle between local and cloud mode");
-                    println!("  /model, /m  - Select local model from ~/models/");
-                    println!("  /voice, /v  - Toggle voice mode (Ctrl+Space or Enter to speak)");
-                    println!("  /status     - Show current mode and model info");
-                    println!("  /help, /h   - Show this help");
-                    println!("  Ctrl+C      - Exit\n");
+                    println!("  /local, /l      - Toggle between local and cloud mode");
+                    println!("  /model, /m      - Select local model from ~/models/");
+                    println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
+                    println!("  /whatsapp, /wa  - Switch to WhatsApp gateway mode");
+                    println!("  /telegram, /tg  - Switch to Telegram gateway mode");
+                    println!("  /status         - Show current mode and model info");
+                    println!("  /help, /h       - Show this help");
+                    println!("  Ctrl+C          - Exit\n");
                     continue;
                 }
 
@@ -790,83 +870,185 @@ fn cmd_gateway(port: u16, verbose: bool) {
     println!("{} Starting nanoclaw gateway on port {}...", LOGO, port);
 
     let config = load_config(None);
-    let api_key = config.get_api_key();
-    let model = config.agents.defaults.model.clone();
-
-    if api_key.is_none() && !model.starts_with("bedrock/") {
-        eprintln!("Error: No API key configured.");
-        std::process::exit(1);
-    }
+    check_api_key(&config);
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    runtime.block_on(run_gateway_async(&config));
+}
 
-    runtime.block_on(async {
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+/// Shared async gateway: creates channels, provider, cron, agent loop, and runs until Ctrl+C.
+async fn run_gateway_async(config: &Config) {
+    let model = config.agents.defaults.model.clone();
 
-        let provider = create_provider(&config);
-        let brave_key = if config.tools.web.search.api_key.is_empty() {
-            None
-        } else {
-            Some(config.tools.web.search.api_key.clone())
-        };
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
-        let cron_store_path = get_data_dir().join("cron").join("jobs.json");
-        let mut cron_service = CronService::new(cron_store_path);
-        cron_service.start().await;
-        let cron_status = cron_service.status();
-        let cron_arc = Arc::new(cron_service);
+    let provider = create_provider(config);
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
 
-        let mut agent_loop = AgentLoop::new(
-            inbound_rx,
-            outbound_tx,
-            inbound_tx.clone(),
-            provider,
-            config.workspace_path(),
-            model,
-            config.agents.defaults.max_tool_iterations,
-            config.agents.defaults.max_tokens,
-            config.agents.defaults.temperature,
-            config.agents.defaults.max_context_tokens,
-            brave_key,
-            config.tools.exec_.timeout,
-            config.tools.exec_.restrict_to_workspace,
-            Some(cron_arc),
-        );
+    let cron_store_path = get_data_dir().join("cron").join("jobs.json");
+    let mut cron_service = CronService::new(cron_store_path);
+    cron_service.start().await;
+    let cron_status = cron_service.status();
+    let cron_arc = Arc::new(cron_service);
 
-        let channel_manager = ChannelManager::new(&config, inbound_tx, outbound_rx);
+    let mut agent_loop = AgentLoop::new(
+        inbound_rx,
+        outbound_tx,
+        inbound_tx.clone(),
+        provider,
+        config.workspace_path(),
+        model,
+        config.agents.defaults.max_tool_iterations,
+        config.agents.defaults.max_tokens,
+        config.agents.defaults.temperature,
+        config.agents.defaults.max_context_tokens,
+        brave_key,
+        config.tools.exec_.timeout,
+        config.tools.exec_.restrict_to_workspace,
+        Some(cron_arc),
+    );
 
-        let enabled = channel_manager.enabled_channels();
-        if !enabled.is_empty() {
-            println!("  Channels enabled: {}", enabled.join(", "));
-        } else {
-            println!("  Warning: No channels enabled");
+    let channel_manager = ChannelManager::new(config, inbound_tx, outbound_rx);
+
+    let enabled = channel_manager.enabled_channels();
+    if !enabled.is_empty() {
+        println!("  Channels enabled: {}", enabled.join(", "));
+    } else {
+        println!("  Warning: No channels enabled");
+    }
+
+    {
+        let job_count = cron_status.get("jobs").and_then(|v| v.as_i64()).unwrap_or(0);
+        if job_count > 0 {
+            println!("  Cron: {} scheduled jobs", job_count);
         }
+    }
 
-        {
-            let job_count = cron_status.get("jobs").and_then(|v| v.as_i64()).unwrap_or(0);
-            if job_count > 0 {
-                println!("  Cron: {} scheduled jobs", job_count);
-            }
+    println!("  Heartbeat: every 30m");
+
+    // start_all() spawns channels as background tasks and returns immediately,
+    // so call it before the select rather than racing it.
+    channel_manager.start_all().await;
+
+    tokio::select! {
+        _ = agent_loop.run() => {
+            info!("Agent loop ended");
         }
-
-        println!("  Heartbeat: every 30m");
-
-        tokio::select! {
-            _ = agent_loop.run() => {
-                info!("Agent loop ended");
-            }
-            _ = channel_manager.start_all() => {
-                info!("Channel manager ended");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nShutting down...");
-            }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nShutting down...");
         }
+    }
 
-        agent_loop.stop();
-        channel_manager.stop_all().await;
-    });
+    agent_loop.stop();
+    channel_manager.stop_all().await;
+}
+
+// ============================================================================
+// Quick-start channel commands
+// ============================================================================
+
+fn cmd_whatsapp() {
+    println!("{} Starting WhatsApp...\n", LOGO);
+
+    let mut config = load_config(None);
+    check_api_key(&config);
+
+    config.channels.whatsapp.enabled = true;
+    config.channels.telegram.enabled = false;
+    config.channels.feishu.enabled = false;
+
+    println!("  Scan the QR code when it appears");
+    println!("  Press Ctrl+C to stop\n");
+
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    runtime.block_on(run_gateway_async(&config));
+}
+
+fn cmd_telegram(token_arg: Option<String>) {
+    println!("{} Starting Telegram...\n", LOGO);
+
+    let mut config = load_config(None);
+    check_api_key(&config);
+
+    let saved_token = &config.channels.telegram.token;
+    let token = match token_arg {
+        Some(t) => t,
+        None if !saved_token.is_empty() => {
+            println!("  Using saved bot token");
+            saved_token.clone()
+        }
+        None => {
+            println!("  No Telegram bot token found.");
+            println!("  Get one from @BotFather on Telegram.\n");
+            print!("  Enter bot token: ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            let t = input.trim().to_string();
+            if t.is_empty() {
+                eprintln!("Error: No token provided.");
+                std::process::exit(1);
+            }
+
+            print!("  Validating token... ");
+            io::stdout().flush().ok();
+            if validate_telegram_token(&t) {
+                println!("valid!\n");
+            } else {
+                println!("invalid!");
+                eprintln!("Error: Token validation failed. Check the token and try again.");
+                std::process::exit(1);
+            }
+
+            print!("  Save token to config for next time? [Y/n] ");
+            io::stdout().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer).ok();
+            if !answer.trim().eq_ignore_ascii_case("n") {
+                let mut save_cfg = load_config(None);
+                save_cfg.channels.telegram.token = t.clone();
+                save_config(&save_cfg, None);
+                println!("  Token saved to ~/.nanoclaw/config.json\n");
+            }
+
+            t
+        }
+    };
+
+    config.channels.telegram.token = token;
+    config.channels.telegram.enabled = true;
+    config.channels.whatsapp.enabled = false;
+    config.channels.feishu.enabled = false;
+
+    println!("  Press Ctrl+C to stop\n");
+
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    runtime.block_on(run_gateway_async(&config));
+}
+
+/// Validate a Telegram bot token by calling the getMe API.
+fn validate_telegram_token(token: &str) -> bool {
+    let url = format!("https://api.telegram.org/bot{}/getMe", token);
+    reqwest::blocking::get(&url)
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|d| d.get("ok")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Check that an LLM API key is configured, exit with error if not.
+fn check_api_key(config: &Config) {
+    let model = &config.agents.defaults.model;
+    if config.get_api_key().is_none() && !model.starts_with("bedrock/") {
+        eprintln!("Error: No API key configured.");
+        eprintln!("Set one in ~/.nanoclaw/config.json under providers.openrouter.apiKey");
+        std::process::exit(1);
+    }
 }
 
 // ============================================================================
@@ -938,7 +1120,7 @@ fn cmd_channels_status() {
     println!(
         "  WhatsApp: {} ({})",
         if config.channels.whatsapp.enabled { "enabled" } else { "disabled" },
-        config.channels.whatsapp.bridge_url
+        config.channels.whatsapp.effective_bridge_url()
     );
     let tg_info = if config.channels.telegram.token.is_empty() {
         "not configured".to_string()

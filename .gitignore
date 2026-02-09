@@ -1,4 +1,5 @@
 /target
+bridge/whatsapp/node_modules/
 .env
 *.swp
 *.swo
