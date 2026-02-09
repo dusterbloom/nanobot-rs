@@ -34,6 +34,21 @@ fn split_tts_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// Apply fade-in and fade-out envelopes to eliminate clicks at sentence boundaries.
+/// `fade_samples` is the number of samples to ramp over (~5ms at 44.1kHz = 220 samples).
+fn apply_fade_envelope(samples: &mut [f32], fade_samples: usize) {
+    let len = samples.len();
+    let fade = fade_samples.min(len / 2);
+    // Fade in
+    for i in 0..fade {
+        samples[i] *= i as f32 / fade as f32;
+    }
+    // Fade out
+    for i in 0..fade {
+        samples[len - 1 - i] *= i as f32 / fade as f32;
+    }
+}
+
 fn samples_to_s16le_stereo(samples: &[f32]) -> Vec<u8> {
     samples.iter().flat_map(|&s| {
         let clamped = s.clamp(-1.0, 1.0);
@@ -243,9 +258,12 @@ impl VoiceSession {
         }
 
         // Synthesize first sentence to get sample_rate, then spawn paplay
-        let first = self.tts.synthesize(&sentences[0])
+        let mut first = self.tts.synthesize(&sentences[0])
             .map_err(|e| format!("TTS failed: {e}"))?;
         let sample_rate = first.sample_rate;
+        // ~5ms fade at 44.1kHz
+        let fade_samples = (sample_rate as usize * 5) / 1000;
+        apply_fade_envelope(&mut first.samples, fade_samples);
 
         let mut child = Command::new("paplay")
             .args([
@@ -271,11 +289,12 @@ impl VoiceSession {
             if self.cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let output = self.tts.synthesize(sentence)
+            let mut output = self.tts.synthesize(sentence)
                 .map_err(|e| format!("TTS failed: {e}"))?;
             if self.cancel.load(Ordering::Relaxed) {
                 break;
             }
+            apply_fade_envelope(&mut output.samples, fade_samples);
             let pcm = samples_to_s16le_stereo(&output.samples);
             stdin.write_all(&pcm).map_err(|e| format!("Write to paplay failed: {e}"))?;
         }
