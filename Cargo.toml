@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A lightweight personal AI assistant framework in Rust"
 license = "MIT"
-repository = "https://github.com/dusterbloom/nanobot"
+repository = "https://github.com/dusterbloom/nanobot-rs"
 
 [[bin]]
 name = "nanoclaw"

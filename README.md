@@ -1,63 +1,176 @@
 # nanoclaw
 
-A lightweight personal AI assistant framework in Rust.
+A personal AI assistant that runs on your terms. Cloud or local. Text or voice. Your machine, your models, your data.
 
-Ported from [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS) (MIT License).
+Rust port of [nanobot](https://github.com/HKUDS/nanobot) by HKUDS -- rebuilt from scratch for speed, portability, and offline-first operation.
 
-## What it does
+## Why
 
-- **Agent loop**: LLM -> tools -> response cycle with configurable providers
-- **Multi-provider**: OpenRouter, Anthropic, OpenAI, Groq, DeepSeek, Gemini, vLLM (all via OpenAI-compatible API)
-- **Built-in tools**: file read/write/edit, shell exec, web search/fetch, message, spawn subagents, cron scheduling
-- **Chat channels**: Telegram, WhatsApp (bridge), Feishu
-- **Memory**: Daily notes + long-term memory with file-based persistence
-- **Skills**: Markdown-based skill system with YAML frontmatter
-- **Sessions**: JSONL session persistence
+Most AI assistants are cloud-locked SaaS products. nanoclaw is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a GGUF running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
 
-## Build
-
-```bash
-cargo build --release
-```
+No containers. No Python. No dependencies beyond what `cargo build` pulls in.
 
 ## Quick start
 
 ```bash
+cargo build --release
+
 # Initialize config and workspace
 nanoclaw onboard
 
 # Add your API key to ~/.nanoclaw/config.json
 
-# Chat directly
-nanoclaw agent -m "Hello!"
-
-# Interactive mode
+# Start chatting
 nanoclaw agent
-
-# Start gateway with channels
-nanoclaw gateway
 ```
 
-## Commands
+## Features
+
+### Talk to any LLM
+
+All providers speak the same OpenAI-compatible protocol. First API key found wins:
+
+OpenRouter / DeepSeek / Anthropic / OpenAI / Gemini / Groq / vLLM
+
+```
+You: What's the weather like?
+```
+
+### Go local with `/local`
+
+Toggle between cloud and local inference mid-conversation. nanoclaw auto-spawns a llama.cpp server, waits for it to be ready, and switches over.
+
+```
+You: /local
+Starting llama.cpp server on port 8080...
+LOCAL MODE - Using Nemotron-Nano-9B on port 8080
+
+You: /model
+Available models:
+  [1] gemma-3n-E4B-it-Q4_K_S.gguf (3923 MB)
+  [2] Ministral-8B-Instruct-Q4_K_M.gguf (4815 MB)
+  [3] NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf (5352 MB) (active)
+  ...
+Select model [1-12] or Enter to cancel:
+```
+
+Switch models on the fly. Stale servers from previous sessions are cleaned up automatically.
+
+### Voice mode
+
+```bash
+cargo build --release --features voice
+```
+
+```
+You: /voice
+Voice mode ON. Ctrl+Space or Enter to speak, type for text.
+
+Recording... (press Enter or Ctrl+Space to stop)
+You said: "What time is it in Tokyo?"
+
+It's currently about two in the morning in Tokyo.
+```
+
+Voice mode uses on-device models -- no cloud STT/TTS:
+- **Speech-to-text**: Whisper (via jack-voice)
+- **Text-to-speech**: Supertonic v2 diffusion TTS (ONNX, 44.1kHz)
+
+Audio is streamed sentence-by-sentence through PulseAudio. First audio plays in ~300-500ms while remaining sentences synthesize in the background.
+
+**Interrupt anytime**: press Enter during playback to cut the response short and start speaking. The assistant stops talking and listens.
+
+### Tools
+
+The agent has hands. It can read and write files, run shell commands, search the web, spawn sub-agents, and schedule recurring tasks:
+
+| Tool | What it does |
+|------|-------------|
+| File read/write/edit | Workspace file operations |
+| Shell exec | Run commands with timeout and sandboxing |
+| Web search + fetch | Brave Search API + page fetching |
+| Message | Send messages to channels |
+| Spawn | Launch sub-agent conversations |
+| Cron | Schedule recurring tasks with cron expressions |
+
+### Channels
+
+Deploy as a bot on your messaging platforms:
+
+| Channel | Transport |
+|---------|-----------|
+| Telegram | Long-polling |
+| WhatsApp | WebSocket bridge |
+| Feishu (Lark) | WebSocket |
+
+### Memory and skills
+
+- **Memory**: Daily notes + long-term MEMORY.md, loaded into every prompt
+- **Skills**: Markdown files with YAML frontmatter at `{workspace}/skills/{name}/SKILL.md`. Skills marked `always: true` are always loaded; others appear as summaries the agent can read on demand
+- **Sessions**: JSONL persistence at `~/.nanoclaw/sessions/`
+
+## Interactive commands
+
+| Command | Description |
+|---------|-------------|
+| `/local`, `/l` | Toggle local/cloud mode |
+| `/model`, `/m` | Select local GGUF model |
+| `/voice`, `/v` | Toggle voice mode |
+| `/status`, `/s` | Show current mode and model |
+| `/help`, `/h` | Show help |
+| `Ctrl+C` | Exit |
+
+## CLI commands
 
 | Command | Description |
 |---------|-------------|
 | `nanoclaw onboard` | Initialize config and workspace |
-| `nanoclaw agent -m "..."` | Send a message to the agent |
-| `nanoclaw agent` | Interactive chat mode |
-| `nanoclaw gateway` | Start gateway with channels + agent loop |
-| `nanoclaw status` | Show configuration status |
-| `nanoclaw channels status` | Show channel status |
+| `nanoclaw agent` | Interactive chat |
+| `nanoclaw agent -m "..."` | Single message |
+| `nanoclaw gateway` | Start with channel adapters |
+| `nanoclaw status` | Configuration status |
+| `nanoclaw channels status` | Channel status |
 | `nanoclaw cron list` | List scheduled jobs |
 | `nanoclaw cron add` | Add a scheduled job |
 
-## Config
+## Building
 
-Configuration lives at `~/.nanoclaw/config.json`. Workspace defaults to `~/.nanoclaw/workspace/`.
+```bash
+# Standard build
+cargo build --release
+
+# With voice mode (requires jack-voice + supertonic)
+cargo build --release --features voice
+
+# Debug with logging
+RUST_LOG=debug cargo run -- agent -m "Hello"
+```
+
+## Configuration
+
+Config lives at `~/.nanoclaw/config.json` (camelCase keys). Workspace defaults to `~/.nanoclaw/workspace/`.
+
+For local mode, place GGUF models in `~/models/` and ensure llama.cpp is built at `~/llama.cpp/build/bin/llama-server`.
+
+## Architecture
+
+```
+              Channels (Telegram / WhatsApp / Feishu)
+                              |
+                              v
+User --> CLI / Voice --> AgentLoop --> LLM Provider
+                           |   ^        (any OpenAI-compat API)
+                           |   |
+                           v   |
+                        ToolRegistry --> file, shell, web,
+                                         message, spawn, cron
+```
+
+Single-binary. No microservices. The agent loop is the core -- it takes a message, builds context (identity + memory + skills + history), calls the LLM, executes any tool calls, and returns a response. Voice mode wraps this with STT on input and streaming TTS on output.
 
 ## Attribution
 
-This project is a Rust port of [nanobot](https://github.com/HKUDS/nanobot), an ultra-lightweight personal AI assistant by HKUDS. The original Python implementation is licensed under MIT.
+Rust port of [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS). Original Python implementation licensed under MIT.
 
 ## License
 
