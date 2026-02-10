@@ -105,13 +105,26 @@ The agent has hands. It can read and write files, run shell commands, search the
 
 ### Channels
 
-Deploy as a bot on your messaging platforms:
+Deploy as a bot on your messaging platforms -- or start them right from the REPL:
 
-| Channel | Transport |
-|---------|-----------|
-| Telegram | Long-polling |
-| WhatsApp | WebSocket bridge |
-| Feishu (Lark) | WebSocket |
+| Channel | Transport | Quick start |
+|---------|-----------|-------------|
+| Telegram | Long-polling (POST) | `/telegram` or `/tg` |
+| WhatsApp | WebSocket bridge | `/whatsapp` or `/wa` |
+| Email | IMAP polling + SMTP | `/email` |
+| Feishu (Lark) | WebSocket | gateway mode |
+
+Channels run in the background while you keep chatting. Inbound messages and bot responses are displayed in the REPL as they flow through:
+
+```
+[telegram] 4815162342: What's the capital of France?
+[telegram] bot: The capital of France is Paris.
+You: (you keep chatting locally)
+```
+
+#### Voice messages on channels
+
+With the `voice` feature enabled, voice messages sent via Telegram or WhatsApp are automatically transcribed using on-device STT (same Whisper model as `/voice` mode). The bot replies with both text and a voice note synthesized via TTS. No cloud transcription -- everything runs locally. Requires `ffmpeg` for audio codec conversion.
 
 ### Context compaction
 
@@ -134,7 +147,12 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `/local`, `/l` | Toggle local/cloud mode |
 | `/model`, `/m` | Select local GGUF model |
 | `/voice`, `/v` | Toggle voice mode |
-| `/status`, `/s` | Show current mode and model |
+| `/telegram`, `/tg` | Start Telegram channel in background |
+| `/whatsapp`, `/wa` | Start WhatsApp channel in background |
+| `/email` | Start Email channel in background |
+| `/paste`, `/p` | Paste mode -- multiline input until `---` |
+| `/stop` | Stop all running channels |
+| `/status`, `/s` | Show current mode, model, and channels |
 | `/help`, `/h` | Show help |
 | `Ctrl+C` | Exit |
 

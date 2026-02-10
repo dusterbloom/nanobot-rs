@@ -76,6 +76,13 @@ url = "2"
 # Mime type guessing
 mime_guess = "2"
 
+# Email channel (IMAP + SMTP)
+async-imap = "0.10"
+async-native-tls = "0.5"
+tokio-util = { version = "0.7", features = ["compat"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+mail-parser = "0.9"
+
 [dev-dependencies]
 tempfile = "3"
 

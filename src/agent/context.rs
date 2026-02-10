@@ -118,6 +118,7 @@ impl ContextBuilder {
         media: Option<&[String]>,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        is_voice_message: bool,
     ) -> Vec<Value> {
         let mut messages: Vec<Value> = Vec::new();
 
@@ -126,7 +127,7 @@ impl ContextBuilder {
         if let (Some(ch), Some(cid)) = (channel, chat_id) {
             system_prompt
                 .push_str(&format!("\n\n## Current Session\nChannel: {}\nChat ID: {}", ch, cid));
-            if ch == "voice" {
+            if ch == "voice" || is_voice_message {
                 system_prompt.push_str(concat!(
                     "\n\n## Voice Mode (IMPORTANT)\n",
                     "The user is speaking via microphone and your response will be read aloud by TTS. ",
@@ -438,7 +439,7 @@ mod tests {
     fn test_build_messages_structure() {
         let (_tmp, cb) = make_context();
         let history: Vec<Value> = vec![json!({"role": "user", "content": "hello"})];
-        let messages = cb.build_messages(&history, "what's up?", None, None, None, None);
+        let messages = cb.build_messages(&history, "what's up?", None, None, None, None, false);
 
         // Should have: system, history entry, current user message.
         assert_eq!(messages.len(), 3);
@@ -453,7 +454,7 @@ mod tests {
     fn test_build_messages_includes_channel_and_chat_id() {
         let (_tmp, cb) = make_context();
         let messages =
-            cb.build_messages(&[], "hi", None, None, Some("telegram"), Some("12345"));
+            cb.build_messages(&[], "hi", None, None, Some("telegram"), Some("12345"), false);
         let system_content = messages[0]["content"].as_str().unwrap();
         assert!(system_content.contains("Channel: telegram"));
         assert!(system_content.contains("Chat ID: 12345"));
@@ -462,7 +463,7 @@ mod tests {
     #[test]
     fn test_build_messages_without_history() {
         let (_tmp, cb) = make_context();
-        let messages = cb.build_messages(&[], "test", None, None, None, None);
+        let messages = cb.build_messages(&[], "test", None, None, None, None, false);
         // system + current user message
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");

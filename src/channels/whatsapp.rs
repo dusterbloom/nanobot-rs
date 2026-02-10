@@ -25,6 +25,9 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::WhatsAppConfig;
 
+#[cfg(feature = "voice")]
+use crate::voice_pipeline::VoicePipeline;
+
 /// Embedded bridge files (baked in at compile time for `cargo install` support).
 const BRIDGE_INDEX_JS: &str = include_str!("../../bridge/whatsapp/index.js");
 const BRIDGE_PACKAGE_JSON: &str = include_str!("../../bridge/whatsapp/package.json");
@@ -38,6 +41,8 @@ pub struct WhatsAppChannel {
     ws_tx: Arc<TokioMutex<Option<UnboundedSender<String>>>>,
     /// Child bridge process (auto-spawned).
     bridge_process: Option<Child>,
+    #[cfg(feature = "voice")]
+    voice_pipeline: Option<Arc<VoicePipeline>>,
 }
 
 impl Drop for WhatsAppChannel {
@@ -51,13 +56,19 @@ impl Drop for WhatsAppChannel {
 
 impl WhatsAppChannel {
     /// Create a new `WhatsAppChannel`.
-    pub fn new(config: WhatsAppConfig, bus_tx: UnboundedSender<InboundMessage>) -> Self {
+    pub fn new(
+        config: WhatsAppConfig,
+        bus_tx: UnboundedSender<InboundMessage>,
+        #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
+    ) -> Self {
         Self {
             config,
             bus_tx,
             running: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(TokioMutex::new(None)),
             bridge_process: None,
+            #[cfg(feature = "voice")]
+            voice_pipeline,
         }
     }
 
@@ -126,10 +137,11 @@ impl WhatsAppChannel {
     }
 
     /// Handle a JSON message from the bridge.
-    fn _handle_bridge_message(
+    async fn _handle_bridge_message(
         data: &Value,
         bus_tx: &UnboundedSender<InboundMessage>,
         allow_from: &[String],
+        #[cfg(feature = "voice")] voice_pipeline: &Option<Arc<VoicePipeline>>,
     ) {
         let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -160,10 +172,41 @@ impl WhatsAppChannel {
                     return;
                 }
 
-                let content = if content == "[Voice Message]" {
-                    "[Voice Message: Transcription not available for WhatsApp yet]"
+                #[allow(unused_mut)]
+                let mut is_voice_message = false;
+                #[allow(unused_mut)]
+                let mut voice_file_path: Option<String> = None;
+                let voice_file = data.get("voiceFile").and_then(|v| v.as_str());
+
+                let content = if let Some(vf) = voice_file {
+                    // Voice message with downloaded file — try to transcribe.
+                    #[cfg(feature = "voice")]
+                    {
+                        if let Some(ref pipeline) = voice_pipeline {
+                            match pipeline.transcribe_file(vf).await {
+                                Ok(text) => {
+                                    info!("Transcribed WhatsApp voice: \"{}\"", &text[..text.len().min(60)]);
+                                    is_voice_message = true;
+                                    voice_file_path = Some(vf.to_string());
+                                    text
+                                }
+                                Err(e) => {
+                                    warn!("WhatsApp voice transcription failed: {}", e);
+                                    format!("[voice: {}]", vf)
+                                }
+                            }
+                        } else {
+                            format!("[voice: {}]", vf)
+                        }
+                    }
+                    #[cfg(not(feature = "voice"))]
+                    {
+                        format!("[voice: {}]", vf)
+                    }
+                } else if content == "[Voice Message]" {
+                    "[Voice Message: Transcription not available for WhatsApp yet]".to_string()
                 } else {
-                    content
+                    content.to_string()
                 };
 
                 let is_group = data
@@ -171,7 +214,7 @@ impl WhatsAppChannel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let mut msg = InboundMessage::new("whatsapp", chat_id, sender, content);
+                let mut msg = InboundMessage::new("whatsapp", chat_id, sender, &content);
                 if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                     msg.metadata
                         .insert("message_id".to_string(), json!(id));
@@ -182,6 +225,15 @@ impl WhatsAppChannel {
                 }
                 msg.metadata
                     .insert("is_group".to_string(), json!(is_group));
+
+                if is_voice_message {
+                    msg.metadata
+                        .insert("voice_message".to_string(), json!(true));
+                    if let Some(ref vf) = voice_file_path {
+                        msg.metadata
+                            .insert("voice_file".to_string(), json!(vf));
+                    }
+                }
 
                 let _ = bus_tx.send(msg);
             }
@@ -231,6 +283,8 @@ impl Channel for WhatsAppChannel {
         let running = self.running.clone();
         let ws_tx_slot = self.ws_tx.clone();
         let allow_from = self.config.allow_from.clone();
+        #[cfg(feature = "voice")]
+        let voice_pipeline = self.voice_pipeline.clone();
 
         info!("Connecting to WhatsApp bridge at {}...", bridge_url);
 
@@ -277,7 +331,9 @@ impl Channel for WhatsAppChannel {
                                         Ok(data) => {
                                             Self::_handle_bridge_message(
                                                 &data, &bus_tx, &allow_from,
-                                            );
+                                                #[cfg(feature = "voice")]
+                                                &voice_pipeline,
+                                            ).await;
                                         }
                                         Err(_) => {
                                             warn!(
@@ -348,6 +404,46 @@ impl Channel for WhatsAppChannel {
             }
         };
         drop(slot);
+
+        // If this is a reply to a voice message, try to send a voice note.
+        #[cfg(feature = "voice")]
+        {
+            let is_voice = msg
+                .metadata
+                .get("voice_message")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_voice {
+                if let Some(ref pipeline) = self.voice_pipeline {
+                    let tts_text = crate::strip_markdown_for_tts(&msg.content);
+                    if !tts_text.is_empty() {
+                        match pipeline.synthesize_to_file(&tts_text).await {
+                            Ok(ogg_path) => {
+                                if let Ok(bytes) = std::fs::read(&ogg_path) {
+                                    use base64::Engine;
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    let media_payload = json!({
+                                        "type": "sendMedia",
+                                        "to": msg.chat_id,
+                                        "media": b64,
+                                        "mimetype": "audio/ogg",
+                                        "filename": "voice.ogg",
+                                        "caption": msg.content,
+                                    });
+                                    let _ = tx.send(serde_json::to_string(&media_payload).unwrap_or_default());
+                                    let _ = std::fs::remove_file(&ogg_path);
+                                    return Ok(());
+                                }
+                                let _ = std::fs::remove_file(&ogg_path);
+                            }
+                            Err(e) => {
+                                warn!("WhatsApp TTS synthesis failed, sending text only: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let payload = json!({
             "type": "send",

@@ -24,11 +24,12 @@ use crate::agent::subagent::SubagentManager;
 use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
-    CronScheduleTool, ExecTool, ListDirTool, MessageTool, ReadFileTool, SendCallback,
-    SpawnCallback, SpawnTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
-    EditFileTool,
+    CheckInboxTool, CronScheduleTool, ExecTool, ListDirTool, MessageTool, ReadFileTool,
+    SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteFileTool, EditFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::config::schema::EmailConfig;
 use crate::cron::service::CronService;
 use crate::providers::base::LLMProvider;
 use crate::session::manager::SessionManager;
@@ -62,6 +63,8 @@ struct AgentLoopShared {
     exec_timeout: u64,
     restrict_to_workspace: bool,
     cron_service: Option<Arc<CronService>>,
+    email_config: Option<EmailConfig>,
+    repl_display_tx: Option<UnboundedSender<String>>,
 }
 
 impl AgentLoopShared {
@@ -136,6 +139,12 @@ impl AgentLoopShared {
             tools.register(Box::new(CronToolProxy(ct)));
         }
 
+        // Email tools (optional) - available when email is configured.
+        if let Some(ref email_cfg) = self.email_config {
+            tools.register(Box::new(CheckInboxTool::new(email_cfg.clone())));
+            tools.register(Box::new(SendEmailTool::new(email_cfg.clone())));
+        }
+
         tools
     }
 
@@ -177,6 +186,9 @@ impl AgentLoopShared {
             .unwrap_or_default();
 
         // Build messages.
+        let is_voice_message = msg.metadata.get("voice_message")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut messages = self.context.build_messages(
             &history,
             &msg.content,
@@ -188,6 +200,7 @@ impl AgentLoopShared {
             },
             Some(&msg.channel),
             Some(&msg.chat_id),
+            is_voice_message,
         );
 
         // Track which tools have been used for smart tool selection.
@@ -327,11 +340,16 @@ impl AgentLoopShared {
         if final_content.is_empty() {
             None
         } else {
-            Some(OutboundMessage::new(
+            let mut outbound = OutboundMessage::new(
                 &msg.channel,
                 &msg.chat_id,
                 &final_content,
-            ))
+            );
+            // Propagate voice_message metadata so channels know to reply with voice.
+            if msg.metadata.get("voice_message").and_then(|v| v.as_bool()).unwrap_or(false) {
+                outbound.metadata.insert("voice_message".to_string(), json!(true));
+            }
+            Some(outbound)
         }
     }
 }
@@ -374,6 +392,8 @@ impl AgentLoop {
         restrict_to_workspace: bool,
         cron_service: Option<Arc<CronService>>,
         max_concurrent_chats: usize,
+        email_config: Option<EmailConfig>,
+        repl_display_tx: Option<UnboundedSender<String>>,
     ) -> Self {
         let mut context = ContextBuilder::new(&workspace);
         context.model_name = model.clone();
@@ -413,6 +433,8 @@ impl AgentLoop {
             exec_timeout,
             restrict_to_workspace,
             cron_service,
+            email_config,
+            repl_display_tx,
         });
 
         Self {
@@ -494,14 +516,40 @@ impl AgentLoop {
 
             let shared = self.shared.clone();
             let outbound_tx = self.shared.bus_outbound_tx.clone();
+            let display_tx = self.shared.repl_display_tx.clone();
 
             tokio::spawn(async move {
                 // Serialize within the same session.
                 let _session_guard = session_lock.lock().await;
 
+                // Notify REPL about inbound channel message.
+                if let Some(ref dtx) = display_tx {
+                    let preview = if msg.content.len() > 120 {
+                        format!("{}...", &msg.content[..120])
+                    } else {
+                        msg.content.clone()
+                    };
+                    let _ = dtx.send(format!(
+                        "\x1b[2m[{}]\x1b[0m \x1b[36m{}\x1b[0m: {}",
+                        msg.channel, msg.sender_id, preview
+                    ));
+                }
+
                 let response = shared.process_message(&msg).await;
 
                 if let Some(outbound) = response {
+                    // Notify REPL about outbound response.
+                    if let Some(ref dtx) = display_tx {
+                        let preview = if outbound.content.len() > 120 {
+                            format!("{}...", &outbound.content[..120])
+                        } else {
+                            outbound.content.clone()
+                        };
+                        let _ = dtx.send(format!(
+                            "\x1b[2m[{}]\x1b[0m \x1b[33mbot\x1b[0m: {}",
+                            outbound.channel, preview
+                        ));
+                    }
                     if let Err(e) = outbound_tx.send(outbound) {
                         error!("Failed to publish outbound message: {}", e);
                     }

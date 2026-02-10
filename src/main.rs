@@ -14,16 +14,19 @@ mod session;
 mod utils;
 #[cfg(feature = "voice")]
 mod voice;
+#[cfg(feature = "voice")]
+mod voice_pipeline;
 
 use std::io::{self, BufRead, Write as _};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::loader::{get_config_path, get_data_dir, load_config, save_config};
@@ -149,6 +152,21 @@ enum Commands {
         #[arg(short, long)]
         token: Option<String>,
     },
+    /// Quick-start Email channel.
+    Email {
+        /// IMAP host (prompted interactively if not provided).
+        #[arg(long)]
+        imap_host: Option<String>,
+        /// SMTP host (prompted interactively if not provided).
+        #[arg(long)]
+        smtp_host: Option<String>,
+        /// Email account username/address.
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Email account password or app password.
+        #[arg(short, long)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -232,6 +250,9 @@ fn main() {
         },
         Commands::WhatsApp => cmd_whatsapp(),
         Commands::Telegram { token } => cmd_telegram(token),
+        Commands::Email { imap_host, smtp_host, username, password } => {
+            cmd_email(imap_host, smtp_host, username, password)
+        }
     }
 }
 
@@ -361,7 +382,21 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
             // Markdown skin for rendering LLM responses
             let skin = make_skin();
 
+            // Background channel state
+            struct ActiveChannel {
+                name: String,
+                stop: Arc<AtomicBool>,
+                handle: tokio::task::JoinHandle<()>,
+            }
+            let mut active_channels: Vec<ActiveChannel> = vec![];
+            // Channel for background gateways to send display lines to the REPL.
+            let (display_tx, mut display_rx) = mpsc::unbounded_channel::<String>();
+
             loop {
+                // Drain any pending display messages from background channels.
+                while let Ok(line) = display_rx.try_recv() {
+                    println!("\r{}", line);
+                }
                 let is_local = LOCAL_MODE.load(Ordering::SeqCst);
                 #[cfg(feature = "voice")]
                 let voice_on = voice_session.is_some();
@@ -635,21 +670,38 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
 
                 // Handle WhatsApp quick-start from REPL
                 if input == "/whatsapp" || input == "/wa" {
-                    println!("\n  Switching to WhatsApp gateway mode...\n");
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if active_channels.iter().any(|ch| ch.name == "whatsapp") {
+                        println!("\n  WhatsApp is already running. Use /stop to stop channels.\n");
+                        continue;
+                    }
                     let mut gw_config = load_config(None);
                     check_api_key(&gw_config);
                     gw_config.channels.whatsapp.enabled = true;
                     gw_config.channels.telegram.enabled = false;
                     gw_config.channels.feishu.enabled = false;
-                    println!("  Scan the QR code when it appears");
-                    println!("  Press Ctrl+C to stop\n");
-                    run_gateway_async(&gw_config).await;
-                    println!("\n  {}Back to chat mode.{}\n", tui::DIM, tui::RESET);
+                    gw_config.channels.email.enabled = false;
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stop2 = stop.clone();
+                    let dtx = display_tx.clone();
+                    println!("\n  Scan the QR code when it appears");
+                    let handle = tokio::spawn(async move {
+                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                    });
+                    active_channels.push(ActiveChannel {
+                        name: "whatsapp".to_string(), stop, handle,
+                    });
+                    println!("  WhatsApp running in background. Continue chatting.\n");
                     continue;
                 }
 
                 // Handle Telegram quick-start from REPL
                 if input == "/telegram" || input == "/tg" {
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if active_channels.iter().any(|ch| ch.name == "telegram") {
+                        println!("\n  Telegram is already running. Use /stop to stop channels.\n");
+                        continue;
+                    }
                     println!();
                     let mut gw_config = load_config(None);
                     check_api_key(&gw_config);
@@ -689,26 +741,117 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         }
                         t
                     };
-                    println!("  Switching to Telegram gateway mode...");
                     gw_config.channels.telegram.token = token;
                     gw_config.channels.telegram.enabled = true;
                     gw_config.channels.whatsapp.enabled = false;
                     gw_config.channels.feishu.enabled = false;
-                    println!("  Press Ctrl+C to stop\n");
-                    run_gateway_async(&gw_config).await;
-                    println!("\n  {}Back to chat mode.{}\n", tui::DIM, tui::RESET);
+                    gw_config.channels.email.enabled = false;
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stop2 = stop.clone();
+                    let dtx = display_tx.clone();
+                    let handle = tokio::spawn(async move {
+                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                    });
+                    active_channels.push(ActiveChannel {
+                        name: "telegram".to_string(), stop, handle,
+                    });
+                    println!("  Telegram running in background. Continue chatting.\n");
+                    continue;
+                }
+
+                // Handle Email quick-start from REPL
+                if input == "/email" {
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if active_channels.iter().any(|ch| ch.name == "email") {
+                        println!("\n  Email is already running. Use /stop to stop channels.\n");
+                        continue;
+                    }
+                    println!();
+                    let mut gw_config = load_config(None);
+                    check_api_key(&gw_config);
+                    let email_cfg = &gw_config.channels.email;
+                    if email_cfg.imap_host.is_empty() || email_cfg.username.is_empty() || email_cfg.password.is_empty() {
+                        println!("  Email not configured. Run `nanoclaw email` first or add settings to config.json.\n");
+                        continue;
+                    }
+                    println!("  Starting Email channel...");
+                    println!("  Polling {}", email_cfg.imap_host);
+                    gw_config.channels.email.enabled = true;
+                    gw_config.channels.whatsapp.enabled = false;
+                    gw_config.channels.telegram.enabled = false;
+                    gw_config.channels.feishu.enabled = false;
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stop2 = stop.clone();
+                    let dtx = display_tx.clone();
+                    let handle = tokio::spawn(async move {
+                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                    });
+                    active_channels.push(ActiveChannel {
+                        name: "email".to_string(), stop, handle,
+                    });
+                    println!("  Email running in background. Continue chatting.\n");
+                    continue;
+                }
+
+                // Handle stop command — stop all background channels
+                if input == "/stop" {
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if active_channels.is_empty() {
+                        println!("\n  No channels running.\n");
+                    } else {
+                        let names: Vec<String> = active_channels.iter().map(|c| c.name.clone()).collect();
+                        println!("\n  Stopping: {}", names.join(", "));
+                        for ch in &active_channels {
+                            ch.stop.store(true, Ordering::Relaxed);
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        for ch in &active_channels {
+                            ch.handle.abort();
+                        }
+                        active_channels.clear();
+                        println!("  All channels stopped.\n");
+                    }
                     continue;
                 }
 
                 // Handle help command
+                if input == "/paste" || input == "/p" {
+                    println!("  {}Paste mode: type or paste text, then enter --- on its own line to send{}", tui::DIM, tui::RESET);
+                    let mut lines: Vec<String> = Vec::new();
+                    let stdin = io::stdin();
+                    for line in stdin.lock().lines() {
+                        match line {
+                            Ok(l) if l.trim() == "---" => break,
+                            Ok(l) => lines.push(l),
+                            Err(_) => break,
+                        }
+                    }
+                    let pasted = lines.join("\n").trim().to_string();
+                    if pasted.is_empty() {
+                        continue;
+                    }
+                    let _ = rl.add_history_entry(&pasted);
+                    let channel = if voice_on { "voice" } else { "cli" };
+                    let response = agent_loop
+                        .process_direct(&pasted, &session_id, channel, "direct")
+                        .await;
+                    println!();
+                    skin.print_text(&response);
+                    println!();
+                    continue;
+                }
+
                 if input == "/help" || input == "/h" || input == "/?" {
                     println!("\nCommands:");
                     println!("  /local, /l      - Toggle between local and cloud mode");
                     println!("  /model, /m      - Select local model from ~/models/");
                     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
-                    println!("  /whatsapp, /wa  - Switch to WhatsApp gateway mode");
-                    println!("  /telegram, /tg  - Switch to Telegram gateway mode");
-                    println!("  /status         - Show current mode and model info");
+                    println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
+                    println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
+                    println!("  /email          - Start Email channel (runs alongside chat)");
+                    println!("  /paste, /p      - Paste mode: multiline input until --- on its own line");
+                    println!("  /stop           - Stop all running channels");
+                    println!("  /status         - Show current mode, model, and channel info");
                     println!("  /help, /h       - Show this help");
                     println!("  Ctrl+C          - Exit\n");
                     continue;
@@ -717,6 +860,11 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 // Handle status command
                 if input == "/status" || input == "/s" {
                     print_mode_banner(&local_port);
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if !active_channels.is_empty() {
+                        let names: Vec<&str> = active_channels.iter().map(|c| c.name.as_str()).collect();
+                        println!("  {}Channels running:{} {}\n", tui::DIM, tui::RESET, names.join(", "));
+                    }
                     continue;
                 }
 
@@ -738,6 +886,17 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     }
                 }
             }
+            // Stop any active background channels
+            for ch in &active_channels {
+                ch.stop.store(true, Ordering::Relaxed);
+            }
+            if !active_channels.is_empty() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                for ch in &active_channels {
+                    ch.handle.abort();
+                }
+            }
+
             // Cleanup: kill llama.cpp server if still running
             // Save readline history
             let _ = rl.save_history(&history_path);
@@ -786,6 +945,16 @@ async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: 
     let cron_store_path = get_data_dir().join("cron").join("jobs.json");
     let cron_service = Arc::new(CronService::new(cron_store_path));
 
+    // Provide email config to the REPL agent when credentials are configured.
+    let email_config = {
+        let ec = &config.channels.email;
+        if !ec.imap_host.is_empty() && !ec.username.is_empty() && !ec.password.is_empty() {
+            Some(ec.clone())
+        } else {
+            None
+        }
+    };
+
     let agent_loop = AgentLoop::new(
         inbound_rx,
         outbound_tx,
@@ -802,6 +971,8 @@ async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: 
         config.tools.exec_.restrict_to_workspace,
         Some(cron_service),
         config.agents.defaults.max_concurrent_chats,
+        email_config,
+        None, // REPL display not used for CLI direct mode
     );
 
     (agent_loop, config.clone())
@@ -874,17 +1045,24 @@ fn cmd_gateway(port: u16, verbose: bool) {
     check_api_key(&config);
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(&config));
+    runtime.block_on(run_gateway_async(config, None, None));
 }
 
-/// Shared async gateway: creates channels, provider, cron, agent loop, and runs until Ctrl+C.
-async fn run_gateway_async(config: &Config) {
+/// Shared async gateway: creates channels, provider, cron, agent loop, and runs until stopped.
+///
+/// If `stop_signal` is `Some`, watches the flag for shutdown (used when spawned from REPL).
+/// If `None`, watches for Ctrl+C (used for standalone CLI commands).
+async fn run_gateway_async(
+    config: Config,
+    stop_signal: Option<Arc<AtomicBool>>,
+    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+) {
     let model = config.agents.defaults.model.clone();
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
-    let provider = create_provider(config);
+    let provider = create_provider(&config);
     let brave_key = if config.tools.web.search.api_key.is_empty() {
         None
     } else {
@@ -913,25 +1091,52 @@ async fn run_gateway_async(config: &Config) {
         config.tools.exec_.restrict_to_workspace,
         Some(cron_arc),
         config.agents.defaults.max_concurrent_chats,
+        None, // gateway agent uses bus for email, not tools
+        repl_display_tx,
     );
 
-    let channel_manager = ChannelManager::new(config, inbound_tx, outbound_rx);
+    // Initialize voice pipeline for channels (when voice feature is enabled).
+    #[cfg(feature = "voice")]
+    let voice_pipeline: Option<Arc<voice_pipeline::VoicePipeline>> = {
+        match voice_pipeline::VoicePipeline::new().await {
+            Ok(vp) => {
+                info!("Voice pipeline initialized for channels");
+                Some(Arc::new(vp))
+            }
+            Err(e) => {
+                warn!("Voice pipeline init failed (voice messages will not be transcribed): {}", e);
+                None
+            }
+        }
+    };
+
+    let channel_manager = ChannelManager::new(
+        &config,
+        inbound_tx,
+        outbound_rx,
+        #[cfg(feature = "voice")]
+        voice_pipeline,
+    );
+
+    let quiet = stop_signal.is_some();
 
     let enabled = channel_manager.enabled_channels();
-    if !enabled.is_empty() {
-        println!("  Channels enabled: {}", enabled.join(", "));
-    } else {
-        println!("  Warning: No channels enabled");
-    }
-
-    {
-        let job_count = cron_status.get("jobs").and_then(|v| v.as_i64()).unwrap_or(0);
-        if job_count > 0 {
-            println!("  Cron: {} scheduled jobs", job_count);
+    if !quiet {
+        if !enabled.is_empty() {
+            println!("  Channels enabled: {}", enabled.join(", "));
+        } else {
+            println!("  Warning: No channels enabled");
         }
-    }
 
-    println!("  Heartbeat: every 30m");
+        {
+            let job_count = cron_status.get("jobs").and_then(|v| v.as_i64()).unwrap_or(0);
+            if job_count > 0 {
+                println!("  Cron: {} scheduled jobs", job_count);
+            }
+        }
+
+        println!("  Heartbeat: every 30m");
+    }
 
     // start_all() spawns channels as background tasks and returns immediately,
     // so call it before the select rather than racing it.
@@ -941,8 +1146,19 @@ async fn run_gateway_async(config: &Config) {
         _ = agent_loop.run() => {
             info!("Agent loop ended");
         }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
+        _ = async {
+            match &stop_signal {
+                Some(flag) => {
+                    while !flag.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+                None => { tokio::signal::ctrl_c().await.ok(); }
+            }
+        } => {
+            if stop_signal.is_none() {
+                println!("\nShutting down...");
+            }
         }
     }
 
@@ -963,12 +1179,13 @@ fn cmd_whatsapp() {
     config.channels.whatsapp.enabled = true;
     config.channels.telegram.enabled = false;
     config.channels.feishu.enabled = false;
+    config.channels.email.enabled = false;
 
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(&config));
+    runtime.block_on(run_gateway_async(config, None, None));
 }
 
 fn cmd_telegram(token_arg: Option<String>) {
@@ -1026,11 +1243,132 @@ fn cmd_telegram(token_arg: Option<String>) {
     config.channels.telegram.enabled = true;
     config.channels.whatsapp.enabled = false;
     config.channels.feishu.enabled = false;
+    config.channels.email.enabled = false;
 
     println!("  Press Ctrl+C to stop\n");
 
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(&config));
+    runtime.block_on(run_gateway_async(config, None, None));
+}
+
+fn cmd_email(
+    imap_host_arg: Option<String>,
+    smtp_host_arg: Option<String>,
+    username_arg: Option<String>,
+    password_arg: Option<String>,
+) {
+    println!("{} Starting Email...\n", LOGO);
+
+    let mut config = load_config(None);
+    check_api_key(&config);
+
+    let email_cfg = &config.channels.email;
+
+    // Resolve each field: CLI arg > saved config > interactive prompt.
+    let imap_host = imap_host_arg
+        .or_else(|| {
+            if !email_cfg.imap_host.is_empty() {
+                println!("  Using saved IMAP host: {}", email_cfg.imap_host);
+                Some(email_cfg.imap_host.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            print!("  IMAP host (e.g. imap.gmail.com): ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            input.trim().to_string()
+        });
+
+    let smtp_host = smtp_host_arg
+        .or_else(|| {
+            if !email_cfg.smtp_host.is_empty() {
+                println!("  Using saved SMTP host: {}", email_cfg.smtp_host);
+                Some(email_cfg.smtp_host.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            print!("  SMTP host (e.g. smtp.gmail.com): ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            input.trim().to_string()
+        });
+
+    let username = username_arg
+        .or_else(|| {
+            if !email_cfg.username.is_empty() {
+                println!("  Using saved username: {}", email_cfg.username);
+                Some(email_cfg.username.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            print!("  Email address: ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            input.trim().to_string()
+        });
+
+    let password = password_arg
+        .or_else(|| {
+            if !email_cfg.password.is_empty() {
+                println!("  Using saved password");
+                Some(email_cfg.password.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            print!("  Password (or app password): ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok();
+            input.trim().to_string()
+        });
+
+    if imap_host.is_empty() || smtp_host.is_empty() || username.is_empty() || password.is_empty() {
+        eprintln!("Error: All email fields are required.");
+        std::process::exit(1);
+    }
+
+    // Ask to save.
+    let needs_save = email_cfg.imap_host.is_empty();
+    if needs_save {
+        print!("  Save email settings to config for next time? [Y/n] ");
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok();
+        if !answer.trim().eq_ignore_ascii_case("n") {
+            let mut save_cfg = load_config(None);
+            save_cfg.channels.email.imap_host = imap_host.clone();
+            save_cfg.channels.email.smtp_host = smtp_host.clone();
+            save_cfg.channels.email.username = username.clone();
+            save_cfg.channels.email.password = password.clone();
+            save_config(&save_cfg, None);
+            println!("  Settings saved to ~/.nanoclaw/config.json\n");
+        }
+    }
+
+    config.channels.email.imap_host = imap_host;
+    config.channels.email.smtp_host = smtp_host;
+    config.channels.email.username = username;
+    config.channels.email.password = password;
+    config.channels.email.enabled = true;
+    config.channels.whatsapp.enabled = false;
+    config.channels.telegram.enabled = false;
+    config.channels.feishu.enabled = false;
+
+    println!("  Press Ctrl+C to stop\n");
+
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    runtime.block_on(run_gateway_async(config, None, None));
 }
 
 /// Validate a Telegram bot token by calling the getMe API.
@@ -1138,6 +1476,16 @@ fn cmd_channels_status() {
     println!(
         "  Feishu: {}",
         if config.channels.feishu.enabled { "enabled" } else { "disabled" }
+    );
+    let email_info = if config.channels.email.imap_host.is_empty() {
+        "not configured".to_string()
+    } else {
+        format!("imap: {}, smtp: {}", config.channels.email.imap_host, config.channels.email.smtp_host)
+    };
+    println!(
+        "  Email: {} ({})",
+        if config.channels.email.enabled { "enabled" } else { "disabled" },
+        email_info
     );
 }
 
@@ -1404,7 +1752,7 @@ async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut
 /// Strip markdown formatting, code blocks, emojis, and special characters
 /// so that TTS receives only clean natural language text.
 #[cfg(feature = "voice")]
-fn strip_markdown_for_tts(text: &str) -> String {
+pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
     let mut out = String::new();
     let mut in_code_block = false;
 

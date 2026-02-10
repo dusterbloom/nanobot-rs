@@ -8,6 +8,7 @@ pub mod web;
 pub mod message;
 pub mod spawn;
 pub mod cron_tool;
+pub mod email;
 
 pub use base::Tool;
 pub use registry::ToolRegistry;
@@ -17,3 +18,4 @@ pub use web::{WebSearchTool, WebFetchTool};
 pub use message::{MessageTool, SendCallback};
 pub use spawn::{SpawnTool, SpawnCallback};
 pub use cron_tool::CronScheduleTool;
+pub use email::{CheckInboxTool, SendEmailTool};

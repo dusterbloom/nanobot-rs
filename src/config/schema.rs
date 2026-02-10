@@ -106,6 +106,58 @@ impl Default for FeishuConfig {
     }
 }
 
+/// Email channel configuration (IMAP polling + SMTP sending).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub imap_host: String,
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    #[serde(default)]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+fn default_imap_port() -> u16 {
+    993
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_poll_interval() -> u64 {
+    30
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            imap_host: String::new(),
+            imap_port: default_imap_port(),
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            username: String::new(),
+            password: String::new(),
+            poll_interval_secs: default_poll_interval(),
+            allow_from: Vec::new(),
+        }
+    }
+}
+
 /// Configuration for chat channels.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +168,8 @@ pub struct ChannelsConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub feishu: FeishuConfig,
+    #[serde(default)]
+    pub email: EmailConfig,
 }
 
 // ---------------------------------------------------------------------------

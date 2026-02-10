@@ -13,10 +13,14 @@ use tracing::{error, info, warn};
 
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
+use crate::channels::email::EmailChannel;
 use crate::channels::feishu::FeishuChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::whatsapp::WhatsAppChannel;
 use crate::config::schema::Config;
+
+#[cfg(feature = "voice")]
+use crate::voice_pipeline::VoicePipeline;
 
 /// Manages chat channels and coordinates message routing.
 pub struct ChannelManager {
@@ -30,6 +34,7 @@ impl ChannelManager {
         config: &Config,
         bus_inbound_tx: UnboundedSender<InboundMessage>,
         bus_outbound_rx: UnboundedReceiver<OutboundMessage>,
+        #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
     ) -> Self {
         let mut channels: HashMap<String, Arc<TokioMutex<Box<dyn Channel>>>> = HashMap::new();
 
@@ -40,6 +45,8 @@ impl ChannelManager {
                 config.channels.telegram.clone(),
                 bus_inbound_tx.clone(),
                 groq_key,
+                #[cfg(feature = "voice")]
+                voice_pipeline.clone(),
             );
             channels.insert(
                 "telegram".to_string(),
@@ -53,6 +60,8 @@ impl ChannelManager {
             let ch = WhatsAppChannel::new(
                 config.channels.whatsapp.clone(),
                 bus_inbound_tx.clone(),
+                #[cfg(feature = "voice")]
+                voice_pipeline.clone(),
             );
             channels.insert(
                 "whatsapp".to_string(),
@@ -72,6 +81,19 @@ impl ChannelManager {
                 Arc::new(TokioMutex::new(Box::new(ch))),
             );
             info!("Feishu channel enabled");
+        }
+
+        // Email.
+        if config.channels.email.enabled {
+            let ch = EmailChannel::new(
+                config.channels.email.clone(),
+                bus_inbound_tx.clone(),
+            );
+            channels.insert(
+                "email".to_string(),
+                Arc::new(TokioMutex::new(Box::new(ch))),
+            );
+            info!("Email channel enabled");
         }
 
         Self {

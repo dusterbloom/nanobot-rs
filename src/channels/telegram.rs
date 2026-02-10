@@ -2,6 +2,7 @@
 //!
 //! Uses long polling (`getUpdates`) so no public IP or webhook is needed.
 
+use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -16,6 +17,9 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::TelegramConfig;
 
+#[cfg(feature = "voice")]
+use crate::voice_pipeline::VoicePipeline;
+
 /// Telegram channel using long-polling.
 pub struct TelegramChannel {
     config: TelegramConfig,
@@ -23,6 +27,8 @@ pub struct TelegramChannel {
     groq_api_key: String,
     running: Arc<AtomicBool>,
     client: reqwest::Client,
+    #[cfg(feature = "voice")]
+    voice_pipeline: Option<Arc<VoicePipeline>>,
 }
 
 impl TelegramChannel {
@@ -31,6 +37,7 @@ impl TelegramChannel {
         config: TelegramConfig,
         bus_tx: UnboundedSender<InboundMessage>,
         groq_api_key: String,
+        #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
     ) -> Self {
         Self {
             config,
@@ -38,6 +45,8 @@ impl TelegramChannel {
             groq_api_key,
             running: Arc::new(AtomicBool::new(false)),
             client: reqwest::Client::new(),
+            #[cfg(feature = "voice")]
+            voice_pipeline,
         }
     }
 
@@ -49,6 +58,7 @@ impl TelegramChannel {
         allow_from: &[String],
         update: &Value,
         _groq_api_key: &str,
+        #[cfg(feature = "voice")] voice_pipeline: &Option<Arc<VoicePipeline>>,
     ) {
         let message = match update.get("message") {
             Some(m) => m,
@@ -121,12 +131,38 @@ impl TelegramChannel {
         }
 
         // Handle voice.
+        #[allow(unused_mut)]
+        let mut is_voice_message = false;
+        #[allow(unused_mut)]
+        let mut voice_file_path: Option<String> = None;
         if let Some(voice) = message.get("voice") {
             if let Some(file_id) = voice.get("file_id").and_then(|v| v.as_str()) {
                 let media_path =
                     Self::_download_file(client, token, file_id, "voice", ".ogg").await;
                 if let Some(path) = media_path {
-                    content_parts.push(format!("[voice: {}]", path));
+                    #[cfg(feature = "voice")]
+                    {
+                        if let Some(ref pipeline) = voice_pipeline {
+                            match pipeline.transcribe_file(&path).await {
+                                Ok(text) => {
+                                    info!("Transcribed Telegram voice: \"{}\"", &text[..text.len().min(60)]);
+                                    content_parts.push(text);
+                                    is_voice_message = true;
+                                    voice_file_path = Some(path);
+                                }
+                                Err(e) => {
+                                    warn!("Voice transcription failed: {}", e);
+                                    content_parts.push(format!("[voice: {}]", path));
+                                }
+                            }
+                        } else {
+                            content_parts.push(format!("[voice: {}]", path));
+                        }
+                    }
+                    #[cfg(not(feature = "voice"))]
+                    {
+                        content_parts.push(format!("[voice: {}]", path));
+                    }
                 } else {
                     content_parts.push("[voice: download failed]".to_string());
                 }
@@ -190,6 +226,15 @@ impl TelegramChannel {
             .insert("username".to_string(), json!(username));
         msg.metadata
             .insert("is_group".to_string(), json!(is_group));
+
+        if is_voice_message {
+            msg.metadata
+                .insert("voice_message".to_string(), json!(true));
+            if let Some(ref vf) = voice_file_path {
+                msg.metadata
+                    .insert("voice_file".to_string(), json!(vf));
+            }
+        }
 
         let _ = bus_tx.send(msg);
     }
@@ -268,20 +313,30 @@ impl Channel for TelegramChannel {
         let client = self.client.clone();
         let allow_from = self.config.allow_from.clone();
         let groq_api_key = self.groq_api_key.clone();
+        #[cfg(feature = "voice")]
+        let voice_pipeline = self.voice_pipeline.clone();
 
         info!("Starting Telegram bot (long-polling mode)...");
 
         // Spawn the long-polling loop.
         tokio::spawn(async move {
             let mut offset: i64 = 0;
+            let base_url = format!("https://api.telegram.org/bot{}/getUpdates", token);
 
             while running.load(Ordering::SeqCst) {
-                let url = format!(
-                    "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\"]",
-                    token, offset
-                );
+                let body = json!({
+                    "offset": offset,
+                    "timeout": 30,
+                    "allowed_updates": ["message"],
+                });
 
-                match client.get(&url).timeout(std::time::Duration::from_secs(35)).send().await {
+                match client
+                    .post(&base_url)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(35))
+                    .send()
+                    .await
+                {
                     Ok(resp) => {
                         if let Ok(data) = resp.json::<Value>().await {
                             if let Some(updates) = data.get("result").and_then(|v| v.as_array()) {
@@ -296,6 +351,8 @@ impl Channel for TelegramChannel {
                                         &allow_from,
                                         update,
                                         &groq_api_key,
+                                        #[cfg(feature = "voice")]
+                                        &voice_pipeline,
                                     )
                                     .await;
                                 }
@@ -303,7 +360,14 @@ impl Channel for TelegramChannel {
                         }
                     }
                     Err(e) => {
-                        warn!("Telegram polling error: {}", e);
+                        // Log full error chain for debugging.
+                        let mut cause = String::new();
+                        let mut src: Option<&dyn StdError> = StdError::source(&e);
+                        while let Some(s) = src {
+                            cause.push_str(&format!(" -> {}", s));
+                            src = s.source();
+                        }
+                        warn!("Telegram polling error: {}{}", e, cause);
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
                 }
@@ -328,6 +392,48 @@ impl Channel for TelegramChannel {
             .chat_id
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid chat_id: {}", msg.chat_id))?;
+
+        // If this is a reply to a voice message, try to send a voice note.
+        #[cfg(feature = "voice")]
+        {
+            let is_voice = msg
+                .metadata
+                .get("voice_message")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_voice {
+                if let Some(ref pipeline) = self.voice_pipeline {
+                    let tts_text = crate::strip_markdown_for_tts(&msg.content);
+                    if !tts_text.is_empty() {
+                        match pipeline.synthesize_to_file(&tts_text).await {
+                            Ok(ogg_path) => {
+                                let caption = if msg.content.len() > 1024 {
+                                    &msg.content[..1024]
+                                } else {
+                                    &msg.content
+                                };
+                                match self._send_voice(chat_id, &ogg_path, caption).await {
+                                    Ok(()) => {
+                                        // Clean up temp file
+                                        let _ = std::fs::remove_file(&ogg_path);
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to send voice, falling back to text: {}", e);
+                                        let _ = std::fs::remove_file(&ogg_path);
+                                        // Fall through to text send
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("TTS synthesis failed, sending text only: {}", e);
+                                // Fall through to text send
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let html_content = markdown_to_telegram_html(&msg.content);
         let url = format!(
@@ -368,6 +474,38 @@ impl Channel for TelegramChannel {
 
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "voice")]
+impl TelegramChannel {
+    /// Send a voice note via Telegram sendVoice API.
+    async fn _send_voice(&self, chat_id: i64, ogg_path: &str, caption: &str) -> Result<()> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/sendVoice",
+            self.config.token
+        );
+
+        let file_bytes = std::fs::read(ogg_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read voice file: {}", e))?;
+
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name("voice.ogg")
+            .mime_str("audio/ogg")?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("voice", part)
+            .text("caption", caption.to_string());
+
+        let resp = self.client.post(&url).multipart(form).send().await?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!("sendVoice failed: {}", body))
+        }
     }
 }
 

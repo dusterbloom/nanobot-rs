@@ -11,7 +11,7 @@ use jack_voice::{
     models::{self, ModelProgressCallback},
 };
 
-fn split_tts_sentences(text: &str) -> Vec<String> {
+pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut start = 0;
     let bytes = text.as_bytes();
@@ -36,7 +36,7 @@ fn split_tts_sentences(text: &str) -> Vec<String> {
 
 /// Apply fade-in and fade-out envelopes to eliminate clicks at sentence boundaries.
 /// `fade_samples` is the number of samples to ramp over (~5ms at 44.1kHz = 220 samples).
-fn apply_fade_envelope(samples: &mut [f32], fade_samples: usize) {
+pub(crate) fn apply_fade_envelope(samples: &mut [f32], fade_samples: usize) {
     let len = samples.len();
     let fade = fade_samples.min(len / 2);
     // Fade in
