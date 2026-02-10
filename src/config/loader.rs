@@ -8,13 +8,13 @@ use tracing::warn;
 use crate::config::schema::Config;
 use crate::utils::helpers::get_data_path;
 
-/// Get the default configuration file path (`~/.nanoclaw/config.json`).
+/// Get the default configuration file path (`~/.nanobot/config.json`).
 pub fn get_config_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".nanoclaw").join("config.json")
+    home.join(".nanobot").join("config.json")
 }
 
-/// Get the nanoclaw data directory (delegates to `utils::helpers::get_data_path`).
+/// Get the nanobot data directory (delegates to `utils::helpers::get_data_path`).
 pub fn get_data_dir() -> PathBuf {
     get_data_path()
 }
@@ -22,7 +22,7 @@ pub fn get_data_dir() -> PathBuf {
 /// Load configuration from a file, or return a default [`Config`] if the file
 /// does not exist or cannot be parsed.
 ///
-/// If `config_path` is `None`, the default path (`~/.nanoclaw/config.json`) is
+/// If `config_path` is `None`, the default path (`~/.nanobot/config.json`) is
 /// used.
 pub fn load_config(config_path: Option<&Path>) -> Config {
     let path = match config_path {
@@ -57,7 +57,7 @@ pub fn load_config(config_path: Option<&Path>) -> Config {
 
 /// Save configuration to a JSON file.
 ///
-/// If `config_path` is `None`, the default path (`~/.nanoclaw/config.json`) is
+/// If `config_path` is `None`, the default path (`~/.nanobot/config.json`) is
 /// used. Parent directories are created if they don't exist.
 pub fn save_config(config: &Config, config_path: Option<&Path>) {
     let path = match config_path {
@@ -88,14 +88,14 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_returns_default() {
-        let path = Path::new("/tmp/nanoclaw_test_does_not_exist_987654.json");
+        let path = Path::new("/tmp/nanobot_test_does_not_exist_987654.json");
         let cfg = load_config(Some(path));
         assert_eq!(cfg.gateway.port, 18790);
     }
 
     #[test]
     fn test_load_and_save_roundtrip() {
-        let dir = std::env::temp_dir().join("nanoclaw_test_loader");
+        let dir = std::env::temp_dir().join("nanobot_test_loader");
         let _ = fs::create_dir_all(&dir);
         let tmp_path = dir.join("config_roundtrip.json");
 

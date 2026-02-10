@@ -79,7 +79,7 @@ impl CronScheduleTool {
         // For simplicity, we'll just report the operation.
         // TODO: In production, wrap CronService in Mutex in the AgentLoop.
         format!(
-            "Scheduled: '{}' (schedule: {}). Note: use CLI `nanoclaw cron add` for persistent scheduling.",
+            "Scheduled: '{}' (schedule: {}). Note: use CLI `nanobot cron add` for persistent scheduling.",
             name,
             if every_seconds.is_some() {
                 format!("every {}s", every_seconds.unwrap())
@@ -110,7 +110,7 @@ impl CronScheduleTool {
         };
         // remove_job requires &mut self, but we only have Arc<CronService>.
         // Report that CLI should be used for removal.
-        format!("To remove job {}, use CLI: `nanoclaw cron remove {}`", job_id, job_id)
+        format!("To remove job {}, use CLI: `nanobot cron remove {}`", job_id, job_id)
     }
 }
 

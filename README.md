@@ -23,12 +23,12 @@ No containers. No Python. No dependencies beyond what `cargo build` pulls in.
 cargo build --release
 
 # Initialize config and workspace
-nanoclaw onboard
+nanobot onboard
 
-# Add your API key to ~/.nanoclaw/config.json
+# Add your API key to ~/.nanobot/config.json
 
 # Start chatting
-nanoclaw agent
+nanobot agent
 ```
 
 ## Features
@@ -128,7 +128,7 @@ With the `voice` feature enabled, voice messages sent via Telegram or WhatsApp a
 
 ### Context compaction
 
-Long conversations don't lose context. When history exceeds the token budget, nanoclaw summarizes older messages via a cheap LLM call instead of silently dropping them. The summary preserves key facts, decisions, and pending actions. Falls back to hard truncation if summarization fails.
+Long conversations don't lose context. When history exceeds the token budget, nanobot summarizes older messages via a cheap LLM call instead of silently dropping them. The summary preserves key facts, decisions, and pending actions. Falls back to hard truncation if summarization fails.
 
 ### Concurrent message processing
 
@@ -138,7 +138,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 
 - **Memory**: Daily notes + long-term MEMORY.md, loaded into every prompt
 - **Skills**: Markdown files with YAML frontmatter at `{workspace}/skills/{name}/SKILL.md`. Skills marked `always: true` are always loaded; others appear as summaries the agent can read on demand
-- **Sessions**: JSONL persistence at `~/.nanoclaw/sessions/`
+- **Sessions**: JSONL persistence at `~/.nanobot/sessions/`
 
 ## Interactive commands
 
@@ -160,14 +160,14 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 
 | Command | Description |
 |---------|-------------|
-| `nanoclaw onboard` | Initialize config and workspace |
-| `nanoclaw agent` | Interactive chat |
-| `nanoclaw agent -m "..."` | Single message |
-| `nanoclaw gateway` | Start with channel adapters |
-| `nanoclaw status` | Configuration status |
-| `nanoclaw channels status` | Channel status |
-| `nanoclaw cron list` | List scheduled jobs |
-| `nanoclaw cron add` | Add a scheduled job |
+| `nanobot onboard` | Initialize config and workspace |
+| `nanobot agent` | Interactive chat |
+| `nanobot agent -m "..."` | Single message |
+| `nanobot gateway` | Start with channel adapters |
+| `nanobot status` | Configuration status |
+| `nanobot channels status` | Channel status |
+| `nanobot cron list` | List scheduled jobs |
+| `nanobot cron add` | Add a scheduled job |
 
 ## Building
 
@@ -184,7 +184,7 @@ RUST_LOG=debug cargo run -- agent -m "Hello"
 
 ## Configuration
 
-Config lives at `~/.nanoclaw/config.json` (camelCase keys). Workspace defaults to `~/.nanoclaw/workspace/`.
+Config lives at `~/.nanobot/config.json` (camelCase keys). Workspace defaults to `~/.nanobot/workspace/`.
 
 Key agent settings in `config.json`:
 

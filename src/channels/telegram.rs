@@ -275,7 +275,7 @@ impl TelegramChannel {
 
         // Step 3: save locally
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        let media_dir = home.join(".nanoclaw").join("media");
+        let media_dir = home.join(".nanobot").join("media");
         let _ = std::fs::create_dir_all(&media_dir);
 
         let short_id = &file_id[..file_id.len().min(16)];

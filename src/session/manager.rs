@@ -92,7 +92,7 @@ impl Session {
 
 /// Manages conversation sessions.
 ///
-/// Sessions are stored as JSONL files in `~/.nanoclaw/sessions`.
+/// Sessions are stored as JSONL files in `~/.nanobot/sessions`.
 /// Thread-safe: the cache is protected by a Mutex so multiple tasks can
 /// access sessions concurrently.
 pub struct SessionManager {
@@ -105,7 +105,7 @@ impl SessionManager {
     /// Create a new `SessionManager` rooted at `workspace`.
     pub fn new(workspace: &Path) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let sessions_dir = ensure_dir(home.join(".nanoclaw").join("sessions"));
+        let sessions_dir = ensure_dir(home.join(".nanobot").join("sessions"));
 
         Self {
             workspace: workspace.to_path_buf(),
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_session_path() {
-        let tmp = std::env::temp_dir().join("nanoclaw_test_session_path");
+        let tmp = std::env::temp_dir().join("nanobot_test_session_path");
         let mgr = SessionManager::new(&tmp);
         let path = SessionManager::session_path("telegram:12345", &mgr.sessions_dir);
         assert!(path.to_string_lossy().ends_with("telegram_12345.jsonl"));
@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_history_creates_session() {
-        let tmp = std::env::temp_dir().join("nanoclaw_test_get_history");
+        let tmp = std::env::temp_dir().join("nanobot_test_get_history");
         let mgr = SessionManager::new(&tmp);
         let history = mgr.get_history("new:session", 100).await;
         assert!(history.is_empty());
@@ -384,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_message_and_save() {
-        let tmp = std::env::temp_dir().join("nanoclaw_test_add_msg");
+        let tmp = std::env::temp_dir().join("nanobot_test_add_msg");
         let mgr = SessionManager::new(&tmp);
         // Use a unique key to avoid interference from previous test runs.
         let key = format!("test:add_{}", uuid::Uuid::new_v4());

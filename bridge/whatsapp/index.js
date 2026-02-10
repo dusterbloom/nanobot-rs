@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// nanoclaw WhatsApp bridge - WebSocket server that bridges whatsapp-web.js to Rust.
+// nanobot WhatsApp bridge - WebSocket server that bridges whatsapp-web.js to Rust.
 //
-// Usage: node index.js [--port 3001] [--session-dir ~/.nanoclaw/whatsapp-session]
+// Usage: node index.js [--port 3001] [--session-dir ~/.nanobot/whatsapp-session]
 //
 // Protocol (JSON over WebSocket):
 //   Bridge -> Rust: { type: "message"|"status"|"qr"|"error", ... }
@@ -23,7 +23,7 @@ function getArg(name, fallback) {
 const PORT = parseInt(getArg("--port", "3001"), 10);
 const SESSION_DIR = getArg(
   "--session-dir",
-  path.join(os.homedir(), ".nanoclaw", "whatsapp-session")
+  path.join(os.homedir(), ".nanobot", "whatsapp-session")
 );
 
 // Track connected Rust clients.
@@ -95,7 +95,7 @@ wa.on("message", async (msg) => {
       const media = await msg.downloadMedia();
       if (media && media.data) {
         const fs = require("fs");
-        const mediaDir = path.join(os.homedir(), ".nanoclaw", "media");
+        const mediaDir = path.join(os.homedir(), ".nanobot", "media");
         fs.mkdirSync(mediaDir, { recursive: true });
         const ext = msg.type === "ptt" ? ".ogg" : ".ogg";
         const filename = `wa_voice_${Date.now()}${ext}`;

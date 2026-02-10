@@ -1,4 +1,4 @@
-//! Utility functions for nanoclaw.
+//! Utility functions for nanobot.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,22 +15,32 @@ pub fn ensure_dir(path: impl AsRef<Path>) -> PathBuf {
     path
 }
 
-/// Get the nanoclaw data directory (~/.nanoclaw).
+/// Get the nanobot data directory (~/.nanobot).
+///
+/// Migrates from the old `~/.nanoclaw` directory if it exists and
+/// `~/.nanobot` does not.
 pub fn get_data_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    ensure_dir(home.join(".nanoclaw"))
+    let new_path = home.join(".nanobot");
+    let old_path = home.join(".nanoclaw");
+    if !new_path.exists() && old_path.exists() {
+        if fs::rename(&old_path, &new_path).is_ok() {
+            eprintln!("Migrated ~/.nanoclaw -> ~/.nanobot");
+        }
+    }
+    ensure_dir(new_path)
 }
 
 /// Get the workspace path.
 ///
 /// If `workspace` is provided, it is used (with `~` expansion).
-/// Otherwise defaults to `~/.nanoclaw/workspace`.
+/// Otherwise defaults to `~/.nanobot/workspace`.
 pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
     let path = match workspace {
         Some(ws) => expand_tilde(ws),
         None => {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            home.join(".nanoclaw").join("workspace")
+            home.join(".nanobot").join("workspace")
         }
     };
     ensure_dir(path)

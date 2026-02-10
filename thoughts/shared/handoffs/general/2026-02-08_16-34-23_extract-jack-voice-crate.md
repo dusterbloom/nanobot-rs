@@ -21,7 +21,7 @@ turn_span_id: ""
 
 **COMPLETED** - All 7 phases of the extraction plan executed successfully.
 
-The goal was to extract the voice pipeline from `jack-desktop` (a Tauri desktop app at `/mnt/c/Users/PC/Downloads/jack/jack-desktop/src-tauri/`) into a standalone, framework-agnostic Rust crate at `~/Dev/jack-voice/` that nanoclaw can consume as a dependency.
+The goal was to extract the voice pipeline from `jack-desktop` (a Tauri desktop app at `/mnt/c/Users/PC/Downloads/jack/jack-desktop/src-tauri/`) into a standalone, framework-agnostic Rust crate at `~/Dev/jack-voice/` that nanobot can consume as a dependency.
 
 Plan reference: `/home/peppi/.claude/plans/bright-swinging-boot.md`
 
@@ -131,8 +131,8 @@ The supertonic crate has zero dependency on jack-voice or any other local code. 
 ## Action Items & Next Steps
 
 1. **Initialize git repo**: `cd ~/Dev/jack-voice && git init && git add . && git commit -m "Initial extraction from jack-desktop"`
-2. **Wire into nanoclaw**: Add `jack-voice = { path = "../jack-voice/jack-voice" }` to nanoclaw's Cargo.toml
-3. **Implement voice integration in nanoclaw**: Create a voice module that uses `VoicePipeline`, implements `VoiceEventSink`, and connects to the agent loop
+2. **Wire into nanobot**: Add `jack-voice = { path = "../jack-voice/jack-voice" }` to nanobot's Cargo.toml
+3. **Implement voice integration in nanobot**: Create a voice module that uses `VoicePipeline`, implements `VoiceEventSink`, and connects to the agent loop
 4. **Wire up progress callbacks**: The `ModelProgressCallback` in models.rs currently uses `_progress` (underscore prefix) - wire the actual progress reporting when integrating
 5. **Consider publishing**: Once stable, supertonic could be published to crates.io independently
 6. **Address remaining warnings**: The 3 warnings in audio.rs and stt.rs can be cleaned up when the full pipeline loop is implemented

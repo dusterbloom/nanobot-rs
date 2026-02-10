@@ -396,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_missing() {
         let tool = ReadFileTool;
-        let params = make_params(&[("path", "/tmp/nonexistent_nanoclaw_test_file_xyz.txt")]);
+        let params = make_params(&[("path", "/tmp/nonexistent_nanobot_test_file_xyz.txt")]);
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error: File not found"));
     }
@@ -549,7 +549,7 @@ mod tests {
     async fn test_edit_file_missing_file() {
         let tool = EditFileTool;
         let params = make_params(&[
-            ("path", "/tmp/nonexistent_nanoclaw_edit_test_xyz.txt"),
+            ("path", "/tmp/nonexistent_nanobot_edit_test_xyz.txt"),
             ("old_text", "a"),
             ("new_text", "b"),
         ]);
@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_dir_not_found() {
         let tool = ListDirTool;
-        let params = make_params(&[("path", "/tmp/nonexistent_nanoclaw_dir_xyz")]);
+        let params = make_params(&[("path", "/tmp/nonexistent_nanobot_dir_xyz")]);
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error: Directory not found"));
     }

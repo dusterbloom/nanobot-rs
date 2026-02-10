@@ -5,7 +5,7 @@
 //!
 //! On startup, the channel auto-spawns the Node.js bridge as a child process.
 //! Bridge files are embedded at compile time and extracted to
-//! `~/.nanoclaw/bridge/whatsapp/` on first run.
+//! `~/.nanobot/bridge/whatsapp/` on first run.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -82,9 +82,9 @@ impl WhatsAppChannel {
             return Ok(dev_path);
         }
 
-        // Installed path: ~/.nanoclaw/bridge/whatsapp/
+        // Installed path: ~/.nanobot/bridge/whatsapp/
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let installed_path = home.join(".nanoclaw").join("bridge").join("whatsapp");
+        let installed_path = home.join(".nanobot").join("bridge").join("whatsapp");
 
         if !installed_path.join("index.js").exists() {
             info!("Extracting embedded WhatsApp bridge to {}", installed_path.display());

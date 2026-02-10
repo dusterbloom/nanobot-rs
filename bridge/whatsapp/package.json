@@ -1,8 +1,8 @@
 {
-  "name": "nanoclaw-whatsapp-bridge",
+  "name": "nanobot-whatsapp-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "WhatsApp Web bridge for nanoclaw",
+  "description": "WhatsApp Web bridge for nanobot",
   "main": "index.js",
   "dependencies": {
     "whatsapp-web.js": "^1.26.0",

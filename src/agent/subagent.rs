@@ -292,7 +292,7 @@ impl SubagentManager {
     fn _build_subagent_prompt(task: &str, workspace: &PathBuf) -> String {
         let workspace_str = workspace.to_string_lossy();
         format!(
-            r#"You are a subagent of nanoclaw, a helpful AI assistant.
+            r#"You are a subagent of nanobot, a helpful AI assistant.
 
 You have been spawned to complete a specific task. Focus on this task and complete it efficiently.
 

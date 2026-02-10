@@ -1,7 +1,7 @@
-# Continuity Ledger: Graduating nanoclaw - Agent Resilience
+# Continuity Ledger: Graduating nanobot - Agent Resilience
 
 ## Goal
-Make nanoclaw's agent loop production-resilient: context budget management, protocol-safe messages, efficient token usage, outcome-aware learning, bypass-resistant sandbox, smart summarization, and concurrent chat processing.
+Make nanobot's agent loop production-resilient: context budget management, protocol-safe messages, efficient token usage, outcome-aware learning, bypass-resistant sandbox, smart summarization, and concurrent chat processing.
 
 ## Constraints
 - No new crate dependencies (character-based token estimation, not tiktoken)
@@ -86,5 +86,5 @@ Make nanoclaw's agent loop production-resilient: context budget management, prot
 - Compaction test uses MockProvider to verify summary is injected
 - Compaction fallback test uses FailingProvider to verify trim_to_fit kicks in
 - Session manager test uses UUID keys to avoid stale data from disk
-- End-to-end testing: use `RUST_LOG=debug nanoclaw agent -m "..."` for compaction/concurrency verification
+- End-to-end testing: use `RUST_LOG=debug nanobot agent -m "..."` for compaction/concurrency verification
 - Gateway concurrency: start gateway with 2+ channels, send simultaneous messages, verify parallel processing

@@ -1,4 +1,4 @@
-//! Configuration schema for nanoclaw.
+//! Configuration schema for nanobot.
 //!
 //! All structs use `#[serde(rename_all = "camelCase")]` so that the JSON config
 //! file can use camelCase keys while Rust code uses snake_case fields.
@@ -197,7 +197,7 @@ pub struct AgentDefaults {
 }
 
 fn default_workspace() -> String {
-    "~/.nanoclaw/workspace".to_string()
+    "~/.nanobot/workspace".to_string()
 }
 
 fn default_model() -> String {
@@ -388,7 +388,7 @@ pub struct ToolsConfig {
 // Root config
 // ---------------------------------------------------------------------------
 
-/// Root configuration for nanoclaw.
+/// Root configuration for nanobot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -532,7 +532,7 @@ mod tests {
     fn test_workspace_path() {
         let cfg = Config::default();
         let ws = cfg.workspace_path();
-        assert!(ws.ends_with(".nanoclaw/workspace"));
+        assert!(ws.ends_with(".nanobot/workspace"));
     }
 
     #[test]

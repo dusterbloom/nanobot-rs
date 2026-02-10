@@ -1,4 +1,4 @@
-//! nanoclaw - A lightweight personal AI assistant framework in Rust.
+//! nanobot - A lightweight personal AI assistant framework in Rust.
 //! Based on nanobot by HKUDS (https://github.com/HKUDS/nanobot).
 //!
 //! Local LLM support: Use Ctrl+L or /local to toggle between cloud and local mode.
@@ -100,7 +100,7 @@ mod tui {
 static LOCAL_MODE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
-#[command(name = "nanoclaw", about = "nanoclaw - Personal AI Assistant", version = VERSION)]
+#[command(name = "nanobot", about = "nanobot - Personal AI Assistant", version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -108,7 +108,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize nanoclaw configuration and workspace.
+    /// Initialize nanobot configuration and workspace.
     Onboard,
     /// Interact with the agent directly.
     Agent {
@@ -122,7 +122,7 @@ enum Commands {
         #[arg(short, long)]
         local: bool,
     },
-    /// Start the nanoclaw gateway (channels + agent loop).
+    /// Start the nanobot gateway (channels + agent loop).
     Gateway {
         /// Gateway port.
         #[arg(short, long, default_value_t = 18790)]
@@ -131,7 +131,7 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Show nanoclaw status.
+    /// Show nanobot status.
     Status,
     /// Manage channels.
     Channels {
@@ -283,17 +283,17 @@ fn cmd_onboard() {
 
     create_workspace_templates(&workspace);
 
-    println!("\n{} nanoclaw is ready!", LOGO);
+    println!("\n{} nanobot is ready!", LOGO);
     println!("\nNext steps:");
-    println!("  1. Add your API key to ~/.nanoclaw/config.json");
+    println!("  1. Add your API key to ~/.nanobot/config.json");
     println!("     Get one at: https://openrouter.ai/keys");
-    println!("  2. Chat: nanoclaw agent -m \"Hello!\"");
+    println!("  2. Chat: nanobot agent -m \"Hello!\"");
 }
 
 fn create_workspace_templates(workspace: &std::path::Path) {
     let templates: Vec<(&str, &str)> = vec![
         ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Remember important information in your memory files\n"),
-        ("SOUL.md", "# Soul\n\nI am nanoclaw, a lightweight AI assistant.\n\n## Personality\n\n- Helpful and friendly\n- Concise and to the point\n- Curious and eager to learn\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions\n"),
+        ("SOUL.md", "# Soul\n\nI am nanobot, a lightweight AI assistant.\n\n## Personality\n\n- Helpful and friendly\n- Concise and to the point\n- Curious and eager to learn\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions\n"),
         ("USER.md", "# User\n\nInformation about the user goes here.\n\n## Preferences\n\n- Communication style: (casual/formal)\n- Timezone: (your timezone)\n- Language: (your preferred language)\n"),
     ];
 
@@ -345,7 +345,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
         let model = &config.agents.defaults.model;
         if api_key.is_none() && !model.starts_with("bedrock/") {
             eprintln!("Error: No API key configured.");
-            eprintln!("Set one in ~/.nanoclaw/config.json under providers.openrouter.apiKey");
+            eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
             eprintln!("Or use --local flag to use a local LLM server.");
             std::process::exit(1);
         }
@@ -736,7 +736,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                                 let mut save_cfg = load_config(None);
                                 save_cfg.channels.telegram.token = t.clone();
                                 save_config(&save_cfg, None);
-                                println!("  Token saved to ~/.nanoclaw/config.json\n");
+                                println!("  Token saved to ~/.nanobot/config.json\n");
                             }
                         }
                         t
@@ -771,7 +771,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     check_api_key(&gw_config);
                     let email_cfg = &gw_config.channels.email;
                     if email_cfg.imap_host.is_empty() || email_cfg.username.is_empty() || email_cfg.password.is_empty() {
-                        println!("  Email not configured. Run `nanoclaw email` first or add settings to config.json.\n");
+                        println!("  Email not configured. Run `nanobot email` first or add settings to config.json.\n");
                         continue;
                     }
                     println!("  Starting Email channel...");
@@ -1039,7 +1039,7 @@ fn cmd_gateway(port: u16, verbose: bool) {
         eprintln!("Verbose mode enabled");
     }
 
-    println!("{} Starting nanoclaw gateway on port {}...", LOGO, port);
+    println!("{} Starting nanobot gateway on port {}...", LOGO, port);
 
     let config = load_config(None);
     check_api_key(&config);
@@ -1232,7 +1232,7 @@ fn cmd_telegram(token_arg: Option<String>) {
                 let mut save_cfg = load_config(None);
                 save_cfg.channels.telegram.token = t.clone();
                 save_config(&save_cfg, None);
-                println!("  Token saved to ~/.nanoclaw/config.json\n");
+                println!("  Token saved to ~/.nanobot/config.json\n");
             }
 
             t
@@ -1352,7 +1352,7 @@ fn cmd_email(
             save_cfg.channels.email.username = username.clone();
             save_cfg.channels.email.password = password.clone();
             save_config(&save_cfg, None);
-            println!("  Settings saved to ~/.nanoclaw/config.json\n");
+            println!("  Settings saved to ~/.nanobot/config.json\n");
         }
     }
 
@@ -1386,7 +1386,7 @@ fn check_api_key(config: &Config) {
     let model = &config.agents.defaults.model;
     if config.get_api_key().is_none() && !model.starts_with("bedrock/") {
         eprintln!("Error: No API key configured.");
-        eprintln!("Set one in ~/.nanoclaw/config.json under providers.openrouter.apiKey");
+        eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
         std::process::exit(1);
     }
 }
@@ -1400,7 +1400,7 @@ fn cmd_status() {
     let config = load_config(None);
     let workspace = config.workspace_path();
 
-    println!("{} nanoclaw Status\n", LOGO);
+    println!("{} nanobot Status\n", LOGO);
     println!(
         "Config: {} [{}]",
         config_path.display(),

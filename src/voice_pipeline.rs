@@ -103,7 +103,7 @@ impl VoicePipeline {
 
     /// Synthesize text to an `.ogg` opus file.
     ///
-    /// Returns the path to the generated file in `~/.nanoclaw/media/`.
+    /// Returns the path to the generated file in `~/.nanobot/media/`.
     pub async fn synthesize_to_file(&self, text: &str) -> Result<String, String> {
         let text = text.to_string();
         let tts = self.tts.clone();
@@ -180,7 +180,7 @@ fn decode_audio_file(path: &str) -> Result<Vec<f32>, String> {
 /// Returns the path to the output file.
 fn encode_samples_to_ogg(samples: &[f32], sample_rate: u32) -> Result<String, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let media_dir = home.join(".nanoclaw").join("media");
+    let media_dir = home.join(".nanobot").join("media");
     std::fs::create_dir_all(&media_dir)
         .map_err(|e| format!("Failed to create media dir: {e}"))?;
 

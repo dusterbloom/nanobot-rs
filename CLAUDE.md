@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**nanoclaw** - A lightweight personal AI assistant framework in Rust, ported from [nanobot](https://github.com/HKUDS/nanobot) (Python, MIT). Binary name: `nanoclaw`.
+**nanobot** - A lightweight personal AI assistant framework in Rust, ported from [nanobot](https://github.com/HKUDS/nanobot) (Python, MIT). Binary name: `nanobot`.
 
 ## Build & Test
 
@@ -44,10 +44,10 @@ The `AgentLoop` (`src/agent/agent_loop.rs`) is the core: it receives messages vi
 - **`agent/`** - Agent core: loop, context builder, memory, skills, subagents, tools
 - **`agent/tools/`** - Tool trait (`base.rs`) + registry (`registry.rs`) + implementations (filesystem, shell, web, message, spawn, cron)
 - **`providers/`** - Single `OpenAICompatProvider` that talks to all providers via OpenAI-compatible chat completions API
-- **`config/`** - JSON config schema (`schema.rs`) + loader. Config lives at `~/.nanoclaw/config.json`
+- **`config/`** - JSON config schema (`schema.rs`) + loader. Config lives at `~/.nanobot/config.json`
 - **`channels/`** - Chat channel adapters (Telegram polling, WhatsApp WebSocket bridge, Feishu WebSocket)
 - **`bus/`** - `InboundMessage`/`OutboundMessage` event types, message queue
-- **`session/`** - JSONL-based session persistence in `~/.nanoclaw/sessions/`
+- **`session/`** - JSONL-based session persistence in `~/.nanobot/sessions/`
 - **`cron/`** - Scheduled job system with interval and cron expression support
 - **`heartbeat/`** - Periodic heartbeat service
 
@@ -63,7 +63,7 @@ Tools implement the `Tool` trait (`agent/tools/base.rs`): `name()`, `description
 
 ### Context & Memory
 
-`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (daily notes + `MEMORY.md`), and skills. The workspace defaults to `~/.nanoclaw/workspace/`.
+`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (daily notes + `MEMORY.md`), and skills. The workspace defaults to `~/.nanobot/workspace/`.
 
 ### Skills
 

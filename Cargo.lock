@@ -2424,7 +2424,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanoclaw"
+name = "nanobot"
 version = "0.1.0"
 dependencies = [
  "anyhow",

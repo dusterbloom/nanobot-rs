@@ -216,9 +216,9 @@ impl ContextBuilder {
         };
 
         format!(
-            r#"# nanoclaw
+            r#"# nanobot
 
-You are nanoclaw, a helpful AI assistant. You have access to tools that allow you to:
+You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
 - Read, write, and edit files
 - Execute shell commands
 - Search the web and fetch web pages
@@ -377,15 +377,15 @@ mod tests {
     // ----- build_system_prompt -----
 
     #[test]
-    fn test_build_system_prompt_contains_nanoclaw_identity() {
+    fn test_build_system_prompt_contains_nanobot_identity() {
         let (_tmp, cb) = make_context();
         let prompt = cb.build_system_prompt(None);
         assert!(
-            prompt.contains("nanoclaw"),
-            "system prompt should contain 'nanoclaw' identity"
+            prompt.contains("nanobot"),
+            "system prompt should contain 'nanobot' identity"
         );
         assert!(
-            prompt.contains("You are nanoclaw"),
+            prompt.contains("You are nanobot"),
             "system prompt should contain identity introduction"
         );
     }

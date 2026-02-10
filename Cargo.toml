@@ -1,5 +1,5 @@
 [package]
-name = "nanoclaw"
+name = "nanobot"
 version = "0.1.0"
 edition = "2021"
 description = "A lightweight personal AI assistant framework in Rust"
@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/dusterbloom/nanobot-rs"
 
 [[bin]]
-name = "nanoclaw"
+name = "nanobot"
 path = "src/main.rs"
 
 [dependencies]

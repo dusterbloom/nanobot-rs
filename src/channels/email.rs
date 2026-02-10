@@ -541,7 +541,7 @@ mod tests {
         let resp = client
             .post("https://api.nodemailer.com/user")
             .json(&serde_json::json!({
-                "requestor": "nanoclaw-test",
+                "requestor": "nanobot-test",
                 "version": "1.0.0"
             }))
             .send()
@@ -841,7 +841,7 @@ mod tests {
         let mut msg = OutboundMessage::new(
             "email",
             format!("email:{}", config.username),
-            "Hello from nanoclaw!",
+            "Hello from nanobot!",
         );
         msg.metadata.insert("subject".to_string(), json!("Test Email"));
 
@@ -1191,8 +1191,8 @@ mod tests {
         let email = Message::builder()
             .from(from)
             .to(to)
-            .subject("nanoclaw email channel test")
-            .body("Hello from nanoclaw!\n\nThis is a test email sent by the nanoclaw email channel.".to_string())
+            .subject("nanobot email channel test")
+            .body("Hello from nanobot!\n\nThis is a test email sent by the nanobot email channel.".to_string())
             .expect("failed to build email");
 
         let creds = Credentials::new(smtp_user.clone(), password);
