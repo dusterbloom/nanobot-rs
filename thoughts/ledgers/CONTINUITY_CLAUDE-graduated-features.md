@@ -32,8 +32,8 @@ Make nanobot's agent loop production-resilient: context budget management, proto
   - [x] Phase 6: Context Compaction — `compaction.rs`, LLM-powered summarization before truncation, falls back to trim_to_fit
   - [x] Phase 7: Concurrent Message Processing — fan-out dispatcher, per-session serialization, per-message tool instances
   - [x] All tests passing (362), release build clean, pushed to main
-- Now: [DONE]
-- Next: End-to-end testing with real LLM conversations
+- Now: [DONE] — All phases shipped
+- Next: Real-world validation
 - Remaining:
   - [ ] Test compaction with real conversations (verify summary quality)
   - [ ] Tune maxConcurrentChats under load (4 may be conservative)
@@ -48,7 +48,7 @@ Make nanobot's agent loop production-resilient: context budget management, proto
 ## Working Set
 - Files: `src/agent/{token_budget,thread_repair,learning,compaction}.rs`, `src/agent/{agent_loop,context,mod}.rs`, `src/agent/tools/{registry,shell}.rs`, `src/config/schema.rs`, `src/session/manager.rs`, `src/main.rs`
 - Branch: main
-- Commit: `8e5f797`
+- Commit: `1603896` (pushed to origin)
 - Test command: `cargo test` (362 tests)
 - Build: `cargo build --release`
 

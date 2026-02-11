@@ -25,7 +25,7 @@ Fully functional voice assistant with local LLM support: low-latency TTS, interr
   - [x] Stale server cleanup: pkill orphaned llama-server before spawn
   - [x] Voice prompt hardening: no emoji, no markdown, 1-3 sentences
   - [x] /local auto-spawn: llama.cpp server with --ctx-size 16384
-- Now: Idle - no active work
+- Now: Idle — voice_pipeline.rs extracted (250 lines), main.rs voice refactored
 - Remaining:
   - [ ] Investigate Supertonic word-dropping (upstream diffusion issue, no fix yet)
   - [ ] Consider multi-sample generation (generate N, pick best) for quality vs latency tradeoff
@@ -43,7 +43,7 @@ Fully functional voice assistant with local LLM support: low-latency TTS, interr
 - [#60](https://github.com/supertone-inc/supertonic/issues/60): Long sentences + numbers cause drops
 
 ## Working Set
-- Files: `src/voice.rs`, `src/main.rs`, `src/agent/context.rs`
+- Files: `src/voice.rs`, `src/voice_pipeline.rs`, `src/main.rs`, `src/agent/context.rs`
 - Branch: main
 - Build: `cargo build --features voice`
 - Test: `cargo test`
