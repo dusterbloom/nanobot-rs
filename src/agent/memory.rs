@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn test_new_creates_memory_dir() {
         let (tmp, store) = make_store();
-        assert!(store.memory_dir.exists(), "memory directory should be created");
+        assert!(
+            store.memory_dir.exists(),
+            "memory directory should be created"
+        );
         assert_eq!(store.memory_dir, tmp.path().join("memory"));
     }
 

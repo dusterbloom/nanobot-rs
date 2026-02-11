@@ -23,6 +23,14 @@ use crate::providers::base::LLMProvider;
 /// Maximum iterations for a subagent run.
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
 
+/// Info about a running subagent task (cheaply cloneable).
+#[derive(Clone)]
+pub struct SubagentInfo {
+    pub task_id: String,
+    pub label: String,
+    pub started_at: std::time::Instant,
+}
+
 /// Manages background subagent tasks.
 pub struct SubagentManager {
     provider: Arc<dyn LLMProvider>,
@@ -32,7 +40,7 @@ pub struct SubagentManager {
     brave_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
-    running_tasks: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>)>>>,
 }
 
 impl SubagentManager {
@@ -73,10 +81,7 @@ impl SubagentManager {
             .clone()
             .unwrap_or_else(|| task.chars().take(40).collect());
 
-        info!(
-            "Spawning subagent {} for: {}",
-            task_id, display_label
-        );
+        info!("Spawning subagent {} for: {}", task_id, display_label);
 
         let provider = self.provider.clone();
         let workspace = self.workspace.clone();
@@ -127,8 +132,13 @@ impl SubagentManager {
 
         // Track the task.
         {
+            let info = SubagentInfo {
+                task_id: task_id.clone(),
+                label: display_label.clone(),
+                started_at: std::time::Instant::now(),
+            };
             let mut tasks = self.running_tasks.lock().await;
-            tasks.insert(task_id.clone(), handle);
+            tasks.insert(task_id.clone(), (info, handle));
         }
 
         format!(
@@ -139,8 +149,29 @@ impl SubagentManager {
 
     /// Get the count of currently running subagent tasks.
     pub async fn get_running_count(&self) -> usize {
-        let tasks = self.running_tasks.lock().await;
+        let mut tasks = self.running_tasks.lock().await;
+        tasks.retain(|_, (_, h)| !h.is_finished());
         tasks.len()
+    }
+
+    /// List all running subagent tasks.
+    pub async fn list_running(&self) -> Vec<SubagentInfo> {
+        let mut tasks = self.running_tasks.lock().await;
+        tasks.retain(|_, (_, h)| !h.is_finished());
+        tasks.values().map(|(info, _)| info.clone()).collect()
+    }
+
+    /// Cancel a running subagent by task ID (or prefix match).
+    pub async fn cancel(&self, task_id: &str) -> bool {
+        let mut tasks = self.running_tasks.lock().await;
+        let key = tasks.keys().find(|k| k.starts_with(task_id)).cloned();
+        if let Some(k) = key {
+            if let Some((_, handle)) = tasks.remove(&k) {
+                handle.abort();
+                return true;
+            }
+        }
+        false
     }
 
     // ------------------------------------------------------------------
@@ -236,12 +267,7 @@ impl SubagentManager {
                 for tc in &response.tool_calls {
                     debug!("Subagent {} calling tool: {}", task_id, tc.name);
                     let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-                    ContextBuilder::add_tool_result(
-                        &mut messages,
-                        &tc.id,
-                        &tc.name,
-                        &result,
-                    );
+                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
                 }
             } else {
                 // No tool calls -- the subagent is done.
@@ -273,12 +299,8 @@ impl SubagentManager {
             label, task_id, status, task, result
         );
 
-        let mut msg = InboundMessage::new(
-            origin_channel,
-            "subagent",
-            origin_chat_id,
-            &announcement,
-        );
+        let mut msg =
+            InboundMessage::new(origin_channel, "subagent", origin_chat_id, &announcement);
         msg.metadata
             .insert("subagent_task_id".to_string(), json!(task_id));
         msg.metadata

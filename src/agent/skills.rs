@@ -232,7 +232,10 @@ impl SkillsLoader {
         for line in frontmatter.lines() {
             if let Some((key, value)) = line.split_once(':') {
                 let k = key.trim().to_string();
-                let v = value.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                let v = value
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
                 metadata.insert(k, v);
             }
         }
@@ -321,10 +324,7 @@ fn _check_requirements(skill_meta: &HashMap<String, serde_json::Value>) -> bool 
             for env_val in env_vars {
                 if let Some(env_name) = env_val.as_str() {
                     if std::env::var(env_name).is_err() {
-                        debug!(
-                            "Skill requirement not met: env var '{}' not set",
-                            env_name
-                        );
+                        debug!("Skill requirement not met: env var '{}' not set", env_name);
                         return false;
                     }
                 }
@@ -388,10 +388,7 @@ mod tests {
 
     /// Helper: create a workspace temp dir with a skills/ subdirectory
     /// containing one skill named `test-skill` with a SKILL.md file.
-    fn make_workspace_with_skill(
-        frontmatter: Option<&str>,
-        body: &str,
-    ) -> (TempDir, SkillsLoader) {
+    fn make_workspace_with_skill(frontmatter: Option<&str>, body: &str) -> (TempDir, SkillsLoader) {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join("skills").join("test-skill");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -444,10 +441,7 @@ mod tests {
 
     #[test]
     fn test_escape_xml_combined() {
-        assert_eq!(
-            _escape_xml("x < y & y > z"),
-            "x &lt; y &amp; y &gt; z"
-        );
+        assert_eq!(_escape_xml("x < y & y > z"), "x &lt; y &amp; y &gt; z");
     }
 
     #[test]
@@ -467,14 +461,8 @@ mod tests {
     fn test_parse_skill_metadata_valid_json() {
         let raw = r#"{"nanobot": {"always": true, "priority": 1}}"#;
         let result = _parse_skill_metadata(raw);
-        assert_eq!(
-            result.get("always").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            result.get("priority").and_then(|v| v.as_i64()),
-            Some(1)
-        );
+        assert_eq!(result.get("always").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("priority").and_then(|v| v.as_i64()), Some(1));
     }
 
     #[test]
@@ -503,10 +491,7 @@ mod tests {
     fn test_check_requirements_with_existing_bin() {
         // "ls" should always exist on Linux/macOS.
         let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
-        meta.insert(
-            "requires".to_string(),
-            serde_json::json!({"bins": ["ls"]}),
-        );
+        meta.insert("requires".to_string(), serde_json::json!({"bins": ["ls"]}));
         assert!(_check_requirements(&meta));
     }
 
@@ -575,7 +560,10 @@ mod tests {
         let meta = loader.get_skill_metadata("test-skill");
         assert!(meta.is_some());
         let meta = meta.unwrap();
-        assert_eq!(meta.get("description").map(|s| s.as_str()), Some("A cool skill"));
+        assert_eq!(
+            meta.get("description").map(|s| s.as_str()),
+            Some("A cool skill")
+        );
         assert_eq!(meta.get("author").map(|s| s.as_str()), Some("tester"));
     }
 
@@ -591,7 +579,10 @@ mod tests {
         let frontmatter = "description: \"Quoted value\"";
         let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
         let meta = loader.get_skill_metadata("test-skill").unwrap();
-        assert_eq!(meta.get("description").map(|s| s.as_str()), Some("Quoted value"));
+        assert_eq!(
+            meta.get("description").map(|s| s.as_str()),
+            Some("Quoted value")
+        );
     }
 
     // ----- build_skills_summary -----
@@ -621,7 +612,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join("skills").join("a&b");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("SKILL.md"), "---\ndescription: x < y\n---\nbody").unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: x < y\n---\nbody",
+        )
+        .unwrap();
         let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
         let summary = loader.build_skills_summary();
         assert!(summary.contains("a&amp;b"));

@@ -10,11 +10,13 @@ use url::Url;
 use super::base::Tool;
 
 /// Shared user-agent string.
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
 
 /// Maximum number of redirects to follow.
 const MAX_REDIRECTS: usize = 5;
+
+/// Maximum response body size (5 MB). Prevents memory spikes on large responses.
+const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,21 +43,45 @@ fn normalize_whitespace(text: &str) -> String {
     re_newlines.replace_all(&text, "\n\n").trim().to_string()
 }
 
-/// Validate a URL: must be http(s) with a valid domain.
+/// Validate a URL: must be http(s) with a valid, non-private domain.
+///
+/// Blocks local/private addresses to prevent SSRF attacks where the LLM
+/// might be tricked into fetching internal services.
 fn validate_url(url_str: &str) -> Result<(), String> {
     let parsed = Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
     match parsed.scheme() {
         "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "Only http/https allowed, got '{}'",
-                other
-            ))
+        other => return Err(format!("Only http/https allowed, got '{}'", other)),
+    }
+    let host = parsed.host_str().ok_or("Missing domain")?;
+
+    // Block known private/local hostnames.
+    let lower = host.to_lowercase();
+    if lower == "localhost"
+        || lower == "0.0.0.0"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return Err(format!("Access to local host '{}' is blocked", host));
+    }
+
+    // Block private/reserved IP ranges (RFC 1918, link-local, loopback, metadata).
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()                              // 127.0.0.0/8
+                    || v4.is_private()                        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                    || v4.is_link_local()                     // 169.254.0.0/16
+                    || v4.is_unspecified()                    // 0.0.0.0
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // cloud metadata
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if blocked {
+            return Err(format!("Access to private/local IP '{}' is blocked", ip));
         }
     }
-    if parsed.host_str().is_none() {
-        return Err("Missing domain".to_string());
-    }
+
     Ok(())
 }
 
@@ -166,14 +192,8 @@ impl Tool for WebSearchTool {
 
                         let mut lines = vec![format!("Results for: {}\n", query)];
                         for (i, item) in results.iter().take(count as usize).enumerate() {
-                            let title = item
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let url = item
-                                .get("url")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
                             lines.push(format!("{}. {}\n   {}", i + 1, title, url));
 
                             if let Some(desc) = item.get("description").and_then(|v| v.as_str()) {
@@ -283,53 +303,76 @@ impl Tool for WebFetchTool {
                     .unwrap_or("")
                     .to_string();
 
-                match response.text().await {
-                    Ok(body) => {
-                        let (text, extractor) = if content_type.contains("application/json") {
-                            // Pretty-print JSON.
-                            let formatted = match serde_json::from_str::<serde_json::Value>(&body)
-                            {
-                                Ok(v) => {
-                                    serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone())
-                                }
-                                Err(_) => body.clone(),
-                            };
-                            (formatted, "json")
-                        } else if content_type.contains("text/html")
-                            || body.trim_start().to_lowercase().starts_with("<!doctype")
-                            || body.trim_start().to_lowercase().starts_with("<html")
-                        {
-                            // Extract text from HTML using scraper.
-                            let extracted = extract_html_content(&body, extract_mode);
-                            (extracted, "scraper")
-                        } else {
-                            (body, "raw")
-                        };
-
-                        let truncated = text.len() > max_chars;
-                        let final_text = if truncated {
-                            text[..max_chars].to_string()
-                        } else {
-                            text.clone()
-                        };
-
-                        serde_json::json!({
-                            "url": url,
-                            "finalUrl": final_url,
-                            "status": status,
-                            "extractor": extractor,
-                            "truncated": truncated,
-                            "length": final_text.len(),
-                            "text": final_text
+                // Check content-length header; reject obviously oversized responses early.
+                if let Some(len) = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    if len > MAX_BODY_BYTES {
+                        return serde_json::json!({
+                            "error": format!("Response too large ({:.1} MB, limit {:.1} MB)",
+                                len as f64 / 1e6, MAX_BODY_BYTES as f64 / 1e6),
+                            "url": url
                         })
-                        .to_string()
+                        .to_string();
                     }
-                    Err(e) => serde_json::json!({
-                        "error": format!("Failed to read response body: {}", e),
-                        "url": url
-                    })
-                    .to_string(),
                 }
+
+                // Read body with size guard (content-length can be absent or wrong).
+                let body = match response.bytes().await {
+                    Ok(bytes) if bytes.len() > MAX_BODY_BYTES => {
+                        return serde_json::json!({
+                            "error": format!("Response too large ({:.1} MB, limit {:.1} MB)",
+                                bytes.len() as f64 / 1e6, MAX_BODY_BYTES as f64 / 1e6),
+                            "url": url
+                        })
+                        .to_string();
+                    }
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(e) => {
+                        return serde_json::json!({
+                            "error": format!("Failed to read response body: {}", e),
+                            "url": url
+                        })
+                        .to_string();
+                    }
+                };
+
+                let (text, extractor) = if content_type.contains("application/json") {
+                    let formatted = match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone()),
+                        Err(_) => body.clone(),
+                    };
+                    (formatted, "json")
+                } else if content_type.contains("text/html")
+                    || body.trim_start().to_lowercase().starts_with("<!doctype")
+                    || body.trim_start().to_lowercase().starts_with("<html")
+                {
+                    let extracted = extract_html_content(&body, extract_mode);
+                    (extracted, "scraper")
+                } else {
+                    (body, "raw")
+                };
+
+                let truncated = text.len() > max_chars;
+                let final_text = if truncated {
+                    text[..max_chars].to_string()
+                } else {
+                    text
+                };
+
+                serde_json::json!({
+                    "url": url,
+                    "finalUrl": final_url,
+                    "status": status,
+                    "extractor": extractor,
+                    "truncated": truncated,
+                    "length": final_text.len(),
+                    "text": final_text
+                })
+                .to_string()
             }
             Err(e) => serde_json::json!({
                 "error": e.to_string(),
@@ -477,6 +520,39 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_validate_url_localhost_blocked() {
+        let result = validate_url("http://localhost:8080/api");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked"));
+    }
+
+    #[test]
+    fn test_validate_url_loopback_ip_blocked() {
+        let result = validate_url("http://127.0.0.1:9090/secret");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked"));
+    }
+
+    #[test]
+    fn test_validate_url_private_ip_blocked() {
+        assert!(validate_url("http://192.168.1.1").is_err());
+        assert!(validate_url("http://10.0.0.1").is_err());
+        assert!(validate_url("http://172.16.0.1").is_err());
+    }
+
+    #[test]
+    fn test_validate_url_metadata_ip_blocked() {
+        let result = validate_url("http://169.254.169.254/latest/meta-data/");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_url_public_ip_allowed() {
+        assert!(validate_url("http://8.8.8.8").is_ok());
+        assert!(validate_url("https://1.1.1.1").is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // strip_tags tests
     // -----------------------------------------------------------------------
@@ -569,7 +645,11 @@ mod tests {
     fn test_html_to_markdown_links() {
         let html = r#"<a href="https://example.com">Example</a>"#;
         let result = html_to_markdown_simple(html);
-        assert!(result.contains("[Example](https://example.com)"), "result: {}", result);
+        assert!(
+            result.contains("[Example](https://example.com)"),
+            "result: {}",
+            result
+        );
     }
 
     #[test]
@@ -611,7 +691,8 @@ mod tests {
 
     #[test]
     fn test_extract_html_content_with_title() {
-        let html = "<html><head><title>Test Page</title></head><body><p>Content here</p></body></html>";
+        let html =
+            "<html><head><title>Test Page</title></head><body><p>Content here</p></body></html>";
         let result = extract_html_content(html, "text");
         assert!(result.contains("# Test Page"), "result: {}", result);
         assert!(result.contains("Content here"), "result: {}", result);
@@ -627,7 +708,8 @@ mod tests {
 
     #[test]
     fn test_extract_html_content_prefers_article() {
-        let html = "<html><body><div>Noise</div><article><p>Article content</p></article></body></html>";
+        let html =
+            "<html><body><div>Noise</div><article><p>Article content</p></article></body></html>";
         let result = extract_html_content(html, "text");
         assert!(result.contains("Article content"), "result: {}", result);
     }

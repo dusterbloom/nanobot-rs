@@ -29,9 +29,8 @@ pub const HEARTBEAT_OK_TOKEN: &str = "HEARTBEAT_OK";
 
 /// Async callback invoked on each heartbeat.
 /// Receives the heartbeat prompt and returns the agent response.
-pub type HeartbeatCallback = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync,
->;
+pub type HeartbeatCallback =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Helpers

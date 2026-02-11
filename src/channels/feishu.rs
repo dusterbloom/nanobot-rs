@@ -202,7 +202,10 @@ impl Channel for FeishuChannel {
                     .await?;
 
                 let retry_data: Value = retry_resp.json().await.unwrap_or_default();
-                let retry_code = retry_data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let retry_code = retry_data
+                    .get("code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
                 if retry_code != 0 {
                     let retry_msg = retry_data
                         .get("msg")

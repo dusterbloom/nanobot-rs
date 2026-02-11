@@ -25,10 +25,28 @@ impl TokenBudget {
         }
     }
 
+    /// Return the maximum context window size in tokens.
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    /// Backward-compatible no-op.
+    ///
+    /// Local tokenizer HTTP calls were removed to avoid blocking/brick behavior
+    /// when `/tokenize` is unavailable.
+    pub fn with_tokenizer_endpoint(self, _endpoint: Option<String>) -> Self {
+        self
+    }
+
     /// Estimate token count for a string (~4 chars per token).
     pub fn estimate_str_tokens(s: &str) -> usize {
         // Add 1 to avoid underestimating short strings.
         (s.len() + 3) / 4
+    }
+
+    /// Estimate token count for a string (heuristic).
+    pub fn estimate_str_tokens_with_fallback(&self, s: &str) -> usize {
+        Self::estimate_str_tokens(s)
     }
 
     /// Estimate token count for a single message Value.
@@ -71,15 +89,30 @@ impl TokenBudget {
         tokens
     }
 
+    /// Estimate token count for a single message (heuristic).
+    fn estimate_message_tokens_with_fallback(&self, msg: &Value) -> usize {
+        Self::estimate_message_tokens(msg)
+    }
+
     /// Estimate total tokens for a message array.
     pub fn estimate_tokens(messages: &[Value]) -> usize {
         messages.iter().map(Self::estimate_message_tokens).sum()
+    }
+
+    /// Estimate total tokens (heuristic).
+    pub fn estimate_tokens_with_fallback(&self, messages: &[Value]) -> usize {
+        Self::estimate_tokens(messages)
     }
 
     /// Estimate tokens for tool definitions.
     pub fn estimate_tool_def_tokens(tool_defs: &[Value]) -> usize {
         let json = serde_json::to_string(tool_defs).unwrap_or_default();
         Self::estimate_str_tokens(&json)
+    }
+
+    /// Estimate tool definition tokens (heuristic).
+    pub fn estimate_tool_def_tokens_with_fallback(&self, tool_defs: &[Value]) -> usize {
+        Self::estimate_tool_def_tokens(tool_defs)
     }
 
     /// Available budget for messages (after reserving response + tool defs).
@@ -103,7 +136,7 @@ impl TokenBudget {
         let mut msgs = messages.to_vec();
 
         // Already within budget?
-        if Self::estimate_tokens(&msgs) <= budget {
+        if self.estimate_tokens_with_fallback(&msgs) <= budget {
             return msgs;
         }
 
@@ -131,7 +164,7 @@ impl TokenBudget {
             }
         }
 
-        if Self::estimate_tokens(&msgs) <= budget {
+        if self.estimate_tokens_with_fallback(&msgs) <= budget {
             return msgs;
         }
 
@@ -139,7 +172,7 @@ impl TokenBudget {
         // Keep: system (index 0) + last N messages that fit.
         if msgs.len() > 2 {
             let system_msg = msgs[0].clone();
-            let system_tokens = Self::estimate_message_tokens(&system_msg);
+            let system_tokens = self.estimate_message_tokens_with_fallback(&system_msg);
 
             let mut kept_tail: Vec<Value> = Vec::new();
             let mut tail_tokens = 0;
@@ -147,7 +180,7 @@ impl TokenBudget {
 
             // Walk backwards from the end, keeping messages that fit.
             for msg in msgs[1..].iter().rev() {
-                let msg_tokens = Self::estimate_message_tokens(msg);
+                let msg_tokens = self.estimate_message_tokens_with_fallback(msg);
                 if tail_tokens + msg_tokens <= remaining_budget {
                     kept_tail.push(msg.clone());
                     tail_tokens += msg_tokens;
@@ -162,7 +195,7 @@ impl TokenBudget {
             msgs = result;
         }
 
-        if Self::estimate_tokens(&msgs) <= budget {
+        if self.estimate_tokens_with_fallback(&msgs) <= budget {
             return msgs;
         }
 
@@ -328,5 +361,13 @@ mod tests {
         })];
         let tokens = TokenBudget::estimate_tool_def_tokens(&defs);
         assert!(tokens > 10, "tool def should have tokens, got {}", tokens);
+    }
+
+    #[test]
+    fn test_local_tokenizer_fallback_when_unavailable() {
+        let budget = TokenBudget::new(128000, 8192)
+            .with_tokenizer_endpoint(Some("http://127.0.0.1:1/tokenize".to_string()));
+        // Unreachable endpoint should gracefully fall back to heuristic.
+        assert_eq!(budget.estimate_str_tokens_with_fallback("hello"), 2);
     }
 }

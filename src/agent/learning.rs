@@ -4,7 +4,10 @@
 //! a short summary for injection into the system prompt.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,8 @@ use serde::{Deserialize, Serialize};
 /// Stores and retrieves tool outcome data.
 pub struct LearningStore {
     file_path: PathBuf,
+    lock_path: PathBuf,
+    legacy_file_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,20 +32,23 @@ struct LearningEntry {
 impl LearningStore {
     /// Create a new learning store rooted at the given workspace.
     ///
-    /// Data is stored at `{workspace}/memory/learnings.json`.
+    /// Data is stored at `{workspace}/memory/learnings.jsonl`.
+    /// Legacy `{workspace}/memory/learnings.json` is still read for backward
+    /// compatibility until the first prune/write.
     pub fn new(workspace: &Path) -> Self {
-        let file_path = workspace.join("memory").join("learnings.json");
-        Self { file_path }
+        let memory_dir = workspace.join("memory");
+        let file_path = memory_dir.join("learnings.jsonl");
+        let lock_path = memory_dir.join("learnings.lock");
+        let legacy_file_path = memory_dir.join("learnings.json");
+        Self {
+            file_path,
+            lock_path,
+            legacy_file_path,
+        }
     }
 
     /// Record a tool outcome.
-    pub fn record(
-        &self,
-        tool_name: &str,
-        succeeded: bool,
-        context: &str,
-        error: Option<&str>,
-    ) {
+    pub fn record(&self, tool_name: &str, succeeded: bool, context: &str, error: Option<&str>) {
         let entry = LearningEntry {
             timestamp: Utc::now().to_rfc3339(),
             tool_name: tool_name.to_string(),
@@ -49,9 +57,12 @@ impl LearningStore {
             error: error.map(|e| e.chars().take(200).collect()),
         };
 
-        let mut entries = self.load_entries();
-        entries.push(entry);
-        self.save_entries(&entries);
+        let _guard = match self.acquire_lock() {
+            Some(g) => g,
+            None => return,
+        };
+        self.ensure_parent_dir();
+        self.append_entry_jsonl(&entry);
     }
 
     /// Get a learning context summary for injection into the system prompt.
@@ -136,6 +147,11 @@ impl LearningStore {
 
     /// Prune entries older than 30 days.
     pub fn prune(&self) {
+        let _guard = match self.acquire_lock() {
+            Some(g) => g,
+            None => return,
+        };
+
         let mut entries = self.load_entries();
         let cutoff = Utc::now() - chrono::Duration::days(30);
         let cutoff_str = cutoff.to_rfc3339();
@@ -149,20 +165,107 @@ impl LearningStore {
     // ---------------------------------------------------------------
 
     fn load_entries(&self) -> Vec<LearningEntry> {
-        match fs::read_to_string(&self.file_path) {
+        // Prefer JSONL. If missing/empty, fall back to legacy JSON array.
+        let mut entries = self.load_entries_from_jsonl();
+        if entries.is_empty() && self.legacy_file_path.exists() {
+            entries = self.load_entries_from_legacy_json();
+        }
+        entries
+    }
+
+    fn save_entries(&self, entries: &[LearningEntry]) {
+        // Ensure parent directory exists.
+        self.ensure_parent_dir();
+
+        // Rewrite JSONL atomically via temp file + rename.
+        let tmp_path = self.file_path.with_extension("jsonl.tmp");
+        if let Ok(mut f) = fs::File::create(&tmp_path) {
+            for entry in entries {
+                if let Ok(line) = serde_json::to_string(entry) {
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+            let _ = f.sync_all();
+            let _ = fs::rename(&tmp_path, &self.file_path);
+        }
+    }
+
+    fn ensure_parent_dir(&self) {
+        if let Some(parent) = self.file_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+
+    fn append_entry_jsonl(&self, entry: &LearningEntry) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)
+        {
+            if let Ok(line) = serde_json::to_string(entry) {
+                let _ = writeln!(f, "{}", line);
+            }
+        }
+    }
+
+    fn load_entries_from_jsonl(&self) -> Vec<LearningEntry> {
+        let mut out: Vec<LearningEntry> = Vec::new();
+        let data = match fs::read_to_string(&self.file_path) {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<LearningEntry>(line) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    fn load_entries_from_legacy_json(&self) -> Vec<LearningEntry> {
+        match fs::read_to_string(&self.legacy_file_path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
 
-    fn save_entries(&self, entries: &[LearningEntry]) {
-        // Ensure parent directory exists.
-        if let Some(parent) = self.file_path.parent() {
-            let _ = fs::create_dir_all(parent);
+    fn acquire_lock(&self) -> Option<LearningLockGuard> {
+        self.ensure_parent_dir();
+        const MAX_ATTEMPTS: u32 = 50;
+        const RETRY_DELAY_MS: u64 = 20;
+        for _ in 0..MAX_ATTEMPTS {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.lock_path)
+            {
+                Ok(_) => {
+                    return Some(LearningLockGuard {
+                        lock_path: self.lock_path.clone(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+                }
+                Err(_) => return None,
+            }
         }
-        if let Ok(json) = serde_json::to_string_pretty(entries) {
-            let _ = fs::write(&self.file_path, json);
-        }
+        None
+    }
+}
+
+struct LearningLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for LearningLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
     }
 }
 
@@ -214,6 +317,17 @@ mod tests {
     }
 
     #[test]
+    fn test_record_writes_jsonl_lines() {
+        let (_tmp, store) = make_store();
+        store.record("read_file", true, "/tmp/a", None);
+        store.record("exec", false, "bad", Some("oops"));
+
+        let raw = fs::read_to_string(&store.file_path).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
     fn test_get_learning_context_all_success_no_report() {
         let (_tmp, store) = make_store();
 
@@ -261,5 +375,26 @@ mod tests {
         let entries = store.load_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].context, "new");
+    }
+
+    #[test]
+    fn test_load_entries_falls_back_to_legacy_json() {
+        let (_tmp, store) = make_store();
+        let legacy = vec![LearningEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            tool_name: "exec".to_string(),
+            succeeded: false,
+            context: "legacy".to_string(),
+            error: Some("legacy error".to_string()),
+        }];
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        if let Some(parent) = store.legacy_file_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&store.legacy_file_path, legacy_json).unwrap();
+
+        let entries = store.load_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].context, "legacy");
     }
 }

@@ -77,10 +77,7 @@ impl TelegramChannel {
         };
 
         let user_id = user.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        let username = user
-            .get("username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let username = user.get("username").and_then(|v| v.as_str()).unwrap_or("");
 
         // Build composite sender_id.
         let sender_id = if username.is_empty() {
@@ -95,7 +92,10 @@ impl TelegramChannel {
                 || allow_from.contains(&user_id.to_string())
                 || (!username.is_empty() && allow_from.contains(&username.to_string()));
             if !allowed {
-                debug!("Telegram: ignoring message from non-allowed sender {}", sender_id);
+                debug!(
+                    "Telegram: ignoring message from non-allowed sender {}",
+                    sender_id
+                );
                 return;
             }
         }
@@ -135,6 +135,8 @@ impl TelegramChannel {
         let mut is_voice_message = false;
         #[allow(unused_mut)]
         let mut voice_file_path: Option<String> = None;
+        #[allow(unused_mut)]
+        let mut detected_language: Option<String> = None;
         if let Some(voice) = message.get("voice") {
             if let Some(file_id) = voice.get("file_id").and_then(|v| v.as_str()) {
                 let media_path =
@@ -144,11 +146,16 @@ impl TelegramChannel {
                     {
                         if let Some(ref pipeline) = voice_pipeline {
                             match pipeline.transcribe_file(&path).await {
-                                Ok(text) => {
-                                    info!("Transcribed Telegram voice: \"{}\"", &text[..text.len().min(60)]);
+                                Ok((text, lang)) => {
+                                    info!(
+                                        "Transcribed Telegram voice: \"{}\" (lang: {})",
+                                        &text[..text.len().min(60)],
+                                        lang
+                                    );
                                     content_parts.push(text);
                                     is_voice_message = true;
                                     voice_file_path = Some(path);
+                                    detected_language = Some(lang);
                                 }
                                 Err(e) => {
                                     warn!("Voice transcription failed: {}", e);
@@ -178,8 +185,7 @@ impl TelegramChannel {
                     .and_then(|name| name.rsplit('.').next())
                     .map(|e| format!(".{}", e))
                     .unwrap_or_default();
-                let media_path =
-                    Self::_download_file(client, token, file_id, "file", &ext).await;
+                let media_path = Self::_download_file(client, token, file_id, "file", &ext).await;
                 if let Some(path) = media_path {
                     content_parts.push(format!("[file: {}]", path));
                 } else {
@@ -212,27 +218,22 @@ impl TelegramChannel {
             .map(|t| t != "private")
             .unwrap_or(false);
 
-        let mut msg = InboundMessage::new(
-            "telegram",
-            &sender_id,
-            &chat_id.to_string(),
-            &content,
-        );
+        let mut msg = InboundMessage::new("telegram", &sender_id, &chat_id.to_string(), &content);
         msg.metadata
             .insert("message_id".to_string(), json!(message_id));
-        msg.metadata
-            .insert("user_id".to_string(), json!(user_id));
-        msg.metadata
-            .insert("username".to_string(), json!(username));
-        msg.metadata
-            .insert("is_group".to_string(), json!(is_group));
+        msg.metadata.insert("user_id".to_string(), json!(user_id));
+        msg.metadata.insert("username".to_string(), json!(username));
+        msg.metadata.insert("is_group".to_string(), json!(is_group));
 
         if is_voice_message {
             msg.metadata
                 .insert("voice_message".to_string(), json!(true));
             if let Some(ref vf) = voice_file_path {
+                msg.metadata.insert("voice_file".to_string(), json!(vf));
+            }
+            if let Some(ref lang) = detected_language {
                 msg.metadata
-                    .insert("voice_file".to_string(), json!(vf));
+                    .insert("detected_language".to_string(), json!(lang));
             }
         }
 
@@ -260,10 +261,7 @@ impl TelegramChannel {
             .and_then(|v| v.as_str())?;
 
         // Step 2: download
-        let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            token, file_path
-        );
+        let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
         let bytes = client
             .get(&download_url)
             .send()
@@ -341,7 +339,9 @@ impl Channel for TelegramChannel {
                         if let Ok(data) = resp.json::<Value>().await {
                             if let Some(updates) = data.get("result").and_then(|v| v.as_array()) {
                                 for update in updates {
-                                    if let Some(update_id) = update.get("update_id").and_then(|v| v.as_i64()) {
+                                    if let Some(update_id) =
+                                        update.get("update_id").and_then(|v| v.as_i64())
+                                    {
                                         offset = update_id + 1;
                                     }
                                     TelegramChannel::_on_message(
@@ -404,8 +404,13 @@ impl Channel for TelegramChannel {
             if is_voice {
                 if let Some(ref pipeline) = self.voice_pipeline {
                     let tts_text = crate::strip_markdown_for_tts(&msg.content);
+                    let lang = msg
+                        .metadata
+                        .get("detected_language")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("en");
                     if !tts_text.is_empty() {
-                        match pipeline.synthesize_to_file(&tts_text).await {
+                        match pipeline.synthesize_to_file(&tts_text, lang).await {
                             Ok(ogg_path) => {
                                 let caption = if msg.content.len() > 1024 {
                                     &msg.content[..1024]

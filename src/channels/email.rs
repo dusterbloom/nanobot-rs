@@ -25,10 +25,7 @@ pub struct EmailChannel {
 
 impl EmailChannel {
     /// Create a new `EmailChannel`.
-    pub fn new(
-        config: EmailConfig,
-        bus_tx: UnboundedSender<InboundMessage>,
-    ) -> Self {
+    pub fn new(config: EmailConfig, bus_tx: UnboundedSender<InboundMessage>) -> Self {
         Self {
             config,
             bus_tx,
@@ -59,9 +56,15 @@ impl Channel for EmailChannel {
 
         let use_api = config.imap_host.contains("agentmail.to");
         if use_api {
-            info!("Starting email channel (agentmail.to API polling every {}s)...", config.poll_interval_secs);
+            info!(
+                "Starting email channel (agentmail.to API polling every {}s)...",
+                config.poll_interval_secs
+            );
         } else {
-            info!("Starting email channel (IMAP polling every {}s)...", config.poll_interval_secs);
+            info!(
+                "Starting email channel (IMAP polling every {}s)...",
+                config.poll_interval_secs
+            );
         }
 
         tokio::spawn(async move {
@@ -110,7 +113,10 @@ pub async fn poll_inbox(
     use futures_util::TryStreamExt;
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
-    debug!("Email: connecting to {}:{}", config.imap_host, config.imap_port);
+    debug!(
+        "Email: connecting to {}:{}",
+        config.imap_host, config.imap_port
+    );
     let tcp = tokio::net::TcpStream::connect((config.imap_host.as_str(), config.imap_port))
         .await
         .context("IMAP TCP connect failed")?;
@@ -133,7 +139,10 @@ pub async fn poll_inbox(
         .map_err(|e| anyhow::anyhow!("IMAP LOGIN failed: {}", e.0))?;
 
     debug!("Email: selecting INBOX");
-    session.select("INBOX").await.context("IMAP SELECT INBOX failed")?;
+    session
+        .select("INBOX")
+        .await
+        .context("IMAP SELECT INBOX failed")?;
 
     // Use UID SEARCH for better compatibility across IMAP servers.
     debug!("Email: searching for unseen messages (UID SEARCH)");
@@ -197,17 +206,10 @@ pub async fn poll_inbox(
                         continue;
                     }
 
-                    let message_id = parsed
-                        .message_id()
-                        .unwrap_or("")
-                        .to_string();
+                    let message_id = parsed.message_id().unwrap_or("").to_string();
 
-                    let mut inbound = InboundMessage::new(
-                        "email",
-                        &from,
-                        &format!("email:{}", from),
-                        &content,
-                    );
+                    let mut inbound =
+                        InboundMessage::new("email", &from, &format!("email:{}", from), &content);
                     inbound
                         .metadata
                         .insert("message_id".to_string(), json!(message_id));
@@ -215,11 +217,7 @@ pub async fn poll_inbox(
                         .metadata
                         .insert("subject".to_string(), json!(subject));
 
-                    debug!(
-                        "Email from {}: {}",
-                        from,
-                        &content[..content.len().min(50)]
-                    );
+                    debug!("Email from {}: {}", from, &content[..content.len().min(50)]);
 
                     let _ = bus_tx.send(inbound);
                 }
@@ -262,10 +260,7 @@ pub async fn poll_inbox_api(
     let client = reqwest::Client::new();
 
     // List unread messages.
-    let url = format!(
-        "https://api.agentmail.to/v0/inboxes/{}/messages",
-        inbox_id
-    );
+    let url = format!("https://api.agentmail.to/v0/inboxes/{}/messages", inbox_id);
     debug!("Email API: listing unread messages for {}", inbox_id);
 
     let resp = client
@@ -288,10 +283,7 @@ pub async fn poll_inbox_api(
 
     let data: serde_json::Value = resp.json().await.context("Failed to parse API response")?;
 
-    let messages = data["messages"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .clone();
+    let messages = data["messages"].as_array().unwrap_or(&Vec::new()).clone();
 
     if messages.is_empty() {
         debug!("Email API: no unread messages");
@@ -317,7 +309,10 @@ pub async fn poll_inbox_api(
 
         // Check allow list.
         if !config.allow_from.is_empty() && !config.allow_from.contains(&from) {
-            debug!("Email API: ignoring message from non-allowed sender {}", from);
+            debug!(
+                "Email API: ignoring message from non-allowed sender {}",
+                from
+            );
             continue;
         }
 
@@ -344,12 +339,7 @@ pub async fn poll_inbox_api(
             continue;
         }
 
-        let mut inbound = InboundMessage::new(
-            "email",
-            &from,
-            &format!("email:{}", from),
-            &content,
-        );
+        let mut inbound = InboundMessage::new("email", &from, &format!("email:{}", from), &content);
         inbound
             .metadata
             .insert("message_id".to_string(), json!(message_id));
@@ -460,10 +450,7 @@ pub async fn send_email(config: &EmailConfig, msg: &OutboundMessage) -> Result<(
     use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
     // chat_id format is "email:recipient@example.com".
-    let recipient = msg
-        .chat_id
-        .strip_prefix("email:")
-        .unwrap_or(&msg.chat_id);
+    let recipient = msg.chat_id.strip_prefix("email:").unwrap_or(&msg.chat_id);
 
     let from: Mailbox = config
         .username
@@ -568,11 +555,7 @@ mod tests {
 
     /// Helper: send a test email to self using send_email().
     async fn send_self(config: &EmailConfig, subject: &str, body: &str) {
-        let mut msg = OutboundMessage::new(
-            "email",
-            format!("email:{}", config.username),
-            body,
-        );
+        let mut msg = OutboundMessage::new("email", format!("email:{}", config.username), body);
         msg.metadata
             .insert("subject".to_string(), serde_json::json!(subject));
         send_email(config, &msg).await.expect("SMTP send failed");
@@ -603,7 +586,11 @@ mod tests {
             let result = channel.start().await;
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
-            assert!(err.contains("IMAP host"), "Should mention IMAP host, got: {}", err);
+            assert!(
+                err.contains("IMAP host"),
+                "Should mention IMAP host, got: {}",
+                err
+            );
         });
     }
 
@@ -618,7 +605,11 @@ mod tests {
             let result = channel.start().await;
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
-            assert!(err.contains("username/password"), "Should mention credentials, got: {}", err);
+            assert!(
+                err.contains("username/password"),
+                "Should mention credentials, got: {}",
+                err
+            );
         });
     }
 
@@ -693,7 +684,10 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
         let result = poll_inbox(&config, &tx).await;
-        assert!(result.is_err(), "Should fail connecting to unreachable host");
+        assert!(
+            result.is_err(),
+            "Should fail connecting to unreachable host"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("TCP connect") || err.contains("Connection refused"),
@@ -819,7 +813,8 @@ mod tests {
 
         // With "Re: " already present
         let mut msg2 = OutboundMessage::new("email", "email:recv@example.com", "body");
-        msg2.metadata.insert("subject".to_string(), json!("Re: Hello"));
+        msg2.metadata
+            .insert("subject".to_string(), json!("Re: Hello"));
         let _ = send_email(&config, &msg2).await;
 
         // Without subject metadata
@@ -835,7 +830,10 @@ mod tests {
     async fn test_smtp_send_basic() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let mut msg = OutboundMessage::new(
@@ -843,7 +841,8 @@ mod tests {
             format!("email:{}", config.username),
             "Hello from nanobot!",
         );
-        msg.metadata.insert("subject".to_string(), json!("Test Email"));
+        msg.metadata
+            .insert("subject".to_string(), json!("Test Email"));
 
         let result = send_email(&config, &msg).await;
         assert!(result.is_ok(), "SMTP send failed: {:?}", result.err());
@@ -853,7 +852,10 @@ mod tests {
     async fn test_smtp_send_without_subject_metadata() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         // No subject in metadata — should default to "Re: Your message"
@@ -863,14 +865,21 @@ mod tests {
             "Body without explicit subject",
         );
         let result = send_email(&config, &msg).await;
-        assert!(result.is_ok(), "Send without subject failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Send without subject failed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
     async fn test_smtp_send_with_threading_headers() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let mut msg = OutboundMessage::new(
@@ -878,18 +887,27 @@ mod tests {
             format!("email:{}", config.username),
             "This is a reply",
         );
-        msg.metadata.insert("subject".to_string(), json!("Thread Test"));
-        msg.metadata.insert("message_id".to_string(), json!("<abc123@example.com>"));
+        msg.metadata
+            .insert("subject".to_string(), json!("Thread Test"));
+        msg.metadata
+            .insert("message_id".to_string(), json!("<abc123@example.com>"));
 
         let result = send_email(&config, &msg).await;
-        assert!(result.is_ok(), "Send with threading failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Send with threading failed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
     async fn test_smtp_send_unicode_body() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let mut msg = OutboundMessage::new(
@@ -897,7 +915,8 @@ mod tests {
             format!("email:{}", config.username),
             "Unicode test: \u{1F600} \u{1F408} \u{2764}\u{FE0F} \u{00E9}\u{00E8}\u{00EA} \u{4F60}\u{597D}",
         );
-        msg.metadata.insert("subject".to_string(), json!("Unicode \u{1F30D}"));
+        msg.metadata
+            .insert("subject".to_string(), json!("Unicode \u{1F30D}"));
 
         let result = send_email(&config, &msg).await;
         assert!(result.is_ok(), "Unicode send failed: {:?}", result.err());
@@ -907,16 +926,17 @@ mod tests {
     async fn test_smtp_send_long_body() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let long_body = "A".repeat(50_000);
-        let mut msg = OutboundMessage::new(
-            "email",
-            format!("email:{}", config.username),
-            &long_body,
-        );
-        msg.metadata.insert("subject".to_string(), json!("Long Body Test"));
+        let mut msg =
+            OutboundMessage::new("email", format!("email:{}", config.username), &long_body);
+        msg.metadata
+            .insert("subject".to_string(), json!("Long Body Test"));
 
         let result = send_email(&config, &msg).await;
         assert!(result.is_ok(), "Long body send failed: {:?}", result.err());
@@ -926,19 +946,29 @@ mod tests {
     async fn test_imap_poll_empty_inbox() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
         let result = poll_inbox(&config, &tx).await;
-        assert!(result.is_ok(), "IMAP poll failed on empty inbox: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "IMAP poll failed on empty inbox: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
     async fn test_roundtrip_send_then_poll() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Roundtrip Test", "Integration test body").await;
@@ -949,15 +979,26 @@ mod tests {
 
         let inbound = &msgs[0];
         assert_eq!(inbound.channel, "email");
-        assert!(inbound.content.contains("Integration test body"), "Body mismatch: {}", inbound.content);
-        assert!(inbound.content.contains("Roundtrip Test"), "Subject missing: {}", inbound.content);
+        assert!(
+            inbound.content.contains("Integration test body"),
+            "Body mismatch: {}",
+            inbound.content
+        );
+        assert!(
+            inbound.content.contains("Roundtrip Test"),
+            "Subject missing: {}",
+            inbound.content
+        );
     }
 
     #[tokio::test]
     async fn test_roundtrip_message_metadata() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Metadata Test", "Check metadata fields").await;
@@ -985,7 +1026,10 @@ mod tests {
     async fn test_roundtrip_marks_as_seen() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Seen Test", "Should be marked as read").await;
@@ -997,14 +1041,21 @@ mod tests {
 
         // Second poll should find nothing (message was marked Seen).
         let msgs2 = poll_collect(&config).await;
-        assert_eq!(msgs2.len(), 0, "Second poll should find 0 messages (marked Seen)");
+        assert_eq!(
+            msgs2.len(),
+            0,
+            "Second poll should find 0 messages (marked Seen)"
+        );
     }
 
     #[tokio::test]
     async fn test_roundtrip_multiple_messages() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         // Send 3 emails.
@@ -1026,7 +1077,10 @@ mod tests {
     async fn test_roundtrip_body_only_no_subject() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         // Send with empty subject — content should be body only (no "Subject: " prefix).
@@ -1055,7 +1109,10 @@ mod tests {
     async fn test_roundtrip_unicode_preserved() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let unicode_body = "Caf\u{00E9} \u{4F60}\u{597D} \u{1F600}";
@@ -1076,7 +1133,10 @@ mod tests {
     async fn test_allow_from_filters_sender() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Filter Test", "Should be filtered").await;
@@ -1093,7 +1153,10 @@ mod tests {
     async fn test_allow_from_passes_matching_sender() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Allowed Test", "Should pass through").await;
@@ -1103,14 +1166,21 @@ mod tests {
         let mut allowed = config.clone();
         allowed.allow_from = vec![config.username.clone()];
         let msgs = poll_collect(&allowed).await;
-        assert_eq!(msgs.len(), 1, "Should pass allow_from filter with matching sender");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Should pass allow_from filter with matching sender"
+        );
     }
 
     #[tokio::test]
     async fn test_allow_from_empty_allows_all() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         send_self(&config, "Open Test", "No filter").await;
@@ -1126,7 +1196,10 @@ mod tests {
     async fn test_channel_start_stop() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
@@ -1143,7 +1216,10 @@ mod tests {
     async fn test_channel_start_stop_restart() {
         let config = match create_ethereal_account().await {
             Some(c) => c,
-            None => { eprintln!("Skipping: Ethereal unavailable"); return; }
+            None => {
+                eprintln!("Skipping: Ethereal unavailable");
+                return;
+            }
         };
 
         let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
@@ -1192,7 +1268,10 @@ mod tests {
             .from(from)
             .to(to)
             .subject("nanobot email channel test")
-            .body("Hello from nanobot!\n\nThis is a test email sent by the nanobot email channel.".to_string())
+            .body(
+                "Hello from nanobot!\n\nThis is a test email sent by the nanobot email channel."
+                    .to_string(),
+            )
             .expect("failed to build email");
 
         let creds = Credentials::new(smtp_user.clone(), password);
@@ -1211,7 +1290,10 @@ mod tests {
                 .build()
         };
 
-        println!("Sending from {} (auth: {}) to {} via {}:{}", from_addr, smtp_user, to_addr, smtp_host, smtp_port);
+        println!(
+            "Sending from {} (auth: {}) to {} via {}:{}",
+            from_addr, smtp_user, to_addr, smtp_host, smtp_port
+        );
         let result = mailer.send(email).await;
         match &result {
             Ok(resp) => println!("Email sent! Response: {:?}", resp),
@@ -1242,7 +1324,10 @@ mod tests {
             allow_from: Vec::new(),
         };
 
-        println!("Polling {}:{} as {}", config.imap_host, config.imap_port, config.username);
+        println!(
+            "Polling {}:{} as {}",
+            config.imap_host, config.imap_port, config.username
+        );
         let (tx, mut rx) = mpsc::unbounded_channel::<InboundMessage>();
         let result = poll_inbox(&config, &tx).await;
         match &result {
@@ -1250,9 +1335,12 @@ mod tests {
                 let mut count = 0;
                 while let Ok(m) = rx.try_recv() {
                     count += 1;
-                    println!("  Message {}: from={} subject={:?}",
-                        count, m.sender_id,
-                        m.metadata.get("subject").and_then(|v| v.as_str()));
+                    println!(
+                        "  Message {}: from={} subject={:?}",
+                        count,
+                        m.sender_id,
+                        m.metadata.get("subject").and_then(|v| v.as_str())
+                    );
                 }
                 println!("Poll succeeded: {} messages", count);
             }
@@ -1331,10 +1419,8 @@ mod tests {
             imap_port: 993,
             smtp_host: "smtp.agentmail.to".to_string(),
             smtp_port: 465,
-            username: std::env::var("TEST_AGENTMAIL_USER")
-                .expect("TEST_AGENTMAIL_USER required"),
-            password: std::env::var("TEST_AGENTMAIL_PASS")
-                .expect("TEST_AGENTMAIL_PASS required"),
+            username: std::env::var("TEST_AGENTMAIL_USER").expect("TEST_AGENTMAIL_USER required"),
+            password: std::env::var("TEST_AGENTMAIL_PASS").expect("TEST_AGENTMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
         };
@@ -1347,9 +1433,12 @@ mod tests {
                 let mut count = 0;
                 while let Ok(m) = rx.try_recv() {
                     count += 1;
-                    println!("  Message {}: from={} subject={:?}",
-                        count, m.sender_id,
-                        m.metadata.get("subject").and_then(|v| v.as_str()));
+                    println!(
+                        "  Message {}: from={} subject={:?}",
+                        count,
+                        m.sender_id,
+                        m.metadata.get("subject").and_then(|v| v.as_str())
+                    );
                 }
                 println!("API poll succeeded: {} messages", count);
             }

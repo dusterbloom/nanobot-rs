@@ -9,10 +9,11 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use super::base::{LLMProvider, LLMResponse, ToolCallRequest};
+use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -30,11 +31,7 @@ impl OpenAICompatProvider {
     /// - DeepSeek: detected by `deepseek` in the default model name
     /// - vLLM / custom: when an explicit `api_base` is provided that isn't OpenRouter
     /// - Default fallback: OpenRouter (`https://openrouter.ai/api/v1`)
-    pub fn new(
-        api_key: &str,
-        api_base: Option<&str>,
-        default_model: Option<&str>,
-    ) -> Self {
+    pub fn new(api_key: &str, api_base: Option<&str>, default_model: Option<&str>) -> Self {
         let default_model = default_model
             .unwrap_or("anthropic/claude-opus-4-5")
             .to_string();
@@ -113,7 +110,7 @@ impl LLMProvider for OpenAICompatProvider {
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("HTTP request to LLM failed: {}", e);
+                warn!("HTTP request to LLM failed (base={}): {}", self.api_base, e);
                 return Ok(LLMResponse {
                     content: Some(format!("Error calling LLM: {}", e)),
                     tool_calls: Vec::new(),
@@ -137,7 +134,10 @@ impl LLMProvider for OpenAICompatProvider {
         };
 
         if !status.is_success() {
-            warn!("LLM API returned status {}: {}", status, response_text);
+            warn!(
+                "LLM API returned status {} (base={}): {}",
+                status, self.api_base, response_text
+            );
             return Ok(LLMResponse {
                 content: Some(format!(
                     "Error calling LLM (HTTP {}): {}",
@@ -162,6 +162,71 @@ impl LLMProvider for OpenAICompatProvider {
         };
 
         parse_response(&data)
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+    ) -> Result<StreamHandle> {
+        let raw_model = model.unwrap_or(&self.default_model);
+        let model = if !self.api_base.contains("openrouter") {
+            raw_model.split('/').last().unwrap_or(raw_model)
+        } else {
+            raw_model
+        };
+        let url = format!("{}/chat/completions", self.api_base);
+
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": true,
+        });
+
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
+                body["tool_choice"] = serde_json::json!("auto");
+            }
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            warn!("LLM streaming API returned status {} (base={}): {}", status, self.api_base, error_text);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = tx.send(StreamChunk::Done(LLMResponse {
+                content: Some(format!("Error calling LLM (HTTP {}): {}", status, error_text)),
+                tool_calls: Vec::new(),
+                finish_reason: "error".to_string(),
+                usage: HashMap::new(),
+            }));
+            return Ok(StreamHandle { rx });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Spawn a task to parse the SSE stream
+        let byte_stream = response.bytes_stream();
+        tokio::spawn(async move {
+            parse_sse_stream(byte_stream, tx).await;
+        });
+
+        Ok(StreamHandle { rx })
     }
 
     fn get_default_model(&self) -> &str {
@@ -223,24 +288,21 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
                 .cloned()
                 .unwrap_or(serde_json::Value::String("{}".to_string()));
 
-            let arguments: HashMap<String, serde_json::Value> = if let Some(s) =
-                arguments_raw.as_str()
-            {
-                match serde_json::from_str(s) {
-                    Ok(map) => map,
-                    Err(_) => {
-                        let mut m = HashMap::new();
-                        m.insert("raw".to_string(), serde_json::Value::String(s.to_string()));
-                        m
+            let arguments: HashMap<String, serde_json::Value> =
+                if let Some(s) = arguments_raw.as_str() {
+                    match serde_json::from_str(s) {
+                        Ok(map) => map,
+                        Err(_) => {
+                            let mut m = HashMap::new();
+                            m.insert("raw".to_string(), serde_json::Value::String(s.to_string()));
+                            m
+                        }
                     }
-                }
-            } else if let Some(obj) = arguments_raw.as_object() {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+                } else if let Some(obj) = arguments_raw.as_object() {
+                    obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                } else {
+                    HashMap::new()
+                };
 
             tool_calls.push(ToolCallRequest {
                 id,
@@ -268,10 +330,200 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
     })
 }
 
+/// Parse an SSE byte stream from an OpenAI-compatible streaming response.
+///
+/// Emits `TextDelta` for each content delta and `Done` at the end with the
+/// fully assembled response. Tool call argument deltas are accumulated
+/// internally and only emitted in the final `Done`.
+async fn parse_sse_stream(
+    byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+) {
+    let mut line_buffer = String::new();
+    let mut full_content = String::new();
+    let mut finish_reason = String::from("stop");
+    let mut usage: HashMap<String, i64> = HashMap::new();
+
+    // Tool call accumulation: index → (id, name, arguments_json_str)
+    let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
+
+    let mut stream = Box::pin(byte_stream);
+
+    while let Some(result) = stream.next().await {
+        let bytes = match result {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("SSE stream error: {}", e);
+                break;
+            }
+        };
+
+        let text = String::from_utf8_lossy(&bytes);
+        line_buffer.push_str(&text);
+
+        // Process complete lines
+        while let Some(newline_pos) = line_buffer.find('\n') {
+            let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+            line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if !line.starts_with("data: ") {
+                continue;
+            }
+
+            let data = &line[6..];
+
+            if data == "[DONE]" {
+                // Stream is complete
+                let content = if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content.clone())
+                };
+
+                let mut tool_calls = Vec::new();
+                let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
+                indices.sort();
+                for idx in indices {
+                    let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+                    let arguments: HashMap<String, serde_json::Value> =
+                        match serde_json::from_str(&args_str) {
+                            Ok(map) => map,
+                            Err(_) => {
+                                let mut m = HashMap::new();
+                                m.insert(
+                                    "raw".to_string(),
+                                    serde_json::Value::String(args_str),
+                                );
+                                m
+                            }
+                        };
+                    tool_calls.push(ToolCallRequest {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+
+                let _ = tx.send(StreamChunk::Done(LLMResponse {
+                    content,
+                    tool_calls,
+                    finish_reason: finish_reason.clone(),
+                    usage: usage.clone(),
+                }));
+                return;
+            }
+
+            // Parse JSON chunk
+            let chunk: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("SSE parse error (skipping chunk): {}", e);
+                    continue;
+                }
+            };
+
+            // Extract from choices[0].delta
+            if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                if let Some(choice) = choices.first() {
+                    // Update finish_reason if present
+                    if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        finish_reason = fr.to_string();
+                    }
+
+                    if let Some(delta) = choice.get("delta") {
+                        // Text content delta
+                        if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                            if !content.is_empty() {
+                                full_content.push_str(content);
+                                let _ = tx.send(StreamChunk::TextDelta(content.to_string()));
+                            }
+                        }
+
+                        // Tool call deltas
+                        if let Some(tc_array) = delta.get("tool_calls").and_then(|v| v.as_array())
+                        {
+                            for tc in tc_array {
+                                let index =
+                                    tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let entry = tool_calls_acc
+                                    .entry(index)
+                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(function) = tc.get("function") {
+                                    if let Some(name) =
+                                        function.get("name").and_then(|v| v.as_str())
+                                    {
+                                        entry.1 = name.to_string();
+                                    }
+                                    if let Some(args) =
+                                        function.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        entry.2.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extract usage if present (some providers include it in the last chunk)
+            if let Some(usage_obj) = chunk.get("usage").and_then(|v| v.as_object()) {
+                for (key, value) in usage_obj {
+                    if let Some(n) = value.as_i64() {
+                        usage.insert(key.clone(), n);
+                    }
+                }
+            }
+        }
+    }
+
+    // Stream ended without [DONE] — emit whatever we have
+    let content = if full_content.is_empty() {
+        None
+    } else {
+        Some(full_content)
+    };
+
+    let mut tool_calls = Vec::new();
+    let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
+    indices.sort();
+    for idx in indices {
+        let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
+        let arguments: HashMap<String, serde_json::Value> = match serde_json::from_str(&args_str) {
+            Ok(map) => map,
+            Err(_) => {
+                let mut m = HashMap::new();
+                m.insert("raw".to_string(), serde_json::Value::String(args_str));
+                m
+            }
+        };
+        tool_calls.push(ToolCallRequest {
+            id,
+            name,
+            arguments,
+        });
+    }
+
+    let _ = tx.send(StreamChunk::Done(LLMResponse {
+        content,
+        tool_calls,
+        finish_reason,
+        usage,
+    }));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::base::LLMProvider;
+    use super::*;
 
     // ── parse_response tests ──────────────────────────────────────
 
@@ -470,16 +722,14 @@ mod tests {
 
     #[test]
     fn test_new_deepseek_detection() {
-        let provider =
-            OpenAICompatProvider::new("sk-something", None, Some("deepseek-chat"));
+        let provider = OpenAICompatProvider::new("sk-something", None, Some("deepseek-chat"));
         assert_eq!(provider.api_base, "https://api.deepseek.com");
         assert_eq!(provider.default_model, "deepseek-chat");
     }
 
     #[test]
     fn test_new_groq_detection() {
-        let provider =
-            OpenAICompatProvider::new("gsk_something", None, Some("groq/llama3"));
+        let provider = OpenAICompatProvider::new("gsk_something", None, Some("groq/llama3"));
         assert_eq!(provider.api_base, "https://api.groq.com/openai/v1");
         assert_eq!(provider.default_model, "groq/llama3");
     }
@@ -514,8 +764,7 @@ mod tests {
     #[test]
     fn test_new_openai_key_with_bare_model() {
         // sk- prefix with a non-routed model -> OpenAI direct.
-        let provider =
-            OpenAICompatProvider::new("sk-abc123", None, Some("gpt-4o"));
+        let provider = OpenAICompatProvider::new("sk-abc123", None, Some("gpt-4o"));
         assert_eq!(provider.api_base, "https://api.openai.com/v1");
     }
 

@@ -4,6 +4,32 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+/// Structured outcome for a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionResult {
+    pub ok: bool,
+    pub data: String,
+    pub error: Option<String>,
+}
+
+impl ToolExecutionResult {
+    pub fn success(data: String) -> Self {
+        Self {
+            ok: true,
+            data,
+            error: None,
+        }
+    }
+
+    pub fn failure(message: String) -> Self {
+        Self {
+            ok: false,
+            data: format!("Error: {}", message),
+            error: Some(message),
+        }
+    }
+}
+
 /// Abstract base trait for agent tools.
 ///
 /// Tools are capabilities that the agent can use to interact with
@@ -23,6 +49,27 @@ pub trait Tool: Send + Sync {
     ///
     /// Returns the result as a string.
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String;
+
+    /// Execute and return a structured outcome.
+    ///
+    /// Tools can override this to report explicit success/failure semantics.
+    /// The default implementation keeps backward compatibility and maps
+    /// `Error:`-prefixed outputs to failures.
+    async fn execute_with_result(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let out = self.execute(params).await;
+        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            ToolExecutionResult {
+                ok: false,
+                data: out,
+                error: Some(err),
+            }
+        } else {
+            ToolExecutionResult::success(out)
+        }
+    }
 
     /// Convert tool to OpenAI function schema format.
     fn to_schema(&self) -> serde_json::Value {
@@ -141,5 +188,46 @@ mod tests {
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert_eq!(result, "executed with: none");
+    }
+
+    #[tokio::test]
+    async fn test_mock_tool_execute_with_result_success() {
+        let tool = MockTool;
+        let mut params = HashMap::new();
+        params.insert(
+            "input".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
+        let result = tool.execute_with_result(params).await;
+        assert!(result.ok);
+        assert_eq!(result.data, "executed with: hello");
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mock_tool_execute_with_result_error_prefix() {
+        struct ErrorTool;
+
+        #[async_trait]
+        impl Tool for ErrorTool {
+            fn name(&self) -> &str {
+                "error_tool"
+            }
+            fn description(&self) -> &str {
+                "Returns an error string"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+                "Error: bad input".to_string()
+            }
+        }
+
+        let tool = ErrorTool;
+        let result = tool.execute_with_result(HashMap::new()).await;
+        assert!(!result.ok);
+        assert_eq!(result.data, "Error: bad input");
+        assert_eq!(result.error.as_deref(), Some("bad input"));
     }
 }

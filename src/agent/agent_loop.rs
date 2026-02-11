@@ -8,60 +8,173 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
+use crate::agent::observer::ObservationStore;
+use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
-    CheckInboxTool, CronScheduleTool, ExecTool, ListDirTool, MessageTool, ReadFileTool,
-    SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteFileTool, EditFileTool,
+    CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
+    ReadFileTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::config::schema::EmailConfig;
+use crate::config::schema::{EmailConfig, MemoryConfig};
 use crate::cron::service::CronService;
-use crate::providers::base::LLMProvider;
+use crate::providers::base::{LLMProvider, StreamChunk};
+use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::session::manager::SessionManager;
 
 // ---------------------------------------------------------------------------
-// Shared state (Arc-wrapped for concurrent access)
+// Shared core (identical across all agents, swappable on /local toggle)
 // ---------------------------------------------------------------------------
 
-/// Shared state that is accessed by concurrent message-processing tasks.
+/// Core state shared identically across all agent instances.
 ///
-/// All fields are either `Send + Sync` naturally or wrapped in synchronization
-/// primitives. The `sessions` field uses internal locking; all other fields
-/// are read-only after construction.
-struct AgentLoopShared {
+/// When the user toggles `/local` or `/model`, a new `SharedCore` is built
+/// and swapped into the handle so every agent sees the change.
+pub struct SharedCore {
+    pub provider: Arc<dyn LLMProvider>,
+    pub workspace: PathBuf,
+    pub model: String,
+    pub max_iterations: u32,
+    pub max_tokens: u32,
+    pub temperature: f64,
+    pub context: ContextBuilder,
+    pub sessions: SessionManager,
+    pub token_budget: TokenBudget,
+    pub compactor: ContextCompactor,
+    pub learning: LearningStore,
+    pub brave_api_key: Option<String>,
+    pub exec_timeout: u64,
+    pub restrict_to_workspace: bool,
+    pub memory_enabled: bool,
+    pub memory_provider: Arc<dyn LLMProvider>,
+    pub memory_model: String,
+    pub reflection_threshold: usize,
+    pub learning_turn_counter: AtomicU64,
+    pub last_context_used: AtomicU64,
+    pub last_context_max: AtomicU64,
+}
+
+/// Handle for hot-swapping the shared core.
+///
+/// Readers clone the inner `Arc<SharedCore>` under a brief read lock.
+/// Writers (only `/local` toggle) take the write lock to replace the inner Arc.
+pub type SharedCoreHandle = Arc<std::sync::RwLock<Arc<SharedCore>>>;
+
+/// Build a `SharedCore` from the given parameters.
+///
+/// When `is_local` is true, the compactor and memory operations use a dedicated
+/// `compaction_provider` if supplied (e.g. a CPU-only Qwen3-0.6B server), or
+/// fall back to the main (local) provider.
+pub fn build_shared_core(
     provider: Arc<dyn LLMProvider>,
     workspace: PathBuf,
     model: String,
     max_iterations: u32,
     max_tokens: u32,
     temperature: f64,
-    context: ContextBuilder,
-    sessions: SessionManager,
-    subagents: Arc<SubagentManager>,
-    token_budget: TokenBudget,
-    compactor: ContextCompactor,
-    learning: LearningStore,
-    bus_outbound_tx: UnboundedSender<OutboundMessage>,
-    bus_inbound_tx: UnboundedSender<InboundMessage>,
-    // Parameters for building per-message tool registries.
+    max_context_tokens: usize,
     brave_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
+    memory_config: MemoryConfig,
+    is_local: bool,
+    compaction_provider: Option<Arc<dyn LLMProvider>>,
+) -> SharedCore {
+    let mut context = ContextBuilder::new(&workspace);
+    context.model_name = model.clone();
+    context.observation_budget = memory_config.observation_budget;
+    let sessions = SessionManager::new(&workspace);
+
+    // When local, use dedicated compaction provider if available, else main provider.
+    let (memory_provider, memory_model): (Arc<dyn LLMProvider>, String) = if is_local {
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        if let Some(cp) = compaction_provider {
+            (cp, m)
+        } else {
+            (provider.clone(), m)
+        }
+    } else if let Some(ref mem_provider_cfg) = memory_config.provider {
+        let p: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+            &mem_provider_cfg.api_key,
+            mem_provider_cfg
+                .api_base
+                .as_deref()
+                .or(Some("http://localhost:8080/v1")),
+            None,
+        ));
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        (p, m)
+    } else {
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        (provider.clone(), m)
+    };
+
+    let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone());
+    let learning = LearningStore::new(&workspace);
+
+    SharedCore {
+        provider,
+        workspace,
+        model,
+        max_iterations,
+        max_tokens,
+        temperature,
+        context,
+        sessions,
+        token_budget,
+        compactor,
+        learning,
+        brave_api_key,
+        exec_timeout,
+        restrict_to_workspace,
+        memory_enabled: memory_config.enabled,
+        memory_provider,
+        memory_model,
+        reflection_threshold: memory_config.reflection_threshold,
+        learning_turn_counter: AtomicU64::new(0),
+        last_context_used: AtomicU64::new(0),
+        last_context_max: AtomicU64::new(max_context_tokens as u64),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-instance state (different per agent)
+// ---------------------------------------------------------------------------
+
+/// Per-instance state that differs between the REPL agent and gateway agents.
+struct AgentLoopShared {
+    core_handle: SharedCoreHandle,
+    subagents: Arc<SubagentManager>,
+    bus_outbound_tx: UnboundedSender<OutboundMessage>,
+    bus_inbound_tx: UnboundedSender<InboundMessage>,
     cron_service: Option<Arc<CronService>>,
     email_config: Option<EmailConfig>,
     repl_display_tx: Option<UnboundedSender<String>>,
@@ -71,9 +184,9 @@ impl AgentLoopShared {
     /// Build a fresh [`ToolRegistry`] with context-sensitive tools (message,
     /// spawn, cron) pre-configured for a specific channel/chat_id.
     ///
-    /// This eliminates the shared-context race condition: each concurrent
-    /// message-processing task gets its own tools with the correct context.
-    fn build_tools(&self, channel: &str, chat_id: &str) -> ToolRegistry {
+    /// Takes a snapshot of `SharedCore` so the registry is consistent for the
+    /// entire message processing.
+    async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
 
         // File system tools (stateless).
@@ -84,15 +197,15 @@ impl AgentLoopShared {
 
         // Shell (stateless config).
         tools.register(Box::new(ExecTool::new(
-            self.exec_timeout,
-            Some(self.workspace.to_string_lossy().to_string()),
+            core.exec_timeout,
+            Some(core.workspace.to_string_lossy().to_string()),
             None,
             None,
-            self.restrict_to_workspace,
+            core.restrict_to_workspace,
         )));
 
         // Web (stateless config).
-        tools.register(Box::new(WebSearchTool::new(self.brave_api_key.clone(), 5)));
+        tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
         tools.register(Box::new(WebFetchTool::new(50_000)));
 
         // Message tool - context baked in.
@@ -114,28 +227,15 @@ impl AgentLoopShared {
             Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
         });
         let spawn_tool = Arc::new(SpawnTool::new());
-        // Set callback and context synchronously (tool is fresh, no contention).
-        {
-            let st = spawn_tool.clone();
-            let cb = spawn_cb;
-            let ch = channel.to_string();
-            let cid = chat_id.to_string();
-            tokio::spawn(async move {
-                st.set_callback(cb).await;
-                st.set_context(&ch, &cid).await;
-            });
-        }
+        // Set callback and context before registering so they're ready for use.
+        spawn_tool.set_callback(spawn_cb).await;
+        spawn_tool.set_context(channel, chat_id).await;
         tools.register(Box::new(SpawnToolProxy(spawn_tool)));
 
         // Cron tool (optional) - context baked in.
         if let Some(ref svc) = self.cron_service {
             let ct = Arc::new(CronScheduleTool::new(svc.clone()));
-            let ct2 = ct.clone();
-            let ch = channel.to_string();
-            let cid = chat_id.to_string();
-            tokio::spawn(async move {
-                ct2.set_context(&ch, &cid).await;
-            });
+            ct.set_context(channel, chat_id).await;
             tools.register(Box::new(CronToolProxy(ct)));
         }
 
@@ -153,6 +253,13 @@ impl AgentLoopShared {
     /// This method takes `&self` and is safe to call from multiple concurrent
     /// tasks. Per-message tool instances eliminate shared-context races.
     async fn process_message(&self, msg: &InboundMessage) -> Option<OutboundMessage> {
+        // Snapshot core — instant Arc clone under brief read lock.
+        let core = self.core_handle.read().unwrap().clone();
+        let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if turn_count % 50 == 0 {
+            core.learning.prune();
+        }
+
         let session_key = msg
             .metadata
             .get("session_key")
@@ -168,10 +275,10 @@ impl AgentLoopShared {
         );
 
         // Build per-message tools with context baked in.
-        let tools = self.build_tools(&msg.channel, &msg.chat_id);
+        let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
         // Get session history.
-        let history = self.sessions.get_history(&session_key, 100).await;
+        let history = core.sessions.get_history(&session_key, 100).await;
 
         // Extract media paths.
         let media_paths: Vec<String> = msg
@@ -186,10 +293,17 @@ impl AgentLoopShared {
             .unwrap_or_default();
 
         // Build messages.
-        let is_voice_message = msg.metadata.get("voice_message")
+        let is_voice_message = msg
+            .metadata
+            .get("voice_message")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let mut messages = self.context.build_messages(
+        let detected_language = msg
+            .metadata
+            .get("detected_language")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut messages = core.context.build_messages(
             &history,
             &msg.content,
             None,
@@ -201,24 +315,50 @@ impl AgentLoopShared {
             Some(&msg.channel),
             Some(&msg.chat_id),
             is_voice_message,
+            detected_language.as_deref(),
         );
 
         // Track which tools have been used for smart tool selection.
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Pre-loop compaction: summarize old messages if over budget.
-        let initial_tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
-        let initial_tool_tokens = TokenBudget::estimate_tool_def_tokens(&initial_tool_defs);
-        messages = self
-            .compactor
-            .compact(&messages, &self.token_budget, initial_tool_tokens)
-            .await;
+        // When a dedicated compaction server is available (local mode with Qwen3-0.6B),
+        // this works great. When it's not, the ContextCompactor's Stage 1 failure is
+        // handled gracefully (falls back to trim_to_fit in the loop below).
+        {
+            let initial_tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            let initial_tool_tokens = core
+                .token_budget
+                .estimate_tool_def_tokens_with_fallback(&initial_tool_defs);
+            let compaction_result = core
+                .compactor
+                .compact(&messages, &core.token_budget, initial_tool_tokens)
+                .await;
+            messages = compaction_result.messages;
+
+            // Persist observation in background — never blocks user chat.
+            if core.memory_enabled {
+                if let Some(summary) = compaction_result.observation {
+                    let workspace = core.workspace.clone();
+                    let obs_session_key = session_key.clone();
+                    let obs_channel = msg.channel.clone();
+                    tokio::spawn(async move {
+                        let observer = ObservationStore::new(&workspace);
+                        if let Err(e) =
+                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
+                        {
+                            tracing::warn!("Failed to save observation: {}", e);
+                        }
+                    });
+                }
+            }
+        }
 
         let mut final_content = String::new();
 
         // Agent loop: call LLM, handle tool calls, repeat.
-        for iteration in 0..self.max_iterations {
-            debug!("Agent iteration {}/{}", iteration + 1, self.max_iterations);
+        for iteration in 0..core.max_iterations {
+            debug!("Agent iteration {}/{}", iteration + 1, core.max_iterations);
 
             // Filter tool definitions to relevant tools.
             let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
@@ -229,21 +369,22 @@ impl AgentLoopShared {
             };
 
             // Trim messages to fit context budget.
-            let tool_def_tokens =
-                TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-            messages = self.token_budget.trim_to_fit(&messages, tool_def_tokens);
+            let tool_def_tokens = core
+                .token_budget
+                .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
+            messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
 
             // Repair any protocol violations before calling the LLM.
             thread_repair::repair_messages(&mut messages);
 
-            let response = match self
+            let response = match core
                 .provider
                 .chat(
                     &messages,
                     tool_defs_opt,
-                    Some(&self.model),
-                    self.max_tokens,
-                    self.temperature,
+                    Some(&core.model),
+                    core.max_tokens,
+                    core.temperature,
                 )
                 .await
             {
@@ -283,13 +424,13 @@ impl AgentLoopShared {
                 for tc in &response.tool_calls {
                     debug!("Executing tool: {} (id: {})", tc.name, tc.id);
                     let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-                    debug!("Tool {} result ({}B)", tc.name, result.len());
-                    ContextBuilder::add_tool_result(
-                        &mut messages,
-                        &tc.id,
-                        &tc.name,
-                        &result,
+                    debug!(
+                        "Tool {} result ({}B, ok={})",
+                        tc.name,
+                        result.data.len(),
+                        result.ok
                     );
+                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
 
                     // Track used tools.
                     used_tools.insert(tc.name.clone());
@@ -304,12 +445,11 @@ impl AgentLoopShared {
                         .chars()
                         .take(100)
                         .collect();
-                    let succeeded = !result.starts_with("Error:");
-                    self.learning.record(
+                    core.learning.record(
                         &tc.name,
-                        succeeded,
+                        result.ok,
                         &context_str,
-                        if succeeded { None } else { Some(&result) },
+                        result.error.as_deref(),
                     );
                 }
             } else {
@@ -319,17 +459,24 @@ impl AgentLoopShared {
             }
         }
 
+        // Store context stats for status bar.
+        let final_tokens = core.token_budget.estimate_tokens_with_fallback(&messages) as u64;
+        core.last_context_used
+            .store(final_tokens, Ordering::Relaxed);
+        core.last_context_max
+            .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
+
         if final_content.is_empty() && messages.len() > 2 {
-            final_content = "I completed the requested actions.".to_string();
+            final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
         }
 
         // Update session history.
         if final_content.is_empty() {
-            self.sessions
+            core.sessions
                 .add_message_and_save(&session_key, "user", &msg.content)
                 .await;
         } else {
-            self.sessions
+            core.sessions
                 .add_messages_and_save(
                     &session_key,
                     &[("user", &msg.content), ("assistant", &final_content)],
@@ -340,14 +487,288 @@ impl AgentLoopShared {
         if final_content.is_empty() {
             None
         } else {
-            let mut outbound = OutboundMessage::new(
-                &msg.channel,
-                &msg.chat_id,
-                &final_content,
-            );
+            let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
             // Propagate voice_message metadata so channels know to reply with voice.
-            if msg.metadata.get("voice_message").and_then(|v| v.as_bool()).unwrap_or(false) {
-                outbound.metadata.insert("voice_message".to_string(), json!(true));
+            if msg
+                .metadata
+                .get("voice_message")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                outbound
+                    .metadata
+                    .insert("voice_message".to_string(), json!(true));
+            }
+            // Propagate detected_language for TTS voice selection.
+            if let Some(lang) = msg.metadata.get("detected_language") {
+                outbound
+                    .metadata
+                    .insert("detected_language".to_string(), lang.clone());
+            }
+            Some(outbound)
+        }
+    }
+
+    /// Process a message with streaming: text deltas are forwarded to
+    /// `text_delta_tx` as they arrive from the LLM. The full response text
+    /// is still returned for session history.
+    async fn process_message_streaming(
+        &self,
+        msg: &InboundMessage,
+        text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Option<OutboundMessage> {
+        let core = self.core_handle.read().unwrap().clone();
+        let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if turn_count % 50 == 0 {
+            core.learning.prune();
+        }
+
+        let session_key = msg
+            .metadata
+            .get("session_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id));
+
+        debug!(
+            "Processing message (streaming) from {} on {}: {}",
+            msg.sender_id,
+            msg.channel,
+            &msg.content[..msg.content.len().min(80)]
+        );
+
+        let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+
+        let history = core.sessions.get_history(&session_key, 100).await;
+
+        let media_paths: Vec<String> = msg
+            .metadata
+            .get("media")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let is_voice_message = msg
+            .metadata
+            .get("voice_message")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let detected_language = msg
+            .metadata
+            .get("detected_language")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut messages = core.context.build_messages(
+            &history,
+            &msg.content,
+            None,
+            if media_paths.is_empty() {
+                None
+            } else {
+                Some(&media_paths)
+            },
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+            is_voice_message,
+            detected_language.as_deref(),
+        );
+
+        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Pre-loop compaction
+        {
+            let initial_tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            let initial_tool_tokens = core
+                .token_budget
+                .estimate_tool_def_tokens_with_fallback(&initial_tool_defs);
+            let compaction_result = core
+                .compactor
+                .compact(&messages, &core.token_budget, initial_tool_tokens)
+                .await;
+            messages = compaction_result.messages;
+
+            if core.memory_enabled {
+                if let Some(summary) = compaction_result.observation {
+                    let workspace = core.workspace.clone();
+                    let obs_session_key = session_key.clone();
+                    let obs_channel = msg.channel.clone();
+                    tokio::spawn(async move {
+                        let observer = ObservationStore::new(&workspace);
+                        if let Err(e) =
+                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
+                        {
+                            tracing::warn!("Failed to save observation: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+
+        let mut final_content = String::new();
+
+        for iteration in 0..core.max_iterations {
+            debug!("Agent iteration (streaming) {}/{}", iteration + 1, core.max_iterations);
+
+            let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+                None
+            } else {
+                Some(&tool_defs)
+            };
+
+            let tool_def_tokens = core
+                .token_budget
+                .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
+            messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
+            thread_repair::repair_messages(&mut messages);
+
+            // Use streaming API
+            let mut stream = match core
+                .provider
+                .chat_stream(
+                    &messages,
+                    tool_defs_opt,
+                    Some(&core.model),
+                    core.max_tokens,
+                    core.temperature,
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LLM streaming call failed: {}", e);
+                    final_content = format!("I encountered an error: {}", e);
+                    break;
+                }
+            };
+
+            // Consume stream chunks
+            let mut response = None;
+            while let Some(chunk) = stream.rx.recv().await {
+                match chunk {
+                    StreamChunk::TextDelta(delta) => {
+                        // Forward text deltas for TTS pipeline
+                        let _ = text_delta_tx.send(delta);
+                    }
+                    StreamChunk::Done(resp) => {
+                        response = Some(resp);
+                    }
+                }
+            }
+
+            let response = match response {
+                Some(r) => r,
+                None => {
+                    error!("LLM stream ended without Done");
+                    final_content = "I encountered a streaming error.".to_string();
+                    break;
+                }
+            };
+
+            if response.has_tool_calls() {
+                let tc_json: Vec<Value> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": serde_json::to_string(&tc.arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            }
+                        })
+                    })
+                    .collect();
+
+                ContextBuilder::add_assistant_message(
+                    &mut messages,
+                    response.content.as_deref(),
+                    Some(&tc_json),
+                );
+
+                for tc in &response.tool_calls {
+                    debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+                    let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                    debug!(
+                        "Tool {} result ({}B, ok={})",
+                        tc.name,
+                        result.data.len(),
+                        result.ok
+                    );
+                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+                    used_tools.insert(tc.name.clone());
+
+                    let context_str: String = tc
+                        .arguments
+                        .values()
+                        .filter_map(|v| v.as_str())
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(100)
+                        .collect();
+                    core.learning.record(
+                        &tc.name,
+                        result.ok,
+                        &context_str,
+                        result.error.as_deref(),
+                    );
+                }
+            } else {
+                final_content = response.content.unwrap_or_default();
+                break;
+            }
+        }
+
+        // Store context stats
+        let final_tokens = core.token_budget.estimate_tokens_with_fallback(&messages) as u64;
+        core.last_context_used
+            .store(final_tokens, Ordering::Relaxed);
+        core.last_context_max
+            .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
+
+        if final_content.is_empty() && messages.len() > 2 {
+            final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+        }
+
+        // Update session history
+        if final_content.is_empty() {
+            core.sessions
+                .add_message_and_save(&session_key, "user", &msg.content)
+                .await;
+        } else {
+            core.sessions
+                .add_messages_and_save(
+                    &session_key,
+                    &[("user", &msg.content), ("assistant", &final_content)],
+                )
+                .await;
+        }
+
+        if final_content.is_empty() {
+            None
+        } else {
+            let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
+            if msg
+                .metadata
+                .get("voice_message")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                outbound
+                    .metadata
+                    .insert("voice_message".to_string(), json!(true));
+            }
+            if let Some(lang) = msg.metadata.get("detected_language") {
+                outbound
+                    .metadata
+                    .insert("detected_language".to_string(), lang.clone());
             }
             Some(outbound)
         }
@@ -371,67 +792,39 @@ pub struct AgentLoop {
     bus_inbound_rx: UnboundedReceiver<InboundMessage>,
     running: Arc<AtomicBool>,
     max_concurrent_chats: usize,
+    reflection_spawned: AtomicBool,
 }
 
 impl AgentLoop {
     /// Create a new `AgentLoop`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        core_handle: SharedCoreHandle,
         bus_inbound_rx: UnboundedReceiver<InboundMessage>,
         bus_outbound_tx: UnboundedSender<OutboundMessage>,
         bus_inbound_tx: UnboundedSender<InboundMessage>,
-        provider: Arc<dyn LLMProvider>,
-        workspace: PathBuf,
-        model: String,
-        max_iterations: u32,
-        max_tokens: u32,
-        temperature: f64,
-        max_context_tokens: usize,
-        brave_api_key: Option<String>,
-        exec_timeout: u64,
-        restrict_to_workspace: bool,
         cron_service: Option<Arc<CronService>>,
         max_concurrent_chats: usize,
         email_config: Option<EmailConfig>,
         repl_display_tx: Option<UnboundedSender<String>>,
     ) -> Self {
-        let mut context = ContextBuilder::new(&workspace);
-        context.model_name = model.clone();
-        let sessions = SessionManager::new(&workspace);
-
-        // Create the subagent manager.
+        // Read core to initialize the subagent manager.
+        let core = core_handle.read().unwrap().clone();
         let subagents = Arc::new(SubagentManager::new(
-            provider.clone(),
-            workspace.clone(),
+            core.provider.clone(),
+            core.workspace.clone(),
             bus_inbound_tx.clone(),
-            model.clone(),
-            brave_api_key.clone(),
-            exec_timeout,
-            restrict_to_workspace,
+            core.model.clone(),
+            core.brave_api_key.clone(),
+            core.exec_timeout,
+            core.restrict_to_workspace,
         ));
 
-        let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
-        let compactor = ContextCompactor::new(provider.clone(), model.clone());
-        let learning = LearningStore::new(&workspace);
-
         let shared = Arc::new(AgentLoopShared {
-            provider,
-            workspace,
-            model,
-            max_iterations,
-            max_tokens,
-            temperature,
-            context,
-            sessions,
+            core_handle,
             subagents,
-            token_budget,
-            compactor,
-            learning,
             bus_outbound_tx,
             bus_inbound_tx,
-            brave_api_key,
-            exec_timeout,
-            restrict_to_workspace,
             cron_service,
             email_config,
             repl_display_tx,
@@ -442,6 +835,31 @@ impl AgentLoop {
             bus_inbound_rx,
             running: Arc::new(AtomicBool::new(false)),
             max_concurrent_chats,
+            reflection_spawned: AtomicBool::new(false),
+        }
+    }
+
+    /// Spawn a background reflection task if observations exceed threshold.
+    fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
+        let core = shared.core_handle.read().unwrap().clone();
+        if !core.memory_enabled {
+            return;
+        }
+        let reflector = Reflector::new(
+            core.memory_provider.clone(),
+            core.memory_model.clone(),
+            &core.workspace,
+            core.reflection_threshold,
+        );
+        if reflector.should_reflect() {
+            tokio::spawn(async move {
+                info!("Background: reflecting on accumulated observations...");
+                if let Err(e) = reflector.reflect().await {
+                    warn!("Background reflection failed: {}", e);
+                } else {
+                    info!("Background reflection complete — MEMORY.md updated");
+                }
+            });
         }
     }
 
@@ -456,17 +874,17 @@ impl AgentLoop {
             self.max_concurrent_chats
         );
 
+        // Spawn background reflection if observations have accumulated.
+        Self::spawn_background_reflection(&self.shared);
+
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
         // Per-session locks to serialize messages within the same conversation.
         let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         while self.running.load(Ordering::SeqCst) {
-            let msg = match tokio::time::timeout(
-                Duration::from_secs(1),
-                self.bus_inbound_rx.recv(),
-            )
-            .await
+            let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus_inbound_rx.recv())
+                .await
             {
                 Ok(Some(msg)) => msg,
                 Ok(None) => {
@@ -562,6 +980,11 @@ impl AgentLoop {
         info!("Agent loop stopped");
     }
 
+    /// Return a handle to the subagent manager.
+    pub fn subagent_manager(&self) -> Arc<SubagentManager> {
+        self.shared.subagents.clone()
+    }
+
     /// Signal the agent loop to stop.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
@@ -576,11 +999,67 @@ impl AgentLoop {
         channel: &str,
         chat_id: &str,
     ) -> String {
+        self.process_direct_with_lang(content, session_key, channel, chat_id, None)
+            .await
+    }
+
+    /// Like `process_direct` but allows passing a detected language code
+    /// (e.g. "it", "es") so the LLM responds in that language.
+    pub async fn process_direct_with_lang(
+        &self,
+        content: &str,
+        session_key: &str,
+        channel: &str,
+        chat_id: &str,
+        detected_language: Option<&str>,
+    ) -> String {
+        // Spawn background reflection once per session (on first message).
+        if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
+            Self::spawn_background_reflection(&self.shared);
+        }
+
         let mut msg = InboundMessage::new(channel, "user", chat_id, content);
         msg.metadata
             .insert("session_key".to_string(), json!(session_key));
+        if let Some(lang) = detected_language {
+            msg.metadata
+                .insert("detected_language".to_string(), json!(lang));
+        }
 
         match self.shared.process_message(&msg).await {
+            Some(response) => response.content,
+            None => String::new(),
+        }
+    }
+
+    /// Like `process_direct_with_lang` but streams text deltas to `text_delta_tx`
+    /// as they arrive from the LLM. Returns the full response text.
+    pub async fn process_direct_streaming(
+        &self,
+        content: &str,
+        session_key: &str,
+        channel: &str,
+        chat_id: &str,
+        detected_language: Option<&str>,
+        text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> String {
+        if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
+            Self::spawn_background_reflection(&self.shared);
+        }
+
+        let mut msg = InboundMessage::new(channel, "user", chat_id, content);
+        msg.metadata
+            .insert("session_key".to_string(), json!(session_key));
+        if let Some(lang) = detected_language {
+            msg.metadata
+                .insert("detected_language".to_string(), json!(lang));
+        }
+
+        match self
+            .shared
+            .process_message_streaming(&msg, text_delta_tx)
+            .await
+        {
             Some(response) => response.content,
             None => String::new(),
         }

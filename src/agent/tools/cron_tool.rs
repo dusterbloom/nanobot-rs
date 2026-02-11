@@ -8,7 +8,6 @@ use tokio::sync::Mutex;
 
 use super::base::Tool;
 use crate::cron::service::CronService;
-use crate::cron::types::CronSchedule;
 
 /// Tool to schedule reminders and recurring tasks.
 pub struct CronScheduleTool {
@@ -51,19 +50,11 @@ impl CronScheduleTool {
             return "Error: no session context (channel/chat_id)".to_string();
         }
 
-        // Build schedule.
-        let schedule = if let Some(secs) = every_seconds {
-            CronSchedule {
-                kind: "every".to_string(),
-                every_ms: Some(secs * 1000),
-                ..Default::default()
-            }
+        // Validate schedule parameters.
+        let schedule_desc = if let Some(secs) = every_seconds {
+            format!("every {}s", secs)
         } else if let Some(expr) = cron_expr {
-            CronSchedule {
-                kind: "cron".to_string(),
-                expr: Some(expr.to_string()),
-                ..Default::default()
-            }
+            expr.to_string()
         } else {
             return "Error: either every_seconds or cron_expr is required".to_string();
         };
@@ -71,21 +62,11 @@ impl CronScheduleTool {
         // Truncate name to 30 chars.
         let name: String = message.chars().take(30).collect();
 
-        // CronService uses interior &self so we need to get mutable somehow.
-        // Since it's Arc<CronService> and add_job is &mut self, we work around
-        // by using unsafe or by changing the service. For now, we use a best-effort
-        // approach: the CronService methods are synchronous.
-        // This requires CronService to be behind a Mutex if we want to mutate.
-        // For simplicity, we'll just report the operation.
-        // TODO: In production, wrap CronService in Mutex in the AgentLoop.
+        // CronService::add_job requires &mut self, but we only have Arc<CronService>.
+        // Report back that CLI should be used for persistent scheduling.
         format!(
             "Scheduled: '{}' (schedule: {}). Note: use CLI `nanobot cron add` for persistent scheduling.",
-            name,
-            if every_seconds.is_some() {
-                format!("every {}s", every_seconds.unwrap())
-            } else {
-                cron_expr.unwrap_or("unknown").to_string()
-            }
+            name, schedule_desc,
         )
     }
 
@@ -110,7 +91,10 @@ impl CronScheduleTool {
         };
         // remove_job requires &mut self, but we only have Arc<CronService>.
         // Report that CLI should be used for removal.
-        format!("To remove job {}, use CLI: `nanobot cron remove {}`", job_id, job_id)
+        format!(
+            "To remove job {}, use CLI: `nanobot cron remove {}`",
+            job_id, job_id
+        )
     }
 }
 
@@ -162,23 +146,14 @@ impl Tool for CronScheduleTool {
 
         match action {
             "add" => {
-                let message = params
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let every_seconds = params
-                    .get("every_seconds")
-                    .and_then(|v| v.as_i64());
-                let cron_expr = params
-                    .get("cron_expr")
-                    .and_then(|v| v.as_str());
+                let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let every_seconds = params.get("every_seconds").and_then(|v| v.as_i64());
+                let cron_expr = params.get("cron_expr").and_then(|v| v.as_str());
                 self.add_job(message, every_seconds, cron_expr).await
             }
             "list" => self.list_jobs().await,
             "remove" => {
-                let job_id = params
-                    .get("job_id")
-                    .and_then(|v| v.as_str());
+                let job_id = params.get("job_id").and_then(|v| v.as_str());
                 self.remove_job(job_id).await
             }
             other => format!("Unknown action: {}", other),

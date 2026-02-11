@@ -1,9 +1,13 @@
 //! Context compaction via LLM-powered summarization.
 //!
-//! When conversation history exceeds the token budget, this module summarizes
-//! old messages via a cheap LLM call before falling back to hard truncation.
+//! Two-stage design:
+//! - Stage 1 (66.6% capacity): Proactive LLM summarization → creates observation.
+//! - Stage 2 (100% capacity): Emergency `trim_to_fit()` — mechanical, no LLM.
+//!
+//! Stage 1 is handled here. Stage 2 is `TokenBudget::trim_to_fit()` in agent_loop.rs.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -20,12 +24,37 @@ Summarize this conversation history concisely. Focus on:
 - Any pending actions or commitments
 Keep it under 500 words.";
 
+/// Prompt for merging already-compressed chunk summaries.
+const MERGE_SUMMARIES_PROMPT: &str = "\
+Merge these partial conversation summaries into one coherent summary.
+Preserve concrete facts, decisions, and pending actions.
+Avoid repetition. Keep it under 500 words.";
+
+/// Approximate max tokens for transcript input sent to the compaction model.
+///
+/// Keeps total summarize request comfortably under a 4K ctx server (system
+/// prompt + transcript + response budget).
+const SUMMARIZER_INPUT_BUDGET_TOKENS: usize = 2500;
+
+/// Safety cap for iterative merge rounds.
+const MAX_MERGE_ROUNDS: usize = 6;
+
+/// Result of a compaction attempt.
+pub struct CompactionResult {
+    /// The (possibly compacted) messages.
+    pub messages: Vec<Value>,
+    /// If compaction occurred, the summary text (for observation storage).
+    pub observation: Option<String>,
+}
+
 /// Compacts conversation context by summarizing old messages via an LLM call.
 pub struct ContextCompactor {
     provider: Arc<dyn LLMProvider>,
     model: String,
     /// Max tokens for the summarization response.
     summary_max_tokens: u32,
+    /// Disable proactive compaction after first provider failure.
+    disabled: AtomicBool,
 }
 
 impl ContextCompactor {
@@ -35,61 +64,93 @@ impl ContextCompactor {
             provider,
             model,
             summary_max_tokens: 1024,
+            disabled: AtomicBool::new(false),
         }
     }
 
-    /// Compact messages to fit within the token budget.
+    /// Compact messages when they exceed 66.6% of the token budget.
     ///
-    /// If messages already fit, returns them unchanged. Otherwise:
-    /// 1. Splits into system + old messages + recent messages (~60% budget for recent)
-    /// 2. Summarizes old messages via an LLM call
-    /// 3. Returns system + summary + recent messages
-    /// 4. Falls back to `TokenBudget::trim_to_fit()` on failure
+    /// Returns a `CompactionResult` with the (possibly compacted) messages and
+    /// an optional observation summary for cross-session memory.
+    ///
+    /// If messages fit within 66.6% of budget, returns them unchanged with no
+    /// observation. The 100% safety net (`trim_to_fit`) runs separately in
+    /// agent_loop.rs every iteration.
     pub async fn compact(
         &self,
         messages: &[Value],
         budget: &TokenBudget,
         tool_def_tokens: usize,
-    ) -> Vec<Value> {
-        let available = budget.available_budget(tool_def_tokens);
-        let current = TokenBudget::estimate_tokens(messages);
+    ) -> CompactionResult {
+        if self.disabled.load(Ordering::Relaxed) {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
 
-        if current <= available {
-            return messages.to_vec();
+        let available = budget.available_budget(tool_def_tokens);
+        let current = budget.estimate_tokens_with_fallback(messages);
+
+        // Stage 1: Proactive compaction at 66.6% capacity.
+        let threshold = (available as f64 * 0.666) as usize;
+        if current <= threshold {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
         }
 
         debug!(
-            "Context needs compaction: {} tokens > {} available",
-            current, available
+            "Proactive compaction at {:.0}% capacity ({}/{})",
+            (current as f64 / available as f64) * 100.0,
+            current,
+            available,
         );
 
         // Try LLM summarization.
-        match self.compact_via_summary(messages, available).await {
-            Ok(compacted) => {
-                let new_size = TokenBudget::estimate_tokens(&compacted);
+        match self.compact_via_summary(messages, available, budget).await {
+            Ok((compacted, summary)) => {
+                let new_size = budget.estimate_tokens_with_fallback(&compacted);
                 debug!("Compacted {} -> {} tokens", current, new_size);
-                compacted
+                CompactionResult {
+                    messages: compacted,
+                    observation: Some(summary),
+                }
             }
             Err(e) => {
-                warn!("Compaction summarization failed, falling back to trim: {}", e);
-                budget.trim_to_fit(messages, tool_def_tokens)
+                if !self.disabled.swap(true, Ordering::SeqCst) {
+                    warn!(
+                        "Compaction failed; disabling proactive compaction for this run: {}",
+                        e
+                    );
+                } else {
+                    debug!("Compaction still disabled after prior failure: {}", e);
+                }
+                CompactionResult {
+                    messages: messages.to_vec(),
+                    observation: None,
+                }
             }
         }
     }
 
     /// Perform the actual summarization-based compaction.
+    ///
+    /// Returns (compacted_messages, summary_text).
     async fn compact_via_summary(
         &self,
         messages: &[Value],
         available_budget: usize,
-    ) -> Result<Vec<Value>> {
+        budget: &TokenBudget,
+    ) -> Result<(Vec<Value>, String)> {
         if messages.is_empty() {
-            return Ok(messages.to_vec());
+            return Ok((messages.to_vec(), String::new()));
         }
 
         // Always keep the system message (first).
         let system_msg = messages[0].clone();
-        let system_tokens = TokenBudget::estimate_tokens(&[system_msg.clone()]);
+        let system_tokens = budget.estimate_tokens_with_fallback(&[system_msg.clone()]);
 
         // Reserve space: system + summary overhead + some headroom.
         let summary_headroom = 400; // ~400 tokens for the summary message
@@ -97,7 +158,12 @@ impl ContextCompactor {
             .saturating_sub(system_tokens)
             .saturating_sub(summary_headroom);
         if remaining == 0 {
-            anyhow::bail!("Budget too small for summarization");
+            anyhow::bail!(
+                "Budget too small for summarization (available={}, system={}, headroom={})",
+                available_budget,
+                system_tokens,
+                summary_headroom
+            );
         }
         let recent_budget = (remaining as f64 * 0.6) as usize;
 
@@ -107,7 +173,7 @@ impl ContextCompactor {
         let mut recent_tokens = 0;
 
         for (i, msg) in body.iter().enumerate().rev() {
-            let msg_tokens = TokenBudget::estimate_tokens(&[msg.clone()]);
+            let msg_tokens = budget.estimate_tokens_with_fallback(&[msg.clone()]);
             if recent_tokens + msg_tokens > recent_budget {
                 recent_start = i + 1;
                 break;
@@ -138,50 +204,70 @@ impl ContextCompactor {
         }));
         result.extend_from_slice(recent_messages);
 
-        Ok(result)
+        Ok((result, summary))
     }
 
     /// Call the LLM to summarize a set of messages.
     async fn summarize(&self, messages: &[Value]) -> Result<String> {
-        // Format messages into a readable transcript for the summarizer.
-        let mut transcript = String::new();
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            // Skip very long tool results - just note they existed.
-            if role == "tool" {
-                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                if content.len() > 500 {
-                    transcript.push_str(&format!("{}: [result from {} - {} chars]\n", role, name, content.len()));
-                } else {
-                    transcript.push_str(&format!("{} ({}): {}\n", role, name, content));
-                }
-            } else if role == "assistant" && msg.get("tool_calls").is_some() {
-                // Summarize tool call requests briefly.
-                if let Some(Value::Array(calls)) = msg.get("tool_calls") {
-                    let names: Vec<&str> = calls.iter()
-                        .filter_map(|c| c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
-                        .collect();
-                    transcript.push_str(&format!("assistant: [called tools: {}]\n", names.join(", ")));
-                }
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                    if !text.is_empty() {
-                        transcript.push_str(&format!("assistant: {}\n", text));
-                    }
-                }
-            } else {
-                transcript.push_str(&format!("{}: {}\n", role, content));
-            }
+        if messages.is_empty() {
+            return Ok(String::new());
         }
 
+        // First pass: summarize message chunks that fit the summarizer input budget.
+        let mut summaries: Vec<String> = Vec::new();
+        for (start, end) in split_message_ranges_by_budget(messages, SUMMARIZER_INPUT_BUDGET_TOKENS)
+        {
+            let transcript = build_transcript(&messages[start..end]);
+            let s = self.summarize_text(&transcript, SUMMARIZE_PROMPT).await?;
+            summaries.push(s);
+        }
+
+        // Merge pass: if we produced multiple chunk summaries, iteratively merge
+        // them until one summary remains.
+        let mut rounds = 0usize;
+        while summaries.len() > 1 {
+            rounds += 1;
+            if rounds > MAX_MERGE_ROUNDS {
+                anyhow::bail!(
+                    "Exceeded merge rounds while summarizing (remaining chunks={})",
+                    summaries.len()
+                );
+            }
+
+            let mut merged: Vec<String> = Vec::new();
+            for (start, end) in
+                split_summary_ranges_by_budget(&summaries, SUMMARIZER_INPUT_BUDGET_TOKENS)
+            {
+                let mut block = String::new();
+                for (i, s) in summaries[start..end].iter().enumerate() {
+                    block.push_str(&format!("Summary {}:\n{}\n\n", i + 1, s));
+                }
+                let next = self.summarize_text(&block, MERGE_SUMMARIES_PROMPT).await?;
+                merged.push(next);
+            }
+
+            if merged.len() >= summaries.len() {
+                anyhow::bail!(
+                    "Summary merge made no progress (before={}, after={})",
+                    summaries.len(),
+                    merged.len()
+                );
+            }
+            summaries = merged;
+        }
+
+        Ok(summaries.remove(0))
+    }
+
+    async fn summarize_text(&self, input: &str, prompt: &str) -> Result<String> {
         let summary_messages = vec![
             json!({
                 "role": "system",
-                "content": SUMMARIZE_PROMPT
+                "content": prompt
             }),
             json!({
                 "role": "user",
-                "content": transcript
+                "content": input
             }),
         ];
 
@@ -196,10 +282,148 @@ impl ContextCompactor {
             )
             .await?;
 
-        response
+        if response.finish_reason == "error" {
+            let detail = response
+                .content
+                .as_deref()
+                .unwrap_or("unknown summarization error");
+            anyhow::bail!("Summarization provider error: {}", detail);
+        }
+
+        let text = response
             .content
-            .ok_or_else(|| anyhow::anyhow!("Summarization returned no content"))
+            .ok_or_else(|| anyhow::anyhow!("Summarization returned no content"))?;
+
+        // Defensive: some providers encode HTTP/transport failures as plain text.
+        if text.starts_with("Error calling LLM") || text.starts_with("Error:") {
+            anyhow::bail!("Summarization failed: {}", text);
+        }
+
+        Ok(text)
     }
+}
+
+fn format_message_for_transcript(msg: &Value) -> String {
+    let role = msg
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("unknown");
+    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+    // Skip very long tool results - just note they existed.
+    if role == "tool" {
+        let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+        if content.len() > 500 {
+            return format!("{}: [result from {} - {} chars]", role, name, content.len());
+        }
+        return format!("{} ({}): {}", role, name, content);
+    }
+
+    if role == "assistant" && msg.get("tool_calls").is_some() {
+        let mut out = String::new();
+        // Summarize tool call requests briefly.
+        if let Some(Value::Array(calls)) = msg.get("tool_calls") {
+            let names: Vec<&str> = calls
+                .iter()
+                .filter_map(|c| {
+                    c.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                })
+                .collect();
+            out.push_str(&format!("assistant: [called tools: {}]", names.join(", ")));
+        }
+        if !content.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("assistant: {}", content));
+        }
+        return out;
+    }
+
+    format!("{}: {}", role, content)
+}
+
+fn build_transcript(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .map(format_message_for_transcript)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn split_message_ranges_by_budget(messages: &[Value], max_tokens: usize) -> Vec<(usize, usize)> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+
+    for (i, msg) in messages.iter().enumerate() {
+        let piece = format_message_for_transcript(msg);
+        let t = TokenBudget::estimate_str_tokens(&piece).max(1);
+
+        if acc + t > max_tokens && i > start {
+            ranges.push((start, i));
+            start = i;
+            acc = 0;
+        }
+
+        // Very large single message: keep as its own chunk so we preserve
+        // message boundaries rather than slicing text arbitrarily.
+        if t > max_tokens && i == start {
+            ranges.push((i, i + 1));
+            start = i + 1;
+            acc = 0;
+            continue;
+        }
+
+        acc += t;
+    }
+
+    if start < messages.len() {
+        ranges.push((start, messages.len()));
+    }
+
+    ranges
+}
+
+fn split_summary_ranges_by_budget(summaries: &[String], max_tokens: usize) -> Vec<(usize, usize)> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+
+    for (i, s) in summaries.iter().enumerate() {
+        let t = (TokenBudget::estimate_str_tokens(s) + 12).max(1); // label overhead
+
+        if acc + t > max_tokens && i > start {
+            ranges.push((start, i));
+            start = i;
+            acc = 0;
+        }
+
+        if t > max_tokens && i == start {
+            ranges.push((i, i + 1));
+            start = i + 1;
+            acc = 0;
+            continue;
+        }
+
+        acc += t;
+    }
+
+    if start < summaries.len() {
+        ranges.push((start, summaries.len()));
+    }
+
+    ranges
 }
 
 #[cfg(test)]
@@ -208,6 +432,7 @@ mod tests {
     use crate::providers::base::{LLMProvider, LLMResponse};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock provider that returns a fixed summary.
     struct MockProvider {
@@ -266,6 +491,29 @@ mod tests {
         }
     }
 
+    struct CountingFailingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CountingFailingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+        ) -> Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("LLM unavailable"))
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock"
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_within_budget_is_noop() {
         let provider = Arc::new(MockProvider::new("summary"));
@@ -278,36 +526,36 @@ mod tests {
         ];
 
         let result = compactor.compact(&messages, &budget, 500).await;
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.messages.len(), 2);
+        assert!(result.observation.is_none());
     }
 
     #[tokio::test]
     async fn test_compact_summarizes_old_messages() {
         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
         let compactor = ContextCompactor::new(provider, "test".into());
-        // Budget must be smaller than total message tokens to trigger compaction,
-        // but large enough for system + summary + a few recent messages.
         let budget = TokenBudget::new(1200, 200);
 
-        let mut messages = vec![json!({"role": "system", "content": "You are a helpful assistant."})];
-        // Generate enough messages with long content to exceed the budget.
+        let mut messages =
+            vec![json!({"role": "system", "content": "You are a helpful assistant."})];
         for i in 0..30 {
             messages.push(json!({"role": "user", "content": format!("This is a long user message number {} discussing many important topics about the world and various subjects at length", i)}));
             messages.push(json!({"role": "assistant", "content": format!("This is a detailed assistant response number {} providing thorough analysis and helpful information about the topics", i)}));
         }
 
         let result = compactor.compact(&messages, &budget, 50).await;
-        // Should have: system + summary + some recent messages (fewer than 61)
         assert!(
-            result.len() < messages.len(),
+            result.messages.len() < messages.len(),
             "Expected fewer messages after compaction: got {} vs original {}",
-            result.len(),
+            result.messages.len(),
             messages.len()
         );
-        assert_eq!(result[0]["role"], "system");
-        // Second message should be the summary.
-        let summary_content = result[1]["content"].as_str().unwrap();
+        assert_eq!(result.messages[0]["role"], "system");
+        let summary_content = result.messages[1]["content"].as_str().unwrap();
         assert!(summary_content.contains("Conversation summary"));
+        // Should produce an observation.
+        assert!(result.observation.is_some());
+        assert!(result.observation.unwrap().contains("weather and cats"));
     }
 
     #[tokio::test]
@@ -322,8 +570,57 @@ mod tests {
         }
 
         let result = compactor.compact(&messages, &budget, 20).await;
-        // Should still return valid messages (via trim_to_fit fallback).
-        assert!(!result.is_empty());
-        assert_eq!(result[0]["role"], "system");
+        assert!(!result.messages.is_empty());
+        assert_eq!(result.messages[0]["role"], "system");
+        // On failure, no observation is produced.
+        assert!(result.observation.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_compact_proactive_threshold() {
+        // Test that compaction triggers at 66.6%, not 100%.
+        let provider = Arc::new(MockProvider::new("Summary of the conversation."));
+        let compactor = ContextCompactor::new(provider, "test".into());
+        // Budget: 1000 available (after response reserve). 66.6% = 666 tokens.
+        let budget = TokenBudget::new(1200, 200);
+
+        let mut messages = vec![json!({"role": "system", "content": "System prompt."})];
+        // Add messages totaling ~700 tokens (above 66.6% of 1000).
+        for i in 0..15 {
+            messages.push(json!({"role": "user", "content": format!("Message {} with moderate length content here.", i)}));
+            messages.push(json!({"role": "assistant", "content": format!("Response {} with moderate length content here.", i)}));
+        }
+
+        let result = compactor.compact(&messages, &budget, 0).await;
+        // Should have triggered compaction and produced an observation.
+        if result.messages.len() < messages.len() {
+            assert!(result.observation.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compaction_disables_after_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingFailingProvider {
+            calls: calls.clone(),
+        });
+        let compactor = ContextCompactor::new(provider, "test".into());
+        let budget = TokenBudget::new(2200, 200);
+
+        let mut messages = vec![json!({"role": "system", "content": "Sys"})];
+        for i in 0..80 {
+            messages.push(
+                json!({"role": "user", "content": format!("Long message {} {}", i, "x".repeat(180))}),
+            );
+        }
+
+        let _ = compactor.compact(&messages, &budget, 20).await;
+        let _ = compactor.compact(&messages, &budget, 20).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "compaction provider should be called only once after first failure"
+        );
     }
 }

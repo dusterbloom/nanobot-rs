@@ -225,13 +225,7 @@ mod tests {
 
         let callback: SpawnCallback = Arc::new(
             |task: String, label: Option<String>, _channel: String, _chat_id: String| {
-                Box::pin(async move {
-                    format!(
-                        "task={}, has_label={}",
-                        task,
-                        label.is_some(),
-                    )
-                })
+                Box::pin(async move { format!("task={}, has_label={}", task, label.is_some(),) })
             },
         );
         tool.set_callback(callback).await;

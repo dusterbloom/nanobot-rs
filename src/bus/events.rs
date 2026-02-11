@@ -34,7 +34,12 @@ fn now() -> DateTime<Local> {
 
 impl InboundMessage {
     /// Create a new inbound message with required fields and sensible defaults.
-    pub fn new(channel: impl Into<String>, sender_id: impl Into<String>, chat_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(
+        channel: impl Into<String>,
+        sender_id: impl Into<String>,
+        chat_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             channel: channel.into(),
             sender_id: sender_id.into(),
@@ -74,7 +79,11 @@ pub struct OutboundMessage {
 
 impl OutboundMessage {
     /// Create a new outbound message with required fields and sensible defaults.
-    pub fn new(channel: impl Into<String>, chat_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             channel: channel.into(),
             chat_id: chat_id.into(),

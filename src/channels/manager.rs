@@ -72,10 +72,7 @@ impl ChannelManager {
 
         // Feishu.
         if config.channels.feishu.enabled {
-            let ch = FeishuChannel::new(
-                config.channels.feishu.clone(),
-                bus_inbound_tx.clone(),
-            );
+            let ch = FeishuChannel::new(config.channels.feishu.clone(), bus_inbound_tx.clone());
             channels.insert(
                 "feishu".to_string(),
                 Arc::new(TokioMutex::new(Box::new(ch))),
@@ -85,14 +82,8 @@ impl ChannelManager {
 
         // Email.
         if config.channels.email.enabled {
-            let ch = EmailChannel::new(
-                config.channels.email.clone(),
-                bus_inbound_tx.clone(),
-            );
-            channels.insert(
-                "email".to_string(),
-                Arc::new(TokioMutex::new(Box::new(ch))),
-            );
+            let ch = EmailChannel::new(config.channels.email.clone(), bus_inbound_tx.clone());
+            channels.insert("email".to_string(), Arc::new(TokioMutex::new(Box::new(ch))));
             info!("Email channel enabled");
         }
 

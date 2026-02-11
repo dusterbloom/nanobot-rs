@@ -385,6 +385,67 @@ pub struct ToolsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Memory config
+// ---------------------------------------------------------------------------
+
+/// Configuration for the observational memory system.
+///
+/// Observations are LLM-generated summaries of conversations, saved after
+/// context compaction. A background reflector periodically condenses
+/// observations into long-term memory (`MEMORY.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryConfig {
+    /// Enable/disable observational memory (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Model to use for memory operations (observation + reflection).
+    /// If empty, falls back to the main agent model.
+    /// Recommended: a small, fast model like "google/gemini-2.5-flash".
+    #[serde(default)]
+    pub model: String,
+
+    /// Optional separate provider for memory operations.
+    /// If not set, reuses the main agent's provider.
+    /// Allows pointing memory at a local llama.cpp or cheap cloud API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderConfig>,
+
+    /// Max tokens for observations in system prompt (default: 2000).
+    #[serde(default = "default_observation_budget")]
+    pub observation_budget: usize,
+
+    /// Token threshold to trigger reflection (default: 20000).
+    #[serde(default = "default_reflection_threshold")]
+    pub reflection_threshold: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_observation_budget() -> usize {
+    2000
+}
+
+fn default_reflection_threshold() -> usize {
+    20000
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            model: String::new(),
+            provider: None,
+            observation_budget: default_observation_budget(),
+            reflection_threshold: default_reflection_threshold(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -402,6 +463,8 @@ pub struct Config {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 impl Config {

@@ -72,7 +72,8 @@ impl ExecTool {
 
         // Remove single backslashes used to break up command names (e.g. r\m → rm).
         // But keep actual escape sequences like \n, \t.
-        let escape_re = Regex::new(r"\\([^nrtav\\0])").unwrap_or_else(|_| Regex::new(r"^$").unwrap());
+        let escape_re =
+            Regex::new(r"\\([^nrtav\\0])").unwrap_or_else(|_| Regex::new(r"^$").unwrap());
         normalized = escape_re.replace_all(&normalized, "$1").to_string();
 
         // Remove inserted empty quotes used to evade: r""m → rm.
@@ -215,7 +216,8 @@ impl ExecTool {
             };
 
             // Extract absolute paths from the command.
-            let posix_re = Regex::new(r#"/[^\s"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
+            let posix_re =
+                Regex::new(r#"/[^\s"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
             let win_re =
                 Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
 
@@ -294,45 +296,42 @@ impl Tool for ExecTool {
             return error;
         }
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(self.timeout),
-            async {
-                let output = Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .current_dir(&cwd)
-                    .output()
-                    .await;
+        let result = tokio::time::timeout(Duration::from_secs(self.timeout), async {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&cwd)
+                .output()
+                .await;
 
-                match output {
-                    Ok(output) => {
-                        let mut parts: Vec<String> = Vec::new();
+            match output {
+                Ok(output) => {
+                    let mut parts: Vec<String> = Vec::new();
 
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        if !stdout.is_empty() {
-                            parts.push(stdout.to_string());
-                        }
-
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if !stderr.trim().is_empty() {
-                            parts.push(format!("STDERR:\n{}", stderr));
-                        }
-
-                        if !output.status.success() {
-                            let code = output.status.code().unwrap_or(-1);
-                            parts.push(format!("\nExit code: {}", code));
-                        }
-
-                        if parts.is_empty() {
-                            "(no output)".to_string()
-                        } else {
-                            parts.join("\n")
-                        }
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if !stdout.is_empty() {
+                        parts.push(stdout.to_string());
                     }
-                    Err(e) => format!("Error executing command: {}", e),
+
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.trim().is_empty() {
+                        parts.push(format!("STDERR:\n{}", stderr));
+                    }
+
+                    if !output.status.success() {
+                        let code = output.status.code().unwrap_or(-1);
+                        parts.push(format!("\nExit code: {}", code));
+                    }
+
+                    if parts.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        parts.join("\n")
+                    }
                 }
-            },
-        )
+                Err(e) => format!("Error executing command: {}", e),
+            }
+        })
         .await;
 
         let mut output = match result {
@@ -498,13 +497,7 @@ mod tests {
 
     #[test]
     fn test_allow_patterns_block_unmatched() {
-        let tool = ExecTool::new(
-            10,
-            None,
-            None,
-            Some(vec![r"^echo\b".to_string()]),
-            false,
-        );
+        let tool = ExecTool::new(10, None, None, Some(vec![r"^echo\b".to_string()]), false);
         let cwd = ".".to_string();
 
         // "echo" matches, so it should be allowed.

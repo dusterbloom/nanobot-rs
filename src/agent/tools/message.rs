@@ -13,9 +13,8 @@ use super::base::Tool;
 use crate::bus::events::OutboundMessage;
 
 /// Type alias for the send callback.
-pub type SendCallback = Arc<
-    dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
->;
+pub type SendCallback =
+    Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// Tool to send messages to users on chat channels.
 pub struct MessageTool {
@@ -204,9 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_mock_callback() {
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| {
-            Box::pin(async { Ok(()) })
-        });
+        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
         let tool = MessageTool::new(Some(callback), "telegram", "12345");
 
         let mut params = HashMap::new();
@@ -249,9 +246,7 @@ mod tests {
         assert!(result.contains("Message sending not configured"));
 
         // Set callback.
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| {
-            Box::pin(async { Ok(()) })
-        });
+        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
         tool.set_send_callback(callback).await;
 
         // Now it should succeed.
@@ -266,9 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_channel_override() {
-        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| {
-            Box::pin(async { Ok(()) })
-        });
+        let callback: SendCallback = Arc::new(|_msg: OutboundMessage| Box::pin(async { Ok(()) }));
         let tool = MessageTool::new(Some(callback), "default_chan", "default_chat");
 
         let mut params = HashMap::new();

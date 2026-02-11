@@ -12,16 +12,12 @@ use serde_json::{json, Value};
 
 use crate::agent::learning::LearningStore;
 use crate::agent::memory::MemoryStore;
+use crate::agent::observer::ObservationStore;
 use crate::agent::skills::SkillsLoader;
+use crate::agent::token_budget::TokenBudget;
 
 /// Well-known files that are loaded from the workspace root when present.
-const BOOTSTRAP_FILES: &[&str] = &[
-    "AGENTS.md",
-    "SOUL.md",
-    "USER.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-];
+const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
 
 /// Builds the context (system prompt + messages) for the agent.
 pub struct ContextBuilder {
@@ -29,6 +25,16 @@ pub struct ContextBuilder {
     pub memory: MemoryStore,
     pub skills: SkillsLoader,
     pub model_name: String,
+    /// Max tokens for bootstrap instruction files in the system prompt.
+    pub bootstrap_budget: usize,
+    /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
+    pub long_term_memory_budget: usize,
+    /// Max tokens for today's notes in the system prompt.
+    pub today_notes_budget: usize,
+    /// Max tokens for observations in the system prompt (default: 2000).
+    pub observation_budget: usize,
+    /// Max tokens for learning context in the system prompt.
+    pub learning_budget: usize,
 }
 
 impl ContextBuilder {
@@ -39,6 +45,11 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
+            bootstrap_budget: 3000,
+            long_term_memory_budget: 2000,
+            today_notes_budget: 1200,
+            observation_budget: 2000,
+            learning_budget: 800,
         }
     }
 
@@ -54,20 +65,42 @@ impl ContextBuilder {
         parts.push(self._get_identity());
 
         // Bootstrap files.
-        let bootstrap = self._load_bootstrap_files();
+        let bootstrap =
+            Self::_truncate_to_budget(&self._load_bootstrap_files(), self.bootstrap_budget);
         if !bootstrap.is_empty() {
             parts.push(bootstrap);
         }
 
         // Memory context.
-        let memory = self.memory.get_memory_context();
-        if !memory.is_empty() {
-            parts.push(format!("# Memory\n\n{}", memory));
+        let mut memory_parts: Vec<String> = Vec::new();
+        let long_term =
+            Self::_truncate_to_budget(&self.memory.read_long_term(), self.long_term_memory_budget);
+        if !long_term.is_empty() {
+            memory_parts.push(format!("## Long-term Memory\n{}", long_term));
+        }
+        let today_notes =
+            Self::_truncate_to_budget(&self.memory.read_today(), self.today_notes_budget);
+        if !today_notes.is_empty() {
+            memory_parts.push(format!("## Today's Notes\n{}", today_notes));
+        }
+        if !memory_parts.is_empty() {
+            parts.push(format!("# Memory\n\n{}", memory_parts.join("\n\n")));
+        }
+
+        // Observations from past conversations.
+        let observer = ObservationStore::new(&self.workspace);
+        let obs_context = observer.get_context(self.observation_budget);
+        if !obs_context.is_empty() {
+            parts.push(format!(
+                "# Observations from Past Conversations\n\n{}",
+                obs_context
+            ));
         }
 
         // Learning context (tool outcome patterns).
         let learning = LearningStore::new(&self.workspace);
-        let learning_context = learning.get_learning_context();
+        let learning_context =
+            Self::_truncate_to_budget(&learning.get_learning_context(), self.learning_budget);
         if !learning_context.is_empty() {
             parts.push(format!("# Recent Tool Patterns\n\n{}", learning_context));
         }
@@ -119,14 +152,17 @@ impl ContextBuilder {
         channel: Option<&str>,
         chat_id: Option<&str>,
         is_voice_message: bool,
+        detected_language: Option<&str>,
     ) -> Vec<Value> {
         let mut messages: Vec<Value> = Vec::new();
 
         // System prompt.
         let mut system_prompt = self.build_system_prompt(skill_names);
         if let (Some(ch), Some(cid)) = (channel, chat_id) {
-            system_prompt
-                .push_str(&format!("\n\n## Current Session\nChannel: {}\nChat ID: {}", ch, cid));
+            system_prompt.push_str(&format!(
+                "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                ch, cid
+            ));
             if ch == "voice" || is_voice_message {
                 system_prompt.push_str(concat!(
                     "\n\n## Voice Mode (IMPORTANT)\n",
@@ -139,6 +175,18 @@ impl ContextBuilder {
                     "- NEVER output code blocks or technical formatting.\n",
                     "- If asked a complex question, give a brief spoken answer, not a written essay.",
                 ));
+                if let Some(lang) = detected_language {
+                    if lang == "en" {
+                        system_prompt.push_str(
+                            "\n- The user is speaking in English. You MUST respond in English.",
+                        );
+                    } else {
+                        system_prompt.push_str(&format!(
+                            "\n- The user is speaking in {}. You MUST respond in the same language.",
+                            lang_code_to_name(lang)
+                        ));
+                    }
+                }
             }
         }
         messages.push(json!({"role": "system", "content": system_prompt}));
@@ -299,6 +347,39 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"#
         images.push(json!({"type": "text", "text": text}));
         Value::Array(images)
     }
+
+    /// Truncate a section to fit an approximate token budget.
+    fn _truncate_to_budget(text: &str, max_tokens: usize) -> String {
+        if text.is_empty() || max_tokens == 0 {
+            return String::new();
+        }
+
+        if TokenBudget::estimate_str_tokens(text) <= max_tokens {
+            return text.to_string();
+        }
+
+        let max_chars = max_tokens.saturating_mul(4);
+        let marker = "\n\n[truncated to fit token budget]";
+        let keep_chars = max_chars.saturating_sub(marker.len());
+        let mut out: String = text.chars().take(keep_chars).collect();
+        out.push_str(marker);
+        out
+    }
+}
+
+/// Map ISO 639-1 language code to a human-readable name for LLM instruction.
+fn lang_code_to_name(code: &str) -> &'static str {
+    match code {
+        "es" => "Spanish",
+        "fr" => "French",
+        "hi" => "Hindi",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "pt" => "Portuguese",
+        "zh" => "Chinese",
+        "en" => "English",
+        _ => "the user's language",
+    }
 }
 
 /// Guess MIME type from a file extension.
@@ -433,13 +514,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_system_prompt_applies_bootstrap_budget() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "x".repeat(4000)).unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.bootstrap_budget = 40;
+        let prompt = cb.build_system_prompt(None);
+        assert!(prompt.contains("[truncated to fit token budget]"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_applies_learning_budget() {
+        let tmp = TempDir::new().unwrap();
+        let store = LearningStore::new(tmp.path());
+        for _ in 0..6 {
+            store.record("exec", false, "bad", Some(&"very long error ".repeat(30)));
+        }
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.learning_budget = 40;
+        let prompt = cb.build_system_prompt(None);
+        assert!(prompt.contains("# Recent Tool Patterns"));
+        assert!(prompt.contains("[truncated to fit token budget]"));
+    }
+
     // ----- build_messages -----
 
     #[test]
     fn test_build_messages_structure() {
         let (_tmp, cb) = make_context();
         let history: Vec<Value> = vec![json!({"role": "user", "content": "hello"})];
-        let messages = cb.build_messages(&history, "what's up?", None, None, None, None, false);
+        let messages =
+            cb.build_messages(&history, "what's up?", None, None, None, None, false, None);
 
         // Should have: system, history entry, current user message.
         assert_eq!(messages.len(), 3);
@@ -453,8 +559,16 @@ mod tests {
     #[test]
     fn test_build_messages_includes_channel_and_chat_id() {
         let (_tmp, cb) = make_context();
-        let messages =
-            cb.build_messages(&[], "hi", None, None, Some("telegram"), Some("12345"), false);
+        let messages = cb.build_messages(
+            &[],
+            "hi",
+            None,
+            None,
+            Some("telegram"),
+            Some("12345"),
+            false,
+            None,
+        );
         let system_content = messages[0]["content"].as_str().unwrap();
         assert!(system_content.contains("Channel: telegram"));
         assert!(system_content.contains("Chat ID: 12345"));
@@ -463,7 +577,7 @@ mod tests {
     #[test]
     fn test_build_messages_without_history() {
         let (_tmp, cb) = make_context();
-        let messages = cb.build_messages(&[], "test", None, None, None, None, false);
+        let messages = cb.build_messages(&[], "test", None, None, None, None, false, None);
         // system + current user message
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -515,7 +629,11 @@ mod tests {
             "type": "function",
             "function": {"name": "read_file", "arguments": "{}"}
         })];
-        ContextBuilder::add_assistant_message(&mut messages, Some("Let me check."), Some(&tool_calls));
+        ContextBuilder::add_assistant_message(
+            &mut messages,
+            Some("Let me check."),
+            Some(&tool_calls),
+        );
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "assistant");
@@ -539,5 +657,56 @@ mod tests {
         ContextBuilder::add_assistant_message(&mut messages, Some("ok"), Some(&empty));
         // Empty tool_calls should not add the key.
         assert!(messages[0].get("tool_calls").is_none());
+    }
+
+    // ----- observations -----
+
+    #[test]
+    fn test_system_prompt_includes_observations_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let obs_dir = tmp.path().join("memory").join("observations");
+        fs::create_dir_all(&obs_dir).unwrap();
+        fs::write(
+            obs_dir.join("20260101T000000Z_test.md"),
+            "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: test\n---\n\nUser likes dark mode and Rust.",
+        )
+        .unwrap();
+        let cb = ContextBuilder::new(tmp.path());
+        let prompt = cb.build_system_prompt(None);
+        assert!(
+            prompt.contains("Observations from Past Conversations"),
+            "system prompt should include observations header"
+        );
+        assert!(
+            prompt.contains("User likes dark mode and Rust"),
+            "system prompt should include observation content"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_respects_observation_budget() {
+        let tmp = TempDir::new().unwrap();
+        let obs_dir = tmp.path().join("memory").join("observations");
+        fs::create_dir_all(&obs_dir).unwrap();
+        // Write a large observation.
+        let big_content = "x".repeat(40000); // ~10000 tokens
+        fs::write(
+            obs_dir.join("20260101T000000Z_big.md"),
+            format!(
+                "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: big\n---\n\n{}",
+                big_content
+            ),
+        )
+        .unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.observation_budget = 100; // very small budget
+
+        let prompt = cb.build_system_prompt(None);
+        // If the observation exceeds budget, it should not appear.
+        // (The single entry is too big for 100 tokens, so get_context returns empty.)
+        assert!(
+            !prompt.contains("xxxx"),
+            "oversized observation should not appear in prompt"
+        );
     }
 }

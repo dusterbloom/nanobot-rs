@@ -30,6 +30,20 @@ impl LLMResponse {
     }
 }
 
+/// A chunk from an SSE streaming response.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// Incremental text content from the LLM.
+    TextDelta(String),
+    /// Stream complete — contains the fully assembled response.
+    Done(LLMResponse),
+}
+
+/// Handle to a streaming LLM response.
+pub struct StreamHandle {
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+}
+
 /// Abstract base trait for LLM providers.
 ///
 /// Implementations should handle the specifics of each provider's API
@@ -52,6 +66,26 @@ pub trait LLMProvider: Send + Sync {
         max_tokens: u32,
         temperature: f64,
     ) -> Result<LLMResponse>;
+
+    /// Send a streaming chat completion request.
+    ///
+    /// Default implementation falls back to buffered `chat()`.
+    async fn chat_stream(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        model: Option<&str>,
+        max_tokens: u32,
+        temperature: f64,
+    ) -> Result<StreamHandle> {
+        let response = self.chat(messages, tools, model, max_tokens, temperature).await?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Some(ref content) = response.content {
+            let _ = tx.send(StreamChunk::TextDelta(content.clone()));
+        }
+        let _ = tx.send(StreamChunk::Done(response));
+        Ok(StreamHandle { rx })
+    }
 
     /// Get the default model for this provider.
     fn get_default_model(&self) -> &str;

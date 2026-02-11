@@ -19,20 +19,23 @@ mod voice_pipeline;
 
 use std::io::{self, BufRead, Write as _};
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::agent::agent_loop::{build_shared_core, AgentLoop, SharedCoreHandle};
+use crate::agent::tuning::{
+    score_feasible_profiles, select_optimal_from_input, OptimizationInput,
+};
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::channels::manager::ChannelManager;
 use crate::config::loader::{get_config_path, get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
-use crate::agent::agent_loop::AgentLoop;
-use crate::channels::manager::ChannelManager;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
 use crate::providers::base::LLMProvider;
@@ -40,10 +43,7 @@ use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
 
 const VERSION: &str = "0.1.0";
-const LOGO: &str = "\u{1F408}"; // cat emoji
-const LOCAL_LOGO: &str = "\u{1F3E0}"; // house emoji for local mode
-#[cfg(feature = "voice")]
-const VOICE_LOGO: &str = "\u{1F3A4}"; // microphone emoji for voice mode
+const LOGO: &str = "*";
 
 /// Build a styled termimad skin for rendering LLM markdown responses.
 fn make_skin() -> termimad::MadSkin {
@@ -66,6 +66,7 @@ mod tui {
     pub const CYAN: &str = "\x1b[36m";
     pub const GREEN: &str = "\x1b[32m";
     pub const YELLOW: &str = "\x1b[33m";
+    pub const RED: &str = "\x1b[31m";
     pub const MAGENTA: &str = "\x1b[35m";
     pub const WHITE: &str = "\x1b[97m";
     pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
@@ -121,6 +122,9 @@ enum Commands {
         /// Use local LLM instead of cloud API.
         #[arg(short, long)]
         local: bool,
+        /// Language hint for voice TTS engine (e.g. "en" uses faster Supertonic).
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// Start the nanobot gateway (channels + agent loop).
     Gateway {
@@ -133,6 +137,15 @@ enum Commands {
     },
     /// Show nanobot status.
     Status,
+    /// Select the best local profile from benchmark results.
+    Tune {
+        /// Path to benchmark JSON input file.
+        #[arg(short, long)]
+        input: String,
+        /// Print the selected profile as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage channels.
     Channels {
         #[command(subcommand)]
@@ -223,36 +236,63 @@ enum CronAction {
 }
 
 fn main() {
+    // Safety net: kill orphaned llama-server on panic so it doesn't hold VRAM
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "llama-server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,ort=off,supertonic=off")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn,ort=off,supertonic=off")
+            }),
         )
         .init();
 
     match cli.command {
         Commands::Onboard => cmd_onboard(),
-        Commands::Agent { message, session, local } => cmd_agent(message, session, local),
+        Commands::Agent {
+            message,
+            session,
+            local,
+            lang,
+        } => cmd_agent(message, session, local, lang),
         Commands::Gateway { port, verbose } => cmd_gateway(port, verbose),
         Commands::Status => cmd_status(),
+        Commands::Tune { input, json } => cmd_tune(input, json),
         Commands::Channels { action } => match action {
             ChannelsAction::Status => cmd_channels_status(),
         },
         Commands::Cron { action } => match action {
             CronAction::List { all } => cmd_cron_list(all),
             CronAction::Add {
-                name, message, every, cron, deliver, to, channel,
+                name,
+                message,
+                every,
+                cron,
+                deliver,
+                to,
+                channel,
             } => cmd_cron_add(name, message, every, cron, deliver, to, channel),
             CronAction::Remove { job_id } => cmd_cron_remove(job_id),
             CronAction::Enable { job_id, disable } => cmd_cron_enable(job_id, disable),
         },
         Commands::WhatsApp => cmd_whatsapp(),
         Commands::Telegram { token } => cmd_telegram(token),
-        Commands::Email { imap_host, smtp_host, username, password } => {
-            cmd_email(imap_host, smtp_host, username, password)
-        }
+        Commands::Email {
+            imap_host,
+            smtp_host,
+            username,
+            password,
+        } => cmd_email(imap_host, smtp_host, username, password),
     }
 }
 
@@ -322,22 +362,21 @@ fn create_workspace_templates(workspace: &std::path::Path) {
 // Agent
 // ============================================================================
 
-fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
+fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang: Option<String>) {
     let config = load_config(None);
-    
+
     // Check environment variable for local mode
-    let local_env = std::env::var("NANOCLAW_LOCAL")
+    let local_env = std::env::var("NANOBOT_LOCAL")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
-    
+
     // Set initial local mode from flag or environment
     if local_flag || local_env {
         LOCAL_MODE.store(true, Ordering::SeqCst);
     }
-    
-    let mut local_port = std::env::var("NANOCLAW_LOCAL_PORT")
-        .unwrap_or_else(|_| "8080".to_string());
-    
+
+    let mut local_port = std::env::var("NANOBOT_LOCAL_PORT").unwrap_or_else(|_| "8080".to_string());
+
     // Check if we can proceed
     let is_local = LOCAL_MODE.load(Ordering::SeqCst);
     if !is_local {
@@ -354,20 +393,47 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     runtime.block_on(async {
-        // Create initial agent loop
-        let (mut agent_loop, config) = create_agent_loop(&config, &local_port, Some(DEFAULT_LOCAL_MODEL)).await;
+        // Create shared core and initial agent loop.
+        let core_handle = build_core_handle(&config, &local_port, Some(DEFAULT_LOCAL_MODEL), None);
+        let cron_store_path = get_data_dir().join("cron").join("jobs.json");
+        let cron_service = Arc::new(CronService::new(cron_store_path));
+
+        // Provide email config to the REPL agent when credentials are configured.
+        let email_config = {
+            let ec = &config.channels.email;
+            if !ec.imap_host.is_empty() && !ec.username.is_empty() && !ec.password.is_empty() {
+                Some(ec.clone())
+            } else {
+                None
+            }
+        };
+
+        let mut agent_loop = create_agent_loop(
+            core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None,
+        );
 
         if let Some(msg) = message {
-            let skin = make_skin();
-            let response = agent_loop
-                .process_direct(&msg, &session_id, "cli", "direct")
-                .await;
+            let (delta_tx, mut delta_rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            let print_task = tokio::spawn(async move {
+                use std::io::Write as _;
+                while let Some(delta) = delta_rx.recv().await {
+                    print!("{}", delta);
+                    std::io::stdout().flush().ok();
+                }
+                println!();
+            });
             println!();
-            skin.print_text(&response);
+            let _response = agent_loop
+                .process_direct_streaming(&msg, &session_id, "cli", "direct", None, delta_tx)
+                .await;
+            let _ = print_task.await;
         } else {
             print_startup_splash(&local_port);
 
             let mut llama_process: Option<std::process::Child> = None;
+            let mut compaction_process: Option<std::process::Child> = None;
+            let mut compaction_port: Option<String> = None;
             let default_model = dirs::home_dir().unwrap().join("models").join(DEFAULT_LOCAL_MODEL);
             let mut current_model_path: std::path::PathBuf = default_model;
             #[cfg(feature = "voice")]
@@ -404,14 +470,11 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 let voice_on = false;
 
                 let prompt = if voice_on {
-                    #[cfg(feature = "voice")]
-                    { format!("{} {}{}You:{} ", VOICE_LOGO, tui::BOLD, tui::MAGENTA, tui::RESET) }
-                    #[cfg(not(feature = "voice"))]
-                    { format!("{}{}You:{} ", tui::BOLD, tui::GREEN, tui::RESET) }
+                    format!("{}{}~>{} ", tui::BOLD, tui::MAGENTA, tui::RESET)
                 } else if is_local {
-                    format!("{} {}{}You:{} ", LOCAL_LOGO, tui::BOLD, tui::YELLOW, tui::RESET)
+                    format!("{}{}L>{} ", tui::BOLD, tui::YELLOW, tui::RESET)
                 } else {
-                    format!("{}{}You:{} ", tui::BOLD, tui::GREEN, tui::RESET)
+                    format!("{}{}>{} ", tui::BOLD, tui::GREEN, tui::RESET)
                 };
 
                 // === GET INPUT ===
@@ -455,7 +518,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     }
                 }
 
-                // === VOICE RECORDING ===
+                // === VOICE RECORDING (streaming pipeline) ===
                 #[cfg(feature = "voice")]
                 if do_record {
                     if let Some(ref mut vs) = voice_session {
@@ -464,24 +527,127 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         while keep_recording {
                             keep_recording = false;
                             match vs.record_and_transcribe() {
-                                Ok(Some(text)) => {
-                                    println!();
-                                    let response = agent_loop
-                                        .process_direct(&text, &session_id, "voice", "direct")
-                                        .await;
-                                    println!();
-                                    skin.print_text(&response);
-                                    println!();
-                                    let tts_text = strip_markdown_for_tts(&response);
-                                    if !tts_text.is_empty() {
-                                        if speak_interruptible(vs, &tts_text) {
-                                            // User interrupted TTS — loop back to record
-                                            keep_recording = true;
+                                Ok(Some((text, lang))) => {
+                                    // Start streaming TTS pipeline
+                                    vs.clear_cancel();
+                                    let cancel = vs.cancel_flag();
+
+                                    // Display channel: synthesis thread → terminal
+                                    // Text appears when TTS finishes each sentence (synced with audio)
+                                    let (display_tx, mut display_rx) =
+                                        tokio::sync::mpsc::unbounded_channel::<String>();
+
+                                    match vs.start_streaming_speak(&lang, Some(display_tx)) {
+                                        Ok((sentence_tx, tts_handle)) => {
+                                            // Delta channel: LLM → accumulator (silent, feeds TTS only)
+                                            let (delta_tx, mut delta_rx) =
+                                                tokio::sync::mpsc::unbounded_channel::<String>();
+
+                                            let acc_sentence_tx = sentence_tx.clone();
+                                            let accumulator_task = tokio::spawn(async move {
+                                                let mut acc = voice::SentenceAccumulator::new(acc_sentence_tx);
+                                                while let Some(delta) = delta_rx.recv().await {
+                                                    acc.push(&delta);
+                                                }
+                                                acc.flush();
+                                            });
+
+                                            // Display task: print sentences as TTS synthesizes them
+                                            let display_task = tokio::spawn(async move {
+                                                use std::io::Write as _;
+                                                let mut first = true;
+                                                while let Some(sentence) = display_rx.recv().await {
+                                                    if first {
+                                                        first = false;
+                                                    } else {
+                                                        print!(" ");
+                                                    }
+                                                    print!("{}", sentence);
+                                                    std::io::stdout().flush().ok();
+                                                }
+                                                println!();
+                                            });
+
+                                            // Stream LLM response (deltas go to accumulator silently)
+                                            let _response = agent_loop
+                                                .process_direct_streaming(
+                                                    &text,
+                                                    &session_id,
+                                                    "voice",
+                                                    "direct",
+                                                    Some(&lang),
+                                                    delta_tx,
+                                                )
+                                                .await;
+
+                                            // Wait for accumulator to flush remaining sentences
+                                            let _ = accumulator_task.await;
+
+                                            // Interrupt watcher: runs while TTS plays remaining audio
+                                            let done = Arc::new(AtomicBool::new(false));
+                                            let done2 = done.clone();
+                                            let cancel2 = cancel.clone();
+                                            let watcher = std::thread::spawn(move || {
+                                                use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+                                                use crossterm::terminal;
+                                                terminal::enable_raw_mode().ok();
+                                                let mut interrupted = false;
+                                                while !done2.load(Ordering::Relaxed) {
+                                                    if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                                                        if let Ok(Event::Key(key)) = event::read() {
+                                                            let is_interrupt = key.code == KeyCode::Enter
+                                                                || (key.code == KeyCode::Char(' ')
+                                                                    && key.modifiers.contains(KeyModifiers::CONTROL));
+                                                            if is_interrupt {
+                                                                cancel2.store(true, Ordering::Relaxed);
+                                                                interrupted = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                terminal::disable_raw_mode().ok();
+                                                interrupted
+                                            });
+
+                                            // Wait for TTS + playback + display to finish
+                                            let _ = tts_handle.join();
+                                            done.store(true, Ordering::Relaxed);
+                                            let interrupted = watcher.join().unwrap_or(false);
+                                            let _ = display_task.await;
+
+                                            {
+                                                let sa_count = agent_loop.subagent_manager().get_running_count().await;
+                                                active_channels.retain(|ch| !ch.handle.is_finished());
+                                                let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
+                                                    "whatsapp" => "wa", "telegram" => "tg", other => other,
+                                                }).collect();
+                                                print_status_bar(&core_handle, &ch_names, sa_count);
+                                            }
+
+                                            if interrupted {
+                                                keep_recording = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Streaming TTS failed ({}), falling back", e);
+                                            let response = agent_loop
+                                                .process_direct_with_lang(&text, &session_id, "voice", "direct", Some(&lang))
+                                                .await;
+                                            println!();
+                                            skin.print_text(&response);
+                                            println!();
+                                            let tts_text = strip_markdown_for_tts(&response);
+                                            if !tts_text.is_empty() {
+                                                if speak_interruptible(vs, &tts_text, "en") {
+                                                    keep_recording = true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                Ok(None) => println!("(no speech detected)\n"),
-                                Err(e) => eprintln!("Recording error: {}\n", e),
+                                Ok(None) => println!("\x1b[2m(no speech detected)\x1b[0m"),
+                                Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
                             }
                         }
                         drain_stdin();
@@ -504,8 +670,26 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             let url = format!("http://localhost:{}/health", port);
                             if let Ok(resp) = reqwest::blocking::get(&url) {
                                 if resp.status().is_success() {
-                                    found_port = Some(port);
-                                    break;
+                                    // Reuse only if this server is configured with
+                                    // one slot (`n_parallel=1`), otherwise per-request
+                                    // context can be much smaller than advertised.
+                                    let props_url = format!("http://localhost:{}/props", port);
+                                    let n_parallel = reqwest::blocking::get(&props_url)
+                                        .ok()
+                                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                                        .and_then(|json| {
+                                            json.get("default_generation_settings")
+                                                .and_then(|s| s.get("n_parallel"))
+                                                .and_then(|n| n.as_u64())
+                                                .or_else(|| {
+                                                    json.get("n_parallel").and_then(|n| n.as_u64())
+                                                })
+                                        })
+                                        .unwrap_or(1);
+                                    if n_parallel <= 1 {
+                                        found_port = Some(port);
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -515,23 +699,26 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             println!("\n  {}{}Reusing{} llama.cpp server on port {}", tui::BOLD, tui::YELLOW, tui::RESET, port);
                             local_port = port.to_string();
                             LOCAL_MODE.store(true, Ordering::SeqCst);
-                            let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
-                            agent_loop = new_loop;
+                            start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
+                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                             print_mode_banner(&local_port);
                         } else {
                             // Kill any orphaned servers from previous runs
                             kill_stale_llama_servers();
                             let port = find_available_port(8080);
-                            println!("\n  {}{}Starting{} llama.cpp server on port {}...", tui::BOLD, tui::YELLOW, tui::RESET, port);
+                            let ctx_size = compute_optimal_context_size(&current_model_path);
+                            println!("\n  {}{}Starting{} llama.cpp server on port {} (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, port, ctx_size / 1024);
 
-                            match spawn_llama_server(port, &current_model_path) {
+                            match spawn_llama_server(port, &current_model_path, ctx_size) {
                                 Ok(child) => {
                                     llama_process = Some(child);
                                     if wait_for_server_ready(port, 120, &mut llama_process).await {
                                         local_port = port.to_string();
                                         LOCAL_MODE.store(true, Ordering::SeqCst);
-                                        let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
-                                        agent_loop = new_loop;
+                                        start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
+                                        rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                        agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                                         print_mode_banner(&local_port);
                                     } else {
                                         println!("  {}{}Server failed to start{}", tui::BOLD, tui::YELLOW, tui::RESET);
@@ -555,11 +742,16 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                             println!("\n  {}Stopping llama.cpp server...{}", tui::DIM, tui::RESET);
                             child.kill().ok();
                             child.wait().ok();
+                        } else {
+                            // If we were reusing an external server, make sure we
+                            // don't keep carrying stale settings across toggles.
+                            kill_stale_llama_servers();
                         }
                         llama_process = None;
+                        stop_compaction_server(&mut compaction_process, &mut compaction_port);
                         LOCAL_MODE.store(false, Ordering::SeqCst);
-                        let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
-                        agent_loop = new_loop;
+                        rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                        agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                         print_mode_banner(&local_port);
                     }
 
@@ -601,6 +793,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     };
 
                     let selected = &models[idx];
+                    let previous_model_path = current_model_path.clone();
                     current_model_path = selected.clone();
                     let name = selected.file_name().unwrap().to_string_lossy();
                     println!("\nSelected: {}", name);
@@ -617,31 +810,195 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         kill_stale_llama_servers();
 
                         let port = find_available_port(8080);
-                        println!("  {}{}Starting{} llama.cpp server on port {}...", tui::BOLD, tui::YELLOW, tui::RESET, port);
+                        let ctx_size = compute_optimal_context_size(&current_model_path);
+                        println!("  {}{}Starting{} llama.cpp server on port {} (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, port, ctx_size / 1024);
 
-                        match spawn_llama_server(port, &current_model_path) {
+                        match spawn_llama_server(port, &current_model_path, ctx_size) {
                             Ok(child) => {
                                 llama_process = Some(child);
                                 if wait_for_server_ready(port, 120, &mut llama_process).await {
                                     local_port = port.to_string();
-                                    let (new_loop, _) = create_agent_loop(&config, &local_port, current_model_path.file_name().and_then(|n| n.to_str())).await;
-                                    agent_loop = new_loop;
+                                    rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                    agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                                     print_mode_banner(&local_port);
                                 } else {
-                                    println!("  {}{}Server failed to start{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                    println!("  {}{}Server failed to start with new model{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                     if let Some(ref mut child) = llama_process {
                                         child.kill().ok();
                                         child.wait().ok();
                                     }
                                     llama_process = None;
+
+                                    // Restart the previous working model
+                                    current_model_path = previous_model_path.clone();
+                                    let prev_name = current_model_path.file_name().unwrap().to_string_lossy();
+                                    println!("  {}Restarting previous model: {}{}", tui::DIM, prev_name, tui::RESET);
+                                    let port = find_available_port(8080);
+                                    let ctx_size = compute_optimal_context_size(&current_model_path);
+                                    match spawn_llama_server(port, &current_model_path, ctx_size) {
+                                        Ok(child) => {
+                                            llama_process = Some(child);
+                                            if wait_for_server_ready(port, 120, &mut llama_process).await {
+                                                local_port = port.to_string();
+                                                rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                                agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                                println!("  {}Restored: {}{}\n", tui::DIM, prev_name, tui::RESET);
+                                            } else {
+                                                println!("  {}{}Previous model also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                                LOCAL_MODE.store(false, Ordering::SeqCst);
+                                                rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                                agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            println!("  {}{}Previous model also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                            LOCAL_MODE.store(false, Ordering::SeqCst);
+                                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
                                 println!("\n  {}{}Failed to start server:{} {}", tui::BOLD, tui::YELLOW, tui::RESET, e);
+
+                                // Restart the previous working model
+                                current_model_path = previous_model_path.clone();
+                                let prev_name = current_model_path.file_name().unwrap().to_string_lossy();
+                                println!("  {}Restarting previous model: {}{}", tui::DIM, prev_name, tui::RESET);
+                                let port = find_available_port(8080);
+                                let ctx_size = compute_optimal_context_size(&current_model_path);
+                                match spawn_llama_server(port, &current_model_path, ctx_size) {
+                                    Ok(child) => {
+                                        llama_process = Some(child);
+                                        if wait_for_server_ready(port, 120, &mut llama_process).await {
+                                            local_port = port.to_string();
+                                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                            println!("  {}Restored: {}{}\n", tui::DIM, prev_name, tui::RESET);
+                                        } else {
+                                            println!("  {}{}Previous model also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                            LOCAL_MODE.store(false, Ordering::SeqCst);
+                                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        println!("  {}{}Previous model also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                        LOCAL_MODE.store(false, Ordering::SeqCst);
+                                        rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                        agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                    }
+                                }
                             }
                         }
                     } else {
                         println!("Model will be used next time you toggle /local on.\n");
+                    }
+
+                    continue;
+                }
+
+                // Handle context size change
+                if input == "/ctx" || input.starts_with("/ctx ") {
+                    if !LOCAL_MODE.load(Ordering::SeqCst) {
+                        println!("\n  {}Not in local mode — use /local first{}\n", tui::DIM, tui::RESET);
+                        continue;
+                    }
+
+                    let arg = input.strip_prefix("/ctx").unwrap().trim();
+                    let new_ctx: usize = if arg.is_empty() {
+                        // No argument → re-auto-detect
+                        let auto = compute_optimal_context_size(&current_model_path);
+                        println!("\n  Auto-detected: {}K", auto / 1024);
+                        auto
+                    } else {
+                        // Parse: accept "32768", "32K", "32k"
+                        let s = arg.to_lowercase();
+                        let parsed = if let Some(prefix) = s.strip_suffix('k') {
+                            prefix.parse::<usize>().map(|n| n * 1024)
+                        } else {
+                            s.parse::<usize>()
+                        };
+                        match parsed {
+                            Ok(n) if n >= 2048 => n,
+                            Ok(_) => {
+                                println!("\n  Minimum context size is 2048 (2K)\n");
+                                continue;
+                            }
+                            Err(_) => {
+                                println!("\n  Usage: /ctx [size]  e.g. /ctx 32K or /ctx 32768\n");
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Round down to nearest 1024
+                    let new_ctx = (new_ctx / 1024) * 1024;
+
+                    // Restart server with new context size
+                    if let Some(ref mut child) = llama_process {
+                        println!("  {}Stopping current server...{}", tui::DIM, tui::RESET);
+                        child.kill().ok();
+                        child.wait().ok();
+                    }
+                    llama_process = None;
+                    kill_stale_llama_servers();
+
+                    let port = find_available_port(8080);
+                    println!("  {}{}Restarting{} llama.cpp on port {} (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, port, new_ctx / 1024);
+
+                    match spawn_llama_server(port, &current_model_path, new_ctx) {
+                        Ok(child) => {
+                            llama_process = Some(child);
+                            if wait_for_server_ready(port, 120, &mut llama_process).await {
+                                local_port = port.to_string();
+                                rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                print_mode_banner(&local_port);
+                            } else {
+                                println!("  {}{}Server failed to start with new context size{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                if let Some(ref mut child) = llama_process {
+                                    child.kill().ok();
+                                    child.wait().ok();
+                                }
+                                llama_process = None;
+
+                                // Restart with auto-detected size as fallback
+                                let port = find_available_port(8080);
+                                let fallback_ctx = compute_optimal_context_size(&current_model_path);
+                                println!("  {}Falling back to auto-detected context ({}K)...{}", tui::DIM, fallback_ctx / 1024, tui::RESET);
+                                match spawn_llama_server(port, &current_model_path, fallback_ctx) {
+                                    Ok(child) => {
+                                        llama_process = Some(child);
+                                        if wait_for_server_ready(port, 120, &mut llama_process).await {
+                                            local_port = port.to_string();
+                                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                            print_mode_banner(&local_port);
+                                        } else {
+                                            println!("  {}{}Fallback also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                            LOCAL_MODE.store(false, Ordering::SeqCst);
+                                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        println!("  {}{}Fallback also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
+                                        LOCAL_MODE.store(false, Ordering::SeqCst);
+                                        rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                                        agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("\n  {}{}Failed to start server:{} {}", tui::BOLD, tui::YELLOW, tui::RESET, e);
+                            println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
+                            LOCAL_MODE.store(false, Ordering::SeqCst);
+                            rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
+                            agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                        }
                     }
 
                     continue;
@@ -657,7 +1014,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                         voice_session = None;
                         println!("\nVoice mode OFF\n");
                     } else {
-                        match voice::VoiceSession::new().await {
+                        match voice::VoiceSession::with_lang(lang.as_deref()).await {
                             Ok(vs) => {
                                 voice_session = Some(vs);
                                 println!("\nVoice mode ON. Ctrl+Space or Enter to speak, type for text.\n");
@@ -684,9 +1041,10 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     let stop = Arc::new(AtomicBool::new(false));
                     let stop2 = stop.clone();
                     let dtx = display_tx.clone();
+                    let ch = core_handle.clone();
                     println!("\n  Scan the QR code when it appears");
                     let handle = tokio::spawn(async move {
-                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                        run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
                     });
                     active_channels.push(ActiveChannel {
                         name: "whatsapp".to_string(), stop, handle,
@@ -749,8 +1107,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     let stop = Arc::new(AtomicBool::new(false));
                     let stop2 = stop.clone();
                     let dtx = display_tx.clone();
+                    let ch = core_handle.clone();
                     let handle = tokio::spawn(async move {
-                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                        run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
                     });
                     active_channels.push(ActiveChannel {
                         name: "telegram".to_string(), stop, handle,
@@ -783,8 +1142,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     let stop = Arc::new(AtomicBool::new(false));
                     let stop2 = stop.clone();
                     let dtx = display_tx.clone();
+                    let ch = core_handle.clone();
                     let handle = tokio::spawn(async move {
-                        run_gateway_async(gw_config, Some(stop2), Some(dtx)).await;
+                        run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
                     });
                     active_channels.push(ActiveChannel {
                         name: "email".to_string(), stop, handle,
@@ -832,12 +1192,32 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     }
                     let _ = rl.add_history_entry(&pasted);
                     let channel = if voice_on { "voice" } else { "cli" };
+                    let (delta_tx, mut delta_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let print_task = tokio::spawn(async move {
+                        use std::io::Write as _;
+                        while let Some(delta) = delta_rx.recv().await {
+                            print!("{}", delta);
+                            std::io::stdout().flush().ok();
+                        }
+                        println!();
+                    });
+                    println!();
                     let response = agent_loop
-                        .process_direct(&pasted, &session_id, channel, "direct")
+                        .process_direct_streaming(
+                            &pasted, &session_id, channel, "direct", None, delta_tx,
+                        )
                         .await;
+                    let _ = print_task.await;
                     println!();
-                    skin.print_text(&response);
-                    println!();
+                    {
+                        let sa_count = agent_loop.subagent_manager().get_running_count().await;
+                        active_channels.retain(|ch| !ch.handle.is_finished());
+                        let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
+                            "whatsapp" => "wa", "telegram" => "tg", other => other,
+                        }).collect();
+                        print_status_bar(&core_handle, &ch_names, sa_count);
+                    }
                     continue;
                 }
 
@@ -845,44 +1225,163 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                     println!("\nCommands:");
                     println!("  /local, /l      - Toggle between local and cloud mode");
                     println!("  /model, /m      - Select local model from ~/models/");
+                    println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
                     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
                     println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
                     println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
                     println!("  /email          - Start Email channel (runs alongside chat)");
                     println!("  /paste, /p      - Paste mode: multiline input until --- on its own line");
                     println!("  /stop           - Stop all running channels");
-                    println!("  /status         - Show current mode, model, and channel info");
+                    println!("  /agents, /a     - List running background agents");
+                    println!("  /kill <id>      - Cancel a background agent");
+                    println!("  /status, /s     - Show current mode, model, and channel info");
                     println!("  /help, /h       - Show this help");
                     println!("  Ctrl+C          - Exit\n");
                     continue;
                 }
 
-                // Handle status command
-                if input == "/status" || input == "/s" {
-                    print_mode_banner(&local_port);
-                    active_channels.retain(|ch| !ch.handle.is_finished());
-                    if !active_channels.is_empty() {
-                        let names: Vec<&str> = active_channels.iter().map(|c| c.name.as_str()).collect();
-                        println!("  {}Channels running:{} {}\n", tui::DIM, tui::RESET, names.join(", "));
+                // Handle /agents command — list running subagents
+                if input == "/agents" || input == "/a" {
+                    let agents = agent_loop.subagent_manager().list_running().await;
+                    if agents.is_empty() {
+                        println!("\n  No agents running.\n");
+                    } else {
+                        println!("\n  Running agents:\n");
+                        println!("  {:<10} {:<26} {}", "ID", "LABEL", "ELAPSED");
+                        for a in &agents {
+                            let elapsed = a.started_at.elapsed();
+                            let mins = elapsed.as_secs() / 60;
+                            let secs = elapsed.as_secs() % 60;
+                            println!("  {:<10} {:<26} {}m {:02}s", a.task_id, a.label, mins, secs);
+                        }
+                        println!(
+                            "\n  {} agent{} running. /kill <id> to cancel.\n",
+                            agents.len(),
+                            if agents.len() > 1 { "s" } else { "" }
+                        );
                     }
                     continue;
                 }
 
-                // Process message
+                // Handle /kill command — cancel a subagent
+                if input.starts_with("/kill ") {
+                    let id = input[6..].trim();
+                    if id.is_empty() {
+                        println!("\n  Usage: /kill <id>\n");
+                    } else if agent_loop.subagent_manager().cancel(id).await {
+                        println!("\n  Cancelled agent {}.\n", id);
+                    } else {
+                        println!("\n  No running agent matching '{}'.\n", id);
+                    }
+                    continue;
+                }
+
+                // Handle status command
+                if input == "/status" || input == "/s" {
+                    let core = core_handle.read().unwrap().clone();
+                    let is_local = LOCAL_MODE.load(Ordering::SeqCst);
+                    let model_name = &core.model;
+                    let mode_label = if is_local { "local" } else { "cloud" };
+
+                    println!();
+                    println!("  {}MODE{}      {} ({})", tui::BOLD, tui::RESET, mode_label, model_name);
+
+                    let used = core.last_context_used.load(Ordering::Relaxed) as usize;
+                    let max = core.last_context_max.load(Ordering::Relaxed) as usize;
+                    let pct = if max > 0 { (used * 100) / max } else { 0 };
+                    let ctx_color = match pct {
+                        0..=49 => tui::GREEN,
+                        50..=79 => tui::YELLOW,
+                        _ => tui::RED,
+                    };
+                    println!(
+                        "  {}CONTEXT{}   {:>6} / {:>6} tokens ({}{}{}%{})",
+                        tui::BOLD, tui::RESET,
+                        format_thousands(used), format_thousands(max),
+                        ctx_color, tui::BOLD, pct, tui::RESET
+                    );
+
+                    let obs_count = {
+                        let obs = crate::agent::observer::ObservationStore::new(&core.workspace);
+                        obs.count()
+                    };
+                    println!(
+                        "  {}MEMORY{}    {} ({} observations)",
+                        tui::BOLD, tui::RESET,
+                        if core.memory_enabled { "enabled" } else { "disabled" },
+                        obs_count
+                    );
+
+                    let agent_count = agent_loop.subagent_manager().get_running_count().await;
+                    println!("  {}AGENTS{}    {} running", tui::BOLD, tui::RESET, agent_count);
+
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    if !active_channels.is_empty() {
+                        let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
+                            "whatsapp" => "wa",
+                            "telegram" => "tg",
+                            other => other,
+                        }).collect();
+                        println!("  {}CHANNELS{}  {}", tui::BOLD, tui::RESET, ch_names.join(" "));
+                    }
+
+                    let turn = core.learning_turn_counter.load(Ordering::Relaxed);
+                    println!("  {}TURN{}      {}", tui::BOLD, tui::RESET, turn);
+
+                    if is_local {
+                        if let Some(ref cp) = compaction_port {
+                            println!("  {}COMPACT{}   on port {} (CPU)", tui::BOLD, tui::RESET, cp);
+                        }
+                    }
+
+                    println!();
+                    continue;
+                }
+
+                // Process message (streaming)
                 let channel = if voice_on { "voice" } else { "cli" };
-                let response = agent_loop
-                    .process_direct(input, &session_id, channel, "direct")
-                    .await;
+
+                let (delta_tx, mut delta_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+
+                // Print deltas as they stream in
+                let print_task = tokio::spawn(async move {
+                    use std::io::Write as _;
+                    while let Some(delta) = delta_rx.recv().await {
+                        print!("{}", delta);
+                        std::io::stdout().flush().ok();
+                    }
+                    println!();
+                });
 
                 println!();
-                skin.print_text(&response);
+                let response = agent_loop
+                    .process_direct_streaming(
+                        input,
+                        &session_id,
+                        channel,
+                        "direct",
+                        None,
+                        delta_tx,
+                    )
+                    .await;
+
+                let _ = print_task.await;
                 println!();
+                {
+                    let sa_count = agent_loop.subagent_manager().get_running_count().await;
+                    active_channels.retain(|ch| !ch.handle.is_finished());
+                    let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
+                        "whatsapp" => "wa", "telegram" => "tg", other => other,
+                    }).collect();
+                    print_status_bar(&core_handle, &ch_names, sa_count);
+                }
 
                 #[cfg(feature = "voice")]
                 if let Some(ref mut vs) = voice_session {
                     let tts_text = strip_markdown_for_tts(&response);
                     if !tts_text.is_empty() {
-                        speak_interruptible(vs, &tts_text);
+                        speak_interruptible(vs, &tts_text, "en");
                     }
                 }
             }
@@ -906,22 +1405,27 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool) {
                 child.kill().ok();
                 child.wait().ok();
             }
+            if let Some(ref mut child) = compaction_process {
+                child.kill().ok();
+                child.wait().ok();
+            }
 
             println!("Goodbye!");
         }
     });
 }
 
-/// Create an agent loop with the appropriate provider based on local mode.
-async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: Option<&str>) -> (AgentLoop, Config) {
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
-
+/// Build a `SharedCoreHandle` from config — called once at startup.
+fn build_core_handle(
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+) -> SharedCoreHandle {
     let is_local = LOCAL_MODE.load(Ordering::SeqCst);
     let provider: Arc<dyn LLMProvider> = if is_local {
-        // Create local provider pointing to llama.cpp server
         Arc::new(OpenAICompatProvider::new(
-            "local", // API key not needed for local
+            "local",
             Some(&format!("http://localhost:{}/v1", local_port)),
             Some("local-model"),
         ))
@@ -930,7 +1434,6 @@ async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: 
     };
 
     let model = if is_local {
-        // Pass the actual GGUF filename so the LLM knows what model it is.
         format!("local:{}", local_model_name.unwrap_or("local-model"))
     } else {
         config.agents.defaults.model.clone()
@@ -942,40 +1445,221 @@ async fn create_agent_loop(config: &Config, local_port: &str, local_model_name: 
         Some(config.tools.web.search.api_key.clone())
     };
 
-    let cron_store_path = get_data_dir().join("cron").join("jobs.json");
-    let cron_service = Arc::new(CronService::new(cron_store_path));
-
-    // Provide email config to the REPL agent when credentials are configured.
-    let email_config = {
-        let ec = &config.channels.email;
-        if !ec.imap_host.is_empty() && !ec.username.is_empty() && !ec.password.is_empty() {
-            Some(ec.clone())
-        } else {
-            None
-        }
+    // Auto-detect context size from local server; fall back to config default.
+    let max_context_tokens = if is_local {
+        query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
+    } else {
+        config.agents.defaults.max_context_tokens
     };
 
-    let agent_loop = AgentLoop::new(
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
+    let cp: Option<Arc<dyn LLMProvider>> = if is_local {
+        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
+            Arc::new(OpenAICompatProvider::new(
+                "local-compaction",
+                Some(&format!("http://localhost:{}/v1", p)),
+                None,
+            ))
+        })
+    } else {
+        None
+    };
+
+    let core = build_shared_core(
         provider,
         config.workspace_path(),
         model,
         config.agents.defaults.max_tool_iterations,
         config.agents.defaults.max_tokens,
         config.agents.defaults.temperature,
-        config.agents.defaults.max_context_tokens,
+        max_context_tokens,
         brave_key,
         config.tools.exec_.timeout,
         config.tools.exec_.restrict_to_workspace,
-        Some(cron_service),
+        config.memory.clone(),
+        is_local,
+        cp,
+    );
+    Arc::new(std::sync::RwLock::new(Arc::new(core)))
+}
+
+/// Rebuild the shared core for `/local` toggle or `/model` swap.
+///
+/// All agents sharing this handle see the new provider on their next message.
+fn rebuild_core(
+    handle: &SharedCoreHandle,
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+) {
+    let is_local = LOCAL_MODE.load(Ordering::SeqCst);
+    let provider: Arc<dyn LLMProvider> = if is_local {
+        Arc::new(OpenAICompatProvider::new(
+            "local",
+            Some(&format!("http://localhost:{}/v1", local_port)),
+            Some("local-model"),
+        ))
+    } else {
+        create_provider(config)
+    };
+
+    let model = if is_local {
+        format!("local:{}", local_model_name.unwrap_or("local-model"))
+    } else {
+        config.agents.defaults.model.clone()
+    };
+
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
+
+    // Auto-detect context size from local server; fall back to config default.
+    let max_context_tokens = if is_local {
+        query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
+    } else {
+        config.agents.defaults.max_context_tokens
+    };
+
+    let cp: Option<Arc<dyn LLMProvider>> = if is_local {
+        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
+            Arc::new(OpenAICompatProvider::new(
+                "local-compaction",
+                Some(&format!("http://localhost:{}/v1", p)),
+                None,
+            ))
+        })
+    } else {
+        None
+    };
+
+    let new_core = build_shared_core(
+        provider,
+        config.workspace_path(),
+        model,
+        config.agents.defaults.max_tool_iterations,
+        config.agents.defaults.max_tokens,
+        config.agents.defaults.temperature,
+        max_context_tokens,
+        brave_key,
+        config.tools.exec_.timeout,
+        config.tools.exec_.restrict_to_workspace,
+        config.memory.clone(),
+        is_local,
+        cp,
+    );
+    *handle.write().unwrap() = Arc::new(new_core);
+}
+
+/// Create an agent loop with per-instance channels, using the shared core handle.
+fn create_agent_loop(
+    core_handle: SharedCoreHandle,
+    config: &Config,
+    cron_service: Option<Arc<CronService>>,
+    email_config: Option<crate::config::schema::EmailConfig>,
+    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+) -> AgentLoop {
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+
+    AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        cron_service,
         config.agents.defaults.max_concurrent_chats,
         email_config,
-        None, // REPL display not used for CLI direct mode
-    );
+        repl_display_tx,
+    )
+}
 
-    (agent_loop, config.clone())
+/// Query the local llama.cpp server for its actual context size (`n_ctx`).
+///
+/// Returns the server's context window with 5% headroom subtracted (to account
+/// for token-estimation drift). Falls back to `None` if the server is
+/// unreachable or the response is unexpected.
+fn query_local_context_size(port: &str) -> Option<usize> {
+    let url = format!("http://localhost:{}/props", port);
+    let props = reqwest::blocking::get(&url)
+        .ok()?
+        .json::<serde_json::Value>()
+        .ok()?;
+    let n_ctx = props
+        .get("default_generation_settings")
+        .and_then(|v| v.get("n_ctx"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| props.get("n_ctx").and_then(|v| v.as_u64()))? as usize;
+    let n_parallel = props
+        .get("default_generation_settings")
+        .and_then(|v| v.get("n_parallel"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| props.get("n_parallel").and_then(|v| v.as_u64()))
+        .unwrap_or(1)
+        .max(1) as usize;
+    let per_request_ctx = (n_ctx / n_parallel).max(1);
+    // Apply 5% headroom — our char/4 estimator can overshoot slightly.
+    Some((per_request_ctx as f64 * 0.95) as usize)
+}
+
+/// Format a number with thousands separators (e.g. 12430 -> "12,430").
+fn format_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Print a compact status bar after each agent response.
+fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[&str], subagent_count: usize) {
+    use std::sync::atomic::Ordering;
+    let core = core_handle.read().unwrap().clone();
+    let used = core.last_context_used.load(Ordering::Relaxed) as usize;
+    let max = core.last_context_max.load(Ordering::Relaxed) as usize;
+    let turn = core.learning_turn_counter.load(Ordering::Relaxed);
+
+    let pct = if max > 0 { (used * 100) / max } else { 0 };
+    let ctx_color = match pct {
+        0..=49 => tui::GREEN,
+        50..=79 => tui::YELLOW,
+        _ => tui::RED,
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!(
+        "ctx {}{}{}%{}",
+        ctx_color,
+        tui::BOLD,
+        pct,
+        tui::RESET
+    ));
+
+    if !channel_names.is_empty() {
+        parts.push(format!(
+            "{}{}{}",
+            tui::CYAN,
+            channel_names.join(" "),
+            tui::RESET
+        ));
+    }
+
+    if subagent_count > 0 {
+        parts.push(format!(
+            "{} agent{}",
+            subagent_count,
+            if subagent_count > 1 { "s" } else { "" }
+        ));
+    }
+
+    parts.push(format!("t:{}", turn));
+
+    println!("  {}{}{}", tui::DIM, parts.join(" | "), tui::RESET);
 }
 
 /// Print the current mode banner (compact, for mode switches mid-session).
@@ -988,7 +1672,8 @@ fn print_mode_banner(local_port: &str) {
         let props_url = format!("http://localhost:{}/props", local_port);
         if let Ok(resp) = reqwest::blocking::get(&props_url) {
             if let Ok(json) = resp.json::<serde_json::Value>() {
-                if let Some(model) = json.get("default_generation_settings")
+                if let Some(model) = json
+                    .get("default_generation_settings")
                     .and_then(|s| s.get("model"))
                     .and_then(|m| m.as_str())
                 {
@@ -998,11 +1683,38 @@ fn print_mode_banner(local_port: &str) {
                         .unwrap_or(model);
                     println!("  {DIM}Model: {RESET}{GREEN}{model_name}{RESET}");
                 }
+                if let Some(n_ctx) = json
+                    .get("default_generation_settings")
+                    .and_then(|s| s.get("n_ctx"))
+                    .and_then(|n| n.as_u64())
+                {
+                    let n_parallel = json
+                        .get("default_generation_settings")
+                        .and_then(|s| s.get("n_parallel"))
+                        .and_then(|n| n.as_u64())
+                        .or_else(|| json.get("n_parallel").and_then(|n| n.as_u64()))
+                        .unwrap_or(1)
+                        .max(1);
+                    let per_request = (n_ctx / n_parallel).max(1);
+                    if n_parallel > 1 {
+                        println!(
+                            "  {DIM}Context: {RESET}{GREEN}{}K{RESET}{DIM} ({}K total / parallel {}){RESET}",
+                            per_request / 1024,
+                            n_ctx / 1024,
+                            n_parallel
+                        );
+                    } else {
+                        println!("  {DIM}Context: {RESET}{GREEN}{}K{RESET}", n_ctx / 1024);
+                    }
+                }
             }
         }
     } else {
         let config = load_config(None);
-        println!("  {BOLD}{CYAN}CLOUD MODE{RESET} {DIM}{}{RESET}", config.agents.defaults.model);
+        println!(
+            "  {BOLD}{CYAN}CLOUD MODE{RESET} {DIM}{}{RESET}",
+            config.agents.defaults.model
+        );
     }
     println!();
 }
@@ -1021,7 +1733,10 @@ fn print_startup_splash(local_port: &str) {
         println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}llama.cpp :{local_port}{RESET}");
     } else {
         let config = load_config(None);
-        println!("  {BOLD}{CYAN}CLOUD{RESET} {DIM}{}{RESET}", config.agents.defaults.model);
+        println!(
+            "  {BOLD}{CYAN}CLOUD{RESET} {DIM}{}{RESET}",
+            config.agents.defaults.model
+        );
     }
     println!("  {DIM}v{VERSION}  |  /local  /model  /voice  Ctrl+C quit{RESET}");
     println!();
@@ -1044,8 +1759,9 @@ fn cmd_gateway(port: u16, verbose: bool) {
     let config = load_config(None);
     check_api_key(&config);
 
+    let core_handle = build_core_handle(&config, "8080", None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
 
 /// Shared async gateway: creates channels, provider, cron, agent loop, and runs until stopped.
@@ -1054,20 +1770,12 @@ fn cmd_gateway(port: u16, verbose: bool) {
 /// If `None`, watches for Ctrl+C (used for standalone CLI commands).
 async fn run_gateway_async(
     config: Config,
+    core_handle: SharedCoreHandle,
     stop_signal: Option<Arc<AtomicBool>>,
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
 ) {
-    let model = config.agents.defaults.model.clone();
-
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
-
-    let provider = create_provider(&config);
-    let brave_key = if config.tools.web.search.api_key.is_empty() {
-        None
-    } else {
-        Some(config.tools.web.search.api_key.clone())
-    };
 
     let cron_store_path = get_data_dir().join("cron").join("jobs.json");
     let mut cron_service = CronService::new(cron_store_path);
@@ -1076,19 +1784,10 @@ async fn run_gateway_async(
     let cron_arc = Arc::new(cron_service);
 
     let mut agent_loop = AgentLoop::new(
+        core_handle,
         inbound_rx,
         outbound_tx,
         inbound_tx.clone(),
-        provider,
-        config.workspace_path(),
-        model,
-        config.agents.defaults.max_tool_iterations,
-        config.agents.defaults.max_tokens,
-        config.agents.defaults.temperature,
-        config.agents.defaults.max_context_tokens,
-        brave_key,
-        config.tools.exec_.timeout,
-        config.tools.exec_.restrict_to_workspace,
         Some(cron_arc),
         config.agents.defaults.max_concurrent_chats,
         None, // gateway agent uses bus for email, not tools
@@ -1104,7 +1803,10 @@ async fn run_gateway_async(
                 Some(Arc::new(vp))
             }
             Err(e) => {
-                warn!("Voice pipeline init failed (voice messages will not be transcribed): {}", e);
+                warn!(
+                    "Voice pipeline init failed (voice messages will not be transcribed): {}",
+                    e
+                );
                 None
             }
         }
@@ -1129,7 +1831,10 @@ async fn run_gateway_async(
         }
 
         {
-            let job_count = cron_status.get("jobs").and_then(|v| v.as_i64()).unwrap_or(0);
+            let job_count = cron_status
+                .get("jobs")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if job_count > 0 {
                 println!("  Cron: {} scheduled jobs", job_count);
             }
@@ -1184,8 +1889,9 @@ fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
+    let core_handle = build_core_handle(&config, "8080", None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
 
 fn cmd_telegram(token_arg: Option<String>) {
@@ -1247,8 +1953,9 @@ fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
+    let core_handle = build_core_handle(&config, "8080", None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
 
 fn cmd_email(
@@ -1367,8 +2074,9 @@ fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
+    let core_handle = build_core_handle(&config, "8080", None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
 
 /// Validate a Telegram bot token by calling the getMe API.
@@ -1404,7 +2112,11 @@ fn cmd_status() {
     println!(
         "Config: {} [{}]",
         config_path.display(),
-        if config_path.exists() { "ok" } else { "missing" }
+        if config_path.exists() {
+            "ok"
+        } else {
+            "missing"
+        }
     );
     println!(
         "Workspace: {} [{}]",
@@ -1416,19 +2128,35 @@ fn cmd_status() {
         println!("Model: {}", config.agents.defaults.model);
         println!(
             "OpenRouter API: {}",
-            if config.providers.openrouter.api_key.is_empty() { "not set" } else { "configured" }
+            if config.providers.openrouter.api_key.is_empty() {
+                "not set"
+            } else {
+                "configured"
+            }
         );
         println!(
             "Anthropic API: {}",
-            if config.providers.anthropic.api_key.is_empty() { "not set" } else { "configured" }
+            if config.providers.anthropic.api_key.is_empty() {
+                "not set"
+            } else {
+                "configured"
+            }
         );
         println!(
             "OpenAI API: {}",
-            if config.providers.openai.api_key.is_empty() { "not set" } else { "configured" }
+            if config.providers.openai.api_key.is_empty() {
+                "not set"
+            } else {
+                "configured"
+            }
         );
         println!(
             "Gemini API: {}",
-            if config.providers.gemini.api_key.is_empty() { "not set" } else { "configured" }
+            if config.providers.gemini.api_key.is_empty() {
+                "not set"
+            } else {
+                "configured"
+            }
         );
         let vllm_status = if let Some(ref base) = config.providers.vllm.api_base {
             format!("configured ({})", base)
@@ -1437,7 +2165,7 @@ fn cmd_status() {
         };
         println!("vLLM/Local: {}", vllm_status);
     }
-    
+
     // Check local LLM status
     println!("\nLocal LLM Servers:");
     for (name, port) in [("main", 8080), ("fast", 8081), ("coder", 8082)] {
@@ -1450,6 +2178,80 @@ fn cmd_status() {
     }
 }
 
+fn cmd_tune(input_path: String, json: bool) {
+    let path = std::path::PathBuf::from(input_path);
+    match run_tune_from_path(&path, json) {
+        Ok(output) => println!("{}", output),
+        Err(e) => {
+            eprintln!("Tune failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_tune_from_path(path: &std::path::Path, as_json: bool) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed reading benchmark file '{}': {}", path.display(), e))?;
+
+    let input: OptimizationInput = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed parsing benchmark JSON '{}': {}", path.display(), e))?;
+
+    if input.measurements.is_empty() {
+        return Err("benchmark file has no measurements".to_string());
+    }
+
+    let constraints = input.resolved_constraints();
+    let weights = input.resolved_weights();
+    let scored = score_feasible_profiles(&input.measurements, constraints, weights);
+    let best = select_optimal_from_input(&input).ok_or_else(|| {
+        format!(
+            "no feasible profile found (min_quality={}, min_tool_success={}, max_ttft_ms={}, max_overflow={})",
+            constraints.min_quality_score,
+            constraints.min_tool_success_rate,
+            constraints.max_ttft_ms,
+            constraints.max_context_overflow_rate
+        )
+    })?;
+
+    if as_json {
+        return serde_json::to_string_pretty(&best)
+            .map_err(|e| format!("failed serializing result JSON: {}", e));
+    }
+
+    let mut out = String::new();
+    out.push_str("Best local profile\n");
+    out.push_str(&format!("  id: {}\n", best.profile.id));
+    out.push_str(&format!("  model: {}\n", best.profile.model));
+    out.push_str(&format!("  ctx_size: {}\n", best.profile.ctx_size));
+    out.push_str(&format!("  max_tokens: {}\n", best.profile.max_tokens));
+    out.push_str(&format!("  temperature: {:.3}\n", best.profile.temperature));
+    out.push_str(&format!("  score: {:.4}\n", best.score));
+    out.push_str(&format!(
+        "  metrics: quality={:.3}, tool_success={:.3}, ttft_ms={:.0}, toks_per_sec={:.1}, overflow={:.3}\n",
+        best.sample.quality_score,
+        best.sample.tool_success_rate,
+        best.sample.ttft_ms,
+        best.sample.output_toks_per_sec,
+        best.sample.context_overflow_rate
+    ));
+
+    if scored.len() > 1 {
+        out.push_str("Top alternatives\n");
+        for candidate in scored.iter().take(3).skip(1) {
+            out.push_str(&format!(
+                "  - {} (score {:.4}, q {:.3}, ttft {:.0} ms, {:.1} tok/s)\n",
+                candidate.profile.id,
+                candidate.score,
+                candidate.sample.quality_score,
+                candidate.sample.ttft_ms,
+                candidate.sample.output_toks_per_sec
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
 // ============================================================================
 // Channels
 // ============================================================================
@@ -1459,7 +2261,11 @@ fn cmd_channels_status() {
     println!("Channel Status\n");
     println!(
         "  WhatsApp: {} ({})",
-        if config.channels.whatsapp.enabled { "enabled" } else { "disabled" },
+        if config.channels.whatsapp.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         config.channels.whatsapp.effective_bridge_url()
     );
     let tg_info = if config.channels.telegram.token.is_empty() {
@@ -1470,21 +2276,36 @@ fn cmd_channels_status() {
     };
     println!(
         "  Telegram: {} ({})",
-        if config.channels.telegram.enabled { "enabled" } else { "disabled" },
+        if config.channels.telegram.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         tg_info
     );
     println!(
         "  Feishu: {}",
-        if config.channels.feishu.enabled { "enabled" } else { "disabled" }
+        if config.channels.feishu.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     let email_info = if config.channels.email.imap_host.is_empty() {
         "not configured".to_string()
     } else {
-        format!("imap: {}, smtp: {}", config.channels.email.imap_host, config.channels.email.smtp_host)
+        format!(
+            "imap: {}, smtp: {}",
+            config.channels.email.imap_host, config.channels.email.smtp_host
+        )
     };
     println!(
         "  Email: {} ({})",
-        if config.channels.email.enabled { "enabled" } else { "disabled" },
+        if config.channels.email.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         email_info
     );
 }
@@ -1620,13 +2441,151 @@ fn list_local_models() -> Vec<std::path::PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
         .collect();
-    models.sort_by(|a, b| {
-        a.file_name().cmp(&b.file_name())
-    });
+    models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     models
 }
 
 const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
+
+const COMPACTION_MODEL_URL: &str =
+    "https://huggingface.co/MaziyarPanahi/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B.Q4_K_M.gguf";
+const COMPACTION_MODEL_FILENAME: &str = "Qwen3-0.6B.Q4_K_M.gguf";
+
+/// Ensure the dedicated compaction model is available locally.
+///
+/// Downloads Qwen3-0.6B Q4_K_M (~500MB) to `~/.nanobot/models/` if not already
+/// present. Returns `None` on failure (graceful degradation — compaction just
+/// gets skipped and the system falls back to `trim_to_fit`).
+fn ensure_compaction_model() -> Option<std::path::PathBuf> {
+    let models_dir = dirs::home_dir()?.join(".nanobot").join("models");
+    std::fs::create_dir_all(&models_dir).ok()?;
+
+    let model_path = models_dir.join(COMPACTION_MODEL_FILENAME);
+    if model_path.exists() {
+        return Some(model_path);
+    }
+
+    println!(
+        "  {}{}Downloading{} compaction model (Qwen3-0.6B, ~500MB)...",
+        tui::BOLD,
+        tui::YELLOW,
+        tui::RESET
+    );
+
+    let tmp_path = models_dir.join(format!("{}.downloading", COMPACTION_MODEL_FILENAME));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut resp = reqwest::blocking::get(COMPACTION_MODEL_URL)?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()).into());
+        }
+        let mut file = std::fs::File::create(&tmp_path)?;
+        resp.copy_to(&mut file)?;
+        std::fs::rename(&tmp_path, &model_path)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            println!(
+                "  {}{}Done{} — saved to {}",
+                tui::BOLD,
+                tui::GREEN,
+                tui::RESET,
+                model_path.display()
+            );
+            Some(model_path)
+        }
+        Err(e) => {
+            println!(
+                "  {}{}Download failed:{} {} (compaction will use trim_to_fit fallback)",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                e
+            );
+            // Clean up partial download
+            let _ = std::fs::remove_file(&tmp_path);
+            None
+        }
+    }
+}
+
+/// Start the dedicated compaction server if the model is available.
+///
+/// Downloads the model on first run, spawns a CPU-only llama-server on port 8090+,
+/// and stores the process handle and port. Gracefully degrades if anything fails.
+async fn start_compaction_if_available(
+    compaction_process: &mut Option<std::process::Child>,
+    compaction_port: &mut Option<String>,
+) {
+    // Already running?
+    if compaction_process.is_some() {
+        return;
+    }
+
+    let model_path = match ensure_compaction_model() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let port = find_available_port(8090);
+    println!(
+        "  {}{}Starting{} compaction server on port {} (CPU-only)...",
+        tui::BOLD,
+        tui::YELLOW,
+        tui::RESET,
+        port
+    );
+
+    match spawn_compaction_server(port, &model_path) {
+        Ok(child) => {
+            *compaction_process = Some(child);
+            if wait_for_server_ready(port, 15, compaction_process).await {
+                *compaction_port = Some(port.to_string());
+                println!(
+                    "  {}{}Compaction server ready{} (Qwen3-0.6B on CPU)",
+                    tui::BOLD,
+                    tui::GREEN,
+                    tui::RESET
+                );
+            } else {
+                println!(
+                    "  {}{}Compaction server failed to start{} (using trim_to_fit fallback)",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                if let Some(ref mut child) = compaction_process {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                *compaction_process = None;
+            }
+        }
+        Err(e) => {
+            println!(
+                "  {}{}Compaction server failed:{} {} (using trim_to_fit fallback)",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                e
+            );
+        }
+    }
+}
+
+/// Stop the compaction server and clear state.
+fn stop_compaction_server(
+    compaction_process: &mut Option<std::process::Child>,
+    compaction_port: &mut Option<String>,
+) {
+    if let Some(ref mut child) = compaction_process {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    *compaction_process = None;
+    *compaction_port = None;
+}
 
 fn kill_stale_llama_servers() {
     // Kill any orphaned llama-server processes from previous runs
@@ -1639,12 +2598,330 @@ fn kill_stale_llama_servers() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 }
 
-fn spawn_llama_server(port: u16, model_path: &std::path::Path) -> Result<std::process::Child, String> {
+// ---------------------------------------------------------------------------
+// Auto-size context window: GGUF metadata + system resources
+// ---------------------------------------------------------------------------
+
+struct GgufModelInfo {
+    n_layers: u32,
+    n_kv_heads: u32,
+    n_heads: u32,
+    embedding_dim: u32,
+    context_length: u32,
+}
+
+/// Parse architecture-specific metadata from a GGUF file header.
+fn parse_gguf_metadata(path: &std::path::Path) -> Option<GgufModelInfo> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+
+    // Magic "GGUF"
+    f.read_exact(&mut buf4).ok()?;
+    if &buf4 != b"GGUF" {
+        return None;
+    }
+
+    // Version (u32 LE) — we support v2 and v3
+    f.read_exact(&mut buf4).ok()?;
+    let version = u32::from_le_bytes(buf4);
+    if version < 2 {
+        return None;
+    }
+
+    // tensor_count (u64), kv_count (u64)
+    f.read_exact(&mut buf8).ok()?;
+    let _tensor_count = u64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8).ok()?;
+    let kv_count = u64::from_le_bytes(buf8);
+
+    fn gguf_read_string(f: &mut std::fs::File) -> Option<String> {
+        let mut b8 = [0u8; 8];
+        f.read_exact(&mut b8).ok()?;
+        let len = u64::from_le_bytes(b8) as usize;
+        if len > 256 {
+            f.seek(SeekFrom::Current(len as i64)).ok()?;
+            return Some(String::new());
+        }
+        let mut s = vec![0u8; len];
+        f.read_exact(&mut s).ok()?;
+        String::from_utf8(s).ok()
+    }
+
+    fn gguf_skip_value(f: &mut std::fs::File, vtype: u32) -> Option<()> {
+        match vtype {
+            0 | 1 | 7 => {
+                let mut b = [0u8; 1];
+                f.read_exact(&mut b).ok()?;
+            }
+            2 | 3 => {
+                let mut b = [0u8; 2];
+                f.read_exact(&mut b).ok()?;
+            }
+            4 | 5 | 6 => {
+                let mut b = [0u8; 4];
+                f.read_exact(&mut b).ok()?;
+            }
+            8 => {
+                gguf_read_string(f)?;
+            }
+            9 => {
+                let mut tb = [0u8; 4];
+                f.read_exact(&mut tb).ok()?;
+                let elem_type = u32::from_le_bytes(tb);
+                let mut cb = [0u8; 8];
+                f.read_exact(&mut cb).ok()?;
+                let count = u64::from_le_bytes(cb);
+                for _ in 0..count {
+                    gguf_skip_value(f, elem_type)?;
+                }
+            }
+            10 | 11 | 12 => {
+                let mut b = [0u8; 8];
+                f.read_exact(&mut b).ok()?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    let mut arch = String::new();
+    let mut n_layers: Option<u32> = None;
+    let mut n_kv_heads: Option<u32> = None;
+    let mut n_heads: Option<u32> = None;
+    let mut embedding_dim: Option<u32> = None;
+    let mut context_length: Option<u32> = None;
+
+    for _ in 0..kv_count {
+        let key = match gguf_read_string(&mut f) {
+            Some(k) => k,
+            None => return None,
+        };
+
+        // Read value type
+        f.read_exact(&mut buf4).ok()?;
+        let vtype = u32::from_le_bytes(buf4);
+
+        if key == "general.architecture" && vtype == 8 {
+            arch = gguf_read_string(&mut f)?;
+            continue;
+        }
+
+        // Check for u32 metadata fields (type 4 = u32, type 5 = i32)
+        if (vtype == 4 || vtype == 5) && !arch.is_empty() {
+            let mut vb = [0u8; 4];
+            f.read_exact(&mut vb).ok()?;
+            let val = u32::from_le_bytes(vb);
+            if key == format!("{}.block_count", arch) {
+                n_layers = Some(val);
+            } else if key == format!("{}.attention.head_count_kv", arch) {
+                n_kv_heads = Some(val);
+            } else if key == format!("{}.attention.head_count", arch) {
+                n_heads = Some(val);
+            } else if key == format!("{}.embedding_length", arch) {
+                embedding_dim = Some(val);
+            } else if key == format!("{}.context_length", arch) {
+                context_length = Some(val);
+            }
+            continue;
+        }
+
+        // Skip values we don't need
+        gguf_skip_value(&mut f, vtype)?;
+    }
+
+    Some(GgufModelInfo {
+        n_layers: n_layers?,
+        n_kv_heads: n_kv_heads?,
+        n_heads: n_heads?,
+        embedding_dim: embedding_dim?,
+        context_length: context_length?,
+    })
+}
+
+/// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
+/// Returns (vram_bytes, ram_bytes).
+fn detect_available_memory() -> (Option<u64>, u64) {
+    // Try VRAM via nvidia-smi
+    let vram = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().lines().next()?.trim().parse::<u64>().ok()
+        })
+        .map(|mib| mib * 1024 * 1024);
+
+    // RAM via /proc/meminfo
+    let ram = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| {
+            for line in contents.lines() {
+                if line.starts_with("MemAvailable:") {
+                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                    return Some(kb * 1024);
+                }
+            }
+            None
+        })
+        .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
+
+    (vram, ram)
+}
+
+/// Practical context cap based on model file size (proxy for parameter count).
+///
+/// Small models become unresponsive with very large contexts — attention is O(n²)
+/// and they lack the capacity to utilize long contexts effectively.
+fn practical_context_cap(model_file_size_bytes: u64) -> usize {
+    let gb = model_file_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gb < 2.0 {
+        8192
+    }
+    // tiny (~1-3B heavy quant)
+    else if gb < 4.0 {
+        16384
+    }
+    // small (~3-7B)
+    else if gb < 8.0 {
+        32768
+    }
+    // medium (~7-14B)
+    else if gb < 16.0 {
+        65536
+    }
+    // large (~14-30B)
+    else {
+        usize::MAX
+    } // xlarge (30B+) — no cap
+}
+
+/// Compute optimal --ctx-size for a GGUF model given available system resources.
+fn compute_optimal_context_size(model_path: &std::path::Path) -> usize {
+    const OVERHEAD: u64 = 512 * 1024 * 1024; // 512 MB
+    const FALLBACK_CTX: usize = 16384;
+
+    let model_file_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+
+    let gguf = match parse_gguf_metadata(model_path) {
+        Some(info) => info,
+        None => {
+            // GGUF parse failed — use practical cap based on file size, or fallback
+            let cap = practical_context_cap(model_file_size).min(FALLBACK_CTX);
+            debug!(
+                "GGUF parse failed for {}, using {}K context (file size: {:.1}GB)",
+                model_path.display(),
+                cap / 1024,
+                model_file_size as f64 / 1e9
+            );
+            return cap;
+        }
+    };
+
+    let head_dim = gguf.embedding_dim / gguf.n_heads;
+    // KV cache per token (FP16): 2 (K+V) × layers × kv_heads × head_dim × 2 bytes
+    let kv_per_token = 2u64 * gguf.n_layers as u64 * gguf.n_kv_heads as u64 * head_dim as u64 * 2;
+
+    let (vram, ram) = detect_available_memory();
+
+    let available_for_kv = if let Some(vram_bytes) = vram {
+        // GPU mode: VRAM must hold model weights + KV cache
+        vram_bytes
+            .saturating_sub(model_file_size)
+            .saturating_sub(OVERHEAD)
+    } else {
+        // CPU mode: weights are mmap'd, RAM mainly for KV cache
+        ram.saturating_sub(OVERHEAD)
+    };
+
+    if kv_per_token == 0 {
+        let cap = practical_context_cap(model_file_size).min(FALLBACK_CTX);
+        debug!("KV per token is 0, using {}K context", cap / 1024);
+        return cap;
+    }
+
+    let max_ctx_from_memory = (available_for_kv / kv_per_token) as usize;
+    let cap = practical_context_cap(model_file_size);
+    // Clamp: at least 4096, at most min(memory allows, GGUF native, practical cap)
+    let ctx = max_ctx_from_memory
+        .max(4096)
+        .min(gguf.context_length as usize)
+        .min(cap);
+    // Round down to nearest 1024
+    let ctx = (ctx / 1024) * 1024;
+
+    let mem_source = if vram.is_some() { "VRAM" } else { "RAM" };
+    debug!(
+        "Auto-sized context: {} tokens ({}K) — kv/tok={}B, available {}={:.1}GB, model={:.1}GB, practical_cap={}K",
+        ctx, ctx / 1024, kv_per_token,
+        mem_source, available_for_kv as f64 / 1e9,
+        model_file_size as f64 / 1e9,
+        cap / 1024,
+    );
+
+    ctx
+}
+
+/// Spawn a CPU-only llama-server for context compaction (summarization).
+///
+/// Uses `--n-gpu-layers 0` so it never competes with the main model for VRAM.
+/// Fixed 4K context — summarization doesn't need more.
+fn spawn_compaction_server(
+    port: u16,
+    model_path: &std::path::Path,
+) -> Result<std::process::Child, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     let server_path = home.join("llama.cpp/build/bin/llama-server");
 
     if !server_path.exists() {
-        return Err(format!("llama-server not found at {}", server_path.display()));
+        return Err(format!(
+            "llama-server not found at {}",
+            server_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!(
+            "Compaction model not found at {}",
+            model_path.display()
+        ));
+    }
+
+    std::process::Command::new(&server_path)
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg("4096")
+        .arg("--parallel")
+        .arg("1")
+        .arg("--n-gpu-layers")
+        .arg("0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn compaction server: {}", e))
+}
+
+fn spawn_llama_server(
+    port: u16,
+    model_path: &std::path::Path,
+    ctx_size: usize,
+) -> Result<std::process::Child, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let server_path = home.join("llama.cpp/build/bin/llama-server");
+
+    if !server_path.exists() {
+        return Err(format!(
+            "llama-server not found at {}",
+            server_path.display()
+        ));
     }
     if !model_path.exists() {
         return Err(format!("Model not found at {}", model_path.display()));
@@ -1656,7 +2933,9 @@ fn spawn_llama_server(port: u16, model_path: &std::path::Path) -> Result<std::pr
         .arg("--port")
         .arg(port.to_string())
         .arg("--ctx-size")
-        .arg("16384")
+        .arg(ctx_size.to_string())
+        .arg("--parallel")
+        .arg("1")
         .arg("--n-gpu-layers")
         .arg("99")
         .arg("--flash-attn")
@@ -1667,11 +2946,16 @@ fn spawn_llama_server(port: u16, model_path: &std::path::Path) -> Result<std::pr
         .map_err(|e| format!("Failed to spawn llama-server: {}", e))
 }
 
-async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut Option<std::process::Child>) -> bool {
+async fn wait_for_server_ready(
+    port: u16,
+    timeout_secs: u64,
+    llama_process: &mut Option<std::process::Child>,
+) -> bool {
     use std::io::Write;
 
     // Drain stderr in a background thread so the pipe buffer doesn't block the server.
-    let stderr_lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_lines: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     if let Some(ref mut child) = llama_process {
         if let Some(stderr) = child.stderr.take() {
             let lines = stderr_lines.clone();
@@ -1701,8 +2985,17 @@ async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut
         if let Some(ref mut child) = llama_process {
             if let Ok(Some(_)) = child.try_wait() {
                 // Clear the bar line, show error
-                print!("\r{}{}{}  ", tui::SHOW_CURSOR, tui::RESET, " ".repeat(bar_width + 30));
-                print!("\r  {}Server exited unexpectedly{}\n", tui::YELLOW, tui::RESET);
+                print!(
+                    "\r{}{}{}  ",
+                    tui::SHOW_CURSOR,
+                    tui::RESET,
+                    " ".repeat(bar_width + 30)
+                );
+                print!(
+                    "\r  {}Server exited unexpectedly{}\n",
+                    tui::YELLOW,
+                    tui::RESET
+                );
                 // Show last few stderr lines as hint
                 let lines = stderr_lines.lock().unwrap();
                 if let Some(last) = lines.last() {
@@ -1720,10 +3013,14 @@ async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut
         let empty = bar_width - filled;
         print!(
             "\r  {}Loading model [{}{}{}{}{}] {:.0}s{}",
-            tui::DIM, tui::RESET, tui::CYAN,
-            "\u{2588}".repeat(filled),   // █
-            "\u{2591}".repeat(empty),    // ░
-            tui::DIM, elapsed, tui::RESET,
+            tui::DIM,
+            tui::RESET,
+            tui::CYAN,
+            "\u{2588}".repeat(filled), // █
+            "\u{2591}".repeat(empty),  // ░
+            tui::DIM,
+            elapsed,
+            tui::RESET,
         );
         std::io::stdout().flush().ok();
 
@@ -1732,8 +3029,11 @@ async fn wait_for_server_ready(port: u16, timeout_secs: u64, llama_process: &mut
                 // Fill bar to 100% briefly
                 print!(
                     "\r  {}Loading model [{}{}{}] done{}",
-                    tui::DIM, tui::RESET, tui::CYAN,
-                    "\u{2588}".repeat(bar_width), tui::RESET,
+                    tui::DIM,
+                    tui::RESET,
+                    tui::CYAN,
+                    "\u{2588}".repeat(bar_width),
+                    tui::RESET,
                 );
                 std::io::stdout().flush().ok();
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1762,18 +3062,24 @@ pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
             in_code_block = !in_code_block;
             continue;
         }
-        if in_code_block { continue; }
+        if in_code_block {
+            continue;
+        }
 
         let line = trimmed.trim_start_matches('#').trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         for c in line.chars() {
             match c {
                 'a'..='z' | 'A'..='Z' | '0'..='9' => out.push(c),
-                ' ' | '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')' => out.push(c),
+                ' ' | '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')' => {
+                    out.push(c)
+                }
                 '*' | '_' | '`' | '~' | '[' | ']' | '|' | '#' => {} // strip markdown syntax
-                _ if c.is_alphabetic() => out.push(c), // keep non-English letters
-                _ => {} // strip emojis, arrows, etc.
+                _ if c.is_alphabetic() => out.push(c),              // keep non-English letters
+                _ => {}                                             // strip emojis, arrows, etc.
             }
         }
         out.push(' ');
@@ -1789,14 +3095,16 @@ fn drain_stdin() {
     {
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stdin().as_raw_fd();
-        unsafe { libc::tcflush(fd, libc::TCIFLUSH); }
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH);
+        }
     }
 }
 
 /// Speak with TTS while watching for user interrupt (Enter or Ctrl+Space).
 /// Returns true if the user interrupted (wants to speak next).
 #[cfg(feature = "voice")]
-fn speak_interruptible(vs: &mut voice::VoiceSession, text: &str) -> bool {
+fn speak_interruptible(vs: &mut voice::VoiceSession, text: &str, lang: &str) -> bool {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1829,7 +3137,7 @@ fn speak_interruptible(vs: &mut voice::VoiceSession, text: &str) -> bool {
         interrupted
     });
 
-    if let Err(e) = vs.speak(text) {
+    if let Err(e) = vs.speak(text, lang) {
         eprintln!("TTS error: {}", e);
     }
 
@@ -1865,7 +3173,11 @@ fn voice_read_input() -> VoiceAction {
             Ok(0) | Err(_) => VoiceAction::Exit,
             _ => {
                 let trimmed = line.trim().to_string();
-                if trimmed.is_empty() { VoiceAction::Record } else { VoiceAction::Text(trimmed) }
+                if trimmed.is_empty() {
+                    VoiceAction::Record
+                } else {
+                    VoiceAction::Text(trimmed)
+                }
             }
         };
     }
@@ -1940,7 +3252,9 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
+    use tempfile::tempdir;
 
     // ======================================================================
     // find_available_port
@@ -1982,7 +3296,11 @@ mod tests {
 
         if let (Ok(_l1), Ok(_l2)) = (l1, l2) {
             let found = find_available_port(base);
-            assert!(found >= base + 2, "Should skip both occupied ports, got {}", found);
+            assert!(
+                found >= base + 2,
+                "Should skip both occupied ports, got {}",
+                found
+            );
         }
         // If we can't bind both (already in use), test is inconclusive — that's fine
     }
@@ -2005,7 +3323,7 @@ mod tests {
 
         if !server_path.exists() {
             let fake_model = home.join("models/nonexistent.gguf");
-            let result = spawn_llama_server(19876, &fake_model);
+            let result = spawn_llama_server(19876, &fake_model, 8192);
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("llama-server not found"),
@@ -2021,7 +3339,7 @@ mod tests {
         let model_path = home.join("models/nonexistent-test-model.gguf");
 
         if server_path.exists() {
-            let result = spawn_llama_server(19877, &model_path);
+            let result = spawn_llama_server(19877, &model_path, 8192);
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("Model not found"),
@@ -2060,7 +3378,8 @@ mod tests {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
                     let _ = stream.read(&mut buf).await;
-                    let resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+                    let resp =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
                     stream.write_all(resp.as_bytes()).await.ok();
                 }
             }
@@ -2105,5 +3424,94 @@ mod tests {
             request_count.load(Ordering::SeqCst) >= 3,
             "Should have retried at least 3 times"
         );
+    }
+
+    #[test]
+    fn test_cli_parses_tune_command() {
+        let cli = Cli::try_parse_from(["nanobot", "tune", "--input", "bench.json"]).unwrap();
+        match cli.command {
+            Commands::Tune { input, json } => {
+                assert_eq!(input, "bench.json");
+                assert!(!json);
+            }
+            other => panic!("unexpected parsed command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_run_tune_from_path_selects_best_profile() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench.json");
+        let payload = r#"{
+  "measurements": [
+    {
+      "profile": {
+        "id": "fast",
+        "model": "slm-a",
+        "ctx_size": 16384,
+        "max_tokens": 768,
+        "temperature": 0.3
+      },
+      "sample": {
+        "ttft_ms": 650.0,
+        "output_toks_per_sec": 95.0,
+        "quality_score": 0.81,
+        "tool_success_rate": 0.95,
+        "context_overflow_rate": 0.0
+      }
+    },
+    {
+      "profile": {
+        "id": "slow",
+        "model": "slm-b",
+        "ctx_size": 16384,
+        "max_tokens": 768,
+        "temperature": 0.3
+      },
+      "sample": {
+        "ttft_ms": 1300.0,
+        "output_toks_per_sec": 40.0,
+        "quality_score": 0.82,
+        "tool_success_rate": 0.95,
+        "context_overflow_rate": 0.0
+      }
+    }
+  ]
+}"#;
+        fs::write(&path, payload).unwrap();
+
+        let output = run_tune_from_path(&path, false).expect("expected tuned profile output");
+        assert!(output.contains("fast"), "output: {}", output);
+    }
+
+    #[test]
+    fn test_run_tune_from_path_json_output() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bench.json");
+        let payload = r#"{
+  "measurements": [
+    {
+      "profile": {
+        "id": "balanced",
+        "model": "slm-c",
+        "ctx_size": 16384,
+        "max_tokens": 768,
+        "temperature": 0.3
+      },
+      "sample": {
+        "ttft_ms": 800.0,
+        "output_toks_per_sec": 70.0,
+        "quality_score": 0.86,
+        "tool_success_rate": 0.97,
+        "context_overflow_rate": 0.0
+      }
+    }
+  ]
+}"#;
+        fs::write(&path, payload).unwrap();
+
+        let output = run_tune_from_path(&path, true).expect("expected JSON output");
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["profile"]["id"].as_str(), Some("balanced"));
     }
 }

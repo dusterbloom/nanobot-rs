@@ -20,8 +20,7 @@ impl GroqTranscriptionProvider {
     /// If `api_key` is `None`, the `GROQ_API_KEY` environment variable is
     /// checked at construction time.
     pub fn new(api_key: Option<String>) -> Self {
-        let resolved_key =
-            api_key.or_else(|| std::env::var("GROQ_API_KEY").ok());
+        let resolved_key = api_key.or_else(|| std::env::var("GROQ_API_KEY").ok());
 
         Self {
             api_key: resolved_key,
@@ -66,9 +65,7 @@ impl GroqTranscriptionProvider {
         let file_part = reqwest::multipart::Part::bytes(file_bytes)
             .file_name(file_name)
             .mime_str("application/octet-stream")
-            .unwrap_or_else(|_| {
-                reqwest::multipart::Part::bytes(Vec::new())
-            });
+            .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new()));
 
         let form = reqwest::multipart::Form::new()
             .part("file", file_part)

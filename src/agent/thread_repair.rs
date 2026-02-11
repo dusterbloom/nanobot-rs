@@ -42,7 +42,11 @@ fn fix_orphaned_tool_calls(messages: &mut Vec<Value>) {
     let result_ids: HashSet<String> = messages
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .filter_map(|m| m.get("tool_call_id").and_then(|id| id.as_str()).map(String::from))
+        .filter_map(|m| {
+            m.get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .map(String::from)
+        })
         .collect();
 
     // Find assistant messages with tool_calls that are missing results.
@@ -59,10 +63,7 @@ fn fix_orphaned_tool_calls(messages: &mut Vec<Value>) {
 
         let mut missing: Vec<Value> = Vec::new();
         for tc in tool_calls {
-            let call_id = tc
-                .get("id")
-                .and_then(|id| id.as_str())
-                .unwrap_or_default();
+            let call_id = tc.get("id").and_then(|id| id.as_str()).unwrap_or_default();
             if !call_id.is_empty() && !result_ids.contains(call_id) {
                 let tool_name = tc
                     .get("function")
@@ -254,7 +255,9 @@ mod tests {
 
         // The orphaned tool result should be removed.
         assert_eq!(messages.len(), 3);
-        assert!(!messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")));
+        assert!(!messages
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")));
     }
 
     #[test]
@@ -289,10 +292,7 @@ mod tests {
 
         // Should have inserted a synthetic user message before the assistant.
         assert_eq!(messages[1]["role"], "user");
-        assert!(messages[1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("resumed"));
+        assert!(messages[1]["content"].as_str().unwrap().contains("resumed"));
     }
 
     #[test]
@@ -353,8 +353,6 @@ mod tests {
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
             .collect();
         assert_eq!(tool_msgs.len(), 2);
-        assert!(tool_msgs
-            .iter()
-            .any(|m| m["tool_call_id"] == "tc_2"));
+        assert!(tool_msgs.iter().any(|m| m["tool_call_id"] == "tc_2"));
     }
 }

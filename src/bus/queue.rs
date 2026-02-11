@@ -19,9 +19,8 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 ///
 /// Each callback receives an `OutboundMessage` and returns a pinned future
 /// that resolves to `()`.
-pub type OutboundCallback = Arc<
-    dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type OutboundCallback =
+    Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Async message bus that decouples chat channels from the agent core.
 ///

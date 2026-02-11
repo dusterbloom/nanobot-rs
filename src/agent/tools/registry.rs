@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::base::Tool;
+use super::base::{Tool, ToolExecutionResult};
 
 /// Registry for agent tools.
 ///
@@ -47,41 +47,53 @@ impl ToolRegistry {
 
     /// Execute a tool by name with given parameters.
     ///
-    /// Returns the tool execution result as a string, or an error message
-    /// if the tool is not found or execution fails.
+    /// Returns a structured outcome (`ok`, `data`, `error`) so callers can
+    /// reason about success/failure without parsing raw strings.
+    /// Catches panics so a single tool failure doesn't crash the agent loop.
     pub async fn execute(
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
-    ) -> String {
+    ) -> ToolExecutionResult {
         let tool = match self.tools.get(name) {
             Some(t) => t,
-            None => return format!("Error: Tool '{}' not found", name),
+            None => {
+                return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
+            }
         };
 
-        match std::panic::AssertUnwindSafe(tool.execute(params))
-            .await
-        {
-            result => result,
+        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params));
+        match futures_util::FutureExt::catch_unwind(fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
+            }
         }
     }
 
     /// Core tools that are always included in tool definitions.
-    const CORE_TOOLS: &'static [&'static str] = &[
-        "read_file",
-        "write_file",
-        "edit_file",
-        "list_dir",
-        "exec",
-    ];
+    const CORE_TOOLS: &'static [&'static str] =
+        &["read_file", "write_file", "edit_file", "list_dir", "exec"];
 
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
-        (&["search", "find online", "look up", "google"], "web_search"),
-        (&["http", "url", "fetch", "website", "webpage", "download"], "web_fetch"),
+        (
+            &["search", "find online", "look up", "google"],
+            "web_search",
+        ),
+        (
+            &["http", "url", "fetch", "website", "webpage", "download"],
+            "web_fetch",
+        ),
         (&["schedule", "cron", "every", "timer", "periodic"], "cron"),
-        (&["send", "message", "notify", "tell", "reply to"], "message"),
-        (&["spawn", "agent", "background", "subagent", "delegate"], "spawn"),
+        (
+            &["send", "message", "notify", "tell", "reply to"],
+            "message",
+        ),
+        (
+            &["spawn", "agent", "background", "subagent", "delegate"],
+            "spawn",
+        ),
     ];
 
     /// Get tool definitions filtered by relevance to the current context.
@@ -344,7 +356,9 @@ mod tests {
         );
 
         let result = registry.execute("echo", params).await;
-        assert_eq!(result, "echo:hello");
+        assert!(result.ok);
+        assert_eq!(result.data, "echo:hello");
+        assert!(result.error.is_none());
     }
 
     #[tokio::test]
@@ -353,9 +367,14 @@ mod tests {
         let params = HashMap::new();
 
         let result = registry.execute("nonexistent", params).await;
-        assert!(result.contains("Error"));
-        assert!(result.contains("nonexistent"));
-        assert!(result.contains("not found"));
+        assert!(!result.ok);
+        assert!(result.data.contains("Error"));
+        assert!(result.data.contains("nonexistent"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not found"));
     }
 
     // -----------------------------------------------------------------------
@@ -391,9 +410,8 @@ mod tests {
         registry.register(Box::new(MockTool::new("read_file")));
         registry.register(Box::new(MockTool::new("web_search")));
 
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "search for Rust async patterns"}),
-        ];
+        let messages =
+            vec![serde_json::json!({"role": "user", "content": "search for Rust async patterns"})];
         let used = HashSet::new();
         let defs = registry.get_relevant_definitions(&messages, &used);
 

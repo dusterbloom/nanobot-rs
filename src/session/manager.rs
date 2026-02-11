@@ -210,14 +210,8 @@ impl SessionManager {
 
         // Sort by updated_at descending.
         sessions.sort_by(|a, b| {
-            let ua = a
-                .get("updated_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ub = b
-                .get("updated_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let ua = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            let ub = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
             ub.cmp(ua)
         });
 
@@ -235,8 +229,8 @@ impl SessionManager {
         sessions_dir: &Path,
     ) -> &'a mut Session {
         if !cache.contains_key(key) {
-            let session = Self::load_from_disk(key, sessions_dir)
-                .unwrap_or_else(|| Session::new(key));
+            let session =
+                Self::load_from_disk(key, sessions_dir).unwrap_or_else(|| Session::new(key));
             cache.insert(key.to_string(), session);
         }
         cache.get_mut(key).expect("session must exist in cache")
@@ -297,10 +291,7 @@ impl SessionManager {
                 Ok(data) => {
                     if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
                         if let Some(obj) = data.get("metadata").and_then(|v| v.as_object()) {
-                            metadata = obj
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            metadata = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                         }
                         if let Some(ts) = data.get("created_at").and_then(|v| v.as_str()) {
                             if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {

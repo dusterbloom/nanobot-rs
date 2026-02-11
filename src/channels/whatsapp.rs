@@ -87,7 +87,10 @@ impl WhatsAppChannel {
         let installed_path = home.join(".nanobot").join("bridge").join("whatsapp");
 
         if !installed_path.join("index.js").exists() {
-            info!("Extracting embedded WhatsApp bridge to {}", installed_path.display());
+            info!(
+                "Extracting embedded WhatsApp bridge to {}",
+                installed_path.display()
+            );
             std::fs::create_dir_all(&installed_path)?;
             std::fs::write(installed_path.join("index.js"), BRIDGE_INDEX_JS)?;
             std::fs::write(installed_path.join("package.json"), BRIDGE_PACKAGE_JSON)?;
@@ -147,14 +150,8 @@ impl WhatsAppChannel {
 
         match msg_type {
             "message" => {
-                let sender = data
-                    .get("sender")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let content = data
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let sender = data.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+                let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
                 // Extract phone number from JID (phone@s.whatsapp.net).
                 let chat_id = if sender.contains('@') {
@@ -168,7 +165,10 @@ impl WhatsAppChannel {
                     && !allow_from.contains(&chat_id.to_string())
                     && !allow_from.contains(&sender.to_string())
                 {
-                    debug!("WhatsApp: ignoring message from non-allowed sender {}", chat_id);
+                    debug!(
+                        "WhatsApp: ignoring message from non-allowed sender {}",
+                        chat_id
+                    );
                     return;
                 }
 
@@ -176,6 +176,8 @@ impl WhatsAppChannel {
                 let mut is_voice_message = false;
                 #[allow(unused_mut)]
                 let mut voice_file_path: Option<String> = None;
+                #[allow(unused_mut)]
+                let mut detected_language: Option<String> = None;
                 let voice_file = data.get("voiceFile").and_then(|v| v.as_str());
 
                 let content = if let Some(vf) = voice_file {
@@ -184,10 +186,15 @@ impl WhatsAppChannel {
                     {
                         if let Some(ref pipeline) = voice_pipeline {
                             match pipeline.transcribe_file(vf).await {
-                                Ok(text) => {
-                                    info!("Transcribed WhatsApp voice: \"{}\"", &text[..text.len().min(60)]);
+                                Ok((text, lang)) => {
+                                    info!(
+                                        "Transcribed WhatsApp voice: \"{}\" (lang: {})",
+                                        &text[..text.len().min(60)],
+                                        lang
+                                    );
                                     is_voice_message = true;
                                     voice_file_path = Some(vf.to_string());
+                                    detected_language = Some(lang);
                                     text
                                 }
                                 Err(e) => {
@@ -216,22 +223,22 @@ impl WhatsAppChannel {
 
                 let mut msg = InboundMessage::new("whatsapp", chat_id, sender, &content);
                 if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
-                    msg.metadata
-                        .insert("message_id".to_string(), json!(id));
+                    msg.metadata.insert("message_id".to_string(), json!(id));
                 }
                 if let Some(ts) = data.get("timestamp") {
-                    msg.metadata
-                        .insert("timestamp".to_string(), ts.clone());
+                    msg.metadata.insert("timestamp".to_string(), ts.clone());
                 }
-                msg.metadata
-                    .insert("is_group".to_string(), json!(is_group));
+                msg.metadata.insert("is_group".to_string(), json!(is_group));
 
                 if is_voice_message {
                     msg.metadata
                         .insert("voice_message".to_string(), json!(true));
                     if let Some(ref vf) = voice_file_path {
+                        msg.metadata.insert("voice_file".to_string(), json!(vf));
+                    }
+                    if let Some(ref lang) = detected_language {
                         msg.metadata
-                            .insert("voice_file".to_string(), json!(vf));
+                            .insert("detected_language".to_string(), json!(lang));
                     }
                 }
 
@@ -296,8 +303,7 @@ impl Channel for WhatsAppChannel {
                         let (write, mut read) = ws_stream.split();
 
                         // Create an mpsc channel to send messages to the WebSocket.
-                        let (out_tx, mut out_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<String>();
+                        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
                         // Store the sender so send() can use it.
                         {
@@ -330,10 +336,13 @@ impl Channel for WhatsAppChannel {
                                     match serde_json::from_str::<Value>(&text) {
                                         Ok(data) => {
                                             Self::_handle_bridge_message(
-                                                &data, &bus_tx, &allow_from,
+                                                &data,
+                                                &bus_tx,
+                                                &allow_from,
                                                 #[cfg(feature = "voice")]
                                                 &voice_pipeline,
-                                            ).await;
+                                            )
+                                            .await;
                                         }
                                         Err(_) => {
                                             warn!(
@@ -416,12 +425,18 @@ impl Channel for WhatsAppChannel {
             if is_voice {
                 if let Some(ref pipeline) = self.voice_pipeline {
                     let tts_text = crate::strip_markdown_for_tts(&msg.content);
+                    let lang = msg
+                        .metadata
+                        .get("detected_language")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("en");
                     if !tts_text.is_empty() {
-                        match pipeline.synthesize_to_file(&tts_text).await {
+                        match pipeline.synthesize_to_file(&tts_text, lang).await {
                             Ok(ogg_path) => {
                                 if let Ok(bytes) = std::fs::read(&ogg_path) {
                                     use base64::Engine;
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    let b64 =
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
                                     let media_payload = json!({
                                         "type": "sendMedia",
                                         "to": msg.chat_id,
@@ -430,7 +445,9 @@ impl Channel for WhatsAppChannel {
                                         "filename": "voice.ogg",
                                         "caption": msg.content,
                                     });
-                                    let _ = tx.send(serde_json::to_string(&media_payload).unwrap_or_default());
+                                    let _ = tx.send(
+                                        serde_json::to_string(&media_payload).unwrap_or_default(),
+                                    );
                                     let _ = std::fs::remove_file(&ogg_path);
                                     return Ok(());
                                 }

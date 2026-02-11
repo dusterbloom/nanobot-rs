@@ -71,7 +71,11 @@ impl Tool for CheckInboxTool {
         if messages.is_empty() {
             "No new messages.".to_string()
         } else {
-            format!("{} unread message(s):\n\n{}", messages.len(), messages.join("\n---\n"))
+            format!(
+                "{} unread message(s):\n\n{}",
+                messages.len(),
+                messages.join("\n---\n")
+            )
         }
     }
 }
@@ -135,16 +139,12 @@ impl Tool for SendEmailTool {
             Some(b) => b,
             None => return "Error: 'body' parameter is required".to_string(),
         };
-        let reply_to = params
-            .get("reply_to_message_id")
-            .and_then(|v| v.as_str());
+        let reply_to = params.get("reply_to_message_id").and_then(|v| v.as_str());
 
         let mut msg = OutboundMessage::new("email", format!("email:{}", to), body);
-        msg.metadata
-            .insert("subject".to_string(), json!(subject));
+        msg.metadata.insert("subject".to_string(), json!(subject));
         if let Some(ref_id) = reply_to {
-            msg.metadata
-                .insert("message_id".to_string(), json!(ref_id));
+            msg.metadata.insert("message_id".to_string(), json!(ref_id));
         }
 
         match send_email(&self.email_config, &msg).await {
@@ -203,7 +203,11 @@ mod tests {
         let tool = SendEmailTool::new(config);
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"), "Should error without 'to': {}", result);
+        assert!(
+            result.contains("Error"),
+            "Should error without 'to': {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -213,7 +217,11 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("to".to_string(), json!("test@example.com"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"), "Should error without 'subject': {}", result);
+        assert!(
+            result.contains("Error"),
+            "Should error without 'subject': {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -224,7 +232,11 @@ mod tests {
         params.insert("to".to_string(), json!("test@example.com"));
         params.insert("subject".to_string(), json!("Test"));
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"), "Should error without 'body': {}", result);
+        assert!(
+            result.contains("Error"),
+            "Should error without 'body': {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -238,7 +250,11 @@ mod tests {
         };
         let tool = CheckInboxTool::new(config);
         let result = tool.execute(HashMap::new()).await;
-        assert!(result.starts_with("Error"), "Should return error: {}", result);
+        assert!(
+            result.starts_with("Error"),
+            "Should return error: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -255,6 +271,10 @@ mod tests {
         params.insert("subject".to_string(), json!("Test"));
         params.insert("body".to_string(), json!("Hello"));
         let result = tool.execute(params).await;
-        assert!(result.starts_with("Error"), "Should return error: {}", result);
+        assert!(
+            result.starts_with("Error"),
+            "Should return error: {}",
+            result
+        );
     }
 }

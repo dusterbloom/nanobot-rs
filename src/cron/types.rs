@@ -241,8 +241,7 @@ mod tests {
             expr: None,
             tz: None,
         };
-        let val: serde_json::Value =
-            serde_json::to_value(&schedule).expect("to_value");
+        let val: serde_json::Value = serde_json::to_value(&schedule).expect("to_value");
         // Rust field `every_ms` should serialize as `everyMs`.
         assert!(val.get("everyMs").is_some());
         assert!(val.get("atMs").is_some());

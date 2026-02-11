@@ -165,6 +165,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot agent -m "..."` | Single message |
 | `nanobot gateway` | Start with channel adapters |
 | `nanobot status` | Configuration status |
+| `nanobot tune --input bench.json` | Pick best local profile from benchmark JSON |
 | `nanobot channels status` | Channel status |
 | `nanobot cron list` | List scheduled jobs |
 | `nanobot cron add` | Add a scheduled job |

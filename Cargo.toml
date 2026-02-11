@@ -22,7 +22,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking", "stream"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
@@ -46,6 +46,9 @@ uuid = { version = "1", features = ["v4"] }
 
 # Cron parsing
 cron = "0.15"
+
+# Byte buffers (used by reqwest streaming)
+bytes = "1"
 
 # Base64
 base64 = "0.22"
@@ -72,6 +75,9 @@ libc = "0.2"
 
 # URL parsing
 url = "2"
+
+# Language detection
+whatlang = "0.16"
 
 # Mime type guessing
 mime_guess = "2"

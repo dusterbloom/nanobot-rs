@@ -40,10 +40,7 @@ impl CronService {
     /// Start the cron service.
     pub async fn start(&mut self) {
         self.running = true;
-        info!(
-            "Cron service started with {} jobs",
-            self.store.jobs.len()
-        );
+        info!("Cron service started with {} jobs", self.store.jobs.len());
     }
 
     /// Stop the cron service.
@@ -337,7 +334,15 @@ mod tests {
         let (job1_id, job2_id) = {
             let mut svc = CronService::new(path.clone());
             let j1 = svc.add_job("alpha", every_60s(), "hello", false, None, None, false);
-            let j2 = svc.add_job("beta", cron_9am(), "world", true, Some("slack"), None, false);
+            let j2 = svc.add_job(
+                "beta",
+                cron_9am(),
+                "world",
+                true,
+                Some("slack"),
+                None,
+                false,
+            );
             (j1.id, j2.id)
         };
 
