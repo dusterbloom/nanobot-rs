@@ -17,7 +17,7 @@ use jack_voice::{
 use tracing::{debug, info};
 use whatlang;
 
-use crate::voice::{apply_fade_envelope, normalize_peak, split_tts_sentences};
+use crate::voice::split_tts_sentences;
 
 /// Shared voice pipeline for channel voice message processing.
 ///
@@ -195,13 +195,10 @@ impl VoicePipeline {
             let mut sample_rate = 0u32;
 
             for sentence in &sentences {
-                let mut output = guard
+                let output = guard
                     .synthesize(sentence)
                     .map_err(|e| format!("TTS failed: {e}"))?;
                 sample_rate = output.sample_rate;
-                let fade_samples = (sample_rate as usize * 5) / 1000;
-                normalize_peak(&mut output.samples, 0.85);
-                apply_fade_envelope(&mut output.samples, fade_samples);
                 all_samples.extend_from_slice(&output.samples);
             }
 

@@ -12,13 +12,18 @@ use jack_voice::{
 };
 use whatlang;
 
-pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
+/// Max chunk size in characters for TTS batching.
+/// Supertonic throughput scales with input length (996 chars/sec @59ch → 2509 @266ch).
+/// Chunks always end on sentence-ending punctuation (.!?) so prosody stays natural.
+/// Short sentences (even 5 chars) are valid chunks — no artificial minimum delay.
+const TTS_CHUNK_MAX_CHARS: usize = 250;
+
+fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut start = 0;
     let bytes = text.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'.' || b == b'!' || b == b'?' {
-            // Include the punctuation, skip trailing whitespace for the boundary
             let end = i + 1;
             let s = text[start..end].trim().to_string();
             if !s.is_empty() {
@@ -27,12 +32,40 @@ pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
             start = end;
         }
     }
-    // Remainder (text after last punctuation)
     let remainder = text[start..].trim().to_string();
     if !remainder.is_empty() {
         sentences.push(remainder);
     }
     sentences
+}
+
+/// Split text into TTS chunks up to 250 chars, always ending on sentence punctuation.
+/// Short responses (<=500 chars) are synthesized as a single chunk — no splitting overhead.
+pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.len() <= 500 {
+        return if trimmed.is_empty() { vec![] } else { vec![trimmed.to_string()] };
+    }
+
+    let sentences = split_sentences(text);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for sentence in sentences {
+        if current.is_empty() {
+            current = sentence;
+        } else if current.len() + 1 + sentence.len() <= TTS_CHUNK_MAX_CHARS {
+            current.push(' ');
+            current.push_str(&sentence);
+        } else {
+            chunks.push(current);
+            current = sentence;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Normalize samples to a target peak level so all sentences have consistent volume.
@@ -427,13 +460,10 @@ impl VoiceSession {
                 }
                 tracing::debug!("Synthesizing sentence {}/{}...", i + 1, sentences.len());
                 match guard.synthesize(sentence) {
-                    Ok(mut output) => {
+                    Ok(output) => {
                         if cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                        let fade_samples = (output.sample_rate as usize * 5) / 1000;
-                        normalize_peak(&mut output.samples, 0.85);
-                        apply_fade_envelope(&mut output.samples, fade_samples);
                         let chunk = AudioChunk {
                             data: samples_to_f32le_bytes(&output.samples),
                             sample_rate: output.sample_rate,
@@ -548,7 +578,7 @@ impl VoiceSession {
                         }
                         tracing::debug!("Streaming TTS: synthesizing \"{}\"", &sentence[..sentence.len().min(40)]);
                         match guard.synthesize(&sentence) {
-                            Ok(mut output) => {
+                            Ok(output) => {
                                 if cancel_synth.load(Ordering::Relaxed) {
                                     break;
                                 }
@@ -556,9 +586,6 @@ impl VoiceSession {
                                 if let Some(ref dtx) = display_tx {
                                     let _ = dtx.send(sentence.clone());
                                 }
-                                let fade_samples = (output.sample_rate as usize * 5) / 1000;
-                                normalize_peak(&mut output.samples, 0.85);
-                                apply_fade_envelope(&mut output.samples, fade_samples);
                                 let chunk = AudioChunk {
                                     data: samples_to_f32le_bytes(&output.samples),
                                     sample_rate: output.sample_rate,
@@ -657,12 +684,16 @@ impl VoiceSession {
     }
 }
 
-/// Accumulates streaming text deltas and emits complete sentences as `TtsCommand`s.
+/// Accumulates streaming text deltas and batches complete sentences into ~200-char
+/// chunks before sending to TTS. This exploits Supertonic's higher throughput on
+/// longer inputs (2509 chars/sec @266ch vs 996 @59ch).
 ///
 /// Detects sentence boundaries (`.` `!` `?` followed by space/newline) and
 /// skips code blocks (```). Call `flush()` at the end to emit any remaining text.
 pub(crate) struct SentenceAccumulator {
     buffer: String,
+    /// Sentences waiting to be batched into a chunk.
+    pending: String,
     in_code_block: bool,
     sentence_tx: std_mpsc::Sender<TtsCommand>,
 }
@@ -671,12 +702,14 @@ impl SentenceAccumulator {
     pub fn new(sentence_tx: std_mpsc::Sender<TtsCommand>) -> Self {
         Self {
             buffer: String::new(),
+            pending: String::new(),
             in_code_block: false,
             sentence_tx,
         }
     }
 
-    /// Feed a text delta. Complete sentences are sent to the TTS thread.
+    /// Feed a text delta. Batched chunks are sent to the TTS thread when
+    /// accumulated sentences reach ~200 chars.
     pub fn push(&mut self, delta: &str) {
         self.buffer.push_str(delta);
         self.extract_sentences();
@@ -684,15 +717,36 @@ impl SentenceAccumulator {
 
     /// Flush any remaining text and send Finish.
     pub fn flush(self) {
+        let mut pending = self.pending;
         // Emit whatever is left in the buffer
         let remainder = self.buffer.trim().to_string();
         if !remainder.is_empty() && !self.in_code_block {
             let cleaned = strip_inline_markdown(&remainder);
             if !cleaned.is_empty() {
-                let _ = self.sentence_tx.send(TtsCommand::Synthesize(cleaned));
+                if !pending.is_empty() {
+                    pending.push(' ');
+                }
+                pending.push_str(&cleaned);
             }
         }
+        if !pending.is_empty() {
+            let _ = self.sentence_tx.send(TtsCommand::Synthesize(pending));
+        }
         let _ = self.sentence_tx.send(TtsCommand::Finish);
+    }
+
+    /// Add a sentence to the pending batch. Emits when batch reaches target size.
+    fn enqueue_sentence(&mut self, sentence: &str) {
+        if self.pending.is_empty() {
+            self.pending = sentence.to_string();
+        } else if self.pending.len() + 1 + sentence.len() <= TTS_CHUNK_MAX_CHARS {
+            self.pending.push(' ');
+            self.pending.push_str(sentence);
+        } else {
+            // Current batch is full — send it, start new batch with this sentence
+            let batch = std::mem::replace(&mut self.pending, sentence.to_string());
+            let _ = self.sentence_tx.send(TtsCommand::Synthesize(batch));
+        }
     }
 
     fn extract_sentences(&mut self) {
@@ -705,8 +759,13 @@ impl SentenceAccumulator {
                     if !before.is_empty() {
                         let cleaned = strip_inline_markdown(&before);
                         if !cleaned.is_empty() {
-                            let _ = self.sentence_tx.send(TtsCommand::Synthesize(cleaned));
+                            self.enqueue_sentence(&cleaned);
                         }
+                    }
+                    // Code block boundary — flush pending batch so it doesn't stall
+                    if !self.pending.is_empty() {
+                        let batch = std::mem::take(&mut self.pending);
+                        let _ = self.sentence_tx.send(TtsCommand::Synthesize(batch));
                     }
                 }
                 self.in_code_block = !self.in_code_block;
@@ -733,7 +792,7 @@ impl SentenceAccumulator {
                 if !sentence.is_empty() {
                     let cleaned = strip_inline_markdown(&sentence);
                     if !cleaned.is_empty() {
-                        let _ = self.sentence_tx.send(TtsCommand::Synthesize(cleaned));
+                        self.enqueue_sentence(&cleaned);
                     }
                 }
             } else {
