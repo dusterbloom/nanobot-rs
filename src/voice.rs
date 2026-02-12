@@ -202,7 +202,8 @@ impl VoiceSession {
             Some(_) => "Kokoro only",
             None => "Supertonic + Kokoro",
         };
-        println!("Initializing voice mode ({label})...");
+        print!("\x1b[2m  Initializing voice mode ({label})...\x1b[0m");
+        std::io::stdout().flush().ok();
 
         // Fail fast: check that parec exists
         Command::new("parec")
@@ -213,8 +214,6 @@ impl VoiceSession {
             .map_err(|_| {
                 "parec not found. Install: sudo apt install pulseaudio-utils".to_string()
             })?;
-
-        println!("Checking models...");
 
         let progress = &TerminalProgress;
         for bundle in models::MODEL_BUNDLES {
@@ -250,10 +249,7 @@ impl VoiceSession {
             .await
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
-                Ok(tts) => {
-                    println!("  Supertonic TTS ready (English)");
-                    Some(Arc::new(Mutex::new(tts)))
-                }
+                Ok(tts) => Some(Arc::new(Mutex::new(tts))),
                 Err(e) => {
                     tracing::warn!("Supertonic TTS init failed, English will use Kokoro: {e}");
                     None
@@ -270,10 +266,7 @@ impl VoiceSession {
             .await
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
-                Ok(tts) => {
-                    println!("  Kokoro TTS ready (multilingual)");
-                    Some(Arc::new(Mutex::new(tts)))
-                }
+                Ok(tts) => Some(Arc::new(Mutex::new(tts))),
                 Err(e) => {
                     tracing::warn!("Kokoro TTS init failed: {e}");
                     None
@@ -284,8 +277,20 @@ impl VoiceSession {
         };
 
         if tts_en.is_none() && tts_multi.is_none() {
+            println!(" \x1b[31mfailed\x1b[0m");
             return Err("No TTS engine could be initialized".to_string());
         }
+
+        // Finish the init line: overwrite "Initializing..." with result
+        let engines: Vec<&str> = [
+            tts_en.as_ref().map(|_| "supertonic"),
+            tts_multi.as_ref().map(|_| "kokoro"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        print!("\r\x1b[2K");
+        println!("  \x1b[2mVoice ready ({}) · Ctrl+Space to speak\x1b[0m", engines.join(" + "));
 
         Ok(Self {
             stt,
@@ -395,8 +400,6 @@ impl VoiceSession {
             })
             .unwrap_or_else(|| "en".to_string());
 
-        // Transcription appears inline after ~> prompt
-        println!("{}", text);
         Ok(Some((text, lang)))
     }
 

@@ -14,8 +14,11 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::agent::context::ContextBuilder;
+use crate::agent::scratchpad::SharedScratchpad;
+use crate::agent::taskboard::{TaskBoard, TaskStatus};
 use crate::agent::tools::{
-    ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
+    ExecTool, ListDirTool, ReadFileTool, ScratchpadTool, SkillManagerTool, TaskBoardTool,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::InboundMessage;
 use crate::providers::base::LLMProvider;
@@ -40,6 +43,8 @@ pub struct SubagentManager {
     brave_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
+    task_board: Arc<TaskBoard>,
+    scratchpad: Arc<SharedScratchpad>,
     running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>)>>>,
 }
 
@@ -53,6 +58,8 @@ impl SubagentManager {
         brave_api_key: Option<String>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
+        task_board: Arc<TaskBoard>,
+        scratchpad: Arc<SharedScratchpad>,
     ) -> Self {
         Self {
             provider,
@@ -62,6 +69,8 @@ impl SubagentManager {
             brave_api_key,
             exec_timeout,
             restrict_to_workspace,
+            task_board,
+            scratchpad,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -69,12 +78,15 @@ impl SubagentManager {
     /// Spawn a background subagent task.
     ///
     /// Returns a status message with the task ID.
+    /// If `board_task_id` is provided, the task board entry is updated
+    /// to InProgress on start and Completed/Failed on finish.
     pub async fn spawn(
         &self,
         task: String,
         label: Option<String>,
         origin_channel: String,
         origin_chat_id: String,
+        board_task_id: Option<String>,
     ) -> String {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         let display_label = label
@@ -83,6 +95,11 @@ impl SubagentManager {
 
         info!("Spawning subagent {} for: {}", task_id, display_label);
 
+        // Mark task board entry as InProgress.
+        if let Some(ref btid) = board_task_id {
+            self.task_board.update_status(btid, TaskStatus::InProgress);
+        }
+
         let provider = self.provider.clone();
         let workspace = self.workspace.clone();
         let bus_tx = self.bus_tx.clone();
@@ -90,10 +107,13 @@ impl SubagentManager {
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
+        let task_board = self.task_board.clone();
+        let scratchpad = self.scratchpad.clone();
         let running_tasks = self.running_tasks.clone();
         let tid = task_id.clone();
         let lbl = display_label.clone();
         let tsk = task.clone();
+        let btid = board_task_id.clone();
 
         let handle = tokio::spawn(async move {
             let result = Self::_run_subagent(
@@ -106,6 +126,8 @@ impl SubagentManager {
                 brave_api_key.as_deref(),
                 exec_timeout,
                 restrict_to_workspace,
+                &task_board,
+                &scratchpad,
             )
             .await;
 
@@ -113,6 +135,16 @@ impl SubagentManager {
                 Ok(text) => (text, "completed"),
                 Err(e) => (format!("Error: {}", e), "failed"),
             };
+
+            // Update task board entry on completion/failure.
+            if let Some(ref btid) = btid {
+                let board_status = if status == "completed" {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Failed
+                };
+                task_board.update_status(btid, board_status);
+            }
 
             Self::_announce_result(
                 &bus_tx,
@@ -189,6 +221,8 @@ impl SubagentManager {
         brave_api_key: Option<&str>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
+        task_board: &Arc<TaskBoard>,
+        scratchpad: &Arc<SharedScratchpad>,
     ) -> anyhow::Result<String> {
         debug!("Subagent {} starting: {}", task_id, label);
 
@@ -209,6 +243,11 @@ impl SubagentManager {
             5,
         )));
         tools.register(Box::new(WebFetchTool::new(50_000)));
+
+        // Shared coordination tools (task board, scratchpad, skill manager).
+        tools.register(Box::new(SkillManagerTool::new(workspace.clone())));
+        tools.register(Box::new(TaskBoardTool::new(task_board.clone())));
+        tools.register(Box::new(ScratchpadTool::new(scratchpad.clone())));
 
         // Build the subagent system prompt.
         let system_prompt = Self::_build_subagent_prompt(task, workspace);

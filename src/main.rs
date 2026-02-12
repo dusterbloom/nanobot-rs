@@ -11,6 +11,8 @@ mod cron;
 mod heartbeat;
 mod providers;
 mod session;
+mod store;
+mod tui;
 mod utils;
 #[cfg(feature = "voice")]
 mod voice;
@@ -45,57 +47,6 @@ use crate::utils::helpers::get_workspace_path;
 const VERSION: &str = "0.1.0";
 const LOGO: &str = "*";
 
-/// Build a styled termimad skin for rendering LLM markdown responses.
-fn make_skin() -> termimad::MadSkin {
-    use termimad::crossterm::style::Color;
-    let mut skin = termimad::MadSkin::default_dark();
-    skin.headers[0].set_fg(Color::Cyan);
-    skin.headers[1].set_fg(Color::Cyan);
-    skin.bold.set_fg(Color::White);
-    skin.italic.set_fg(Color::Magenta);
-    skin.inline_code.set_fg(Color::Green);
-    skin.code_block.set_fg(Color::Green);
-    skin
-}
-
-/// ANSI escape helpers for colored terminal output.
-mod tui {
-    pub const RESET: &str = "\x1b[0m";
-    pub const BOLD: &str = "\x1b[1m";
-    pub const DIM: &str = "\x1b[2m";
-    pub const CYAN: &str = "\x1b[36m";
-    pub const GREEN: &str = "\x1b[32m";
-    pub const YELLOW: &str = "\x1b[33m";
-    pub const RED: &str = "\x1b[31m";
-    pub const MAGENTA: &str = "\x1b[35m";
-    pub const WHITE: &str = "\x1b[97m";
-    pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
-    pub const HIDE_CURSOR: &str = "\x1b[?25l";
-    pub const SHOW_CURSOR: &str = "\x1b[?25h";
-
-    /// Print the nanobot demoscene-style ASCII logo.
-    pub fn print_logo() {
-        println!("  {BOLD}{CYAN} _____             _       _   {RESET}");
-        println!("  {BOLD}{WHITE}|   | |___ ___ ___| |_ ___| |_ {RESET}");
-        println!("  {BOLD}{WHITE}| | | | .'|   | . | . | . |  _|{RESET}");
-        println!("  {BOLD}{CYAN}|_|___|__,|_|_|___|___|___|_|  {RESET}");
-    }
-
-    /// Animated loading sequence.
-    pub fn loading_animation(message: &str) {
-        use std::io::Write;
-        let frames = ["   ", ".  ", ".. ", "..."];
-        print!("{HIDE_CURSOR}");
-        for i in 0..8 {
-            print!("\r  {DIM}{}{}{RESET}  ", message, frames[i % frames.len()]);
-            std::io::stdout().flush().ok();
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
-        print!("\r{}\r", " ".repeat(60)); // clear the line
-        print!("{SHOW_CURSOR}");
-        std::io::stdout().flush().ok();
-    }
-}
 
 // Global flag for local mode
 static LOCAL_MODE: AtomicBool = AtomicBool::new(false);
@@ -413,23 +364,29 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
         );
 
         if let Some(msg) = message {
-            let (delta_tx, mut delta_rx) =
+            let (delta_tx, _delta_rx) =
                 tokio::sync::mpsc::unbounded_channel::<String>();
-            let print_task = tokio::spawn(async move {
-                use std::io::Write as _;
-                while let Some(delta) = delta_rx.recv().await {
-                    print!("{}", delta);
-                    std::io::stdout().flush().ok();
+            let (tui_tx, mut tui_rx) =
+                tokio::sync::mpsc::unbounded_channel::<tui::events::TuiEvent>();
+            let display_handle = tokio::spawn(async move {
+                let mut display = tui::stream::StreamDisplay::new();
+                while let Some(event) = tui_rx.recv().await {
+                    display.handle_event(event);
                 }
-                println!();
+                display.finish()
             });
-            println!();
-            let _response = agent_loop
-                .process_direct_streaming(&msg, &session_id, "cli", "direct", None, delta_tx)
+            let response = agent_loop
+                .process_direct_streaming(&msg, &session_id, "cli", "direct", None, delta_tx, Some(tui_tx))
                 .await;
-            let _ = print_task.await;
+            let displayed = display_handle.await.unwrap_or(false);
+            if !displayed && !response.is_empty() {
+                println!();
+                tui::print_turn_header("nanobot", false);
+                let skin = tui::make_skin();
+                tui::print_markdown(&skin, &response);
+            }
         } else {
-            print_startup_splash(&local_port);
+            tui::print_startup_splash(&local_port);
 
             let mut llama_process: Option<std::process::Child> = None;
             let mut compaction_process: Option<std::process::Child> = None;
@@ -446,7 +403,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
             let _ = rl.load_history(&history_path);
 
             // Markdown skin for rendering LLM responses
-            let skin = make_skin();
+            let skin = tui::make_skin();
 
             // Background channel state
             struct ActiveChannel {
@@ -457,6 +414,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
             let mut active_channels: Vec<ActiveChannel> = vec![];
             // Channel for background gateways to send display lines to the REPL.
             let (display_tx, mut display_rx) = mpsc::unbounded_channel::<String>();
+            let model_name = config.agents.defaults.model.clone();
 
             loop {
                 // Drain any pending display messages from background channels.
@@ -464,17 +422,21 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                     println!("\r{}", line);
                 }
                 let is_local = LOCAL_MODE.load(Ordering::SeqCst);
+
+                // Info bar: ctx · model · turns
+                tui::print_info_bar(&core_handle, &model_name);
+
                 #[cfg(feature = "voice")]
                 let voice_on = voice_session.is_some();
                 #[cfg(not(feature = "voice"))]
                 let voice_on = false;
 
                 let prompt = if voice_on {
-                    format!("{}{}~>{} ", tui::BOLD, tui::MAGENTA, tui::RESET)
+                    format!("{}{}▌~>{} ", tui::BOLD, tui::MAGENTA, tui::RESET)
                 } else if is_local {
-                    format!("{}{}L>{} ", tui::BOLD, tui::YELLOW, tui::RESET)
+                    format!("{}{}▌L>{} ", tui::BOLD, tui::YELLOW, tui::RESET)
                 } else {
-                    format!("{}{}>{} ", tui::BOLD, tui::GREEN, tui::RESET)
+                    format!("{}{}▌>{} ", tui::BOLD, tui::WHITE, tui::RESET)
                 };
 
                 // === GET INPUT ===
@@ -528,6 +490,11 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                             keep_recording = false;
                             match vs.record_and_transcribe() {
                                 Ok(Some((text, lang))) => {
+                                    // Clear current line + prompt line above
+                                    print!("\r\x1b[2K\x1b[A\x1b[2K");
+                                    tui::print_turn_header("You", true);
+                                    tui::print_user_text(&text);
+
                                     // Start streaming TTS pipeline
                                     vs.clear_cancel();
                                     let cancel = vs.cancel_flag();
@@ -554,18 +521,18 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
 
                                             // Display task: print sentences as TTS synthesizes them
                                             let display_task = tokio::spawn(async move {
-                                                use std::io::Write as _;
+                                                let width = tui::terminal_width().saturating_sub(4);
                                                 let mut first = true;
                                                 while let Some(sentence) = display_rx.recv().await {
                                                     if first {
+                                                        println!();
+                                                        tui::print_turn_header("nanobot", false);
                                                         first = false;
-                                                    } else {
-                                                        print!(" ");
                                                     }
-                                                    print!("{}", sentence);
-                                                    std::io::stdout().flush().ok();
+                                                    for line in tui::wrap_text(&sentence, width) {
+                                                        println!("  {}", line);
+                                                    }
                                                 }
-                                                println!();
                                             });
 
                                             // Stream LLM response (deltas go to accumulator silently)
@@ -577,6 +544,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                                     "direct",
                                                     Some(&lang),
                                                     delta_tx,
+                                                    None,
                                                 )
                                                 .await;
 
@@ -616,15 +584,6 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                             let interrupted = watcher.join().unwrap_or(false);
                                             let _ = display_task.await;
 
-                                            {
-                                                let sa_count = agent_loop.subagent_manager().get_running_count().await;
-                                                active_channels.retain(|ch| !ch.handle.is_finished());
-                                                let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
-                                                    "whatsapp" => "wa", "telegram" => "tg", other => other,
-                                                }).collect();
-                                                print_status_bar(&core_handle, &ch_names, sa_count);
-                                            }
-
                                             if interrupted {
                                                 keep_recording = true;
                                             }
@@ -635,7 +594,8 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                                 .process_direct_with_lang(&text, &session_id, "voice", "direct", Some(&lang))
                                                 .await;
                                             println!();
-                                            skin.print_text(&response);
+                                            tui::print_turn_header("nanobot", false);
+                                            tui::print_markdown(&skin, &response);
                                             println!();
                                             let tts_text = strip_markdown_for_tts(&response);
                                             if !tts_text.is_empty() {
@@ -646,8 +606,14 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                         }
                                     }
                                 }
-                                Ok(None) => println!("\x1b[2m(no speech detected)\x1b[0m"),
-                                Err(e) => eprintln!("\x1b[31m{}\x1b[0m", e),
+                                Ok(None) => {
+                                    print!("\r\x1b[2K\x1b[A\x1b[2K");
+                                    println!("  {}(no speech detected){}", tui::DIM, tui::RESET);
+                                }
+                                Err(e) => {
+                                    print!("\r\x1b[2K\x1b[A\x1b[2K");
+                                    eprintln!("  {}{}{}", tui::RED, e, tui::RESET);
+                                }
                             }
                         }
                         drain_stdin();
@@ -702,7 +668,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                             start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
                             rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                             agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                            print_mode_banner(&local_port);
+                            tui::print_mode_banner(&local_port);
                         } else {
                             // Kill any orphaned servers from previous runs
                             kill_stale_llama_servers();
@@ -719,7 +685,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                         start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
                                         rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                                         agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                                        print_mode_banner(&local_port);
+                                        tui::print_mode_banner(&local_port);
                                     } else {
                                         println!("  {}{}Server failed to start{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                         if let Some(ref mut child) = llama_process {
@@ -752,7 +718,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         LOCAL_MODE.store(false, Ordering::SeqCst);
                         rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                         agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                        print_mode_banner(&local_port);
+                        tui::print_mode_banner(&local_port);
                     }
 
                     continue;
@@ -807,7 +773,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                             child.wait().ok();
                         }
                         llama_process = None;
-                        kill_stale_llama_servers();
+                        // Spare the compaction server when killing orphans
+                        let compaction_pid = compaction_process.as_ref().map(|c| c.id());
+                        kill_stale_llama_servers_except(compaction_pid);
 
                         let port = find_available_port(8080);
                         let ctx_size = compute_optimal_context_size(&current_model_path);
@@ -820,7 +788,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                     local_port = port.to_string();
                                     rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                                     agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                                    print_mode_banner(&local_port);
+                                    tui::print_mode_banner(&local_port);
                                 } else {
                                     println!("  {}{}Server failed to start with new model{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                     if let Some(ref mut child) = llama_process {
@@ -943,7 +911,9 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         child.wait().ok();
                     }
                     llama_process = None;
-                    kill_stale_llama_servers();
+                    // Spare the compaction server when killing orphans
+                    let compaction_pid = compaction_process.as_ref().map(|c| c.id());
+                    kill_stale_llama_servers_except(compaction_pid);
 
                     let port = find_available_port(8080);
                     println!("  {}{}Restarting{} llama.cpp on port {} (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, port, new_ctx / 1024);
@@ -955,7 +925,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                 local_port = port.to_string();
                                 rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                                 agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                                print_mode_banner(&local_port);
+                                tui::print_mode_banner(&local_port);
                             } else {
                                 println!("  {}{}Server failed to start with new context size{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                 if let Some(ref mut child) = llama_process {
@@ -975,7 +945,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                             local_port = port.to_string();
                                             rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                                             agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
-                                            print_mode_banner(&local_port);
+                                            tui::print_mode_banner(&local_port);
                                         } else {
                                             println!("  {}{}Fallback also failed — switching to cloud{}", tui::BOLD, tui::YELLOW, tui::RESET);
                                             LOCAL_MODE.store(false, Ordering::SeqCst);
@@ -1012,14 +982,13 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                             vs.stop_playback();
                         }
                         voice_session = None;
-                        println!("\nVoice mode OFF\n");
+                        println!("\n  {}Voice off{}", tui::DIM, tui::RESET);
                     } else {
                         match voice::VoiceSession::with_lang(lang.as_deref()).await {
                             Ok(vs) => {
                                 voice_session = Some(vs);
-                                println!("\nVoice mode ON. Ctrl+Space or Enter to speak, type for text.\n");
                             }
-                            Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
+                            Err(e) => eprintln!("\n  {}Voice init failed: {}{}\n", tui::RED, e, tui::RESET),
                         }
                     }
                     continue;
@@ -1191,32 +1160,37 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         continue;
                     }
                     let _ = rl.add_history_entry(&pasted);
+                    tui::print_turn_header("You", true);
+                    tui::print_user_text(&pasted);
+
                     let channel = if voice_on { "voice" } else { "cli" };
-                    let (delta_tx, mut delta_rx) =
+                    let (delta_tx, _delta_rx) =
                         tokio::sync::mpsc::unbounded_channel::<String>();
-                    let print_task = tokio::spawn(async move {
-                        use std::io::Write as _;
-                        while let Some(delta) = delta_rx.recv().await {
-                            print!("{}", delta);
-                            std::io::stdout().flush().ok();
+                    let (tui_tx, mut tui_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<tui::events::TuiEvent>();
+                    let display_handle = tokio::spawn(async move {
+                        let mut display = tui::stream::StreamDisplay::new();
+                        while let Some(event) = tui_rx.recv().await {
+                            display.handle_event(event);
                         }
-                        println!();
+                        display.finish()
                     });
-                    println!();
+
                     let response = agent_loop
                         .process_direct_streaming(
-                            &pasted, &session_id, channel, "direct", None, delta_tx,
+                            &pasted, &session_id, channel, "direct", None, delta_tx, Some(tui_tx),
                         )
                         .await;
-                    let _ = print_task.await;
-                    println!();
-                    {
-                        let sa_count = agent_loop.subagent_manager().get_running_count().await;
-                        active_channels.retain(|ch| !ch.handle.is_finished());
-                        let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
-                            "whatsapp" => "wa", "telegram" => "tg", other => other,
-                        }).collect();
-                        print_status_bar(&core_handle, &ch_names, sa_count);
+                    let displayed = display_handle.await.unwrap_or(false);
+
+                    if !displayed {
+                        println!();
+                        tui::print_turn_header("nanobot", false);
+                        if response.is_empty() {
+                            println!("  {}(no response){}", tui::DIM, tui::RESET);
+                        } else {
+                            tui::print_markdown(&skin, &response);
+                        }
                     }
                     continue;
                 }
@@ -1297,7 +1271,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                     println!(
                         "  {}CONTEXT{}   {:>6} / {:>6} tokens ({}{}{}%{})",
                         tui::BOLD, tui::RESET,
-                        format_thousands(used), format_thousands(max),
+                        tui::format_thousands(used), tui::format_thousands(max),
                         ctx_color, tui::BOLD, pct, tui::RESET
                     );
 
@@ -1339,22 +1313,26 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                 }
 
                 // Process message (streaming)
+                // Overwrite readline echo (move up + clear)
+                print!("\x1b[A\x1b[2K");
+                tui::print_turn_header("You", true);
+                tui::print_user_text(input);
+
                 let channel = if voice_on { "voice" } else { "cli" };
 
-                let (delta_tx, mut delta_rx) =
+                let (delta_tx, _delta_rx) =
                     tokio::sync::mpsc::unbounded_channel::<String>();
+                let (tui_tx, mut tui_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<tui::events::TuiEvent>();
 
-                // Print deltas as they stream in
-                let print_task = tokio::spawn(async move {
-                    use std::io::Write as _;
-                    while let Some(delta) = delta_rx.recv().await {
-                        print!("{}", delta);
-                        std::io::stdout().flush().ok();
+                let display_handle = tokio::spawn(async move {
+                    let mut display = tui::stream::StreamDisplay::new();
+                    while let Some(event) = tui_rx.recv().await {
+                        display.handle_event(event);
                     }
-                    println!();
+                    display.finish()
                 });
 
-                println!();
                 let response = agent_loop
                     .process_direct_streaming(
                         input,
@@ -1363,18 +1341,20 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         "direct",
                         None,
                         delta_tx,
+                        Some(tui_tx),
                     )
                     .await;
 
-                let _ = print_task.await;
-                println!();
-                {
-                    let sa_count = agent_loop.subagent_manager().get_running_count().await;
-                    active_channels.retain(|ch| !ch.handle.is_finished());
-                    let ch_names: Vec<&str> = active_channels.iter().map(|c| match c.name.as_str() {
-                        "whatsapp" => "wa", "telegram" => "tg", other => other,
-                    }).collect();
-                    print_status_bar(&core_handle, &ch_names, sa_count);
+                let displayed = display_handle.await.unwrap_or(false);
+
+                if !displayed {
+                    println!();
+                    tui::print_turn_header("nanobot", false);
+                    if response.is_empty() {
+                        println!("  {}(no response){}", tui::DIM, tui::RESET);
+                    } else {
+                        tui::print_markdown(&skin, &response);
+                    }
                 }
 
                 #[cfg(feature = "voice")]
@@ -1601,148 +1581,6 @@ fn query_local_context_size(port: &str) -> Option<usize> {
     let per_request_ctx = (n_ctx / n_parallel).max(1);
     // Apply 5% headroom — our char/4 estimator can overshoot slightly.
     Some((per_request_ctx as f64 * 0.95) as usize)
-}
-
-/// Format a number with thousands separators (e.g. 12430 -> "12,430").
-fn format_thousands(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-/// Print a compact status bar after each agent response.
-fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[&str], subagent_count: usize) {
-    use std::sync::atomic::Ordering;
-    let core = core_handle.read().unwrap().clone();
-    let used = core.last_context_used.load(Ordering::Relaxed) as usize;
-    let max = core.last_context_max.load(Ordering::Relaxed) as usize;
-    let turn = core.learning_turn_counter.load(Ordering::Relaxed);
-
-    let pct = if max > 0 { (used * 100) / max } else { 0 };
-    let ctx_color = match pct {
-        0..=49 => tui::GREEN,
-        50..=79 => tui::YELLOW,
-        _ => tui::RED,
-    };
-
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!(
-        "ctx {}{}{}%{}",
-        ctx_color,
-        tui::BOLD,
-        pct,
-        tui::RESET
-    ));
-
-    if !channel_names.is_empty() {
-        parts.push(format!(
-            "{}{}{}",
-            tui::CYAN,
-            channel_names.join(" "),
-            tui::RESET
-        ));
-    }
-
-    if subagent_count > 0 {
-        parts.push(format!(
-            "{} agent{}",
-            subagent_count,
-            if subagent_count > 1 { "s" } else { "" }
-        ));
-    }
-
-    parts.push(format!("t:{}", turn));
-
-    println!("  {}{}{}", tui::DIM, parts.join(" | "), tui::RESET);
-}
-
-/// Print the current mode banner (compact, for mode switches mid-session).
-fn print_mode_banner(local_port: &str) {
-    use tui::*;
-    let is_local = LOCAL_MODE.load(Ordering::SeqCst);
-    println!();
-    if is_local {
-        println!("  {BOLD}{YELLOW}LOCAL MODE{RESET} {DIM}llama.cpp on port {local_port}{RESET}");
-        let props_url = format!("http://localhost:{}/props", local_port);
-        if let Ok(resp) = reqwest::blocking::get(&props_url) {
-            if let Ok(json) = resp.json::<serde_json::Value>() {
-                if let Some(model) = json
-                    .get("default_generation_settings")
-                    .and_then(|s| s.get("model"))
-                    .and_then(|m| m.as_str())
-                {
-                    let model_name = std::path::Path::new(model)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(model);
-                    println!("  {DIM}Model: {RESET}{GREEN}{model_name}{RESET}");
-                }
-                if let Some(n_ctx) = json
-                    .get("default_generation_settings")
-                    .and_then(|s| s.get("n_ctx"))
-                    .and_then(|n| n.as_u64())
-                {
-                    let n_parallel = json
-                        .get("default_generation_settings")
-                        .and_then(|s| s.get("n_parallel"))
-                        .and_then(|n| n.as_u64())
-                        .or_else(|| json.get("n_parallel").and_then(|n| n.as_u64()))
-                        .unwrap_or(1)
-                        .max(1);
-                    let per_request = (n_ctx / n_parallel).max(1);
-                    if n_parallel > 1 {
-                        println!(
-                            "  {DIM}Context: {RESET}{GREEN}{}K{RESET}{DIM} ({}K total / parallel {}){RESET}",
-                            per_request / 1024,
-                            n_ctx / 1024,
-                            n_parallel
-                        );
-                    } else {
-                        println!("  {DIM}Context: {RESET}{GREEN}{}K{RESET}", n_ctx / 1024);
-                    }
-                }
-            }
-        }
-    } else {
-        let config = load_config(None);
-        println!(
-            "  {BOLD}{CYAN}CLOUD MODE{RESET} {DIM}{}{RESET}",
-            config.agents.defaults.model
-        );
-    }
-    println!();
-}
-
-/// Full startup splash: clear screen, ASCII logo, mode info, hints.
-fn print_startup_splash(local_port: &str) {
-    use tui::*;
-    // Clear the terminal for a fresh start.
-    print!("{CLEAR_SCREEN}");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
-
-    tui::print_logo();
-
-    let is_local = LOCAL_MODE.load(Ordering::SeqCst);
-    if is_local {
-        println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}llama.cpp :{local_port}{RESET}");
-    } else {
-        let config = load_config(None);
-        println!(
-            "  {BOLD}{CYAN}CLOUD{RESET} {DIM}{}{RESET}",
-            config.agents.defaults.model
-        );
-    }
-    println!("  {DIM}v{VERSION}  |  /local  /model  /voice  Ctrl+C quit{RESET}");
-    println!();
-
-    // Brief loading animation
-    tui::loading_animation("Initializing agent");
 }
 
 // ============================================================================
@@ -2588,12 +2426,33 @@ fn stop_compaction_server(
 }
 
 fn kill_stale_llama_servers() {
-    // Kill any orphaned llama-server processes from previous runs
-    let _ = std::process::Command::new("pkill")
+    kill_stale_llama_servers_except(None);
+}
+
+/// Kill orphaned llama-server processes, optionally sparing a specific PID
+/// (e.g. the compaction server).
+fn kill_stale_llama_servers_except(spare_pid: Option<u32>) {
+    // Find all llama-server PIDs
+    let output = std::process::Command::new("pgrep")
         .args(["-f", "llama-server"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .output();
+
+    if let Ok(output) = output {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        for line in pids.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                if Some(pid) == spare_pid {
+                    continue;
+                }
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+
     // Brief pause to let ports be released
     std::thread::sleep(std::time::Duration::from_millis(300));
 }

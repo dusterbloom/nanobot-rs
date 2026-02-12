@@ -18,17 +18,21 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::compaction::ContextCompactor;
+use crate::agent::environment::EnvironmentScanner;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
 use crate::agent::observer::ObservationStore;
 use crate::agent::reflector::Reflector;
+use crate::agent::semantic::SemanticIndex;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
+use crate::agent::scratchpad::SharedScratchpad;
+use crate::agent::taskboard::TaskBoard;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    ReadFileTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    ReadFileTool, ScratchpadTool, SendCallback, SendEmailTool, SkillManagerTool, SpawnCallback,
+    SpawnTool, TaskBoardTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{EmailConfig, MemoryConfig};
@@ -36,6 +40,7 @@ use crate::cron::service::CronService;
 use crate::providers::base::{LLMProvider, StreamChunk};
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::session::manager::SessionManager;
+use crate::store::conversation::ConversationStore;
 
 // ---------------------------------------------------------------------------
 // Shared core (identical across all agents, swappable on /local toggle)
@@ -54,6 +59,9 @@ pub struct SharedCore {
     pub temperature: f64,
     pub context: ContextBuilder,
     pub sessions: SessionManager,
+    pub conversation_store: Arc<ConversationStore>,
+    pub semantic_index: Arc<SemanticIndex>,
+    pub semantic_budget: usize,
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
     pub learning: LearningStore,
@@ -67,6 +75,7 @@ pub struct SharedCore {
     pub learning_turn_counter: AtomicU64,
     pub last_context_used: AtomicU64,
     pub last_context_max: AtomicU64,
+    pub is_local: bool,
 }
 
 /// Handle for hot-swapping the shared core.
@@ -98,6 +107,29 @@ pub fn build_shared_core(
     let mut context = ContextBuilder::new(&workspace);
     context.model_name = model.clone();
     context.observation_budget = memory_config.observation_budget;
+    context.semantic_budget = memory_config.semantic_budget;
+
+    // Environment scanning (cached, fast on subsequent starts).
+    let env_scanner = EnvironmentScanner::new(&workspace);
+    let env_caps = env_scanner.get_capabilities();
+    context.environment_summary = Some(EnvironmentScanner::format_for_context(&env_caps));
+
+    // Time awareness: find the most recent session file modification time.
+    context.last_interaction = detect_last_interaction(&workspace);
+
+    // Git change detection: check for workspace changes since last session.
+    context.git_changes = detect_git_changes(&workspace);
+
+    // SLM budget mode: reduce all context budgets for local models.
+    if is_local {
+        context.bootstrap_budget = 1000;
+        context.long_term_memory_budget = 500;
+        context.today_notes_budget = 0;
+        context.observation_budget = 0;
+        context.learning_budget = 0;
+        context.semantic_budget = 500;
+    }
+
     let sessions = SessionManager::new(&workspace);
 
     // When local, use dedicated compaction provider if available, else main provider.
@@ -140,6 +172,20 @@ pub fn build_shared_core(
     let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone());
     let learning = LearningStore::new(&workspace);
 
+    // SQLite conversation store (parallel write path alongside JSONL sessions).
+    let store_db_path = crate::config::loader::get_data_dir().join("store.db");
+    let conversation_store = match ConversationStore::new(&store_db_path) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            warn!("Failed to open conversation store at {:?}: {}. Using in-memory fallback.", store_db_path, e);
+            Arc::new(ConversationStore::new(std::path::Path::new(":memory:")).expect("in-memory SQLite must work"))
+        }
+    };
+
+    // Semantic retrieval index (BM25 over turns + memory files).
+    let semantic_index = Arc::new(SemanticIndex::new(&workspace, conversation_store.clone()));
+    context.semantic_index = Some(semantic_index.clone());
+
     SharedCore {
         provider,
         workspace,
@@ -149,6 +195,9 @@ pub fn build_shared_core(
         temperature,
         context,
         sessions,
+        conversation_store,
+        semantic_index,
+        semantic_budget: memory_config.semantic_budget,
         token_budget,
         compactor,
         learning,
@@ -162,7 +211,76 @@ pub fn build_shared_core(
         learning_turn_counter: AtomicU64::new(0),
         last_context_used: AtomicU64::new(0),
         last_context_max: AtomicU64::new(max_context_tokens as u64),
+        is_local,
     }
+}
+
+/// Detect the most recent interaction time by scanning session files.
+fn detect_last_interaction(workspace: &std::path::Path) -> Option<chrono::DateTime<chrono::Local>> {
+    let sessions_dir = workspace.join("sessions");
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut latest: Option<std::time::SystemTime> = None;
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    latest = Some(match latest {
+                        Some(prev) if mtime > prev => mtime,
+                        Some(prev) => prev,
+                        None => mtime,
+                    });
+                }
+            }
+        }
+    }
+    latest.map(|t| chrono::DateTime::<chrono::Local>::from(t))
+}
+
+/// Detect git changes in the workspace since last session.
+fn detect_git_changes(workspace: &std::path::Path) -> Option<String> {
+    // Only run if the workspace is inside a git repo.
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+
+    if !status_output.status.success() {
+        return None; // Not a git repo or git not available.
+    }
+
+    let status = String::from_utf8_lossy(&status_output.stdout);
+    let changed_files: Vec<&str> = status.lines().collect();
+
+    let log_output = std::process::Command::new("git")
+        .args(["log", "--oneline", "-5", "--since=12h"])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+
+    let log = String::from_utf8_lossy(&log_output.stdout);
+    let recent_commits: Vec<&str> = log.lines().collect();
+
+    if changed_files.is_empty() && recent_commits.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if !changed_files.is_empty() {
+        parts.push(format!(
+            "{} file(s) with uncommitted changes",
+            changed_files.len()
+        ));
+    }
+    if !recent_commits.is_empty() {
+        parts.push(format!(
+            "Recent commits (last 12h):\n{}",
+            recent_commits.join("\n")
+        ));
+    }
+    Some(parts.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +291,8 @@ pub fn build_shared_core(
 struct AgentLoopShared {
     core_handle: SharedCoreHandle,
     subagents: Arc<SubagentManager>,
+    task_board: Arc<TaskBoard>,
+    scratchpad: Arc<SharedScratchpad>,
     bus_outbound_tx: UnboundedSender<OutboundMessage>,
     bus_inbound_tx: UnboundedSender<InboundMessage>,
     cron_service: Option<Arc<CronService>>,
@@ -188,6 +308,7 @@ impl AgentLoopShared {
     /// entire message processing.
     async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
+        tools.condensed = core.is_local;
 
         // File system tools (stateless).
         tools.register(Box::new(ReadFileTool));
@@ -208,6 +329,13 @@ impl AgentLoopShared {
         tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
         tools.register(Box::new(WebFetchTool::new(50_000)));
 
+        // Skill manager (dynamic skill creation).
+        tools.register(Box::new(SkillManagerTool::new(core.workspace.clone())));
+
+        // Task board and scratchpad (multi-agent coordination).
+        tools.register(Box::new(TaskBoardTool::new(self.task_board.clone())));
+        tools.register(Box::new(ScratchpadTool::new(self.scratchpad.clone())));
+
         // Message tool - context baked in.
         let outbound_tx_clone = self.bus_outbound_tx.clone();
         let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
@@ -222,9 +350,9 @@ impl AgentLoopShared {
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid| {
+        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid, task_id| {
             let mgr = subagents_ref.clone();
-            Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
+            Box::pin(async move { mgr.spawn(task, label, ch, cid, task_id).await })
         });
         let spawn_tool = Arc::new(SpawnTool::new());
         // Set callback and context before registering so they're ready for use.
@@ -318,6 +446,18 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
 
+        // Inject task board summary into system prompt.
+        {
+            let board_summary = self.task_board.summary();
+            if !board_summary.is_empty() {
+                if let Some(sys_msg) = messages.first_mut() {
+                    if let Some(content) = sys_msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()) {
+                        sys_msg["content"] = json!(format!("{}\n\n---\n\n# Task Board\n\n{}", content, board_summary));
+                    }
+                }
+            }
+        }
+
         // Track which tools have been used for smart tool selection.
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -342,12 +482,16 @@ impl AgentLoopShared {
                     let workspace = core.workspace.clone();
                     let obs_session_key = session_key.clone();
                     let obs_channel = msg.channel.clone();
+                    let sem_index = core.semantic_index.clone();
                     tokio::spawn(async move {
                         let observer = ObservationStore::new(&workspace);
-                        if let Err(e) =
-                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
-                        {
-                            tracing::warn!("Failed to save observation: {}", e);
+                        match observer.save(&summary, &obs_session_key, Some(&obs_channel)) {
+                            Ok(path) => {
+                                sem_index.add_observation(&path, &summary);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to save observation: {}", e);
+                            }
                         }
                     });
                 }
@@ -484,6 +628,26 @@ impl AgentLoopShared {
                 .await;
         }
 
+        // Write turns to SQLite conversation store (parallel path) + index.
+        {
+            let store = core.conversation_store.clone();
+            let sem_index = core.semantic_index.clone();
+            let channel = msg.channel.clone();
+            let chat_id = msg.chat_id.clone();
+            let user_content = msg.content.clone();
+            let assistant_content = final_content.clone();
+            let model_name = core.model.clone();
+            let lang = detected_language.clone();
+            tokio::task::spawn_blocking(move || {
+                let sid = store.ensure_session(&channel, &chat_id);
+                store.add_turn(&sid, "user", Some(&user_content), None, None, None, None, None, Some(&channel), lang.as_deref(), is_voice_message, None);
+                if !assistant_content.is_empty() {
+                    let turn_id = store.add_turn(&sid, "assistant", Some(&assistant_content), None, None, Some(&model_name), None, None, Some(&channel), lang.as_deref(), false, None);
+                    sem_index.add_turn(&turn_id, &assistant_content);
+                }
+            });
+        }
+
         if final_content.is_empty() {
             None
         } else {
@@ -511,11 +675,13 @@ impl AgentLoopShared {
 
     /// Process a message with streaming: text deltas are forwarded to
     /// `text_delta_tx` as they arrive from the LLM. The full response text
-    /// is still returned for session history.
+    /// is still returned for session history. Optionally emits `TuiEvent`s
+    /// for tool execution visibility.
     async fn process_message_streaming(
         &self,
         msg: &InboundMessage,
         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tui_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::events::TuiEvent>>,
     ) -> Option<OutboundMessage> {
         let core = self.core_handle.read().unwrap().clone();
         let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -577,6 +743,18 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
 
+        // Inject task board summary into system prompt.
+        {
+            let board_summary = self.task_board.summary();
+            if !board_summary.is_empty() {
+                if let Some(sys_msg) = messages.first_mut() {
+                    if let Some(content) = sys_msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()) {
+                        sys_msg["content"] = json!(format!("{}\n\n---\n\n# Task Board\n\n{}", content, board_summary));
+                    }
+                }
+            }
+        }
+
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Pre-loop compaction
@@ -596,12 +774,16 @@ impl AgentLoopShared {
                     let workspace = core.workspace.clone();
                     let obs_session_key = session_key.clone();
                     let obs_channel = msg.channel.clone();
+                    let sem_index = core.semantic_index.clone();
                     tokio::spawn(async move {
                         let observer = ObservationStore::new(&workspace);
-                        if let Err(e) =
-                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
-                        {
-                            tracing::warn!("Failed to save observation: {}", e);
+                        match observer.save(&summary, &obs_session_key, Some(&obs_channel)) {
+                            Ok(path) => {
+                                sem_index.add_observation(&path, &summary);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to save observation: {}", e);
+                            }
                         }
                     });
                 }
@@ -625,6 +807,11 @@ impl AgentLoopShared {
                 .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
             messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
             thread_repair::repair_messages(&mut messages);
+
+            // Emit thinking event at start of each LLM call
+            if let Some(ref tx) = tui_event_tx {
+                let _ = tx.send(crate::tui::events::TuiEvent::Thinking);
+            }
 
             // Use streaming API
             let mut stream = match core
@@ -651,7 +838,10 @@ impl AgentLoopShared {
             while let Some(chunk) = stream.rx.recv().await {
                 match chunk {
                     StreamChunk::TextDelta(delta) => {
-                        // Forward text deltas for TTS pipeline
+                        // Forward text deltas for TTS pipeline and TUI
+                        if let Some(ref tx) = tui_event_tx {
+                            let _ = tx.send(crate::tui::events::TuiEvent::TextDelta(delta.clone()));
+                        }
                         let _ = text_delta_tx.send(delta);
                     }
                     StreamChunk::Done(resp) => {
@@ -694,13 +884,29 @@ impl AgentLoopShared {
 
                 for tc in &response.tool_calls {
                     debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+                    if let Some(ref tx) = tui_event_tx {
+                        let _ = tx.send(crate::tui::events::TuiEvent::ToolStart {
+                            name: tc.name.clone(),
+                            id: tc.id.clone(),
+                        });
+                    }
+                    let tool_start = std::time::Instant::now();
                     let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                    let tool_duration = tool_start.elapsed();
                     debug!(
                         "Tool {} result ({}B, ok={})",
                         tc.name,
                         result.data.len(),
                         result.ok
                     );
+                    if let Some(ref tx) = tui_event_tx {
+                        let _ = tx.send(crate::tui::events::TuiEvent::ToolComplete {
+                            name: tc.name.clone(),
+                            id: tc.id.clone(),
+                            success: result.ok,
+                            duration: tool_duration,
+                        });
+                    }
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
                     used_tools.insert(tc.name.clone());
 
@@ -749,6 +955,31 @@ impl AgentLoopShared {
                     &[("user", &msg.content), ("assistant", &final_content)],
                 )
                 .await;
+        }
+
+        // Write turns to SQLite conversation store (parallel path) + index.
+        {
+            let store = core.conversation_store.clone();
+            let sem_index = core.semantic_index.clone();
+            let channel = msg.channel.clone();
+            let chat_id = msg.chat_id.clone();
+            let user_content = msg.content.clone();
+            let assistant_content = final_content.clone();
+            let model_name = core.model.clone();
+            let lang = detected_language.clone();
+            tokio::task::spawn_blocking(move || {
+                let sid = store.ensure_session(&channel, &chat_id);
+                store.add_turn(&sid, "user", Some(&user_content), None, None, None, None, None, Some(&channel), lang.as_deref(), is_voice_message, None);
+                if !assistant_content.is_empty() {
+                    let turn_id = store.add_turn(&sid, "assistant", Some(&assistant_content), None, None, Some(&model_name), None, None, Some(&channel), lang.as_deref(), false, None);
+                    sem_index.add_turn(&turn_id, &assistant_content);
+                }
+            });
+        }
+
+        // Signal completion to TUI
+        if let Some(ref tx) = tui_event_tx {
+            let _ = tx.send(crate::tui::events::TuiEvent::Done);
         }
 
         if final_content.is_empty() {
@@ -810,6 +1041,9 @@ impl AgentLoop {
     ) -> Self {
         // Read core to initialize the subagent manager.
         let core = core_handle.read().unwrap().clone();
+        let task_board = Arc::new(TaskBoard::new(&core.workspace));
+        let scratchpad = Arc::new(SharedScratchpad::new(&core.workspace));
+
         let subagents = Arc::new(SubagentManager::new(
             core.provider.clone(),
             core.workspace.clone(),
@@ -818,11 +1052,15 @@ impl AgentLoop {
             core.brave_api_key.clone(),
             core.exec_timeout,
             core.restrict_to_workspace,
+            task_board.clone(),
+            scratchpad.clone(),
         ));
 
         let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
+            task_board,
+            scratchpad,
             bus_outbound_tx,
             bus_inbound_tx,
             cron_service,
@@ -852,12 +1090,14 @@ impl AgentLoop {
             core.reflection_threshold,
         );
         if reflector.should_reflect() {
+            let sem_index = core.semantic_index.clone();
             tokio::spawn(async move {
                 info!("Background: reflecting on accumulated observations...");
                 if let Err(e) = reflector.reflect().await {
                     warn!("Background reflection failed: {}", e);
                 } else {
                     info!("Background reflection complete — MEMORY.md updated");
+                    sem_index.mark_dirty();
                 }
             });
         }
@@ -977,6 +1217,9 @@ impl AgentLoop {
             });
         }
 
+        // End all active sessions in the conversation store.
+        let core = self.shared.core_handle.read().unwrap().clone();
+        core.conversation_store.end_all_active_sessions();
         info!("Agent loop stopped");
     }
 
@@ -1033,7 +1276,8 @@ impl AgentLoop {
     }
 
     /// Like `process_direct_with_lang` but streams text deltas to `text_delta_tx`
-    /// as they arrive from the LLM. Returns the full response text.
+    /// as they arrive from the LLM. Returns the full response text. Optionally
+    /// accepts a `tui_event_tx` for rich TUI event emission.
     pub async fn process_direct_streaming(
         &self,
         content: &str,
@@ -1042,6 +1286,7 @@ impl AgentLoop {
         chat_id: &str,
         detected_language: Option<&str>,
         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tui_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::events::TuiEvent>>,
     ) -> String {
         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
             Self::spawn_background_reflection(&self.shared);
@@ -1057,7 +1302,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message_streaming(&msg, text_delta_tx)
+            .process_message_streaming(&msg, text_delta_tx, tui_event_tx)
             .await
         {
             Some(response) => response.content,

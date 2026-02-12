@@ -70,6 +70,9 @@ rustyline = "15"
 # Terminal markdown rendering
 termimad = "0.30"
 
+# Unicode visible width (for CJK/emoji in streaming display)
+unicode-width = "0.2"
+
 # Unix terminal control (stdin flush after voice recording)
 libc = "0.2"
 
@@ -81,6 +84,9 @@ whatlang = "0.16"
 
 # Mime type guessing
 mime_guess = "2"
+
+# SQLite conversation store
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Email channel (IMAP + SMTP)
 async-imap = "0.10"

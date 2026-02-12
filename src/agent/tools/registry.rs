@@ -9,6 +9,9 @@ use super::base::{Tool, ToolExecutionResult};
 /// Allows dynamic registration and execution of tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    /// When true, tool schemas use condensed (first-sentence) descriptions.
+    /// Enabled in SLM/local mode to reduce token overhead.
+    pub condensed: bool,
 }
 
 impl ToolRegistry {
@@ -16,6 +19,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            condensed: false,
         }
     }
 
@@ -42,7 +46,30 @@ impl ToolRegistry {
 
     /// Get all tool definitions in OpenAI format.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
-        self.tools.values().map(|tool| tool.to_schema()).collect()
+        let mut defs: Vec<serde_json::Value> =
+            self.tools.values().map(|tool| tool.to_schema()).collect();
+        if self.condensed {
+            Self::condense_descriptions(&mut defs);
+        }
+        defs
+    }
+
+    /// Truncate tool descriptions to the first sentence for SLM mode.
+    fn condense_descriptions(defs: &mut [serde_json::Value]) {
+        for def in defs.iter_mut() {
+            if let Some(desc) = def
+                .get("function")
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+            {
+                let short = desc
+                    .split_once('.')
+                    .map(|(first, _)| format!("{}.", first.trim()))
+                    .unwrap_or(desc);
+                def["function"]["description"] = serde_json::Value::String(short);
+            }
+        }
     }
 
     /// Execute a tool by name with given parameters.
@@ -94,6 +121,18 @@ impl ToolRegistry {
             &["spawn", "agent", "background", "subagent", "delegate"],
             "spawn",
         ),
+        (
+            &["skill", "learn", "capability", "teach"],
+            "skill_manager",
+        ),
+        (
+            &["task", "board", "assign", "handoff", "coordinate"],
+            "task_board",
+        ),
+        (
+            &["scratchpad", "scratch", "notes", "share data", "memo"],
+            "scratchpad",
+        ),
     ];
 
     /// Get tool definitions filtered by relevance to the current context.
@@ -142,22 +181,41 @@ impl ToolRegistry {
             return self.get_definitions();
         }
 
-        self.tools
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
             .iter()
             .filter(|(name, _)| relevant.contains(name.as_str()))
             .map(|(_, tool)| tool.to_schema())
-            .collect()
+            .collect();
+        if self.condensed {
+            Self::condense_descriptions(&mut defs);
+        }
+        defs
     }
 
-    /// Extract text content from the last N messages for keyword scanning.
+    /// Extract text content from the system prompt + last N messages for keyword scanning.
     fn extract_recent_text(messages: &[serde_json::Value], n: usize) -> String {
-        messages
-            .iter()
-            .rev()
-            .take(n)
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .collect::<Vec<&str>>()
-            .join(" ")
+        // Always include the system prompt (first message) for tool discoverability,
+        // plus the last N messages for conversation context.
+        let mut parts: Vec<&str> = Vec::new();
+
+        // System prompt (always first).
+        if let Some(sys) = messages.first() {
+            if let Some(content) = sys.get("content").and_then(|c| c.as_str()) {
+                parts.push(content);
+            }
+        }
+
+        // Last N non-system messages.
+        for msg in messages.iter().rev().take(n) {
+            if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    parts.push(content);
+                }
+            }
+        }
+
+        parts.join(" ")
     }
 
     /// Get list of registered tool names.
@@ -438,5 +496,64 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
         assert!(names.contains(&"web_fetch".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // condensed mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_condensed_mode_truncates_descriptions() {
+        let mut registry = ToolRegistry::new();
+        registry.condensed = true;
+        registry.register(Box::new(MockTool::new("test_tool")));
+
+        let defs = registry.get_definitions();
+        assert_eq!(defs.len(), 1);
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        // MockTool description is "A mock tool for testing" — single sentence
+        // with no period, so condensed mode preserves it as-is.
+        assert_eq!(desc, "A mock tool for testing");
+    }
+
+    #[test]
+    fn test_condensed_mode_keeps_first_sentence() {
+        // Create a tool with multi-sentence description.
+        struct VerboseTool;
+
+        #[async_trait]
+        impl Tool for VerboseTool {
+            fn name(&self) -> &str {
+                "verbose"
+            }
+            fn description(&self) -> &str {
+                "Search the web for information. Returns results from multiple search engines. Supports advanced operators."
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+                String::new()
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.condensed = true;
+        registry.register(Box::new(VerboseTool));
+
+        let defs = registry.get_definitions();
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(desc, "Search the web for information.");
+    }
+
+    #[test]
+    fn test_non_condensed_preserves_full_description() {
+        let mut registry = ToolRegistry::new();
+        registry.condensed = false;
+        registry.register(Box::new(MockTool::new("test_tool")));
+
+        let defs = registry.get_definitions();
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(desc, "A mock tool for testing");
     }
 }

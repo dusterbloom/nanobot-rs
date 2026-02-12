@@ -12,9 +12,9 @@ use super::base::Tool;
 
 /// Type alias for the spawn callback.
 ///
-/// Arguments: (task, label, origin_channel, origin_chat_id) -> result string.
+/// Arguments: (task, label, origin_channel, origin_chat_id, task_id) -> result string.
 pub type SpawnCallback = Arc<
-    dyn Fn(String, Option<String>, String, String) -> Pin<Box<dyn Future<Output = String> + Send>>
+    dyn Fn(String, Option<String>, String, String, Option<String>) -> Pin<Box<dyn Future<Output = String> + Send>>
         + Send
         + Sync,
 >;
@@ -80,6 +80,10 @@ impl Tool for SpawnTool {
                 "label": {
                     "type": "string",
                     "description": "Optional short label for the task (for display)"
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Optional task board ID to track progress against"
                 }
             },
             "required": ["task"]
@@ -97,6 +101,11 @@ impl Tool for SpawnTool {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let task_id = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let channel = self.origin_channel.lock().await.clone();
         let chat_id = self.origin_chat_id.lock().await.clone();
 
@@ -108,7 +117,7 @@ impl Tool for SpawnTool {
         // Drop the lock before awaiting.
         drop(callback_guard);
 
-        callback(task, label, channel, chat_id).await
+        callback(task, label, channel, chat_id, task_id).await
     }
 }
 
@@ -187,7 +196,7 @@ mod tests {
         let tool = SpawnTool::new();
 
         let callback: SpawnCallback = Arc::new(
-            |task: String, label: Option<String>, channel: String, chat_id: String| {
+            |task: String, label: Option<String>, channel: String, chat_id: String, _task_id: Option<String>| {
                 Box::pin(async move {
                     format!(
                         "spawned: task={}, label={}, channel={}, chat_id={}",
@@ -224,7 +233,7 @@ mod tests {
         let tool = SpawnTool::new();
 
         let callback: SpawnCallback = Arc::new(
-            |task: String, label: Option<String>, _channel: String, _chat_id: String| {
+            |task: String, label: Option<String>, _channel: String, _chat_id: String, _task_id: Option<String>| {
                 Box::pin(async move { format!("task={}, has_label={}", task, label.is_some(),) })
             },
         );

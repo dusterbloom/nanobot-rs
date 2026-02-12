@@ -419,6 +419,10 @@ pub struct MemoryConfig {
     /// Token threshold to trigger reflection (default: 20000).
     #[serde(default = "default_reflection_threshold")]
     pub reflection_threshold: usize,
+
+    /// Max tokens for semantic retrieval context in system prompt (default: 1500).
+    #[serde(default = "default_semantic_budget")]
+    pub semantic_budget: usize,
 }
 
 fn default_true() -> bool {
@@ -433,6 +437,10 @@ fn default_reflection_threshold() -> usize {
     20000
 }
 
+fn default_semantic_budget() -> usize {
+    1500
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -441,6 +449,7 @@ impl Default for MemoryConfig {
             provider: None,
             observation_budget: default_observation_budget(),
             reflection_threshold: default_reflection_threshold(),
+            semantic_budget: default_semantic_budget(),
         }
     }
 }
