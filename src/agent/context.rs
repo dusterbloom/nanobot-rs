@@ -53,6 +53,33 @@ impl ContextBuilder {
         }
     }
 
+    /// Create a context builder optimized for local/small models.
+    /// 
+    /// Uses much smaller budgets to keep the system prompt under ~2k tokens,
+    /// leaving more room for conversation in limited context windows.
+    pub fn new_lite(workspace: &Path) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            memory: MemoryStore::new(workspace),
+            skills: SkillsLoader::new(workspace, None),
+            model_name: String::new(),
+            bootstrap_budget: 500,      // Down from 3000
+            long_term_memory_budget: 300, // Down from 2000
+            today_notes_budget: 200,    // Down from 1200
+            observation_budget: 300,    // Down from 2000
+            learning_budget: 200,       // Down from 800
+        }
+    }
+
+    /// Convert this builder to lite mode (for local models).
+    pub fn set_lite_mode(&mut self) {
+        self.bootstrap_budget = 500;
+        self.long_term_memory_budget = 300;
+        self.today_notes_budget = 200;
+        self.observation_budget = 300;
+        self.learning_budget = 200;
+    }
+
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------

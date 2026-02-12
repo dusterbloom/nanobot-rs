@@ -30,11 +30,8 @@ Merge these partial conversation summaries into one coherent summary.
 Preserve concrete facts, decisions, and pending actions.
 Avoid repetition. Keep it under 500 words.";
 
-/// Approximate max tokens for transcript input sent to the compaction model.
-///
-/// Keeps total summarize request comfortably under a 4K ctx server (system
-/// prompt + transcript + response budget).
-const SUMMARIZER_INPUT_BUDGET_TOKENS: usize = 2500;
+// SUMMARIZER_INPUT_BUDGET_TOKENS removed — now dynamically computed via
+// ContextCompactor::input_budget() based on the compaction server's ctx size.
 
 /// Safety cap for iterative merge rounds.
 const MAX_MERGE_ROUNDS: usize = 6;
@@ -55,17 +52,45 @@ pub struct ContextCompactor {
     summary_max_tokens: u32,
     /// Disable proactive compaction after first provider failure.
     disabled: AtomicBool,
+    /// Context window size of the compaction model (tokens).
+    compaction_context_size: usize,
 }
 
 impl ContextCompactor {
     /// Create a new compactor that uses the given provider/model for summaries.
-    pub fn new(provider: Arc<dyn LLMProvider>, model: String) -> Self {
+    ///
+    /// `compaction_context_size` is the context window of the compaction model
+    /// (in tokens). The input budget for summarization chunks is derived from
+    /// this dynamically, so a 4K model produces ~2.5K budgets while a 32K
+    /// model can summarize in a single call.
+    pub fn new(provider: Arc<dyn LLMProvider>, model: String, compaction_context_size: usize) -> Self {
         Self {
             provider,
             model,
             summary_max_tokens: 1024,
             disabled: AtomicBool::new(false),
+            compaction_context_size,
         }
+    }
+
+    /// Dynamic input budget derived from the compaction model's context size.
+    ///
+    /// Reserves space for the system prompt (~200 tokens), the summary
+    /// response, and a small safety margin.
+    fn input_budget(&self) -> usize {
+        let reserved = 200 + self.summary_max_tokens as usize + 300;
+        self.compaction_context_size.saturating_sub(reserved)
+    }
+
+    /// Check whether the conversation needs compaction (>66.6% of budget).
+    pub fn needs_compaction(&self, messages: &[Value], budget: &TokenBudget, tool_def_tokens: usize) -> bool {
+        if self.disabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let available = budget.available_budget(tool_def_tokens);
+        let estimated = budget.estimate_tokens_with_fallback(messages);
+        let threshold = (available as f64 * 0.666) as usize;
+        estimated > threshold
     }
 
     /// Compact messages when they exceed 66.6% of the token budget.
@@ -215,8 +240,7 @@ impl ContextCompactor {
 
         // First pass: summarize message chunks that fit the summarizer input budget.
         let mut summaries: Vec<String> = Vec::new();
-        for (start, end) in split_message_ranges_by_budget(messages, SUMMARIZER_INPUT_BUDGET_TOKENS)
-        {
+        for (start, end) in split_message_ranges_by_budget(messages, self.input_budget()) {
             let transcript = build_transcript(&messages[start..end]);
             let s = self.summarize_text(&transcript, SUMMARIZE_PROMPT).await?;
             summaries.push(s);
@@ -236,7 +260,7 @@ impl ContextCompactor {
 
             let mut merged: Vec<String> = Vec::new();
             for (start, end) in
-                split_summary_ranges_by_budget(&summaries, SUMMARIZER_INPUT_BUDGET_TOKENS)
+                split_summary_ranges_by_budget(&summaries, self.input_budget())
             {
                 let mut block = String::new();
                 for (i, s) in summaries[start..end].iter().enumerate() {
@@ -517,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn test_compact_within_budget_is_noop() {
         let provider = Arc::new(MockProvider::new("summary"));
-        let compactor = ContextCompactor::new(provider, "test".into());
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
         let budget = TokenBudget::new(100_000, 8192);
 
         let messages = vec![
@@ -533,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn test_compact_summarizes_old_messages() {
         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
-        let compactor = ContextCompactor::new(provider, "test".into());
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
         let budget = TokenBudget::new(1200, 200);
 
         let mut messages =
@@ -561,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn test_compact_falls_back_on_failure() {
         let provider = Arc::new(FailingProvider);
-        let compactor = ContextCompactor::new(provider, "test".into());
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
         let budget = TokenBudget::new(200, 50);
 
         let mut messages = vec![json!({"role": "system", "content": "Sys"})];
@@ -580,7 +604,7 @@ mod tests {
     async fn test_compact_proactive_threshold() {
         // Test that compaction triggers at 66.6%, not 100%.
         let provider = Arc::new(MockProvider::new("Summary of the conversation."));
-        let compactor = ContextCompactor::new(provider, "test".into());
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
         // Budget: 1000 available (after response reserve). 66.6% = 666 tokens.
         let budget = TokenBudget::new(1200, 200);
 
@@ -604,7 +628,7 @@ mod tests {
         let provider = Arc::new(CountingFailingProvider {
             calls: calls.clone(),
         });
-        let compactor = ContextCompactor::new(provider, "test".into());
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000);
         let budget = TokenBudget::new(2200, 200);
 
         let mut messages = vec![json!({"role": "system", "content": "Sys"})];

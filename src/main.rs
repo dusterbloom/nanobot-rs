@@ -11,6 +11,7 @@ mod cron;
 mod heartbeat;
 mod providers;
 mod session;
+mod syntax;
 mod utils;
 #[cfg(feature = "voice")]
 mod voice;
@@ -56,6 +57,13 @@ fn make_skin() -> termimad::MadSkin {
     skin.inline_code.set_fg(Color::Green);
     skin.code_block.set_fg(Color::Green);
     skin
+}
+
+/// Render markdown response to the terminal.
+///
+/// Uses termimad for structural markdown (headers, bold, lists, etc.).
+fn render_markdown(text: &str, skin: &termimad::MadSkin) {
+    skin.print_text(text);
 }
 
 /// ANSI escape helpers for colored terminal output.
@@ -635,7 +643,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                                 .process_direct_with_lang(&text, &session_id, "voice", "direct", Some(&lang))
                                                 .await;
                                             println!();
-                                            skin.print_text(&response);
+                                            render_markdown(&response, &skin);
                                             println!();
                                             let tts_text = strip_markdown_for_tts(&response);
                                             if !tts_text.is_empty() {
@@ -699,7 +707,8 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                             println!("\n  {}{}Reusing{} llama.cpp server on port {}", tui::BOLD, tui::YELLOW, tui::RESET, port);
                             local_port = port.to_string();
                             LOCAL_MODE.store(true, Ordering::SeqCst);
-                            start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
+                            let main_ctx = compute_optimal_context_size(&current_model_path);
+                            start_compaction_if_available(&mut compaction_process, &mut compaction_port, main_ctx).await;
                             rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                             agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                             print_mode_banner(&local_port);
@@ -716,7 +725,7 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                                     if wait_for_server_ready(port, 120, &mut llama_process).await {
                                         local_port = port.to_string();
                                         LOCAL_MODE.store(true, Ordering::SeqCst);
-                                        start_compaction_if_available(&mut compaction_process, &mut compaction_port).await;
+                                        start_compaction_if_available(&mut compaction_process, &mut compaction_port, ctx_size).await;
                                         rebuild_core(&core_handle, &config, &local_port, current_model_path.file_name().and_then(|n| n.to_str()), compaction_port.as_deref());
                                         agent_loop = create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
                                         print_mode_banner(&local_port);
@@ -1209,6 +1218,14 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         )
                         .await;
                     let _ = print_task.await;
+                    if !response.is_empty() {
+                        use std::io::Write as _;
+                        let lines = response.chars().filter(|&c| c == '\n').count() + 2;
+                        print!("\x1b[{}A\x1b[J", lines);
+                        std::io::stdout().flush().ok();
+                        let skin = make_skin();
+                        render_markdown(&response, &skin);
+                    }
                     println!();
                     {
                         let sa_count = agent_loop.subagent_manager().get_running_count().await;
@@ -1344,7 +1361,6 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                 let (delta_tx, mut delta_rx) =
                     tokio::sync::mpsc::unbounded_channel::<String>();
 
-                // Print deltas as they stream in
                 let print_task = tokio::spawn(async move {
                     use std::io::Write as _;
                     while let Some(delta) = delta_rx.recv().await {
@@ -1365,8 +1381,16 @@ fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang
                         delta_tx,
                     )
                     .await;
-
                 let _ = print_task.await;
+                // Erase raw streamed text, re-render with markdown formatting.
+                if !response.is_empty() {
+                    use std::io::Write as _;
+                    let lines = response.chars().filter(|&c| c == '\n').count() + 2; // +1 trailing newline, +1 blank
+                    print!("\x1b[{}A\x1b[J", lines);
+                    std::io::stdout().flush().ok();
+                    let skin = make_skin();
+                    render_markdown(&response, &skin);
+                }
                 println!();
                 {
                     let sa_count = agent_loop.subagent_manager().get_running_count().await;
@@ -2512,11 +2536,13 @@ fn ensure_compaction_model() -> Option<std::path::PathBuf> {
 
 /// Start the dedicated compaction server if the model is available.
 ///
-/// Downloads the model on first run, spawns a CPU-only llama-server on port 8090+,
-/// and stores the process handle and port. Gracefully degrades if anything fails.
+/// Downloads the model on first run, spawns a GPU-accelerated llama-server on
+/// port 8090+ with context matching the main model, and stores the process
+/// handle and port. Gracefully degrades if anything fails.
 async fn start_compaction_if_available(
     compaction_process: &mut Option<std::process::Child>,
     compaction_port: &mut Option<String>,
+    main_ctx_size: usize,
 ) {
     // Already running?
     if compaction_process.is_some() {
@@ -2530,20 +2556,21 @@ async fn start_compaction_if_available(
 
     let port = find_available_port(8090);
     println!(
-        "  {}{}Starting{} compaction server on port {} (CPU-only)...",
+        "  {}{}Starting{} compaction server on port {} (ctx: {}K, GPU)...",
         tui::BOLD,
         tui::YELLOW,
         tui::RESET,
-        port
+        port,
+        main_ctx_size / 1024,
     );
 
-    match spawn_compaction_server(port, &model_path) {
+    match spawn_compaction_server(port, &model_path, main_ctx_size) {
         Ok(child) => {
             *compaction_process = Some(child);
             if wait_for_server_ready(port, 15, compaction_process).await {
                 *compaction_port = Some(port.to_string());
                 println!(
-                    "  {}{}Compaction server ready{} (Qwen3-0.6B on CPU)",
+                    "  {}{}Compaction server ready{} (Qwen3-0.6B on GPU)",
                     tui::BOLD,
                     tui::GREEN,
                     tui::RESET
@@ -2868,13 +2895,14 @@ fn compute_optimal_context_size(model_path: &std::path::Path) -> usize {
     ctx
 }
 
-/// Spawn a CPU-only llama-server for context compaction (summarization).
+/// Spawn a llama-server for context compaction (summarization).
 ///
-/// Uses `--n-gpu-layers 0` so it never competes with the main model for VRAM.
-/// Fixed 4K context — summarization doesn't need more.
+/// Uses GPU acceleration and matches the main model's context size so
+/// large conversations can be summarized in a single LLM call.
 fn spawn_compaction_server(
     port: u16,
     model_path: &std::path::Path,
+    ctx_size: usize,
 ) -> Result<std::process::Child, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     let server_path = home.join("llama.cpp/build/bin/llama-server");
@@ -2898,11 +2926,13 @@ fn spawn_compaction_server(
         .arg("--port")
         .arg(port.to_string())
         .arg("--ctx-size")
-        .arg("4096")
+        .arg(ctx_size.to_string())
         .arg("--parallel")
         .arg("1")
         .arg("--n-gpu-layers")
-        .arg("0")
+        .arg("99")
+        .arg("--flash-attn")
+        .arg("on")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()

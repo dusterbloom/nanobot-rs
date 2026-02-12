@@ -67,6 +67,7 @@ pub struct SharedCore {
     pub learning_turn_counter: AtomicU64,
     pub last_context_used: AtomicU64,
     pub last_context_max: AtomicU64,
+    pub is_local: bool,
 }
 
 /// Handle for hot-swapping the shared core.
@@ -95,9 +96,16 @@ pub fn build_shared_core(
     is_local: bool,
     compaction_provider: Option<Arc<dyn LLMProvider>>,
 ) -> SharedCore {
-    let mut context = ContextBuilder::new(&workspace);
+    let mut context = if is_local {
+        ContextBuilder::new_lite(&workspace)
+    } else {
+        ContextBuilder::new(&workspace)
+    };
     context.model_name = model.clone();
-    context.observation_budget = memory_config.observation_budget;
+    if !is_local {
+        // Only override observation budget for cloud mode (lite mode has its own defaults)
+        context.observation_budget = memory_config.observation_budget;
+    }
     let sessions = SessionManager::new(&workspace);
 
     // When local, use dedicated compaction provider if available, else main provider.
@@ -137,7 +145,7 @@ pub fn build_shared_core(
     };
 
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
-    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone());
+    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens);
     let learning = LearningStore::new(&workspace);
 
     SharedCore {
@@ -162,7 +170,52 @@ pub fn build_shared_core(
         learning_turn_counter: AtomicU64::new(0),
         last_context_used: AtomicU64::new(0),
         last_context_max: AtomicU64::new(max_context_tokens as u64),
+        is_local,
     }
+}
+
+// ---------------------------------------------------------------------------
+// History limit scaling
+// ---------------------------------------------------------------------------
+
+/// Scale history message count with context window size.
+///
+/// Small models (16K) can't afford 100 messages of history — that alone
+/// can eat 40%+ of the context. Scale linearly: ~20 msgs at 16K, ~100 at
+/// 128K, clamped to [6, 100].
+fn history_limit(max_context_tokens: usize) -> usize {
+    // Real-world average is ~150 tokens per message (user queries + assistant
+    // responses). Reserve at most 30% of context for history.
+    let max_history_tokens = max_context_tokens * 3 / 10;
+    let limit = max_history_tokens / 150;
+    limit.clamp(6, 100)
+}
+
+// ---------------------------------------------------------------------------
+// Background compaction helpers
+// ---------------------------------------------------------------------------
+
+/// Pending compaction result ready to be swapped into the conversation.
+struct PendingCompaction {
+    result: crate::agent::compaction::CompactionResult,
+    watermark: usize, // messages.len() when compaction was spawned
+}
+
+/// Swap compacted messages into the live conversation, preserving
+/// messages added after the compaction snapshot was taken.
+fn apply_compaction_result(messages: &mut Vec<Value>, pending: PendingCompaction) {
+    let new_messages: Vec<Value> = if pending.watermark < messages.len() {
+        messages[pending.watermark..].to_vec()
+    } else {
+        vec![]
+    };
+    let mut swapped = Vec::with_capacity(1 + pending.result.messages.len() + new_messages.len());
+    swapped.push(messages[0].clone()); // fresh system msg
+    if pending.result.messages.len() > 1 {
+        swapped.extend_from_slice(&pending.result.messages[1..]); // skip stale system msg
+    }
+    swapped.extend(new_messages);
+    *messages = swapped;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +331,10 @@ impl AgentLoopShared {
         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
         // Get session history.
-        let history = core.sessions.get_history(&session_key, 100).await;
+        let history = core.sessions.get_history(
+                &session_key,
+                history_limit(core.token_budget.max_context()),
+            ).await;
 
         // Extract media paths.
         let media_paths: Vec<String> = msg
@@ -321,44 +377,29 @@ impl AgentLoopShared {
         // Track which tools have been used for smart tool selection.
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Pre-loop compaction: summarize old messages if over budget.
-        // When a dedicated compaction server is available (local mode with Qwen3-0.6B),
-        // this works great. When it's not, the ContextCompactor's Stage 1 failure is
-        // handled gracefully (falls back to trim_to_fit in the loop below).
-        {
-            let initial_tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
-            let initial_tool_tokens = core
-                .token_budget
-                .estimate_tool_def_tokens_with_fallback(&initial_tool_defs);
-            let compaction_result = core
-                .compactor
-                .compact(&messages, &core.token_budget, initial_tool_tokens)
-                .await;
-            messages = compaction_result.messages;
-
-            // Persist observation in background — never blocks user chat.
-            if core.memory_enabled {
-                if let Some(summary) = compaction_result.observation {
-                    let workspace = core.workspace.clone();
-                    let obs_session_key = session_key.clone();
-                    let obs_channel = msg.channel.clone();
-                    tokio::spawn(async move {
-                        let observer = ObservationStore::new(&workspace);
-                        if let Err(e) =
-                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
-                        {
-                            tracing::warn!("Failed to save observation: {}", e);
-                        }
-                    });
-                }
-            }
-        }
-
         let mut final_content = String::new();
+
+        // Background compaction state.
+        let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let compaction_in_flight = Arc::new(AtomicBool::new(false));
 
         // Agent loop: call LLM, handle tool calls, repeat.
         for iteration in 0..core.max_iterations {
             debug!("Agent iteration {}/{}", iteration + 1, core.max_iterations);
+
+            // Check if background compaction finished — swap in compacted messages.
+            if let Ok(mut guard) = compaction_slot.try_lock() {
+                if let Some(pending) = guard.take() {
+                    debug!(
+                        "Compaction swap: {} msgs -> {} compacted + {} new",
+                        pending.watermark,
+                        pending.result.messages.len(),
+                        messages.len().saturating_sub(pending.watermark)
+                    );
+                    apply_compaction_result(&mut messages, pending);
+                }
+            }
 
             // Filter tool definitions to relevant tools.
             let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
@@ -373,6 +414,39 @@ impl AgentLoopShared {
                 .token_budget
                 .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
             messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
+
+            // Spawn background compaction when threshold exceeded.
+            if !compaction_in_flight.load(Ordering::Relaxed)
+                && core.compactor.needs_compaction(&messages, &core.token_budget, tool_def_tokens)
+            {
+                let slot = compaction_slot.clone();
+                let in_flight = compaction_in_flight.clone();
+                let bg_messages = messages.clone();
+                let bg_core = core.clone();
+                let bg_session_key = session_key.clone();
+                let bg_channel = msg.channel.clone();
+                let watermark = messages.len();
+                in_flight.store(true, Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let result = bg_core
+                        .compactor
+                        .compact(&bg_messages, &bg_core.token_budget, 0)
+                        .await;
+                    if bg_core.memory_enabled {
+                        if let Some(ref summary) = result.observation {
+                            let observer = ObservationStore::new(&bg_core.workspace);
+                            if let Err(e) = observer.save(summary, &bg_session_key, Some(&bg_channel)) {
+                                tracing::warn!("Failed to save observation: {}", e);
+                            }
+                        }
+                    }
+                    if result.messages.len() < bg_messages.len() {
+                        *slot.lock().await = Some(PendingCompaction { result, watermark });
+                    }
+                    in_flight.store(false, Ordering::SeqCst);
+                });
+            }
 
             // Repair any protocol violations before calling the LLM.
             thread_repair::repair_messages(&mut messages);
@@ -539,7 +613,10 @@ impl AgentLoopShared {
 
         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
-        let history = core.sessions.get_history(&session_key, 100).await;
+        let history = core.sessions.get_history(
+                &session_key,
+                history_limit(core.token_budget.max_context()),
+            ).await;
 
         let media_paths: Vec<String> = msg
             .metadata
@@ -579,39 +656,28 @@ impl AgentLoopShared {
 
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // Pre-loop compaction
-        {
-            let initial_tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
-            let initial_tool_tokens = core
-                .token_budget
-                .estimate_tool_def_tokens_with_fallback(&initial_tool_defs);
-            let compaction_result = core
-                .compactor
-                .compact(&messages, &core.token_budget, initial_tool_tokens)
-                .await;
-            messages = compaction_result.messages;
-
-            if core.memory_enabled {
-                if let Some(summary) = compaction_result.observation {
-                    let workspace = core.workspace.clone();
-                    let obs_session_key = session_key.clone();
-                    let obs_channel = msg.channel.clone();
-                    tokio::spawn(async move {
-                        let observer = ObservationStore::new(&workspace);
-                        if let Err(e) =
-                            observer.save(&summary, &obs_session_key, Some(&obs_channel))
-                        {
-                            tracing::warn!("Failed to save observation: {}", e);
-                        }
-                    });
-                }
-            }
-        }
-
         let mut final_content = String::new();
+
+        // Background compaction state.
+        let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let compaction_in_flight = Arc::new(AtomicBool::new(false));
 
         for iteration in 0..core.max_iterations {
             debug!("Agent iteration (streaming) {}/{}", iteration + 1, core.max_iterations);
+
+            // Check if background compaction finished — swap in compacted messages.
+            if let Ok(mut guard) = compaction_slot.try_lock() {
+                if let Some(pending) = guard.take() {
+                    debug!(
+                        "Compaction swap: {} msgs -> {} compacted + {} new",
+                        pending.watermark,
+                        pending.result.messages.len(),
+                        messages.len().saturating_sub(pending.watermark)
+                    );
+                    apply_compaction_result(&mut messages, pending);
+                }
+            }
 
             let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
@@ -624,6 +690,40 @@ impl AgentLoopShared {
                 .token_budget
                 .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
             messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
+
+            // Spawn background compaction when threshold exceeded.
+            if !compaction_in_flight.load(Ordering::Relaxed)
+                && core.compactor.needs_compaction(&messages, &core.token_budget, tool_def_tokens)
+            {
+                let slot = compaction_slot.clone();
+                let in_flight = compaction_in_flight.clone();
+                let bg_messages = messages.clone();
+                let bg_core = core.clone();
+                let bg_session_key = session_key.clone();
+                let bg_channel = msg.channel.clone();
+                let watermark = messages.len();
+                in_flight.store(true, Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let result = bg_core
+                        .compactor
+                        .compact(&bg_messages, &bg_core.token_budget, 0)
+                        .await;
+                    if bg_core.memory_enabled {
+                        if let Some(ref summary) = result.observation {
+                            let observer = ObservationStore::new(&bg_core.workspace);
+                            if let Err(e) = observer.save(summary, &bg_session_key, Some(&bg_channel)) {
+                                tracing::warn!("Failed to save observation: {}", e);
+                            }
+                        }
+                    }
+                    if result.messages.len() < bg_messages.len() {
+                        *slot.lock().await = Some(PendingCompaction { result, watermark });
+                    }
+                    in_flight.store(false, Ordering::SeqCst);
+                });
+            }
+
             thread_repair::repair_messages(&mut messages);
 
             // Use streaming API
