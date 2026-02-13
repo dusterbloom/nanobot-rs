@@ -27,6 +27,15 @@ struct LearningEntry {
     /// Brief description (first 100 chars of command/query).
     context: String,
     error: Option<String>,
+    /// Provider that executed this tool call (e.g. "openrouter", "local").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// Model used for this tool call (e.g. "qwen2-0.5b").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// Latency in milliseconds for this tool execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u64>,
 }
 
 impl LearningStore {
@@ -55,6 +64,39 @@ impl LearningStore {
             succeeded,
             context: context.chars().take(100).collect(),
             error: error.map(|e| e.chars().take(200).collect()),
+            provider: None,
+            model: None,
+            latency_ms: None,
+        };
+
+        let _guard = match self.acquire_lock() {
+            Some(g) => g,
+            None => return,
+        };
+        self.ensure_parent_dir();
+        self.append_entry_jsonl(&entry);
+    }
+
+    /// Record a tool outcome with extended provider/model/latency info.
+    pub fn record_extended(
+        &self,
+        tool_name: &str,
+        succeeded: bool,
+        context: &str,
+        error: Option<&str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        latency_ms: Option<u64>,
+    ) {
+        let entry = LearningEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            tool_name: tool_name.to_string(),
+            succeeded,
+            context: context.chars().take(100).collect(),
+            error: error.map(|e| e.chars().take(200).collect()),
+            provider: provider.map(|s| s.to_string()),
+            model: model.map(|s| s.to_string()),
+            latency_ms,
         };
 
         let _guard = match self.acquire_lock() {
@@ -125,7 +167,27 @@ impl LearningStore {
             }
         }
 
-        if lines.is_empty() && error_lines.is_empty() {
+        // Compute average latency per tool (only entries with latency data).
+        let mut latency_stats: std::collections::HashMap<&str, (u64, u32)> =
+            std::collections::HashMap::new();
+        for entry in &recent {
+            if let Some(ms) = entry.latency_ms {
+                let stat = latency_stats.entry(&entry.tool_name).or_insert((0, 0));
+                stat.0 += ms;
+                stat.1 += 1;
+            }
+        }
+        let mut slow_lines: Vec<String> = Vec::new();
+        let mut sorted_latency: Vec<(&&str, &(u64, u32))> = latency_stats.iter().collect();
+        sorted_latency.sort_by_key(|(name, _)| name.to_string());
+        for (tool_name, (total_ms, count)) in sorted_latency {
+            let avg = total_ms / (*count as u64);
+            if avg > 5000 {
+                slow_lines.push(format!("- {}: avg {}ms (slow)", tool_name, avg));
+            }
+        }
+
+        if lines.is_empty() && error_lines.is_empty() && slow_lines.is_empty() {
             return String::new();
         }
 
@@ -140,6 +202,13 @@ impl LearningStore {
             }
             result.push_str("Recent errors:\n");
             result.push_str(&error_lines.join("\n"));
+        }
+        if !slow_lines.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str("Slow tools:\n");
+            result.push_str(&slow_lines.join("\n"));
         }
 
         result
@@ -361,6 +430,9 @@ mod tests {
             succeeded: true,
             context: "old".to_string(),
             error: None,
+            provider: None,
+            model: None,
+            latency_ms: None,
         };
         let new_entry = LearningEntry {
             timestamp: Utc::now().to_rfc3339(),
@@ -368,6 +440,9 @@ mod tests {
             succeeded: true,
             context: "new".to_string(),
             error: None,
+            provider: None,
+            model: None,
+            latency_ms: None,
         };
         store.save_entries(&[old_entry, new_entry]);
 
@@ -375,6 +450,51 @@ mod tests {
         let entries = store.load_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].context, "new");
+    }
+
+    #[test]
+    fn test_record_with_provider_info() {
+        let (_tmp, store) = make_store();
+        store.record_extended(
+            "exec",
+            true,
+            "ls -la",
+            None,
+            Some("local"),
+            Some("qwen2-0.5b"),
+            Some(150),
+        );
+
+        let entries = store.load_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provider.as_deref(), Some("local"));
+        assert_eq!(entries[0].model.as_deref(), Some("qwen2-0.5b"));
+        assert_eq!(entries[0].latency_ms, Some(150));
+    }
+
+    #[test]
+    fn test_learning_context_shows_latency() {
+        let (_tmp, store) = make_store();
+        // Record several slow entries (>5s average).
+        for _ in 0..3 {
+            store.record_extended("web_fetch", true, "fetch page", None, None, None, Some(8000));
+        }
+
+        let context = store.get_learning_context();
+        assert!(context.contains("Slow tools:"));
+        assert!(context.contains("web_fetch"));
+        assert!(context.contains("avg 8000ms"));
+    }
+
+    #[test]
+    fn test_learning_context_no_slow_warning_for_fast_tools() {
+        let (_tmp, store) = make_store();
+        for _ in 0..3 {
+            store.record_extended("read_file", true, "/tmp/a", None, None, None, Some(50));
+        }
+
+        let context = store.get_learning_context();
+        assert!(!context.contains("Slow tools:"));
     }
 
     #[test]
@@ -386,6 +506,9 @@ mod tests {
             succeeded: false,
             context: "legacy".to_string(),
             error: Some("legacy error".to_string()),
+            provider: None,
+            model: None,
+            latency_ms: None,
         }];
         let legacy_json = serde_json::to_string(&legacy).unwrap();
         if let Some(parent) = store.legacy_file_path.parent() {
