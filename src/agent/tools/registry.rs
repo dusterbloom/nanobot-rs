@@ -94,6 +94,10 @@ impl ToolRegistry {
             &["spawn", "agent", "background", "subagent", "delegate"],
             "spawn",
         ),
+        (
+            &["recall", "remember", "memory", "past", "previous", "earlier", "last time"],
+            "recall",
+        ),
     ];
 
     /// Get tool definitions filtered by relevance to the current context.

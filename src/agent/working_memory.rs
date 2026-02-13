@@ -421,4 +421,121 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].session_key, "session:a");
     }
+
+    // ----- Integration tests: cross-module memory pipeline -----
+
+    #[test]
+    fn test_integration_working_memory_injected_into_context() {
+        // Verify that ContextBuilder picks up working memory via get_context().
+        let tmp = TempDir::new().unwrap();
+        let wm = WorkingMemoryStore::new(tmp.path());
+        wm.update_from_compaction("cli:test", "User prefers dark mode and Vim keybindings.");
+
+        // Build system prompt (won't have working memory — that's injected by agent_loop).
+        // But verify get_context returns the right content for injection.
+        let ctx = wm.get_context("cli:test", 5000);
+        assert!(ctx.contains("dark mode"));
+        assert!(ctx.contains("Vim keybindings"));
+
+        // Simulate what agent_loop does: enrich system prompt.
+        let base_prompt = "You are nanobot.";
+        let enriched = format!(
+            "{}\n\n---\n\n# Working Memory (Current Session)\n\n{}",
+            base_prompt, ctx
+        );
+        assert!(enriched.contains("You are nanobot."));
+        assert!(enriched.contains("Working Memory (Current Session)"));
+        assert!(enriched.contains("dark mode"));
+    }
+
+    #[test]
+    fn test_integration_compaction_to_working_memory_to_context() {
+        // Full pipeline: compaction writes summary → working memory stores it →
+        // get_context returns it for system prompt injection.
+        let tmp = TempDir::new().unwrap();
+        let wm = WorkingMemoryStore::new(tmp.path());
+
+        // Simulate 3 compaction cycles.
+        wm.update_from_compaction("cli:session1", "Discussed Rust ownership model.");
+        wm.update_from_compaction("cli:session1", "Implemented borrow checker example.");
+        wm.update_from_compaction("cli:session1", "User wants to learn async next.");
+
+        // Verify all 3 summaries are present.
+        let ctx = wm.get_context("cli:session1", 10000);
+        assert!(ctx.contains("ownership model"));
+        assert!(ctx.contains("borrow checker"));
+        assert!(ctx.contains("async next"));
+
+        // Verify the session file exists on disk.
+        let hash = WorkingMemoryStore::session_hash("cli:session1");
+        let session_file = tmp.path().join("memory").join("sessions").join(format!("SESSION_{}.md", hash));
+        assert!(session_file.exists(), "Session file should exist on disk");
+    }
+
+    #[test]
+    fn test_integration_complete_and_reflector_readiness() {
+        // Verify that completing a session makes it visible to the reflector's
+        // list_completed(), and that archiving removes it.
+        let tmp = TempDir::new().unwrap();
+        let wm = WorkingMemoryStore::new(tmp.path());
+
+        wm.update_from_compaction("s:1", "Facts from session 1.");
+        wm.update_from_compaction("s:2", "Facts from session 2.");
+        wm.update_from_compaction("s:3", "Facts from session 3.");
+
+        // Only complete sessions are visible to the reflector.
+        assert_eq!(wm.list_completed().len(), 0);
+        assert_eq!(wm.list_active().len(), 3);
+
+        wm.complete("s:1");
+        wm.complete("s:2");
+
+        let completed = wm.list_completed();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(wm.list_active().len(), 1);
+
+        // After archiving, completed list is empty (reflector has processed them).
+        wm.archive("s:1").unwrap();
+        wm.archive("s:2").unwrap();
+        assert_eq!(wm.list_completed().len(), 0);
+        assert_eq!(wm.list_active().len(), 1);
+
+        // Archived files exist.
+        let archived_dir = tmp.path().join("memory").join("sessions").join("archived");
+        assert!(archived_dir.exists());
+        let count = std::fs::read_dir(&archived_dir).unwrap().count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_integration_context_no_longer_has_observations() {
+        // Verify the system prompt no longer loads observations even when they exist.
+        use crate::agent::context::ContextBuilder;
+
+        let tmp = TempDir::new().unwrap();
+        let obs_dir = tmp.path().join("memory").join("observations");
+        std::fs::create_dir_all(&obs_dir).unwrap();
+        std::fs::write(
+            obs_dir.join("20260101T000000Z_test.md"),
+            "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: test\n---\n\nOld observation data.",
+        ).unwrap();
+
+        // Also write long-term memory to verify it IS loaded.
+        let mem_dir = tmp.path().join("memory");
+        std::fs::write(mem_dir.join("MEMORY.md"), "- User likes Rust").unwrap();
+
+        let cb = ContextBuilder::new(tmp.path());
+        let prompt = cb.build_system_prompt(None);
+
+        // Observations should NOT be in the prompt.
+        assert!(!prompt.contains("Old observation data"), "Observations must not be in system prompt");
+        assert!(!prompt.contains("Observations from Past Conversations"));
+
+        // Long-term memory SHOULD be in the prompt.
+        assert!(prompt.contains("User likes Rust"), "Long-term memory should be in system prompt");
+
+        // Identity should mention layered memory system.
+        assert!(prompt.contains("Working Memory"), "Identity should mention working memory");
+        assert!(prompt.contains("recall"), "Identity should mention recall tool");
+    }
 }

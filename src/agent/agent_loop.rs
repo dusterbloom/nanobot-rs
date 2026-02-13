@@ -28,7 +28,7 @@ use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    ReadFileTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+    ReadFileTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -299,6 +299,9 @@ impl AgentLoopShared {
         // Web (stateless config).
         tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
         tools.register(Box::new(WebFetchTool::new(50_000)));
+
+        // Memory recall (stateless config).
+        tools.register(Box::new(RecallTool::new(&core.workspace)));
 
         // Message tool - context baked in.
         let outbound_tx_clone = self.bus_outbound_tx.clone();
