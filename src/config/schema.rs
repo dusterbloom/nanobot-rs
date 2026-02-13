@@ -446,6 +446,109 @@ impl Default for MemoryConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Provenance config
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Agent Provenance Protocol.
+///
+/// When enabled, tool calls are recorded in an immutable audit log,
+/// tool execution is shown in the REPL, and the agent's claims can be
+/// mechanically verified against actual tool outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenanceConfig {
+    /// Enable the provenance system (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Write an append-only audit log of all tool calls (default: true when enabled).
+    #[serde(default = "default_true")]
+    pub audit_log: bool,
+
+    /// Show tool call start/end events in the REPL (default: true).
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
+
+    /// Run mechanical claim verification on agent responses (default: false).
+    #[serde(default)]
+    pub verify_claims: bool,
+
+    /// Strict mode: append a summary of all unverified claims (default: false).
+    #[serde(default)]
+    pub strict_mode: bool,
+
+    /// Inject verification rules into the system prompt (default: true).
+    #[serde(default = "default_true")]
+    pub system_prompt_rules: bool,
+}
+
+impl Default for ProvenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            audit_log: true,
+            show_tool_calls: true,
+            verify_claims: false,
+            strict_mode: false,
+            system_prompt_rules: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool delegation config
+// ---------------------------------------------------------------------------
+
+fn default_td_max_iterations() -> u32 {
+    15
+}
+
+fn default_td_max_tokens() -> u32 {
+    4096
+}
+
+/// Configuration for delegating tool execution loops to a cheaper model.
+///
+/// When enabled, tool calls from the main LLM are handed off to a lightweight
+/// model that executes the tools and interprets their results, conserving the
+/// main model's context window for reasoning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDelegationConfig {
+    /// Enable tool delegation (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Model to use for the tool runner. Empty string = use main model.
+    #[serde(default)]
+    pub model: String,
+
+    /// Optional separate provider for the tool runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderConfig>,
+
+    /// Max tool loop iterations for the runner (default: 15).
+    #[serde(default = "default_td_max_iterations")]
+    pub max_iterations: u32,
+
+    /// Max tokens per runner LLM call (default: 4096).
+    #[serde(default = "default_td_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for ToolDelegationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            provider: None,
+            max_iterations: default_td_max_iterations(),
+            max_tokens: default_td_max_tokens(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -465,6 +568,10 @@ pub struct Config {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub tool_delegation: ToolDelegationConfig,
+    #[serde(default)]
+    pub provenance: ProvenanceConfig,
 }
 
 impl Config {
@@ -645,6 +752,47 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_delegation_config_defaults() {
+        let td = ToolDelegationConfig::default();
+        assert!(!td.enabled);
+        assert!(td.model.is_empty());
+        assert!(td.provider.is_none());
+        assert_eq!(td.max_iterations, 15);
+        assert_eq!(td.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_tool_delegation_config_roundtrip() {
+        let td = ToolDelegationConfig {
+            enabled: true,
+            model: "qwen2-0.5b".to_string(),
+            provider: Some(ProviderConfig {
+                api_key: "local".to_string(),
+                api_base: Some("http://localhost:8080/v1".to_string()),
+            }),
+            max_iterations: 10,
+            max_tokens: 2048,
+        };
+        let json = serde_json::to_string(&td).unwrap();
+        let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
+        assert!(td2.enabled);
+        assert_eq!(td2.model, "qwen2-0.5b");
+        assert_eq!(td2.max_iterations, 10);
+        assert_eq!(td2.max_tokens, 2048);
+        assert!(td2.provider.is_some());
+    }
+
+    #[test]
+    fn test_tool_delegation_config_in_root() {
+        let json = r#"{"toolDelegation": {"enabled": true, "model": "small-model", "maxIterations": 5}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.tool_delegation.enabled);
+        assert_eq!(cfg.tool_delegation.model, "small-model");
+        assert_eq!(cfg.tool_delegation.max_iterations, 5);
+        assert_eq!(cfg.tool_delegation.max_tokens, 4096); // default
+    }
+
+    #[test]
     fn test_api_base_priority_matches_key_priority() {
         // When both OpenRouter and Anthropic keys are set, OpenRouter wins
         // (matching get_api_key priority).
@@ -655,5 +803,45 @@ mod tests {
             cfg.get_api_base(),
             Some("https://openrouter.ai/api/v1".to_string())
         );
+    }
+
+    #[test]
+    fn test_provenance_config_defaults() {
+        let pc = ProvenanceConfig::default();
+        assert!(!pc.enabled);
+        assert!(pc.audit_log);
+        assert!(pc.show_tool_calls);
+        assert!(!pc.verify_claims);
+        assert!(!pc.strict_mode);
+        assert!(pc.system_prompt_rules);
+    }
+
+    #[test]
+    fn test_provenance_config_roundtrip() {
+        let pc = ProvenanceConfig {
+            enabled: true,
+            audit_log: true,
+            show_tool_calls: false,
+            verify_claims: true,
+            strict_mode: true,
+            system_prompt_rules: false,
+        };
+        let json = serde_json::to_string(&pc).unwrap();
+        let pc2: ProvenanceConfig = serde_json::from_str(&json).unwrap();
+        assert!(pc2.enabled);
+        assert!(!pc2.show_tool_calls);
+        assert!(pc2.verify_claims);
+        assert!(pc2.strict_mode);
+        assert!(!pc2.system_prompt_rules);
+    }
+
+    #[test]
+    fn test_provenance_config_in_root() {
+        let json = r#"{"provenance": {"enabled": true, "verifyClaims": true}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.provenance.enabled);
+        assert!(cfg.provenance.verify_claims);
+        assert!(cfg.provenance.audit_log); // default
+        assert!(cfg.provenance.show_tool_calls); // default
     }
 }

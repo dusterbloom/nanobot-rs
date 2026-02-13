@@ -17,6 +17,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
@@ -31,7 +32,8 @@ use crate::agent::tools::{
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::config::schema::{EmailConfig, MemoryConfig};
+use crate::agent::tool_runner::{self, ToolRunnerConfig};
+use crate::config::schema::{EmailConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig};
 use crate::cron::service::CronService;
 use crate::providers::base::{LLMProvider, StreamChunk};
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -68,6 +70,10 @@ pub struct SharedCore {
     pub last_context_used: AtomicU64,
     pub last_context_max: AtomicU64,
     pub is_local: bool,
+    pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
+    pub tool_runner_model: Option<String>,
+    pub tool_delegation_config: ToolDelegationConfig,
+    pub provenance_config: ProvenanceConfig,
 }
 
 /// Handle for hot-swapping the shared core.
@@ -95,6 +101,8 @@ pub fn build_shared_core(
     memory_config: MemoryConfig,
     is_local: bool,
     compaction_provider: Option<Arc<dyn LLMProvider>>,
+    tool_delegation: ToolDelegationConfig,
+    provenance: ProvenanceConfig,
 ) -> SharedCore {
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
@@ -105,6 +113,10 @@ pub fn build_shared_core(
     if !is_local {
         // Only override observation budget for cloud mode (lite mode has its own defaults)
         context.observation_budget = memory_config.observation_budget;
+    }
+    // Inject provenance verification rules when enabled.
+    if provenance.enabled && provenance.system_prompt_rules {
+        context.provenance_enabled = true;
     }
     let sessions = SessionManager::new(&workspace);
 
@@ -148,6 +160,28 @@ pub fn build_shared_core(
     let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens);
     let learning = LearningStore::new(&workspace);
 
+    // Build tool runner provider if delegation is enabled.
+    let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
+        let tr_model = if tool_delegation.model.is_empty() {
+            model.clone()
+        } else {
+            tool_delegation.model.clone()
+        };
+        let tr_provider: Arc<dyn LLMProvider> =
+            if let Some(ref tr_cfg) = tool_delegation.provider {
+                Arc::new(OpenAICompatProvider::new(
+                    &tr_cfg.api_key,
+                    tr_cfg.api_base.as_deref().or(Some("http://localhost:8080/v1")),
+                    None,
+                ))
+            } else {
+                provider.clone()
+            };
+        (Some(tr_provider), Some(tr_model))
+    } else {
+        (None, None)
+    };
+
     SharedCore {
         provider,
         workspace,
@@ -171,6 +205,10 @@ pub fn build_shared_core(
         last_context_used: AtomicU64::new(0),
         last_context_max: AtomicU64::new(max_context_tokens as u64),
         is_local,
+        tool_runner_provider,
+        tool_runner_model,
+        tool_delegation_config: tool_delegation,
+        provenance_config: provenance,
     }
 }
 
@@ -313,6 +351,7 @@ impl AgentLoopShared {
         &self,
         msg: &InboundMessage,
         text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
     ) -> Option<OutboundMessage> {
         let streaming = text_delta_tx.is_some();
 
@@ -337,6 +376,13 @@ impl AgentLoopShared {
             msg.channel,
             &msg.content[..msg.content.len().min(80)]
         );
+
+        // Create audit log if provenance is enabled.
+        let audit = if core.provenance_config.enabled && core.provenance_config.audit_log {
+            Some(AuditLog::new(&core.workspace, &session_key))
+        } else {
+            None
+        };
 
         // Build per-message tools with context baked in.
         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
@@ -527,7 +573,159 @@ impl AgentLoopShared {
             };
 
             if response.has_tool_calls() {
-                // Build tool_calls JSON for the assistant message.
+                // Check if we should delegate to the tool runner.
+                if core.tool_delegation_config.enabled {
+                    if let (Some(ref tr_provider), Some(ref tr_model)) =
+                        (&core.tool_runner_provider, &core.tool_runner_model)
+                    {
+                        debug!(
+                            "Delegating {} tool calls to tool runner (model: {})",
+                            response.tool_calls.len(),
+                            tr_model
+                        );
+
+                        let runner_config = ToolRunnerConfig {
+                            provider: tr_provider.clone(),
+                            model: tr_model.clone(),
+                            max_iterations: core.tool_delegation_config.max_iterations,
+                            max_tokens: core.tool_delegation_config.max_tokens,
+                        };
+
+                        // Emit tool call start events for delegated calls.
+                        if let Some(ref tx) = tool_event_tx {
+                            for tc in &response.tool_calls {
+                                let preview: String = serde_json::to_string(&tc.arguments)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(80)
+                                    .collect();
+                                let _ = tx.send(ToolEvent::CallStart {
+                                    tool_name: tc.name.clone(),
+                                    tool_call_id: tc.id.clone(),
+                                    arguments_preview: preview,
+                                });
+                            }
+                        }
+
+                        let run_result = tool_runner::run_tool_loop(
+                            &runner_config,
+                            &response.tool_calls,
+                            &tools,
+                            &msg.content,
+                        )
+                        .await;
+
+                        debug!(
+                            "Tool runner completed: {} results in {} iterations",
+                            run_result.tool_results.len(),
+                            run_result.iterations_used
+                        );
+
+                        // Build the assistant message with original tool_calls.
+                        let tc_json: Vec<Value> = response
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": serde_json::to_string(&tc.arguments)
+                                            .unwrap_or_else(|_| "{}".to_string()),
+                                    }
+                                })
+                            })
+                            .collect();
+                        ContextBuilder::add_assistant_message(
+                            &mut messages,
+                            response.content.as_deref(),
+                            Some(&tc_json),
+                        );
+
+                        // Add tool results from the runner to the main context.
+                        // We need to add results for the original tool calls first.
+                        for tc in &response.tool_calls {
+                            // Find the matching result from the runner.
+                            let result_data = run_result
+                                .tool_results
+                                .iter()
+                                .find(|(id, _, _)| id == &tc.id)
+                                .map(|(_, _, data)| data.as_str())
+                                .unwrap_or("(no result)");
+                            ContextBuilder::add_tool_result(
+                                &mut messages,
+                                &tc.id,
+                                &tc.name,
+                                result_data,
+                            );
+                            used_tools.insert(tc.name.clone());
+                        }
+
+                        // If the runner executed additional tool calls beyond the
+                        // initial ones, inject a summary as a system-like message.
+                        if run_result.tool_results.len() > response.tool_calls.len() {
+                            let extra_summary =
+                                tool_runner::format_results_for_context(&run_result);
+                            ContextBuilder::add_assistant_message(
+                                &mut messages,
+                                Some(&format!(
+                                    "[Tool runner executed {} additional tool calls]\n{}",
+                                    run_result.tool_results.len() - response.tool_calls.len(),
+                                    extra_summary
+                                )),
+                                None,
+                            );
+                        }
+
+                        // Record learning + audit for all tool results.
+                        let executor = format!("tool_runner:{}", tr_model);
+                        for (tool_call_id, tool_name, data) in &run_result.tool_results {
+                            let ok = !data.starts_with("Error:");
+
+                            // Emit tool call end event.
+                            if let Some(ref tx) = tool_event_tx {
+                                let preview: String = data.chars().take(80).collect();
+                                let _ = tx.send(ToolEvent::CallEnd {
+                                    tool_name: tool_name.clone(),
+                                    tool_call_id: tool_call_id.clone(),
+                                    result_preview: preview,
+                                    ok,
+                                    duration_ms: 0,
+                                });
+                            }
+
+                            // Record in audit log.
+                            if let Some(ref audit) = audit {
+                                let _ = audit.record(
+                                    tool_name,
+                                    tool_call_id,
+                                    &json!({}), // args not available from runner results
+                                    data,
+                                    ok,
+                                    0, // duration not tracked per-tool in runner
+                                    &executor,
+                                );
+                            }
+
+                            core.learning.record_extended(
+                                tool_name,
+                                ok,
+                                &data.chars().take(100).collect::<String>(),
+                                if ok { None } else { Some(data) },
+                                Some(tr_model),
+                                Some(tr_model),
+                                None,
+                            );
+                            used_tools.insert(tool_name.clone());
+                        }
+
+                        // Continue the main loop — the main LLM will see the results.
+                        continue;
+                    }
+                }
+
+                // Inline path (default, unchanged): execute tools directly.
                 let tc_json: Vec<Value> = response
                     .tool_calls
                     .iter()
@@ -553,14 +751,58 @@ impl AgentLoopShared {
                 // Execute each tool call.
                 for tc in &response.tool_calls {
                     debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+
+                    // Emit tool call start event.
+                    if let Some(ref tx) = tool_event_tx {
+                        let preview: String = serde_json::to_string(&tc.arguments)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(80)
+                            .collect();
+                        let _ = tx.send(ToolEvent::CallStart {
+                            tool_name: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
+                            arguments_preview: preview,
+                        });
+                    }
+
+                    let start = std::time::Instant::now();
                     let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                    let duration_ms = start.elapsed().as_millis() as u64;
                     debug!(
-                        "Tool {} result ({}B, ok={})",
+                        "Tool {} result ({}B, ok={}, {}ms)",
                         tc.name,
                         result.data.len(),
-                        result.ok
+                        result.ok,
+                        duration_ms
                     );
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+
+                    // Emit tool call end event.
+                    if let Some(ref tx) = tool_event_tx {
+                        let preview: String = result.data.chars().take(80).collect();
+                        let _ = tx.send(ToolEvent::CallEnd {
+                            tool_name: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
+                            result_preview: preview,
+                            ok: result.ok,
+                            duration_ms,
+                        });
+                    }
+
+                    // Record in audit log.
+                    if let Some(ref audit) = audit {
+                        let args_value = serde_json::to_value(&tc.arguments).unwrap_or(json!({}));
+                        let _ = audit.record(
+                            &tc.name,
+                            &tc.id,
+                            &args_value,
+                            &result.data,
+                            result.ok,
+                            duration_ms,
+                            "inline",
+                        );
+                    }
 
                     // Track used tools.
                     used_tools.insert(tc.name.clone());
@@ -818,7 +1060,7 @@ impl AgentLoop {
                     ));
                 }
 
-                let response = shared.process_message(&msg, None).await;
+                let response = shared.process_message(&msg, None, None).await;
 
                 if let Some(outbound) = response {
                     // Notify REPL about outbound response.
@@ -891,7 +1133,7 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        match self.shared.process_message(&msg, None).await {
+        match self.shared.process_message(&msg, None, None).await {
             Some(response) => response.content,
             None => String::new(),
         }
@@ -907,6 +1149,7 @@ impl AgentLoop {
         chat_id: &str,
         detected_language: Option<&str>,
         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
     ) -> String {
         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
             Self::spawn_background_reflection(&self.shared);
@@ -922,7 +1165,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, Some(text_delta_tx))
+            .process_message(&msg, Some(text_delta_tx), tool_event_tx)
             .await
         {
             Some(response) => response.content,

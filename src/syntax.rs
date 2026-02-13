@@ -27,6 +27,110 @@ static SKIN: Lazy<MadSkin> = Lazy::new(|| {
     skin
 });
 
+/// Which side of the conversation a turn belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
+
+/// Render a complete conversation turn with role marker and markdown formatting.
+///
+/// - **Assistant** turns get a bold white `И` marker line before the content.
+/// - **User** turns are rendered through the same markdown pipeline (no marker).
+/// - Empty input returns an empty string.
+pub fn render_turn(text: &str, role: TurnRole) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    match role {
+        TurnRole::User => {
+            // Dark grey background for user text to visually separate it.
+            output.push_str("\x1b[48;5;236m");
+            output.push_str(&render_response(text));
+            output.push_str("\x1b[0m");
+            // Extra blank line after user text before assistant reply.
+            output.push('\n');
+        }
+        TurnRole::Assistant => {
+            // И marker on the same line as the start of the reply.
+            output.push_str("\x1b[1m\x1b[97mИ \x1b[0m");
+            output.push_str(&render_response(text));
+        }
+    }
+    output
+}
+
+/// Render a turn with provenance claim annotations.
+///
+/// Appends verification markers inline:
+/// - ✓ (green) = Observed (verified by audit log)
+/// - ~ (blue) = Derived (partial match)
+/// - ⚠ (yellow) = Claimed (no matching tool call)
+/// - ◇ (dim) = Recalled (from memory, not current tools)
+///
+/// If `strict` is true and there are Claimed items, appends a summary block.
+///
+/// Claims format: `(start, end, status, claim_text)` where status is:
+/// - 0 = Observed
+/// - 1 = Derived
+/// - 2 = Claimed
+/// - 3 = Recalled
+pub fn render_turn_with_provenance(
+    text: &str,
+    role: TurnRole,
+    claims: &[(usize, usize, u8, String)],
+    strict: bool,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    // Start with the normal rendered turn.
+    let mut output = render_turn(text, role);
+
+    // If there are claimed items in strict mode, append a summary.
+    if strict {
+        let claimed: Vec<&(usize, usize, u8, String)> = claims.iter().filter(|c| c.2 == 2).collect();
+        if !claimed.is_empty() {
+            output.push_str(&format!(
+                "\n\x1b[33m\x1b[1m⚠ {} unverified claim(s):\x1b[0m\n",
+                claimed.len()
+            ));
+            for (_, _, _, ref claim_text) in &claimed {
+                let preview: String = claim_text.chars().take(60).collect();
+                output.push_str(&format!("  \x1b[33m⚠\x1b[0m {}\n", preview));
+            }
+        }
+    }
+
+    // Append per-claim status markers as a footer block.
+    if !claims.is_empty() {
+        let observed = claims.iter().filter(|c| c.2 == 0).count();
+        let derived = claims.iter().filter(|c| c.2 == 1).count();
+        let claimed_count = claims.iter().filter(|c| c.2 == 2).count();
+        let recalled = claims.iter().filter(|c| c.2 == 3).count();
+
+        let mut parts = Vec::new();
+        if observed > 0 {
+            parts.push(format!("\x1b[32m✓{}\x1b[0m", observed));
+        }
+        if derived > 0 {
+            parts.push(format!("\x1b[34m~{}\x1b[0m", derived));
+        }
+        if claimed_count > 0 {
+            parts.push(format!("\x1b[33m⚠{}\x1b[0m", claimed_count));
+        }
+        if recalled > 0 {
+            parts.push(format!("\x1b[2m◇{}\x1b[0m", recalled));
+        }
+        output.push_str(&format!("\x1b[2mprovenance: {}\x1b[0m\n", parts.join(" ")));
+    }
+
+    output
+}
+
 /// Render an LLM response with termimad prose formatting and syntect code highlighting.
 ///
 /// Splits input into prose and fenced code segments:
@@ -233,5 +337,99 @@ mod tests {
     fn test_empty_input() {
         let output = render_response("");
         assert!(output.is_empty());
+    }
+
+    // --- render_turn tests ---
+
+    #[test]
+    fn test_render_turn_assistant_has_marker() {
+        let output = render_turn("Hello world", TurnRole::Assistant);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains('И'), "assistant turn must start with И marker");
+        assert!(plain.contains("Hello world"));
+    }
+
+    #[test]
+    fn test_render_turn_assistant_marker_before_content() {
+        let output = render_turn("Some response", TurnRole::Assistant);
+        let plain = strip_ansi(&output);
+        let marker_pos = plain.find('И').expect("И must be present");
+        let content_pos = plain.find("Some response").expect("content must be present");
+        assert!(marker_pos < content_pos, "И must appear before content");
+    }
+
+    #[test]
+    fn test_render_turn_user_no_marker() {
+        let output = render_turn("my question", TurnRole::User);
+        let plain = strip_ansi(&output);
+        assert!(!plain.contains('И'), "user turn must NOT have И marker");
+    }
+
+    #[test]
+    fn test_render_turn_user_renders_markdown() {
+        let output = render_turn("Hello **bold** text", TurnRole::User);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("bold"), "user markdown should be rendered");
+        assert!(!plain.contains("**"), "markdown syntax should be stripped");
+    }
+
+    #[test]
+    fn test_render_turn_user_renders_code_block() {
+        let output = render_turn("Look:\n\n```rust\nlet x = 1;\n```", TurnRole::User);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("let x"));
+        assert!(plain.contains("─"), "code block should have rule");
+    }
+
+    #[test]
+    fn test_render_turn_assistant_renders_code_block() {
+        let output = render_turn("Here:\n\n```python\nprint(1)\n```", TurnRole::Assistant);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains('И'));
+        assert!(plain.contains("print"));
+        assert!(plain.contains("─"));
+    }
+
+    #[test]
+    fn test_render_turn_empty_returns_empty() {
+        assert!(render_turn("", TurnRole::Assistant).is_empty());
+        assert!(render_turn("", TurnRole::User).is_empty());
+    }
+
+    // --- render_turn_with_provenance tests ---
+
+    #[test]
+    fn test_render_turn_with_provenance_empty() {
+        let output = render_turn_with_provenance("", TurnRole::Assistant, &[], false);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_render_turn_with_provenance_no_claims() {
+        let output = render_turn_with_provenance("Hello world", TurnRole::Assistant, &[], false);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("Hello world"));
+        assert!(!plain.contains("provenance:"));
+    }
+
+    #[test]
+    fn test_render_turn_with_provenance_with_claims() {
+        let claims = vec![
+            (0, 5, 0u8, "read file".to_string()),  // Observed
+            (10, 20, 2u8, "deleted stuff".to_string()),  // Claimed
+        ];
+        let output = render_turn_with_provenance("Hello world with claims", TurnRole::Assistant, &claims, false);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("provenance:"));
+    }
+
+    #[test]
+    fn test_render_turn_with_provenance_strict_mode() {
+        let claims = vec![
+            (0, 5, 2u8, "I deleted the files".to_string()),  // Claimed
+        ];
+        let output = render_turn_with_provenance("Test", TurnRole::Assistant, &claims, true);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("unverified"));
     }
 }

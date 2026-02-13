@@ -1,0 +1,459 @@
+//! Immutable audit log for tool call provenance.
+//!
+//! Records every tool invocation with arguments, results, timing, and a
+//! SHA-256 hash chain so tampering is detectable.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Maximum size of result_data stored per entry (8 KB).
+const MAX_RESULT_SIZE: usize = 8192;
+
+/// A single audit log entry recording one tool invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Monotonically increasing sequence number within the session.
+    pub seq: u64,
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+    /// Name of the tool that was called.
+    pub tool_name: String,
+    /// Unique ID for this tool call (from the LLM).
+    pub tool_call_id: String,
+    /// Raw arguments JSON.
+    pub arguments: serde_json::Value,
+    /// Tool output, truncated to MAX_RESULT_SIZE.
+    pub result_data: String,
+    /// Whether the tool execution succeeded.
+    pub result_ok: bool,
+    /// Wall-clock duration of the tool execution.
+    pub duration_ms: u64,
+    /// Who executed the tool: "inline" or "tool_runner:{model}".
+    pub executor: String,
+    /// SHA-256 hex digest of this entry.
+    pub hash: String,
+    /// Hash of the previous entry (empty string for the first entry).
+    pub prev_hash: String,
+}
+
+/// Append-only audit log with hash chain integrity.
+pub struct AuditLog {
+    file_path: PathBuf,
+    lock_path: PathBuf,
+    last_hash: Mutex<String>,
+    seq_counter: AtomicU64,
+}
+
+impl AuditLog {
+    /// Create a new audit log for the given workspace and session.
+    ///
+    /// Storage: `{workspace}/memory/audit/{session_key}.jsonl`
+    pub fn new(workspace: &Path, session_key: &str) -> Self {
+        let audit_dir = workspace.join("memory").join("audit");
+        let _ = fs::create_dir_all(&audit_dir);
+        // Sanitize session_key for use as filename
+        let safe_key: String = session_key
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let file_path = audit_dir.join(format!("{}.jsonl", safe_key));
+        let lock_path = audit_dir.join(format!("{}.lock", safe_key));
+
+        // Resume sequence from existing file.
+        let (last_hash, seq) = Self::read_last_entry(&file_path);
+
+        Self {
+            file_path,
+            lock_path,
+            last_hash: Mutex::new(last_hash),
+            seq_counter: AtomicU64::new(seq),
+        }
+    }
+
+    /// Record a tool invocation in the audit log.
+    pub fn record(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        arguments: &serde_json::Value,
+        result_data: &str,
+        result_ok: bool,
+        duration_ms: u64,
+        executor: &str,
+    ) {
+        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+        let timestamp = Utc::now().to_rfc3339();
+
+        // Truncate result_data to MAX_RESULT_SIZE.
+        let truncated_result: String = if result_data.len() > MAX_RESULT_SIZE {
+            let mut s: String = result_data.chars().take(MAX_RESULT_SIZE).collect();
+            s.push_str("...[truncated]");
+            s
+        } else {
+            result_data.to_string()
+        };
+
+        let prev_hash = {
+            let guard = self.last_hash.lock().unwrap();
+            guard.clone()
+        };
+
+        // Compute hash: SHA256(prev_hash|seq|tool_name|tool_call_id|arguments_json|result_data|timestamp)
+        let args_json = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
+        let hash = Self::compute_hash(
+            &prev_hash,
+            seq,
+            tool_name,
+            tool_call_id,
+            &args_json,
+            &truncated_result,
+            &timestamp,
+        );
+
+        let entry = AuditEntry {
+            seq,
+            timestamp,
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.to_string(),
+            arguments: arguments.clone(),
+            result_data: truncated_result,
+            result_ok,
+            duration_ms,
+            executor: executor.to_string(),
+            hash: hash.clone(),
+            prev_hash,
+        };
+
+        // Acquire lock and append.
+        let _guard = match self.acquire_lock() {
+            Some(g) => g,
+            None => {
+                tracing::warn!("Failed to acquire audit log lock, skipping entry");
+                return;
+            }
+        };
+
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)
+        {
+            if let Ok(line) = serde_json::to_string(&entry) {
+                let _ = writeln!(f, "{}", line);
+            }
+        }
+
+        // Update last_hash.
+        *self.last_hash.lock().unwrap() = hash;
+    }
+
+    /// Load all entries from the audit log.
+    pub fn get_entries(&self) -> Vec<AuditEntry> {
+        let data = match fs::read_to_string(&self.file_path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+
+        data.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<AuditEntry>(l).ok())
+            .collect()
+    }
+
+    /// Verify the hash chain integrity of the audit log.
+    ///
+    /// Returns `Ok(entry_count)` if valid, `Err(message)` if tampered.
+    pub fn verify_chain(&self) -> Result<usize, String> {
+        let entries = self.get_entries();
+        let mut expected_prev = String::new();
+
+        for (i, entry) in entries.iter().enumerate() {
+            // Check prev_hash linkage.
+            if entry.prev_hash != expected_prev {
+                return Err(format!(
+                    "Entry {} prev_hash mismatch: expected '{}', got '{}'",
+                    i, expected_prev, entry.prev_hash
+                ));
+            }
+
+            // Recompute hash and verify.
+            let args_json = serde_json::to_string(&entry.arguments).unwrap_or_else(|_| "{}".to_string());
+            let computed = Self::compute_hash(
+                &entry.prev_hash,
+                entry.seq,
+                &entry.tool_name,
+                &entry.tool_call_id,
+                &args_json,
+                &entry.result_data,
+                &entry.timestamp,
+            );
+
+            if entry.hash != computed {
+                return Err(format!(
+                    "Entry {} hash mismatch: expected '{}', got '{}'",
+                    i, computed, entry.hash
+                ));
+            }
+
+            expected_prev = entry.hash.clone();
+        }
+
+        Ok(entries.len())
+    }
+
+    /// Search entries for one whose result_data contains the given substring.
+    pub fn find_matching_result(&self, substring: &str) -> Option<AuditEntry> {
+        let entries = self.get_entries();
+        entries.into_iter().rev().find(|e| e.result_data.contains(substring))
+    }
+
+    // --- Private helpers ---
+
+    fn compute_hash(
+        prev_hash: &str,
+        seq: u64,
+        tool_name: &str,
+        tool_call_id: &str,
+        args_json: &str,
+        result_data: &str,
+        timestamp: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            prev_hash, seq, tool_name, tool_call_id, args_json, result_data, timestamp
+        ));
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn read_last_entry(file_path: &Path) -> (String, u64) {
+        let data = match fs::read_to_string(file_path) {
+            Ok(d) => d,
+            Err(_) => return (String::new(), 0),
+        };
+
+        let last_entry = data
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .and_then(|l| serde_json::from_str::<AuditEntry>(l).ok());
+
+        match last_entry {
+            Some(entry) => (entry.hash, entry.seq + 1),
+            None => (String::new(), 0),
+        }
+    }
+
+    fn acquire_lock(&self) -> Option<AuditLockGuard> {
+        const MAX_ATTEMPTS: u32 = 50;
+        const RETRY_DELAY_MS: u64 = 20;
+        for _ in 0..MAX_ATTEMPTS {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.lock_path)
+            {
+                Ok(_) => {
+                    return Some(AuditLockGuard {
+                        lock_path: self.lock_path.clone(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+struct AuditLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for AuditLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Events emitted during tool execution for REPL display.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    /// Tool execution is starting.
+    CallStart {
+        tool_name: String,
+        tool_call_id: String,
+        arguments_preview: String,
+    },
+    /// Tool execution has completed.
+    CallEnd {
+        tool_name: String,
+        tool_call_id: String,
+        result_preview: String,
+        ok: bool,
+        duration_ms: u64,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn make_audit() -> (TempDir, AuditLog) {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path(), "test-session");
+        (tmp, log)
+    }
+
+    #[test]
+    fn test_record_and_load() {
+        let (_tmp, log) = make_audit();
+        log.record(
+            "read_file",
+            "call_1",
+            &json!({"path": "/tmp/test.txt"}),
+            "file contents here",
+            true,
+            12,
+            "inline",
+        );
+        log.record(
+            "exec",
+            "call_2",
+            &json!({"command": "ls"}),
+            "Error: not found",
+            false,
+            5,
+            "inline",
+        );
+
+        let entries = log.get_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[0].tool_name, "read_file");
+        assert!(entries[0].result_ok);
+        assert_eq!(entries[1].seq, 1);
+        assert!(!entries[1].result_ok);
+    }
+
+    #[test]
+    fn test_hash_chain_verification() {
+        let (_tmp, log) = make_audit();
+        log.record("tool_a", "c1", &json!({}), "result_a", true, 10, "inline");
+        log.record("tool_b", "c2", &json!({}), "result_b", true, 20, "inline");
+        log.record("tool_c", "c3", &json!({}), "result_c", true, 30, "inline");
+
+        let result = log.verify_chain();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn test_chain_tamper_detection() {
+        let (_tmp, log) = make_audit();
+        log.record("tool_a", "c1", &json!({}), "result_a", true, 10, "inline");
+        log.record("tool_b", "c2", &json!({}), "result_b", true, 20, "inline");
+
+        // Tamper with the file: replace a result
+        let data = fs::read_to_string(&log.file_path).unwrap();
+        let tampered = data.replace("result_a", "FAKE_result");
+        fs::write(&log.file_path, tampered).unwrap();
+
+        let result = log.verify_chain();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_matching_result() {
+        let (_tmp, log) = make_audit();
+        log.record("read_file", "c1", &json!({}), "hello world", true, 5, "inline");
+        log.record("exec", "c2", &json!({}), "total 42 files", true, 10, "inline");
+
+        let found = log.find_matching_result("42 files");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().tool_name, "exec");
+
+        let not_found = log.find_matching_result("nonexistent");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_result_truncation() {
+        let (_tmp, log) = make_audit();
+        let big_result = "x".repeat(20000);
+        log.record("tool", "c1", &json!({}), &big_result, true, 5, "inline");
+
+        let entries = log.get_entries();
+        assert!(entries[0].result_data.len() < 10000);
+        assert!(entries[0].result_data.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn test_empty_log_verification() {
+        let (_tmp, log) = make_audit();
+        let result = log.verify_chain();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_prev_hash_linkage() {
+        let (_tmp, log) = make_audit();
+        log.record("a", "c1", &json!({}), "r1", true, 1, "inline");
+        log.record("b", "c2", &json!({}), "r2", true, 2, "inline");
+
+        let entries = log.get_entries();
+        assert!(entries[0].prev_hash.is_empty());
+        assert_eq!(entries[1].prev_hash, entries[0].hash);
+    }
+
+    #[test]
+    fn test_session_key_sanitization() {
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path(), "cli:user@123/test");
+        log.record("tool", "c1", &json!({}), "ok", true, 1, "inline");
+        let entries = log.get_entries();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_resume_from_existing_log() {
+        let tmp = TempDir::new().unwrap();
+
+        // First session: write 2 entries.
+        {
+            let log = AuditLog::new(tmp.path(), "resume-test");
+            log.record("a", "c1", &json!({}), "r1", true, 1, "inline");
+            log.record("b", "c2", &json!({}), "r2", true, 2, "inline");
+        }
+
+        // Second session: resume and write more.
+        {
+            let log = AuditLog::new(tmp.path(), "resume-test");
+            log.record("c", "c3", &json!({}), "r3", true, 3, "inline");
+        }
+
+        // Verify full chain.
+        let log = AuditLog::new(tmp.path(), "resume-test");
+        let result = log.verify_chain();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 3);
+
+        let entries = log.get_entries();
+        assert_eq!(entries[2].seq, 2);
+        assert_eq!(entries[2].prev_hash, entries[1].hash);
+    }
+}

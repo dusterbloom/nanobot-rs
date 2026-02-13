@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
+use crate::agent::audit::{AuditLog, ToolEvent};
+use crate::agent::provenance::{ClaimVerifier, ClaimStatus};
 use crate::cli;
 use crate::config::loader::{get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
@@ -94,6 +96,9 @@ pub(crate) fn print_help() {
     println!("  /agents, /a     - List running background agents");
     println!("  /kill <id>      - Cancel a background agent");
     println!("  /status, /s     - Show current mode, model, and channel info");
+    println!("  /audit          - Show audit log for current session");
+    println!("  /verify         - Re-verify claims in last response");
+    println!("  /provenance     - Toggle provenance display on/off");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
 }
@@ -103,6 +108,9 @@ pub(crate) fn print_help() {
 /// This replaces the 3x copy-pasted pattern:
 ///   create delta channel → spawn print task → stream → await → erase raw → re-render
 ///
+/// When provenance is enabled, tool call events are displayed during streaming
+/// and claim verification is applied to the final render.
+///
 /// Returns the full response text.
 pub(crate) async fn stream_and_render(
     agent_loop: &mut crate::agent::agent_loop::AgentLoop,
@@ -110,30 +118,140 @@ pub(crate) async fn stream_and_render(
     session_id: &str,
     channel: &str,
     lang: Option<&str>,
+    core_handle: &SharedCoreHandle,
 ) -> String {
-    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let print_task = tokio::spawn(async move {
+    // Render user input with markdown (erase raw readline, reprint formatted).
+    if std::io::stdout().is_terminal() && input.contains('*') || input.contains('`') || input.contains('#') || input.contains('[') {
         use std::io::Write as _;
-        while let Some(delta) = delta_rx.recv().await {
-            print!("{}", delta);
-            std::io::stdout().flush().ok();
-        }
-        println!();
-    });
+        // Readline left cursor on the line after input. Erase the raw input line(s)
+        // and the prompt, then reprint prompt + rendered input.
+        let prompt_and_input = format!("> {}", input);
+        let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
+        print!("\x1b[{}A\x1b[J", raw_lines);
+        std::io::stdout().flush().ok();
+        let prompt = build_prompt(
+            crate::LOCAL_MODE.load(std::sync::atomic::Ordering::Relaxed),
+            false,
+        );
+        print!("{}", prompt);
+        print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
+    }
+
+    // Check provenance config for tool event display and claim verification.
+    let (show_tool_calls, verify_claims, strict_mode, workspace) = {
+        let core = core_handle.read().unwrap().clone();
+        (
+            core.provenance_config.enabled && core.provenance_config.show_tool_calls,
+            core.provenance_config.enabled && core.provenance_config.verify_claims,
+            core.provenance_config.strict_mode,
+            core.workspace.clone(),
+        )
+    };
+
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Create tool event channel when provenance is enabled.
+    let (tool_rx_opt, tool_event_tx) = if show_tool_calls {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        (Some(rx), Some(tx))
+    } else {
+        (None, None)
+    };
+
+    // Spawn combined print task handling both text deltas and tool events.
+    let print_task = if let Some(mut tool_rx) = tool_rx_opt {
+        tokio::spawn(async move {
+            use std::io::Write as _;
+            let mut tool_lines = 0usize;
+            let mut delta_done = false;
+            let mut tool_done = false;
+            loop {
+                if delta_done && tool_done {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    delta = delta_rx.recv(), if !delta_done => {
+                        match delta {
+                            Some(d) => {
+                                print!("{}", d);
+                                std::io::stdout().flush().ok();
+                            }
+                            None => delta_done = true,
+                        }
+                    }
+                    event = tool_rx.recv(), if !tool_done => {
+                        match event {
+                            Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
+                                print!("\r\x1b[2m\x1b[36m  \u{25b6} {}({})\x1b[0m", tool_name, arguments_preview);
+                                std::io::stdout().flush().ok();
+                            }
+                            Some(ToolEvent::CallEnd { ok, duration_ms, ref result_preview, .. }) => {
+                                let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
+                                println!("  {} \x1b[2m{}ms\x1b[0m", marker, duration_ms);
+                                tool_lines += 1;
+                                if !ok && !result_preview.is_empty() {
+                                    let preview: String = result_preview.chars().take(80).collect();
+                                    println!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
+                                    tool_lines += 1;
+                                }
+                                std::io::stdout().flush().ok();
+                            }
+                            None => tool_done = true,
+                        }
+                    }
+                }
+            }
+            println!();
+            tool_lines
+        })
+    } else {
+        tokio::spawn(async move {
+            use std::io::Write as _;
+            while let Some(delta) = delta_rx.recv().await {
+                print!("{}", delta);
+                std::io::stdout().flush().ok();
+            }
+            println!();
+            0usize
+        })
+    };
+
     println!();
     let response = agent_loop
-        .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx)
+        .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx, tool_event_tx)
         .await;
-    let _ = print_task.await;
+    let tool_lines = print_task.await.unwrap_or(0);
 
-    // Erase raw streamed text, re-render with formatting
+    // Erase raw streamed text + tool event lines, re-render with formatting + И marker
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
-        let lines = tui::terminal_rows(&response, 1);
-        print!("\x1b[{}A\x1b[J", lines);
+        let text_lines = tui::terminal_rows(&response, 1);
+        let total_lines = text_lines + tool_lines;
+        print!("\x1b[{}A\x1b[J", total_lines);
         std::io::stdout().flush().ok();
-        println!("{}{}И{}", tui::BOLD, tui::WHITE, tui::RESET);
-        print!("{}", syntax::render_response(&response));
+
+        // Re-render with provenance claim verification if enabled.
+        if verify_claims {
+            let audit = AuditLog::new(&workspace, session_id);
+            let entries = audit.get_entries();
+            let verifier = ClaimVerifier::new(&entries);
+            let annotated = verifier.verify(&response);
+            let claims: Vec<(usize, usize, u8, String)> = annotated.iter().map(|c| {
+                let status = match c.status {
+                    ClaimStatus::Observed => 0u8,
+                    ClaimStatus::Derived => 1,
+                    ClaimStatus::Claimed => 2,
+                    ClaimStatus::Recalled => 3,
+                };
+                (c.span.0, c.span.1, status, c.text.clone())
+            }).collect();
+            print!("{}", syntax::render_turn_with_provenance(
+                &response, syntax::TurnRole::Assistant, &claims, strict_mode,
+            ));
+        } else {
+            print!("{}", syntax::render_turn(&response, syntax::TurnRole::Assistant));
+        }
     }
 
     response
@@ -358,7 +476,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
         );
 
         if let Some(msg) = message {
-            stream_and_render(&mut agent_loop, &msg, &session_id, "cli", None).await;
+            stream_and_render(&mut agent_loop, &msg, &session_id, "cli", None, &core_handle).await;
         } else {
             tui::print_startup_splash(&local_port);
 
@@ -500,6 +618,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                                     "direct",
                                                     Some(&lang),
                                                     delta_tx,
+                                                    None,
                                                 )
                                                 .await;
 
@@ -524,8 +643,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                                 let rows = (display_chars / term_width) + 2;
                                                 print!("\x1b[{}A\x1b[J", rows);
                                                 std::io::stdout().flush().ok();
-                                                print!("{}", syntax::render_response(&response));
-                                                println!();
+                                                print!("{}", syntax::render_turn(&response, syntax::TurnRole::Assistant));
                                             }
 
                                             {
@@ -545,8 +663,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                                 .process_direct_with_lang(&text, &session_id, "voice", "direct", Some(&lang))
                                                 .await;
                                             println!();
-                                            print!("{}", syntax::render_response(&response));
-                                            println!();
+                                            print!("{}", syntax::render_turn(&response, syntax::TurnRole::Assistant));
                                             let tts_text = tui::strip_markdown_for_tts(&response);
                                             if !tts_text.is_empty() {
                                                 if tui::speak_interruptible(vs, &tts_text, "en") {
@@ -946,7 +1063,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     }
                     let _ = rl.add_history_entry(&pasted);
                     let channel = if voice_on { "voice" } else { "cli" };
-                    stream_and_render(&mut agent_loop, &pasted, &session_id, channel, None).await;
+                    stream_and_render(&mut agent_loop, &pasted, &session_id, channel, None, &core_handle).await;
                     println!();
                     {
                         let sa_count = agent_loop.subagent_manager().get_running_count().await;
@@ -1056,9 +1173,120 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     continue;
                 }
 
+                // Handle /audit command — display audit log for current session
+                if input == "/audit" {
+                    let core = core_handle.read().unwrap().clone();
+                    if !core.provenance_config.enabled {
+                        println!("\n  Provenance is not enabled. Set provenance.enabled = true in config.\n");
+                    } else {
+                        let audit = AuditLog::new(&core.workspace, &session_id);
+                        let entries = audit.get_entries();
+                        if entries.is_empty() {
+                            println!("\n  No audit entries for this session.\n");
+                        } else {
+                            println!("\n  Audit log ({} entries):\n", entries.len());
+                            println!("  {:<4} {:<14} {:<12} {:<6} {:<8} {}", "SEQ", "TOOL", "EXECUTOR", "OK", "MS", "RESULT (preview)");
+                            for e in &entries {
+                                let preview: String = e.result_data.chars().take(40).collect();
+                                let preview = preview.replace('\n', " ");
+                                println!(
+                                    "  {:<4} {:<14} {:<12} {:<6} {:<8} {}",
+                                    e.seq,
+                                    &e.tool_name[..e.tool_name.len().min(14)],
+                                    &e.executor[..e.executor.len().min(12)],
+                                    if e.result_ok { "yes" } else { "NO" },
+                                    e.duration_ms,
+                                    preview,
+                                );
+                            }
+                            match audit.verify_chain() {
+                                Ok(n) => println!("\n  \x1b[32m\u{2713}\x1b[0m Hash chain valid ({} entries)", n),
+                                Err(e) => println!("\n  \x1b[31m\u{2717}\x1b[0m Hash chain BROKEN: {}", e),
+                            }
+                            println!();
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle /verify command — re-run claim verification on last response
+                if input == "/verify" {
+                    let core = core_handle.read().unwrap().clone();
+                    if !core.provenance_config.enabled {
+                        println!("\n  Provenance is not enabled. Set provenance.enabled = true in config.\n");
+                    } else {
+                        let audit = AuditLog::new(&core.workspace, &session_id);
+                        let entries = audit.get_entries();
+                        if entries.is_empty() {
+                            println!("\n  No audit entries to verify against.\n");
+                        } else {
+                            // Get last assistant response from session history.
+                            let history = core.sessions.get_history(&session_id, 10).await;
+                            let last_response = history.iter().rev()
+                                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                                .and_then(|m| m.get("content").and_then(|c| c.as_str()));
+                            match last_response {
+                                Some(text) => {
+                                    let verifier = ClaimVerifier::new(&entries);
+                                    let claims = verifier.verify(text);
+                                    if claims.is_empty() {
+                                        println!("\n  No verifiable claims found in last response.\n");
+                                    } else {
+                                        println!("\n  Claim verification ({} claims):\n", claims.len());
+                                        for c in &claims {
+                                            let (marker, color) = match c.status {
+                                                ClaimStatus::Observed => ("\u{2713}", "\x1b[32m"),
+                                                ClaimStatus::Derived  => ("~", "\x1b[34m"),
+                                                ClaimStatus::Claimed  => ("\u{26a0}", "\x1b[33m"),
+                                                ClaimStatus::Recalled => ("\u{25c7}", "\x1b[2m"),
+                                            };
+                                            let preview: String = c.text.chars().take(60).collect();
+                                            println!("  {}{}\x1b[0m [{}] {}", color, marker, c.claim_type, preview);
+                                        }
+                                        let summary = verifier.unverified_summary(&claims);
+                                        if !summary.is_empty() {
+                                            println!("\n  \x1b[33m{}\x1b[0m", summary);
+                                        }
+                                        println!();
+                                    }
+                                }
+                                None => println!("\n  No assistant response found in session history.\n"),
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle /provenance command — toggle provenance display on/off
+                if input == "/provenance" {
+                    let was_enabled = {
+                        let core = core_handle.read().unwrap().clone();
+                        core.provenance_config.enabled
+                    };
+                    // Toggle by rebuilding core with modified config.
+                    let mut toggled_config = config.clone();
+                    toggled_config.provenance.enabled = !was_enabled;
+                    cli::rebuild_core(
+                        &core_handle,
+                        &toggled_config,
+                        &srv.local_port,
+                        current_model_path.file_name().and_then(|n| n.to_str()),
+                        srv.compaction_port.as_deref(),
+                    );
+                    agent_loop = cli::create_agent_loop(
+                        core_handle.clone(), &toggled_config, Some(cron_service.clone()), email_config.clone(), None,
+                    );
+                    if !was_enabled {
+                        println!("\n  Provenance \x1b[32menabled\x1b[0m (tool calls visible, audit logging on)\n");
+                    } else {
+                        println!("\n  Provenance \x1b[33mdisabled\x1b[0m\n");
+                    }
+                    continue;
+                }
+
                 // Process message (streaming)
                 let channel = if voice_on { "voice" } else { "cli" };
-                let response = stream_and_render(&mut agent_loop, input, &session_id, channel, None).await;
+                let response = stream_and_render(&mut agent_loop, input, &session_id, channel, None, &core_handle).await;
                 println!();
                 {
                     let sa_count = agent_loop.subagent_manager().get_running_count().await;

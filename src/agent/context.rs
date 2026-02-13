@@ -35,6 +35,8 @@ pub struct ContextBuilder {
     pub observation_budget: usize,
     /// Max tokens for learning context in the system prompt.
     pub learning_budget: usize,
+    /// Whether to inject provenance verification rules into the system prompt.
+    pub provenance_enabled: bool,
 }
 
 impl ContextBuilder {
@@ -50,11 +52,12 @@ impl ContextBuilder {
             today_notes_budget: 1200,
             observation_budget: 2000,
             learning_budget: 800,
+            provenance_enabled: false,
         }
     }
 
     /// Create a context builder optimized for local/small models.
-    /// 
+    ///
     /// Uses much smaller budgets to keep the system prompt under ~2k tokens,
     /// leaving more room for conversation in limited context windows.
     pub fn new_lite(workspace: &Path) -> Self {
@@ -68,6 +71,7 @@ impl ContextBuilder {
             today_notes_budget: 200,    // Down from 1200
             observation_budget: 300,    // Down from 2000
             learning_budget: 200,       // Down from 800
+            provenance_enabled: false,
         }
     }
 
@@ -90,6 +94,22 @@ impl ContextBuilder {
 
         // Core identity.
         parts.push(self._get_identity());
+
+        // Provenance verification rules.
+        if self.provenance_enabled {
+            parts.push(
+                "## Verification Protocol\n\n\
+                 Every tool call is recorded in an immutable audit log with exact arguments, results,\n\
+                 and timestamps. Your output is mechanically verified against this log. Rules:\n\n\
+                 1. QUOTE EXACTLY — report actual tool results, do not paraphrase as direct quotes\n\
+                 2. NEVER FABRICATE — do not invent file contents, command outputs, or metrics\n\
+                 3. REPORT ERRORS — if a tool returned an error, report the error honestly\n\
+                 4. NO PHANTOM ACTIONS — do not claim \"I read/wrote/ran X\" without that tool call\n\
+                 5. STATE UNCERTAINTY — if output was truncated or timed out, say \"result unknown\"\n\n\
+                 Violations are automatically detected and flagged."
+                    .to_string(),
+            );
+        }
 
         // Bootstrap files.
         let bootstrap =

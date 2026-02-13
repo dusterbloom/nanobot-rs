@@ -274,6 +274,8 @@ pub(crate) fn build_core_handle(
         config.memory.clone(),
         is_local,
         cp,
+        config.tool_delegation.clone(),
+        config.provenance.clone(),
     );
     Arc::new(std::sync::RwLock::new(Arc::new(core)))
 }
@@ -344,6 +346,8 @@ pub(crate) fn rebuild_core(
         config.memory.clone(),
         is_local,
         cp,
+        config.tool_delegation.clone(),
+        config.provenance.clone(),
     );
     *handle.write().unwrap() = Arc::new(new_core);
 }
