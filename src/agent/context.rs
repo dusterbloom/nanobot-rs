@@ -99,14 +99,23 @@ impl ContextBuilder {
         if self.provenance_enabled {
             parts.push(
                 "## Verification Protocol\n\n\
-                 Every tool call is recorded in an immutable audit log with exact arguments, results,\n\
-                 and timestamps. Your output is mechanically verified against this log. Rules:\n\n\
-                 1. QUOTE EXACTLY — report actual tool results, do not paraphrase as direct quotes\n\
-                 2. NEVER FABRICATE — do not invent file contents, command outputs, or metrics\n\
-                 3. REPORT ERRORS — if a tool returned an error, report the error honestly\n\
-                 4. NO PHANTOM ACTIONS — do not claim \"I read/wrote/ran X\" without that tool call\n\
-                 5. STATE UNCERTAINTY — if output was truncated or timed out, say \"result unknown\"\n\n\
-                 Violations are automatically detected and flagged."
+                 CRITICAL: Every tool call is recorded in an immutable audit log. Your output is \
+                 mechanically verified against this log. Unverified claims are automatically redacted.\n\n\
+                 RULES:\n\
+                 1. QUOTE VERBATIM — copy tool output exactly. Do NOT paraphrase, summarize, or \
+                    approximate. If a tool returned \"42 files found\", say \"42 files found\", not \
+                    \"about 40 files\" or \"many files\".\n\
+                 2. NEVER FABRICATE — do not invent file contents, command outputs, paths, numbers, \
+                    or error messages. If you don't know, say so.\n\
+                 3. REPORT ERRORS — if a tool returned an error, report the exact error message.\n\
+                 4. NO PHANTOM ACTIONS — never say \"I read/wrote/ran X\" unless that exact tool call \
+                    appears in your conversation. If you didn't call the tool, don't claim you did.\n\
+                 5. STATE UNCERTAINTY — if output was truncated, say \"output was truncated\". If a \
+                    tool timed out, say \"timed out\". Never fill in what you think the output was.\n\
+                 6. USE TOOL OUTPUT MARKERS — tool results are wrapped in [VERBATIM TOOL OUTPUT] \
+                    blocks. Quote from these blocks directly.\n\n\
+                 CONSEQUENCE: Claims that cannot be traced to an actual tool output will be \
+                 automatically removed from your response before the user sees it."
                     .to_string(),
             );
         }
@@ -260,6 +269,28 @@ impl ContextBuilder {
             "tool_call_id": tool_call_id,
             "name": tool_name,
             "content": result,
+        }));
+    }
+
+    /// Add a tool result wrapped with verbatim markers (provenance mode).
+    ///
+    /// When provenance is enabled, tool results are marked as immutable so the
+    /// LLM is instructed to quote rather than paraphrase.
+    pub fn add_tool_result_immutable(
+        messages: &mut Vec<Value>,
+        tool_call_id: &str,
+        tool_name: &str,
+        result: &str,
+    ) {
+        let wrapped = format!(
+            "[VERBATIM TOOL OUTPUT — do not paraphrase]\n{}\n[END TOOL OUTPUT]",
+            result
+        );
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": wrapped,
         }));
     }
 
@@ -704,6 +735,32 @@ mod tests {
         ContextBuilder::add_assistant_message(&mut messages, Some("ok"), Some(&empty));
         // Empty tool_calls should not add the key.
         assert!(messages[0].get("tool_calls").is_none());
+    }
+
+    // ----- add_tool_result_immutable -----
+
+    #[test]
+    fn test_add_tool_result_immutable_wraps_content() {
+        let mut messages: Vec<Value> = Vec::new();
+        ContextBuilder::add_tool_result_immutable(&mut messages, "call_1", "read_file", "file content");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["name"], "read_file");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("[VERBATIM TOOL OUTPUT"));
+        assert!(content.contains("file content"));
+        assert!(content.ends_with("[END TOOL OUTPUT]"));
+    }
+
+    #[test]
+    fn test_add_tool_result_immutable_empty_result() {
+        let mut messages: Vec<Value> = Vec::new();
+        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "exec", "");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("[VERBATIM TOOL OUTPUT"));
+        assert!(content.contains("[END TOOL OUTPUT]"));
     }
 
     // ----- observations -----

@@ -46,10 +46,17 @@ pub fn render_turn(text: &str, role: TurnRole) -> String {
     let mut output = String::new();
     match role {
         TurnRole::User => {
+            // Padding before user box.
+            output.push('\n');
             // Dark grey background per line (raw text, no markdown pipeline —
             // render_response resets would kill the bg color).
-            for line in text.lines() {
-                output.push_str(&format!("\x1b[48;5;236m {} \x1b[0m\n", line));
+            // First line gets a green ● marker.
+            for (i, line) in text.lines().enumerate() {
+                if i == 0 {
+                    output.push_str(&format!("\x1b[48;5;236m \x1b[32m●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n", line));
+                } else {
+                    output.push_str(&format!("\x1b[48;5;236m   {} \x1b[0m\n", line));
+                }
             }
             // Extra blank line after user text before assistant reply.
             output.push('\n');

@@ -441,6 +441,9 @@ impl AgentLoopShared {
             Arc::new(tokio::sync::Mutex::new(None));
         let compaction_in_flight = Arc::new(AtomicBool::new(false));
 
+        // Response boundary: after exec/write_file, force a text response.
+        let mut force_response = false;
+
         // Agent loop: call LLM, handle tool calls, repeat.
         for iteration in 0..core.max_iterations {
             debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
@@ -458,8 +461,30 @@ impl AgentLoopShared {
                 }
             }
 
+            // Response boundary: suppress exec/write_file tools to force text output.
+            let boundary_active = force_response
+                && core.provenance_config.enabled
+                && core.provenance_config.response_boundary;
+            if boundary_active {
+                messages.push(json!({
+                    "role": "system",
+                    "content": "You just executed a tool that modifies files or runs commands. \
+                                Report the result to the user before making additional tool calls."
+                }));
+                force_response = false;
+            }
+
             // Filter tool definitions to relevant tools.
-            let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            let mut tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            if boundary_active {
+                tool_defs.retain(|def| {
+                    let name = def
+                        .pointer("/function/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    name != "exec" && name != "write_file"
+                });
+            }
             let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
                 None
             } else {
@@ -653,12 +678,21 @@ impl AgentLoopShared {
                                 .find(|(id, _, _)| id == &tc.id)
                                 .map(|(_, _, data)| data.as_str())
                                 .unwrap_or("(no result)");
-                            ContextBuilder::add_tool_result(
-                                &mut messages,
-                                &tc.id,
-                                &tc.name,
-                                result_data,
-                            );
+                            if core.provenance_config.enabled {
+                                ContextBuilder::add_tool_result_immutable(
+                                    &mut messages,
+                                    &tc.id,
+                                    &tc.name,
+                                    result_data,
+                                );
+                            } else {
+                                ContextBuilder::add_tool_result(
+                                    &mut messages,
+                                    &tc.id,
+                                    &tc.name,
+                                    result_data,
+                                );
+                            }
                             used_tools.insert(tc.name.clone());
                         }
 
@@ -685,11 +719,10 @@ impl AgentLoopShared {
 
                             // Emit tool call end event.
                             if let Some(ref tx) = tool_event_tx {
-                                let preview: String = data.chars().take(80).collect();
                                 let _ = tx.send(ToolEvent::CallEnd {
                                     tool_name: tool_name.clone(),
                                     tool_call_id: tool_call_id.clone(),
-                                    result_preview: preview,
+                                    result_data: data.clone(),
                                     ok,
                                     duration_ms: 0,
                                 });
@@ -718,6 +751,14 @@ impl AgentLoopShared {
                                 None,
                             );
                             used_tools.insert(tool_name.clone());
+                        }
+
+                        // Set response boundary flag if any delegated tool was exec/write_file.
+                        for (_, tool_name, _) in &run_result.tool_results {
+                            if tool_name == "exec" || tool_name == "write_file" {
+                                force_response = true;
+                                break;
+                            }
                         }
 
                         // Continue the main loop — the main LLM will see the results.
@@ -776,15 +817,18 @@ impl AgentLoopShared {
                         result.ok,
                         duration_ms
                     );
-                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+                    if core.provenance_config.enabled {
+                        ContextBuilder::add_tool_result_immutable(&mut messages, &tc.id, &tc.name, &result.data);
+                    } else {
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+                    }
 
                     // Emit tool call end event.
                     if let Some(ref tx) = tool_event_tx {
-                        let preview: String = result.data.chars().take(80).collect();
                         let _ = tx.send(ToolEvent::CallEnd {
                             tool_name: tc.name.clone(),
                             tool_call_id: tc.id.clone(),
-                            result_preview: preview,
+                            result_data: result.data.clone(),
                             ok: result.ok,
                             duration_ms,
                         });
@@ -823,6 +867,11 @@ impl AgentLoopShared {
                         &context_str,
                         result.error.as_deref(),
                     );
+
+                    // Set response boundary flag for exec/write_file.
+                    if tc.name == "exec" || tc.name == "write_file" {
+                        force_response = true;
+                    }
                 }
             } else {
                 // No tool calls -- the agent is done.
@@ -840,6 +889,34 @@ impl AgentLoopShared {
 
         if final_content.is_empty() && messages.len() > 2 {
             final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+        }
+
+        // Phase 3+4: Claim verification and context hygiene.
+        if !final_content.is_empty()
+            && core.provenance_config.enabled
+            && core.provenance_config.verify_claims
+        {
+            if let Some(ref audit) = audit {
+                let entries = audit.get_entries();
+                let (claims, has_fabrication) =
+                    crate::agent::provenance::verify_turn_claims(&final_content, &entries);
+
+                if has_fabrication && core.provenance_config.strict_mode {
+                    let (redacted, redaction_count) =
+                        crate::agent::provenance::redact_fabrications(&final_content, &claims);
+                    final_content = redacted;
+                    if redaction_count > 0 {
+                        messages.push(json!({
+                            "role": "system",
+                            "content": format!(
+                                "NOTICE: {} claim(s) in the previous response could not be \
+                                 verified against tool outputs and were removed.",
+                                redaction_count
+                            )
+                        }));
+                    }
+                }
+            }
         }
 
         // Update session history.

@@ -300,7 +300,8 @@ pub enum ToolEvent {
     CallEnd {
         tool_name: String,
         tool_call_id: String,
-        result_preview: String,
+        /// Full tool output (consumers truncate for display).
+        result_data: String,
         ok: bool,
         duration_ms: u64,
     },

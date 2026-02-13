@@ -469,28 +469,33 @@ pub struct ProvenanceConfig {
     #[serde(default = "default_true")]
     pub show_tool_calls: bool,
 
-    /// Run mechanical claim verification on agent responses (default: false).
-    #[serde(default)]
+    /// Run mechanical claim verification on agent responses (default: true).
+    #[serde(default = "default_true")]
     pub verify_claims: bool,
 
-    /// Strict mode: append a summary of all unverified claims (default: false).
-    #[serde(default)]
+    /// Strict mode: redact unverified claims from responses (default: true).
+    #[serde(default = "default_true")]
     pub strict_mode: bool,
 
     /// Inject verification rules into the system prompt (default: true).
     #[serde(default = "default_true")]
     pub system_prompt_rules: bool,
+
+    /// Force a user-visible response after every exec/write_file call (default: true).
+    #[serde(default = "default_true")]
+    pub response_boundary: bool,
 }
 
 impl Default for ProvenanceConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             audit_log: true,
             show_tool_calls: true,
-            verify_claims: false,
-            strict_mode: false,
+            verify_claims: true,
+            strict_mode: true,
             system_prompt_rules: true,
+            response_boundary: true,
         }
     }
 }
@@ -808,12 +813,13 @@ mod tests {
     #[test]
     fn test_provenance_config_defaults() {
         let pc = ProvenanceConfig::default();
-        assert!(!pc.enabled);
+        assert!(pc.enabled);
         assert!(pc.audit_log);
         assert!(pc.show_tool_calls);
-        assert!(!pc.verify_claims);
-        assert!(!pc.strict_mode);
+        assert!(pc.verify_claims);
+        assert!(pc.strict_mode);
         assert!(pc.system_prompt_rules);
+        assert!(pc.response_boundary);
     }
 
     #[test]
@@ -825,6 +831,7 @@ mod tests {
             verify_claims: true,
             strict_mode: true,
             system_prompt_rules: false,
+            response_boundary: true,
         };
         let json = serde_json::to_string(&pc).unwrap();
         let pc2: ProvenanceConfig = serde_json::from_str(&json).unwrap();
@@ -833,6 +840,7 @@ mod tests {
         assert!(pc2.verify_claims);
         assert!(pc2.strict_mode);
         assert!(!pc2.system_prompt_rules);
+        assert!(pc2.response_boundary);
     }
 
     #[test]
@@ -841,7 +849,9 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.provenance.enabled);
         assert!(cfg.provenance.verify_claims);
-        assert!(cfg.provenance.audit_log); // default
-        assert!(cfg.provenance.show_tool_calls); // default
+        assert!(cfg.provenance.audit_log); // default true
+        assert!(cfg.provenance.show_tool_calls); // default true
+        assert!(cfg.provenance.strict_mode); // default true
+        assert!(cfg.provenance.response_boundary); // default true
     }
 }

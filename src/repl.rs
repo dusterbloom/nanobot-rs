@@ -35,6 +35,34 @@ use crate::voice_pipeline;
 // Helpers (testable, pure-ish)
 // ============================================================================
 
+/// Truncate tool output for verbatim display: max `max_lines` lines or `max_chars` characters.
+fn truncate_output(data: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    let mut chars = 0usize;
+    for line in data.lines() {
+        if lines >= max_lines || chars >= max_chars {
+            out.push_str("...[truncated]");
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            chars += 1;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if line.len() > remaining {
+            let partial: String = line.chars().take(remaining).collect();
+            out.push_str(&partial);
+            out.push_str("...[truncated]");
+            break;
+        }
+        out.push_str(line);
+        chars += line.len();
+        lines += 1;
+    }
+    out
+}
+
 /// Parse a `/ctx` argument into a byte count.
 ///
 /// Accepts:
@@ -152,10 +180,12 @@ pub(crate) async fn stream_and_render(
     };
 
     // Spawn combined print task handling both text deltas and tool events.
+    // Returns (tool_line_count, collected_tool_lines) so we can replay tool events after re-render.
     let print_task = if let Some(mut tool_rx) = tool_rx_opt {
         tokio::spawn(async move {
             use std::io::Write as _;
             let mut tool_lines = 0usize;
+            let mut collected: Vec<String> = Vec::new();
             let mut delta_done = false;
             let mut tool_done = false;
             loop {
@@ -176,16 +206,44 @@ pub(crate) async fn stream_and_render(
                     event = tool_rx.recv(), if !tool_done => {
                         match event {
                             Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
-                                print!("\r\x1b[2m\x1b[36m  \u{25b6} {}({})\x1b[0m", tool_name, arguments_preview);
+                                let line = format!(
+                                    "\x1b[2m\x1b[36m  \u{25b6} {}({})\x1b[0m",
+                                    tool_name, arguments_preview
+                                );
+                                print!("\r{}", line);
                                 std::io::stdout().flush().ok();
+                                // CallStart line gets overwritten by CallEnd, don't collect.
                             }
-                            Some(ToolEvent::CallEnd { ok, duration_ms, ref result_preview, .. }) => {
+                            Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
                                 let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
+                                let status_line = format!(
+                                    "\x1b[2m\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
+                                    tool_name, marker, duration_ms
+                                );
                                 println!("  {} \x1b[2m{}ms\x1b[0m", marker, duration_ms);
                                 tool_lines += 1;
-                                if !ok && !result_preview.is_empty() {
-                                    let preview: String = result_preview.chars().take(80).collect();
-                                    println!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
+                                collected.push(status_line);
+
+                                if ok && !result_data.is_empty() {
+                                    let truncated = truncate_output(result_data, 40, 2000);
+                                    if !truncated.is_empty() {
+                                        println!("    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m");
+                                        collected.push("    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m".to_string());
+                                        for line in truncated.lines() {
+                                            let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
+                                            println!("{}", formatted);
+                                            collected.push(formatted);
+                                            tool_lines += 1;
+                                        }
+                                        println!("    \x1b[2m\u{2514}\u{2500}\x1b[0m");
+                                        collected.push("    \x1b[2m\u{2514}\u{2500}\x1b[0m".to_string());
+                                        tool_lines += 2;
+                                    }
+                                } else if !ok && !result_data.is_empty() {
+                                    let preview: String = result_data.chars().take(80).collect();
+                                    let err_line = format!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
+                                    println!("{}", err_line);
+                                    collected.push(err_line);
                                     tool_lines += 1;
                                 }
                                 std::io::stdout().flush().ok();
@@ -196,7 +254,7 @@ pub(crate) async fn stream_and_render(
                 }
             }
             println!();
-            tool_lines
+            (tool_lines, collected)
         })
     } else {
         tokio::spawn(async move {
@@ -206,7 +264,7 @@ pub(crate) async fn stream_and_render(
                 std::io::stdout().flush().ok();
             }
             println!();
-            0usize
+            (0usize, Vec::<String>::new())
         })
     };
 
@@ -214,7 +272,7 @@ pub(crate) async fn stream_and_render(
     let response = agent_loop
         .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx, tool_event_tx)
         .await;
-    let tool_lines = print_task.await.unwrap_or(0);
+    let (tool_lines, tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
 
     // Erase raw streamed text + tool event lines, re-render with formatting + И marker
     if !response.is_empty() && std::io::stdout().is_terminal() {
@@ -223,6 +281,23 @@ pub(crate) async fn stream_and_render(
         let total_lines = text_lines + tool_lines;
         print!("\x1b[{}A\x1b[J", total_lines);
         std::io::stdout().flush().ok();
+
+        // Re-render tool events first so the user can see what the LLM actually did.
+        if !tool_event_lines.is_empty() {
+            for line in &tool_event_lines {
+                println!("{}", line);
+            }
+            println!();
+        }
+
+        // Show redaction warning if strict mode removed fabricated claims.
+        let redaction_count = response.matches("[unverified claim removed]").count();
+        if redaction_count > 0 {
+            println!(
+                "\x1b[33m\x1b[1m  \u{26a0} {} claim(s) could not be verified against tool outputs and were redacted.\x1b[0m\n",
+                redaction_count
+            );
+        }
 
         // Re-render with provenance claim verification if enabled.
         if verify_claims {
@@ -1451,6 +1526,36 @@ mod tests {
         // Verify the process is gone (kill(pid, 0) should fail)
         let status = unsafe { libc::kill(pid as i32, 0) };
         assert_ne!(status, 0, "process should be dead after kill_current");
+    }
+
+    // --- truncate_output ---
+
+    #[test]
+    fn test_truncate_output_short() {
+        let result = truncate_output("hello\nworld", 40, 2000);
+        assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn test_truncate_output_max_lines() {
+        let data = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let result = truncate_output(&data, 5, 10000);
+        assert!(result.lines().count() <= 6); // 5 lines + truncated marker
+        assert!(result.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn test_truncate_output_max_chars() {
+        let data = "x".repeat(5000);
+        let result = truncate_output(&data, 100, 100);
+        assert!(result.len() < 200);
+        assert!(result.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn test_truncate_output_empty() {
+        let result = truncate_output("", 40, 2000);
+        assert_eq!(result, "");
     }
 
     // --- StartOutcome ---

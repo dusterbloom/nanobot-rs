@@ -62,6 +62,12 @@ impl<'a> ClaimVerifier<'a> {
         // Extract numeric assertions.
         claims.extend(self.extract_numeric_claims(text));
 
+        // Extract outcome claims ("Build succeeded", "install worked", etc.).
+        claims.extend(self.extract_outcome_claims(text));
+
+        // Extract timestamp claims (HH:MM patterns).
+        claims.extend(self.extract_timestamp_claims(text));
+
         // Deduplicate overlapping spans (keep the most specific).
         claims.sort_by_key(|c| c.span.0);
         claims.dedup_by(|a, b| a.span.0 == b.span.0 && a.span.1 == b.span.1);
@@ -166,23 +172,16 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_action_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        let re = Regex::new(
-            r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed)\b[^.\n]{0,80}"
+
+        // Pattern 1: "I read/wrote/ran/..." (past-tense self-attribution)
+        let re_past = Regex::new(
+            r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b[^.\n]{0,80}"
         ).unwrap();
 
-        for cap in re.captures_iter(text) {
+        for cap in re_past.captures_iter(text) {
             if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
                 let action_str = action.as_str().to_lowercase();
-                let tool_hint = match action_str.as_str() {
-                    "read" => Some("read_file"),
-                    "wrote" | "created" | "modified" | "updated" => Some("write_file"),
-                    "deleted" | "removed" => Some("exec"),
-                    "executed" | "ran" => Some("exec"),
-                    "searched" => Some("web_search"),
-                    "fetched" => Some("web_fetch"),
-                    "edited" => Some("edit_file"),
-                    _ => None,
-                };
+                let tool_hint = Self::action_to_tool_hint(&action_str);
                 let status = self.match_action_against_entries(&action_str, tool_hint);
                 claims.push(AnnotatedClaim {
                     span: (full.start(), full.end()),
@@ -192,7 +191,62 @@ impl<'a> ClaimVerifier<'a> {
                 });
             }
         }
+
+        // Pattern 2: "Let me check/run/verify/look" (present-tense with implied result)
+        let re_present = Regex::new(
+            r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}"
+        ).unwrap();
+
+        for cap in re_present.captures_iter(text) {
+            if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
+                let action_str = action.as_str().to_lowercase();
+                let tool_hint = Self::action_to_tool_hint(&action_str);
+                let status = self.match_action_against_entries(&action_str, tool_hint);
+                claims.push(AnnotatedClaim {
+                    span: (full.start(), full.end()),
+                    claim_type: "action_claim".to_string(),
+                    status,
+                    text: full.as_str().to_string(),
+                });
+            }
+        }
+
+        // Pattern 3: "When I run X" / "If I run X" (implied action)
+        let re_when = Regex::new(
+            r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}"
+        ).unwrap();
+
+        for cap in re_when.captures_iter(text) {
+            if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
+                let action_str = action.as_str().to_lowercase();
+                let tool_hint = Self::action_to_tool_hint(&action_str);
+                let status = self.match_action_against_entries(&action_str, tool_hint);
+                claims.push(AnnotatedClaim {
+                    span: (full.start(), full.end()),
+                    claim_type: "action_claim".to_string(),
+                    status,
+                    text: full.as_str().to_string(),
+                });
+            }
+        }
+
         claims
+    }
+
+    /// Map an action verb to the tool it implies.
+    fn action_to_tool_hint(action: &str) -> Option<&'static str> {
+        match action {
+            "read" => Some("read_file"),
+            "wrote" | "created" | "modified" | "updated" => Some("write_file"),
+            "deleted" | "removed" => Some("exec"),
+            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify"
+            | "built" | "build" | "compiled" | "installed" | "install" | "copied"
+            | "copy" | "tested" | "test" | "try" | "look" | "see" => Some("exec"),
+            "searched" => Some("web_search"),
+            "fetched" => Some("web_fetch"),
+            "edited" => Some("edit_file"),
+            _ => None,
+        }
     }
 
     fn extract_numeric_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
@@ -223,11 +277,64 @@ impl<'a> ClaimVerifier<'a> {
         claims
     }
 
+    fn extract_outcome_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
+        let mut claims = Vec::new();
+        // Match outcome assertions: "Build succeeded", "copy worked", "install completed", etc.
+        let re = Regex::new(
+            r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b"
+        ).unwrap();
+
+        for cap in re.captures_iter(text) {
+            if let Some(full) = cap.get(0) {
+                let claim_text = full.as_str();
+                // Check if any audit entry contains evidence matching this outcome.
+                let status = self.match_outcome_against_entries(claim_text);
+                claims.push(AnnotatedClaim {
+                    span: (full.start(), full.end()),
+                    claim_type: "outcome".to_string(),
+                    status,
+                    text: claim_text.to_string(),
+                });
+            }
+        }
+        claims
+    }
+
+    fn extract_timestamp_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
+        let mut claims = Vec::new();
+        // Match time patterns: "17:45", "from 17:36", "at 3:30 PM"
+        let re = Regex::new(
+            r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b"
+        ).unwrap();
+
+        for cap in re.captures_iter(text) {
+            if let Some(full) = cap.get(0) {
+                let time_str = full.as_str();
+                // Check if any audit entry result contains this timestamp.
+                let status = if self.entries.iter().any(|e| e.result_data.contains(time_str)) {
+                    ClaimStatus::Derived
+                } else if self.entries.is_empty() {
+                    ClaimStatus::Recalled
+                } else {
+                    ClaimStatus::Claimed
+                };
+                claims.push(AnnotatedClaim {
+                    span: (full.start(), full.end()),
+                    claim_type: "timestamp".to_string(),
+                    status,
+                    text: time_str.to_string(),
+                });
+            }
+        }
+        claims
+    }
+
     // --- Matching helpers ---
 
     fn match_against_entries(&self, needle: &str, tool_hint: Option<&str>) -> ClaimStatus {
         if self.entries.is_empty() {
-            return ClaimStatus::Recalled;
+            // No tool calls at all = phantom action, not legitimate recall.
+            return ClaimStatus::Claimed;
         }
 
         for entry in self.entries.iter().rev() {
@@ -264,7 +371,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn match_content_against_results(&self, content: &str) -> ClaimStatus {
         if self.entries.is_empty() {
-            return ClaimStatus::Recalled;
+            return ClaimStatus::Claimed;
         }
 
         // Try exact substring match (20+ chars).
@@ -290,9 +397,58 @@ impl<'a> ClaimVerifier<'a> {
         ClaimStatus::Claimed
     }
 
-    fn match_action_against_entries(&self, action: &str, tool_hint: Option<&str>) -> ClaimStatus {
+    fn match_outcome_against_entries(&self, claim_text: &str) -> ClaimStatus {
         if self.entries.is_empty() {
-            return ClaimStatus::Recalled;
+            return ClaimStatus::Claimed;
+        }
+
+        let lower = claim_text.to_lowercase();
+        let claims_success = lower.contains("succeeded")
+            || lower.contains("worked")
+            || lower.contains("completed")
+            || lower.contains("finished")
+            || lower.contains("passed")
+            || lower.contains("done")
+            || lower.contains("ready")
+            || lower.contains("updated");
+        let claims_failure = lower.contains("failed")
+            || lower.contains("error")
+            || lower.contains("broke")
+            || lower.contains("broken")
+            || lower.contains("permission denied")
+            || lower.contains("not found")
+            || lower.contains("timed out")
+            || lower.contains("timeout");
+
+        // Look at exec tool results to verify outcome claims.
+        let exec_entries: Vec<&AuditEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.tool_name == "exec")
+            .collect();
+
+        if exec_entries.is_empty() {
+            return ClaimStatus::Claimed;
+        }
+
+        // Check if the claimed outcome matches actual tool results.
+        let last_exec = exec_entries.last().unwrap();
+        if claims_success && last_exec.result_ok {
+            return ClaimStatus::Derived;
+        }
+        if claims_failure && !last_exec.result_ok {
+            return ClaimStatus::Derived;
+        }
+
+        // Outcome contradicts actual result → fabrication.
+        ClaimStatus::Claimed
+    }
+
+    fn match_action_against_entries(&self, action: &str, tool_hint: Option<&str>) -> ClaimStatus {
+        // When there are NO audit entries and the agent claims an action,
+        // this is a phantom action (fabrication), not a recall.
+        if self.entries.is_empty() {
+            return ClaimStatus::Claimed;
         }
 
         // Check if there's a matching tool call.
@@ -307,7 +463,9 @@ impl<'a> ClaimVerifier<'a> {
             "read" => vec!["read_file", "read"],
             "wrote" | "created" | "modified" | "updated" => vec!["write_file", "write", "edit_file"],
             "deleted" | "removed" => vec!["exec"],
-            "executed" | "ran" => vec!["exec"],
+            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify"
+            | "built" | "build" | "compiled" | "installed" | "install" | "copied"
+            | "copy" | "tested" | "test" | "try" | "look" | "see" => vec!["exec"],
             "searched" => vec!["web_search", "search"],
             "fetched" => vec!["web_fetch", "fetch"],
             "edited" => vec!["edit_file", "edit"],
@@ -322,6 +480,48 @@ impl<'a> ClaimVerifier<'a> {
 
         ClaimStatus::Claimed
     }
+}
+
+/// Verify claims in a response against audit entries from this turn.
+///
+/// Returns annotated claims and a flag indicating whether any fabrication was detected.
+pub fn verify_turn_claims(response: &str, entries: &[AuditEntry]) -> (Vec<AnnotatedClaim>, bool) {
+    let verifier = ClaimVerifier::new(entries);
+    let claims = verifier.verify(response);
+    let has_fabrication = verifier.has_unverified(&claims);
+    (claims, has_fabrication)
+}
+
+/// Redact unverified claims from text, replacing each span with a placeholder.
+///
+/// Returns the redacted text and the number of redactions made.
+/// Claims are processed from end to start to preserve byte offsets.
+pub fn redact_fabrications(text: &str, claims: &[AnnotatedClaim]) -> (String, usize) {
+    // Filter to Claimed status only.
+    let mut to_redact: Vec<&AnnotatedClaim> = claims
+        .iter()
+        .filter(|c| c.status == ClaimStatus::Claimed)
+        .collect();
+
+    if to_redact.is_empty() {
+        return (text.to_string(), 0);
+    }
+
+    // Sort by span start descending (process from end to preserve offsets).
+    to_redact.sort_by(|a, b| b.span.0.cmp(&a.span.0));
+
+    let mut result = text.to_string();
+    let mut count = 0usize;
+
+    for claim in &to_redact {
+        let (start, end) = claim.span;
+        if start <= result.len() && end <= result.len() && start <= end {
+            result.replace_range(start..end, "[unverified claim removed]");
+            count += 1;
+        }
+    }
+
+    (result, count)
 }
 
 #[cfg(test)]
@@ -365,7 +565,8 @@ mod tests {
         let claims = verifier.verify("I read `/tmp/secret.txt` and found passwords.");
         let file_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "file_ref").collect();
         if !file_claims.is_empty() {
-            assert_eq!(file_claims[0].status, ClaimStatus::Recalled);
+            // No tool calls = phantom action, should be Claimed (fabrication).
+            assert_eq!(file_claims[0].status, ClaimStatus::Claimed);
         }
     }
 
@@ -454,5 +655,192 @@ mod tests {
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Hello! How can I help you today?");
         assert!(claims.is_empty());
+    }
+
+    // --- phantom action detection ---
+
+    #[test]
+    fn test_phantom_action_let_me_check() {
+        // Agent says "Let me check" but never called any tool.
+        let entries: Vec<AuditEntry> = vec![];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Let me check the time. It's 5:35 PM.");
+        // Should detect "Let me check" as a phantom action (Claimed).
+        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        assert!(!action_claims.is_empty());
+        assert_eq!(action_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    #[test]
+    fn test_phantom_action_let_me_run() {
+        let entries: Vec<AuditEntry> = vec![];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Let me run date to get the current time.");
+        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        assert!(!action_claims.is_empty());
+        assert_eq!(action_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    #[test]
+    fn test_let_me_check_with_actual_tool_call() {
+        // Agent says "Let me check" AND actually called exec.
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "date"}), "Fri Feb 13 17:35:00 CET 2026", true),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Let me check the time. It's 17:35.");
+        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        assert!(!action_claims.is_empty());
+        // Tool WAS called → Observed, not Claimed.
+        assert_eq!(action_claims[0].status, ClaimStatus::Observed);
+    }
+
+    // --- outcome claims ---
+
+    #[test]
+    fn test_outcome_claim_success_matches_ok_tool() {
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "cargo build"}), "Compiling...\nFinished", true),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Build succeeded. Now let me copy the binary.");
+        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        assert!(!outcome_claims.is_empty());
+        assert_eq!(outcome_claims[0].status, ClaimStatus::Derived);
+    }
+
+    #[test]
+    fn test_outcome_claim_success_contradicts_failed_tool() {
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "cargo build"}), "error[E0308]: mismatched types", false),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Build succeeded. Now let me install.");
+        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        assert!(!outcome_claims.is_empty());
+        assert_eq!(outcome_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    #[test]
+    fn test_outcome_claim_failure_matches_failed_tool() {
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "cargo build"}), "error: aborting due to previous error", false),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("Build failed. Let me fix the error.");
+        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        assert!(!outcome_claims.is_empty());
+        assert_eq!(outcome_claims[0].status, ClaimStatus::Derived);
+    }
+
+    // --- timestamp claims ---
+
+    #[test]
+    fn test_timestamp_claim_from_tool_output() {
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "stat file"}), "Modify: 2026-02-13 17:36:00", true),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("The binary is from 17:36.");
+        let ts_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "timestamp").collect();
+        assert!(!ts_claims.is_empty());
+        assert_eq!(ts_claims[0].status, ClaimStatus::Derived);
+    }
+
+    #[test]
+    fn test_timestamp_claim_fabricated() {
+        let entries = vec![
+            make_entry("exec", "c1", json!({"command": "stat file"}), "Modify: 2026-02-13 17:36:00", true),
+        ];
+        let verifier = ClaimVerifier::new(&entries);
+        let claims = verifier.verify("The binary is from 17:45.");
+        let ts_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "timestamp").collect();
+        assert!(!ts_claims.is_empty());
+        // 17:45 is NOT in any tool output → fabricated
+        assert_eq!(ts_claims[0].status, ClaimStatus::Claimed);
+    }
+
+    // --- verify_turn_claims ---
+
+    #[test]
+    fn test_verify_turn_claims_no_fabrication() {
+        let entries = vec![
+            make_entry("write_file", "c1", json!({"path": "/tmp/out.txt"}), "ok", true),
+        ];
+        let (claims, has_fab) = verify_turn_claims("I wrote the output to a file.", &entries);
+        assert!(!claims.is_empty());
+        assert!(!has_fab);
+    }
+
+    #[test]
+    fn test_verify_turn_claims_with_fabrication() {
+        let entries = vec![
+            make_entry("read_file", "c1", json!({}), "data", true),
+        ];
+        let (claims, has_fab) = verify_turn_claims("I deleted the old backups.", &entries);
+        assert!(has_fab);
+    }
+
+    // --- redact_fabrications ---
+
+    #[test]
+    fn test_redact_fabrications_empty_input() {
+        let (result, count) = redact_fabrications("", &[]);
+        assert_eq!(result, "");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_redact_fabrications_no_claimed() {
+        let claims = vec![AnnotatedClaim {
+            span: (0, 5),
+            claim_type: "action_claim".to_string(),
+            status: ClaimStatus::Observed,
+            text: "hello".to_string(),
+        }];
+        let (result, count) = redact_fabrications("hello world", &claims);
+        assert_eq!(result, "hello world");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_redact_fabrications_single_span() {
+        let text = "I deleted the old backups and cleaned up.";
+        let claims = vec![AnnotatedClaim {
+            span: (0, 25),
+            claim_type: "action_claim".to_string(),
+            status: ClaimStatus::Claimed,
+            text: "I deleted the old backups".to_string(),
+        }];
+        let (result, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert!(result.contains("[unverified claim removed]"));
+        assert!(result.contains("and cleaned up."));
+    }
+
+    #[test]
+    fn test_redact_fabrications_preserves_offsets() {
+        // Two claims: the second claim's offsets should still be valid after
+        // the first is redacted (because we process from end to start).
+        let text = "AAA BBB CCC";
+        let claims = vec![
+            AnnotatedClaim {
+                span: (0, 3),
+                claim_type: "numeric".to_string(),
+                status: ClaimStatus::Claimed,
+                text: "AAA".to_string(),
+            },
+            AnnotatedClaim {
+                span: (8, 11),
+                claim_type: "numeric".to_string(),
+                status: ClaimStatus::Claimed,
+                text: "CCC".to_string(),
+            },
+        ];
+        let (result, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 2);
+        assert!(result.contains("BBB"));
+        assert!(!result.contains("AAA"));
+        assert!(!result.contains("CCC"));
     }
 }
