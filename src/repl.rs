@@ -120,20 +120,13 @@ pub(crate) async fn stream_and_render(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
 ) -> String {
-    // Render user input with markdown (erase raw readline, reprint formatted).
-    if std::io::stdout().is_terminal() && input.contains('*') || input.contains('`') || input.contains('#') || input.contains('[') {
+    // Always erase raw readline output and reprint user text in grey box.
+    if std::io::stdout().is_terminal() {
         use std::io::Write as _;
-        // Readline left cursor on the line after input. Erase the raw input line(s)
-        // and the prompt, then reprint prompt + rendered input.
         let prompt_and_input = format!("> {}", input);
         let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
         print!("\x1b[{}A\x1b[J", raw_lines);
         std::io::stdout().flush().ok();
-        let prompt = build_prompt(
-            crate::LOCAL_MODE.load(std::sync::atomic::Ordering::Relaxed),
-            false,
-        );
-        print!("{}", prompt);
         print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
     }
 

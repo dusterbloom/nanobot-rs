@@ -46,17 +46,20 @@ pub fn render_turn(text: &str, role: TurnRole) -> String {
     let mut output = String::new();
     match role {
         TurnRole::User => {
-            // Dark grey background for user text to visually separate it.
-            output.push_str("\x1b[48;5;236m");
-            output.push_str(&render_response(text));
-            output.push_str("\x1b[0m");
+            // Dark grey background per line (raw text, no markdown pipeline —
+            // render_response resets would kill the bg color).
+            for line in text.lines() {
+                output.push_str(&format!("\x1b[48;5;236m {} \x1b[0m\n", line));
+            }
             // Extra blank line after user text before assistant reply.
             output.push('\n');
         }
         TurnRole::Assistant => {
             // И marker on the same line as the start of the reply.
-            output.push_str("\x1b[1m\x1b[97mИ \x1b[0m");
-            output.push_str(&render_response(text));
+            // trim_start() strips the leading newline termimad injects.
+            let rendered = render_response(text);
+            let trimmed = rendered.trim_start();
+            output.push_str(&format!("\x1b[1m\x1b[97mИ\x1b[0m {}", trimmed));
         }
     }
     output
@@ -366,19 +369,19 @@ mod tests {
     }
 
     #[test]
-    fn test_render_turn_user_renders_markdown() {
+    fn test_render_turn_user_preserves_raw_text() {
         let output = render_turn("Hello **bold** text", TurnRole::User);
         let plain = strip_ansi(&output);
-        assert!(plain.contains("bold"), "user markdown should be rendered");
-        assert!(!plain.contains("**"), "markdown syntax should be stripped");
+        // User text is raw (grey box), not markdown-rendered.
+        assert!(plain.contains("**bold**"), "user text should be raw, not markdown-processed");
     }
 
     #[test]
-    fn test_render_turn_user_renders_code_block() {
+    fn test_render_turn_user_preserves_code_text() {
         let output = render_turn("Look:\n\n```rust\nlet x = 1;\n```", TurnRole::User);
         let plain = strip_ansi(&output);
-        assert!(plain.contains("let x"));
-        assert!(plain.contains("─"), "code block should have rule");
+        assert!(plain.contains("let x = 1;"));
+        assert!(plain.contains("```rust"), "code fences should be preserved raw");
     }
 
     #[test]
