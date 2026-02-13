@@ -457,8 +457,8 @@ impl Default for MemoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProvenanceConfig {
-    /// Enable the provenance system (default: false).
-    #[serde(default)]
+    /// Enable the provenance system (default: true).
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Write an append-only audit log of all tool calls (default: true when enabled).

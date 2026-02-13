@@ -212,6 +212,22 @@ pub(crate) fn create_workspace_templates(workspace: &Path) {
 // Core Handle & Agent Loop
 // ============================================================================
 
+/// Return the appropriate context window size for a cloud model.
+///
+/// Models with known large context windows get their full capacity;
+/// everything else uses the config default (128K).
+fn model_context_size(model: &str, config_default: usize) -> usize {
+    let m = model.to_lowercase();
+    if m.contains("opus") || m.contains("sonnet") || m.contains("claude") {
+        // Claude 4.x family: 1M token context
+        config_default.max(1_000_000)
+    } else if m.contains("gemini") {
+        config_default.max(1_000_000)
+    } else {
+        config_default
+    }
+}
+
 pub(crate) fn build_core_handle(
     config: &Config,
     local_port: &str,
@@ -241,11 +257,11 @@ pub(crate) fn build_core_handle(
         Some(config.tools.web.search.api_key.clone())
     };
 
-    // Auto-detect context size from local server; fall back to config default.
+    // Auto-detect context size from local server; fall back to config/model default.
     let max_context_tokens = if is_local {
         crate::server::query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
     } else {
-        config.agents.defaults.max_context_tokens
+        model_context_size(&model, config.agents.defaults.max_context_tokens)
     };
 
     let cp: Option<Arc<dyn LLMProvider>> = if is_local {
@@ -313,11 +329,11 @@ pub(crate) fn rebuild_core(
         Some(config.tools.web.search.api_key.clone())
     };
 
-    // Auto-detect context size from local server; fall back to config default.
+    // Auto-detect context size from local server; fall back to config/model default.
     let max_context_tokens = if is_local {
         crate::server::query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
     } else {
-        config.agents.defaults.max_context_tokens
+        model_context_size(&model, config.agents.defaults.max_context_tokens)
     };
 
     let cp: Option<Arc<dyn LLMProvider>> = if is_local {
