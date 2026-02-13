@@ -301,11 +301,21 @@ impl AgentLoopShared {
         tools
     }
 
-    /// Process a regular inbound message through the agent loop.
+    /// Process an inbound message through the agent loop.
+    ///
+    /// When `text_delta_tx` is `Some`, text deltas are streamed to the sender
+    /// as they arrive (used by CLI/voice). When `None`, a blocking LLM call
+    /// is used (gateway mode).
     ///
     /// This method takes `&self` and is safe to call from multiple concurrent
     /// tasks. Per-message tool instances eliminate shared-context races.
-    async fn process_message(&self, msg: &InboundMessage) -> Option<OutboundMessage> {
+    async fn process_message(
+        &self,
+        msg: &InboundMessage,
+        text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Option<OutboundMessage> {
+        let streaming = text_delta_tx.is_some();
+
         // Snapshot core — instant Arc clone under brief read lock.
         let core = self.core_handle.read().unwrap().clone();
         let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -321,7 +331,8 @@ impl AgentLoopShared {
             .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id));
 
         debug!(
-            "Processing message from {} on {}: {}",
+            "Processing message{} from {} on {}: {}",
+            if streaming { " (streaming)" } else { "" },
             msg.sender_id,
             msg.channel,
             &msg.content[..msg.content.len().min(80)]
@@ -386,7 +397,7 @@ impl AgentLoopShared {
 
         // Agent loop: call LLM, handle tool calls, repeat.
         for iteration in 0..core.max_iterations {
-            debug!("Agent iteration {}/{}", iteration + 1, core.max_iterations);
+            debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
 
             // Check if background compaction finished — swap in compacted messages.
             if let Ok(mut guard) = compaction_slot.try_lock() {
@@ -451,22 +462,67 @@ impl AgentLoopShared {
             // Repair any protocol violations before calling the LLM.
             thread_repair::repair_messages(&mut messages);
 
-            let response = match core
-                .provider
-                .chat(
-                    &messages,
-                    tool_defs_opt,
-                    Some(&core.model),
-                    core.max_tokens,
-                    core.temperature,
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("LLM call failed: {}", e);
-                    final_content = format!("I encountered an error: {}", e);
-                    break;
+            // Call LLM — streaming or blocking depending on mode.
+            let response = if let Some(ref delta_tx) = text_delta_tx {
+                // Streaming path: forward text deltas as they arrive.
+                let mut stream = match core
+                    .provider
+                    .chat_stream(
+                        &messages,
+                        tool_defs_opt,
+                        Some(&core.model),
+                        core.max_tokens,
+                        core.temperature,
+                    )
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("LLM streaming call failed: {}", e);
+                        final_content = format!("I encountered an error: {}", e);
+                        break;
+                    }
+                };
+
+                let mut streamed_response = None;
+                while let Some(chunk) = stream.rx.recv().await {
+                    match chunk {
+                        StreamChunk::TextDelta(delta) => {
+                            let _ = delta_tx.send(delta);
+                        }
+                        StreamChunk::Done(resp) => {
+                            streamed_response = Some(resp);
+                        }
+                    }
+                }
+
+                match streamed_response {
+                    Some(r) => r,
+                    None => {
+                        error!("LLM stream ended without Done");
+                        final_content = "I encountered a streaming error.".to_string();
+                        break;
+                    }
+                }
+            } else {
+                // Blocking path: single request/response.
+                match core
+                    .provider
+                    .chat(
+                        &messages,
+                        tool_defs_opt,
+                        Some(&core.model),
+                        core.max_tokens,
+                        core.temperature,
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("LLM call failed: {}", e);
+                        final_content = format!("I encountered an error: {}", e);
+                        break;
+                    }
                 }
             };
 
@@ -574,297 +630,6 @@ impl AgentLoopShared {
                     .insert("voice_message".to_string(), json!(true));
             }
             // Propagate detected_language for TTS voice selection.
-            if let Some(lang) = msg.metadata.get("detected_language") {
-                outbound
-                    .metadata
-                    .insert("detected_language".to_string(), lang.clone());
-            }
-            Some(outbound)
-        }
-    }
-
-    /// Process a message with streaming: text deltas are forwarded to
-    /// `text_delta_tx` as they arrive from the LLM. The full response text
-    /// is still returned for session history.
-    async fn process_message_streaming(
-        &self,
-        msg: &InboundMessage,
-        text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    ) -> Option<OutboundMessage> {
-        let core = self.core_handle.read().unwrap().clone();
-        let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if turn_count % 50 == 0 {
-            core.learning.prune();
-        }
-
-        let session_key = msg
-            .metadata
-            .get("session_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id));
-
-        debug!(
-            "Processing message (streaming) from {} on {}: {}",
-            msg.sender_id,
-            msg.channel,
-            &msg.content[..msg.content.len().min(80)]
-        );
-
-        let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
-
-        let history = core.sessions.get_history(
-                &session_key,
-                history_limit(core.token_budget.max_context()),
-            ).await;
-
-        let media_paths: Vec<String> = msg
-            .metadata
-            .get("media")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let is_voice_message = msg
-            .metadata
-            .get("voice_message")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let detected_language = msg
-            .metadata
-            .get("detected_language")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let mut messages = core.context.build_messages(
-            &history,
-            &msg.content,
-            None,
-            if media_paths.is_empty() {
-                None
-            } else {
-                Some(&media_paths)
-            },
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-            is_voice_message,
-            detected_language.as_deref(),
-        );
-
-        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let mut final_content = String::new();
-
-        // Background compaction state.
-        let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let compaction_in_flight = Arc::new(AtomicBool::new(false));
-
-        for iteration in 0..core.max_iterations {
-            debug!("Agent iteration (streaming) {}/{}", iteration + 1, core.max_iterations);
-
-            // Check if background compaction finished — swap in compacted messages.
-            if let Ok(mut guard) = compaction_slot.try_lock() {
-                if let Some(pending) = guard.take() {
-                    debug!(
-                        "Compaction swap: {} msgs -> {} compacted + {} new",
-                        pending.watermark,
-                        pending.result.messages.len(),
-                        messages.len().saturating_sub(pending.watermark)
-                    );
-                    apply_compaction_result(&mut messages, pending);
-                }
-            }
-
-            let tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
-            let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-                None
-            } else {
-                Some(&tool_defs)
-            };
-
-            let tool_def_tokens = core
-                .token_budget
-                .estimate_tool_def_tokens_with_fallback(tool_defs_opt.unwrap_or(&[]));
-            messages = core.token_budget.trim_to_fit(&messages, tool_def_tokens);
-
-            // Spawn background compaction when threshold exceeded.
-            if !compaction_in_flight.load(Ordering::Relaxed)
-                && core.compactor.needs_compaction(&messages, &core.token_budget, tool_def_tokens)
-            {
-                let slot = compaction_slot.clone();
-                let in_flight = compaction_in_flight.clone();
-                let bg_messages = messages.clone();
-                let bg_core = core.clone();
-                let bg_session_key = session_key.clone();
-                let bg_channel = msg.channel.clone();
-                let watermark = messages.len();
-                in_flight.store(true, Ordering::SeqCst);
-
-                tokio::spawn(async move {
-                    let result = bg_core
-                        .compactor
-                        .compact(&bg_messages, &bg_core.token_budget, 0)
-                        .await;
-                    if bg_core.memory_enabled {
-                        if let Some(ref summary) = result.observation {
-                            let observer = ObservationStore::new(&bg_core.workspace);
-                            if let Err(e) = observer.save(summary, &bg_session_key, Some(&bg_channel)) {
-                                tracing::warn!("Failed to save observation: {}", e);
-                            }
-                        }
-                    }
-                    if result.messages.len() < bg_messages.len() {
-                        *slot.lock().await = Some(PendingCompaction { result, watermark });
-                    }
-                    in_flight.store(false, Ordering::SeqCst);
-                });
-            }
-
-            thread_repair::repair_messages(&mut messages);
-
-            // Use streaming API
-            let mut stream = match core
-                .provider
-                .chat_stream(
-                    &messages,
-                    tool_defs_opt,
-                    Some(&core.model),
-                    core.max_tokens,
-                    core.temperature,
-                )
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("LLM streaming call failed: {}", e);
-                    final_content = format!("I encountered an error: {}", e);
-                    break;
-                }
-            };
-
-            // Consume stream chunks
-            let mut response = None;
-            while let Some(chunk) = stream.rx.recv().await {
-                match chunk {
-                    StreamChunk::TextDelta(delta) => {
-                        // Forward text deltas for TTS pipeline
-                        let _ = text_delta_tx.send(delta);
-                    }
-                    StreamChunk::Done(resp) => {
-                        response = Some(resp);
-                    }
-                }
-            }
-
-            let response = match response {
-                Some(r) => r,
-                None => {
-                    error!("LLM stream ended without Done");
-                    final_content = "I encountered a streaming error.".to_string();
-                    break;
-                }
-            };
-
-            if response.has_tool_calls() {
-                let tc_json: Vec<Value> = response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": serde_json::to_string(&tc.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            }
-                        })
-                    })
-                    .collect();
-
-                ContextBuilder::add_assistant_message(
-                    &mut messages,
-                    response.content.as_deref(),
-                    Some(&tc_json),
-                );
-
-                for tc in &response.tool_calls {
-                    debug!("Executing tool: {} (id: {})", tc.name, tc.id);
-                    let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-                    debug!(
-                        "Tool {} result ({}B, ok={})",
-                        tc.name,
-                        result.data.len(),
-                        result.ok
-                    );
-                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
-                    used_tools.insert(tc.name.clone());
-
-                    let context_str: String = tc
-                        .arguments
-                        .values()
-                        .filter_map(|v| v.as_str())
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(100)
-                        .collect();
-                    core.learning.record(
-                        &tc.name,
-                        result.ok,
-                        &context_str,
-                        result.error.as_deref(),
-                    );
-                }
-            } else {
-                final_content = response.content.unwrap_or_default();
-                break;
-            }
-        }
-
-        // Store context stats
-        let final_tokens = core.token_budget.estimate_tokens_with_fallback(&messages) as u64;
-        core.last_context_used
-            .store(final_tokens, Ordering::Relaxed);
-        core.last_context_max
-            .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
-
-        if final_content.is_empty() && messages.len() > 2 {
-            final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
-        }
-
-        // Update session history
-        if final_content.is_empty() {
-            core.sessions
-                .add_message_and_save(&session_key, "user", &msg.content)
-                .await;
-        } else {
-            core.sessions
-                .add_messages_and_save(
-                    &session_key,
-                    &[("user", &msg.content), ("assistant", &final_content)],
-                )
-                .await;
-        }
-
-        if final_content.is_empty() {
-            None
-        } else {
-            let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
-            if msg
-                .metadata
-                .get("voice_message")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                outbound
-                    .metadata
-                    .insert("voice_message".to_string(), json!(true));
-            }
             if let Some(lang) = msg.metadata.get("detected_language") {
                 outbound
                     .metadata
@@ -1053,7 +818,7 @@ impl AgentLoop {
                     ));
                 }
 
-                let response = shared.process_message(&msg).await;
+                let response = shared.process_message(&msg, None).await;
 
                 if let Some(outbound) = response {
                     // Notify REPL about outbound response.
@@ -1126,7 +891,7 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        match self.shared.process_message(&msg).await {
+        match self.shared.process_message(&msg, None).await {
             Some(response) => response.content,
             None => String::new(),
         }
@@ -1157,7 +922,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message_streaming(&msg, text_delta_tx)
+            .process_message(&msg, Some(text_delta_tx))
             .await
         {
             Some(response) => response.content,

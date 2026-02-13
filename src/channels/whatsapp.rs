@@ -424,7 +424,7 @@ impl Channel for WhatsAppChannel {
                 .unwrap_or(false);
             if is_voice {
                 if let Some(ref pipeline) = self.voice_pipeline {
-                    let tts_text = crate::strip_markdown_for_tts(&msg.content);
+                    let tts_text = crate::tui::strip_markdown_for_tts(&msg.content);
                     let lang = msg
                         .metadata
                         .get("detected_language")
