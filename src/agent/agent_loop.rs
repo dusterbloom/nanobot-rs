@@ -21,8 +21,8 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
-use crate::agent::observer::ObservationStore;
 use crate::agent::reflector::Reflector;
+use crate::agent::working_memory::WorkingMemoryStore;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
@@ -59,6 +59,8 @@ pub struct SharedCore {
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
     pub learning: LearningStore,
+    pub working_memory: WorkingMemoryStore,
+    pub working_memory_budget: usize,
     pub brave_api_key: Option<String>,
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
@@ -110,10 +112,6 @@ pub fn build_shared_core(
         ContextBuilder::new(&workspace)
     };
     context.model_name = model.clone();
-    if !is_local {
-        // Only override observation budget for cloud mode (lite mode has its own defaults)
-        context.observation_budget = memory_config.observation_budget;
-    }
     // Inject provenance verification rules when enabled.
     if provenance.enabled && provenance.system_prompt_rules {
         context.provenance_enabled = true;
@@ -159,6 +157,7 @@ pub fn build_shared_core(
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
     let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens);
     let learning = LearningStore::new(&workspace);
+    let working_memory = WorkingMemoryStore::new(&workspace);
 
     // Build tool runner provider if delegation is enabled.
     let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
@@ -194,6 +193,8 @@ pub fn build_shared_core(
         token_budget,
         compactor,
         learning,
+        working_memory,
+        working_memory_budget: memory_config.working_memory_budget,
         brave_api_key,
         exec_timeout,
         restrict_to_workspace,
@@ -431,6 +432,20 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
 
+        // Inject per-session working memory into the system message.
+        if core.memory_enabled {
+            let wm = core.working_memory.get_context(&session_key, core.working_memory_budget);
+            if !wm.is_empty() {
+                if let Some(system_content) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+                    let enriched = format!(
+                        "{}\n\n---\n\n# Working Memory (Current Session)\n\n{}",
+                        system_content, wm
+                    );
+                    messages[0]["content"] = Value::String(enriched);
+                }
+            }
+        }
+
         // Track which tools have been used for smart tool selection.
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -517,10 +532,7 @@ impl AgentLoopShared {
                         .await;
                     if bg_core.memory_enabled {
                         if let Some(ref summary) = result.observation {
-                            let observer = ObservationStore::new(&bg_core.workspace);
-                            if let Err(e) = observer.save(summary, &bg_session_key, Some(&bg_channel)) {
-                                tracing::warn!("Failed to save observation: {}", e);
-                            }
+                            bg_core.working_memory.update_from_compaction(&bg_session_key, summary);
                         }
                     }
                     if result.messages.len() < bg_messages.len() {

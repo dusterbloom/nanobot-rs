@@ -10,9 +10,7 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{json, Value};
 
-use crate::agent::learning::LearningStore;
 use crate::agent::memory::MemoryStore;
-use crate::agent::observer::ObservationStore;
 use crate::agent::skills::SkillsLoader;
 use crate::agent::token_budget::TokenBudget;
 
@@ -29,12 +27,6 @@ pub struct ContextBuilder {
     pub bootstrap_budget: usize,
     /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
     pub long_term_memory_budget: usize,
-    /// Max tokens for today's notes in the system prompt.
-    pub today_notes_budget: usize,
-    /// Max tokens for observations in the system prompt (default: 2000).
-    pub observation_budget: usize,
-    /// Max tokens for learning context in the system prompt.
-    pub learning_budget: usize,
     /// Whether to inject provenance verification rules into the system prompt.
     pub provenance_enabled: bool,
 }
@@ -48,10 +40,7 @@ impl ContextBuilder {
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
             bootstrap_budget: 3000,
-            long_term_memory_budget: 2000,
-            today_notes_budget: 1200,
-            observation_budget: 2000,
-            learning_budget: 800,
+            long_term_memory_budget: 800,
             provenance_enabled: false,
         }
     }
@@ -66,11 +55,8 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
-            bootstrap_budget: 500,      // Down from 3000
-            long_term_memory_budget: 300, // Down from 2000
-            today_notes_budget: 200,    // Down from 1200
-            observation_budget: 300,    // Down from 2000
-            learning_budget: 200,       // Down from 800
+            bootstrap_budget: 500,
+            long_term_memory_budget: 200,
             provenance_enabled: false,
         }
     }
@@ -78,10 +64,7 @@ impl ContextBuilder {
     /// Convert this builder to lite mode (for local models).
     pub fn set_lite_mode(&mut self) {
         self.bootstrap_budget = 500;
-        self.long_term_memory_budget = 300;
-        self.today_notes_budget = 200;
-        self.observation_budget = 300;
-        self.learning_budget = 200;
+        self.long_term_memory_budget = 200;
     }
 
     // ------------------------------------------------------------------
@@ -127,38 +110,12 @@ impl ContextBuilder {
             parts.push(bootstrap);
         }
 
-        // Memory context.
-        let mut memory_parts: Vec<String> = Vec::new();
+        // Memory context (long-term facts only — observations, daily notes, and
+        // learnings have been moved out of the system prompt).
         let long_term =
             Self::_truncate_to_budget(&self.memory.read_long_term(), self.long_term_memory_budget);
         if !long_term.is_empty() {
-            memory_parts.push(format!("## Long-term Memory\n{}", long_term));
-        }
-        let today_notes =
-            Self::_truncate_to_budget(&self.memory.read_today(), self.today_notes_budget);
-        if !today_notes.is_empty() {
-            memory_parts.push(format!("## Today's Notes\n{}", today_notes));
-        }
-        if !memory_parts.is_empty() {
-            parts.push(format!("# Memory\n\n{}", memory_parts.join("\n\n")));
-        }
-
-        // Observations from past conversations.
-        let observer = ObservationStore::new(&self.workspace);
-        let obs_context = observer.get_context(self.observation_budget);
-        if !obs_context.is_empty() {
-            parts.push(format!(
-                "# Observations from Past Conversations\n\n{}",
-                obs_context
-            ));
-        }
-
-        // Learning context (tool outcome patterns).
-        let learning = LearningStore::new(&self.workspace);
-        let learning_context =
-            Self::_truncate_to_budget(&learning.get_learning_context(), self.learning_budget);
-        if !learning_context.is_empty() {
-            parts.push(format!("# Recent Tool Patterns\n\n{}", learning_context));
+            parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
         }
 
         // Skills -- progressive loading:
@@ -602,19 +559,7 @@ mod tests {
         assert!(prompt.contains("[truncated to fit token budget]"));
     }
 
-    #[test]
-    fn test_build_system_prompt_applies_learning_budget() {
-        let tmp = TempDir::new().unwrap();
-        let store = LearningStore::new(tmp.path());
-        for _ in 0..6 {
-            store.record("exec", false, "bad", Some(&"very long error ".repeat(30)));
-        }
-        let mut cb = ContextBuilder::new(tmp.path());
-        cb.learning_budget = 40;
-        let prompt = cb.build_system_prompt(None);
-        assert!(prompt.contains("# Recent Tool Patterns"));
-        assert!(prompt.contains("[truncated to fit token budget]"));
-    }
+
 
     // ----- build_messages -----
 
@@ -763,54 +708,21 @@ mod tests {
         assert!(content.contains("[END TOOL OUTPUT]"));
     }
 
-    // ----- observations -----
-
     #[test]
-    fn test_system_prompt_includes_observations_when_present() {
+    fn test_system_prompt_no_longer_includes_observations() {
         let tmp = TempDir::new().unwrap();
         let obs_dir = tmp.path().join("memory").join("observations");
         fs::create_dir_all(&obs_dir).unwrap();
         fs::write(
             obs_dir.join("20260101T000000Z_test.md"),
-            "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: test\n---\n\nUser likes dark mode and Rust.",
+            "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: test\n---\n\nUser likes dark mode.",
         )
         .unwrap();
         let cb = ContextBuilder::new(tmp.path());
         let prompt = cb.build_system_prompt(None);
         assert!(
-            prompt.contains("Observations from Past Conversations"),
-            "system prompt should include observations header"
-        );
-        assert!(
-            prompt.contains("User likes dark mode and Rust"),
-            "system prompt should include observation content"
-        );
-    }
-
-    #[test]
-    fn test_system_prompt_respects_observation_budget() {
-        let tmp = TempDir::new().unwrap();
-        let obs_dir = tmp.path().join("memory").join("observations");
-        fs::create_dir_all(&obs_dir).unwrap();
-        // Write a large observation.
-        let big_content = "x".repeat(40000); // ~10000 tokens
-        fs::write(
-            obs_dir.join("20260101T000000Z_big.md"),
-            format!(
-                "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: big\n---\n\n{}",
-                big_content
-            ),
-        )
-        .unwrap();
-        let mut cb = ContextBuilder::new(tmp.path());
-        cb.observation_budget = 100; // very small budget
-
-        let prompt = cb.build_system_prompt(None);
-        // If the observation exceeds budget, it should not appear.
-        // (The single entry is too big for 100 tokens, so get_context returns empty.)
-        assert!(
-            !prompt.contains("xxxx"),
-            "oversized observation should not appear in prompt"
+            !prompt.contains("Observations from Past Conversations"),
+            "observations should no longer be injected into system prompt"
         );
     }
 }

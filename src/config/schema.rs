@@ -412,9 +412,14 @@ pub struct MemoryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
 
-    /// Max tokens for observations in system prompt (default: 2000).
+    /// Deprecated: observations are no longer injected into the system prompt.
+    /// Kept for backward compatibility with existing config files.
     #[serde(default = "default_observation_budget")]
     pub observation_budget: usize,
+
+    /// Max tokens for working memory (per-session state) in the system prompt (default: 1500).
+    #[serde(default = "default_working_memory_budget")]
+    pub working_memory_budget: usize,
 
     /// Token threshold to trigger reflection (default: 20000).
     #[serde(default = "default_reflection_threshold")]
@@ -429,6 +434,10 @@ fn default_observation_budget() -> usize {
     2000
 }
 
+fn default_working_memory_budget() -> usize {
+    1500
+}
+
 fn default_reflection_threshold() -> usize {
     20000
 }
@@ -440,6 +449,7 @@ impl Default for MemoryConfig {
             model: String::new(),
             provider: None,
             observation_budget: default_observation_budget(),
+            working_memory_budget: default_working_memory_budget(),
             reflection_threshold: default_reflection_threshold(),
         }
     }
