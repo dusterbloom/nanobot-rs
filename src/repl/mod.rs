@@ -22,6 +22,7 @@ use crate::cli;
 use crate::config::loader::{get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
+use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::server;
@@ -713,6 +714,20 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
             let _ = ctx.rl.load_history(&history_path);
 
+            // Start heartbeat: maintenance commands run on every tick (no LLM).
+            let maintenance_cmds: Vec<String> = DEFAULT_MAINTENANCE_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let heartbeat = HeartbeatService::new(
+                ctx.config.workspace_path(),
+                None, // No LLM callback — maintenance only
+                maintenance_cmds,
+                DEFAULT_HEARTBEAT_INTERVAL_S,
+                true,
+            );
+            heartbeat.start().await;
+
             loop {
                 // Drain any pending display messages from background channels.
                 ctx.drain_display();
@@ -880,7 +895,8 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 vs.shutdown();
             }
 
-            // Cleanup: save readline history, kill servers
+            // Cleanup: stop heartbeat, save readline history, kill servers
+            heartbeat.stop().await;
             let _ = ctx.rl.save_history(&history_path);
             ctx.srv.shutdown();
 
