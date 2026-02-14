@@ -32,7 +32,8 @@ fn default_deny_patterns() -> Vec<String> {
         // Windows destructive commands.
         r"\bdel\s+/[fq]\b".to_string(),
         r"\brmdir\s+/s\b".to_string(),
-        r"\b(format|mkfs|diskpart)\b".to_string(),
+        r"\bformat\s+[A-Za-z]:".to_string(),
+        r"\b(mkfs|diskpart)\b".to_string(),
         // Raw disk operations.
         r"\bdd\s+if=".to_string(),
         r">\s*/dev/sd".to_string(),

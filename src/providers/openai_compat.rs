@@ -23,6 +23,40 @@ pub struct OpenAICompatProvider {
     client: Client,
 }
 
+/// Normalize Claude model short-names so the API always gets the canonical ID.
+///
+/// - `"opus"` / `"sonnet"` / `"haiku"` → latest canonical ID
+/// - `"opus-4-6"`, `"sonnet-4-5-..."` etc. → prepend `claude-`
+/// - Already-qualified names or non-Claude models pass through unchanged.
+fn normalize_model_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+
+    // Already has a provider prefix (e.g. "anthropic/claude-opus-4-6") or
+    // already starts with "claude-" — pass through.
+    if lower.contains('/') || lower.starts_with("claude-") {
+        return name.to_string();
+    }
+
+    // Short aliases (bare word).
+    match lower.as_str() {
+        "opus" => return "claude-opus-4-6".to_string(),
+        "sonnet" => return "claude-sonnet-4-20250514".to_string(),
+        "haiku" => return "claude-haiku-4-5-20250414".to_string(),
+        "local" => return name.to_string(),
+        _ => {}
+    }
+
+    // Claude model without the "claude-" prefix (e.g. "opus-4-6", "sonnet-4-5-20250929").
+    if lower.starts_with("opus")
+        || lower.starts_with("sonnet")
+        || lower.starts_with("haiku")
+    {
+        return format!("claude-{}", name);
+    }
+
+    name.to_string()
+}
+
 impl OpenAICompatProvider {
     /// Create a new provider.
     ///
@@ -32,9 +66,9 @@ impl OpenAICompatProvider {
     /// - vLLM / custom: when an explicit `api_base` is provided that isn't OpenRouter
     /// - Default fallback: OpenRouter (`https://openrouter.ai/api/v1`)
     pub fn new(api_key: &str, api_base: Option<&str>, default_model: Option<&str>) -> Self {
-        let default_model = default_model
-            .unwrap_or("anthropic/claude-opus-4-5")
-            .to_string();
+        let default_model = normalize_model_name(
+            default_model.unwrap_or("anthropic/claude-opus-4-5"),
+        );
 
         let resolved_base = if let Some(base) = api_base {
             // Use whatever was explicitly provided.
@@ -74,7 +108,8 @@ impl LLMProvider for OpenAICompatProvider {
         max_tokens: u32,
         temperature: f64,
     ) -> Result<LLMResponse> {
-        let raw_model = model.unwrap_or(&self.default_model);
+        let normalized = model.map(|m| normalize_model_name(m));
+        let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
         // Strip "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
         let model = if !self.api_base.contains("openrouter") {
@@ -172,7 +207,8 @@ impl LLMProvider for OpenAICompatProvider {
         max_tokens: u32,
         temperature: f64,
     ) -> Result<StreamHandle> {
-        let raw_model = model.unwrap_or(&self.default_model);
+        let normalized = model.map(|m| normalize_model_name(m));
+        let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
         let model = if !self.api_base.contains("openrouter") {
             raw_model.split('/').last().unwrap_or(raw_model)
         } else {
@@ -786,5 +822,60 @@ mod tests {
     fn test_get_default_model_uses_fallback() {
         let provider = OpenAICompatProvider::new("sk-key", None, None);
         assert_eq!(provider.get_default_model(), "anthropic/claude-opus-4-5");
+    }
+
+    // ── Model name normalization tests ─────────────────────────────
+
+    #[test]
+    fn test_normalize_short_aliases() {
+        assert_eq!(normalize_model_name("opus"), "claude-opus-4-6");
+        assert_eq!(normalize_model_name("sonnet"), "claude-sonnet-4-20250514");
+        assert_eq!(normalize_model_name("haiku"), "claude-haiku-4-5-20250414");
+        // Case-insensitive.
+        assert_eq!(normalize_model_name("Opus"), "claude-opus-4-6");
+        assert_eq!(normalize_model_name("SONNET"), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_normalize_missing_claude_prefix() {
+        assert_eq!(normalize_model_name("opus-4-6"), "claude-opus-4-6");
+        assert_eq!(
+            normalize_model_name("sonnet-4-5-20250929"),
+            "claude-sonnet-4-5-20250929"
+        );
+        assert_eq!(
+            normalize_model_name("haiku-4-5-20250414"),
+            "claude-haiku-4-5-20250414"
+        );
+    }
+
+    #[test]
+    fn test_normalize_already_correct() {
+        assert_eq!(
+            normalize_model_name("claude-opus-4-6"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            normalize_model_name("anthropic/claude-opus-4-6"),
+            "anthropic/claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn test_normalize_non_claude_passthrough() {
+        assert_eq!(normalize_model_name("gpt-4o"), "gpt-4o");
+        assert_eq!(normalize_model_name("deepseek-chat"), "deepseek-chat");
+        assert_eq!(normalize_model_name("local"), "local");
+        assert_eq!(
+            normalize_model_name("meta-llama/llama-3-70b"),
+            "meta-llama/llama-3-70b"
+        );
+    }
+
+    #[test]
+    fn test_provider_normalizes_default_model() {
+        // Config has "opus-4-6" → provider should normalize to "claude-opus-4-6".
+        let provider = OpenAICompatProvider::new("sk-or-key", None, Some("opus-4-6"));
+        assert_eq!(provider.default_model, "claude-opus-4-6");
     }
 }
