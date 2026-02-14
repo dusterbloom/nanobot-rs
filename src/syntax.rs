@@ -31,6 +31,8 @@ static SKIN: Lazy<MadSkin> = Lazy::new(|| {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnRole {
     User,
+    /// Voice mode user — same as User but with a purple ● marker.
+    VoiceUser,
     Assistant,
 }
 
@@ -45,15 +47,16 @@ pub fn render_turn(text: &str, role: TurnRole) -> String {
     }
     let mut output = String::new();
     match role {
-        TurnRole::User => {
+        TurnRole::User | TurnRole::VoiceUser => {
             // Padding before user box.
             output.push('\n');
             // Dark grey background per line (raw text, no markdown pipeline —
             // render_response resets would kill the bg color).
-            // First line gets a green ● marker.
+            // First line gets a ● marker: green for text, purple for voice.
+            let marker_color = if role == TurnRole::VoiceUser { "\x1b[35m" } else { "\x1b[32m" };
             for (i, line) in text.lines().enumerate() {
                 if i == 0 {
-                    output.push_str(&format!("\x1b[48;5;236m \x1b[32m●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n", line));
+                    output.push_str(&format!("\x1b[48;5;236m {}●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n", marker_color, line));
                 } else {
                     output.push_str(&format!("\x1b[48;5;236m   {} \x1b[0m\n", line));
                 }
