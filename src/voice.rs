@@ -42,12 +42,15 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// Split text into TTS chunks up to 250 chars, always ending on sentence punctuation.
 /// Short responses (<=500 chars) are synthesized as a single chunk — no splitting overhead.
 pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
-    let trimmed = text.trim();
+    // Collapse newlines and multiple whitespace into single spaces so TTS
+    // engines don't pause on soft-wrapped line breaks.
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = normalized.trim();
     if trimmed.len() <= 500 {
         return if trimmed.is_empty() { vec![] } else { vec![trimmed.to_string()] };
     }
 
-    let sentences = split_sentences(text);
+    let sentences = split_sentences(&normalized);
     let mut chunks = Vec::new();
     let mut current = String::new();
 
@@ -98,6 +101,21 @@ pub(crate) fn apply_fade_envelope(samples: &mut [f32], fade_samples: usize) {
 /// Convert f32 samples to raw little-endian bytes for piping to paplay.
 fn samples_to_f32le_bytes(samples: &[f32]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// Block SIGINT delivery in the current thread.
+///
+/// Prevents Ctrl+C from interrupting native TTS/playback code mid-execution,
+/// which would cause segfaults in the C/C++ FFI libraries (Pocket, Kokoro).
+/// The signal is still delivered to the tokio handler thread.
+#[cfg(unix)]
+fn mask_sigint() {
+    unsafe {
+        let mut sigset: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut sigset);
+        libc::sigaddset(&mut sigset, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+    }
 }
 
 /// A command sent to the synthesis thread.
@@ -169,6 +187,7 @@ fn start_playback(samples: Vec<f32>, sample_rate: u32) -> Result<Child, String> 
             &format!("--rate={}", sample_rate),
         ])
         .env("PULSE_SERVER", pulse_server())
+        .env("PULSE_LATENCY_MSEC", "10")
         .stdin(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -213,7 +232,7 @@ impl VoiceSession {
             Some(_) => "Kokoro only",
             None => "Pocket + Kokoro",
         };
-        println!("Initializing voice mode ({label})... [build:v8]");
+        println!("Initializing voice mode ({label})...");
 
         // Fail fast: check that parec exists
         Command::new("parec")
@@ -462,6 +481,8 @@ impl VoiceSession {
         // Must be a plain std::thread (not tokio) because Kokoro internally
         // creates a tokio Runtime which panics inside an existing runtime.
         let synth_handle = std::thread::spawn(move || {
+            #[cfg(unix)]
+            mask_sigint();
             let mut guard = tts.lock().unwrap();
             if let Err(e) = guard.set_speaker(voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
@@ -497,6 +518,8 @@ impl VoiceSession {
         // --- Playback thread ---
         // Spawns a single paplay process and writes audio chunks as they arrive.
         let playback_handle = std::thread::spawn(move || -> Result<Option<Child>, String> {
+            #[cfg(unix)]
+            mask_sigint();
             // Wait for the first chunk to get the sample rate.
             let first_chunk = match audio_rx.recv() {
                 Ok(c) => c,
@@ -511,6 +534,7 @@ impl VoiceSession {
                     &format!("--rate={}", first_chunk.sample_rate),
                 ])
                 .env("PULSE_SERVER", pulse_server())
+                .env("PULSE_LATENCY_MSEC", "10")
                 .stdin(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -577,6 +601,8 @@ impl VoiceSession {
         // --- Synthesis thread ---
         let cancel_synth = cancel.clone();
         let synth_handle = std::thread::spawn(move || {
+            #[cfg(unix)]
+            mask_sigint();
             let mut guard = tts.lock().unwrap();
             if let Err(e) = guard.set_speaker(voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
@@ -618,63 +644,47 @@ impl VoiceSession {
             // audio_tx dropped → playback finishes
         });
 
-        // --- Playback thread ---
+        // Pre-spawn paplay so PA connection is established while LLM streams.
+        // Both Pocket and Kokoro output 24kHz; verified at runtime via debug log.
+        let mut paplay = Command::new("paplay")
+            .args(["--raw", "--format=float32le", "--channels=1", "--rate=24000"])
+            .env("PULSE_SERVER", pulse_server())
+            .env("PULSE_LATENCY_MSEC", "10")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils"))?;
+        let paplay_stdin = paplay.stdin.take().unwrap();
+
+        // --- Playback thread: writes audio chunks to pre-opened stdin ---
         let cancel_play = cancel;
-        let playback_handle = std::thread::spawn(move || -> Option<Child> {
-            let first_chunk = match audio_rx.recv() {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-
-            let mut child = match Command::new("paplay")
-                .args([
-                    "--raw",
-                    "--format=float32le",
-                    "--channels=1",
-                    &format!("--rate={}", first_chunk.sample_rate),
-                ])
-                .env("PULSE_SERVER", pulse_server())
-                .stdin(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("paplay failed: {}", e);
-                    return None;
-                }
-            };
-
-            let mut stdin = child.stdin.take().unwrap();
-
-            if stdin.write_all(&first_chunk.data).is_err() {
-                return Some(child);
-            }
-
+        let playback_handle = std::thread::spawn(move || {
+            #[cfg(unix)]
+            mask_sigint();
+            let mut stdin = paplay_stdin;
             for chunk in audio_rx {
                 if cancel_play.load(Ordering::Relaxed) {
                     break;
+                }
+                if chunk.sample_rate != 24000 {
+                    tracing::warn!("TTS sample rate {} != expected 24000", chunk.sample_rate);
                 }
                 if stdin.write_all(&chunk.data).is_err() {
                     break;
                 }
             }
-
-            drop(stdin);
-            Some(child)
+            drop(stdin); // close pipe so paplay finishes
         });
 
-        // --- Coordinator thread: waits for both threads, stores playback child ---
-        // We need a mutable reference to self.playback, but we can't move it into a thread.
-        // Instead, return the join handle and let the caller wait.
+        // --- Coordinator thread: waits for both threads, kills paplay on cancel ---
+        let cancel_coord = self.cancel.clone();
         let join_handle = std::thread::spawn(move || {
             let _ = synth_handle.join();
-            let child = playback_handle.join().ok().flatten();
-            // We can't store child into self.playback from a thread, so we just
-            // wait for playback to finish here.
-            if let Some(mut c) = child {
-                let _ = c.wait();
+            let _ = playback_handle.join();
+            if cancel_coord.load(Ordering::Relaxed) {
+                let _ = paplay.kill();
             }
+            let _ = paplay.wait();
         });
 
         Ok((sentence_tx, join_handle))
@@ -695,6 +705,15 @@ impl VoiceSession {
         }
         self.playback = None;
     }
+
+    /// Clean shutdown: stop playback and leak the entire session so native
+    /// FFI destructors (Pocket/Kokoro C++, Whisper) never run. The process
+    /// is exiting — the OS reclaims memory. Without this, the C++ dtors
+    /// segfault during drop.
+    pub fn shutdown(mut self) {
+        self.stop_playback();
+        std::mem::forget(self);
+    }
 }
 
 /// Accumulates streaming text deltas and batches complete sentences into ~200-char
@@ -709,6 +728,11 @@ pub(crate) struct SentenceAccumulator {
     pending: String,
     in_code_block: bool,
     sentence_tx: std_mpsc::Sender<TtsCommand>,
+    /// When true, send each sentence immediately instead of batching to 250 chars.
+    /// Use for streaming TTS where latency matters more than batching efficiency.
+    eager: bool,
+    /// When the buffer first received un-flushed content (for timer-based flush).
+    first_buffered: Option<std::time::Instant>,
 }
 
 impl SentenceAccumulator {
@@ -718,14 +742,53 @@ impl SentenceAccumulator {
             pending: String::new(),
             in_code_block: false,
             sentence_tx,
+            eager: false,
+            first_buffered: None,
         }
     }
 
-    /// Feed a text delta. Batched chunks are sent to the TTS thread when
-    /// accumulated sentences reach ~200 chars.
+    /// Create an accumulator that sends each sentence immediately for low-latency
+    /// streaming TTS. Also flushes partial text after 500ms if no sentence boundary
+    /// is found, so the user hears audio before the first period.
+    pub fn new_streaming(sentence_tx: std_mpsc::Sender<TtsCommand>) -> Self {
+        Self {
+            buffer: String::new(),
+            pending: String::new(),
+            in_code_block: false,
+            sentence_tx,
+            eager: true,
+            first_buffered: None,
+        }
+    }
+
+    /// Feed a text delta. Complete sentences are sent to the TTS thread immediately
+    /// in streaming mode. If no sentence boundary is found within 500ms, the buffer
+    /// is flushed as-is so the user hears audio before the first period.
     pub fn push(&mut self, delta: &str) {
         self.buffer.push_str(delta);
+        if self.first_buffered.is_none() && !self.buffer.trim().is_empty() {
+            self.first_buffered = Some(std::time::Instant::now());
+        }
         self.extract_sentences();
+        if self.eager && !self.in_code_block {
+            self.try_timeout_flush();
+        }
+    }
+
+    /// Flush buffer contents if 500ms has passed without a sentence boundary.
+    fn try_timeout_flush(&mut self) {
+        if let Some(t) = self.first_buffered {
+            if t.elapsed() >= std::time::Duration::from_millis(500)
+                && self.buffer.trim().len() > 20
+            {
+                let text = std::mem::take(&mut self.buffer);
+                let cleaned = strip_inline_markdown(text.trim());
+                if !cleaned.is_empty() {
+                    let _ = self.sentence_tx.send(TtsCommand::Synthesize(cleaned));
+                }
+                self.first_buffered = None;
+            }
+        }
     }
 
     /// Flush any remaining text and send Finish.
@@ -748,8 +811,14 @@ impl SentenceAccumulator {
         let _ = self.sentence_tx.send(TtsCommand::Finish);
     }
 
-    /// Add a sentence to the pending batch. Emits when batch reaches target size.
+    /// Add a sentence to the pending batch. Emits when batch reaches target size,
+    /// or immediately in eager (streaming) mode.
     fn enqueue_sentence(&mut self, sentence: &str) {
+        if self.eager {
+            let _ = self.sentence_tx.send(TtsCommand::Synthesize(sentence.to_string()));
+            self.first_buffered = None;
+            return;
+        }
         if self.pending.is_empty() {
             self.pending = sentence.to_string();
         } else if self.pending.len() + 1 + sentence.len() <= TTS_CHUNK_MAX_CHARS {

@@ -30,6 +30,15 @@ use crate::tui;
 use crate::utils::helpers::get_workspace_path;
 
 // ============================================================================
+// Streaming TTS type (feature-gated)
+// ============================================================================
+
+#[cfg(feature = "voice")]
+type TtsSentenceSender = Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>;
+#[cfg(not(feature = "voice"))]
+type TtsSentenceSender = Option<()>;
+
+// ============================================================================
 // Helpers (testable, pure-ish)
 // ============================================================================
 
@@ -150,7 +159,7 @@ pub(crate) async fn stream_and_render(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
 ) -> String {
-    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, false).await
+    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, false, None).await
 }
 
 /// Like `stream_and_render` but skips the user text erase-and-reprint.
@@ -163,8 +172,9 @@ pub(crate) async fn stream_and_render_voice(
     channel: &str,
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
+    tts_sentence_tx: Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>,
 ) -> String {
-    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, true).await
+    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, true, tts_sentence_tx).await
 }
 
 async fn stream_and_render_inner(
@@ -175,6 +185,7 @@ async fn stream_and_render_inner(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
     user_already_rendered: bool,
+    tts_tx: TtsSentenceSender,
 ) -> String {
     // Erase raw readline output and reprint user text in grey box (skip if caller already rendered).
     if !user_already_rendered && std::io::stdout().is_terminal() {
@@ -212,6 +223,10 @@ async fn stream_and_render_inner(
     let print_task = if let Some(mut tool_rx) = tool_rx_opt {
         tokio::spawn(async move {
             use std::io::Write as _;
+            #[cfg(feature = "voice")]
+            let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
+            #[cfg(not(feature = "voice"))]
+            let _ = tts_tx;
             let mut tool_lines = 0usize;
             let mut collected: Vec<String> = Vec::new();
             let mut delta_done = false;
@@ -227,8 +242,18 @@ async fn stream_and_render_inner(
                             Some(d) => {
                                 print!("{}", d);
                                 std::io::stdout().flush().ok();
+                                #[cfg(feature = "voice")]
+                                if let Some(ref mut acc) = tts_acc {
+                                    acc.push(&d);
+                                }
                             }
-                            None => delta_done = true,
+                            None => {
+                                delta_done = true;
+                                #[cfg(feature = "voice")]
+                                if let Some(acc) = tts_acc.take() {
+                                    acc.flush();
+                                }
+                            },
                         }
                     }
                     event = tool_rx.recv(), if !tool_done => {
@@ -302,9 +327,21 @@ async fn stream_and_render_inner(
     } else {
         tokio::spawn(async move {
             use std::io::Write as _;
+            #[cfg(feature = "voice")]
+            let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
+            #[cfg(not(feature = "voice"))]
+            let _ = tts_tx;
             while let Some(delta) = delta_rx.recv().await {
                 print!("{}", delta);
                 std::io::stdout().flush().ok();
+                #[cfg(feature = "voice")]
+                if let Some(ref mut acc) = tts_acc {
+                    acc.push(&delta);
+                }
+            }
+            #[cfg(feature = "voice")]
+            if let Some(acc) = tts_acc.take() {
+                acc.flush();
             }
             println!();
             (0usize, Vec::<String>::new())
@@ -751,23 +788,44 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 // Render user text with purple ● marker.
                                 print!("{}", syntax::render_turn(&text, syntax::TurnRole::VoiceUser));
 
-                                // Phase 2: LLM call with same rendering as text mode.
-                                let response = stream_and_render_voice(
+                                // Start streaming TTS pipeline BEFORE LLM call.
+                                let tts_parts = ctx.voice_session.as_mut()
+                                    .and_then(|vs| {
+                                        vs.clear_cancel();
+                                        vs.start_streaming_speak(&tts_lang_owned, None).ok()
+                                    });
+                                let (sentence_tx, join_handle) = match tts_parts {
+                                    Some((tx, jh)) => (Some(tx), Some(jh)),
+                                    None => (None, None),
+                                };
+
+                                // Phase 2: LLM call with parallel TTS feeding.
+                                let _response = stream_and_render_voice(
                                     &mut ctx.agent_loop, &text, &ctx.session_id,
                                     "voice", Some(&tts_lang_owned), &ctx.core_handle,
+                                    sentence_tx,
                                 ).await;
 
                                 ctx.drain_display();
                                 println!();
                                 ctx.print_status_bar().await;
 
-                                // Phase 3: Speak the response via TTS (borrows vs again).
-                                let tts_text = tui::strip_markdown_for_tts(&response);
-                                if !tts_text.is_empty() {
-                                    if let Some(ref mut vs) = ctx.voice_session {
-                                        if tui::speak_interruptible(vs, &tts_text, &tts_lang_owned) {
-                                            keep_recording = true;
+                                // Phase 3: Wait for TTS playback to finish.
+                                if let Some(jh) = join_handle {
+                                    let cancel = ctx.voice_session.as_ref()
+                                        .map(|vs| vs.cancel_flag())
+                                        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+                                    let done = Arc::new(AtomicBool::new(false));
+                                    let done2 = done.clone();
+                                    let watcher = tui::spawn_interrupt_watcher(cancel.clone(), done2);
+                                    let _ = jh.join();  // blocks until all audio played
+                                    done.store(true, Ordering::Relaxed);
+                                    let interrupted = watcher.join().unwrap_or(false);
+                                    if interrupted {
+                                        if let Some(ref mut vs) = ctx.voice_session {
+                                            vs.stop_playback();
                                         }
+                                        keep_recording = true;
                                     }
                                 }
                             }
@@ -813,6 +871,13 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 for ch in &ctx.active_channels {
                     ch.handle.abort();
                 }
+            }
+
+            // Shutdown voice session first — leaks native TTS engines to
+            // avoid C++ destructor segfault on exit.
+            #[cfg(feature = "voice")]
+            if let Some(vs) = ctx.voice_session.take() {
+                vs.shutdown();
             }
 
             // Cleanup: save readline history, kill servers
