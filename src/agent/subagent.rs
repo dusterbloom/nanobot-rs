@@ -40,6 +40,11 @@ pub struct SubagentManager {
     brave_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
+    is_local: bool,
+    /// Direct display channel for CLI/REPL mode. In gateway mode the bus
+    /// delivers results to channels, but in CLI mode nobody reads the bus
+    /// so we send directly to the terminal.
+    display_tx: Option<UnboundedSender<String>>,
     running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>)>>>,
 }
 
@@ -53,6 +58,7 @@ impl SubagentManager {
         brave_api_key: Option<String>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
+        is_local: bool,
     ) -> Self {
         Self {
             provider,
@@ -62,8 +68,16 @@ impl SubagentManager {
             brave_api_key,
             exec_timeout,
             restrict_to_workspace,
+            is_local,
+            display_tx: None,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Set the display channel for direct CLI/REPL result delivery.
+    pub fn with_display_tx(mut self, tx: UnboundedSender<String>) -> Self {
+        self.display_tx = Some(tx);
+        self
     }
 
     /// Spawn a background subagent task.
@@ -90,6 +104,8 @@ impl SubagentManager {
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
+        let is_local = self.is_local;
+        let display_tx = self.display_tx.clone();
         let running_tasks = self.running_tasks.clone();
         let tid = task_id.clone();
         let lbl = display_label.clone();
@@ -106,6 +122,7 @@ impl SubagentManager {
                 brave_api_key.as_deref(),
                 exec_timeout,
                 restrict_to_workspace,
+                is_local,
             )
             .await;
 
@@ -124,6 +141,15 @@ impl SubagentManager {
                 &origin_chat_id,
                 status,
             );
+
+            // In CLI mode, send directly to the terminal since the bus
+            // isn't consumed by process_direct().
+            if let Some(ref dtx) = display_tx {
+                let _ = dtx.send(format!(
+                    "\n\x1b[2m[subagent {} ({})]\x1b[0m {}: {}\n",
+                    lbl, tid, status, result_text
+                ));
+            }
 
             // Remove self from running tasks.
             let mut tasks = running_tasks.lock().await;
@@ -189,6 +215,7 @@ impl SubagentManager {
         brave_api_key: Option<&str>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
+        is_local: bool,
     ) -> anyhow::Result<String> {
         debug!("Subagent {} starting: {}", task_id, label);
 
@@ -269,6 +296,16 @@ impl SubagentManager {
                     let result = tools.execute(&tc.name, tc.arguments.clone()).await;
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
                 }
+
+                // Local models (llama-server) require conversations to end
+                // with a user message. Mistral/Ministral handle tool→generate
+                // natively and break if a user message is injected here.
+                if is_local {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "Based on the tool results above, continue with your task. Call more tools if needed, or provide your final answer."
+                    }));
+                }
             } else {
                 // No tool calls -- the subagent is done.
                 final_content = response.content.unwrap_or_default();
@@ -331,5 +368,161 @@ Your workspace is at: {workspace_str}
 - Do not try to communicate with users directly - your result will be announced by the main agent.
 - Be thorough but efficient. Do not perform unnecessary actions."#
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use crate::providers::base::{LLMResponse, ToolCallRequest};
+
+    /// Mock provider that captures messages and returns a tool call on first
+    /// call, then a text-only response on second call.
+    struct SubagentCapturingProvider {
+        captured: tokio::sync::Mutex<Vec<Vec<Value>>>,
+    }
+
+    impl SubagentCapturingProvider {
+        fn new() -> Self {
+            Self {
+                captured: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for SubagentCapturingProvider {
+        async fn chat(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+        ) -> anyhow::Result<LLMResponse> {
+            let mut captured = self.captured.lock().await;
+            let call_num = captured.len();
+            captured.push(messages.to_vec());
+
+            if call_num == 0 {
+                // First call: return a tool call (list_dir)
+                Ok(LLMResponse {
+                    content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "tc_1".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments: {
+                            let mut m = HashMap::new();
+                            m.insert("path".to_string(), json!("."));
+                            m
+                        },
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: HashMap::new(),
+                })
+            } else {
+                // Second call: done
+                Ok(LLMResponse {
+                    content: Some("Task complete.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: "stop".to_string(),
+                    usage: HashMap::new(),
+                })
+            }
+        }
+
+        fn get_default_model(&self) -> &str {
+            "subagent-mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subagent_adds_user_continuation_after_tool_results() {
+        let provider = Arc::new(SubagentCapturingProvider::new());
+        let workspace = tempfile::tempdir().unwrap().into_path();
+
+        let result = SubagentManager::_run_subagent(
+            "test-id",
+            "List the current directory",
+            "test-label",
+            provider.as_ref(),
+            &workspace,
+            "mock-model",
+            None,
+            5,
+            false,
+            false, // is_local
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Task complete.");
+
+        let captured = provider.captured.lock().await;
+        assert_eq!(captured.len(), 2, "Should have made 2 LLM calls");
+
+        // Second call's messages should end with tool results (NOT user
+        // continuation). Mistral/Ministral templates handle tool→generate
+        // natively and adding a user message breaks role alternation.
+        let second_call_msgs = &captured[1];
+        let last_msg = second_call_msgs.last().unwrap();
+        assert_eq!(
+            last_msg["role"].as_str(),
+            Some("tool"),
+            "Last message before second LLM call should be role:tool, got: {}",
+            last_msg
+        );
+
+        let roles: Vec<&str> = second_call_msgs
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        // Expected: system, user, assistant, tool
+        assert_eq!(roles.last(), Some(&"tool"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_no_tool_calls_returns_immediately() {
+        /// Provider that never returns tool calls
+        struct ImmediateProvider;
+
+        #[async_trait]
+        impl LLMProvider for ImmediateProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+            ) -> anyhow::Result<LLMResponse> {
+                Ok(LLMResponse {
+                    content: Some("Immediate answer.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: "stop".to_string(),
+                    usage: HashMap::new(),
+                })
+            }
+            fn get_default_model(&self) -> &str { "immediate" }
+        }
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let result = SubagentManager::_run_subagent(
+            "test-id",
+            "Simple question",
+            "test",
+            &ImmediateProvider,
+            &workspace,
+            "mock",
+            None,
+            5,
+            false,
+            false, // is_local
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, "Immediate answer.");
     }
 }

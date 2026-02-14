@@ -233,6 +233,7 @@ pub(crate) fn build_core_handle(
     local_port: &str,
     local_model_name: Option<&str>,
     compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
 ) -> SharedCoreHandle {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     let provider: Arc<dyn LLMProvider> = if is_local {
@@ -276,6 +277,18 @@ pub(crate) fn build_core_handle(
         None
     };
 
+    let dp: Option<Arc<dyn LLMProvider>> = if is_local {
+        delegation_port.map(|p| -> Arc<dyn LLMProvider> {
+            Arc::new(OpenAICompatProvider::new(
+                "local-delegation",
+                Some(&format!("http://localhost:{}/v1", p)),
+                None,
+            ))
+        })
+    } else {
+        None
+    };
+
     let core = build_shared_core(
         provider,
         config.workspace_path(),
@@ -292,6 +305,8 @@ pub(crate) fn build_core_handle(
         cp,
         config.tool_delegation.clone(),
         config.provenance.clone(),
+        config.agents.defaults.max_tool_result_chars,
+        dp,
     );
     Arc::new(std::sync::RwLock::new(Arc::new(core)))
 }
@@ -305,6 +320,7 @@ pub(crate) fn rebuild_core(
     local_port: &str,
     local_model_name: Option<&str>,
     compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
 ) {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     let provider: Arc<dyn LLMProvider> = if is_local {
@@ -348,6 +364,18 @@ pub(crate) fn rebuild_core(
         None
     };
 
+    let dp: Option<Arc<dyn LLMProvider>> = if is_local {
+        delegation_port.map(|p| -> Arc<dyn LLMProvider> {
+            Arc::new(OpenAICompatProvider::new(
+                "local-delegation",
+                Some(&format!("http://localhost:{}/v1", p)),
+                None,
+            ))
+        })
+    } else {
+        None
+    };
+
     let new_core = build_shared_core(
         provider,
         config.workspace_path(),
@@ -364,6 +392,8 @@ pub(crate) fn rebuild_core(
         cp,
         config.tool_delegation.clone(),
         config.provenance.clone(),
+        config.agents.defaults.max_tool_result_chars,
+        dp,
     );
     *handle.write().unwrap() = Arc::new(new_core);
 }
@@ -405,7 +435,7 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     let config = load_config(None);
     check_api_key(&config);
 
-    let core_handle = build_core_handle(&config, "8080", None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -539,7 +569,7 @@ pub(crate) fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -603,7 +633,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -724,7 +754,7 @@ pub(crate) fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }

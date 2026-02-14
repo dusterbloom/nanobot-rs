@@ -98,6 +98,10 @@ impl ToolRegistry {
             &["recall", "remember", "memory", "past", "previous", "earlier", "last time"],
             "recall",
         ),
+        (
+            &["skill", "capability", "how to", "technique", "method"],
+            "read_skill",
+        ),
     ];
 
     /// Get tool definitions filtered by relevance to the current context.

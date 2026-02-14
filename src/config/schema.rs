@@ -194,6 +194,9 @@ pub struct AgentDefaults {
     pub max_context_tokens: usize,
     #[serde(default = "default_max_concurrent_chats")]
     pub max_concurrent_chats: usize,
+    /// Max characters for inline tool results before truncation (default: 30000).
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
 }
 
 fn default_workspace() -> String {
@@ -224,6 +227,10 @@ fn default_max_concurrent_chats() -> usize {
     4
 }
 
+fn default_max_tool_result_chars() -> usize {
+    30000
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -234,6 +241,7 @@ impl Default for AgentDefaults {
             max_tool_iterations: default_max_tool_iterations(),
             max_context_tokens: default_max_context_tokens(),
             max_concurrent_chats: default_max_concurrent_chats(),
+            max_tool_result_chars: default_max_tool_result_chars(),
         }
     }
 }
@@ -424,6 +432,38 @@ pub struct MemoryConfig {
     /// Token threshold to trigger reflection (default: 20000).
     #[serde(default = "default_reflection_threshold")]
     pub reflection_threshold: usize,
+
+    /// Seconds of inactivity before auto-completing a working memory session (default: 3600).
+    #[serde(default = "default_session_complete_after_secs")]
+    pub session_complete_after_secs: u64,
+
+    /// Compaction threshold as a percentage of available context (default: 66.6%).
+    /// Compaction fires when this OR `compaction_threshold_tokens` is exceeded.
+    #[serde(default = "default_compaction_threshold_percent")]
+    pub compaction_threshold_percent: f64,
+
+    /// Compaction threshold in absolute tokens (default: 100000).
+    /// Compaction fires when this OR `compaction_threshold_percent` is exceeded.
+    /// For large contexts (1M), the percent threshold alone would be too late.
+    #[serde(default = "default_compaction_threshold_tokens")]
+    pub compaction_threshold_tokens: usize,
+
+    /// Maximum age (in turns) before messages are preferred for eviction (default: 50).
+    /// Messages older than this are dropped first during trim_to_fit.
+    #[serde(default = "default_max_message_age_turns")]
+    pub max_message_age_turns: usize,
+
+    /// Maximum number of user turns to load from session history (default: 10).
+    /// Working memory carries context from older turns, so loading fewer turns
+    /// saves context budget for the current conversation.
+    #[serde(default = "default_max_history_turns")]
+    pub max_history_turns: usize,
+
+    /// When true, skills are loaded as names+descriptions only (not full content).
+    /// The agent fetches full skill content on demand via the `read_skill` tool.
+    /// This keeps the system prompt lean (RLM pattern: context as variable).
+    #[serde(default)]
+    pub lazy_skills: bool,
 }
 
 fn default_true() -> bool {
@@ -436,6 +476,26 @@ fn default_observation_budget() -> usize {
 
 fn default_working_memory_budget() -> usize {
     1500
+}
+
+fn default_session_complete_after_secs() -> u64 {
+    3600
+}
+
+fn default_compaction_threshold_percent() -> f64 {
+    66.6
+}
+
+fn default_compaction_threshold_tokens() -> usize {
+    100_000
+}
+
+fn default_max_message_age_turns() -> usize {
+    50
+}
+
+fn default_max_history_turns() -> usize {
+    10
 }
 
 fn default_reflection_threshold() -> usize {
@@ -451,6 +511,12 @@ impl Default for MemoryConfig {
             observation_budget: default_observation_budget(),
             working_memory_budget: default_working_memory_budget(),
             reflection_threshold: default_reflection_threshold(),
+            session_complete_after_secs: default_session_complete_after_secs(),
+            compaction_threshold_percent: default_compaction_threshold_percent(),
+            compaction_threshold_tokens: default_compaction_threshold_tokens(),
+            max_message_age_turns: default_max_message_age_turns(),
+            max_history_turns: default_max_history_turns(),
+            lazy_skills: false,
         }
     }
 }
@@ -549,6 +615,26 @@ pub struct ToolDelegationConfig {
     /// Max tokens per runner LLM call (default: 4096).
     #[serde(default = "default_td_max_tokens")]
     pub max_tokens: u32,
+
+    /// Inject only truncated previews of tool results into the main context
+    /// instead of full output. The runner's summary carries the meaning.
+    /// Default: true (the whole point of delegation is context savings).
+    #[serde(default = "default_true")]
+    pub slim_results: bool,
+
+    /// Max chars per tool result preview injected into the main context
+    /// when `slim_results` is enabled (default: 200).
+    #[serde(default = "default_td_preview_chars")]
+    pub max_result_preview_chars: usize,
+
+    /// Auto-spawn a local delegation server when in local mode and no
+    /// explicit provider is configured (default: true).
+    #[serde(default = "default_true")]
+    pub auto_local: bool,
+}
+
+fn default_td_preview_chars() -> usize {
+    200
 }
 
 impl Default for ToolDelegationConfig {
@@ -559,6 +645,9 @@ impl Default for ToolDelegationConfig {
             provider: None,
             max_iterations: default_td_max_iterations(),
             max_tokens: default_td_max_tokens(),
+            slim_results: true,
+            max_result_preview_chars: default_td_preview_chars(),
+            auto_local: true,
         }
     }
 }
@@ -774,6 +863,9 @@ mod tests {
         assert!(td.provider.is_none());
         assert_eq!(td.max_iterations, 15);
         assert_eq!(td.max_tokens, 4096);
+        assert!(td.slim_results);
+        assert_eq!(td.max_result_preview_chars, 200);
+        assert!(td.auto_local);
     }
 
     #[test]
@@ -787,6 +879,9 @@ mod tests {
             }),
             max_iterations: 10,
             max_tokens: 2048,
+            slim_results: true,
+            max_result_preview_chars: 300,
+            auto_local: true,
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
@@ -863,5 +958,50 @@ mod tests {
         assert!(cfg.provenance.show_tool_calls); // default true
         assert!(cfg.provenance.strict_mode); // default true
         assert!(cfg.provenance.response_boundary); // default true
+    }
+
+    // -- auto_local config field tests --
+
+    #[test]
+    fn test_auto_local_defaults_to_true() {
+        // When auto_local is absent from JSON, it should default to true
+        let json = r#"{"enabled": true, "model": "small-model"}"#;
+        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
+        assert!(td.auto_local, "auto_local should default to true when absent");
+    }
+
+    #[test]
+    fn test_auto_local_explicit_false() {
+        let json = r#"{"enabled": true, "autoLocal": false}"#;
+        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
+        assert!(!td.auto_local, "auto_local should be false when explicitly set");
+    }
+
+    #[test]
+    fn test_auto_local_explicit_true() {
+        let json = r#"{"enabled": true, "autoLocal": true}"#;
+        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
+        assert!(td.auto_local);
+    }
+
+    #[test]
+    fn test_auto_local_in_root_config() {
+        // auto_local should be accessible through the root Config object
+        let json = r#"{"toolDelegation": {"enabled": true, "autoLocal": false}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.tool_delegation.enabled);
+        assert!(!cfg.tool_delegation.auto_local);
+    }
+
+    #[test]
+    fn test_auto_local_roundtrip_preserves_value() {
+        let td = ToolDelegationConfig {
+            enabled: true,
+            auto_local: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&td).unwrap();
+        let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
+        assert!(!td2.auto_local, "Roundtrip should preserve auto_local=false");
     }
 }

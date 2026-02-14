@@ -3,6 +3,8 @@
 //! Uses character-based estimation (1 token ~ 4 chars) rather than a
 //! tokenizer crate. Good enough for budget management.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 /// Manages the token budget for LLM context windows.
@@ -30,23 +32,15 @@ impl TokenBudget {
         self.max_context
     }
 
-    /// Backward-compatible no-op.
-    ///
-    /// Local tokenizer HTTP calls were removed to avoid blocking/brick behavior
-    /// when `/tokenize` is unavailable.
-    pub fn with_tokenizer_endpoint(self, _endpoint: Option<String>) -> Self {
-        self
-    }
-
     /// Estimate token count for a string (~4 chars per token).
     pub fn estimate_str_tokens(s: &str) -> usize {
         // Add 1 to avoid underestimating short strings.
         (s.len() + 3) / 4
     }
 
-    /// Estimate token count for a string (heuristic).
-    pub fn estimate_str_tokens_with_fallback(&self, s: &str) -> usize {
-        Self::estimate_str_tokens(s)
+    /// Estimate token count for a single message Value (public variant).
+    pub fn estimate_message_tokens_pub(msg: &Value) -> usize {
+        Self::estimate_message_tokens(msg)
     }
 
     /// Estimate token count for a single message Value.
@@ -89,30 +83,15 @@ impl TokenBudget {
         tokens
     }
 
-    /// Estimate token count for a single message (heuristic).
-    fn estimate_message_tokens_with_fallback(&self, msg: &Value) -> usize {
-        Self::estimate_message_tokens(msg)
-    }
-
     /// Estimate total tokens for a message array.
     pub fn estimate_tokens(messages: &[Value]) -> usize {
         messages.iter().map(Self::estimate_message_tokens).sum()
-    }
-
-    /// Estimate total tokens (heuristic).
-    pub fn estimate_tokens_with_fallback(&self, messages: &[Value]) -> usize {
-        Self::estimate_tokens(messages)
     }
 
     /// Estimate tokens for tool definitions.
     pub fn estimate_tool_def_tokens(tool_defs: &[Value]) -> usize {
         let json = serde_json::to_string(tool_defs).unwrap_or_default();
         Self::estimate_str_tokens(&json)
-    }
-
-    /// Estimate tool definition tokens (heuristic).
-    pub fn estimate_tool_def_tokens_with_fallback(&self, tool_defs: &[Value]) -> usize {
-        Self::estimate_tool_def_tokens(tool_defs)
     }
 
     /// Available budget for messages (after reserving response + tool defs).
@@ -124,19 +103,75 @@ impl TokenBudget {
 
     /// Trim message history to fit within the token budget.
     ///
-    /// Strategy (3 stages):
+    /// Strategy (4 stages):
     /// 1. **Soft**: Truncate old tool results to summaries.
+    /// 1.5. **Age-based**: Drop messages older than `max_age_turns` (if set).
     /// 2. **Medium**: Drop oldest history messages (keep system + recent).
     /// 3. **Hard**: Keep only system prompt + last user message + summary.
     ///
     /// The system prompt (first message) and the most recent user message
     /// (last message) are always preserved.
     pub fn trim_to_fit(&self, messages: &[Value], tool_def_tokens: usize) -> Vec<Value> {
+        self.trim_to_fit_with_age(messages, tool_def_tokens, 0, 0)
+    }
+
+    /// Like `trim_to_fit`, but with age-based eviction.
+    ///
+    /// `current_turn` is the current turn number (from learning_turn_counter).
+    /// `max_age_turns` is the maximum age in turns before a message is preferred
+    /// for eviction (0 = disabled).
+    pub fn trim_to_fit_with_age(
+        &self,
+        messages: &[Value],
+        tool_def_tokens: usize,
+        current_turn: u64,
+        max_age_turns: usize,
+    ) -> Vec<Value> {
         let budget = self.available_budget(tool_def_tokens);
         let mut msgs = messages.to_vec();
 
+        // Stage 0: Proactive age-based eviction — runs even when within budget.
+        // This prevents context rot from old messages accumulating in large windows.
+        if max_age_turns > 0 && current_turn > 0 && msgs.len() > 2 {
+            let age_threshold = current_turn.saturating_sub(max_age_turns as u64);
+            let last_idx = msgs.len() - 1;
+            msgs = msgs
+                .into_iter()
+                .enumerate()
+                .filter(|(i, m)| {
+                    if *i == 0 || *i == last_idx {
+                        return true;
+                    }
+                    if let Some(turn) = m.get("_turn").and_then(|v| v.as_u64()) {
+                        turn >= age_threshold
+                    } else {
+                        true
+                    }
+                })
+                .map(|(_, m)| m)
+                .collect();
+
+            // Remove orphaned tool results whose assistant was age-evicted.
+            let known_call_ids: HashSet<String> = msgs
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                .filter_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+                .flat_map(|tcs| tcs.iter())
+                .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect();
+            msgs.retain(|m| {
+                if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+                    return true;
+                }
+                m.get("tool_call_id")
+                    .and_then(|id| id.as_str())
+                    .map(|id| known_call_ids.contains(id))
+                    .unwrap_or(true) // keep tool msgs without tool_call_id (legacy)
+            });
+        }
+
         // Already within budget?
-        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+        if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
@@ -164,7 +199,7 @@ impl TokenBudget {
             }
         }
 
-        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+        if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
@@ -172,30 +207,71 @@ impl TokenBudget {
         // Keep: system (index 0) + last N messages that fit.
         if msgs.len() > 2 {
             let system_msg = msgs[0].clone();
-            let system_tokens = self.estimate_message_tokens_with_fallback(&system_msg);
+            let system_tokens = Self::estimate_message_tokens(&system_msg);
 
             let mut kept_tail: Vec<Value> = Vec::new();
             let mut tail_tokens = 0;
             let remaining_budget = budget.saturating_sub(system_tokens);
 
             // Walk backwards from the end, keeping messages that fit.
+            // Track tool_call IDs from skipped assistant messages so we also
+            // skip their orphaned tool results (protocol safety).
+            let mut skipped_call_ids: HashSet<String> = HashSet::new();
+
             for msg in msgs[1..].iter().rev() {
-                let msg_tokens = self.estimate_message_tokens_with_fallback(msg);
+                let msg_tokens = Self::estimate_message_tokens(msg);
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+                // Skip tool results whose assistant was already skipped.
+                if role == "tool" {
+                    if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                        if skipped_call_ids.contains(id) {
+                            continue;
+                        }
+                    }
+                }
+
                 if tail_tokens + msg_tokens <= remaining_budget {
                     kept_tail.push(msg.clone());
                     tail_tokens += msg_tokens;
                 } else {
-                    break;
+                    // Track tool_call IDs from skipped assistant messages.
+                    if role == "assistant" {
+                        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                            for tc in tcs {
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    skipped_call_ids.insert(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
             }
 
             kept_tail.reverse();
+
+            // Post-walk cleanup: remove tool results whose assistant was
+            // skipped. This catches cases where the backward walk saw the tool
+            // result before discovering its assistant would be skipped.
+            if !skipped_call_ids.is_empty() {
+                kept_tail.retain(|m| {
+                    if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+                        return true;
+                    }
+                    m.get("tool_call_id")
+                        .and_then(|id| id.as_str())
+                        .map(|id| !skipped_call_ids.contains(id))
+                        .unwrap_or(true)
+                });
+            }
+
             let mut result = vec![system_msg];
             result.extend(kept_tail);
             msgs = result;
         }
 
-        if self.estimate_tokens_with_fallback(&msgs) <= budget {
+        if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
@@ -343,6 +419,30 @@ mod tests {
     }
 
     #[test]
+    fn test_trim_stage2_skips_oversized_keeps_smaller() {
+        // One oversized message in the middle should be skipped, not block
+        // earlier messages from being kept.
+        let budget = TokenBudget::new(400, 50);
+        let mut messages = vec![json!({"role": "system", "content": "S"})];
+        // Small message.
+        messages.push(json!({"role": "user", "content": "tiny"}));
+        // Oversized message (fills most of the budget).
+        messages.push(json!({"role": "assistant", "content": "x".repeat(2000)}));
+        // Small message at the end.
+        messages.push(json!({"role": "user", "content": "latest"}));
+
+        let trimmed = budget.trim_to_fit(&messages, 10);
+        // The oversized message should be skipped, but both small messages
+        // should survive (system + tiny + latest).
+        let contents: Vec<&str> = trimmed
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(contents.contains(&"latest"), "latest message must survive");
+        assert!(contents.contains(&"tiny"), "earlier small message should survive when oversized one is skipped");
+    }
+
+    #[test]
     fn test_available_budget() {
         let budget = TokenBudget::new(128000, 8192);
         let available = budget.available_budget(2000);
@@ -364,10 +464,139 @@ mod tests {
     }
 
     #[test]
-    fn test_local_tokenizer_fallback_when_unavailable() {
-        let budget = TokenBudget::new(128000, 8192)
-            .with_tokenizer_endpoint(Some("http://127.0.0.1:1/tokenize".to_string()));
-        // Unreachable endpoint should gracefully fall back to heuristic.
-        assert_eq!(budget.estimate_str_tokens_with_fallback("hello"), 2);
+    fn test_age_based_eviction_drops_old_messages() {
+        // Budget is generous — age eviction should fire before size eviction.
+        let budget = TokenBudget::new(100_000, 8192);
+        let mut messages = vec![json!({"role": "system", "content": "System prompt"})];
+
+        // Add messages with turn tags. Turns 1-10 are "old", turn 50 is current.
+        for turn in 1..=10 {
+            messages.push(json!({"role": "user", "content": format!("Old msg turn {}", turn), "_turn": turn}));
+            messages.push(json!({"role": "assistant", "content": format!("Old reply {}", turn), "_turn": turn}));
+        }
+        // Recent messages.
+        messages.push(json!({"role": "user", "content": "Recent question", "_turn": 50}));
+
+        let original_count = messages.len();
+
+        // max_age_turns=10, current_turn=50 → threshold = 40. All turns 1-10 < 40 → evicted.
+        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+
+        // Old messages (turns 1-10) should be evicted, system + recent kept.
+        assert!(trimmed.len() < original_count, "should have evicted old messages");
+        assert_eq!(trimmed[0]["role"], "system");
+        let last = trimmed.last().unwrap();
+        assert_eq!(last["content"], "Recent question");
+    }
+
+    #[test]
+    fn test_age_based_eviction_keeps_recent_messages() {
+        let budget = TokenBudget::new(100_000, 8192);
+        let mut messages = vec![json!({"role": "system", "content": "System"})];
+
+        // All messages are recent (turns 45-50, threshold=40 with max_age=10, current=50).
+        for turn in 45..=50 {
+            messages.push(json!({"role": "user", "content": format!("Msg {}", turn), "_turn": turn}));
+        }
+
+        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+        // No eviction — all messages are within age window.
+        assert_eq!(trimmed.len(), messages.len());
+    }
+
+    #[test]
+    fn test_age_based_eviction_preserves_untagged_messages() {
+        let budget = TokenBudget::new(100_000, 8192);
+        let mut messages = vec![json!({"role": "system", "content": "System"})];
+
+        // Mix of tagged and untagged messages.
+        messages.push(json!({"role": "user", "content": "No turn tag"})); // no _turn
+        messages.push(json!({"role": "user", "content": "Old", "_turn": 1}));
+        messages.push(json!({"role": "user", "content": "Recent", "_turn": 50}));
+
+        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+        // Untagged message preserved, old tagged dropped.
+        let contents: Vec<&str> = trimmed.iter().filter_map(|m| m["content"].as_str()).collect();
+        assert!(contents.contains(&"No turn tag"), "untagged messages must survive");
+        assert!(contents.contains(&"Recent"), "recent messages must survive");
+        assert!(!contents.contains(&"Old"), "old tagged messages should be evicted");
+    }
+
+    #[test]
+    fn test_stage2_skips_tool_results_when_assistant_skipped() {
+        // Tight budget: system + large assistant+tool_calls should be skipped,
+        // and the tool result must also be skipped (not orphaned).
+        let budget = TokenBudget::new(300, 50);
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "question"}),
+            json!({
+                "role": "assistant", "content": "x".repeat(2000),
+                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc_1", "name": "read_file", "content": "data"}),
+            json!({"role": "user", "content": "latest question"}),
+        ];
+        let trimmed = budget.trim_to_fit(&messages, 10);
+        // The tool result should NOT survive if its assistant was dropped.
+        let has_orphan = trimmed.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("tool")
+                && !trimmed.iter().any(|a| {
+                    a.get("tool_calls")
+                        .and_then(|tc| tc.as_array())
+                        .map(|tcs| {
+                            tcs.iter().any(|t| {
+                                t.get("id").and_then(|i| i.as_str()) == Some("tc_1")
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+        });
+        assert!(!has_orphan, "Tool result must not survive when its assistant is dropped");
+    }
+
+    #[test]
+    fn test_age_eviction_removes_orphaned_tool_results() {
+        // Age-evict a user message at the start of a turn, which should also
+        // clean up the subsequent tool results from that turn's assistant.
+        let budget = TokenBudget::new(100_000, 8192);
+        let messages = vec![
+            json!({"role": "system", "content": "System"}),
+            // Old turn with tool calls — user gets _turn tag, assistant+tool don't.
+            json!({"role": "user", "content": "Old question", "_turn": 1}),
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "tc_old", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc_old", "name": "exec", "content": "result"}),
+            json!({"role": "assistant", "content": "Done with old task"}),
+            // Recent turn.
+            json!({"role": "user", "content": "New question", "_turn": 50}),
+        ];
+
+        let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
+        // The tool result for tc_old should be removed because its assistant survived
+        // but only if the assistant also got removed. Let's check for orphans.
+        for m in &trimmed {
+            if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                let tool_call_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                // Verify the matching assistant is also present.
+                let has_matching_assistant = trimmed.iter().any(|a| {
+                    a.get("tool_calls")
+                        .and_then(|tc| tc.as_array())
+                        .map(|tcs| {
+                            tcs.iter().any(|t| {
+                                t.get("id").and_then(|i| i.as_str()) == Some(tool_call_id)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                assert!(
+                    has_matching_assistant,
+                    "Tool result for '{}' is orphaned — its assistant was evicted",
+                    tool_call_id
+                );
+            }
+        }
     }
 }

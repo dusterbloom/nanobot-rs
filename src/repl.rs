@@ -124,6 +124,9 @@ pub(crate) fn print_help() {
     println!("  /agents, /a     - List running background agents");
     println!("  /kill <id>      - Cancel a background agent");
     println!("  /status, /s     - Show current mode, model, and channel info");
+    println!("  /context        - Show context breakdown (tokens, messages, memory)");
+    println!("  /memory         - Show working memory for current session");
+    println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
@@ -334,6 +337,8 @@ pub(crate) struct ServerState {
     pub llama_process: Option<std::process::Child>,
     pub compaction_process: Option<std::process::Child>,
     pub compaction_port: Option<String>,
+    pub delegation_process: Option<std::process::Child>,
+    pub delegation_port: Option<String>,
     pub local_port: String,
 }
 
@@ -343,6 +348,8 @@ impl ServerState {
             llama_process: None,
             compaction_process: None,
             compaction_port: None,
+            delegation_process: None,
+            delegation_port: None,
             local_port: port,
         }
     }
@@ -357,7 +364,7 @@ impl ServerState {
         server::kill_stale_llama_servers();
     }
 
-    /// Full shutdown: kill llama + compaction servers.
+    /// Full shutdown: kill llama + compaction + delegation servers.
     pub fn shutdown(&mut self) {
         if let Some(ref mut child) = self.llama_process {
             println!("Stopping llama.cpp server...");
@@ -366,6 +373,7 @@ impl ServerState {
         }
         self.llama_process = None;
         server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
+        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
     }
 }
 
@@ -415,6 +423,7 @@ pub(crate) fn apply_server_change(
         &state.local_port,
         model_path.file_name().and_then(|n| n.to_str()),
         state.compaction_port.as_deref(),
+        state.delegation_port.as_deref(),
     );
 }
 
@@ -525,7 +534,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
     runtime.block_on(async {
         // Create shared core and initial agent loop.
-        let core_handle = cli::build_core_handle(&config, &local_port, Some(server::DEFAULT_LOCAL_MODEL), None);
+        let core_handle = cli::build_core_handle(&config, &local_port, Some(server::DEFAULT_LOCAL_MODEL), None, None);
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
 
@@ -539,8 +548,11 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             }
         };
 
+        // Channel for subagents/background gateways to send display lines to the REPL.
+        let (display_tx, mut display_rx) = mpsc::unbounded_channel::<String>();
+
         let mut agent_loop = cli::create_agent_loop(
-            core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None,
+            core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()),
         );
 
         if let Some(msg) = message {
@@ -561,8 +573,6 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             let _ = rl.load_history(&history_path);
 
             let mut active_channels: Vec<ActiveChannel> = vec![];
-            // Channel for background gateways to send display lines to the REPL.
-            let (display_tx, mut display_rx) = mpsc::unbounded_channel::<String>();
 
             loop {
                 // Drain any pending display messages from background channels.
@@ -796,8 +806,11 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                             crate::LOCAL_MODE.store(true, Ordering::SeqCst);
                             let main_ctx = server::compute_optimal_context_size(&current_model_path);
                             server::start_compaction_if_available(&mut srv.compaction_process, &mut srv.compaction_port, main_ctx).await;
-                            cli::rebuild_core(&core_handle, &config, &srv.local_port, current_model_path.file_name().and_then(|n| n.to_str()), srv.compaction_port.as_deref());
-                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                            if config.tool_delegation.enabled && config.tool_delegation.auto_local && config.tool_delegation.provider.is_none() {
+                                server::start_delegation_if_available(&mut srv.delegation_process, &mut srv.delegation_port).await;
+                            }
+                            cli::rebuild_core(&core_handle, &config, &srv.local_port, current_model_path.file_name().and_then(|n| n.to_str()), srv.compaction_port.as_deref(), srv.delegation_port.as_deref());
+                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                             tui::print_mode_banner(&srv.local_port);
                         } else {
                             // Kill any orphaned servers from previous runs
@@ -809,8 +822,11 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 Ok(_) => {
                                     crate::LOCAL_MODE.store(true, Ordering::SeqCst);
                                     server::start_compaction_if_available(&mut srv.compaction_process, &mut srv.compaction_port, ctx_size).await;
+                                    if config.tool_delegation.enabled && config.tool_delegation.auto_local && config.tool_delegation.provider.is_none() {
+                                        server::start_delegation_if_available(&mut srv.delegation_process, &mut srv.delegation_port).await;
+                                    }
                                     apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                                    agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                    agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                                     tui::print_mode_banner(&srv.local_port);
                                 }
                                 Err(e) => {
@@ -824,7 +840,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         srv.shutdown();
                         crate::LOCAL_MODE.store(false, Ordering::SeqCst);
                         apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                        agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                        agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                         tui::print_mode_banner(&srv.local_port);
                     }
 
@@ -880,18 +896,18 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         match start_with_fallback(&mut srv, &current_model_path, ctx_size, Some((&previous_model_path, fallback_ctx))).await {
                             StartOutcome::Started => {
                                 apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                                 tui::print_mode_banner(&srv.local_port);
                             }
                             StartOutcome::Fallback => {
                                 current_model_path = previous_model_path.clone();
                                 apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                                 println!("  {}Restored previous model{}", tui::DIM, tui::RESET);
                             }
                             StartOutcome::CloudFallback => {
                                 apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                                agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                             }
                         }
                     } else {
@@ -931,12 +947,12 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     match start_with_fallback(&mut srv, &current_model_path, new_ctx, Some((&current_model_path, fallback_ctx))).await {
                         StartOutcome::Started | StartOutcome::Fallback => {
                             apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                             tui::print_mode_banner(&srv.local_port);
                         }
                         StartOutcome::CloudFallback => {
                             apply_server_change(&srv, &current_model_path, &core_handle, &config);
-                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), None);
+                            agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                         }
                     }
 
@@ -1289,7 +1305,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                             println!("\n  No audit entries to verify against.\n");
                         } else {
                             // Get last assistant response from session history.
-                            let history = core.sessions.get_history(&session_id, 10).await;
+                            let history = core.sessions.get_history(&session_id, 10, 0).await;
                             let last_response = history.iter().rev()
                                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                                 .and_then(|m| m.get("content").and_then(|c| c.as_str()));
@@ -1340,14 +1356,149 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         &srv.local_port,
                         current_model_path.file_name().and_then(|n| n.to_str()),
                         srv.compaction_port.as_deref(),
+                        srv.delegation_port.as_deref(),
                     );
                     agent_loop = cli::create_agent_loop(
-                        core_handle.clone(), &toggled_config, Some(cron_service.clone()), email_config.clone(), None,
+                        core_handle.clone(), &toggled_config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()),
                     );
                     if !was_enabled {
                         println!("\n  Provenance \x1b[32menabled\x1b[0m (tool calls visible, audit logging on)\n");
                     } else {
                         println!("\n  Provenance \x1b[33mdisabled\x1b[0m\n");
+                    }
+                    continue;
+                }
+
+                // Handle /context command — dump context state
+                if input == "/context" || input == "/ctx-info" {
+                    let core = core_handle.read().unwrap().clone();
+                    let used = core.last_context_used.load(Ordering::Relaxed) as usize;
+                    let max = core.last_context_max.load(Ordering::Relaxed) as usize;
+                    let msg_count = core.last_message_count.load(Ordering::Relaxed) as usize;
+                    let wm_tokens = core.last_working_memory_tokens.load(Ordering::Relaxed) as usize;
+                    let turn = core.learning_turn_counter.load(Ordering::Relaxed);
+                    let pct = if max > 0 { (used as f64 / max as f64) * 100.0 } else { 0.0 };
+
+                    // Estimate system prompt size from an empty message build.
+                    let system_prompt = core.context.build_messages(
+                        &[], "", None, None, Some("cli"), Some("repl"), false, None,
+                    );
+                    let system_tokens = if let Some(sys) = system_prompt.first() {
+                        crate::agent::token_budget::TokenBudget::estimate_message_tokens_pub(sys)
+                    } else {
+                        0
+                    };
+
+                    println!();
+                    println!("  {}Context Breakdown{}", tui::BOLD, tui::RESET);
+                    println!("  {}System prompt:    {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(system_tokens), tui::RESET);
+                    println!("  {}History:          {} {:>6} messages{}", tui::DIM, tui::RESET, msg_count, tui::RESET);
+                    println!("  {}Working memory:   {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(wm_tokens), tui::RESET);
+                    println!("  {}Turn:             {} {:>6}{}", tui::DIM, tui::RESET, turn, tui::RESET);
+                    println!("  {}─────────────────────────────{}", tui::DIM, tui::RESET);
+                    println!(
+                        "  {}Total:            {} {:>6} / {} tokens ({:.1}%){}",
+                        tui::DIM, tui::RESET,
+                        tui::format_thousands(used), tui::format_thousands(max),
+                        pct, tui::RESET
+                    );
+                    println!();
+                    continue;
+                }
+
+                // Handle /memory command — show working memory for current session
+                if input == "/memory" {
+                    let core = core_handle.read().unwrap().clone();
+                    if !core.memory_enabled {
+                        println!("\n  Memory system is disabled.\n");
+                    } else {
+                        let wm = core.working_memory.get_context(&session_id, usize::MAX);
+                        if wm.is_empty() {
+                            println!("\n  No working memory for this session.\n");
+                        } else {
+                            println!("\n  {}Working Memory (session: {}){}\n", tui::BOLD, session_id, tui::RESET);
+                            for line in wm.lines() {
+                                println!("  {}{}{}", tui::DIM, line, tui::RESET);
+                            }
+                            let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&wm);
+                            println!("\n  {}({} tokens){}\n", tui::DIM, tui::format_thousands(tokens), tui::RESET);
+                        }
+                        // Also show learning context if available.
+                        let learning = core.learning.get_learning_context();
+                        if !learning.is_empty() {
+                            println!("  {}Tool Patterns{}\n", tui::BOLD, tui::RESET);
+                            for line in learning.lines() {
+                                println!("  {}{}{}", tui::DIM, line, tui::RESET);
+                            }
+                            println!();
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle /replay command — show last turn's message array
+                if input.starts_with("/replay") {
+                    let core = core_handle.read().unwrap().clone();
+                    let arg = input.strip_prefix("/replay").unwrap_or("").trim();
+                    let history = core.sessions.get_history(&session_id, 200, 0).await;
+
+                    if history.is_empty() {
+                        println!("\n  No messages in session history.\n");
+                    } else if arg == "full" {
+                        // Show full content of all messages.
+                        println!("\n  {}Session replay ({} messages):{}\n", tui::BOLD, history.len(), tui::RESET);
+                        for (i, msg) in history.iter().enumerate() {
+                            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let has_tc = msg.get("tool_calls").is_some();
+                            let tc_id = msg.get("tool_call_id").and_then(|v| v.as_str());
+                            println!("  {}[{}]{} {} {}", tui::DIM, i, tui::RESET, role,
+                                if has_tc { "[+tool_calls]" } else if tc_id.is_some() { &format!("[tc:{}]", tc_id.unwrap()) } else { "" });
+                            if !content.is_empty() {
+                                let preview: String = content.chars().take(200).collect();
+                                for line in preview.lines() {
+                                    println!("    {}{}{}", tui::DIM, line, tui::RESET);
+                                }
+                                if content.len() > 200 {
+                                    println!("    {}...({} total chars){}", tui::DIM, content.len(), tui::RESET);
+                                }
+                            }
+                        }
+                        println!();
+                    } else if let Ok(idx) = arg.parse::<usize>() {
+                        // Show specific message.
+                        if idx >= history.len() {
+                            println!("\n  Message {} out of range (0..{}).\n", idx, history.len() - 1);
+                        } else {
+                            let msg = &history[idx];
+                            println!("\n  {}Message [{}]:{}\n", tui::BOLD, idx, tui::RESET);
+                            let pretty = serde_json::to_string_pretty(msg).unwrap_or_default();
+                            for line in pretty.lines() {
+                                println!("  {}", line);
+                            }
+                            println!();
+                        }
+                    } else {
+                        // Summary mode (default).
+                        println!("\n  {}Session replay ({} messages):{}\n", tui::BOLD, history.len(), tui::RESET);
+                        for (i, msg) in history.iter().enumerate() {
+                            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(content);
+                            let has_tc = msg.get("tool_calls").is_some();
+                            let name = msg.get("name").and_then(|n| n.as_str());
+                            let extra = if has_tc { " [+tool_calls]" }
+                                else if let Some(n) = name { &format!(" [{}]", n) }
+                                else { "" };
+                            let preview: String = content.chars().take(60).collect();
+                            let preview = preview.replace('\n', " ");
+                            println!(
+                                "  {}[{:>3}]{} {:<10} ({:>5} tok){} {}",
+                                tui::DIM, i, tui::RESET,
+                                role, tokens, extra, preview
+                            );
+                        }
+                        println!("\n  {}Usage: /replay full | /replay <N>{}\n", tui::DIM, tui::RESET);
                     }
                     continue;
                 }
@@ -1488,6 +1639,8 @@ mod tests {
         assert!(state.llama_process.is_none());
         assert!(state.compaction_process.is_none());
         assert!(state.compaction_port.is_none());
+        assert!(state.delegation_process.is_none());
+        assert!(state.delegation_port.is_none());
         assert_eq!(state.local_port, "8080");
     }
 
@@ -1507,6 +1660,8 @@ mod tests {
         assert!(state.llama_process.is_none());
         assert!(state.compaction_process.is_none());
         assert!(state.compaction_port.is_none());
+        assert!(state.delegation_process.is_none());
+        assert!(state.delegation_port.is_none());
     }
 
     #[test]

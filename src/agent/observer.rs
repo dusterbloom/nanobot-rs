@@ -9,7 +9,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use tracing::warn;
 
 use crate::agent::token_budget::TokenBudget;
@@ -39,44 +38,6 @@ impl ObservationStore {
             observations_dir,
             archived_dir,
         }
-    }
-
-    /// Save an observation summary to disk.
-    pub fn save(
-        &self,
-        summary: &str,
-        session_key: &str,
-        channel: Option<&str>,
-    ) -> anyhow::Result<PathBuf> {
-        ensure_dir(&self.observations_dir);
-
-        let now = Utc::now();
-        let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Sanitize session_key for filename (replace : and / with _).
-        let safe_key: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let filename = format!("{}_{}.md", now.format("%Y%m%dT%H%M%SZ"), safe_key,);
-        let path = self.observations_dir.join(&filename);
-
-        let channel_line = match channel {
-            Some(ch) => format!("channel: {}\n", ch),
-            None => String::new(),
-        };
-        let content = format!(
-            "---\ntimestamp: {}\nsession: {}\n{}---\n\n{}",
-            timestamp, session_key, channel_line, summary,
-        );
-
-        fs::write(&path, &content)?;
-        Ok(path)
     }
 
     /// Load recent observations, newest first.
@@ -220,19 +181,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = ObservationStore::new(tmp.path());
         (tmp, store)
-    }
-
-    #[test]
-    fn test_save_creates_observation_file() {
-        let (_tmp, store) = make_store();
-        let path = store
-            .save("User likes Rust.", "cli:default", Some("cli"))
-            .unwrap();
-        assert!(path.exists());
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("User likes Rust."));
-        assert!(content.contains("session: cli:default"));
-        assert!(content.contains("channel: cli"));
     }
 
     #[test]

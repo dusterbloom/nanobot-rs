@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
+use tracing::warn;
 
 /// Repair protocol violations in a message array.
 ///
@@ -22,17 +23,95 @@ pub fn repair_messages(messages: &mut Vec<Value>) {
         return;
     }
 
-    // Pass 1: Fix orphaned tool_use (assistant with tool_calls but missing results).
-    fix_orphaned_tool_calls(messages);
+    // Pass 0: Deduplicate tool results with the same tool_call_id.
+    // Keeps only the first result per ID. This prevents HTTP 400 errors when
+    // duplicate results are written due to stale new_start tracking.
+    dedup_tool_results(messages);
 
-    // Pass 2: Fix orphaned tool results (tool messages without matching assistant).
+    // Pass 1: Remove positionally-orphaned tool results (tool messages whose
+    // matching assistant doesn't PRECEDE them). Must run before fix_orphaned_tool_calls
+    // so that misplaced results don't suppress synthetic result generation.
     fix_orphaned_tool_results(messages);
+
+    // Pass 2: Fix orphaned tool_use (assistant with tool_calls but missing results).
+    // Runs after pass 1 because pass 1 may have removed misplaced results.
+    fix_orphaned_tool_calls(messages);
 
     // Pass 3: Merge consecutive user messages.
     merge_consecutive_user_messages(messages);
 
     // Pass 4: Ensure first non-system message is user role.
     ensure_user_first(messages);
+
+    // Pass 5: Ensure last message is not assistant role.
+    // The Anthropic OpenAI-compat endpoint rejects conversations ending with
+    // an assistant message ("does not support assistant message prefill").
+    ensure_not_ending_with_assistant(messages);
+
+    // Final validation: warn about any remaining protocol issues (shouldn't happen).
+    debug_validate(messages);
+}
+
+/// Log warnings for any remaining protocol violations after repair.
+/// This is a safety net for debugging — it doesn't modify messages.
+fn debug_validate(messages: &[Value]) {
+    let mut known_call_ids: HashSet<String> = HashSet::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        if role == "assistant" {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                for tc in tcs {
+                    if let Some(id) = tc.get("id").and_then(|id| id.as_str()) {
+                        known_call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        } else if role == "tool" {
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or_default();
+            if !call_id.is_empty() && !known_call_ids.contains(call_id) {
+                warn!(
+                    "PROTOCOL BUG: tool result at index {} has tool_call_id '{}' \
+                     not found in any preceding assistant's tool_calls",
+                    i, call_id
+                );
+            }
+        }
+    }
+}
+
+/// Remove duplicate tool results with the same `tool_call_id`.
+/// Keeps only the first result per ID.
+fn dedup_tool_results(messages: &mut Vec<Value>) {
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut remove_indices: Vec<usize> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        let call_id = msg
+            .get("tool_call_id")
+            .and_then(|id| id.as_str())
+            .unwrap_or_default();
+        if !call_id.is_empty() && !seen_ids.insert(call_id.to_string()) {
+            remove_indices.push(i);
+        }
+    }
+    for &i in remove_indices.iter().rev() {
+        warn!(
+            "Removing duplicate tool result at index {} (id: {})",
+            i,
+            messages[i]
+                .get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("?")
+        );
+        messages.remove(i);
+    }
 }
 
 /// Find assistant messages with tool_calls that don't have corresponding
@@ -95,37 +174,42 @@ fn fix_orphaned_tool_calls(messages: &mut Vec<Value>) {
 }
 
 /// Remove tool result messages that don't have a matching tool_call_id
-/// in any preceding assistant message.
+/// in a PRECEDING assistant message.
+///
+/// Uses a forward scan: tool_call_ids are only "known" once their
+/// assistant message has been seen, ensuring positional correctness.
 fn fix_orphaned_tool_results(messages: &mut Vec<Value>) {
-    // Collect all tool_call_ids from assistant messages.
+    // Forward scan: accumulate known_call_ids as we encounter assistants,
+    // then mark tool results whose ID hasn't been seen yet for removal.
     let mut known_call_ids: HashSet<String> = HashSet::new();
-    for msg in messages.iter() {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-            continue;
-        }
-        if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-            for tc in tool_calls {
-                if let Some(id) = tc.get("id").and_then(|id| id.as_str()) {
-                    known_call_ids.insert(id.to_string());
+    let mut remove_indices: Vec<usize> = Vec::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        if role == "assistant" {
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                for tc in tool_calls {
+                    if let Some(id) = tc.get("id").and_then(|id| id.as_str()) {
+                        known_call_ids.insert(id.to_string());
+                    }
                 }
+            }
+        } else if role == "tool" {
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .unwrap_or_default();
+            if call_id.is_empty() || !known_call_ids.contains(call_id) {
+                remove_indices.push(i);
             }
         }
     }
 
-    // Remove tool messages whose tool_call_id isn't in any assistant's tool_calls.
-    messages.retain(|msg| {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
-            return true;
-        }
-        let call_id = msg
-            .get("tool_call_id")
-            .and_then(|id| id.as_str())
-            .unwrap_or_default();
-        if call_id.is_empty() {
-            return false; // malformed tool result
-        }
-        known_call_ids.contains(call_id)
-    });
+    // Remove in reverse order to preserve indices.
+    for &i in remove_indices.iter().rev() {
+        messages.remove(i);
+    }
 }
 
 /// Merge consecutive user messages into a single message.
@@ -182,6 +266,25 @@ fn ensure_user_first(messages: &mut Vec<Value>) {
     }
 }
 
+/// Ensure the conversation does not end with an assistant message.
+/// The Anthropic OpenAI-compat endpoint rejects conversations that end
+/// with role "assistant" (treats it as unsupported prefill). If the last
+/// message is assistant, append a synthetic user continuation.
+fn ensure_not_ending_with_assistant(messages: &mut Vec<Value>) {
+    if let Some(last) = messages.last() {
+        let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role == "assistant" {
+            warn!(
+                "Messages end with assistant role — appending user continuation to prevent prefill error"
+            );
+            messages.push(json!({
+                "role": "user",
+                "content": "[system] Continue with the task."
+            }));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,10 +299,10 @@ mod tests {
 
     #[test]
     fn test_repair_valid_messages_unchanged() {
+        // Conversation ending with user (no assistant prefill issue).
         let mut messages = vec![
             json!({"role": "system", "content": "System prompt"}),
             json!({"role": "user", "content": "Hello"}),
-            json!({"role": "assistant", "content": "Hi there!"}),
         ];
         let original_len = messages.len();
         repair_messages(&mut messages);
@@ -254,10 +357,16 @@ mod tests {
         repair_messages(&mut messages);
 
         // The orphaned tool result should be removed.
-        assert_eq!(messages.len(), 3);
+        // Remaining: system + user + assistant + user(anti-prefill) = 4
+        assert_eq!(messages.len(), 4);
         assert!(!messages
             .iter()
             .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")));
+        assert_eq!(
+            messages.last().unwrap()["role"].as_str(),
+            Some("user"),
+            "Last message should be user continuation"
+        );
     }
 
     #[test]
@@ -273,7 +382,8 @@ mod tests {
         repair_messages(&mut messages);
 
         // Three user messages should be merged into one.
-        assert_eq!(messages.len(), 3);
+        // system + merged_user + assistant + user(anti-prefill) = 4
+        assert_eq!(messages.len(), 4);
         let user_content = messages[1]["content"].as_str().unwrap();
         assert!(user_content.contains("First message"));
         assert!(user_content.contains("Second message"));
@@ -318,9 +428,14 @@ mod tests {
             json!({"role": "assistant", "content": "Here's the file contents."}),
         ];
 
-        let original_len = messages.len();
         repair_messages(&mut messages);
-        assert_eq!(messages.len(), original_len);
+        // Original 5 + user(anti-prefill) = 6
+        assert_eq!(messages.len(), 6);
+        assert_eq!(
+            messages.last().unwrap()["role"].as_str(),
+            Some("user"),
+            "Last message should be user continuation"
+        );
     }
 
     #[test]
@@ -354,5 +469,167 @@ mod tests {
             .collect();
         assert_eq!(tool_msgs.len(), 2);
         assert!(tool_msgs.iter().any(|m| m["tool_call_id"] == "tc_2"));
+    }
+
+    #[test]
+    fn test_tool_result_before_its_assistant_is_removed() {
+        // A tool result that appears BEFORE its matching assistant should be
+        // treated as orphaned (positional violation).
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Hello"}),
+            // Tool result appears BEFORE its matching assistant.
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "content": "data"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+            json!({"role": "assistant", "content": "Done"}),
+        ];
+
+        repair_messages(&mut messages);
+
+        // The mispositioned tool result should be removed.
+        // fix_orphaned_tool_calls will then add a synthetic result after the assistant.
+        let tool_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .collect();
+        // Should have exactly 1 tool result (the synthetic one, AFTER the assistant).
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(
+            tool_msgs[0]["content"].as_str().unwrap().contains("interrupted"),
+            "Should be a synthetic result"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_matching_later_assistant_is_orphan() {
+        // Scenario from history windowing: tool result at the start of window,
+        // matching assistant exists later but the result precedes it.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "q1"}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_old",
+                "name": "exec",
+                "content": "old result"
+            }),
+            json!({"role": "user", "content": "q2"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_new", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_new",
+                "name": "exec",
+                "content": "new result"
+            }),
+            json!({"role": "assistant", "content": "Done"}),
+        ];
+
+        repair_messages(&mut messages);
+
+        // tc_old should be removed (no preceding assistant with that ID).
+        // tc_new should survive (its assistant precedes it).
+        let tool_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0]["tool_call_id"], "tc_new");
+    }
+
+    #[test]
+    fn test_dedup_tool_results() {
+        // Two tool results with the same tool_call_id — the second should be removed.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Do something"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_dup", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_dup",
+                "name": "exec",
+                "content": "first result"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_dup",
+                "name": "exec",
+                "content": "duplicate result written 14s later"
+            }),
+            json!({"role": "assistant", "content": "Done"}),
+        ];
+
+        repair_messages(&mut messages);
+
+        let tool_msgs: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 1, "Duplicate tool result should be removed");
+        assert_eq!(
+            tool_msgs[0]["content"].as_str().unwrap(),
+            "first result",
+            "First result should be kept"
+        );
+    }
+
+    #[test]
+    fn test_ensure_not_ending_with_assistant() {
+        // Messages ending with assistant should get a user continuation.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Hello"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "exec",
+                "content": "result"
+            }),
+            json!({"role": "assistant", "content": "Runner summary"}),
+        ];
+
+        repair_messages(&mut messages);
+
+        let last = messages.last().unwrap();
+        assert_eq!(
+            last["role"].as_str(),
+            Some("user"),
+            "Last message should be user, not assistant. Got: {}",
+            last
+        );
+    }
+
+    #[test]
+    fn test_not_ending_with_assistant_no_op_when_user() {
+        // Messages ending with user should not be modified.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Hello"}),
+        ];
+
+        let len_before = messages.len();
+        repair_messages(&mut messages);
+        assert_eq!(messages.len(), len_before);
     }
 }

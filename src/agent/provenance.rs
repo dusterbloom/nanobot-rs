@@ -524,6 +524,101 @@ pub fn redact_fabrications(text: &str, claims: &[AnnotatedClaim]) -> (String, us
     (result, count)
 }
 
+/// Result of phantom detection.
+pub struct PhantomDetection {
+    /// Warning text for the system message (next turn).
+    pub system_warning: String,
+    /// Matched phantom patterns.
+    pub matched_patterns: Vec<String>,
+}
+
+/// Detect phantom tool call claims — when the LLM mentions tool actions
+/// but no tools were actually called this turn.
+///
+/// Returns `Some(PhantomDetection)` if phantom claims are detected.
+pub fn detect_phantom_claims(response: &str, tools_called: &[String]) -> Option<PhantomDetection> {
+    if !tools_called.is_empty() {
+        return None; // Tools were actually called, no phantom possible.
+    }
+
+    // Patterns that suggest the LLM is referencing tool results.
+    let phantom_patterns = [
+        // Past-tense claims (the model already "did" something)
+        "I read the file",
+        "I ran the command",
+        "I executed",
+        "I searched for",
+        "I wrote to",
+        "I created the file",
+        "I checked",
+        "I verified",
+        "I updated",
+        "I edited",
+        "I deleted",
+        // Result claims without tool calls
+        "the file contains",
+        "the output shows",
+        "the result shows",
+        "the command returned",
+        "the search returned",
+        "here's what I found",
+        "here is the content",
+        "the content is",
+        // Promise-then-fabricate patterns ("Let me X" → fake output)
+        "let me check",
+        "let me read",
+        "let me write",
+        "let me create",
+        "let me run",
+        "let me search",
+        "let me verify",
+        "let me look",
+        // Fake tool output indicators
+        "```\n$",         // fake shell prompt in code block
+        "exit code:",     // fake exec output
+        "successfully edited",
+        "successfully created",
+        "successfully wrote",
+    ];
+
+    let lower = response.to_lowercase();
+    let matches: Vec<String> = phantom_patterns
+        .iter()
+        .filter(|p| lower.contains(&p.to_lowercase()))
+        .map(|p| p.to_string())
+        .collect();
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    let system_warning = format!(
+        "CRITICAL: You did not call any tools this turn, but your response contains \
+         {} phantom claim(s): [{}]. You MUST use tool calls to perform actions. \
+         Do not fabricate tool outputs. If you need to read a file, call read_file. \
+         If you need to run a command, call exec. Never generate fake results.",
+        matches.len(),
+        matches.join(", ")
+    );
+
+    Some(PhantomDetection {
+        system_warning,
+        matched_patterns: matches,
+    })
+}
+
+/// Prepend a visible phantom warning to the response text so the user
+/// knows the response contains unverified claims.
+pub fn annotate_phantom_response(response: &str, detection: &PhantomDetection) -> String {
+    format!(
+        "[PHANTOM WARNING: This response claims tool results but NO tools were called. \
+         Matched patterns: {}. Do not trust claims about file contents, command outputs, \
+         or system state in this response.]\n\n{}",
+        detection.matched_patterns.join(", "),
+        response
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +937,69 @@ mod tests {
         assert!(result.contains("BBB"));
         assert!(!result.contains("AAA"));
         assert!(!result.contains("CCC"));
+    }
+
+    // --- detect_phantom_claims ---
+
+    #[test]
+    fn test_phantom_detection_no_tools_with_claims() {
+        let result = detect_phantom_claims(
+            "I read the file and the output shows the configuration.",
+            &[], // no tools called
+        );
+        assert!(result.is_some(), "should detect phantom claims");
+        let detection = result.unwrap();
+        assert!(detection.matched_patterns.iter().any(|p| p.contains("I read the file")));
+        assert!(detection.matched_patterns.iter().any(|p| p.contains("the output shows")));
+    }
+
+    #[test]
+    fn test_phantom_detection_no_tools_no_claims() {
+        let result = detect_phantom_claims(
+            "Here is a general explanation of Rust ownership.",
+            &[],
+        );
+        assert!(result.is_none(), "should not detect phantom when no tool language used");
+    }
+
+    #[test]
+    fn test_phantom_detection_with_tools() {
+        let result = detect_phantom_claims(
+            "I read the file and it contains configuration data.",
+            &["read_file".to_string()],
+        );
+        assert!(result.is_none(), "should not flag when tools were actually called");
+    }
+
+    #[test]
+    fn test_phantom_detection_case_insensitive() {
+        let result = detect_phantom_claims(
+            "I EXECUTED the command successfully.",
+            &[],
+        );
+        assert!(result.is_some(), "should be case-insensitive");
+    }
+
+    #[test]
+    fn test_phantom_detection_let_me_patterns() {
+        let result = detect_phantom_claims(
+            "Let me check the file and show you the contents.\n\nThe file contains: foo bar baz",
+            &[],
+        );
+        assert!(result.is_some(), "should detect 'let me check' phantom pattern");
+        let detection = result.unwrap();
+        assert!(detection.matched_patterns.iter().any(|p| p.contains("let me check")));
+    }
+
+    #[test]
+    fn test_phantom_annotation() {
+        let detection = PhantomDetection {
+            system_warning: "test warning".to_string(),
+            matched_patterns: vec!["I read the file".to_string()],
+        };
+        let annotated = annotate_phantom_response("I read the file and it says hello.", &detection);
+        assert!(annotated.starts_with("[PHANTOM WARNING:"));
+        assert!(annotated.contains("I read the file"));
+        assert!(annotated.contains("and it says hello"));
     }
 }

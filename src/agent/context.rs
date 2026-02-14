@@ -29,6 +29,9 @@ pub struct ContextBuilder {
     pub long_term_memory_budget: usize,
     /// Whether to inject provenance verification rules into the system prompt.
     pub provenance_enabled: bool,
+    /// When true, all skills are loaded as summaries only (RLM lazy mode).
+    /// The agent uses `read_skill` to fetch full content on demand.
+    pub lazy_skills: bool,
 }
 
 impl ContextBuilder {
@@ -42,6 +45,7 @@ impl ContextBuilder {
             bootstrap_budget: 3000,
             long_term_memory_budget: 800,
             provenance_enabled: false,
+            lazy_skills: false,
         }
     }
 
@@ -58,6 +62,7 @@ impl ContextBuilder {
             bootstrap_budget: 500,
             long_term_memory_budget: 200,
             provenance_enabled: false,
+            lazy_skills: false,
         }
     }
 
@@ -98,7 +103,13 @@ impl ContextBuilder {
                  6. USE TOOL OUTPUT MARKERS — tool results are wrapped in [VERBATIM TOOL OUTPUT] \
                     blocks. Quote from these blocks directly.\n\n\
                  CONSEQUENCE: Claims that cannot be traced to an actual tool output will be \
-                 automatically removed from your response before the user sees it."
+                 automatically removed from your response before the user sees it.\n\n\
+                 CRITICAL ANTI-FABRICATION RULE:\n\
+                 Every \"let me\" is a PROMISE. \"Let me check\" REQUIRES a tool call immediately \
+                 after. \"Let me write\" REQUIRES a write_file call. If you say \"let me\" and then \
+                 generate text without calling the corresponding tool, you are FABRICATING. The system \
+                 will detect this and prepend a [PHANTOM WARNING] to your response. The user will see \
+                 that you lied. NEVER generate fake tool output in your text response."
                     .to_string(),
             );
         }
@@ -112,37 +123,46 @@ impl ContextBuilder {
 
         // Memory context (long-term facts only — observations, daily notes, and
         // learnings have been moved out of the system prompt).
+        // Use tail truncation so newest facts (appended by reflector) survive.
         let long_term =
-            Self::_truncate_to_budget(&self.memory.read_long_term(), self.long_term_memory_budget);
+            Self::_truncate_to_budget_tail(&self.memory.read_long_term(), self.long_term_memory_budget);
         if !long_term.is_empty() {
             parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
         }
 
-        // Skills -- progressive loading:
-        // 1. Always-loaded skills: full content included directly.
-        let always_skills = self.skills.get_always_skills();
-        if !always_skills.is_empty() {
-            let always_content = self.skills.load_skills_for_context(&always_skills);
-            if !always_content.is_empty() {
-                parts.push(format!("# Active Skills\n\n{}", always_content));
+        // Skills -- progressive loading (with lazy/RLM mode support):
+        let fetch_hint = if self.lazy_skills {
+            "Use the read_skill tool to load a skill's full instructions."
+        } else {
+            "To use a skill, read its SKILL.md file using the read_file tool."
+        };
+
+        if !self.lazy_skills {
+            // Eager mode: always-loaded skills get full content.
+            let always_skills = self.skills.get_always_skills();
+            if !always_skills.is_empty() {
+                let always_content = self.skills.load_skills_for_context(&always_skills);
+                if !always_content.is_empty() {
+                    parts.push(format!("# Active Skills\n\n{}", always_content));
+                }
             }
         }
+        // In lazy mode, always-skills appear in the summary below instead.
 
-        // 2. Available skills: summary only (agent can read_file for details).
+        // Available skills: summary only (name + description).
         let skills_summary = self.skills.build_skills_summary();
         if !skills_summary.is_empty() {
             parts.push(format!(
                 "# Skills\n\n\
-                 The following skills extend your capabilities. \
-                 To use a skill, read its SKILL.md file using the read_file tool.\n\
+                 The following skills extend your capabilities. {}\n\
                  Skills with available=\"false\" need dependencies installed first \
                  - you can try installing them with apt/brew.\n\n\
                  {}",
-                skills_summary
+                fetch_hint, skills_summary
             ));
         }
 
-        // 3. Explicitly requested skills.
+        // Explicitly requested skills (always loaded in full, even in lazy mode).
         if let Some(names) = skill_names {
             if !names.is_empty() {
                 let requested = self.skills.load_skills_for_context(names);
@@ -389,6 +409,28 @@ Always be helpful, accurate, and concise. When using tools, explain what you're 
         // Append text part after images.
         images.push(json!({"type": "text", "text": text}));
         Value::Array(images)
+    }
+
+    /// Truncate keeping the TAIL of the text (newest content).
+    ///
+    /// Used for MEMORY.md where the reflector appends new facts at the bottom.
+    fn _truncate_to_budget_tail(text: &str, max_tokens: usize) -> String {
+        if text.is_empty() || max_tokens == 0 {
+            return String::new();
+        }
+
+        if TokenBudget::estimate_str_tokens(text) <= max_tokens {
+            return text.to_string();
+        }
+
+        let max_chars = max_tokens.saturating_mul(4);
+        let marker = "[earlier memory truncated]\n\n";
+        let keep_chars = max_chars.saturating_sub(marker.len());
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(keep_chars);
+        let mut out = String::from(marker);
+        out.extend(text.chars().skip(skip));
+        out
     }
 
     /// Truncate a section to fit an approximate token budget.
@@ -714,6 +756,43 @@ mod tests {
         let content = messages[0]["content"].as_str().unwrap();
         assert!(content.contains("[VERBATIM TOOL OUTPUT"));
         assert!(content.contains("[END TOOL OUTPUT]"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_tail_keeps_newest() {
+        // Long text should keep the tail (newest facts).
+        let text = format!("OLD FACT\n{}\nNEW FACT", "x".repeat(4000));
+        let result = ContextBuilder::_truncate_to_budget_tail(&text, 40);
+        assert!(result.contains("NEW FACT"), "newest facts should survive tail truncation");
+        assert!(!result.contains("OLD FACT"), "oldest facts should be dropped");
+        assert!(result.contains("[earlier memory truncated]"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_tail_short_text_no_truncation() {
+        let text = "Short text.";
+        let result = ContextBuilder::_truncate_to_budget_tail(text, 100);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_truncate_to_budget_tail_empty() {
+        assert_eq!(ContextBuilder::_truncate_to_budget_tail("", 100), "");
+        assert_eq!(ContextBuilder::_truncate_to_budget_tail("hello", 0), "");
+    }
+
+    #[test]
+    fn test_build_system_prompt_memory_uses_tail_truncation() {
+        // Verify that with a tight budget, newest facts survive.
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        let content = format!("- OLD FACT 1\n{}\n- NEWEST FACT", "- filler\n".repeat(500));
+        fs::write(memory_dir.join("MEMORY.md"), &content).unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.long_term_memory_budget = 20; // very tight
+        let prompt = cb.build_system_prompt(None);
+        assert!(prompt.contains("NEWEST FACT"), "newest fact should survive tight budget");
     }
 
     #[test]

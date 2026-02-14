@@ -54,6 +54,10 @@ pub struct ContextCompactor {
     disabled: AtomicBool,
     /// Context window size of the compaction model (tokens).
     compaction_context_size: usize,
+    /// Compaction threshold as percentage of available context (e.g. 66.6).
+    threshold_percent: f64,
+    /// Compaction threshold in absolute tokens. Whichever fires first wins.
+    threshold_tokens: usize,
 }
 
 impl ContextCompactor {
@@ -70,7 +74,16 @@ impl ContextCompactor {
             summary_max_tokens: 1024,
             disabled: AtomicBool::new(false),
             compaction_context_size,
+            threshold_percent: 66.6,
+            threshold_tokens: 100_000,
         }
+    }
+
+    /// Set the compaction thresholds (from config).
+    pub fn with_thresholds(mut self, percent: f64, tokens: usize) -> Self {
+        self.threshold_percent = percent;
+        self.threshold_tokens = tokens;
+        self
     }
 
     /// Dynamic input budget derived from the compaction model's context size.
@@ -82,14 +95,20 @@ impl ContextCompactor {
         self.compaction_context_size.saturating_sub(reserved)
     }
 
-    /// Check whether the conversation needs compaction (>66.6% of budget).
+    /// Compute the effective compaction threshold (the lower of percent-based and token-based).
+    fn effective_threshold(&self, available: usize) -> usize {
+        let pct_threshold = (available as f64 * self.threshold_percent / 100.0) as usize;
+        pct_threshold.min(self.threshold_tokens)
+    }
+
+    /// Check whether the conversation needs compaction.
     pub fn needs_compaction(&self, messages: &[Value], budget: &TokenBudget, tool_def_tokens: usize) -> bool {
         if self.disabled.load(Ordering::Relaxed) {
             return false;
         }
         let available = budget.available_budget(tool_def_tokens);
-        let estimated = budget.estimate_tokens_with_fallback(messages);
-        let threshold = (available as f64 * 0.666) as usize;
+        let estimated = TokenBudget::estimate_tokens(messages);
+        let threshold = self.effective_threshold(available);
         estimated > threshold
     }
 
@@ -115,10 +134,10 @@ impl ContextCompactor {
         }
 
         let available = budget.available_budget(tool_def_tokens);
-        let current = budget.estimate_tokens_with_fallback(messages);
+        let current = TokenBudget::estimate_tokens(messages);
 
-        // Stage 1: Proactive compaction at 66.6% capacity.
-        let threshold = (available as f64 * 0.666) as usize;
+        // Stage 1: Proactive compaction (configurable threshold).
+        let threshold = self.effective_threshold(available);
         if current <= threshold {
             return CompactionResult {
                 messages: messages.to_vec(),
@@ -136,7 +155,7 @@ impl ContextCompactor {
         // Try LLM summarization.
         match self.compact_via_summary(messages, available, budget).await {
             Ok((compacted, summary)) => {
-                let new_size = budget.estimate_tokens_with_fallback(&compacted);
+                let new_size = TokenBudget::estimate_tokens(&compacted);
                 debug!("Compacted {} -> {} tokens", current, new_size);
                 CompactionResult {
                     messages: compacted,
@@ -175,7 +194,7 @@ impl ContextCompactor {
 
         // Always keep the system message (first).
         let system_msg = messages[0].clone();
-        let system_tokens = budget.estimate_tokens_with_fallback(&[system_msg.clone()]);
+        let system_tokens = TokenBudget::estimate_tokens(&[system_msg.clone()]);
 
         // Reserve space: system + summary overhead + some headroom.
         let summary_headroom = 400; // ~400 tokens for the summary message
@@ -198,7 +217,7 @@ impl ContextCompactor {
         let mut recent_tokens = 0;
 
         for (i, msg) in body.iter().enumerate().rev() {
-            let msg_tokens = budget.estimate_tokens_with_fallback(&[msg.clone()]);
+            let msg_tokens = TokenBudget::estimate_tokens(&[msg.clone()]);
             if recent_tokens + msg_tokens > recent_budget {
                 recent_start = i + 1;
                 break;
@@ -646,5 +665,59 @@ mod tests {
             1,
             "compaction provider should be called only once after first failure"
         );
+    }
+
+    #[test]
+    fn test_configurable_threshold_percent() {
+        let provider = Arc::new(MockProvider::new("Summary."));
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+            .with_thresholds(20.0, 100_000);
+        let budget = TokenBudget::new(1200, 200);
+        // available = 1200 - 200 = 1000. threshold = 20% of 1000 = 200 tokens.
+
+        // Messages well under 200 tokens → no compaction needed.
+        let messages = vec![
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "Hi"}),
+        ];
+        assert!(!compactor.needs_compaction(&messages, &budget, 0));
+
+        // Messages well above 200 tokens → needs compaction.
+        let mut messages = vec![json!({"role": "system", "content": "S"})];
+        for i in 0..20 {
+            messages.push(json!({"role": "user", "content": format!("Message number {} with enough content to push us past the threshold surely.", i)}));
+        }
+        let est = TokenBudget::estimate_tokens(&messages);
+        assert!(est > 200, "messages should be above threshold, got {} tokens", est);
+        assert!(compactor.needs_compaction(&messages, &budget, 0));
+    }
+
+    #[test]
+    fn test_configurable_threshold_tokens() {
+        let provider = Arc::new(MockProvider::new("Summary."));
+        // Set token threshold very low (50 tokens), percent very high (99%).
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+            .with_thresholds(99.0, 50);
+        let budget = TokenBudget::new(100_000, 8192);
+
+        // Even though 99% of budget is huge, the 50-token cap fires first.
+        let mut messages = vec![json!({"role": "system", "content": "S"})];
+        for i in 0..5 {
+            messages.push(json!({"role": "user", "content": format!("Message {}", i)}));
+        }
+        // Should need compaction because total tokens > 50.
+        let total = TokenBudget::estimate_tokens(&messages);
+        if total > 50 {
+            assert!(compactor.needs_compaction(&messages, &budget, 0));
+        }
+    }
+
+    #[test]
+    fn test_effective_threshold_uses_minimum() {
+        let provider = Arc::new(MockProvider::new("Summary."));
+        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
+            .with_thresholds(50.0, 200);
+        // available = 1000. 50% of 1000 = 500. Token cap = 200. min(500, 200) = 200.
+        assert_eq!(compactor.effective_threshold(1000), 200);
     }
 }

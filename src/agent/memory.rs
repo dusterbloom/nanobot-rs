@@ -5,9 +5,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 
-use crate::utils::helpers::{ensure_dir, today_date};
+use crate::utils::helpers::ensure_dir;
 
 /// Persistent memory store for the agent.
 pub struct MemoryStore {
@@ -31,38 +31,6 @@ impl MemoryStore {
         }
     }
 
-    /// Get path to today's memory file.
-    pub fn get_today_file(&self) -> PathBuf {
-        self.memory_dir.join(format!("{}.md", today_date()))
-    }
-
-    /// Read today's memory notes. Returns empty string if no file exists.
-    pub fn read_today(&self) -> String {
-        let today_file = self.get_today_file();
-        if today_file.exists() {
-            fs::read_to_string(&today_file).unwrap_or_default()
-        } else {
-            String::new()
-        }
-    }
-
-    /// Append content to today's memory notes.
-    ///
-    /// Creates the file with a date header if it does not exist yet.
-    pub fn append_today(&self, content: &str) {
-        let today_file = self.get_today_file();
-
-        let full_content = if today_file.exists() {
-            let existing = fs::read_to_string(&today_file).unwrap_or_default();
-            format!("{}\n{}", existing, content)
-        } else {
-            let header = format!("# {}\n\n", today_date());
-            format!("{}{}", header, content)
-        };
-
-        let _ = fs::write(&today_file, full_content);
-    }
-
     /// Read long-term memory (`MEMORY.md`).
     pub fn read_long_term(&self) -> String {
         if self.memory_file.exists() {
@@ -73,28 +41,14 @@ impl MemoryStore {
     }
 
     /// Write to long-term memory (`MEMORY.md`), replacing existing content.
+    ///
+    /// Uses atomic write (temp file + rename) to avoid corruption on crash.
     pub fn write_long_term(&self, content: &str) {
-        let _ = fs::write(&self.memory_file, content);
-    }
-
-    /// Get memories from the last N days, concatenated with separators.
-    pub fn get_recent_memories(&self, days: u32) -> String {
-        let today = Local::now().date_naive();
-        let mut memories: Vec<String> = Vec::new();
-
-        for i in 0..days {
-            let date = today - chrono::Duration::days(i64::from(i));
-            let date_str = date.format("%Y-%m-%d").to_string();
-            let file_path = self.memory_dir.join(format!("{}.md", date_str));
-
-            if file_path.exists() {
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    memories.push(content);
-                }
-            }
+        let tmp_path = self.memory_file.with_extension("md.tmp");
+        if fs::write(&tmp_path, content).is_err() {
+            return;
         }
-
-        memories.join("\n\n---\n\n")
+        let _ = fs::rename(&tmp_path, &self.memory_file);
     }
 
     /// List all memory files sorted by date (newest first).
@@ -124,28 +78,6 @@ impl MemoryStore {
         files
     }
 
-    /// Get memory context for the agent prompt.
-    ///
-    /// Combines long-term memory and today's notes.
-    pub fn get_memory_context(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-
-        let long_term = self.read_long_term();
-        if !long_term.is_empty() {
-            parts.push(format!("## Long-term Memory\n{}", long_term));
-        }
-
-        let today = self.read_today();
-        if !today.is_empty() {
-            parts.push(format!("## Today's Notes\n{}", today));
-        }
-
-        if parts.is_empty() {
-            String::new()
-        } else {
-            parts.join("\n\n")
-        }
-    }
 }
 
 #[cfg(test)]
@@ -204,94 +136,6 @@ mod tests {
         assert_eq!(store.read_long_term(), "second");
     }
 
-    // ----- append_today / read_today -----
-
-    #[test]
-    fn test_read_today_empty_initially() {
-        let (_tmp, store) = make_store();
-        assert_eq!(store.read_today(), "");
-    }
-
-    #[test]
-    fn test_append_today_creates_file_with_header() {
-        let (_tmp, store) = make_store();
-        store.append_today("Did something important.");
-        let content = store.read_today();
-        let today_str = today_date();
-        assert!(
-            content.contains(&today_str),
-            "today file should contain today's date in its header"
-        );
-        assert!(content.contains("Did something important."));
-    }
-
-    #[test]
-    fn test_append_today_appends() {
-        let (_tmp, store) = make_store();
-        store.append_today("Line 1");
-        store.append_today("Line 2");
-        let content = store.read_today();
-        assert!(content.contains("Line 1"));
-        assert!(content.contains("Line 2"));
-    }
-
-    // ----- get_memory_context -----
-
-    #[test]
-    fn test_get_memory_context_empty() {
-        let (_tmp, store) = make_store();
-        assert_eq!(store.get_memory_context(), "");
-    }
-
-    #[test]
-    fn test_get_memory_context_includes_long_term() {
-        let (_tmp, store) = make_store();
-        store.write_long_term("Likes cats.");
-        let ctx = store.get_memory_context();
-        assert!(ctx.contains("Long-term Memory"));
-        assert!(ctx.contains("Likes cats."));
-    }
-
-    #[test]
-    fn test_get_memory_context_includes_today() {
-        let (_tmp, store) = make_store();
-        store.append_today("Deployed v2.");
-        let ctx = store.get_memory_context();
-        assert!(ctx.contains("Today's Notes"));
-        assert!(ctx.contains("Deployed v2."));
-    }
-
-    #[test]
-    fn test_get_memory_context_combines_both() {
-        let (_tmp, store) = make_store();
-        store.write_long_term("Long-term note");
-        store.append_today("Daily note");
-        let ctx = store.get_memory_context();
-        assert!(ctx.contains("Long-term Memory"));
-        assert!(ctx.contains("Long-term note"));
-        assert!(ctx.contains("Today's Notes"));
-        assert!(ctx.contains("Daily note"));
-    }
-
-    // ----- get_recent_memories -----
-
-    #[test]
-    fn test_get_recent_memories_empty() {
-        let (_tmp, store) = make_store();
-        assert_eq!(store.get_recent_memories(7), "");
-    }
-
-    #[test]
-    fn test_get_recent_memories_includes_today() {
-        let (_tmp, store) = make_store();
-        store.append_today("Today's work");
-        let recent = store.get_recent_memories(1);
-        assert!(
-            recent.contains("Today's work"),
-            "get_recent_memories(1) should include today's file"
-        );
-    }
-
     // ----- list_memory_files -----
 
     #[test]
@@ -328,13 +172,4 @@ mod tests {
         assert_eq!(names[1], "2025-01-01.md");
     }
 
-    // ----- get_today_file -----
-
-    #[test]
-    fn test_get_today_file_path() {
-        let (_tmp, store) = make_store();
-        let today_file = store.get_today_file();
-        let expected_name = format!("{}.md", today_date());
-        assert!(today_file.ends_with(&expected_name));
-    }
 }

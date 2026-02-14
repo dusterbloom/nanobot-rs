@@ -287,6 +287,45 @@ impl Drop for AuditLockGuard {
     }
 }
 
+/// Per-turn audit summary for the structured turn log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnSummary {
+    pub turn: u64,
+    pub timestamp: String,
+    pub context_tokens: usize,
+    pub message_count: usize,
+    pub tools_called: Vec<TurnToolEntry>,
+    pub working_memory_tokens: usize,
+}
+
+/// Tool call summary within a turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnToolEntry {
+    pub name: String,
+    pub id: String,
+    pub ok: bool,
+    pub duration_ms: u64,
+    pub result_chars: usize,
+}
+
+/// Write a per-turn summary to the session audit JSONL.
+///
+/// Stored at `{workspace}/memory/audit/{session_key}.turns.jsonl`
+pub fn write_turn_summary(workspace: &Path, session_key: &str, summary: &TurnSummary) {
+    let audit_dir = workspace.join("memory").join("audit");
+    let _ = fs::create_dir_all(&audit_dir);
+    let safe_key: String = session_key
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = audit_dir.join(format!("{}.turns.jsonl", safe_key));
+    if let Ok(json) = serde_json::to_string(summary) {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{}", json);
+        }
+    }
+}
+
 /// Events emitted during tool execution for REPL display.
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
@@ -456,5 +495,46 @@ mod tests {
         let entries = log.get_entries();
         assert_eq!(entries[2].seq, 2);
         assert_eq!(entries[2].prev_hash, entries[1].hash);
+    }
+
+    #[test]
+    fn test_write_turn_summary() {
+        let tmp = TempDir::new().unwrap();
+        let summary = TurnSummary {
+            turn: 5,
+            timestamp: "2026-02-13T14:30:00Z".to_string(),
+            context_tokens: 12400,
+            message_count: 34,
+            tools_called: vec![
+                TurnToolEntry {
+                    name: "read_file".to_string(),
+                    id: "tc_1".to_string(),
+                    ok: true,
+                    duration_ms: 45,
+                    result_chars: 1200,
+                },
+                TurnToolEntry {
+                    name: "exec".to_string(),
+                    id: "tc_2".to_string(),
+                    ok: false,
+                    duration_ms: 120,
+                    result_chars: 340,
+                },
+            ],
+            working_memory_tokens: 820,
+        };
+
+        write_turn_summary(tmp.path(), "test-session", &summary);
+
+        // Read back and verify.
+        let path = tmp.path().join("memory").join("audit").join("test-session.turns.jsonl");
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: TurnSummary = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed.turn, 5);
+        assert_eq!(parsed.context_tokens, 12400);
+        assert_eq!(parsed.tools_called.len(), 2);
+        assert_eq!(parsed.tools_called[0].name, "read_file");
+        assert!(!parsed.tools_called[1].ok);
     }
 }

@@ -80,12 +80,27 @@ pub(crate) fn format_thousands(n: usize) -> String {
 // Status Bar & Banners
 // ============================================================================
 
+/// Format token count as compact string (e.g. 12430 -> "12.4K", 1200000 -> "1.2M").
+fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Print a compact status bar after each agent response.
+///
+/// Shows: ctx tokens/max | msgs | tools called | working memory | channels | agents | turn
 pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[&str], subagent_count: usize) {
     let core = core_handle.read().unwrap().clone();
     let used = core.last_context_used.load(Ordering::Relaxed) as usize;
     let max = core.last_context_max.load(Ordering::Relaxed) as usize;
     let turn = core.learning_turn_counter.load(Ordering::Relaxed);
+    let msg_count = core.last_message_count.load(Ordering::Relaxed) as usize;
+    let wm_tokens = core.last_working_memory_tokens.load(Ordering::Relaxed) as usize;
 
     let pct = if max > 0 { (used * 100) / max } else { 0 };
     let ctx_color = match pct {
@@ -95,13 +110,34 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
     };
 
     let mut parts: Vec<String> = Vec::new();
+
+    // Context: 12.4K/1M (colored by usage)
     parts.push(format!(
-        "ctx {}{}{}%{}",
+        "ctx {}{}{}/{}{}",
         ctx_color,
         BOLD,
-        pct,
+        format_tokens(used),
+        format_tokens(max),
         RESET
     ));
+
+    // Message count
+    parts.push(format!("msgs:{}", msg_count));
+
+    // Tools called this turn
+    let tools_called: Vec<String> = core.last_tools_called.lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if !tools_called.is_empty() {
+        let mut sorted = tools_called.clone();
+        sorted.sort();
+        parts.push(format!("tools:{} ({})", sorted.len(), sorted.join(", ")));
+    }
+
+    // Working memory tokens
+    if wm_tokens > 0 {
+        parts.push(format!("wm:{}tok", format_tokens(wm_tokens)));
+    }
 
     if !channel_names.is_empty() {
         parts.push(format!(

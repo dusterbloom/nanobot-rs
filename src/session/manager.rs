@@ -59,22 +59,75 @@ impl Session {
         self.updated_at = Local::now();
     }
 
-    /// Return the last `max_messages` messages in LLM format (just `role` +
-    /// `content`).
-    pub fn get_history(&self, max_messages: usize) -> Vec<Value> {
+    /// Return the last `max_messages` messages in LLM format.
+    ///
+    /// `max_turns` limits how many user turns to include (0 = no limit).
+    /// Preserves `tool_calls` on assistant messages and `tool_call_id` on
+    /// tool result messages so that resumed sessions include full tool context.
+    pub fn get_history(&self, max_messages: usize, max_turns: usize) -> Vec<Value> {
         let start = if self.messages.len() > max_messages {
             self.messages.len() - max_messages
         } else {
             0
         };
 
-        self.messages[start..]
+        // Advance past any orphaned tool results at the window boundary.
+        // A tool result at the boundary is orphaned because its matching
+        // assistant+tool_calls message was before the window and got dropped.
+        let mut safe_start = start;
+        while safe_start < self.messages.len() {
+            let role = self.messages[safe_start]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            if role == "tool" {
+                safe_start += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Turn-based limit: scan backward counting user messages as turn boundaries.
+        if max_turns > 0 {
+            let mut turns_seen = 0;
+            let mut turn_start = safe_start;
+            for i in (safe_start..self.messages.len()).rev() {
+                if self.messages[i]
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    == Some("user")
+                {
+                    turns_seen += 1;
+                    if turns_seen > max_turns {
+                        break;
+                    }
+                    turn_start = i;
+                }
+            }
+            safe_start = safe_start.max(turn_start);
+        }
+
+        self.messages[safe_start..]
             .iter()
             .map(|m| {
-                json!({
-                    "role": m.get("role").and_then(|v| v.as_str()).unwrap_or("user"),
+                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                let mut msg = json!({
+                    "role": role,
                     "content": m.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                })
+                });
+                // Preserve tool_calls on assistant messages.
+                if let Some(tc) = m.get("tool_calls") {
+                    msg["tool_calls"] = tc.clone();
+                }
+                // Preserve tool_call_id on tool result messages.
+                if let Some(id) = m.get("tool_call_id") {
+                    msg["tool_call_id"] = id.clone();
+                }
+                // Preserve name on tool result messages.
+                if let Some(name) = m.get("name") {
+                    msg["name"] = name.clone();
+                }
+                msg
             })
             .collect()
     }
@@ -115,10 +168,13 @@ impl SessionManager {
     }
 
     /// Get the history for a session, creating it if needed.
-    pub async fn get_history(&self, key: &str, max_messages: usize) -> Vec<Value> {
+    ///
+    /// `max_turns` limits how many user turns (conversation rounds) to load.
+    /// Set to 0 to disable turn-based limiting.
+    pub async fn get_history(&self, key: &str, max_messages: usize, max_turns: usize) -> Vec<Value> {
         let mut cache = self.cache.lock().await;
         let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
-        session.get_history(max_messages)
+        session.get_history(max_messages, max_turns)
     }
 
     /// Add a message to a session and persist it.
@@ -136,6 +192,22 @@ impl SessionManager {
         for &(role, content) in messages {
             session.add_message(role, content);
         }
+        Self::save_session(session, &self.sessions_dir);
+    }
+
+    /// Save a batch of raw JSON messages (preserving tool_calls, tool_call_id, etc.)
+    pub async fn add_messages_raw(&self, key: &str, messages: &[Value]) {
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        for msg in messages {
+            let mut m = msg.clone();
+            // Add timestamp if not present.
+            if m.get("timestamp").is_none() {
+                m["timestamp"] = json!(Local::now().to_rfc3339());
+            }
+            session.messages.push(m);
+        }
+        session.updated_at = Local::now();
         Self::save_session(session, &self.sessions_dir);
     }
 
@@ -258,8 +330,14 @@ impl SessionManager {
         }
 
         let content = lines.join("\n") + "\n";
-        if let Err(e) = fs::write(&path, content) {
-            warn!("Failed to save session {}: {}", session.key, e);
+        // Atomic write: write to temp file then rename to avoid corruption on crash.
+        let tmp_path = path.with_extension("jsonl.tmp");
+        if let Err(e) = fs::write(&tmp_path, &content) {
+            warn!("Failed to write temp session {}: {}", session.key, e);
+            return;
+        }
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            warn!("Failed to rename session {}: {}", session.key, e);
         }
     }
 
@@ -335,7 +413,7 @@ mod tests {
         session.add_message("assistant", "hi there");
         session.add_message("user", "how are you?");
 
-        let history = session.get_history(2);
+        let history = session.get_history(2, 0);
         assert_eq!(history.len(), 2);
         assert_eq!(
             history[0].get("role").and_then(|v| v.as_str()),
@@ -369,8 +447,48 @@ mod tests {
     async fn test_get_history_creates_session() {
         let tmp = std::env::temp_dir().join("nanobot_test_get_history");
         let mgr = SessionManager::new(&tmp);
-        let history = mgr.get_history("new:session", 100).await;
+        let history = mgr.get_history("new:session", 100, 0).await;
         assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_messages_raw_preserves_tool_calls() {
+        let tmp = std::env::temp_dir().join("nanobot_test_raw_tool_calls");
+        let mgr = SessionManager::new(&tmp);
+        let key = format!("test:raw_{}", uuid::Uuid::new_v4());
+
+        let messages = vec![
+            json!({"role": "user", "content": "Read /tmp/test.txt"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/tmp/test.txt\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "content": "file contents here"
+            }),
+            json!({"role": "assistant", "content": "The file contains: file contents here"}),
+        ];
+        mgr.add_messages_raw(&key, &messages).await;
+
+        let history = mgr.get_history(&key, 100, 0).await;
+        assert_eq!(history.len(), 4);
+
+        // Verify tool_calls preserved on assistant message.
+        let assistant_msg = &history[1];
+        assert!(assistant_msg.get("tool_calls").is_some(), "tool_calls should be preserved");
+
+        // Verify tool_call_id preserved on tool result message.
+        let tool_msg = &history[2];
+        assert_eq!(tool_msg.get("tool_call_id").and_then(|v| v.as_str()), Some("tc_1"));
+        assert_eq!(tool_msg.get("name").and_then(|v| v.as_str()), Some("read_file"));
     }
 
     #[tokio::test]
@@ -380,11 +498,94 @@ mod tests {
         // Use a unique key to avoid interference from previous test runs.
         let key = format!("test:add_{}", uuid::Uuid::new_v4());
         mgr.add_message_and_save(&key, "user", "hello").await;
-        let history = mgr.get_history(&key, 100).await;
+        let history = mgr.get_history(&key, 100, 0).await;
         assert_eq!(history.len(), 1);
         assert_eq!(
             history[0].get("content").and_then(|v| v.as_str()),
             Some("hello")
+        );
+    }
+
+    #[test]
+    fn test_get_history_skips_orphaned_tool_results_at_boundary() {
+        let mut session = Session::new("test");
+        // Build: user → assistant+tool_calls → tool result → assistant → user → assistant
+        session.messages.push(json!({"role": "user", "content": "q1"}));
+        session.messages.push(json!({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+        }));
+        session.messages.push(json!({"role": "tool", "tool_call_id": "tc_1", "name": "exec", "content": "ok"}));
+        session.messages.push(json!({"role": "assistant", "content": "Done"}));
+        session.messages.push(json!({"role": "user", "content": "q2"}));
+        session.messages.push(json!({"role": "assistant", "content": "answer"}));
+
+        // Window of 4: naive start=2 → messages[2] is the tool result (orphan).
+        // Protocol-safe windowing should skip it.
+        let history = session.get_history(4, 0);
+        assert!(
+            history.iter().all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool")),
+            "Orphaned tool results at window boundary should be skipped"
+        );
+        // Should have: assistant("Done"), user("q2"), assistant("answer") = 3 msgs
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn test_get_history_preserves_complete_tool_groups() {
+        let mut session = Session::new("test");
+        // assistant+tool_calls → tool result → user → assistant
+        session.messages.push(json!({
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]
+        }));
+        session.messages.push(json!({"role": "tool", "tool_call_id": "tc_1", "name": "read", "content": "data"}));
+        session.messages.push(json!({"role": "user", "content": "thanks"}));
+        session.messages.push(json!({"role": "assistant", "content": "you're welcome"}));
+
+        // All 4 messages fit — tool result is NOT orphaned because its assistant is in the window.
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 4);
+        let has_tool = history.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
+        assert!(has_tool, "Complete tool group should be preserved");
+    }
+
+    #[test]
+    fn test_get_history_turn_limited() {
+        let mut session = Session::new("test:turns");
+        // Build 6 turns: user → assistant × 6
+        for i in 0..6 {
+            session
+                .messages
+                .push(json!({"role": "user", "content": format!("question {}", i)}));
+            session
+                .messages
+                .push(json!({"role": "assistant", "content": format!("answer {}", i)}));
+        }
+        assert_eq!(session.messages.len(), 12);
+
+        // max_turns=3 should return only the last 3 turns (6 messages).
+        let history = session.get_history(100, 3);
+        assert_eq!(history.len(), 6);
+        assert_eq!(
+            history[0].get("content").and_then(|v| v.as_str()),
+            Some("question 3")
+        );
+        assert_eq!(
+            history[5].get("content").and_then(|v| v.as_str()),
+            Some("answer 5")
+        );
+
+        // max_turns=0 should return all messages (no turn limit).
+        let history_all = session.get_history(100, 0);
+        assert_eq!(history_all.len(), 12);
+
+        // max_turns=1 should return the last turn (2 messages).
+        let history_one = session.get_history(100, 1);
+        assert_eq!(history_one.len(), 2);
+        assert_eq!(
+            history_one[0].get("content").and_then(|v| v.as_str()),
+            Some("question 5")
         );
     }
 }

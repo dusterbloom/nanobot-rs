@@ -89,10 +89,14 @@ impl RecallTool {
             }
         }
 
-        // Search session files.
+        // Search session files (active + archived).
         let sessions_dir = memory_dir.join("sessions");
-        if sessions_dir.exists() {
-            if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
+        let search_dirs = [sessions_dir.clone(), sessions_dir.join("archived")];
+        for search_dir in &search_dirs {
+            if !search_dir.exists() {
+                continue;
+            }
+            if let Ok(mut entries) = tokio::fs::read_dir(search_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     if results.len() >= max_results {
                         break;
@@ -215,10 +219,11 @@ impl Tool for RecallTool {
         if sections.is_empty() {
             format!("No results found for '{}'.", query)
         } else {
-            // Truncate total output to avoid blowing context.
+            // Truncate total output to avoid blowing context (UTF-8 safe).
             let output = sections.join("\n\n");
             if output.len() > 8000 {
-                format!("{}\n\n[truncated — {} total chars]", &output[..8000], output.len())
+                let truncated: String = output.chars().take(8000).collect();
+                format!("{}\n\n[truncated — {} total chars]", truncated, output.len())
             } else {
                 output
             }
@@ -300,6 +305,36 @@ mod tests {
         // Test the grep_memory fallback directly (bypasses qmd).
         let result = tool.grep_memory("nonexistent_xyz_123_qqq", 5).await;
         assert!(result.contains("No matches found"));
+    }
+
+    #[tokio::test]
+    async fn test_recall_grep_finds_archived_sessions() {
+        let (tmp, tool) = make_tool();
+        let archived_dir = tmp.path().join("memory").join("sessions").join("archived");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        std::fs::write(
+            archived_dir.join("SESSION_old.md"),
+            "---\nsession_key: \"cli:old\"\nstatus: archived\n---\n\nDiscussed UTF-8 encoding.",
+        ).unwrap();
+
+        // Test grep_memory directly to bypass qmd.
+        let result = tool.grep_memory("UTF-8", 10).await;
+        assert!(result.contains("UTF-8"), "Should find UTF-8 in archived session file: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_recall_utf8_truncation_no_panic() {
+        let (tmp, tool) = make_tool();
+        // Write a MEMORY.md with multi-byte UTF-8 characters that would panic with byte slicing.
+        let cjk_content = "日本語テスト\n".repeat(2000); // ~12K chars of CJK
+        std::fs::write(
+            tmp.path().join("memory").join("MEMORY.md"),
+            &cjk_content,
+        ).unwrap();
+
+        // Test grep_memory directly — the old &output[..8000] byte slice would panic on CJK.
+        let result = tool.grep_memory("日本語", 10).await;
+        assert!(result.contains("日本語"), "Should find CJK text: {}", &result[..result.len().min(200)]);
     }
 
     #[tokio::test]

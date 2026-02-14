@@ -68,3 +68,22 @@ Tools implement the `Tool` trait (`agent/tools/base.rs`): `name()`, `description
 ### Skills
 
 Markdown files at `{workspace}/skills/{name}/SKILL.md` with optional YAML frontmatter (description, requires, always). Workspace skills shadow built-in skills. Skills with `always: true` are loaded into every prompt; others appear as summaries the agent can read on demand.
+
+### Local LLM Protocol Constraints
+
+Local models (llama-server) have stricter message protocol than cloud APIs:
+
+- Conversations **MUST** end with a `role: "user"` message
+- Assistant message prefill is **NOT** supported
+- Tool result messages (`role: "tool"`) cannot be the last message
+
+After adding tool results to any message array, always append a user continuation before calling the LLM:
+
+```rust
+messages.push(json!({
+    "role": "user",
+    "content": "Based on the tool results above, continue with the task."
+}));
+```
+
+**Affected code paths:** `tool_runner.rs`, `subagent.rs`, `agent_loop.rs` (inline path, conditional on `is_local`). Any new code path that builds message arrays with tool results must follow this pattern.

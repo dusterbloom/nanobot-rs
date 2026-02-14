@@ -207,6 +207,131 @@ pub(crate) fn stop_compaction_server(
     *compaction_port = None;
 }
 
+// ============================================================================
+// Delegation server (auto-spawned for tool delegation in local mode)
+// ============================================================================
+
+/// Model preferences for the auto-spawned delegation server, in priority order.
+/// The first model found in `~/models/` wins.
+const DELEGATION_MODEL_PREFERENCES: &[&str] = &[
+    "Ministral-8B",
+    "Ministral-3",
+    "Nemotron-Nano-9B",
+];
+
+/// Find a suitable delegation model from `~/models/` using the preference list.
+///
+/// Scans `list_local_models()` and returns the first match against
+/// `DELEGATION_MODEL_PREFERENCES` (case-insensitive substring match).
+pub(crate) fn find_delegation_model() -> Option<PathBuf> {
+    pick_preferred_model(&list_local_models(), DELEGATION_MODEL_PREFERENCES)
+}
+
+/// Pure priority-matching: given a list of model paths and an ordered preference
+/// list, return the first model that matches the highest-priority preference
+/// (case-insensitive substring match on filename).
+fn pick_preferred_model(models: &[PathBuf], preferences: &[&str]) -> Option<PathBuf> {
+    for pref in preferences {
+        let pref_lower = pref.to_lowercase();
+        if let Some(m) = models.iter().find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_lowercase().contains(&pref_lower))
+                .unwrap_or(false)
+        }) {
+            return Some(m.clone());
+        }
+    }
+    None
+}
+
+/// Start the dedicated delegation server if a suitable model is available.
+///
+/// Spawns a GPU-accelerated llama-server on port 8091+ with a small context
+/// window (4096 tokens — tool work is short). Uses 10 GPU layers to avoid
+/// competing with the main model for VRAM.
+pub(crate) async fn start_delegation_if_available(
+    delegation_process: &mut Option<Child>,
+    delegation_port: &mut Option<String>,
+) {
+    // Already running?
+    if delegation_process.is_some() {
+        return;
+    }
+
+    let model_path = match find_delegation_model() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let model_name = model_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("delegation-model");
+    let port = find_available_port(8091);
+    let ctx_size = 4096; // Tool work is short — no need for large context
+
+    println!(
+        "  {}{}Starting{} delegation server ({}, port {}, ctx: {}K, GPU)...",
+        crate::tui::BOLD,
+        crate::tui::YELLOW,
+        crate::tui::RESET,
+        model_name,
+        port,
+        ctx_size / 1024,
+    );
+
+    match spawn_compaction_server(port, &model_path, ctx_size) {
+        Ok(child) => {
+            *delegation_process = Some(child);
+            if wait_for_server_ready(port, 30, delegation_process).await {
+                *delegation_port = Some(port.to_string());
+                println!(
+                    "  {}{}Delegation server ready{} ({} on GPU)",
+                    crate::tui::BOLD,
+                    crate::tui::GREEN,
+                    crate::tui::RESET,
+                    model_name,
+                );
+            } else {
+                println!(
+                    "  {}{}Delegation server failed to start{} (tool delegation will use main model)",
+                    crate::tui::BOLD,
+                    crate::tui::YELLOW,
+                    crate::tui::RESET,
+                );
+                if let Some(ref mut child) = delegation_process {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                *delegation_process = None;
+            }
+        }
+        Err(e) => {
+            println!(
+                "  {}{}Delegation server failed:{} {} (tool delegation will use main model)",
+                crate::tui::BOLD,
+                crate::tui::YELLOW,
+                crate::tui::RESET,
+                e,
+            );
+        }
+    }
+}
+
+/// Stop the delegation server and clear state.
+pub(crate) fn stop_delegation_server(
+    delegation_process: &mut Option<Child>,
+    delegation_port: &mut Option<String>,
+) {
+    if let Some(ref mut child) = delegation_process {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    *delegation_process = None;
+    *delegation_port = None;
+}
+
 /// Kill any orphaned llama-server processes from previous runs.
 pub(crate) fn kill_stale_llama_servers() {
     // Kill any orphaned llama-server processes from previous runs
@@ -515,6 +640,10 @@ pub(crate) fn spawn_compaction_server(
         .arg("10")
         .arg("--flash-attn")
         .arg("on")
+        // Jinja required for tool calling (Mistral/Ministral templates).
+        .arg("--jinja")
+        // Prevent prefill errors when conversation ends with tool results.
+        .arg("--no-prefill-assistant")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -553,6 +682,10 @@ pub(crate) fn spawn_llama_server(
         .arg("99")
         .arg("--flash-attn")
         .arg("on")
+        // Jinja required for tool calling (Mistral/Ministral templates).
+        .arg("--jinja")
+        // Prevent prefill errors when conversation ends with tool results.
+        .arg("--no-prefill-assistant")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1103,5 +1236,195 @@ mod tests {
         } else {
             eprintln!("  No GPU detected. RAM: {:.1} GB", ram as f64 / 1e9);
         }
+    }
+
+    // -- find_delegation_model / pick_preferred_model tests --
+
+    #[test]
+    fn test_find_delegation_model_preference_constants() {
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-8B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "Ministral-3");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Nemotron-Nano-9B");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_empty_list() {
+        let models: Vec<PathBuf> = vec![];
+        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
+    }
+
+    #[test]
+    fn test_pick_preferred_model_no_match() {
+        let models = vec![
+            PathBuf::from("/models/llama-70B.gguf"),
+            PathBuf::from("/models/qwen-7B.gguf"),
+        ];
+        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
+    }
+
+    #[test]
+    fn test_pick_preferred_model_single_match() {
+        let models = vec![
+            PathBuf::from("/models/llama-70B.gguf"),
+            PathBuf::from("/models/Nemotron-Nano-9B-Q4.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert_eq!(
+            result.as_deref(),
+            Some(Path::new("/models/Nemotron-Nano-9B-Q4.gguf"))
+        );
+    }
+
+    #[test]
+    fn test_pick_preferred_model_priority_ordering() {
+        // Both Ministral-8B and Nemotron present — Ministral-8B wins (higher priority)
+        let models = vec![
+            PathBuf::from("/models/Nemotron-Nano-9B-v2-Q4_K_M.gguf"),
+            PathBuf::from("/models/Ministral-8B-Instruct-2410-Q4_K_M.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(
+            result.as_ref().unwrap().to_string_lossy().contains("Ministral-8B"),
+            "Ministral-8B should beat Nemotron, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pick_preferred_model_all_three_present() {
+        let models = vec![
+            PathBuf::from("/models/Nemotron-Nano-9B.gguf"),
+            PathBuf::from("/models/Ministral-3-Q4.gguf"),
+            PathBuf::from("/models/Ministral-8B-Q4.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(
+            result.as_ref().unwrap().to_string_lossy().contains("Ministral-8B"),
+            "Ministral-8B is highest priority, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pick_preferred_model_case_insensitive() {
+        let models = vec![
+            PathBuf::from("/models/MINISTRAL-8B-INSTRUCT.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(result.is_some(), "Should match case-insensitively");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_mixed_case() {
+        let models = vec![
+            PathBuf::from("/models/ministral-8b-instruct-Q4_K_M.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(result.is_some(), "Should match lowercase filename against mixed-case preference");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_substring_match() {
+        // "Ministral-3" should match "Ministral-3B-Instruct-Q4.gguf" via substring
+        let models = vec![
+            PathBuf::from("/models/Ministral-3B-Instruct-Q4.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(result.is_some(), "Substring match should work");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_empty_preferences() {
+        let models = vec![PathBuf::from("/models/anything.gguf")];
+        let prefs: &[&str] = &[];
+        assert!(pick_preferred_model(&models, prefs).is_none());
+    }
+
+    #[test]
+    fn test_find_delegation_model_uses_real_filesystem() {
+        // Integration test: delegates to pick_preferred_model with real ~/models/
+        let result = find_delegation_model();
+        if let Some(ref path) = result {
+            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+            let matches_any = DELEGATION_MODEL_PREFERENCES
+                .iter()
+                .any(|pref| name.contains(&pref.to_lowercase()));
+            assert!(matches_any, "Real match '{}' should be in preferences", name);
+            eprintln!("  Found delegation model: {}", path.display());
+        } else {
+            eprintln!("  No delegation model in ~/models/ (OK in CI)");
+        }
+    }
+
+    // -- stop_delegation_server tests --
+
+    #[test]
+    fn test_stop_delegation_server_clears_state() {
+        let mut process: Option<Child> = None;
+        let mut port: Option<String> = Some("8091".to_string());
+
+        stop_delegation_server(&mut process, &mut port);
+
+        assert!(process.is_none());
+        assert!(port.is_none());
+    }
+
+    #[test]
+    fn test_stop_delegation_server_noop_when_empty() {
+        let mut process: Option<Child> = None;
+        let mut port: Option<String> = None;
+
+        // Should not panic when nothing to stop
+        stop_delegation_server(&mut process, &mut port);
+
+        assert!(process.is_none());
+        assert!(port.is_none());
+    }
+
+    #[test]
+    fn test_stop_delegation_server_kills_real_process() {
+        // Spawn a harmless process, then stop it
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if let Ok(child) = child {
+            let pid = child.id();
+            let mut process = Some(child);
+            let mut port = Some("8091".to_string());
+
+            stop_delegation_server(&mut process, &mut port);
+
+            assert!(process.is_none());
+            assert!(port.is_none());
+
+            // Verify the process is actually dead
+            let status = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status();
+            // kill -0 should fail (process doesn't exist)
+            if let Ok(s) = status {
+                assert!(!s.success(), "Process {} should be dead after stop", pid);
+            }
+        }
+    }
+
+    // -- Delegation vs compaction server symmetry --
+
+    #[test]
+    fn test_stop_delegation_mirrors_stop_compaction() {
+        // Both stop functions should behave identically for state cleanup
+        let mut d_process: Option<Child> = None;
+        let mut d_port: Option<String> = Some("8091".to_string());
+        let mut c_process: Option<Child> = None;
+        let mut c_port: Option<String> = Some("8090".to_string());
+
+        stop_delegation_server(&mut d_process, &mut d_port);
+        stop_compaction_server(&mut c_process, &mut c_port);
+
+        assert_eq!(d_process.is_none(), c_process.is_none());
+        assert_eq!(d_port.is_none(), c_port.is_none());
     }
 }
