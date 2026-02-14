@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustyline::error::ReadlineError;
+use rustyline::ExternalPrinter as _;
 use tokio::sync::mpsc;
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
@@ -72,6 +74,50 @@ impl ReplContext {
         while let Ok(line) = self.display_rx.try_recv() {
             print!("\r{}", crate::syntax::render_response(&line));
         }
+    }
+
+    /// Async readline that drains display messages while waiting for input.
+    ///
+    /// Uses rustyline's `ExternalPrinter` to safely output subagent results
+    /// while `readline()` blocks on a background thread.  This way results
+    /// appear immediately instead of waiting until the next user input.
+    pub async fn readline_async(&mut self, prompt: &str) -> Result<String, ReadlineError> {
+        let printer_result = self.rl.create_external_printer();
+
+        // Move the editor to a blocking thread so we can select! on display_rx.
+        let mut rl = std::mem::replace(
+            &mut self.rl,
+            rustyline::DefaultEditor::new().expect("DefaultEditor::new"),
+        );
+        let prompt_owned = prompt.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            let result = rl.readline(&prompt_owned);
+            (rl, result)
+        });
+        tokio::pin!(handle);
+
+        let result = if let Ok(mut printer) = printer_result {
+            loop {
+                tokio::select! {
+                    res = &mut handle => {
+                        let (rl_back, readline_res) = res.expect("readline task panicked");
+                        self.rl = rl_back;
+                        break readline_res;
+                    }
+                    Some(line) = self.display_rx.recv() => {
+                        let rendered = crate::syntax::render_response(&line);
+                        let _ = printer.print(rendered);
+                    }
+                }
+            }
+        } else {
+            // No external printer available — just wait for readline.
+            let (rl_back, readline_res) = handle.await.expect("readline task panicked");
+            self.rl = rl_back;
+            readline_res
+        };
+
+        result
     }
 
     /// Print the status bar after a response completes.

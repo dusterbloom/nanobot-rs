@@ -740,7 +740,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         tui::VoiceAction::Exit => break,
                     }
                 } else {
-                    match ctx.rl.readline(&prompt) {
+                    match ctx.readline_async(&prompt).await {
                         Ok(line) => {
                             let _ = ctx.rl.add_history_entry(&line);
                             input_text = line;
@@ -752,7 +752,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
                 #[cfg(not(feature = "voice"))]
                 {
-                    match ctx.rl.readline(&prompt) {
+                    match ctx.readline_async(&prompt).await {
                         Ok(line) => {
                             let _ = ctx.rl.add_history_entry(&line);
                             input_text = line;
