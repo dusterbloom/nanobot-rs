@@ -36,6 +36,9 @@ pub struct ToolRunnerConfig {
     pub short_circuit_chars: usize,
     /// Recursion depth for ctx_summarize (default 0, max 2).
     pub depth: u32,
+    /// Optional cancellation token. When cancelled, the loop stops between
+    /// iterations and returns partial results collected so far.
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Result of a delegated tool execution loop.
@@ -133,6 +136,15 @@ pub async fn run_tool_loop(
     for iteration in 0..config.max_iterations {
         iterations_used = iteration + 1;
 
+        // Check cancellation before each iteration.
+        if config.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+            return ToolRunResult {
+                tool_results: all_results,
+                summary: Some("Tool execution cancelled.".to_string()),
+                iterations_used,
+            };
+        }
+
         if pending_calls.is_empty() {
             break;
         }
@@ -199,7 +211,18 @@ pub async fn run_tool_loop(
             } else {
                 // Real tool: execute, store in ContextStore.
                 debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
-                let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                let result = if let Some(ref token) = config.cancellation_token {
+                    use crate::agent::tools::base::ToolExecutionContext;
+                    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let ctx = ToolExecutionContext {
+                        event_tx,
+                        cancellation_token: token.child_token(),
+                        tool_call_id: tc.id.clone(),
+                    };
+                    tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                } else {
+                    tools.execute(&tc.name, tc.arguments.clone()).await
+                };
                 let (_, metadata) = context_store.store(result.data.clone());
                 let delegation_data = if result.data.len() > config.max_tool_result_chars {
                     // Large result: model sees metadata, uses micro-tools to dig in.
@@ -488,6 +511,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -540,6 +564,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -588,6 +613,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         // Initial call uses "test" as query (from make_tool_calls).
@@ -631,6 +657,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -761,6 +788,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let _ = run_tool_loop(
@@ -826,6 +854,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -859,6 +888,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         // 3 simultaneous tool calls
@@ -919,6 +949,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -958,6 +989,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(&config, &[], &tools, "test").await;
@@ -1016,6 +1048,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         // Use long IDs like cloud Claude generates
@@ -1078,6 +1111,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let calls = vec![
@@ -1150,6 +1184,7 @@ mod tests {
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1201,6 +1236,7 @@ mod tests {
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1247,6 +1283,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -1291,6 +1328,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0, // disabled
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -1362,6 +1400,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         // Main model only requested test_tool
@@ -1421,6 +1460,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -1455,6 +1495,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let _ = run_tool_loop(
@@ -1519,6 +1560,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -1593,6 +1635,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
+            cancellation_token: None,
         };
 
         let _ = run_tool_loop(
@@ -1635,6 +1678,7 @@ mod tests {
             max_tool_result_chars: 30000,
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
+            cancellation_token: None,
         };
 
         let result = run_tool_loop(
@@ -1797,6 +1841,7 @@ mod tests {
             max_tool_result_chars: 100, // Force large result → metadata
             short_circuit_chars: 0,
             depth: 0, // First level — ctx_summarize allowed
+            cancellation_token: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1821,5 +1866,182 @@ mod tests {
             "Provider should be called at least twice (outer + sub-loop), got {}",
             total_calls
         );
+    }
+
+    // -- Cancellation tests --
+
+    #[tokio::test]
+    async fn test_cancellation_before_execution() {
+        // Token cancelled before loop starts → immediate return, 0 tool results.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel(); // Pre-cancel
+
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: Some(token),
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        assert!(result.tool_results.is_empty(), "No tools should execute when pre-cancelled");
+        assert_eq!(result.iterations_used, 1);
+        assert!(
+            result.summary.as_deref().unwrap().contains("cancelled"),
+            "Summary should mention cancellation: {:?}",
+            result.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_mid_iteration() {
+        // Cancel after first iteration's LLM call returns a chain request.
+        // The cancellation check at the top of iteration 2 catches it.
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_clone = token.clone();
+
+        // Provider that cancels the token when called (simulating cancel
+        // arriving between iteration 1's LLM response and iteration 2's start).
+        struct CancellingProvider {
+            token: tokio_util::sync::CancellationToken,
+            call_count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl LLMProvider for CancellingProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call: return a chain request, then cancel.
+                    self.token.cancel();
+                    Ok(crate::providers::base::LLMResponse {
+                        content: None,
+                        tool_calls: vec![ToolCallRequest {
+                            id: "chain_0".to_string(),
+                            name: "test_tool".to_string(),
+                            arguments: {
+                                let mut m = HashMap::new();
+                                m.insert("query".to_string(), json!("chained"));
+                                m
+                            },
+                        }],
+                        finish_reason: "tool_calls".to_string(),
+                        usage: HashMap::new(),
+                    })
+                } else {
+                    Ok(crate::providers::base::LLMResponse {
+                        content: Some("Should not reach here.".to_string()),
+                        tool_calls: vec![],
+                        finish_reason: "stop".to_string(),
+                        usage: HashMap::new(),
+                    })
+                }
+            }
+
+            fn get_default_model(&self) -> &str {
+                "cancelling-model"
+            }
+        }
+
+        let provider = Arc::new(CancellingProvider {
+            token: token.clone(),
+            call_count: AtomicU32::new(0),
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: Some(token_clone),
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        // Should have the initial tool result but stopped before the chained call.
+        assert_eq!(
+            result.tool_results.len(), 1,
+            "Should have only the initial result, not the chained one"
+        );
+        assert!(
+            result.summary.as_deref().unwrap().contains("cancelled"),
+            "Summary should mention cancellation: {:?}",
+            result.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_none_token_works() {
+        // cancellation_token: None → normal execution (backward compat).
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::providers::base::LLMResponse {
+                content: Some("All done.".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        ]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: None,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.summary.as_deref(), Some("All done."));
     }
 }

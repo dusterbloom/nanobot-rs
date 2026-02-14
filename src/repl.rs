@@ -288,9 +288,26 @@ pub(crate) async fn stream_and_render(
     };
 
     println!();
+
+    // Ctrl+C cancellation: create a token and spawn a SIGINT watcher.
+    // When the user presses Ctrl+C during tool execution, the token is
+    // cancelled, which propagates to ExecTool (kills child process) and
+    // the tool runner loop (stops between iterations).
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let ct = cancel_token.clone();
+    let signal_task = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        ct.cancel();
+    });
+
     let response = agent_loop
-        .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx, tool_event_tx)
+        .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx, tool_event_tx, Some(cancel_token.clone()))
         .await;
+
+    // Stop listening for SIGINT now that the request is done.
+    signal_task.abort();
+
+    let cancelled = cancel_token.is_cancelled();
     let (tool_lines, tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
 
     // Erase raw streamed text + tool event lines, re-render with formatting + И marker
@@ -339,6 +356,10 @@ pub(crate) async fn stream_and_render(
         } else {
             print!("{}", syntax::render_turn(&response, syntax::TurnRole::Assistant));
         }
+    }
+
+    if cancelled {
+        println!("\n  \x1b[33mCancelled.\x1b[0m");
     }
 
     response
@@ -723,6 +744,22 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                             let done = Arc::new(AtomicBool::new(false));
                                             let watcher = tui::spawn_interrupt_watcher(cancel.clone(), done.clone());
 
+                                            // Cancellation token: bridge the voice session's AtomicBool cancel
+                                            // flag to a CancellationToken so Ctrl+C kills running tools.
+                                            let voice_cancel_token = tokio_util::sync::CancellationToken::new();
+                                            let vct = voice_cancel_token.clone();
+                                            let voice_cancel_flag = cancel.clone();
+                                            let cancel_bridge = tokio::spawn(async move {
+                                                // Poll the AtomicBool (set by the interrupt watcher thread).
+                                                loop {
+                                                    if voice_cancel_flag.load(Ordering::Relaxed) {
+                                                        vct.cancel();
+                                                        break;
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                }
+                                            });
+
                                             // Stream LLM response (deltas go to accumulator silently)
                                             let response = agent_loop
                                                 .process_direct_streaming(
@@ -733,8 +770,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                                     Some(&lang),
                                                     delta_tx,
                                                     None,
+                                                    Some(voice_cancel_token),
                                                 )
                                                 .await;
+                                            cancel_bridge.abort();
 
                                             // Wait for accumulator to flush remaining sentences
                                             let _ = accumulator_task.await;

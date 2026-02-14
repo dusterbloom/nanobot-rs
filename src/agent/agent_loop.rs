@@ -392,6 +392,7 @@ impl AgentLoopShared {
         msg: &InboundMessage,
         text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Option<OutboundMessage> {
         let streaming = text_delta_tx.is_some();
 
@@ -751,6 +752,7 @@ impl AgentLoopShared {
                             max_tool_result_chars: delegation_result_limit,
                             short_circuit_chars: 200,
                             depth: 0,
+                            cancellation_token: cancellation_token.clone(),
                         };
 
                         // Emit tool call start events for delegated calls.
@@ -1026,7 +1028,9 @@ impl AgentLoopShared {
                         use crate::agent::tools::base::ToolExecutionContext;
                         let ctx = ToolExecutionContext {
                             event_tx: tx.clone(),
-                            cancellation_token: tokio_util::sync::CancellationToken::new(),
+                            cancellation_token: cancellation_token.as_ref()
+                                .map(|t| t.child_token())
+                                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
                             tool_call_id: tc.id.clone(),
                         };
                         tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
@@ -1124,6 +1128,11 @@ impl AgentLoopShared {
                 // Mistral/Ministral templates handle tool→generate
                 // natively. Do NOT add user continuation messages —
                 // they break the template's role alternation check.
+
+                // Check cancellation between tool call iterations.
+                if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                    break;
+                }
             } else {
                 // No tool calls -- the agent is done.
                 final_content = response.content.unwrap_or_default();
@@ -1469,7 +1478,7 @@ impl AgentLoop {
                     ));
                 }
 
-                let response = shared.process_message(&msg, None, None).await;
+                let response = shared.process_message(&msg, None, None, None).await;
 
                 if let Some(outbound) = response {
                     // Notify REPL about outbound response.
@@ -1542,7 +1551,7 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        match self.shared.process_message(&msg, None, None).await {
+        match self.shared.process_message(&msg, None, None, None).await {
             Some(response) => response.content,
             None => String::new(),
         }
@@ -1559,6 +1568,7 @@ impl AgentLoop {
         detected_language: Option<&str>,
         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> String {
         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
             Self::spawn_background_reflection(&self.shared);
@@ -1574,7 +1584,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, Some(text_delta_tx), tool_event_tx)
+            .process_message(&msg, Some(text_delta_tx), tool_event_tx, cancellation_token)
             .await
         {
             Some(response) => response.content,
