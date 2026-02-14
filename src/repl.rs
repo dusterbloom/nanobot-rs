@@ -127,6 +127,7 @@ pub(crate) fn print_help() {
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
     println!("  /memory         - Show working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
+    println!("  /restart, /rd   - Restart delegation server");
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
@@ -210,20 +211,20 @@ pub(crate) async fn stream_and_render(
                         match event {
                             Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
                                 let line = format!(
-                                    "\x1b[2m\x1b[36m  \u{25b6} {}({})\x1b[0m",
+                                    "\x1b[36m  \u{25b6} {}({})\x1b[0m",
                                     tool_name, arguments_preview
                                 );
-                                print!("\r{}", line);
+                                print!("\r{}\x1b[K", line);
                                 std::io::stdout().flush().ok();
                                 // CallStart line gets overwritten by CallEnd, don't collect.
                             }
                             Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
                                 let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
                                 let status_line = format!(
-                                    "\x1b[2m\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
+                                    "\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
                                     tool_name, marker, duration_ms
                                 );
-                                println!("  {} \x1b[2m{}ms\x1b[0m", marker, duration_ms);
+                                println!("\r\x1b[K{}", status_line);
                                 tool_lines += 1;
                                 collected.push(status_line);
 
@@ -563,6 +564,26 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             let mut srv = ServerState::new(local_port.clone());
             let default_model = dirs::home_dir().unwrap().join("models").join(server::DEFAULT_LOCAL_MODEL);
             let mut current_model_path: std::path::PathBuf = default_model;
+
+            // Auto-spawn delegation server for cloud mode
+            if !is_local
+                && config.tool_delegation.enabled
+                && config.tool_delegation.auto_local
+                && config.tool_delegation.provider.is_none()
+            {
+                server::start_delegation_if_available(
+                    &mut srv.delegation_process,
+                    &mut srv.delegation_port,
+                ).await;
+                if srv.delegation_port.is_some() {
+                    cli::rebuild_core(
+                        &core_handle, &config, &local_port,
+                        Some(server::DEFAULT_LOCAL_MODEL), None,
+                        srv.delegation_port.as_deref(),
+                    );
+                }
+            }
+
             #[cfg(feature = "voice")]
             let mut voice_session: Option<voice::VoiceSession> = None;
 
@@ -836,9 +857,27 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                             }
                         }
                     } else {
-                        // Toggle OFF: kill server and switch to cloud
-                        srv.shutdown();
+                        // Toggle OFF: kill main and compaction servers, but keep delegation alive
+                        if let Some(ref mut child) = srv.llama_process {
+                            child.kill().ok();
+                            child.wait().ok();
+                        }
+                        srv.llama_process = None;
+                        server::stop_compaction_server(&mut srv.compaction_process, &mut srv.compaction_port);
                         crate::LOCAL_MODE.store(false, Ordering::SeqCst);
+
+                        // Re-spawn delegation if it wasn't already running
+                        if srv.delegation_port.is_none()
+                            && config.tool_delegation.enabled
+                            && config.tool_delegation.auto_local
+                            && config.tool_delegation.provider.is_none()
+                        {
+                            server::start_delegation_if_available(
+                                &mut srv.delegation_process,
+                                &mut srv.delegation_port,
+                            ).await;
+                        }
+
                         apply_server_change(&srv, &current_model_path, &core_handle, &config);
                         agent_loop = cli::create_agent_loop(core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()));
                         tui::print_mode_banner(&srv.local_port);
@@ -1148,6 +1187,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     let _ = rl.add_history_entry(&pasted);
                     let channel = if voice_on { "voice" } else { "cli" };
                     stream_and_render(&mut agent_loop, &pasted, &session_id, channel, None, &core_handle).await;
+                    // Drain subagent results that arrived during streaming.
+                    while let Ok(line) = display_rx.try_recv() {
+                        println!("\r{}", line);
+                    }
                     println!();
                     {
                         let sa_count = agent_loop.subagent_manager().get_running_count().await;
@@ -1253,7 +1296,69 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         }
                     }
 
+                    // Delegation status.
+                    if core.tool_delegation_config.enabled {
+                        let healthy = core.delegation_healthy.load(Ordering::Relaxed);
+                        let port_info = srv.delegation_port.as_deref().unwrap_or("none");
+                        let (status_color, status_label) = if healthy {
+                            (tui::GREEN, "healthy")
+                        } else {
+                            (tui::RED, "DOWN")
+                        };
+                        println!(
+                            "  {}DELEG{}     port {} ({}{}{}{})",
+                            tui::BOLD, tui::RESET,
+                            port_info,
+                            status_color, tui::BOLD, status_label, tui::RESET
+                        );
+                        if !healthy {
+                            println!("            use {}/restart{} to respawn delegation server", tui::BOLD, tui::RESET);
+                        }
+                    }
+
                     println!();
+                    continue;
+                }
+
+                // Handle /restart command — restart delegation server
+                if input == "/restart" || input == "/rd" {
+                    let core = core_handle.read().unwrap().clone();
+                    if !core.tool_delegation_config.enabled {
+                        println!("  Tool delegation is not enabled.");
+                        continue;
+                    }
+
+                    // Stop existing delegation server if any.
+                    server::stop_delegation_server(
+                        &mut srv.delegation_process,
+                        &mut srv.delegation_port,
+                    );
+
+                    // Try to start a fresh one.
+                    server::start_delegation_if_available(
+                        &mut srv.delegation_process,
+                        &mut srv.delegation_port,
+                    ).await;
+
+                    if srv.delegation_port.is_some() {
+                        // Reset health flag and rebuild core with new provider.
+                        core.delegation_healthy.store(true, Ordering::Relaxed);
+                        core.delegation_retry_counter.store(0, Ordering::Relaxed);
+                        cli::rebuild_core(
+                            &core_handle, &config, &srv.local_port,
+                            current_model_path.file_name().and_then(|n| n.to_str()),
+                            srv.compaction_port.as_deref(),
+                            srv.delegation_port.as_deref(),
+                        );
+                        agent_loop = cli::create_agent_loop(
+                            core_handle.clone(), &config,
+                            Some(cron_service.clone()),
+                            email_config.clone(),
+                            Some(display_tx.clone()),
+                        );
+                    } else {
+                        println!("  No suitable delegation model found in ~/models/");
+                    }
                     continue;
                 }
 
@@ -1506,6 +1611,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 // Process message (streaming)
                 let channel = if voice_on { "voice" } else { "cli" };
                 let response = stream_and_render(&mut agent_loop, input, &session_id, channel, None, &core_handle).await;
+                // Drain subagent results that arrived during streaming.
+                while let Ok(line) = display_rx.try_recv() {
+                    println!("\r{}", line);
+                }
                 println!();
                 {
                     let sa_count = agent_loop.subagent_manager().get_running_count().await;

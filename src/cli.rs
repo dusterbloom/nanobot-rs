@@ -144,6 +144,50 @@ mod tests {
         let agents_content = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(agents_content.contains("Agent Instructions"));
     }
+
+    // -- effective_max_iterations tests --
+
+    #[test]
+    fn test_effective_max_iterations_cloud_1m() {
+        // Cloud model with 1M context should get ~50 iterations
+        let result = effective_max_iterations(20, 1_000_000, false);
+        assert_eq!(result, 50, "1M context cloud model should get 50 iterations");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_cloud_128k() {
+        // Cloud model with 128K context
+        let result = effective_max_iterations(20, 128_000, false);
+        assert_eq!(result, 32, "128K context cloud model should get 32 iterations");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_cloud_never_below_configured() {
+        // Even small cloud context should never go below configured value
+        let result = effective_max_iterations(20, 32_000, false);
+        assert!(result >= 20, "Cloud should never go below configured value");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_local_capped() {
+        // Local models capped at 15 regardless of configured value
+        let result = effective_max_iterations(20, 32_000, true);
+        assert_eq!(result, 15, "Local should cap at 15");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_local_respects_low_config() {
+        // If configured value is already low, don't raise it for local
+        let result = effective_max_iterations(10, 32_000, true);
+        assert_eq!(result, 10, "Local should not raise configured value");
+    }
+
+    #[test]
+    fn test_effective_max_iterations_cloud_user_override_high() {
+        // If user sets high value, cloud should honor it
+        let result = effective_max_iterations(100, 128_000, false);
+        assert_eq!(result, 100, "Cloud should honor user's high setting");
+    }
 }
 
 // ============================================================================
@@ -214,6 +258,29 @@ pub(crate) fn create_workspace_templates(workspace: &Path) {
 
 /// Return the appropriate context window size for a cloud model.
 ///
+/// Scale max tool iterations with context size.
+///
+/// Cloud models with large context windows (128K+) can use many more tool
+/// iterations without risking context exhaustion. Local models with tight
+/// context (16K-32K) need a lower cap to leave room for the actual
+/// conversation.
+///
+/// Returns the configured value unchanged when it's already appropriate,
+/// or scales it up/down based on available context.
+fn effective_max_iterations(configured: u32, max_context_tokens: usize, is_local: bool) -> u32 {
+    if is_local {
+        // Local models: cap at 15 to preserve limited context.
+        configured.min(15)
+    } else {
+        // Cloud models: scale up with context. Each tool iteration uses
+        // ~500-1500 tokens on average, so even 50 iterations at 1M context
+        // is only ~5% of the budget.
+        // ~25 at 128K, ~40 at 500K, ~50 at 1M+
+        let context_scaled = (max_context_tokens / 4000).min(50) as u32;
+        configured.max(context_scaled)
+    }
+}
+
 /// Models with known large context windows get their full capacity;
 /// everything else uses the config default (128K).
 fn model_context_size(model: &str, config_default: usize) -> usize {
@@ -277,23 +344,25 @@ pub(crate) fn build_core_handle(
         None
     };
 
-    let dp: Option<Arc<dyn LLMProvider>> = if is_local {
-        delegation_port.map(|p| -> Arc<dyn LLMProvider> {
-            Arc::new(OpenAICompatProvider::new(
-                "local-delegation",
-                Some(&format!("http://localhost:{}/v1", p)),
-                None,
-            ))
-        })
-    } else {
-        None
-    };
+    let dp: Option<Arc<dyn LLMProvider>> = delegation_port.map(|p| -> Arc<dyn LLMProvider> {
+        Arc::new(OpenAICompatProvider::new(
+            "local-delegation",
+            Some(&format!("http://localhost:{}/v1", p)),
+            None,
+        ))
+    });
+
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        is_local,
+    );
 
     let core = build_shared_core(
         provider,
         config.workspace_path(),
         model,
-        config.agents.defaults.max_tool_iterations,
+        max_iters,
         config.agents.defaults.max_tokens,
         config.agents.defaults.temperature,
         max_context_tokens,
@@ -364,23 +433,25 @@ pub(crate) fn rebuild_core(
         None
     };
 
-    let dp: Option<Arc<dyn LLMProvider>> = if is_local {
-        delegation_port.map(|p| -> Arc<dyn LLMProvider> {
-            Arc::new(OpenAICompatProvider::new(
-                "local-delegation",
-                Some(&format!("http://localhost:{}/v1", p)),
-                None,
-            ))
-        })
-    } else {
-        None
-    };
+    let dp: Option<Arc<dyn LLMProvider>> = delegation_port.map(|p| -> Arc<dyn LLMProvider> {
+        Arc::new(OpenAICompatProvider::new(
+            "local-delegation",
+            Some(&format!("http://localhost:{}/v1", p)),
+            None,
+        ))
+    });
+
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        is_local,
+    );
 
     let new_core = build_shared_core(
         provider,
         config.workspace_path(),
         model,
-        config.agents.defaults.max_tool_iterations,
+        max_iters,
         config.agents.defaults.max_tokens,
         config.agents.defaults.temperature,
         max_context_tokens,
