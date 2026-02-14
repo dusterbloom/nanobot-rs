@@ -54,7 +54,7 @@ enum Commands {
         /// Use local LLM instead of cloud API.
         #[arg(short, long)]
         local: bool,
-        /// Language hint for voice TTS engine (e.g. "en" uses faster Supertonic).
+        /// Language hint for voice TTS engine (e.g. "en" uses faster Pocket).
         #[arg(long)]
         lang: Option<String>,
     },
@@ -184,7 +184,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,ort=off,supertonic=off,html5ever=error")
+                tracing_subscriber::EnvFilter::new("warn,ort=off,pocket_tts=off,html5ever=error")
             }),
         )
         .init();

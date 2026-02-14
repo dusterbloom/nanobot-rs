@@ -84,7 +84,7 @@ It's currently about two in the morning in Tokyo.
 
 Voice mode uses on-device models -- no cloud STT/TTS:
 - **Speech-to-text**: Whisper (via jack-voice)
-- **Text-to-speech**: Supertonic v2 diffusion TTS (ONNX, 44.1kHz)
+- **Text-to-speech**: Pocket TTS (Candle, 24kHz, CPU real-time)
 
 Audio is streamed sentence-by-sentence through PulseAudio. First audio plays in ~300-500ms while remaining sentences synthesize in the background.
 
@@ -176,7 +176,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 # Standard build
 cargo build --release
 
-# With voice mode (requires jack-voice + supertonic)
+# With voice mode (requires jack-voice + pocket-tts)
 cargo build --release --features voice
 
 # Debug with logging

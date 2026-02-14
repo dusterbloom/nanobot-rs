@@ -13,7 +13,7 @@ use jack_voice::{
 use whatlang;
 
 /// Max chunk size in characters for TTS batching.
-/// Supertonic throughput scales with input length (996 chars/sec @59ch → 2509 @266ch).
+/// Pocket TTS runs faster-than-real-time on CPU (~200ms latency per chunk).
 /// Chunks always end on sentence-ending punctuation (.!?) so prosody stays natural.
 /// Short sentences (even 5 chars) are valid chunks — no artificial minimum delay.
 const TTS_CHUNK_MAX_CHARS: usize = 250;
@@ -114,7 +114,7 @@ struct AudioChunk {
 
 pub struct VoiceSession {
     stt: SpeechToText,
-    /// Supertonic TTS engine (fast, English-only).
+    /// Pocket TTS engine (fast, English-only, CPU inference).
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     /// Kokoro TTS engine (multilingual).
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
@@ -189,20 +189,31 @@ impl VoiceSession {
 
     /// Create a voice session with optional language-based engine selection.
     ///
-    /// - `None` → load both Supertonic (English) and Kokoro (multilingual),
+    /// - `None` → load both Pocket (English) and Kokoro (multilingual),
     ///   route automatically per utterance based on detected language.
-    /// - `Some("en")` → load only Supertonic (fast English, skip Kokoro download).
+    /// - `Some("en")` → load only Pocket (fast English, skip Kokoro download).
     /// - `Some(_)` → load only Kokoro (multilingual).
     pub async fn with_lang(lang: Option<&str>) -> Result<Self, String> {
-        let load_supertonic = lang.is_none() || lang == Some("en");
+        let load_pocket = lang.is_none() || lang == Some("en");
         let load_kokoro = lang.is_none() || lang != Some("en");
 
+        // Set espeak-ng data path for Kokoro TTS if not already configured.
+        // espeak-rs-sys bakes the build-time path which breaks after installation.
+        if load_kokoro && std::env::var("PIPER_ESPEAKNG_DATA_DIRECTORY").is_err() {
+            let home = dirs::home_dir().unwrap_or_default();
+            let local_data = home.join(".local/share/espeak-ng-data");
+            if local_data.exists() {
+                // The env var points to the PARENT dir containing espeak-ng-data/
+                std::env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", home.join(".local/share"));
+            }
+        }
+
         let label = match lang {
-            Some("en") => "Supertonic only",
+            Some("en") => "Pocket only",
             Some(_) => "Kokoro only",
-            None => "Supertonic + Kokoro",
+            None => "Pocket + Kokoro",
         };
-        println!("Initializing voice mode ({label})...");
+        println!("Initializing voice mode ({label})... [build:v8]");
 
         // Fail fast: check that parec exists
         Command::new("parec")
@@ -243,19 +254,21 @@ impl VoiceSession {
         // TTS init must happen on a blocking thread because Kokoro internally
         // creates a tokio Runtime for async model loading (which panics if
         // called from within an existing runtime).
-        let tts_en = if load_supertonic {
+        let tts_en = if load_pocket {
             match tokio::task::spawn_blocking(|| {
-                TextToSpeech::with_engine(TtsEngine::Supertonic)
+                TextToSpeech::with_engine(TtsEngine::Pocket)
             })
             .await
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
-                    println!("  Supertonic TTS ready (English)");
+                    let engine = tts.engine_type();
+                    println!("  {} TTS ready (English) [engine: {}]",
+                        if engine == "pocket" { "Pocket" } else { engine }, engine);
                     Some(Arc::new(Mutex::new(tts)))
                 }
                 Err(e) => {
-                    tracing::warn!("Supertonic TTS init failed, English will use Kokoro: {e}");
+                    tracing::warn!("Pocket TTS init failed, English will use Kokoro: {e}");
                     None
                 }
             }
@@ -395,8 +408,7 @@ impl VoiceSession {
             })
             .unwrap_or_else(|| "en".to_string());
 
-        // Transcription appears inline after ~> prompt
-        println!("{}", text);
+        // Transcription text returned to REPL for formatted display.
         Ok(Some((text, lang)))
     }
 
@@ -413,9 +425,10 @@ impl VoiceSession {
         .ok_or("No TTS engine available")?
         .clone();
 
-        let is_supertonic = tts.lock().unwrap().engine_type() == "supertonic";
-        let voice_id = if is_supertonic {
-            "F1"
+        let is_pocket = tts.lock().unwrap().engine_type() == "pocket";
+        tracing::debug!("TTS engine selected: {} for lang={}", if is_pocket { "pocket" } else { "kokoro" }, lang);
+        let voice_id = if is_pocket {
+            "alba"
         } else {
             match lang {
                 "es" => "28",
@@ -685,8 +698,8 @@ impl VoiceSession {
 }
 
 /// Accumulates streaming text deltas and batches complete sentences into ~200-char
-/// chunks before sending to TTS. This exploits Supertonic's higher throughput on
-/// longer inputs (2509 chars/sec @266ch vs 996 @59ch).
+/// chunks before sending to TTS. Batching reduces per-chunk overhead and keeps
+/// Pocket TTS latency low (~200ms per chunk on CPU).
 ///
 /// Detects sentence boundaries (`.` `!` `?` followed by space/newline) and
 /// skips code blocks (```). Call `flush()` at the end to emit any remaining text.
@@ -883,5 +896,89 @@ impl ModelProgressCallback for TerminalProgress {
 
     fn on_extracting(&self, model: &str) {
         println!("  Extracting {}...", model);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// whatlang is unreliable for short/informal speech — it misdetects English
+    /// as Estonian, etc. This test documents the problem so we don't rely on
+    /// per-utterance detection for TTS routing. The REPL uses the session-level
+    /// language setting (from config/CLI) instead.
+    #[test]
+    fn test_whatlang_misdetects_short_english() {
+        // This phrase gets detected as Estonian ("est"), not English.
+        // This is why we use session-level lang for TTS routing, not per-utterance.
+        let text = "You just tell me a joke testing uh your pocket";
+        let detected = whatlang::detect(text).map(|i| i.lang().code().to_string());
+        assert_ne!(detected.as_deref(), Some("eng"),
+            "If whatlang starts detecting this correctly, the session-level override is still correct but not strictly necessary");
+    }
+
+    /// Longer English text IS correctly detected.
+    #[test]
+    fn test_whatlang_detects_longer_english() {
+        let text = "Hello, how are you doing today? I wanted to ask you about the weather forecast for this weekend.";
+        let detected = whatlang::detect(text).map(|info| {
+            match info.lang().code() {
+                "eng" => "en",
+                other => other,
+            }.to_string()
+        }).unwrap_or_else(|| "en".to_string());
+        assert_eq!(detected, "en");
+    }
+
+    #[test]
+    fn test_split_tts_sentences_empty() {
+        assert!(split_tts_sentences("").is_empty());
+        assert!(split_tts_sentences("   ").is_empty());
+    }
+
+    #[test]
+    fn test_split_tts_sentences_short() {
+        let result = split_tts_sentences("Hello world.");
+        assert_eq!(result, vec!["Hello world."]);
+    }
+
+    #[test]
+    fn test_split_tts_sentences_no_split_under_500() {
+        let text = "First sentence. Second sentence. Third sentence.";
+        let result = split_tts_sentences(text);
+        assert_eq!(result.len(), 1, "Under 500 chars should be one chunk");
+    }
+
+    #[test]
+    fn test_strip_inline_markdown() {
+        assert_eq!(strip_inline_markdown("**bold** text"), "bold text");
+        assert_eq!(strip_inline_markdown("# Heading"), "Heading");
+        assert_eq!(strip_inline_markdown("[link](url)"), "link");
+    }
+
+    /// Actually init Pocket TTS and synthesize a sentence.
+    /// This catches model-not-found, init failures, and synthesis crashes.
+    #[test]
+    fn test_pocket_tts_synthesizes() {
+        use jack_voice::{TextToSpeech, TtsEngine};
+        let tts = TextToSpeech::with_engine(TtsEngine::Pocket);
+        match tts {
+            Ok(mut tts) => {
+                assert_eq!(tts.engine_type(), "pocket");
+                let result = tts.synthesize("Hello, this is a test.");
+                match result {
+                    Ok(output) => {
+                        assert!(output.samples.len() > 100,
+                            "Expected audio samples, got {} samples", output.samples.len());
+                        assert!(output.sample_rate > 0,
+                            "Expected non-zero sample rate, got {}", output.sample_rate);
+                        println!("Pocket TTS OK: {} samples @ {}Hz",
+                            output.samples.len(), output.sample_rate);
+                    }
+                    Err(e) => panic!("Pocket TTS synthesis failed: {}", e),
+                }
+            }
+            Err(e) => panic!("Pocket TTS init failed: {}", e),
+        }
     }
 }

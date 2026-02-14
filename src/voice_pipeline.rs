@@ -25,12 +25,12 @@ use crate::voice::split_tts_sentences;
 /// held across `spawn_blocking` boundaries. Wrapped in `Arc` so they can
 /// be moved into the blocking closure.
 ///
-/// Holds two TTS engines: Supertonic (fast English) and Kokoro (multilingual).
+/// Holds two TTS engines: Pocket (fast English) and Kokoro (multilingual).
 /// Each synthesis call is routed to the appropriate engine based on the
 /// detected language of the text.
 pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
-    /// Supertonic TTS engine (fast, English-only). `None` if init failed.
+    /// Pocket TTS engine (fast, English-only). `None` if init failed.
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     /// Kokoro TTS engine (multilingual). `None` if init failed.
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
@@ -39,7 +39,7 @@ pub struct VoicePipeline {
 impl VoicePipeline {
     /// Create a new voice pipeline, downloading models if needed.
     ///
-    /// Initializes both Supertonic (English) and Kokoro (multilingual) TTS
+    /// Initializes both Pocket (English) and Kokoro (multilingual) TTS
     /// engines. If one fails, the other is used as fallback.
     pub async fn new() -> Result<Self, String> {
         info!("Initializing voice pipeline for channels...");
@@ -65,19 +65,19 @@ impl VoicePipeline {
 
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
-        // Init Supertonic (English TTS)
+        // Init Pocket (English TTS)
         let tts_en = match tokio::task::spawn_blocking(|| {
-            TextToSpeech::with_engine(TtsEngine::Supertonic)
+            TextToSpeech::with_engine(TtsEngine::Pocket)
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {e}"))?
         {
             Ok(tts) => {
-                info!("Supertonic TTS ready (English)");
+                info!("Pocket TTS ready (English)");
                 Some(tts)
             }
             Err(e) => {
-                info!("Supertonic TTS not available, English will use Kokoro: {e}");
+                info!("Pocket TTS not available, English will use Kokoro: {e}");
                 None
             }
         };
@@ -155,7 +155,7 @@ impl VoicePipeline {
     /// Synthesize text to an `.ogg` opus file.
     ///
     /// `lang` is an ISO 639-1 code (e.g. "en", "es", "fr") used to route
-    /// to the appropriate TTS engine: Supertonic for English, Kokoro for others.
+    /// to the appropriate TTS engine: Pocket for English, Kokoro for others.
     /// Returns the path to the generated file in `~/.nanobot/media/`.
     pub async fn synthesize_to_file(&self, text: &str, lang: &str) -> Result<String, String> {
         let text = text.to_string();
@@ -175,9 +175,9 @@ impl VoicePipeline {
         let (all_samples, sample_rate) = tokio::task::spawn_blocking(move || {
             let mut guard = tts.lock().map_err(|e| format!("TTS lock poisoned: {e}"))?;
 
-            let is_supertonic = guard.engine_type() == "supertonic";
-            if is_supertonic {
-                // Supertonic is English-only; already initialized with default voice
+            let is_pocket = guard.engine_type() == "pocket";
+            if is_pocket {
+                // Pocket is English-only; already initialized with default voice
             } else {
                 // Switch to the language-appropriate Kokoro voice.
                 let (voice_id, _kokoro_lang) = language_to_kokoro_voice(&lang);

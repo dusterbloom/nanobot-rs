@@ -274,8 +274,17 @@ fn ensure_not_ending_with_assistant(messages: &mut Vec<Value>) {
     if let Some(last) = messages.last() {
         let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "assistant" {
+            let content_preview: String = last.get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
+            let has_tool_calls = last.get("tool_calls").and_then(|tc| tc.as_array()).map(|a| a.len()).unwrap_or(0);
             warn!(
-                "Messages end with assistant role — appending user continuation to prevent prefill error"
+                "Messages end with assistant role — appending user continuation to prevent prefill error \
+                 (msg_count={}, content=\"{}\", tool_calls={})",
+                messages.len(), content_preview, has_tool_calls
             );
             messages.push(json!({
                 "role": "user",
