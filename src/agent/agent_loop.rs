@@ -233,11 +233,6 @@ pub fn build_swappable_core(
 
     // Build tool runner provider if delegation is enabled.
     let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
-        let tr_model = if tool_delegation.model.is_empty() {
-            model.clone()
-        } else {
-            tool_delegation.model.clone()
-        };
         let tr_provider: Arc<dyn LLMProvider> = if let Some(dp) = delegation_provider {
             dp // Auto-spawned local delegation server
         } else if let Some(ref tr_cfg) = tool_delegation.provider {
@@ -248,6 +243,17 @@ pub fn build_swappable_core(
             ))
         } else {
             provider.clone() // Fallback to main
+        };
+        // Pick the delegation model. When config is empty, fall back to the
+        // delegation provider's own default (e.g. local server's model) rather
+        // than the main model — the main model may be a special prefix like
+        // "claude-code/opus" that the delegation server doesn't understand.
+        let tr_model = if !tool_delegation.model.is_empty() {
+            tool_delegation.model.clone()
+        } else if model.starts_with("claude-code") {
+            tr_provider.get_default_model().to_string()
+        } else {
+            model.clone()
         };
         (Some(tr_provider), Some(tr_model))
     } else {

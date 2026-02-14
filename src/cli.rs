@@ -20,6 +20,7 @@ use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
 use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
 use crate::providers::base::LLMProvider;
+use crate::providers::claude_code::ClaudeCodeProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
 
@@ -349,7 +350,7 @@ pub(crate) fn build_core_handle(
         Arc::new(OpenAICompatProvider::new(
             "local-delegation",
             Some(&format!("http://localhost:{}/v1", p)),
-            None,
+            Some("local-delegation"),
         ))
     });
 
@@ -439,7 +440,7 @@ pub(crate) fn rebuild_core(
         Arc::new(OpenAICompatProvider::new(
             "local-delegation",
             Some(&format!("http://localhost:{}/v1", p)),
-            None,
+            Some("local-delegation"),
         ))
     });
 
@@ -867,7 +868,7 @@ pub(crate) fn validate_telegram_token(token: &str) -> bool {
 /// Check that an LLM API key is configured, exit with error if not.
 pub(crate) fn check_api_key(config: &Config) {
     let model = &config.agents.defaults.model;
-    if config.get_api_key().is_none() && !model.starts_with("bedrock/") {
+    if config.get_api_key().is_none() && !model.starts_with("bedrock/") && !model.starts_with("claude-code") {
         eprintln!("Error: No API key configured.");
         eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
         std::process::exit(1);
@@ -1195,9 +1196,28 @@ pub(crate) fn cmd_cron_enable(job_id: String, disable: bool) {
 // ============================================================================
 
 pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
+    use tracing::info;
+    let model = &config.agents.defaults.model;
+
+    // "claude-code" or "claude-code/opus" → use Claude CLI (Max plan, no API cost).
+    if model.starts_with("claude-code") {
+        let sub_model = model
+            .strip_prefix("claude-code/")
+            .or_else(|| model.strip_prefix("claude-code"))
+            .filter(|s| !s.is_empty());
+        info!(
+            "create_provider: using ClaudeCodeProvider (model={}, sub_model={:?})",
+            model, sub_model
+        );
+        return Arc::new(ClaudeCodeProvider::new(sub_model));
+    }
+
     let api_key = config.get_api_key().unwrap_or_default();
     let api_base = config.get_api_base();
-    let model = &config.agents.defaults.model;
+    info!(
+        "create_provider: using OpenAICompatProvider (model={}, base={:?})",
+        model, api_base
+    );
     Arc::new(OpenAICompatProvider::new(
         &api_key,
         api_base.as_deref(),
