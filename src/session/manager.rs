@@ -295,11 +295,25 @@ impl SessionManager {
     // -----------------------------------------------------------------------
 
     /// Get or create a session within an already-locked cache.
+    ///
+    /// Handles daily rotation: if the cached session was created on a
+    /// different day, saves it and starts a fresh session for today.
     fn get_or_create_inner<'a>(
         cache: &'a mut HashMap<String, Session>,
         key: &str,
         sessions_dir: &Path,
     ) -> &'a mut Session {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+
+        if let Some(existing) = cache.get(key) {
+            let session_date = existing.created_at.format("%Y-%m-%d").to_string();
+            if session_date != today {
+                // Day rolled over: save the old session, then evict from cache.
+                Self::save_session(existing, sessions_dir);
+                cache.remove(key);
+            }
+        }
+
         if !cache.contains_key(key) {
             let session =
                 Self::load_from_disk(key, sessions_dir).unwrap_or_else(|| Session::new(key));
@@ -342,11 +356,22 @@ impl SessionManager {
     }
 
     /// Load a session from its JSONL file on disk.
+    ///
+    /// Tries today's dated file first, then falls back to the legacy
+    /// (undated) file for migration.
     fn load_from_disk(key: &str, sessions_dir: &Path) -> Option<Session> {
         let path = Self::session_path(key, sessions_dir);
-        if !path.exists() {
-            return None;
-        }
+        let path = if path.exists() {
+            path
+        } else {
+            // Fall back to legacy undated path for migration.
+            let legacy = Self::legacy_session_path(key, sessions_dir);
+            if legacy.exists() {
+                legacy
+            } else {
+                return None;
+            }
+        };
 
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
@@ -396,7 +421,24 @@ impl SessionManager {
     }
 
     /// Compute the filesystem path for a given session key.
+    ///
+    /// Uses daily rotation: `cli_default_2026-02-14.jsonl`.  Each day gets
+    /// its own file so qmd indexes smaller, naturally-archived documents.
     fn session_path(key: &str, sessions_dir: &Path) -> PathBuf {
+        let safe_key = safe_filename(&key.replace(':', "_"));
+        let date = Local::now().format("%Y-%m-%d");
+        sessions_dir.join(format!("{}_{}.jsonl", safe_key, date))
+    }
+
+    /// Compute the path for yesterday's session (for migration/fallback).
+    #[allow(dead_code)]
+    fn session_path_for_date(key: &str, sessions_dir: &Path, date: &str) -> PathBuf {
+        let safe_key = safe_filename(&key.replace(':', "_"));
+        sessions_dir.join(format!("{}_{}.jsonl", safe_key, date))
+    }
+
+    /// Legacy path without date suffix (for migration).
+    fn legacy_session_path(key: &str, sessions_dir: &Path) -> PathBuf {
         let safe_key = safe_filename(&key.replace(':', "_"));
         sessions_dir.join(format!("{}.jsonl", safe_key))
     }
@@ -436,10 +478,24 @@ mod tests {
     }
 
     #[test]
-    fn test_session_path() {
+    fn test_session_path_includes_date() {
         let tmp = std::env::temp_dir().join("nanobot_test_session_path");
         let mgr = SessionManager::new(&tmp);
         let path = SessionManager::session_path("telegram:12345", &mgr.sessions_dir);
+        let path_str = path.to_string_lossy().to_string();
+        // Should contain the key and today's date.
+        assert!(path_str.contains("telegram_12345_"), "path={}", path_str);
+        assert!(path_str.ends_with(".jsonl"), "path={}", path_str);
+        // Date portion should be YYYY-MM-DD format.
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        assert!(path_str.contains(&today), "path={}", path_str);
+    }
+
+    #[test]
+    fn test_legacy_session_path() {
+        let tmp = std::env::temp_dir().join("nanobot_test_legacy_path");
+        let mgr = SessionManager::new(&tmp);
+        let path = SessionManager::legacy_session_path("telegram:12345", &mgr.sessions_dir);
         assert!(path.to_string_lossy().ends_with("telegram_12345.jsonl"));
     }
 
