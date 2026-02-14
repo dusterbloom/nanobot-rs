@@ -59,6 +59,7 @@ base64 = "0.22"
 # HTML processing
 scraper = "0.22"
 html-escape = "0.2"
+dom_smoothie = "0.15"
 
 # Async trait
 async-trait = "0.1"

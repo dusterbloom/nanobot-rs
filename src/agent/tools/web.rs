@@ -351,7 +351,7 @@ impl Tool for WebFetchTool {
                     || body.trim_start().to_lowercase().starts_with("<html")
                 {
                     let extracted = extract_html_content(&body, extract_mode);
-                    (extracted, "scraper")
+                    (extracted, "readability")
                 } else {
                     (body, "raw")
                 };
@@ -383,24 +383,58 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Extract readable content from HTML using the `scraper` crate.
+/// Extract readable content from HTML using `dom_smoothie` (Mozilla Readability port).
 ///
-/// This is a simplified readability extraction: we look for the `<body>` or
-/// `<main>` or `<article>` element and extract text, falling back to the whole
-/// document if those are not found.
+/// Uses content-scoring to find the main article, stripping navigation, ads,
+/// and boilerplate.  Falls back to the old `scraper`-based extraction on
+/// parse errors or when `dom_smoothie` returns empty content.
 fn extract_html_content(html: &str, mode: &str) -> String {
+    use dom_smoothie::{Readability, Config, TextMode};
+
+    let text_mode = if mode == "markdown" {
+        TextMode::Markdown
+    } else {
+        TextMode::Formatted
+    };
+
+    let config = Config {
+        text_mode,
+        ..Default::default()
+    };
+
+    match Readability::new(html, None, Some(config)) {
+        Ok(mut r) => match r.parse() {
+            Ok(article) => {
+                let title = &article.title;
+                let body = article.text_content.to_string();
+                let result = normalize_whitespace(&body);
+                if result.trim().is_empty() {
+                    return fallback_extract(html, mode);
+                }
+                if title.is_empty() {
+                    result
+                } else {
+                    format!("# {}\n\n{}", title.trim(), result)
+                }
+            }
+            Err(_) => fallback_extract(html, mode),
+        },
+        Err(_) => fallback_extract(html, mode),
+    }
+}
+
+/// Fallback HTML extraction using `scraper` when `dom_smoothie` fails.
+fn fallback_extract(html: &str, mode: &str) -> String {
     use scraper::{Html, Selector};
 
     let document = Html::parse_document(html);
 
-    // Try to extract title.
     let title = Selector::parse("title")
         .ok()
         .and_then(|sel| document.select(&sel).next())
         .map(|el| el.text().collect::<String>())
         .unwrap_or_default();
 
-    // Try progressively narrower selectors.
     let selectors = ["article", "main", "[role=\"main\"]", "body"];
     let mut body_text = String::new();
 
@@ -420,7 +454,6 @@ fn extract_html_content(html: &str, mode: &str) -> String {
     }
 
     if body_text.trim().is_empty() {
-        // Fallback: extract all text from the document.
         body_text = document.root_element().text().collect::<Vec<_>>().join(" ");
     }
 

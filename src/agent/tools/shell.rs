@@ -13,13 +13,31 @@ use super::base::Tool;
 /// Default deny patterns for dangerous shell commands.
 fn default_deny_patterns() -> Vec<String> {
     vec![
+        // rm: catch all flag combos containing -r (recursive) — the dangerous flag.
+        // Covers: rm -r, rm -rf, rm -rv, rm -rfi, rm -Rf (after normalization).
+        r"\brm\s+-\w*r".to_string(),
+        // rm: also block -f alone (force-deletes named files without confirmation).
         r"\brm\s+-[rf]{1,2}\b".to_string(),
+        // rm: long-form flags.
+        r"\brm\s+--recursive".to_string(),
+        r"\brm\s+--force".to_string(),
+        // find -delete / find -exec rm: mass deletion patterns.
+        r"\bfind\b.*\s-delete\b".to_string(),
+        r"\bfind\b.*-exec\s+rm\b".to_string(),
+        // shred: secure file destruction.
+        r"\bshred\b".to_string(),
+        // truncate: zero out files.
+        r"\btruncate\b".to_string(),
+        // Windows destructive commands.
         r"\bdel\s+/[fq]\b".to_string(),
         r"\brmdir\s+/s\b".to_string(),
         r"\b(format|mkfs|diskpart)\b".to_string(),
+        // Raw disk operations.
         r"\bdd\s+if=".to_string(),
         r">\s*/dev/sd".to_string(),
+        // System operations.
         r"\b(shutdown|reboot|poweroff)\b".to_string(),
+        // Fork bomb.
         r":\(\)\s*\{.*\};\s*:".to_string(),
         // Download-and-execute patterns.
         r"curl\s.*\|\s*sh".to_string(),
@@ -31,6 +49,8 @@ fn default_deny_patterns() -> Vec<String> {
         r"base64\s.*-d.*\|\s*bash".to_string(),
         // Make files executable/setuid.
         r"\bchmod\s.*\+[xs]".to_string(),
+        // sudo: block privilege escalation entirely.
+        r"\bsudo\b".to_string(),
     ]
 }
 
@@ -668,6 +688,73 @@ mod tests {
     fn test_guard_blocks_chmod_plus_x() {
         let result = guard("chmod +x /tmp/evil.sh");
         assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Enhanced deny patterns: rm variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_blocks_rm_rv() {
+        // rm -rv (recursive + verbose) should be blocked
+        let result = guard("rm -rv /tmp/data");
+        assert!(result.is_some(), "rm -rv should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_rm_rfi() {
+        // rm -rfi (recursive + force + interactive) should be blocked
+        let result = guard("rm -rfi /tmp/data");
+        assert!(result.is_some(), "rm -rfi should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_rm_recursive_long() {
+        let result = guard("rm --recursive /tmp/data");
+        assert!(result.is_some(), "rm --recursive should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_rm_force_long() {
+        let result = guard("rm --force important.txt");
+        assert!(result.is_some(), "rm --force should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_find_delete() {
+        let result = guard("find /tmp -name '*.log' -delete");
+        assert!(result.is_some(), "find -delete should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_find_exec_rm() {
+        let result = guard("find / -name '*.txt' -exec rm {} \\;");
+        assert!(result.is_some(), "find -exec rm should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_shred() {
+        let result = guard("shred -vfz /dev/sda");
+        assert!(result.is_some(), "shred should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_sudo() {
+        let result = guard("sudo rm /etc/passwd");
+        assert!(result.is_some(), "sudo should be blocked");
+    }
+
+    #[test]
+    fn test_guard_blocks_truncate() {
+        let result = guard("truncate -s 0 important.db");
+        assert!(result.is_some(), "truncate should be blocked");
+    }
+
+    #[test]
+    fn test_guard_allows_rm_single_file() {
+        // rm without -r or -f flags on a single file is allowed
+        let result = guard_unrestricted("rm temp.txt");
+        assert!(result.is_none(), "rm without dangerous flags should be allowed");
     }
 
     #[tokio::test]
