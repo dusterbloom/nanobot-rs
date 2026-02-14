@@ -39,6 +39,9 @@ pub struct ToolRunnerConfig {
     /// Optional cancellation token. When cancelled, the loop stops between
     /// iterations and returns partial results collected so far.
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// If true, skip delegation LLM and return raw tool output unsummarized.
+    /// Set by the main agent via `[VERBATIM]` marker in its response.
+    pub verbatim: bool,
 }
 
 /// Result of a delegated tool execution loop.
@@ -261,6 +264,16 @@ pub async fn run_tool_loop(
         // the main model can interpret them directly. This also avoids the
         // loop problem where small models don't know what to do with
         // one-line results. Set short_circuit_chars to 0 to disable.
+        // Verbatim mode: skip delegation entirely, return raw results.
+        if config.verbatim && iteration == 0 {
+            debug!("Verbatim mode — skipping delegation LLM, returning raw results");
+            return ToolRunResult {
+                tool_results: all_results,
+                summary: None,
+                iterations_used,
+            };
+        }
+
         if config.short_circuit_chars > 0 && iteration == 0 {
             let threshold = config.short_circuit_chars;
             let all_short = all_results.iter().all(|(_, _, data)| data.len() < threshold);
@@ -541,6 +554,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -594,6 +608,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -643,6 +658,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         // Initial call uses "test" as query (from make_tool_calls).
@@ -687,6 +703,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -818,6 +835,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let _ = run_tool_loop(
@@ -884,6 +902,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -918,6 +937,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         // 3 simultaneous tool calls
@@ -979,6 +999,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1019,6 +1040,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(&config, &[], &tools, "test").await;
@@ -1078,6 +1100,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         // Use long IDs like cloud Claude generates
@@ -1141,6 +1164,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let calls = vec![
@@ -1214,6 +1238,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1266,6 +1291,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1313,6 +1339,7 @@ mod tests {
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1358,6 +1385,7 @@ mod tests {
             short_circuit_chars: 0, // disabled
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1430,6 +1458,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         // Main model only requested test_tool
@@ -1490,6 +1519,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1525,6 +1555,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let _ = run_tool_loop(
@@ -1590,6 +1621,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1687,6 +1719,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let _ = run_tool_loop(
@@ -1731,6 +1764,7 @@ mod tests {
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -1894,6 +1928,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0, // First level — ctx_summarize allowed
             cancellation_token: None,
+            verbatim: false,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1942,6 +1977,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: Some(token),
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -2036,6 +2072,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: Some(token_clone),
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -2083,6 +2120,7 @@ mod tests {
             short_circuit_chars: 0,
             depth: 0,
             cancellation_token: None,
+            verbatim: false,
         };
 
         let result = run_tool_loop(
@@ -2095,5 +2133,89 @@ mod tests {
 
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.summary.as_deref(), Some("All done."));
+    }
+
+    #[tokio::test]
+    async fn test_verbatim_skips_delegation_returns_raw() {
+        // When verbatim=true, the delegation model should never be called.
+        // Use an empty provider (no responses queued) — if the delegation
+        // model IS called, MockProvider returns a generic "Done." which would
+        // set summary to Some. Verbatim must short-circuit before that.
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: None,
+            verbatim: true,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        // Tools are executed.
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].1, "test_tool");
+        assert_eq!(result.tool_results[0].2, "tool result data");
+        // Delegation model NOT called — no summary.
+        assert!(result.summary.is_none(), "verbatim mode must not produce a summary");
+        // Only one iteration (initial execution, no delegation loop).
+        assert_eq!(result.iterations_used, 1);
+    }
+
+    #[tokio::test]
+    async fn test_verbatim_false_calls_delegation() {
+        // Verify that verbatim=false still calls the delegation model
+        // (control test to ensure verbatim=true is actually the branch).
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::providers::base::LLMResponse {
+                content: Some("Summarized.".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        ]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: None,
+            verbatim: false,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        assert_eq!(result.tool_results.len(), 1);
+        // Delegation model WAS called — summary present.
+        assert_eq!(result.summary.as_deref(), Some("Summarized."));
     }
 }

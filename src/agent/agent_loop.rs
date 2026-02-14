@@ -779,6 +779,12 @@ impl AgentLoopShared {
                         // tool→generate natively and don't need it.
                         let needs_user_cont = auto_escalate && core.is_local;
 
+                        // Detect [VERBATIM] marker: the main model is asking for
+                        // raw tool output instead of a delegation summary.
+                        let verbatim = response.content.as_ref()
+                            .map(|c| c.contains("[VERBATIM]"))
+                            .unwrap_or(false);
+
                         // The delegation model typically has a small context (4K tokens).
                         // Cap tool results to ~1500 tokens (~6000 chars) so the system
                         // prompt, tool call messages, and response all fit comfortably.
@@ -796,6 +802,7 @@ impl AgentLoopShared {
                             short_circuit_chars: 200,
                             depth: 0,
                             cancellation_token: cancellation_token.clone(),
+                            verbatim,
                         };
 
                         // Emit tool call start events for delegated calls.
@@ -891,7 +898,9 @@ impl AgentLoopShared {
                         // Add tool results from the runner to the main context.
                         // In slim mode, truncate results to save context budget —
                         // the runner's summary carries the meaning.
-                        let slim = core.tool_delegation_config.enabled
+                        // Verbatim mode: never slim, the agent wants full output.
+                        let slim = !verbatim
+                            && core.tool_delegation_config.enabled
                             && core.tool_delegation_config.slim_results;
                         let preview_max = core.tool_delegation_config.max_result_preview_chars;
 
@@ -961,9 +970,14 @@ impl AgentLoopShared {
                                 // causes "assistant message prefill" errors when
                                 // the Anthropic API sees the conversation ending
                                 // with an assistant message.
+                                let prefix = if verbatim {
+                                    "[tool runner output]"
+                                } else {
+                                    "[tool runner summary]"
+                                };
                                 messages.push(json!({
                                     "role": "user",
-                                    "content": format!("[tool runner summary] {}", summary_text)
+                                    "content": format!("{} {}", prefix, summary_text)
                                 }));
                             }
                         }
