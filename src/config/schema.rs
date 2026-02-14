@@ -581,7 +581,7 @@ impl Default for ProvenanceConfig {
 // ---------------------------------------------------------------------------
 
 fn default_td_max_iterations() -> u32 {
-    15
+    3
 }
 
 fn default_td_max_tokens() -> u32 {
@@ -861,7 +861,7 @@ mod tests {
         assert!(!td.enabled);
         assert!(td.model.is_empty());
         assert!(td.provider.is_none());
-        assert_eq!(td.max_iterations, 15);
+        assert_eq!(td.max_iterations, 3);
         assert_eq!(td.max_tokens, 4096);
         assert!(td.slim_results);
         assert_eq!(td.max_result_preview_chars, 200);

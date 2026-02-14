@@ -23,6 +23,34 @@ use crate::providers::base::LLMProvider;
 /// Maximum iterations for a subagent run.
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
 
+/// Truncate text for display: max `max_lines` lines or `max_chars` characters.
+fn truncate_for_display(data: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    let mut chars = 0usize;
+    for line in data.lines() {
+        if lines >= max_lines || chars >= max_chars {
+            out.push_str("...[truncated]");
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            chars += 1;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if line.len() > remaining {
+            let partial: String = line.chars().take(remaining).collect();
+            out.push_str(&partial);
+            out.push_str("...[truncated]");
+            break;
+        }
+        out.push_str(line);
+        chars += line.len();
+        lines += 1;
+    }
+    out
+}
+
 /// Info about a running subagent task (cheaply cloneable).
 #[derive(Clone)]
 pub struct SubagentInfo {
@@ -145,10 +173,22 @@ impl SubagentManager {
             // In CLI mode, send directly to the terminal since the bus
             // isn't consumed by process_direct().
             if let Some(ref dtx) = display_tx {
-                let _ = dtx.send(format!(
-                    "\n\x1b[2m[subagent {} ({})]\x1b[0m {}: {}\n",
-                    lbl, tid, status, result_text
-                ));
+                let status_color = if status == "completed" { "\x1b[32m" } else { "\x1b[31m" };
+                let header = format!(
+                    "\n  {status_color}\u{25cf}\x1b[0m \x1b[1mSubagent: {}\x1b[0m  \x1b[2m({})\x1b[0m  {status_color}{}\x1b[0m",
+                    lbl, tid, status
+                );
+                // Strip markdown formatting for terminal display
+                let clean_result = result_text.replace("**", "").replace("__", "");
+                let truncated = truncate_for_display(&clean_result, 20, 2000);
+                let mut block = header;
+                block.push('\n');
+                block.push_str("    \x1b[2m\u{250c}\u{2500} result \u{2500}\x1b[0m\n");
+                for line in truncated.lines() {
+                    block.push_str(&format!("    \x1b[2m\u{2502}\x1b[0m {}\n", line));
+                }
+                block.push_str("    \x1b[2m\u{2514}\u{2500}\x1b[0m\n");
+                let _ = dtx.send(block);
             }
 
             // Remove self from running tasks.

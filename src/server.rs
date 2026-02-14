@@ -214,8 +214,9 @@ pub(crate) fn stop_compaction_server(
 /// Model preferences for the auto-spawned delegation server, in priority order.
 /// The first model found in `~/models/` wins.
 const DELEGATION_MODEL_PREFERENCES: &[&str] = &[
-    "Ministral-8B",
     "Ministral-3",
+    "Qwen3-0.6B",
+    "Ministral-8B",
     "Nemotron-Nano-9B",
 ];
 
@@ -271,17 +272,28 @@ pub(crate) async fn start_delegation_if_available(
     let port = find_available_port(8091);
     let ctx_size = 4096; // Tool work is short — no need for large context
 
+    // Compute GPU layers based on available VRAM (after main model is loaded).
+    let gpu_layers = compute_gpu_layers_for_model(&model_path, ctx_size);
+    let gpu_label = if gpu_layers >= 99 {
+        "full GPU".to_string()
+    } else if gpu_layers == 0 {
+        "CPU".to_string()
+    } else {
+        format!("{} GPU layers", gpu_layers)
+    };
+
     println!(
-        "  {}{}Starting{} delegation server ({}, port {}, ctx: {}K, GPU)...",
+        "  {}{}Starting{} delegation server ({}, port {}, ctx: {}K, {})...",
         crate::tui::BOLD,
         crate::tui::YELLOW,
         crate::tui::RESET,
         model_name,
         port,
         ctx_size / 1024,
+        gpu_label,
     );
 
-    match spawn_compaction_server(port, &model_path, ctx_size) {
+    match spawn_delegation_server(port, &model_path, ctx_size, gpu_layers) {
         Ok(child) => {
             *delegation_process = Some(child);
             if wait_for_server_ready(port, 30, delegation_process).await {
@@ -606,6 +618,59 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
 ///
 /// Uses GPU acceleration and matches the main model's context size so
 /// large conversations can be summarized in a single LLM call.
+/// Estimate VRAM needed to fully offload a GGUF model (weights + small KV cache).
+///
+/// Returns bytes needed for full GPU offload. Uses file size as a proxy for
+/// weight memory (GGUF file ≈ quantized weights + small overhead).
+pub(crate) fn estimate_model_vram(model_path: &Path, ctx_size: usize) -> u64 {
+    let file_size = std::fs::metadata(model_path)
+        .map(|m| m.len())
+        .unwrap_or(5 * 1024 * 1024 * 1024); // 5GB fallback
+
+    // Parse GGUF for KV cache estimation if possible.
+    let kv_bytes = match parse_gguf_metadata(model_path) {
+        Some(meta) => {
+            let head_dim = meta.embedding_dim / meta.n_heads.max(1);
+            let kv_per_token = 2 * meta.n_layers * meta.n_kv_heads * head_dim * 2;
+            (kv_per_token as u64 * ctx_size as u64)
+        }
+        None => {
+            // Rough estimate: ~2MB per 1K context for 8B model
+            (ctx_size as u64 / 1024) * 2 * 1024 * 1024
+        }
+    };
+
+    file_size + kv_bytes + 256 * 1024 * 1024 // weights + KV + 256MB overhead
+}
+
+/// Compute how many GPU layers a model can use given available VRAM.
+///
+/// If the model fits entirely, returns 99 (full offload). Otherwise,
+/// proportionally allocates layers based on how much VRAM is free.
+pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -> u32 {
+    let (vram, _ram) = detect_available_memory();
+    let Some(free_vram) = vram else {
+        return 0; // No GPU detected
+    };
+
+    let needed = estimate_model_vram(model_path, ctx_size);
+
+    if free_vram >= needed {
+        99 // Full offload — plenty of room
+    } else if free_vram < 512 * 1024 * 1024 {
+        0 // Less than 512MB free — CPU only
+    } else {
+        // Proportional: if we have 60% of needed VRAM, use ~60% of layers.
+        // Parse layer count from GGUF, fall back to 32 (typical for 8B models).
+        let total_layers = parse_gguf_metadata(model_path)
+            .map(|m| m.n_layers)
+            .unwrap_or(32) as u64;
+        let proportion = free_vram as f64 / needed as f64;
+        let layers = (total_layers as f64 * proportion).floor() as u32;
+        layers.max(1) // At least 1 layer on GPU
+    }
+}
+
 pub(crate) fn spawn_compaction_server(
     port: u16,
     model_path: &Path,
@@ -648,6 +713,50 @@ pub(crate) fn spawn_compaction_server(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn compaction server: {}", e))
+}
+
+/// Spawn a llama-server for the delegation model with configurable GPU layers.
+pub(crate) fn spawn_delegation_server(
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+    gpu_layers: u32,
+) -> Result<Child, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let server_path = home.join("llama.cpp/build/bin/llama-server");
+
+    if !server_path.exists() {
+        return Err(format!(
+            "llama-server not found at {}",
+            server_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!(
+            "Delegation model not found at {}",
+            model_path.display()
+        ));
+    }
+
+    Command::new(&server_path)
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg(ctx_size.to_string())
+        .arg("--parallel")
+        .arg("1")
+        .arg("--n-gpu-layers")
+        .arg(gpu_layers.to_string())
+        .arg("--flash-attn")
+        .arg("on")
+        .arg("--jinja")
+        .arg("--no-prefill-assistant")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn delegation server: {}", e))
 }
 
 /// Spawn a llama-server for the main model.
@@ -1242,9 +1351,10 @@ mod tests {
 
     #[test]
     fn test_find_delegation_model_preference_constants() {
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-8B");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "Ministral-3");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Nemotron-Nano-9B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-3");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "Qwen3-0.6B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Ministral-8B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[3], "Nemotron-Nano-9B");
     }
 
     #[test]
@@ -1277,15 +1387,15 @@ mod tests {
 
     #[test]
     fn test_pick_preferred_model_priority_ordering() {
-        // Both Ministral-8B and Nemotron present — Ministral-8B wins (higher priority)
+        // Both Ministral-3 and Nemotron present — Ministral-3 wins (higher priority)
         let models = vec![
             PathBuf::from("/models/Nemotron-Nano-9B-v2-Q4_K_M.gguf"),
-            PathBuf::from("/models/Ministral-8B-Instruct-2410-Q4_K_M.gguf"),
+            PathBuf::from("/models/Ministral-3-Instruct-Q4_K_M.gguf"),
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(
-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-8B"),
-            "Ministral-8B should beat Nemotron, got: {:?}",
+            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+            "Ministral-3 should beat Nemotron, got: {:?}",
             result
         );
     }
@@ -1299,8 +1409,8 @@ mod tests {
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(
-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-8B"),
-            "Ministral-8B is highest priority, got: {:?}",
+            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+            "Ministral-3 is highest priority, got: {:?}",
             result
         );
     }

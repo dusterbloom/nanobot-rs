@@ -85,6 +85,15 @@ pub struct SharedCore {
     pub session_complete_after_secs: u64,
     pub max_message_age_turns: usize,
     pub max_history_turns: usize,
+    /// Tracks whether the delegation provider is alive. Set to `false` when
+    /// the delegation LLM returns an error, causing subsequent calls to fall
+    /// through to inline execution. Reset to `true` when the core is rebuilt
+    /// (e.g. `/local` toggle restarts servers).
+    pub delegation_healthy: AtomicBool,
+    /// Counts tool calls since delegation was marked unhealthy. Used to
+    /// periodically re-probe: every 10 inline calls, try delegation once
+    /// more in case the server recovered.
+    pub delegation_retry_counter: AtomicU64,
 }
 
 /// Handle for hot-swapping the shared core.
@@ -232,6 +241,8 @@ pub fn build_shared_core(
         session_complete_after_secs: memory_config.session_complete_after_secs,
         max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
+        delegation_healthy: AtomicBool::new(true),
+        delegation_retry_counter: AtomicU64::new(0),
     }
 }
 
@@ -687,7 +698,21 @@ impl AgentLoopShared {
                 }
 
                 // Check if we should delegate to the tool runner.
-                let should_delegate = core.tool_delegation_config.enabled || auto_escalate;
+                // Skip delegation if the provider was previously marked dead.
+                let mut delegation_alive = core.delegation_healthy.load(Ordering::Relaxed);
+                // Periodically re-probe: every 10 inline calls, try delegation
+                // once in case the server recovered (e.g. user restarted it).
+                if !delegation_alive && core.tool_delegation_config.enabled {
+                    let retries = core.delegation_retry_counter.fetch_add(1, Ordering::Relaxed);
+                    if retries > 0 && retries % 10 == 0 {
+                        info!("Re-probing delegation provider (attempt {} since failure)", retries);
+                        delegation_alive = true; // try this one time
+                    } else {
+                        debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
+                    }
+                }
+                let should_delegate = (core.tool_delegation_config.enabled || auto_escalate)
+                    && delegation_alive;
                 // Resolve provider+model: explicit config, or fall back to main provider.
                 let delegation_provider = core.tool_runner_provider.clone()
                     .or_else(|| if auto_escalate { Some(core.provider.clone()) } else { None });
@@ -710,12 +735,21 @@ impl AgentLoopShared {
                         // tool→generate natively and don't need it.
                         let needs_user_cont = auto_escalate && core.is_local;
 
+                        // The delegation model typically has a small context (4K tokens).
+                        // Cap tool results to ~1500 tokens (~6000 chars) so the system
+                        // prompt, tool call messages, and response all fit comfortably.
+                        // Use the main model's limit only if it's already smaller.
+                        let delegation_result_limit = core.max_tool_result_chars
+                            .min(6000);
+
                         let runner_config = ToolRunnerConfig {
                             provider: tr_provider.clone(),
                             model: tr_model.clone(),
                             max_iterations: core.tool_delegation_config.max_iterations,
                             max_tokens: core.tool_delegation_config.max_tokens,
                             needs_user_continuation: needs_user_cont,
+                            max_tool_result_chars: delegation_result_limit,
+                            short_circuit_chars: 200,
                         };
 
                         // Emit tool call start events for delegated calls.
@@ -734,13 +768,51 @@ impl AgentLoopShared {
                             }
                         }
 
+                        // Build task description for the delegation model.
+                        // Use the main model's content (alongside tool calls) as
+                        // instructions — it naturally contains intent, constraints,
+                        // and expected format. Fall back to the user message if
+                        // the main model didn't produce text.
+                        let tool_names: Vec<&str> = response.tool_calls
+                            .iter()
+                            .map(|tc| tc.name.as_str())
+                            .collect();
+                        let instructions = response.content.as_deref()
+                            .filter(|c| !c.trim().is_empty())
+                            .map(|c| c.chars().take(400).collect::<String>())
+                            .unwrap_or_else(|| {
+                                msg.content.chars().take(300).collect::<String>()
+                            });
+                        let task_desc = format!(
+                            "Instructions: {}\nTools to execute: {}",
+                            instructions,
+                            tool_names.join(", ")
+                        );
+
                         let run_result = tool_runner::run_tool_loop(
                             &runner_config,
                             &response.tool_calls,
                             &tools,
-                            &msg.content,
+                            &task_desc,
                         )
                         .await;
+
+                        // If the runner returned no summary, the delegation
+                        // LLM likely failed (server down). Mark it unhealthy
+                        // so future calls go inline without wasting time.
+                        if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+                            warn!(
+                                "Delegation model returned no summary — marking provider unhealthy. \
+                                 Tool results will flow to main model directly. \
+                                 Restart servers or toggle /local to recover."
+                            );
+                            core.delegation_healthy.store(false, Ordering::Relaxed);
+                        } else if !core.delegation_healthy.load(Ordering::Relaxed) {
+                            // Re-probe succeeded — server recovered!
+                            info!("Delegation provider recovered — re-enabling delegation");
+                            core.delegation_healthy.store(true, Ordering::Relaxed);
+                            core.delegation_retry_counter.store(0, Ordering::Relaxed);
+                        }
 
                         debug!(
                             "Tool runner completed: {} results in {} iterations",
