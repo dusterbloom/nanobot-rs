@@ -52,6 +52,14 @@ pub struct ToolRunResult {
     pub iterations_used: u32,
 }
 
+/// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
+fn normalize_call_key(name: &str, arguments: &HashMap<String, Value>) -> String {
+    let mut sorted: Vec<_> = arguments.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    let normalized = serde_json::to_string(&sorted).unwrap_or_default();
+    format!("{}:{}", name, normalized)
+}
+
 /// Run a delegated tool execution loop.
 ///
 /// Executes `initial_tool_calls` using the `tools` registry, then asks the
@@ -68,6 +76,7 @@ pub async fn run_tool_loop(
     let mut id_counter: usize = 0;
     // Track tool calls we've already executed to detect loops.
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_results: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // RLM ContextStore: stores full tool outputs as named variables.
     // The delegation model sees metadata for large results and can use
@@ -91,7 +100,7 @@ pub async fn run_tool_loop(
     // Keep the system prompt compact — the delegation model has limited context.
     let system_msg = json!({
         "role": "system",
-        "content": "You are a tool execution agent. Tool results are stored as variables.\nYou receive metadata for large results (name, length, preview) and full results for small ones.\nUse ctx_slice, ctx_grep, ctx_length to examine large variables.\nUse ctx_summarize to sub-summarize a variable with a specific instruction.\n\nRULES:\n1. Read the metadata/results. If the answer is visible, SUMMARIZE with specific data and STOP.\n2. For large results: use ctx_grep to search for specific patterns first.\n3. Use ctx_slice to read specific sections only when grep isn't enough.\n4. Use ctx_summarize when you need a focused summary of a specific variable.\n5. NEVER re-execute a tool with the same arguments.\n6. When you have enough information, SUMMARIZE and STOP.\n7. Do not ask questions."
+        "content": "You are a tool result analyst. You receive tool outputs as named variables.\n\nRULES:\n1. If results are clear and complete, write a concise summary with specific data points. STOP.\n2. If results are too large, use ctx_grep(variable, pattern) to find relevant sections.\n3. If grep isn't enough, use ctx_slice(variable, start, end) to read specific ranges.\n4. If you need a focused summary of a large result, use ctx_summarize(variable, instruction).\n5. NEVER re-execute the same tool with identical arguments.\n6. NEVER execute tools not in your allowed list.\n7. Prefer grep → slice → summarize (cheapest first).\n\nOUTPUT FORMAT:\n- Lead with the answer/finding\n- Include specific numbers, paths, error messages verbatim\n- If multiple tool results, organize by tool call"
     });
     let mut messages: Vec<Value> = vec![system_msg];
 
@@ -128,8 +137,7 @@ pub async fn run_tool_loop(
 
     // Seed seen_calls with initial calls so the model can't re-request them.
     for tc in initial_tool_calls {
-        let call_key = format!("{}:{}", tc.name,
-            serde_json::to_string(&tc.arguments).unwrap_or_default());
+        let call_key = normalize_call_key(&tc.name, &tc.arguments);
         seen_calls.insert(call_key);
     }
 
@@ -233,7 +241,17 @@ pub async fn run_tool_loop(
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                all_results.push((original_id, tc.name.clone(), result.data));
+                all_results.push((original_id, tc.name.clone(), result.data.clone()));
+
+                // Track result hashes for loop detection.
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tc.name.hash(&mut hasher);
+                result.data.hash(&mut hasher);
+                let result_hash = hasher.finish();
+                if !seen_results.insert(result_hash) {
+                    warn!("Tool '{}' produced identical results — likely loop", tc.name);
+                }
             }
         }
 
@@ -246,7 +264,12 @@ pub async fn run_tool_loop(
         if config.short_circuit_chars > 0 && iteration == 0 {
             let threshold = config.short_circuit_chars;
             let all_short = all_results.iter().all(|(_, _, data)| data.len() < threshold);
-            if all_short {
+            // exec/web_search/web_fetch results need interpretation even when short
+            // (e.g. a 50-char error message should be analyzed, not passed raw).
+            let needs_interpretation = all_results.iter().any(|(_, name, _)| {
+                matches!(name.as_str(), "exec" | "web_search" | "web_fetch")
+            });
+            if all_short && !needs_interpretation {
                 debug!(
                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
                     all_results.len(), threshold
@@ -265,16 +288,23 @@ pub async fn run_tool_loop(
         if config.needs_user_continuation {
             messages.push(json!({
                 "role": "user",
-                "content": "Tool results are above. Summarize the findings. Only call more tools if the results clearly indicate incomplete or failed execution."
+                "content": "The tool results are shown above. Provide a brief, factual summary of what the results show. Do NOT call more tools unless execution clearly failed."
             }));
         }
 
         // Ask the cheap model if more tools are needed.
+        // On first iteration after initial execution, don't offer tools —
+        // force the model to summarize instead of reflexively calling more.
+        let tools_for_call = if iteration == 0 {
+            None
+        } else {
+            tool_defs_opt
+        };
         let response = match config
             .provider
             .chat(
                 &messages,
-                tool_defs_opt,
+                tools_for_call,
                 Some(&config.model),
                 config.max_tokens,
                 0.3, // low temperature for tool execution
@@ -318,8 +348,7 @@ pub async fn run_tool_loop(
                     );
                     continue;
                 }
-                let call_key = format!("{}:{}", tc.name,
-                    serde_json::to_string(&tc.arguments).unwrap_or_default());
+                let call_key = normalize_call_key(&tc.name, &tc.arguments);
                 if seen_calls.contains(&call_key) {
                     warn!("Delegation model re-requested {} with same args — breaking loop", tc.name);
                 } else {
@@ -1579,15 +1608,17 @@ mod tests {
     #[tokio::test]
     async fn test_delegation_receives_micro_tool_defs() {
         // Verify the delegation model receives ctx_slice, ctx_grep, ctx_length
-        // in its tool definitions.
+        // in its tool definitions on iteration 1+ (iteration 0 has no tools).
         struct CapturingToolsProvider {
             captured_tools: tokio::sync::Mutex<Vec<Vec<Value>>>,
+            call_count: AtomicU32,
         }
 
         impl CapturingToolsProvider {
             fn new() -> Self {
                 Self {
                     captured_tools: tokio::sync::Mutex::new(Vec::new()),
+                    call_count: AtomicU32::new(0),
                 }
             }
         }
@@ -1608,12 +1639,32 @@ mod tests {
                         .await
                         .push(t.to_vec());
                 }
-                Ok(crate::providers::base::LLMResponse {
-                    content: Some("Done.".to_string()),
-                    tool_calls: vec![],
-                    finish_reason: "stop".to_string(),
-                    usage: HashMap::new(),
-                })
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call (iteration 0): request a chained tool to trigger iteration 1
+                    Ok(crate::providers::base::LLMResponse {
+                        content: None,
+                        tool_calls: vec![ToolCallRequest {
+                            id: "chain_0".to_string(),
+                            name: "test_tool".to_string(),
+                            arguments: {
+                                let mut m = HashMap::new();
+                                m.insert("query".to_string(), json!("follow_up"));
+                                m
+                            },
+                        }],
+                        finish_reason: "tool_calls".to_string(),
+                        usage: HashMap::new(),
+                    })
+                } else {
+                    // Second call (iteration 1): done
+                    Ok(crate::providers::base::LLMResponse {
+                        content: Some("Done.".to_string()),
+                        tool_calls: vec![],
+                        finish_reason: "stop".to_string(),
+                        usage: HashMap::new(),
+                    })
+                }
             }
 
             fn get_default_model(&self) -> &str {
@@ -1647,7 +1698,8 @@ mod tests {
         .await;
 
         let captured = provider.captured_tools.lock().await;
-        assert!(!captured.is_empty(), "Should have captured tool definitions");
+        // Iteration 0 gets None, iteration 1 gets tools
+        assert_eq!(captured.len(), 1, "Should have captured tool definitions from iteration 1");
 
         let defs = &captured[0];
         let tool_names: Vec<&str> = defs.iter()

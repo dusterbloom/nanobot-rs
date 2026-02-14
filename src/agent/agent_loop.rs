@@ -45,11 +45,11 @@ use crate::session::manager::SessionManager;
 // Shared core (identical across all agents, swappable on /local toggle)
 // ---------------------------------------------------------------------------
 
-/// Core state shared identically across all agent instances.
+/// Fields that change on `/local` and `/model` — behind `Arc<RwLock<Arc<>>>`.
 ///
-/// When the user toggles `/local` or `/model`, a new `SharedCore` is built
+/// When the user toggles `/local` or `/model`, a new `SwappableCore` is built
 /// and swapped into the handle so every agent sees the change.
-pub struct SharedCore {
+pub struct SwappableCore {
     pub provider: Arc<dyn LLMProvider>,
     pub workspace: PathBuf,
     pub model: String,
@@ -70,12 +70,6 @@ pub struct SharedCore {
     pub memory_provider: Arc<dyn LLMProvider>,
     pub memory_model: String,
     pub reflection_threshold: usize,
-    pub learning_turn_counter: AtomicU64,
-    pub last_context_used: AtomicU64,
-    pub last_context_max: AtomicU64,
-    pub last_message_count: AtomicU64,
-    pub last_working_memory_tokens: AtomicU64,
-    pub last_tools_called: std::sync::Mutex<Vec<String>>,
     pub is_local: bool,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_runner_model: Option<String>,
@@ -85,6 +79,20 @@ pub struct SharedCore {
     pub session_complete_after_secs: u64,
     pub max_message_age_turns: usize,
     pub max_history_turns: usize,
+}
+
+/// Atomic counters that survive core swaps — never behind `RwLock`.
+///
+/// These counters persist across `/local` and `/model` hot-swaps because
+/// they live outside the swappable core. Previously they were inside
+/// `SharedCore` and silently reset to zero on every swap.
+pub struct RuntimeCounters {
+    pub learning_turn_counter: AtomicU64,
+    pub last_context_used: AtomicU64,
+    pub last_context_max: AtomicU64,
+    pub last_message_count: AtomicU64,
+    pub last_working_memory_tokens: AtomicU64,
+    pub last_tools_called: std::sync::Mutex<Vec<String>>,
     /// Tracks whether the delegation provider is alive. Set to `false` when
     /// the delegation LLM returns an error, causing subsequent calls to fall
     /// through to inline execution. Reset to `true` when the core is rebuilt
@@ -96,18 +104,59 @@ pub struct SharedCore {
     pub delegation_retry_counter: AtomicU64,
 }
 
-/// Handle for hot-swapping the shared core.
-///
-/// Readers clone the inner `Arc<SharedCore>` under a brief read lock.
-/// Writers (only `/local` toggle) take the write lock to replace the inner Arc.
-pub type SharedCoreHandle = Arc<std::sync::RwLock<Arc<SharedCore>>>;
+impl RuntimeCounters {
+    pub fn new(max_context_tokens: usize) -> Self {
+        Self {
+            learning_turn_counter: AtomicU64::new(0),
+            last_context_used: AtomicU64::new(0),
+            last_context_max: AtomicU64::new(max_context_tokens as u64),
+            last_message_count: AtomicU64::new(0),
+            last_working_memory_tokens: AtomicU64::new(0),
+            last_tools_called: std::sync::Mutex::new(Vec::new()),
+            delegation_healthy: AtomicBool::new(true),
+            delegation_retry_counter: AtomicU64::new(0),
+        }
+    }
+}
 
-/// Build a `SharedCore` from the given parameters.
+/// Combined handle: cheap to clone (two pointer bumps).
+///
+/// `core` is swapped on `/local` and `/model`. `counters` persists forever.
+#[derive(Clone)]
+pub struct AgentHandle {
+    core: Arc<std::sync::RwLock<Arc<SwappableCore>>>,
+    pub counters: Arc<RuntimeCounters>,
+}
+
+impl AgentHandle {
+    /// Create a new handle from a swappable core and runtime counters.
+    pub fn new(core: SwappableCore, counters: Arc<RuntimeCounters>) -> Self {
+        Self {
+            core: Arc::new(std::sync::RwLock::new(Arc::new(core))),
+            counters,
+        }
+    }
+
+    /// Snapshot the current swappable core (cheap Arc clone under brief read lock).
+    pub fn swappable(&self) -> Arc<SwappableCore> {
+        self.core.read().unwrap().clone()
+    }
+
+    /// Replace the swappable core (write lock). Counters are untouched.
+    pub fn swap_core(&self, new_core: SwappableCore) {
+        *self.core.write().unwrap() = Arc::new(new_core);
+    }
+}
+
+// Backward-compatibility alias during migration.
+pub type SharedCoreHandle = AgentHandle;
+
+/// Build a `SwappableCore` from the given parameters.
 ///
 /// When `is_local` is true, the compactor and memory operations use a dedicated
 /// `compaction_provider` if supplied (e.g. a CPU-only Qwen3-0.6B server), or
 /// fall back to the main (local) provider.
-pub fn build_shared_core(
+pub fn build_swappable_core(
     provider: Arc<dyn LLMProvider>,
     workspace: PathBuf,
     model: String,
@@ -125,7 +174,7 @@ pub fn build_shared_core(
     provenance: ProvenanceConfig,
     max_tool_result_chars: usize,
     delegation_provider: Option<Arc<dyn LLMProvider>>,
-) -> SharedCore {
+) -> SwappableCore {
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
     } else {
@@ -205,7 +254,7 @@ pub fn build_shared_core(
         (None, None)
     };
 
-    SharedCore {
+    SwappableCore {
         provider,
         workspace,
         model,
@@ -226,12 +275,6 @@ pub fn build_shared_core(
         memory_provider,
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
-        learning_turn_counter: AtomicU64::new(0),
-        last_context_used: AtomicU64::new(0),
-        last_context_max: AtomicU64::new(max_context_tokens as u64),
-        last_message_count: AtomicU64::new(0),
-        last_working_memory_tokens: AtomicU64::new(0),
-        last_tools_called: std::sync::Mutex::new(Vec::new()),
         is_local,
         tool_runner_provider,
         tool_runner_model,
@@ -241,8 +284,6 @@ pub fn build_shared_core(
         session_complete_after_secs: memory_config.session_complete_after_secs,
         max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
-        delegation_healthy: AtomicBool::new(true),
-        delegation_retry_counter: AtomicU64::new(0),
     }
 }
 
@@ -309,9 +350,9 @@ impl AgentLoopShared {
     /// Build a fresh [`ToolRegistry`] with context-sensitive tools (message,
     /// spawn, cron) pre-configured for a specific channel/chat_id.
     ///
-    /// Takes a snapshot of `SharedCore` so the registry is consistent for the
+    /// Takes a snapshot of `SwappableCore` so the registry is consistent for the
     /// entire message processing.
-    async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
+    async fn build_tools(&self, core: &SwappableCore, channel: &str, chat_id: &str) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
 
         // File system tools (stateless).
@@ -327,6 +368,7 @@ impl AgentLoopShared {
             None,
             None,
             core.restrict_to_workspace,
+            core.max_tool_result_chars,
         )));
 
         // Web (stateless config).
@@ -397,8 +439,9 @@ impl AgentLoopShared {
         let streaming = text_delta_tx.is_some();
 
         // Snapshot core — instant Arc clone under brief read lock.
-        let core = self.core_handle.read().unwrap().clone();
-        let turn_count = core.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let core = self.core_handle.swappable();
+        let counters = &self.core_handle.counters;
+        let turn_count = counters.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
         if turn_count % 50 == 0 {
             core.learning.prune();
         }
@@ -700,11 +743,11 @@ impl AgentLoopShared {
 
                 // Check if we should delegate to the tool runner.
                 // Skip delegation if the provider was previously marked dead.
-                let mut delegation_alive = core.delegation_healthy.load(Ordering::Relaxed);
+                let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
                 // Periodically re-probe: every 10 inline calls, try delegation
                 // once in case the server recovered (e.g. user restarted it).
                 if !delegation_alive && core.tool_delegation_config.enabled {
-                    let retries = core.delegation_retry_counter.fetch_add(1, Ordering::Relaxed);
+                    let retries = counters.delegation_retry_counter.fetch_add(1, Ordering::Relaxed);
                     if retries > 0 && retries % 10 == 0 {
                         info!("Re-probing delegation provider (attempt {} since failure)", retries);
                         delegation_alive = true; // try this one time
@@ -809,12 +852,12 @@ impl AgentLoopShared {
                                  Tool results will flow to main model directly. \
                                  Restart servers or toggle /local to recover."
                             );
-                            core.delegation_healthy.store(false, Ordering::Relaxed);
-                        } else if !core.delegation_healthy.load(Ordering::Relaxed) {
+                            counters.delegation_healthy.store(false, Ordering::Relaxed);
+                        } else if !counters.delegation_healthy.load(Ordering::Relaxed) {
                             // Re-probe succeeded — server recovered!
                             info!("Delegation provider recovered — re-enabling delegation");
-                            core.delegation_healthy.store(true, Ordering::Relaxed);
-                            core.delegation_retry_counter.store(0, Ordering::Relaxed);
+                            counters.delegation_healthy.store(true, Ordering::Relaxed);
+                            counters.delegation_retry_counter.store(0, Ordering::Relaxed);
                         }
 
                         debug!(
@@ -848,7 +891,8 @@ impl AgentLoopShared {
                         // Add tool results from the runner to the main context.
                         // In slim mode, truncate results to save context budget —
                         // the runner's summary carries the meaning.
-                        let slim = core.tool_delegation_config.slim_results;
+                        let slim = core.tool_delegation_config.enabled
+                            && core.tool_delegation_config.slim_results;
                         let preview_max = core.tool_delegation_config.max_result_preview_chars;
 
                         for tc in &response.tool_calls {
@@ -1142,11 +1186,11 @@ impl AgentLoopShared {
 
         // Store context stats for status bar.
         let final_tokens = TokenBudget::estimate_tokens(&messages) as u64;
-        core.last_context_used
+        counters.last_context_used
             .store(final_tokens, Ordering::Relaxed);
-        core.last_context_max
+        counters.last_context_max
             .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
-        core.last_message_count
+        counters.last_message_count
             .store(messages.len() as u64, Ordering::Relaxed);
         // Store working memory token count.
         let wm_tokens = if core.memory_enabled {
@@ -1155,11 +1199,11 @@ impl AgentLoopShared {
         } else {
             0
         };
-        core.last_working_memory_tokens.store(wm_tokens, Ordering::Relaxed);
+        counters.last_working_memory_tokens.store(wm_tokens, Ordering::Relaxed);
         // Store tools called this turn.
         {
             let tools_list: Vec<String> = used_tools.iter().cloned().collect();
-            if let Ok(mut guard) = core.last_tools_called.lock() {
+            if let Ok(mut guard) = counters.last_tools_called.lock() {
                 *guard = tools_list;
             }
         }
@@ -1329,7 +1373,7 @@ impl AgentLoop {
         repl_display_tx: Option<UnboundedSender<String>>,
     ) -> Self {
         // Read core to initialize the subagent manager.
-        let core = core_handle.read().unwrap().clone();
+        let core = core_handle.swappable();
         let mut subagent_mgr = SubagentManager::new(
             core.provider.clone(),
             core.workspace.clone(),
@@ -1366,7 +1410,7 @@ impl AgentLoop {
 
     /// Spawn a background reflection task if observations exceed threshold.
     fn spawn_background_reflection(shared: &Arc<AgentLoopShared>) {
-        let core = shared.core_handle.read().unwrap().clone();
+        let core = shared.core_handle.swappable();
         if !core.memory_enabled {
             return;
         }
@@ -1702,12 +1746,12 @@ mod tests {
         }
     }
 
-    /// Helper to build a SharedCore with minimal config for wiring tests.
+    /// Helper to build a SwappableCore with minimal config for wiring tests.
     fn build_test_core(
         delegation_enabled: bool,
         delegation_provider: Option<Arc<dyn LLMProvider>>,
         config_provider: Option<ProviderConfig>,
-    ) -> SharedCore {
+    ) -> SwappableCore {
         let workspace = tempfile::tempdir().unwrap().into_path();
         let main = MockLLM::named("main-provider");
         let td = ToolDelegationConfig {
@@ -1717,7 +1761,7 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        build_shared_core(
+        build_swappable_core(
             main,
             workspace,
             "main-model".to_string(),
@@ -1834,7 +1878,7 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_shared_core(
+        let core = build_swappable_core(
             main,
             workspace,
             "main-model".to_string(),
@@ -1886,7 +1930,7 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_shared_core(
+        let core = build_swappable_core(
             main,
             workspace,
             "local-model".to_string(),
@@ -1928,7 +1972,7 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_shared_core(
+        let core = build_swappable_core(
             main,
             workspace,
             "main-model".to_string(),

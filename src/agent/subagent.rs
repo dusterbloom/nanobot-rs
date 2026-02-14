@@ -270,6 +270,7 @@ impl SubagentManager {
             None,
             None,
             restrict_to_workspace,
+            30000,
         )));
         tools.register(Box::new(WebSearchTool::new(
             brave_api_key.map(|s| s.to_string()),

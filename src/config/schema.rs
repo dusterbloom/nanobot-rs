@@ -653,6 +653,19 @@ impl Default for ToolDelegationConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Voice config
+// ---------------------------------------------------------------------------
+
+/// Configuration for voice mode TTS/STT.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfig {
+    /// Default language for TTS. "en" = Pocket only (fast), "auto" or None = both engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -676,6 +689,8 @@ pub struct Config {
     pub tool_delegation: ToolDelegationConfig,
     #[serde(default)]
     pub provenance: ProvenanceConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
 }
 
 impl Config {
@@ -991,6 +1006,26 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.tool_delegation.enabled);
         assert!(!cfg.tool_delegation.auto_local);
+    }
+
+    #[test]
+    fn test_voice_config_defaults() {
+        let vc = VoiceConfig::default();
+        assert!(vc.language.is_none());
+    }
+
+    #[test]
+    fn test_voice_config_in_root() {
+        let json = r#"{"voice": {"language": "en"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn test_voice_config_absent_defaults_to_none() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.voice.language.is_none());
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub struct ExecTool {
     deny_patterns: Vec<String>,
     allow_patterns: Vec<String>,
     restrict_to_workspace: bool,
+    max_output_chars: usize,
 }
 
 impl ExecTool {
@@ -72,6 +73,7 @@ impl ExecTool {
         deny_patterns: Option<Vec<String>>,
         allow_patterns: Option<Vec<String>>,
         restrict_to_workspace: bool,
+        max_output_chars: usize,
     ) -> Self {
         Self {
             timeout,
@@ -79,6 +81,7 @@ impl ExecTool {
             deny_patterns: deny_patterns.unwrap_or_else(default_deny_patterns),
             allow_patterns: allow_patterns.unwrap_or_default(),
             restrict_to_workspace,
+            max_output_chars,
         }
     }
 
@@ -363,7 +366,7 @@ impl Tool for ExecTool {
         };
 
         // Truncate very long output.
-        let max_len = 10000;
+        let max_len = self.max_output_chars;
         if output.len() > max_len {
             let overflow = output.len() - max_len;
             output.truncate(max_len);
@@ -514,7 +517,7 @@ impl Tool for ExecTool {
             Err(_) => format!("Error: Command timed out after {} seconds", self.timeout),
         };
 
-        let max_len = 10000;
+        let max_len = self.max_output_chars;
         if output.len() > max_len {
             let overflow = output.len() - max_len;
             output.truncate(max_len);
@@ -532,7 +535,7 @@ mod tests {
     /// Create an ExecTool with default deny patterns, no allow patterns,
     /// and workspace restriction enabled.
     fn make_exec_tool(restrict: bool) -> ExecTool {
-        ExecTool::new(10, None, None, None, restrict)
+        ExecTool::new(10, None, None, None, restrict, 30000)
     }
 
     /// Helper: call guard_command with the given command on a restricted tool.
@@ -669,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_allow_patterns_block_unmatched() {
-        let tool = ExecTool::new(10, None, None, Some(vec![r"^echo\b".to_string()]), false);
+        let tool = ExecTool::new(10, None, None, Some(vec![r"^echo\b".to_string()]), false, 30000);
         let cwd = ".".to_string();
 
         // "echo" matches, so it should be allowed.

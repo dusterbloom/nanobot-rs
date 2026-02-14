@@ -95,12 +95,13 @@ fn format_tokens(n: usize) -> String {
 ///
 /// Shows: ctx tokens/max | msgs | tools called | working memory | channels | agents | turn
 pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[&str], subagent_count: usize) {
-    let core = core_handle.read().unwrap().clone();
-    let used = core.last_context_used.load(Ordering::Relaxed) as usize;
-    let max = core.last_context_max.load(Ordering::Relaxed) as usize;
-    let turn = core.learning_turn_counter.load(Ordering::Relaxed);
-    let msg_count = core.last_message_count.load(Ordering::Relaxed) as usize;
-    let wm_tokens = core.last_working_memory_tokens.load(Ordering::Relaxed) as usize;
+    // Read counters directly — no RwLock needed.
+    let counters = &core_handle.counters;
+    let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
+    let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
+    let turn = counters.learning_turn_counter.load(Ordering::Relaxed);
+    let msg_count = counters.last_message_count.load(Ordering::Relaxed) as usize;
+    let wm_tokens = counters.last_working_memory_tokens.load(Ordering::Relaxed) as usize;
 
     let pct = if max > 0 { (used * 100) / max } else { 0 };
     let ctx_color = match pct {
@@ -125,7 +126,7 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
     parts.push(format!("msgs:{}", msg_count));
 
     // Tools called this turn
-    let tools_called: Vec<String> = core.last_tools_called.lock()
+    let tools_called: Vec<String> = counters.last_tools_called.lock()
         .map(|g| g.clone())
         .unwrap_or_default();
     if !tools_called.is_empty() {

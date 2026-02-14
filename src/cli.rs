@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 
-use crate::agent::agent_loop::{build_shared_core, AgentLoop, SharedCoreHandle};
+use crate::agent::agent_loop::{build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle};
 use crate::agent::tuning::{score_feasible_profiles, select_optimal_from_input, OptimizationInput};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::manager::ChannelManager;
@@ -358,7 +358,7 @@ pub(crate) fn build_core_handle(
         is_local,
     );
 
-    let core = build_shared_core(
+    let core = build_swappable_core(
         provider,
         config.workspace_path(),
         model,
@@ -377,7 +377,8 @@ pub(crate) fn build_core_handle(
         config.agents.defaults.max_tool_result_chars,
         dp,
     );
-    Arc::new(std::sync::RwLock::new(Arc::new(core)))
+    let counters = Arc::new(RuntimeCounters::new(max_context_tokens));
+    AgentHandle::new(core, counters)
 }
 
 /// Rebuild the shared core for `/local` toggle or `/model` swap.
@@ -447,7 +448,7 @@ pub(crate) fn rebuild_core(
         is_local,
     );
 
-    let new_core = build_shared_core(
+    let new_core = build_swappable_core(
         provider,
         config.workspace_path(),
         model,
@@ -466,7 +467,10 @@ pub(crate) fn rebuild_core(
         config.agents.defaults.max_tool_result_chars,
         dp,
     );
-    *handle.write().unwrap() = Arc::new(new_core);
+    // Swap only the core; counters survive.
+    handle.swap_core(new_core);
+    // Update max context since the new model may have a different size.
+    handle.counters.last_context_max.store(max_context_tokens as u64, Ordering::Relaxed);
 }
 
 /// Create an agent loop with per-instance channels, using the shared core handle.
