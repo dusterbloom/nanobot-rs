@@ -1,7 +1,10 @@
-//! Heartbeat service -- periodic agent wake-up to check for tasks.
+//! Heartbeat service -- periodic maintenance + agent wake-up.
 //!
-//! The agent reads `HEARTBEAT.md` from the workspace and executes any tasks
-//! listed there. If nothing needs attention it replies `HEARTBEAT_OK`.
+//! Two layers run on each tick:
+//! 1. **Maintenance commands** — cheap shell commands (e.g. `qmd update -c sessions`)
+//!    that run unconditionally on every tick.  No LLM involved.
+//! 2. **Agent tasks** — reads `HEARTBEAT.md` and invokes the LLM callback only
+//!    when there are actionable tasks.  Skipped when the file is empty.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -10,10 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-/// Default heartbeat interval: 30 minutes.
-pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 30 * 60;
+/// Default heartbeat interval: 5 minutes.
+pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 5 * 60;
+
+/// Default maintenance commands run on every tick.
+pub const DEFAULT_MAINTENANCE_COMMANDS: &[&str] = &["qmd update -c sessions"];
 
 /// The prompt sent to the agent during a heartbeat.
 pub const HEARTBEAT_PROMPT: &str = "Read HEARTBEAT.md in your workspace (if it exists).\n\
@@ -74,12 +80,14 @@ fn is_heartbeat_empty(content: Option<&str>) -> bool {
 // HeartbeatService
 // ---------------------------------------------------------------------------
 
-/// Periodic heartbeat service that wakes the agent to check for tasks.
+/// Periodic heartbeat service: maintenance commands + optional agent wake-up.
 pub struct HeartbeatService {
     /// Root workspace directory (contains `HEARTBEAT.md`).
     pub workspace: PathBuf,
-    /// Callback invoked on each heartbeat tick.
+    /// Callback invoked on each heartbeat tick (only when HEARTBEAT.md has tasks).
     on_heartbeat: Option<HeartbeatCallback>,
+    /// Shell commands run unconditionally on every tick (no LLM).
+    maintenance_commands: Vec<String>,
     /// Interval between heartbeats in seconds.
     pub interval_s: u64,
     /// Whether the service is enabled at all.
@@ -95,12 +103,14 @@ impl HeartbeatService {
     pub fn new(
         workspace: PathBuf,
         on_heartbeat: Option<HeartbeatCallback>,
+        maintenance_commands: Vec<String>,
         interval_s: u64,
         enabled: bool,
     ) -> Self {
         Self {
             workspace,
             on_heartbeat,
+            maintenance_commands,
             interval_s,
             enabled,
             running: Arc::new(AtomicBool::new(false)),
@@ -131,15 +141,25 @@ impl HeartbeatService {
         }
 
         self.running.store(true, Ordering::Relaxed);
-        info!("Heartbeat started (every {}s)", self.interval_s);
+        if !self.maintenance_commands.is_empty() {
+            info!(
+                "Heartbeat started (every {}s, {} maintenance commands)",
+                self.interval_s,
+                self.maintenance_commands.len()
+            );
+        } else {
+            info!("Heartbeat started (every {}s)", self.interval_s);
+        }
 
         let running = Arc::clone(&self.running);
         let interval_s = self.interval_s;
         let workspace = self.workspace.clone();
         let on_heartbeat = self.on_heartbeat.clone();
+        let maintenance_commands = self.maintenance_commands.clone();
 
         let handle = tokio::spawn(async move {
-            Self::run_loop(running, interval_s, workspace, on_heartbeat).await;
+            Self::run_loop(running, interval_s, workspace, on_heartbeat, maintenance_commands)
+                .await;
         });
 
         let mut guard = self.task_handle.lock().await;
@@ -175,6 +195,7 @@ impl HeartbeatService {
         interval_s: u64,
         workspace: PathBuf,
         on_heartbeat: Option<HeartbeatCallback>,
+        maintenance_commands: Vec<String>,
     ) {
         loop {
             tokio::time::sleep(Duration::from_secs(interval_s)).await;
@@ -183,7 +204,16 @@ impl HeartbeatService {
                 break;
             }
 
-            // Read HEARTBEAT.md
+            // ---------------------------------------------------------------
+            // Layer 1: Maintenance commands (cheap, no LLM)
+            // ---------------------------------------------------------------
+            for cmd in &maintenance_commands {
+                Self::run_maintenance_command(cmd).await;
+            }
+
+            // ---------------------------------------------------------------
+            // Layer 2: Agent tasks (only when HEARTBEAT.md has content)
+            // ---------------------------------------------------------------
             let content = {
                 let path = workspace.join("HEARTBEAT.md");
                 if path.exists() {
@@ -203,7 +233,6 @@ impl HeartbeatService {
             if let Some(ref cb) = on_heartbeat {
                 match cb(HEARTBEAT_PROMPT.to_string()).await {
                     Some(response) => {
-                        // Normalize both sides for comparison (strip underscores, uppercase).
                         let normalized = response.to_uppercase().replace('_', "");
                         let token_normalized = HEARTBEAT_OK_TOKEN.replace('_', "");
                         if normalized.contains(&token_normalized) {
@@ -216,6 +245,40 @@ impl HeartbeatService {
                         info!("Heartbeat: callback returned no response");
                     }
                 }
+            }
+        }
+    }
+
+    /// Run a single maintenance command with a timeout.
+    async fn run_maintenance_command(cmd: &str) {
+        debug!("Maintenance: running `{}`", cmd);
+        let result = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+
+        match tokio::time::timeout(Duration::from_secs(30), result).await {
+            Ok(Ok(output)) => {
+                if output.status.success() {
+                    debug!("Maintenance: `{}` OK", cmd);
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!(
+                        "Maintenance: `{}` failed (exit {}): {}",
+                        cmd,
+                        output.status.code().unwrap_or(-1),
+                        stderr.chars().take(200).collect::<String>()
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Maintenance: `{}` error: {}", cmd, e);
+            }
+            Err(_) => {
+                warn!("Maintenance: `{}` timed out (30s)", cmd);
             }
         }
     }
@@ -259,5 +322,34 @@ mod tests {
     fn test_is_heartbeat_not_empty() {
         assert!(!is_heartbeat_empty(Some("Do the thing\n")));
         assert!(!is_heartbeat_empty(Some("# Tasks\n- Buy milk\n")));
+    }
+
+    #[test]
+    fn test_default_interval_is_5_minutes() {
+        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL_S, 300);
+    }
+
+    #[test]
+    fn test_default_maintenance_commands() {
+        assert!(!DEFAULT_MAINTENANCE_COMMANDS.is_empty());
+        assert!(DEFAULT_MAINTENANCE_COMMANDS[0].contains("qmd"));
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_command_success() {
+        // `true` always exits 0.
+        HeartbeatService::run_maintenance_command("true").await;
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_command_failure_does_not_panic() {
+        // `false` exits 1 — should warn, not panic.
+        HeartbeatService::run_maintenance_command("false").await;
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_command_missing_binary() {
+        // Non-existent command — should warn, not panic.
+        HeartbeatService::run_maintenance_command("__nonexistent_cmd_12345__").await;
     }
 }

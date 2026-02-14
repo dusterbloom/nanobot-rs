@@ -18,6 +18,7 @@ use crate::config::loader::{get_config_path, get_data_dir, load_config, save_con
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
+use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
@@ -595,8 +596,26 @@ pub(crate) async fn run_gateway_async(
             }
         }
 
-        println!("  Heartbeat: every 30m");
+        println!(
+            "  Heartbeat: every {}s ({} maintenance commands)",
+            DEFAULT_HEARTBEAT_INTERVAL_S,
+            DEFAULT_MAINTENANCE_COMMANDS.len()
+        );
     }
+
+    // Heartbeat: maintenance commands + optional agent tasks.
+    let maintenance_cmds: Vec<String> = DEFAULT_MAINTENANCE_COMMANDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let heartbeat = HeartbeatService::new(
+        config.workspace_path(),
+        None, // No LLM callback yet — maintenance only
+        maintenance_cmds,
+        DEFAULT_HEARTBEAT_INTERVAL_S,
+        true,
+    );
+    heartbeat.start().await;
 
     // start_all() spawns channels as background tasks and returns immediately,
     // so call it before the select rather than racing it.
@@ -623,6 +642,7 @@ pub(crate) async fn run_gateway_async(
     }
 
     agent_loop.stop();
+    heartbeat.stop().await;
     channel_manager.stop_all().await;
 }
 
