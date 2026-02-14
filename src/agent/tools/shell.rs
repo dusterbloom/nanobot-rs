@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use regex::Regex;
 use tokio::process::Command;
 
-use super::base::Tool;
+use super::base::{Tool, ToolExecutionContext};
+use crate::agent::audit::ToolEvent;
 
 /// Default deny patterns for dangerous shell commands.
 fn default_deny_patterns() -> Vec<String> {
@@ -362,6 +363,157 @@ impl Tool for ExecTool {
         };
 
         // Truncate very long output.
+        let max_len = 10000;
+        if output.len() > max_len {
+            let overflow = output.len() - max_len;
+            output.truncate(max_len);
+            output.push_str(&format!("\n... (truncated, {} more chars)", overflow));
+        }
+
+        output
+    }
+
+    async fn execute_with_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> String {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let command = match params.get("command").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return "Error: 'command' parameter is required".to_string(),
+        };
+
+        let param_cwd = params
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let cwd = param_cwd
+            .or_else(|| self.working_dir.clone())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+
+        if let Some(error) = self.guard_command(command, &cwd) {
+            return error;
+        }
+
+        let start = std::time::Instant::now();
+        let timeout_dur = Duration::from_secs(self.timeout);
+
+        let result = tokio::time::timeout(timeout_dur, async {
+            let mut child = match Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&cwd)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => return format!("Error executing command: {}", e),
+            };
+
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+
+            let mut stdout_reader = BufReader::new(stdout).lines();
+            let mut stderr_reader = BufReader::new(stderr).lines();
+
+            let mut stdout_buf = String::new();
+            let mut stderr_buf = String::new();
+            let mut last_line = String::new();
+
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.tick().await; // consume immediate first tick
+
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+
+            loop {
+                if !stdout_open && !stderr_open {
+                    break;
+                }
+
+                tokio::select! {
+                    line = stdout_reader.next_line(), if stdout_open => {
+                        match line {
+                            Ok(Some(l)) => {
+                                if !stdout_buf.is_empty() {
+                                    stdout_buf.push('\n');
+                                }
+                                stdout_buf.push_str(&l);
+                                last_line.clone_from(&l);
+                            }
+                            _ => { stdout_open = false; }
+                        }
+                    }
+                    line = stderr_reader.next_line(), if stderr_open => {
+                        match line {
+                            Ok(Some(l)) => {
+                                if !stderr_buf.is_empty() {
+                                    stderr_buf.push('\n');
+                                }
+                                stderr_buf.push_str(&l);
+                                last_line.clone_from(&l);
+                            }
+                            _ => { stderr_open = false; }
+                        }
+                    }
+                    _ = ctx.cancellation_token.cancelled() => {
+                        let _ = child.kill().await;
+                        return "Error: Command cancelled".to_string();
+                    }
+                    _ = ticker.tick() => {
+                        let preview = if last_line.is_empty() {
+                            None
+                        } else {
+                            Some(last_line.clone())
+                        };
+                        let _ = ctx.event_tx.send(ToolEvent::Progress {
+                            tool_name: "exec".to_string(),
+                            tool_call_id: ctx.tool_call_id.clone(),
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                            output_preview: preview,
+                        });
+                    }
+                }
+            }
+
+            let status = child.wait().await;
+
+            let mut parts: Vec<String> = Vec::new();
+            if !stdout_buf.is_empty() {
+                parts.push(stdout_buf);
+            }
+            if !stderr_buf.trim().is_empty() {
+                parts.push(format!("STDERR:\n{}", stderr_buf));
+            }
+            if let Ok(s) = &status {
+                if !s.success() {
+                    let code = s.code().unwrap_or(-1);
+                    parts.push(format!("\nExit code: {}", code));
+                }
+            }
+
+            if parts.is_empty() {
+                "(no output)".to_string()
+            } else {
+                parts.join("\n")
+            }
+        })
+        .await;
+
+        let mut output = match result {
+            Ok(s) => s,
+            Err(_) => format!("Error: Command timed out after {} seconds", self.timeout),
+        };
+
         let max_len = 10000;
         if output.len() > max_len {
             let overflow = output.len() - max_len;
@@ -768,5 +920,291 @@ mod tests {
 
         let result = tool.execute(params).await;
         assert!(result.contains("Exit code:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming progress events via execute_with_context
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_exec_tool_emits_progress_events() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_stream".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        // Command that takes ~2s and produces output at intervals
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String(
+                "echo start && sleep 1 && echo middle && sleep 1 && echo end".to_string(),
+            ),
+        );
+
+        let result = tool.execute_with_context(params, &ctx).await;
+        assert!(result.contains("end"));
+
+        // Collect all Progress events
+        let mut progress_count = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let ToolEvent::Progress {
+                tool_name,
+                elapsed_ms,
+                ..
+            } = event
+            {
+                assert_eq!(tool_name, "exec");
+                assert!(elapsed_ms > 0);
+                progress_count += 1;
+            }
+        }
+        assert!(
+            progress_count >= 1,
+            "Expected at least 1 Progress event, got {}",
+            progress_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_cancellation_kills_child() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token.clone(),
+            tool_call_id: "call_cancel".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        // Command that would take 10 seconds if not cancelled
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("sleep 10".to_string()),
+        );
+
+        // Cancel after 500ms
+        let cancel_token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel_token.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = tool.execute_with_context(params, &ctx).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.contains("cancelled"),
+            "Expected cancellation message, got: {}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Cancellation took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_no_output_command() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_noop".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
+
+        let result = tool.execute_with_context(params, &ctx).await;
+        assert_eq!(result, "(no output)");
+
+        // Fast command should emit no progress events
+        let mut count = 0;
+        while let Ok(_) = rx.try_recv() {
+            count += 1;
+        }
+        assert_eq!(count, 0, "Fast command should emit no progress events");
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_stderr_only() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_stderr".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("echo error_msg >&2".to_string()),
+        );
+
+        let result = tool.execute_with_context(params, &ctx).await;
+        assert!(
+            result.contains("STDERR:"),
+            "Expected STDERR prefix, got: {}",
+            result
+        );
+        assert!(result.contains("error_msg"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_blocked_command() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(true);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_blocked".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("rm -rf /".to_string()),
+        );
+
+        let result = tool.execute_with_context(params, &ctx).await;
+        assert!(
+            result.contains("blocked"),
+            "Blocked command should still be blocked with context, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_matches_execute_for_simple_command() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_compat".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("echo hello world".to_string()),
+        );
+
+        let ctx_result = tool.execute_with_context(params.clone(), &ctx).await;
+        let plain_result = tool.execute(params).await;
+        // Streaming uses BufReader::lines() which strips trailing newlines;
+        // .output() preserves them. Both are equivalent for tool results.
+        assert_eq!(
+            ctx_result.trim_end(),
+            plain_result.trim_end(),
+            "execute_with_context should produce same output as execute (ignoring trailing whitespace)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_progress_has_output_preview() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_preview".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        // Produce output then wait so ticker fires with output available
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String(
+                "echo preview_line && sleep 2".to_string(),
+            ),
+        );
+
+        let _result = tool.execute_with_context(params, &ctx).await;
+
+        // Find a progress event with output_preview containing our line
+        let mut found_preview = false;
+        while let Ok(event) = rx.try_recv() {
+            if let ToolEvent::Progress {
+                output_preview: Some(ref preview),
+                ..
+            } = event
+            {
+                if preview.contains("preview_line") {
+                    found_preview = true;
+                }
+            }
+        }
+        assert!(
+            found_preview,
+            "Expected a Progress event with output_preview containing 'preview_line'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_context_nonzero_exit() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_exit".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("exit 42".to_string()),
+        );
+
+        let result = tool.execute_with_context(params, &ctx).await;
+        assert!(
+            result.contains("Exit code:"),
+            "Expected exit code in output, got: {}",
+            result
+        );
     }
 }

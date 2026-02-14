@@ -344,6 +344,15 @@ pub enum ToolEvent {
         ok: bool,
         duration_ms: u64,
     },
+    /// Periodic progress update during tool execution.
+    Progress {
+        tool_name: String,
+        tool_call_id: String,
+        /// Milliseconds since tool execution started.
+        elapsed_ms: u64,
+        /// Last line of output (if streaming), or None for non-streaming tools.
+        output_preview: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -536,5 +545,44 @@ mod tests {
         assert_eq!(parsed.tools_called.len(), 2);
         assert_eq!(parsed.tools_called[0].name, "read_file");
         assert!(!parsed.tools_called[1].ok);
+    }
+
+    #[test]
+    fn test_progress_event_construction() {
+        let event = ToolEvent::Progress {
+            tool_name: "exec".to_string(),
+            tool_call_id: "call_1".to_string(),
+            elapsed_ms: 3500,
+            output_preview: Some("building...".to_string()),
+        };
+        match event {
+            ToolEvent::Progress {
+                tool_name,
+                elapsed_ms,
+                output_preview,
+                ..
+            } => {
+                assert_eq!(tool_name, "exec");
+                assert_eq!(elapsed_ms, 3500);
+                assert_eq!(output_preview.as_deref(), Some("building..."));
+            }
+            _ => panic!("Expected Progress variant"),
+        }
+    }
+
+    #[test]
+    fn test_progress_event_without_preview() {
+        let event = ToolEvent::Progress {
+            tool_name: "web_fetch".to_string(),
+            tool_call_id: "call_2".to_string(),
+            elapsed_ms: 1000,
+            output_preview: None,
+        };
+        match event {
+            ToolEvent::Progress { output_preview, .. } => {
+                assert!(output_preview.is_none());
+            }
+            _ => panic!("Expected Progress variant"),
+        }
     }
 }

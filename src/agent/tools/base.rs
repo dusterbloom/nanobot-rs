@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::agent::audit::ToolEvent;
 
 /// Structured outcome for a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,17 @@ impl ToolExecutionResult {
             error: Some(message),
         }
     }
+}
+
+/// Context passed to tools during execution for progress reporting
+/// and cancellation support.
+pub struct ToolExecutionContext {
+    /// Channel for emitting progress events to the REPL.
+    pub event_tx: UnboundedSender<ToolEvent>,
+    /// Token that signals the tool should abort gracefully.
+    pub cancellation_token: tokio_util::sync::CancellationToken,
+    /// The tool call ID for correlating events.
+    pub tool_call_id: String,
 }
 
 /// Abstract base trait for agent tools.
@@ -60,6 +74,42 @@ pub trait Tool: Send + Sync {
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
         let out = self.execute(params).await;
+        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            ToolExecutionResult {
+                ok: false,
+                data: out,
+                error: Some(err),
+            }
+        } else {
+            ToolExecutionResult::success(out)
+        }
+    }
+
+    /// Execute the tool with an execution context for progress reporting
+    /// and cancellation.
+    ///
+    /// The default implementation ignores the context and delegates to
+    /// [`execute`]. Tools that support streaming (like ExecTool) override
+    /// this to emit [`ToolEvent::Progress`] events and check the
+    /// cancellation token.
+    async fn execute_with_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        _ctx: &ToolExecutionContext,
+    ) -> String {
+        self.execute(params).await
+    }
+
+    /// Like [`execute_with_result`] but with an execution context.
+    ///
+    /// Default delegates to [`execute_with_context`] and maps `Error:`-prefixed
+    /// outputs to failures, same as [`execute_with_result`].
+    async fn execute_with_result_and_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolExecutionResult {
+        let out = self.execute_with_context(params, ctx).await;
         if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
             ToolExecutionResult {
                 ok: false,
@@ -229,5 +279,101 @@ mod tests {
         assert!(!result.ok);
         assert_eq!(result.data, "Error: bad input");
         assert_eq!(result.error.as_deref(), Some("bad input"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_default_delegates_to_execute() {
+        use crate::agent::audit::ToolEvent;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_1".to_string(),
+        };
+
+        let tool = MockTool;
+        let mut params = HashMap::new();
+        params.insert("input".to_string(), serde_json::Value::String("hello".to_string()));
+
+        // execute_with_context should return same result as execute
+        let result = tool.execute_with_context(params.clone(), &ctx).await;
+        let direct = tool.execute(params).await;
+        assert_eq!(result, direct);
+        assert_eq!(result, "executed with: hello");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_result_and_context_default() {
+        use crate::agent::audit::ToolEvent;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_1".to_string(),
+        };
+
+        let tool = MockTool;
+        let mut params = HashMap::new();
+        params.insert("input".to_string(), serde_json::Value::String("test".to_string()));
+
+        let result = tool.execute_with_result_and_context(params, &ctx).await;
+        assert!(result.ok);
+        assert_eq!(result.data, "executed with: test");
+    }
+
+    #[test]
+    fn test_tool_execution_context_construction() {
+        use crate::agent::audit::ToolEvent;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token.clone(),
+            tool_call_id: "call_123".to_string(),
+        };
+
+        // Verify fields are accessible
+        assert_eq!(ctx.tool_call_id, "call_123");
+        assert!(!ctx.cancellation_token.is_cancelled());
+
+        // Can send events through the channel
+        ctx.event_tx
+            .send(ToolEvent::Progress {
+                tool_name: "exec".to_string(),
+                tool_call_id: "call_123".to_string(),
+                elapsed_ms: 1000,
+                output_preview: None,
+            })
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            ToolEvent::Progress { elapsed_ms, .. } => assert_eq!(elapsed_ms, 1000),
+            _ => panic!("Expected Progress"),
+        }
+    }
+
+    #[test]
+    fn test_cancellation_token_in_context() {
+        use crate::agent::audit::ToolEvent;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token.clone(),
+            tool_call_id: "call_456".to_string(),
+        };
+
+        assert!(!ctx.cancellation_token.is_cancelled());
+        token.cancel();
+        assert!(ctx.cancellation_token.is_cancelled());
     }
 }

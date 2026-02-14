@@ -218,6 +218,21 @@ pub(crate) async fn stream_and_render(
                                 std::io::stdout().flush().ok();
                                 // CallStart line gets overwritten by CallEnd, don't collect.
                             }
+                            Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
+                                let preview_str = output_preview.as_deref().unwrap_or("");
+                                let line = format!(
+                                    "\x1b[36m  \u{25b6} {}\x1b[0m  \x1b[2m{}s{}\x1b[0m",
+                                    tool_name,
+                                    elapsed_ms / 1000,
+                                    if preview_str.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" {}", preview_str)
+                                    }
+                                );
+                                print!("\r\x1b[K{}", line);
+                                std::io::stdout().flush().ok();
+                            }
                             Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
                                 let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
                                 let status_line = format!(

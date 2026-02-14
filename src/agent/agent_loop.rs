@@ -750,6 +750,7 @@ impl AgentLoopShared {
                             needs_user_continuation: needs_user_cont,
                             max_tool_result_chars: delegation_result_limit,
                             short_circuit_chars: 200,
+                            depth: 0,
                         };
 
                         // Emit tool call start events for delegated calls.
@@ -1021,7 +1022,17 @@ impl AgentLoopShared {
                     }
 
                     let start = std::time::Instant::now();
-                    let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                    let result = if let Some(ref tx) = tool_event_tx {
+                        use crate::agent::tools::base::ToolExecutionContext;
+                        let ctx = ToolExecutionContext {
+                            event_tx: tx.clone(),
+                            cancellation_token: tokio_util::sync::CancellationToken::new(),
+                            tool_call_id: tc.id.clone(),
+                        };
+                        tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                    } else {
+                        tools.execute(&tc.name, tc.arguments.clone()).await
+                    };
                     let duration_ms = start.elapsed().as_millis() as u64;
                     debug!(
                         "Tool {} result ({}B, ok={}, {}ms)",

@@ -3,6 +3,7 @@ pub mod audit;
 pub mod circuit_breaker;
 pub mod compaction;
 pub mod context;
+pub mod context_store;
 pub mod learning;
 pub mod memory;
 pub mod observer;

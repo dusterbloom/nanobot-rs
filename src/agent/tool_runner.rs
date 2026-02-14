@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::agent::context::ContextBuilder;
+use crate::agent::context_store::{self, ContextStore};
 use crate::agent::tools::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
 
@@ -33,6 +34,9 @@ pub struct ToolRunnerConfig {
     /// threshold, skip the delegation LLM call entirely and return raw results.
     /// Set to 0 to disable short-circuiting. Default: 200.
     pub short_circuit_chars: usize,
+    /// Recursion depth for ctx_summarize (default 0, max 2).
+    /// Reserved for Phase 2 — currently unused.
+    pub depth: u32,
 }
 
 /// Result of a delegated tool execution loop.
@@ -63,20 +67,29 @@ pub async fn run_tool_loop(
     // Track tool calls we've already executed to detect loops.
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // RLM ContextStore: stores full tool outputs as named variables.
+    // The delegation model sees metadata for large results and can use
+    // micro-tools (ctx_slice, ctx_grep, ctx_length) to inspect on demand.
+    let mut context_store = ContextStore::new();
+
     // SAFETY: restrict the delegation model to ONLY the tools the main model
     // requested. This prevents prompt injection in tool results (web pages,
     // file contents) from tricking the small model into calling exec, write_file,
     // or other destructive tools that weren't part of the original request.
-    let allowed_tools: std::collections::HashSet<&str> = initial_tool_calls
+    let mut allowed_tools: std::collections::HashSet<&str> = initial_tool_calls
         .iter()
         .map(|tc| tc.name.as_str())
         .collect();
+    // Micro-tools are always available to the delegation model.
+    for name in context_store::MICRO_TOOLS {
+        allowed_tools.insert(name);
+    }
 
     // Build a mini message history for the cheap model.
     // Keep the system prompt compact — the delegation model has limited context.
     let system_msg = json!({
         "role": "system",
-        "content": "You are a tool execution agent. You receive tool calls and their results.\n\nRULES:\n1. If the requested tools have been executed and returned results, SUMMARIZE the results and STOP. Include specific data points, values, and counts.\n2. Only call additional tools if the results indicate an error that needs retry, or if the task clearly requires a follow-up step (e.g., a file was created and needs verification).\n3. NEVER re-execute a tool with the same arguments — you already have the result.\n4. When in doubt, SUMMARIZE and stop. Fewer tool calls is better.\n5. Do not ask questions."
+        "content": "You are a tool execution agent. Tool results are stored as variables.\nYou receive metadata for large results (name, length, preview) and full results for small ones.\nUse ctx_slice, ctx_grep, ctx_length to examine large variables.\n\nRULES:\n1. Read the metadata/results. If the answer is visible, SUMMARIZE with specific data and STOP.\n2. For large results: use ctx_grep to search for specific patterns first.\n3. Use ctx_slice to read specific sections only when grep isn't enough.\n4. NEVER re-execute a tool with the same arguments.\n5. When you have enough information, SUMMARIZE and STOP.\n6. Do not ask questions."
     });
     let mut messages: Vec<Value> = vec![system_msg];
 
@@ -91,7 +104,7 @@ pub async fn run_tool_loop(
     // Get tool definitions — filtered to ONLY the tools the main model requested.
     // The delegation model must not discover tools it wasn't asked to use.
     let all_tool_defs = tools.get_definitions();
-    let tool_defs: Vec<Value> = all_tool_defs
+    let mut tool_defs: Vec<Value> = all_tool_defs
         .into_iter()
         .filter(|def| {
             def.pointer("/function/name")
@@ -100,6 +113,8 @@ pub async fn run_tool_loop(
                 .unwrap_or(false)
         })
         .collect();
+    // Append micro-tool definitions so the delegation model can inspect variables.
+    tool_defs.extend(context_store::micro_tool_definitions());
     let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
         None
     } else {
@@ -151,26 +166,34 @@ pub async fn run_tool_loop(
             .collect();
         ContextBuilder::add_assistant_message(&mut messages, None, Some(&tc_json));
 
-        // Execute each tool call — store results with ORIGINAL IDs.
-        // Truncate results for the delegation model's context while keeping
-        // full data in all_results for the main model.
+        // Execute each tool call with ContextStore-aware dispatch.
+        // Micro-tools (ctx_slice, ctx_grep, ctx_length) execute against the
+        // ContextStore and are internal to the delegation conversation.
+        // Real tools execute via the registry; large results are stored as
+        // variables and the delegation model sees metadata only.
         for tc in &pending_calls {
-            debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
-            let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-            let delegation_data = if result.data.len() > config.max_tool_result_chars {
-                let safe_end = result.data.char_indices()
-                    .take_while(|(i, _)| *i < config.max_tool_result_chars)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                format!("{}\n\n[truncated: {} total chars]",
-                    &result.data[..safe_end], result.data.len())
+            if context_store::is_micro_tool(&tc.name) {
+                // Micro-tool: execute against ContextStore (internal to delegation).
+                debug!("Micro-tool: {} (id: {})", tc.name, tc.id);
+                let result = context_store::execute_micro_tool(&context_store, &tc.name, &tc.arguments);
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                // NOT added to all_results — micro-tools are internal.
             } else {
-                result.data.clone()
-            };
-            ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
-            let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-            all_results.push((original_id, tc.name.clone(), result.data));
+                // Real tool: execute, store in ContextStore.
+                debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
+                let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                let (_, metadata) = context_store.store(result.data.clone());
+                let delegation_data = if result.data.len() > config.max_tool_result_chars {
+                    // Large result: model sees metadata, uses micro-tools to dig in.
+                    metadata
+                } else {
+                    // Small result: model sees full result directly.
+                    result.data.clone()
+                };
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push((original_id, tc.name.clone(), result.data));
+            }
         }
 
         // Short-circuit: if this is the first iteration and ALL results
@@ -446,6 +469,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -497,6 +521,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -544,6 +569,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         // Initial call uses "test" as query (from make_tool_calls).
@@ -586,6 +612,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -715,6 +742,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let _ = run_tool_loop(
@@ -779,6 +807,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -811,6 +840,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         // 3 simultaneous tool calls
@@ -870,6 +900,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -908,6 +939,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(&config, &[], &tools, "test").await;
@@ -965,6 +997,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         // Use long IDs like cloud Claude generates
@@ -1026,6 +1059,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let calls = vec![
@@ -1080,9 +1114,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_loop_truncates_for_delegation_model() {
-        // Delegation model should see truncated content, but all_results
-        // should contain the full data.
+    async fn test_large_result_injects_metadata() {
+        // When a tool result exceeds max_tool_result_chars, the delegation
+        // model should see metadata (variable name + char count + preview)
+        // instead of the raw data.
         let provider = Arc::new(CapturingProvider::new());
 
         let mut tools = ToolRegistry::new();
@@ -1096,6 +1131,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1114,23 +1150,25 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].2.len(), 500);
 
-        // Messages sent to delegation model should have truncated content
+        // Messages sent to delegation model should have metadata, not raw data
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
         let tool_msg = messages.iter()
             .find(|m| m["role"].as_str() == Some("tool"))
             .unwrap();
         let content = tool_msg["content"].as_str().unwrap();
-        assert!(content.contains("[truncated: 500 total chars]"),
-            "Delegation model should see truncation marker, got: {}",
-            &content[content.len().saturating_sub(60)..]);
-        assert!(content.len() < 200,
-            "Truncated content should be much shorter than 500 chars, got {} chars",
+        assert!(content.contains("Variable 'output_0'"),
+            "Delegation model should see variable metadata, got: {}", content);
+        assert!(content.contains("500 chars"),
+            "Metadata should contain char count, got: {}", content);
+        assert!(content.len() < 300,
+            "Metadata should be much shorter than 500 chars, got {} chars",
             content.len());
     }
 
     #[tokio::test]
-    async fn test_tool_loop_no_truncation_when_under_limit() {
+    async fn test_small_result_injects_directly() {
+        // Results under max_tool_result_chars should be injected as full text.
         let provider = Arc::new(CapturingProvider::new());
 
         let mut tools = ToolRegistry::new();
@@ -1144,6 +1182,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1167,8 +1206,8 @@ mod tests {
             .find(|m| m["role"].as_str() == Some("tool"))
             .unwrap();
         let content = tool_msg["content"].as_str().unwrap();
-        assert!(!content.contains("[truncated"),
-            "Should not truncate when under limit");
+        assert!(!content.contains("Variable '"),
+            "Small results should not use metadata");
         assert_eq!(content, "x".repeat(50));
     }
 
@@ -1189,6 +1228,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 200, // 16 < 200 → short-circuit
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -1232,6 +1272,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0, // disabled
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -1302,6 +1343,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         // Main model only requested test_tool
@@ -1360,6 +1402,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let result = run_tool_loop(
@@ -1393,6 +1436,7 @@ mod tests {
             needs_user_continuation: false,
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
+            depth: 0,
         };
 
         let _ = run_tool_loop(
@@ -1412,5 +1456,183 @@ mod tests {
         // The run completed without dangerous_tool being available
         let captured = provider.captured_messages.lock().await;
         assert!(!captured.is_empty(), "Should have made at least one LLM call");
+    }
+
+    // -- ContextStore integration tests --
+
+    #[tokio::test]
+    async fn test_micro_tool_results_not_in_all_results() {
+        // When the delegation model calls ctx_slice, the result should NOT
+        // appear in the returned tool_results (micro-tools are internal).
+        let provider = Arc::new(MockProvider::new(vec![
+            // Delegation model requests a micro-tool
+            crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "micro_0".to_string(),
+                    name: "ctx_length".to_string(),
+                    arguments: {
+                        let mut m = HashMap::new();
+                        m.insert("variable".to_string(), json!("output_0"));
+                        m
+                    },
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: HashMap::new(),
+            },
+            // Then it summarizes
+            crate::providers::base::LLMResponse {
+                content: Some("Length is 16.".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: HashMap::new(),
+            },
+        ]));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        // Only the real tool call should be in results
+        assert_eq!(result.tool_results.len(), 1, "Micro-tool results should not be in all_results");
+        assert_eq!(result.tool_results[0].1, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn test_delegation_receives_micro_tool_defs() {
+        // Verify the delegation model receives ctx_slice, ctx_grep, ctx_length
+        // in its tool definitions.
+        struct CapturingToolsProvider {
+            captured_tools: tokio::sync::Mutex<Vec<Vec<Value>>>,
+        }
+
+        impl CapturingToolsProvider {
+            fn new() -> Self {
+                Self {
+                    captured_tools: tokio::sync::Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl LLMProvider for CapturingToolsProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                if let Some(t) = tools {
+                    self.captured_tools
+                        .lock()
+                        .await
+                        .push(t.to_vec());
+                }
+                Ok(crate::providers::base::LLMResponse {
+                    content: Some("Done.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: "stop".to_string(),
+                    usage: HashMap::new(),
+                })
+            }
+
+            fn get_default_model(&self) -> &str {
+                "capturing-tools"
+            }
+        }
+
+        let provider = Arc::new(CapturingToolsProvider::new());
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider: provider.clone(),
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+        };
+
+        let _ = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        let captured = provider.captured_tools.lock().await;
+        assert!(!captured.is_empty(), "Should have captured tool definitions");
+
+        let defs = &captured[0];
+        let tool_names: Vec<&str> = defs.iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(tool_names.contains(&"test_tool"), "Should include the real tool");
+        assert!(tool_names.contains(&"ctx_slice"), "Should include ctx_slice");
+        assert!(tool_names.contains(&"ctx_grep"), "Should include ctx_grep");
+        assert!(tool_names.contains(&"ctx_length"), "Should include ctx_length");
+    }
+
+    #[tokio::test]
+    async fn test_short_circuit_bypasses_context_store() {
+        // When results are short enough for short-circuit, the ContextStore
+        // is still populated but the LLM is not called.
+        let provider = Arc::new(CapturingProvider::new());
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new())); // returns "tool result data" (16 chars)
+
+        let config = ToolRunnerConfig {
+            provider: provider.clone(),
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 200, // 16 < 200 → short-circuit
+            depth: 0,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        )
+        .await;
+
+        // Tool was executed and full result returned
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].2, "tool result data");
+        // No LLM call (short-circuited)
+        assert!(result.summary.is_none());
+        let captured = provider.captured_messages.lock().await;
+        assert!(captured.is_empty(), "No LLM calls should have been made");
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::base::{Tool, ToolExecutionResult};
+use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 
 /// Registry for agent tools.
 ///
@@ -63,6 +63,32 @@ impl ToolRegistry {
         };
 
         let fut = std::panic::AssertUnwindSafe(tool.execute_with_result(params));
+        match futures_util::FutureExt::catch_unwind(fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                ToolExecutionResult::failure(format!("Tool '{}' panicked during execution", name))
+            }
+        }
+    }
+
+    /// Execute a tool by name with a [`ToolExecutionContext`] for progress
+    /// reporting and cancellation support.
+    ///
+    /// Same as [`execute`] but passes the context through to the tool.
+    pub async fn execute_with_context(
+        &self,
+        name: &str,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolExecutionResult {
+        let tool = match self.tools.get(name) {
+            Some(t) => t,
+            None => {
+                return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
+            }
+        };
+
+        let fut = std::panic::AssertUnwindSafe(tool.execute_with_result_and_context(params, ctx));
         match futures_util::FutureExt::catch_unwind(fut).await {
             Ok(result) => result,
             Err(_) => {
@@ -446,5 +472,51 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
         assert!(names.contains(&"web_fetch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("echo")));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_ctx".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "value".to_string(),
+            serde_json::Value::String("world".to_string()),
+        );
+
+        let result = registry.execute_with_context("echo", params, &ctx).await;
+        assert!(result.ok);
+        assert_eq!(result.data, "echo:world");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_missing_tool() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let registry = ToolRegistry::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_missing".to_string(),
+        };
+
+        let result = registry.execute_with_context("nonexistent", HashMap::new(), &ctx).await;
+        assert!(!result.ok);
+        assert!(result.data.contains("not found"));
     }
 }
