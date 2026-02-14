@@ -5,11 +5,14 @@
 //! via micro-tools: `ctx_slice`, `ctx_grep`, `ctx_length`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::providers::base::LLMProvider;
+
 /// Names of micro-tools that operate on the ContextStore.
-pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length"];
+pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize"];
 
 /// Stores full tool outputs as named variables for micro-tool inspection.
 pub struct ContextStore {
@@ -147,6 +150,21 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ctx_summarize",
+                "description": "Summarize a stored variable using a sub-model. Returns the summary text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "variable": {"type": "string", "description": "Variable name (e.g. 'output_0')"},
+                        "instruction": {"type": "string", "description": "What to extract or summarize (e.g. 'List all function names')"}
+                    },
+                    "required": ["variable", "instruction"]
+                }
+            }
+        }),
     ]
 }
 
@@ -192,6 +210,136 @@ pub fn execute_micro_tool(
         },
         _ => format!("Error: unknown micro-tool '{}'.", name),
     }
+}
+
+/// Maximum recursion depth for ctx_summarize.
+pub const MAX_SUMMARIZE_DEPTH: u32 = 2;
+
+/// Sync micro-tool definitions (no ctx_summarize) for use in sub-loops.
+fn sync_micro_tool_definitions() -> Vec<Value> {
+    micro_tool_definitions()
+        .into_iter()
+        .filter(|d| {
+            d.pointer("/function/name")
+                .and_then(|v| v.as_str())
+                != Some("ctx_summarize")
+        })
+        .collect()
+}
+
+/// Execute ctx_summarize: run a mini summarization loop over a stored variable.
+///
+/// Creates a sub-ContextStore with the variable's content, gives the model
+/// only sync micro-tools (slice/grep/length), and returns its text summary.
+pub async fn execute_ctx_summarize(
+    store: &ContextStore,
+    variable: &str,
+    instruction: &str,
+    provider: &Arc<dyn LLMProvider>,
+    model: &str,
+    depth: u32,
+    max_tokens: u32,
+) -> String {
+    // Depth guard: prevent infinite recursion.
+    if depth >= MAX_SUMMARIZE_DEPTH {
+        return format!(
+            "Error: ctx_summarize depth limit reached ({}/{}). Use ctx_slice or ctx_grep instead.",
+            depth, MAX_SUMMARIZE_DEPTH
+        );
+    }
+
+    // Get the variable content.
+    let content = match store.get(variable) {
+        Some(c) => c.to_string(),
+        None => return format!("Error: variable '{}' not found.", variable),
+    };
+
+    // Create a mini ContextStore with just this variable's content.
+    let mut sub_store = ContextStore::new();
+    let (var_name, metadata) = sub_store.store(content);
+
+    // Build messages for the sub-loop.
+    let system_msg = json!({
+        "role": "system",
+        "content": "You summarize data stored in variables. Use ctx_slice, ctx_grep, ctx_length to inspect the variable, then summarize."
+    });
+    let user_msg = json!({
+        "role": "user",
+        "content": format!("{}\n\n{}", instruction, metadata)
+    });
+    let mut messages = vec![system_msg, user_msg];
+
+    // Only sync micro-tools (no ctx_summarize in sub-loop).
+    let tool_defs = sync_micro_tool_definitions();
+    let tool_defs_ref: Option<&[Value]> = if tool_defs.is_empty() {
+        None
+    } else {
+        Some(&tool_defs)
+    };
+
+    // Mini 3-iteration loop: model can use micro-tools to inspect, then summarize.
+    for _ in 0..3 {
+        let response = match provider
+            .chat(&messages, tool_defs_ref, Some(model), max_tokens, 0.3)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return format!("Error: ctx_summarize LLM call failed: {}", e),
+        };
+
+        if response.has_tool_calls() {
+            // Build assistant message with tool calls.
+            let tc_json: Vec<Value> = response
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(i, tc)| {
+                    json!({
+                        "id": format!("sub{:06}", i),
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })
+                })
+                .collect();
+            crate::agent::context::ContextBuilder::add_assistant_message(
+                &mut messages,
+                None,
+                Some(&tc_json),
+            );
+
+            // Execute only sync micro-tools against the sub-store.
+            for (i, tc) in response.tool_calls.iter().enumerate() {
+                let id = format!("sub{:06}", i);
+                if tc.name == "ctx_summarize" {
+                    // Block recursive ctx_summarize in sub-loop.
+                    crate::agent::context::ContextBuilder::add_tool_result(
+                        &mut messages,
+                        &id,
+                        &tc.name,
+                        "Error: ctx_summarize not available in sub-loop.",
+                    );
+                } else {
+                    let result = execute_micro_tool(&sub_store, &tc.name, &tc.arguments);
+                    crate::agent::context::ContextBuilder::add_tool_result(
+                        &mut messages,
+                        &id,
+                        &tc.name,
+                        &result,
+                    );
+                }
+            }
+        } else {
+            // Model produced a text response — that's our summary.
+            return response.content.unwrap_or_else(|| "No summary produced.".to_string());
+        }
+    }
+
+    // Ran out of iterations — return what we have.
+    "Error: ctx_summarize reached max iterations without producing a summary.".to_string()
 }
 
 #[cfg(test)]
@@ -332,7 +480,34 @@ mod tests {
         assert!(is_micro_tool("ctx_slice"));
         assert!(is_micro_tool("ctx_grep"));
         assert!(is_micro_tool("ctx_length"));
+        assert!(is_micro_tool("ctx_summarize"));
         assert!(!is_micro_tool("exec"));
         assert!(!is_micro_tool("read_file"));
+    }
+
+    #[test]
+    fn test_ctx_summarize_definition_present() {
+        let defs = micro_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"ctx_summarize"),
+            "micro_tool_definitions() should include ctx_summarize, got: {:?}",
+            names
+        );
+        // Verify schema has required params
+        let summarize_def = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("ctx_summarize"))
+            .unwrap();
+        let required = summarize_def
+            .pointer("/function/parameters/required")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(req_names.contains(&"variable"), "Should require 'variable'");
+        assert!(req_names.contains(&"instruction"), "Should require 'instruction'");
     }
 }

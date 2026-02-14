@@ -35,7 +35,6 @@ pub struct ToolRunnerConfig {
     /// Set to 0 to disable short-circuiting. Default: 200.
     pub short_circuit_chars: usize,
     /// Recursion depth for ctx_summarize (default 0, max 2).
-    /// Reserved for Phase 2 — currently unused.
     pub depth: u32,
 }
 
@@ -89,7 +88,7 @@ pub async fn run_tool_loop(
     // Keep the system prompt compact — the delegation model has limited context.
     let system_msg = json!({
         "role": "system",
-        "content": "You are a tool execution agent. Tool results are stored as variables.\nYou receive metadata for large results (name, length, preview) and full results for small ones.\nUse ctx_slice, ctx_grep, ctx_length to examine large variables.\n\nRULES:\n1. Read the metadata/results. If the answer is visible, SUMMARIZE with specific data and STOP.\n2. For large results: use ctx_grep to search for specific patterns first.\n3. Use ctx_slice to read specific sections only when grep isn't enough.\n4. NEVER re-execute a tool with the same arguments.\n5. When you have enough information, SUMMARIZE and STOP.\n6. Do not ask questions."
+        "content": "You are a tool execution agent. Tool results are stored as variables.\nYou receive metadata for large results (name, length, preview) and full results for small ones.\nUse ctx_slice, ctx_grep, ctx_length to examine large variables.\nUse ctx_summarize to sub-summarize a variable with a specific instruction.\n\nRULES:\n1. Read the metadata/results. If the answer is visible, SUMMARIZE with specific data and STOP.\n2. For large results: use ctx_grep to search for specific patterns first.\n3. Use ctx_slice to read specific sections only when grep isn't enough.\n4. Use ctx_summarize when you need a focused summary of a specific variable.\n5. NEVER re-execute a tool with the same arguments.\n6. When you have enough information, SUMMARIZE and STOP.\n7. Do not ask questions."
     });
     let mut messages: Vec<Value> = vec![system_msg];
 
@@ -172,8 +171,27 @@ pub async fn run_tool_loop(
         // Real tools execute via the registry; large results are stored as
         // variables and the delegation model sees metadata only.
         for tc in &pending_calls {
-            if context_store::is_micro_tool(&tc.name) {
-                // Micro-tool: execute against ContextStore (internal to delegation).
+            if tc.name == "ctx_summarize" {
+                // Async micro-tool: runs a sub-loop with the provider.
+                let variable = tc.arguments.get("variable").and_then(|v| v.as_str()).unwrap_or("");
+                let instruction = tc.arguments.get("instruction").and_then(|v| v.as_str()).unwrap_or("Summarize");
+                debug!("ctx_summarize: var={}, instruction={}, depth={}", variable, instruction, config.depth);
+                let result = context_store::execute_ctx_summarize(
+                    &context_store,
+                    variable,
+                    instruction,
+                    &config.provider,
+                    &config.model,
+                    config.depth,
+                    config.max_tokens,
+                ).await;
+                // Store the summary as a new variable for subsequent micro-tool access.
+                let (_, summary_metadata) = context_store.store(result.clone());
+                let _ = summary_metadata; // metadata available if needed later
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                // NOT added to all_results — ctx_summarize is internal to delegation.
+            } else if context_store::is_micro_tool(&tc.name) {
+                // Sync micro-tool: execute against ContextStore (internal to delegation).
                 debug!("Micro-tool: {} (id: {})", tc.name, tc.id);
                 let result = context_store::execute_micro_tool(&context_store, &tc.name, &tc.arguments);
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
@@ -1634,5 +1652,174 @@ mod tests {
         assert!(result.summary.is_none());
         let captured = provider.captured_messages.lock().await;
         assert!(captured.is_empty(), "No LLM calls should have been made");
+    }
+
+    // -- ctx_summarize tests --
+
+    #[tokio::test]
+    async fn test_ctx_summarize_depth_guard() {
+        // When depth >= MAX_DEPTH, execute_ctx_summarize returns an error
+        // without calling the provider.
+        let provider: Arc<dyn LLMProvider> = Arc::new(MockProvider::new(vec![]));
+        let mut store = context_store::ContextStore::new();
+        store.store("Some content to summarize.".to_string());
+
+        let result = context_store::execute_ctx_summarize(
+            &store,
+            "output_0",
+            "Summarize this",
+            &provider,
+            "mock",
+            2, // At max depth
+            4096,
+        )
+        .await;
+
+        assert!(
+            result.contains("depth limit"),
+            "Should return depth limit error, got: {}",
+            result
+        );
+        assert!(result.starts_with("Error:"), "Should be an error: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_ctx_summarize_missing_variable() {
+        // ctx_summarize with a nonexistent variable should return an error
+        // without calling the provider.
+        let provider: Arc<dyn LLMProvider> = Arc::new(MockProvider::new(vec![]));
+        let store = context_store::ContextStore::new(); // empty store
+
+        let result = context_store::execute_ctx_summarize(
+            &store,
+            "nonexistent_var",
+            "Summarize this",
+            &provider,
+            "mock",
+            0,
+            4096,
+        )
+        .await;
+
+        assert!(
+            result.contains("not found"),
+            "Should return not-found error, got: {}",
+            result
+        );
+        assert!(result.starts_with("Error:"), "Should be an error: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_ctx_summarize_produces_summary() {
+        // ctx_summarize should call the provider recursively to summarize
+        // a large variable. The sub-loop produces a text summary.
+
+        // Track how many times the provider is called.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        struct SummarizingProvider {
+            call_count: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl LLMProvider for SummarizingProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => {
+                        // First call (outer loop): delegation model calls ctx_summarize
+                        Ok(crate::providers::base::LLMResponse {
+                            content: None,
+                            tool_calls: vec![ToolCallRequest {
+                                id: "sum_0".to_string(),
+                                name: "ctx_summarize".to_string(),
+                                arguments: {
+                                    let mut m = HashMap::new();
+                                    m.insert("variable".to_string(), json!("output_0"));
+                                    m.insert(
+                                        "instruction".to_string(),
+                                        json!("Extract the main topic"),
+                                    );
+                                    m
+                                },
+                            }],
+                            finish_reason: "tool_calls".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                    1 => {
+                        // Second call (sub-loop): summarize model produces text
+                        Ok(crate::providers::base::LLMResponse {
+                            content: Some("The content discusses Rust programming.".to_string()),
+                            tool_calls: vec![],
+                            finish_reason: "stop".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                    _ => {
+                        // Third call (outer loop resumes): use summary to finish
+                        Ok(crate::providers::base::LLMResponse {
+                            content: Some("Based on the summary: Rust programming.".to_string()),
+                            tool_calls: vec![],
+                            finish_reason: "stop".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                }
+            }
+
+            fn get_default_model(&self) -> &str {
+                "summarizing-model"
+            }
+        }
+
+        let provider = Arc::new(SummarizingProvider {
+            call_count: call_count_clone,
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(VerboseTool { output_len: 500 }));
+
+        let config = ToolRunnerConfig {
+            provider,
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 100, // Force large result → metadata
+            short_circuit_chars: 0,
+            depth: 0, // First level — ctx_summarize allowed
+        };
+
+        let calls = vec![ToolCallRequest {
+            id: "call_0".to_string(),
+            name: "verbose_tool".to_string(),
+            arguments: {
+                let mut m = HashMap::new();
+                m.insert("query".to_string(), json!("test"));
+                m
+            },
+        }];
+
+        let result = run_tool_loop(&config, &calls, &tools, "test").await;
+
+        // Real tool result preserved
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].1, "verbose_tool");
+        // Provider was called at least 2 times (outer + sub-loop)
+        let total_calls = call_count.load(Ordering::SeqCst);
+        assert!(
+            total_calls >= 2,
+            "Provider should be called at least twice (outer + sub-loop), got {}",
+            total_calls
+        );
     }
 }
