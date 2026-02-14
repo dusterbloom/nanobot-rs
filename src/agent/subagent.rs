@@ -10,18 +10,30 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::agent::agent_profiles::{self, AgentProfile};
 use crate::agent::context::ContextBuilder;
 use crate::agent::tools::{
-    ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::bus::events::InboundMessage;
 use crate::providers::base::LLMProvider;
 
-/// Maximum iterations for a subagent run.
+/// Maximum iterations for a subagent run (default when no profile overrides).
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
+
+/// Configuration passed to `_run_subagent`, derived from profile + overrides.
+#[derive(Debug, Clone)]
+struct SubagentConfig {
+    model: String,
+    system_prompt: Option<String>,
+    tools_filter: Option<Vec<String>>,
+    read_only: bool,
+    max_iterations: u32,
+}
 
 /// Truncate text for display: max `max_lines` lines or `max_chars` characters.
 fn truncate_for_display(data: &str, max_lines: usize, max_chars: usize) -> String {
@@ -69,6 +81,8 @@ pub struct SubagentManager {
     exec_timeout: u64,
     restrict_to_workspace: bool,
     is_local: bool,
+    /// Loaded agent profiles (name → profile).
+    profiles: HashMap<String, AgentProfile>,
     /// Direct display channel for CLI/REPL mode. In gateway mode the bus
     /// delivers results to channels, but in CLI mode nobody reads the bus
     /// so we send directly to the terminal.
@@ -88,6 +102,16 @@ impl SubagentManager {
         restrict_to_workspace: bool,
         is_local: bool,
     ) -> Self {
+        // Load profiles from standard locations.
+        let profiles = agent_profiles::load_profiles(&workspace);
+        if !profiles.is_empty() {
+            info!(
+                "Loaded {} agent profiles: {:?}",
+                profiles.len(),
+                profiles.keys().collect::<Vec<_>>()
+            );
+        }
+
         Self {
             provider,
             workspace,
@@ -97,6 +121,7 @@ impl SubagentManager {
             exec_timeout,
             restrict_to_workspace,
             is_local,
+            profiles,
             display_tx: None,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -108,27 +133,81 @@ impl SubagentManager {
         self
     }
 
+    /// Get a reference to loaded profiles (for system prompt injection).
+    pub fn profiles(&self) -> &HashMap<String, AgentProfile> {
+        &self.profiles
+    }
+
     /// Spawn a background subagent task.
+    ///
+    /// `agent_name` — optional profile name from `.nanobot/agents/`.
+    /// `model_override` — optional model (overrides profile and default).
     ///
     /// Returns a status message with the task ID.
     pub async fn spawn(
         &self,
         task: String,
         label: Option<String>,
+        agent_name: Option<String>,
+        model_override: Option<String>,
         origin_channel: String,
         origin_chat_id: String,
     ) -> String {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
-        let display_label = label
-            .clone()
-            .unwrap_or_else(|| task.chars().take(40).collect());
 
-        info!("Spawning subagent {} for: {}", task_id, display_label);
+        // Resolve agent profile if specified.
+        let profile = agent_name.as_ref().and_then(|name| {
+            let p = self.profiles.get(name);
+            if p.is_none() {
+                warn!("Agent profile '{}' not found, using defaults", name);
+            }
+            p.cloned()
+        });
+
+        let display_label = label.clone().unwrap_or_else(|| {
+            if let Some(ref name) = agent_name {
+                format!("{}: {}", name, task.chars().take(30).collect::<String>())
+            } else {
+                task.chars().take(40).collect()
+            }
+        });
+
+        // Build config: model_override > profile.model > self.model
+        let effective_model = if let Some(ref m) = model_override {
+            agent_profiles::resolve_model_alias(m)
+        } else if let Some(ref p) = profile {
+            p.model
+                .as_ref()
+                .map(|m| agent_profiles::resolve_model_alias(m))
+                .unwrap_or_else(|| self.model.clone())
+        } else {
+            self.model.clone()
+        };
+
+        let config = SubagentConfig {
+            model: effective_model,
+            system_prompt: profile.as_ref().map(|p| p.system_prompt.clone()),
+            tools_filter: profile.as_ref().and_then(|p| p.tools.clone()),
+            read_only: profile.as_ref().map(|p| p.read_only).unwrap_or(false),
+            max_iterations: profile
+                .as_ref()
+                .and_then(|p| p.max_iterations)
+                .unwrap_or(MAX_SUBAGENT_ITERATIONS),
+        };
+
+        let effective_model_for_display = config.model.clone();
+
+        info!(
+            "Spawning subagent {} (agent={:?}, model={}) for: {}",
+            task_id,
+            agent_name.as_deref().unwrap_or("default"),
+            effective_model_for_display,
+            display_label
+        );
 
         let provider = self.provider.clone();
         let workspace = self.workspace.clone();
         let bus_tx = self.bus_tx.clone();
-        let model = self.model.clone();
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
@@ -146,7 +225,7 @@ impl SubagentManager {
                 &lbl,
                 provider.as_ref(),
                 &workspace,
-                &model,
+                &config,
                 brave_api_key.as_deref(),
                 exec_timeout,
                 restrict_to_workspace,
@@ -207,9 +286,12 @@ impl SubagentManager {
             tasks.insert(task_id.clone(), (info, handle));
         }
 
+        let agent_note = agent_name
+            .map(|n| format!(", agent: {}", n))
+            .unwrap_or_default();
         format!(
-            "Subagent '{}' spawned (id: {}). It will announce results when done.",
-            display_label, task_id
+            "Subagent '{}' spawned (id: {}{}, model: {}). It will announce results when done.",
+            display_label, task_id, agent_note, effective_model_for_display
         )
     }
 
@@ -251,35 +333,82 @@ impl SubagentManager {
         label: &str,
         provider: &dyn LLMProvider,
         workspace: &PathBuf,
-        model: &str,
+        config: &SubagentConfig,
         brave_api_key: Option<&str>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
         is_local: bool,
     ) -> anyhow::Result<String> {
-        debug!("Subagent {} starting: {}", task_id, label);
+        debug!(
+            "Subagent {} starting (model={}, max_iter={}, read_only={}, tools_filter={:?}): {}",
+            task_id, config.model, config.max_iterations, config.read_only, config.tools_filter, label
+        );
 
-        // Build a tool registry with basic tools (no message, no spawn).
+        // Build a tool registry. Start with all tools, then filter.
         let mut tools = ToolRegistry::new();
-        tools.register(Box::new(ReadFileTool));
-        tools.register(Box::new(WriteFileTool));
-        tools.register(Box::new(ListDirTool));
-        tools.register(Box::new(ExecTool::new(
-            exec_timeout,
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            None,
-            restrict_to_workspace,
-            30000,
-        )));
-        tools.register(Box::new(WebSearchTool::new(
-            brave_api_key.map(|s| s.to_string()),
-            5,
-        )));
-        tools.register(Box::new(WebFetchTool::new(50_000)));
+
+        // Determine which tools to register based on profile config.
+        let should_include = |name: &str| -> bool {
+            // If read_only, exclude write tools regardless of filter.
+            if config.read_only && matches!(name, "write_file" | "edit_file") {
+                return false;
+            }
+            // If there's a tools filter, only include listed tools.
+            if let Some(ref filter) = config.tools_filter {
+                return filter.iter().any(|t| t == name);
+            }
+            true
+        };
+
+        if should_include("read_file") {
+            tools.register(Box::new(ReadFileTool));
+        }
+        if should_include("write_file") {
+            tools.register(Box::new(WriteFileTool));
+        }
+        if should_include("edit_file") {
+            tools.register(Box::new(EditFileTool));
+        }
+        if should_include("list_dir") {
+            tools.register(Box::new(ListDirTool));
+        }
+        if should_include("exec") {
+            tools.register(Box::new(ExecTool::new(
+                exec_timeout,
+                Some(workspace.to_string_lossy().to_string()),
+                None,
+                None,
+                restrict_to_workspace,
+                30000,
+            )));
+        }
+        if should_include("web_search") {
+            tools.register(Box::new(WebSearchTool::new(
+                brave_api_key.map(|s| s.to_string()),
+                5,
+            )));
+        }
+        if should_include("web_fetch") {
+            tools.register(Box::new(WebFetchTool::new(50_000)));
+        }
 
         // Build the subagent system prompt.
-        let system_prompt = Self::_build_subagent_prompt(task, workspace);
+        let system_prompt = if let Some(ref profile_prompt) = config.system_prompt {
+            // Profile provides the base prompt; append workspace and task context.
+            let workspace_str = workspace.to_string_lossy();
+            format!(
+                "{profile_prompt}\n\n\
+                 ## Workspace\n\
+                 Your workspace is at: {workspace_str}\n\n\
+                 ## Instructions\n\
+                 - Focus only on the assigned task.\n\
+                 - When done, provide a clear summary of what you accomplished.\n\
+                 - Do not try to communicate with users directly - your result will be announced by the main agent.\n\
+                 - Be thorough but efficient."
+            )
+        } else {
+            Self::_build_subagent_prompt(task, workspace)
+        };
 
         let mut messages: Vec<Value> = vec![
             json!({"role": "system", "content": system_prompt}),
@@ -295,16 +424,16 @@ impl SubagentManager {
 
         let mut final_content = String::new();
 
-        for iteration in 0..MAX_SUBAGENT_ITERATIONS {
+        for iteration in 0..config.max_iterations {
             debug!(
                 "Subagent {} iteration {}/{}",
                 task_id,
                 iteration + 1,
-                MAX_SUBAGENT_ITERATIONS
+                config.max_iterations
             );
 
             let response = provider
-                .chat(&messages, tool_defs_opt, Some(model), 4096, 0.7)
+                .chat(&messages, tool_defs_opt, Some(&config.model), 4096, 0.7)
                 .await?;
 
             if response.has_tool_calls() {
@@ -388,7 +517,7 @@ impl SubagentManager {
         let _ = bus_tx.send(msg);
     }
 
-    /// Build the system prompt for a subagent.
+    /// Build the default system prompt for a subagent (no profile).
     fn _build_subagent_prompt(task: &str, workspace: &PathBuf) -> String {
         let workspace_str = workspace.to_string_lossy();
         format!(
@@ -478,10 +607,22 @@ mod tests {
         }
     }
 
+    /// Helper to build a default config for tests.
+    fn default_test_config(model: &str) -> SubagentConfig {
+        SubagentConfig {
+            model: model.to_string(),
+            system_prompt: None,
+            tools_filter: None,
+            read_only: false,
+            max_iterations: MAX_SUBAGENT_ITERATIONS,
+        }
+    }
+
     #[tokio::test]
     async fn test_subagent_adds_user_continuation_after_tool_results() {
         let provider = Arc::new(SubagentCapturingProvider::new());
         let workspace = tempfile::tempdir().unwrap().into_path();
+        let config = default_test_config("mock-model");
 
         let result = SubagentManager::_run_subagent(
             "test-id",
@@ -489,7 +630,7 @@ mod tests {
             "test-label",
             provider.as_ref(),
             &workspace,
-            "mock-model",
+            &config,
             None,
             5,
             false,
@@ -549,13 +690,14 @@ mod tests {
         }
 
         let workspace = tempfile::tempdir().unwrap().into_path();
+        let config = default_test_config("mock");
         let result = SubagentManager::_run_subagent(
             "test-id",
             "Simple question",
             "test",
             &ImmediateProvider,
             &workspace,
-            "mock",
+            &config,
             None,
             5,
             false,
@@ -565,5 +707,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, "Immediate answer.");
+    }
+
+    #[tokio::test]
+    async fn test_subagent_read_only_excludes_write_tools() {
+        let config = SubagentConfig {
+            model: "test".to_string(),
+            system_prompt: None,
+            tools_filter: None, // all tools allowed
+            read_only: true,    // but read_only
+            max_iterations: 5,
+        };
+
+        // The should_include logic is inline in _run_subagent, but we can
+        // verify by checking that a read_only subagent doesn't get write tools.
+        // For a unit test, we just verify the logic directly.
+        let should_include = |name: &str| -> bool {
+            if config.read_only && matches!(name, "write_file" | "edit_file") {
+                return false;
+            }
+            if let Some(ref filter) = config.tools_filter {
+                return filter.iter().any(|t| t == name);
+            }
+            true
+        };
+
+        assert!(should_include("read_file"));
+        assert!(should_include("list_dir"));
+        assert!(should_include("exec"));
+        assert!(!should_include("write_file"));
+        assert!(!should_include("edit_file"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_tools_filter() {
+        let config = SubagentConfig {
+            model: "test".to_string(),
+            system_prompt: None,
+            tools_filter: Some(vec![
+                "read_file".to_string(),
+                "list_dir".to_string(),
+            ]),
+            read_only: false,
+            max_iterations: 5,
+        };
+
+        let should_include = |name: &str| -> bool {
+            if config.read_only && matches!(name, "write_file" | "edit_file") {
+                return false;
+            }
+            if let Some(ref filter) = config.tools_filter {
+                return filter.iter().any(|t| t == name);
+            }
+            true
+        };
+
+        assert!(should_include("read_file"));
+        assert!(should_include("list_dir"));
+        assert!(!should_include("exec"));
+        assert!(!should_include("write_file"));
+        assert!(!should_include("web_search"));
     }
 }

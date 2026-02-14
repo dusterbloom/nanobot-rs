@@ -581,7 +581,7 @@ impl Default for ProvenanceConfig {
 // ---------------------------------------------------------------------------
 
 fn default_td_max_iterations() -> u32 {
-    3
+    10
 }
 
 fn default_td_max_tokens() -> u32 {
@@ -596,8 +596,8 @@ fn default_td_max_tokens() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDelegationConfig {
-    /// Enable tool delegation (default: false).
-    #[serde(default)]
+    /// Enable tool delegation (default: true).
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Model to use for the tool runner. Empty string = use main model.
@@ -608,7 +608,7 @@ pub struct ToolDelegationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
 
-    /// Max tool loop iterations for the runner (default: 15).
+    /// Max tool loop iterations for the runner (default: 10).
     #[serde(default = "default_td_max_iterations")]
     pub max_iterations: u32,
 
@@ -640,7 +640,7 @@ fn default_td_preview_chars() -> usize {
 impl Default for ToolDelegationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             model: String::new(),
             provider: None,
             max_iterations: default_td_max_iterations(),
@@ -648,6 +648,51 @@ impl Default for ToolDelegationConfig {
             slim_results: true,
             max_result_preview_chars: default_td_preview_chars(),
             auto_local: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker/Swarm config
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Worker/Swarm system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerConfig {
+    /// Enable the swarm worker system (delegate tool). Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum delegation depth (how many levels of delegate). Default: 3.
+    #[serde(default = "default_worker_max_depth")]
+    pub max_depth: u32,
+    /// Enable python_eval tool for workers. Default: true.
+    #[serde(default = "default_true")]
+    pub python: bool,
+    /// Enable delegate tool (recursive workers). Default: true.
+    #[serde(default = "default_true")]
+    pub delegate: bool,
+    /// Budget multiplier for children (0.0-1.0). Default: 0.5.
+    #[serde(default = "default_budget_multiplier")]
+    pub budget_multiplier: f32,
+}
+
+fn default_worker_max_depth() -> u32 {
+    3
+}
+
+fn default_budget_multiplier() -> f32 {
+    0.5
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: 3,
+            python: true,
+            delegate: true,
+            budget_multiplier: 0.5,
         }
     }
 }
@@ -691,6 +736,8 @@ pub struct Config {
     pub provenance: ProvenanceConfig,
     #[serde(default)]
     pub voice: VoiceConfig,
+    #[serde(default)]
+    pub worker: WorkerConfig,
 }
 
 impl Config {
@@ -873,10 +920,10 @@ mod tests {
     #[test]
     fn test_tool_delegation_config_defaults() {
         let td = ToolDelegationConfig::default();
-        assert!(!td.enabled);
+        assert!(td.enabled);
         assert!(td.model.is_empty());
         assert!(td.provider.is_none());
-        assert_eq!(td.max_iterations, 3);
+        assert_eq!(td.max_iterations, 10);
         assert_eq!(td.max_tokens, 4096);
         assert!(td.slim_results);
         assert_eq!(td.max_result_preview_chars, 200);

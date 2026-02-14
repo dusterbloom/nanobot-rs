@@ -34,7 +34,7 @@ use crate::agent::tools::{
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::agent::tool_runner::{self, ToolRunnerConfig};
+use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
 use crate::config::schema::{EmailConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig};
 use crate::cron::service::CronService;
 use crate::providers::base::{LLMProvider, StreamChunk};
@@ -395,9 +395,9 @@ impl AgentLoopShared {
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid| {
+        let spawn_cb: SpawnCallback = Arc::new(move |task, label, agent, model, ch, cid| {
             let mgr = subagents_ref.clone();
-            Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
+            Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid).await })
         });
         let spawn_tool = Arc::new(SpawnTool::new());
         // Set callback and context before registering so they're ready for use.
@@ -803,6 +803,10 @@ impl AgentLoopShared {
                             depth: 0,
                             cancellation_token: cancellation_token.clone(),
                             verbatim,
+                            budget: Some(Budget::root(
+                                core.tool_delegation_config.max_iterations,
+                                2, // max delegation depth: parent → child → grandchild
+                            )),
                         };
 
                         // Emit tool call start events for delegated calls.

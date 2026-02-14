@@ -13,7 +13,11 @@ use tracing::{debug, warn};
 use crate::agent::context::ContextBuilder;
 use crate::agent::context_store::{self, ContextStore};
 use crate::agent::tools::ToolRegistry;
+use crate::agent::worker_tools;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
+
+/// Name of the delegate tool for recursive worker spawning.
+pub const DELEGATE_TOOL: &str = "delegate";
 
 /// Configuration for the tool runner loop.
 pub struct ToolRunnerConfig {
@@ -42,6 +46,51 @@ pub struct ToolRunnerConfig {
     /// If true, skip delegation LLM and return raw tool output unsummarized.
     /// Set by the main agent via `[VERBATIM]` marker in its response.
     pub verbatim: bool,
+    /// Optional budget for recursive delegation. If None, delegate tool is disabled.
+    pub budget: Option<Budget>,
+}
+
+/// Resource budget for a worker. Controls iterations, depth, and timeouts.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    /// Maximum LLM iterations for this worker.
+    pub max_iterations: u32,
+    /// Maximum delegation depth (0 = can't delegate).
+    pub max_depth: u32,
+    /// Current depth in the delegation tree.
+    pub current_depth: u32,
+    /// Budget multiplier for children (0.5 = children get half).
+    pub budget_multiplier: f32,
+}
+
+impl Budget {
+    /// Create a root budget (depth 0).
+    pub fn root(max_iterations: u32, max_depth: u32) -> Self {
+        Self {
+            max_iterations,
+            max_depth,
+            current_depth: 0,
+            budget_multiplier: 0.5,
+        }
+    }
+
+    /// Create a child budget with reduced iterations and incremented depth.
+    pub fn child(&self) -> Option<Self> {
+        if self.current_depth >= self.max_depth {
+            return None;
+        }
+        Some(Self {
+            max_iterations: ((self.max_iterations as f32) * self.budget_multiplier).max(1.0) as u32,
+            max_depth: self.max_depth,
+            current_depth: self.current_depth + 1,
+            budget_multiplier: self.budget_multiplier,
+        })
+    }
+
+    /// Check if delegation is allowed at current depth.
+    pub fn can_delegate(&self) -> bool {
+        self.current_depth < self.max_depth
+    }
 }
 
 /// Result of a delegated tool execution loop.
@@ -98,6 +147,14 @@ pub async fn run_tool_loop(
     for name in context_store::MICRO_TOOLS {
         allowed_tools.insert(name);
     }
+    // Worker tools are always available to the delegation model.
+    for name in worker_tools::WORKER_TOOLS {
+        allowed_tools.insert(name);
+    }
+    // Delegate tool is available if budget allows.
+    if config.budget.as_ref().map_or(false, |b| b.can_delegate()) {
+        allowed_tools.insert(DELEGATE_TOOL);
+    }
 
     // Build a mini message history for the cheap model.
     // Keep the system prompt compact — the delegation model has limited context.
@@ -129,6 +186,32 @@ pub async fn run_tool_loop(
         .collect();
     // Append micro-tool definitions so the delegation model can inspect variables.
     tool_defs.extend(context_store::micro_tool_definitions());
+    tool_defs.extend(worker_tools::worker_tool_definitions());
+
+    // Add delegate tool definition if budget allows delegation.
+    if config.budget.as_ref().map_or(false, |b| b.can_delegate()) {
+        tool_defs.push(json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "description": "Spawn a child worker for a sub-task. The child inherits your model but gets a reduced budget. Returns the child's result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string", "description": "What the child worker should accomplish"},
+                        "tools": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Tool names the child can use (e.g. ['read_file', 'ctx_grep', 'python_eval'])"
+                        },
+                        "context": {"type": "string", "description": "Optional data to seed the child's context"}
+                    },
+                    "required": ["task"]
+                }
+            }
+        }));
+    }
+
     let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
         None
     } else {
@@ -213,10 +296,175 @@ pub async fn run_tool_loop(
                 let _ = summary_metadata; // metadata available if needed later
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                 // NOT added to all_results — ctx_summarize is internal to delegation.
+            } else if tc.name == DELEGATE_TOOL {
+                // Recursive delegation: spawn a child worker.
+                let task = tc.arguments.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let context = tc.arguments.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                let child_budget = match config.budget.as_ref().and_then(|b| b.child()) {
+                    Some(b) => b,
+                    None => {
+                        let result = "Error: delegation depth limit reached.".to_string();
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                        let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        all_results.push((original_id, tc.name.clone(), result));
+                        continue;
+                    }
+                };
+
+                // Determine child tools — use requested subset or all allowed tools.
+                let child_tool_names: Vec<String> = tc.arguments
+                    .get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_else(Vec::new);
+
+                debug!("Delegate: task='{}', depth={}, budget={}, tools={:?}",
+                    task, child_budget.current_depth, child_budget.max_iterations, child_tool_names);
+
+                // Build child config — inherits provider/model from parent.
+                let child_config = ToolRunnerConfig {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    max_iterations: child_budget.max_iterations,
+                    max_tokens: config.max_tokens,
+                    needs_user_continuation: config.needs_user_continuation,
+                    max_tool_result_chars: config.max_tool_result_chars,
+                    short_circuit_chars: config.short_circuit_chars,
+                    depth: config.depth + 1,
+                    cancellation_token: config.cancellation_token.clone(),
+                    verbatim: false,
+                    budget: Some(child_budget),
+                };
+
+                // Build child system prompt.
+                let child_system = format!("You are a worker agent. Complete this task:\n\n{}\n\n{}", task,
+                    if context.is_empty() { String::new() } else { format!("Context:\n{}", context) });
+
+                // Ask the child model what tools to use.
+                let child_msgs = vec![
+                    json!({"role": "system", "content": child_system}),
+                    json!({"role": "user", "content": "Begin working on the task. Use the available tools to complete it."})
+                ];
+
+                // Get child tool definitions.
+                let mut child_tool_defs: Vec<Value> = if child_tool_names.is_empty() {
+                    // No specific tools requested — give same tools as parent (minus delegate to prevent deep recursion issues).
+                    tool_defs.iter()
+                        .filter(|d| d.pointer("/function/name").and_then(|v| v.as_str()) != Some(DELEGATE_TOOL) || child_config.budget.as_ref().map_or(false, |b| b.can_delegate()))
+                        .cloned()
+                        .collect()
+                } else {
+                    // Filter to only requested tools + always include micro-tools and worker tools.
+                    let child_allowed: std::collections::HashSet<&str> = child_tool_names.iter().map(|s| s.as_str()).collect();
+                    tool_defs.iter()
+                        .filter(|d| {
+                            let name = d.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+                            child_allowed.contains(name) || context_store::is_micro_tool(name) || worker_tools::is_worker_tool(name)
+                        })
+                        .cloned()
+                        .collect()
+                };
+
+                // Always add micro-tool and worker tool defs if not already present.
+                let existing_names: std::collections::HashSet<String> = child_tool_defs.iter()
+                    .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect();
+                for def in context_store::micro_tool_definitions() {
+                    let name = def.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+                    if !existing_names.contains(name) {
+                        child_tool_defs.push(def);
+                    }
+                }
+                for def in worker_tools::worker_tool_definitions() {
+                    let name = def.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+                    if !existing_names.contains(name) {
+                        child_tool_defs.push(def);
+                    }
+                }
+
+                let child_tool_defs_opt: Option<&[Value]> = if child_tool_defs.is_empty() {
+                    None
+                } else {
+                    Some(&child_tool_defs)
+                };
+
+                // Get the child's first response (with tool calls).
+                let child_response = match config.provider.chat(
+                    &child_msgs,
+                    child_tool_defs_opt,
+                    Some(&config.model),
+                    config.max_tokens,
+                    0.3,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let result = format!("Delegate error: {}", e);
+                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
+                        let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        all_results.push((original_id, tc.name.clone(), result));
+                        continue;
+                    }
+                };
+
+                let result = if child_response.has_tool_calls() {
+                    // Child wants to use tools — run the tool loop.
+                    let child_result = Box::pin(run_tool_loop(
+                        &child_config,
+                        &child_response.tool_calls,
+                        tools,
+                        &child_system,
+                    )).await;
+                    // Return the child's summary, or concatenated results if no summary.
+                    child_result.summary.unwrap_or_else(|| {
+                        child_result.tool_results.iter()
+                            .map(|(_, name, data)| format!("[{}]: {}", name, &data[..data.len().min(500)]))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                } else {
+                    // Child produced a text response — return it directly.
+                    child_response.content.unwrap_or_else(|| "No result from delegate.".to_string())
+                };
+
+                // Store delegate result like any other tool.
+                let (_, metadata) = context_store.store(result.clone());
+                let delegation_data = if result.len() > config.max_tool_result_chars {
+                    metadata
+                } else {
+                    result.clone()
+                };
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push((original_id, tc.name.clone(), result));
+            } else if worker_tools::is_worker_tool(&tc.name) {
+                // Async worker tool: runs a command/script and returns result.
+                debug!("Worker tool: {} (id: {})", tc.name, tc.id);
+                let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                // Store result in ContextStore for subsequent micro-tool access.
+                let (_, metadata) = context_store.store(result.clone());
+                let delegation_data = if result.len() > config.max_tool_result_chars {
+                    metadata
+                } else {
+                    result.clone()
+                };
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
+                let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                all_results.push((original_id, tc.name.clone(), result));
+
+                // Track result hashes for loop detection.
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tc.name.hash(&mut hasher);
+                all_results.last().unwrap().2.hash(&mut hasher);
+                let result_hash = hasher.finish();
+                if !seen_results.insert(result_hash) {
+                    warn!("Worker tool '{}' produced identical results — likely loop", tc.name);
+                }
             } else if context_store::is_micro_tool(&tc.name) {
                 // Sync micro-tool: execute against ContextStore (internal to delegation).
                 debug!("Micro-tool: {} (id: {})", tc.name, tc.id);
-                let result = context_store::execute_micro_tool(&context_store, &tc.name, &tc.arguments);
+                let result = context_store::execute_micro_tool(&mut context_store, &tc.name, &tc.arguments);
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                 // NOT added to all_results — micro-tools are internal.
             } else {
@@ -306,13 +554,9 @@ pub async fn run_tool_loop(
         }
 
         // Ask the cheap model if more tools are needed.
-        // On first iteration after initial execution, don't offer tools —
-        // force the model to summarize instead of reflexively calling more.
-        let tools_for_call = if iteration == 0 {
-            None
-        } else {
-            tool_defs_opt
-        };
+        // Always offer tools so the model can inspect results with micro-tools
+        // before deciding to summarize.
+        let tools_for_call = tool_defs_opt;
         let response = match config
             .provider
             .chat(
@@ -555,6 +799,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -609,6 +854,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -659,6 +905,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         // Initial call uses "test" as query (from make_tool_calls).
@@ -704,6 +951,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -836,6 +1084,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let _ = run_tool_loop(
@@ -903,6 +1152,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -938,6 +1188,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         // 3 simultaneous tool calls
@@ -1000,6 +1251,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1041,6 +1293,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(&config, &[], &tools, "test").await;
@@ -1101,6 +1354,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         // Use long IDs like cloud Claude generates
@@ -1165,6 +1419,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let calls = vec![
@@ -1239,6 +1494,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1292,6 +1548,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1340,6 +1597,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1386,6 +1644,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1459,6 +1718,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         // Main model only requested test_tool
@@ -1520,6 +1780,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1556,6 +1817,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let _ = run_tool_loop(
@@ -1622,6 +1884,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1640,7 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn test_delegation_receives_micro_tool_defs() {
         // Verify the delegation model receives ctx_slice, ctx_grep, ctx_length
-        // in its tool definitions on iteration 1+ (iteration 0 has no tools).
+        // in its tool definitions on every iteration.
         struct CapturingToolsProvider {
             captured_tools: tokio::sync::Mutex<Vec<Vec<Value>>>,
             call_count: AtomicU32,
@@ -1720,6 +1983,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let _ = run_tool_loop(
@@ -1731,9 +1995,10 @@ mod tests {
         .await;
 
         let captured = provider.captured_tools.lock().await;
-        // Iteration 0 gets None, iteration 1 gets tools
-        assert_eq!(captured.len(), 1, "Should have captured tool definitions from iteration 1");
+        // All iterations now receive tools (no iteration 0 suppression).
+        assert_eq!(captured.len(), 2, "Both iterations should receive tool definitions");
 
+        // Check the first iteration's tool defs (representative of all).
         let defs = &captured[0];
         let tool_names: Vec<&str> = defs.iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
@@ -1765,6 +2030,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -1929,6 +2195,7 @@ mod tests {
             depth: 0, // First level — ctx_summarize allowed
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let calls = vec![ToolCallRequest {
@@ -1978,6 +2245,7 @@ mod tests {
             depth: 0,
             cancellation_token: Some(token),
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -2073,6 +2341,7 @@ mod tests {
             depth: 0,
             cancellation_token: Some(token_clone),
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -2121,6 +2390,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -2157,6 +2427,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: true,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -2204,6 +2475,7 @@ mod tests {
             depth: 0,
             cancellation_token: None,
             verbatim: false,
+            budget: None,
         };
 
         let result = run_tool_loop(
@@ -2217,5 +2489,54 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
         // Delegation model WAS called — summary present.
         assert_eq!(result.summary.as_deref(), Some("Summarized."));
+    }
+
+    // -- Budget tests --
+
+    #[test]
+    fn test_budget_root() {
+        let budget = Budget::root(20, 3);
+        assert_eq!(budget.max_iterations, 20);
+        assert_eq!(budget.max_depth, 3);
+        assert_eq!(budget.current_depth, 0);
+        assert!(budget.can_delegate());
+    }
+
+    #[test]
+    fn test_budget_child() {
+        let root = Budget::root(20, 3);
+        let child = root.child().unwrap();
+        assert_eq!(child.max_iterations, 10); // 20 * 0.5
+        assert_eq!(child.current_depth, 1);
+        assert!(child.can_delegate());
+
+        let grandchild = child.child().unwrap();
+        assert_eq!(grandchild.max_iterations, 5); // 10 * 0.5
+        assert_eq!(grandchild.current_depth, 2);
+        assert!(grandchild.can_delegate());
+
+        let great = grandchild.child().unwrap();
+        assert_eq!(great.current_depth, 3);
+        assert!(!great.can_delegate()); // at max depth
+        assert!(great.child().is_none()); // can't go deeper
+    }
+
+    #[test]
+    fn test_budget_minimum_iterations() {
+        let budget = Budget {
+            max_iterations: 1,
+            max_depth: 5,
+            current_depth: 0,
+            budget_multiplier: 0.5,
+        };
+        let child = budget.child().unwrap();
+        assert_eq!(child.max_iterations, 1, "Should not go below 1 iteration");
+    }
+
+    #[test]
+    fn test_budget_zero_depth() {
+        let budget = Budget::root(10, 0);
+        assert!(!budget.can_delegate());
+        assert!(budget.child().is_none());
     }
 }

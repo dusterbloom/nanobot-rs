@@ -12,12 +12,13 @@ use serde_json::{json, Value};
 use crate::providers::base::LLMProvider;
 
 /// Names of micro-tools that operate on the ContextStore.
-pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize"];
+pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize", "mem_store", "mem_recall"];
 
 /// Stores full tool outputs as named variables for micro-tool inspection.
 pub struct ContextStore {
     variables: HashMap<String, String>,
     counter: usize,
+    memory: HashMap<String, String>,
 }
 
 impl ContextStore {
@@ -25,6 +26,7 @@ impl ContextStore {
         Self {
             variables: HashMap::new(),
             counter: 0,
+            memory: HashMap::new(),
         }
     }
 
@@ -94,6 +96,25 @@ impl ContextStore {
     /// Char count of a variable.
     pub fn length(&self, name: &str) -> Option<usize> {
         self.variables.get(name).map(|s| s.chars().count())
+    }
+
+    /// Store a key-value pair in working memory.
+    pub fn mem_store(&mut self, key: &str, value: String) -> String {
+        self.memory.insert(key.to_string(), value);
+        format!("Stored key '{}'.", key)
+    }
+
+    /// Recall a value from working memory by key.
+    pub fn mem_recall(&self, key: &str) -> String {
+        match self.memory.get(key) {
+            Some(v) => v.clone(),
+            None => format!("Key '{}' not found in memory.", key),
+        }
+    }
+
+    /// List all keys in working memory.
+    pub fn mem_keys(&self) -> Vec<&str> {
+        self.memory.keys().map(|k| k.as_str()).collect()
     }
 }
 
@@ -165,12 +186,41 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mem_store",
+                "description": "Store a key-value pair in working memory. Persists across tool calls in this delegation session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Memory key (e.g. 'findings', 'urls')"},
+                        "value": {"type": "string", "description": "Value to store (overwrites existing)"}
+                    },
+                    "required": ["key", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "mem_recall",
+                "description": "Recall a value from working memory by key. Returns error message if not found.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Memory key to recall"}
+                    },
+                    "required": ["key"]
+                }
+            }
+        }),
     ]
 }
 
 /// Execute a micro-tool against the ContextStore.
 pub fn execute_micro_tool(
-    store: &ContextStore,
+    store: &mut ContextStore,
     name: &str,
     args: &HashMap<String, Value>,
 ) -> String {
@@ -208,6 +258,29 @@ pub fn execute_micro_tool(
             Some(len) => len.to_string(),
             None => format!("Error: variable '{}' not found.", variable),
         },
+        "mem_store" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if key.is_empty() {
+                "Error: 'key' parameter is required.".to_string()
+            } else {
+                store.mem_store(key, value)
+            }
+        }
+        "mem_recall" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            store.mem_recall(key)
+        }
         _ => format!("Error: unknown micro-tool '{}'.", name),
     }
 }
@@ -323,7 +396,7 @@ pub async fn execute_ctx_summarize(
                         "Error: ctx_summarize not available in sub-loop.",
                     );
                 } else {
-                    let result = execute_micro_tool(&sub_store, &tc.name, &tc.arguments);
+                    let result = execute_micro_tool(&mut sub_store, &tc.name, &tc.arguments);
                     crate::agent::context::ContextBuilder::add_tool_result(
                         &mut messages,
                         &id,
@@ -451,27 +524,27 @@ mod tests {
         // ctx_length
         let mut args = HashMap::new();
         args.insert("variable".to_string(), json!("output_0"));
-        let result = execute_micro_tool(&store, "ctx_length", &args);
+        let result = execute_micro_tool(&mut store, "ctx_length", &args);
         assert_eq!(result, "11");
 
         // ctx_slice
         args.insert("start".to_string(), json!(0));
         args.insert("end".to_string(), json!(5));
-        let result = execute_micro_tool(&store, "ctx_slice", &args);
+        let result = execute_micro_tool(&mut store, "ctx_slice", &args);
         assert_eq!(result, "hello");
 
         // ctx_grep
         args.insert("pattern".to_string(), json!("world"));
-        let result = execute_micro_tool(&store, "ctx_grep", &args);
+        let result = execute_micro_tool(&mut store, "ctx_grep", &args);
         assert!(result.contains("world"));
     }
 
     #[test]
     fn test_execute_micro_tool_unknown_var() {
-        let store = ContextStore::new();
+        let mut store = ContextStore::new();
         let mut args = HashMap::new();
         args.insert("variable".to_string(), json!("nonexistent"));
-        let result = execute_micro_tool(&store, "ctx_length", &args);
+        let result = execute_micro_tool(&mut store, "ctx_length", &args);
         assert!(result.contains("not found"), "Should report missing variable: {}", result);
     }
 
@@ -509,5 +582,71 @@ mod tests {
         let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(req_names.contains(&"variable"), "Should require 'variable'");
         assert!(req_names.contains(&"instruction"), "Should require 'instruction'");
+    }
+
+    #[test]
+    fn test_mem_store_and_recall() {
+        let mut store = ContextStore::new();
+        let result = store.mem_store("key1", "value1".to_string());
+        assert!(result.contains("Stored"));
+        assert_eq!(store.mem_recall("key1"), "value1");
+    }
+
+    #[test]
+    fn test_mem_recall_missing_key() {
+        let store = ContextStore::new();
+        let result = store.mem_recall("nonexistent");
+        assert!(result.contains("not found"));
+    }
+
+    #[test]
+    fn test_mem_store_overwrites() {
+        let mut store = ContextStore::new();
+        store.mem_store("key1", "first".to_string());
+        store.mem_store("key1", "second".to_string());
+        assert_eq!(store.mem_recall("key1"), "second");
+    }
+
+    #[test]
+    fn test_mem_keys() {
+        let mut store = ContextStore::new();
+        store.mem_store("a", "1".to_string());
+        store.mem_store("b", "2".to_string());
+        let mut keys = store.mem_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_mem_store_via_micro_tool() {
+        let mut store = ContextStore::new();
+        let mut args = HashMap::new();
+        args.insert("key".to_string(), json!("findings"));
+        args.insert("value".to_string(), json!("Found 3 items"));
+        let result = execute_micro_tool(&mut store, "mem_store", &args);
+        assert!(result.contains("Stored"));
+
+        // Recall via micro-tool
+        let mut recall_args = HashMap::new();
+        recall_args.insert("key".to_string(), json!("findings"));
+        let recalled = execute_micro_tool(&mut store, "mem_recall", &recall_args);
+        assert_eq!(recalled, "Found 3 items");
+    }
+
+    #[test]
+    fn test_is_micro_tool_includes_memory() {
+        assert!(is_micro_tool("mem_store"));
+        assert!(is_micro_tool("mem_recall"));
+    }
+
+    #[test]
+    fn test_mem_tool_definitions_present() {
+        let defs = micro_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"mem_store"), "Should include mem_store, got: {:?}", names);
+        assert!(names.contains(&"mem_recall"), "Should include mem_recall, got: {:?}", names);
     }
 }

@@ -1,3 +1,4 @@
+pub mod agent_profiles;
 pub mod agent_loop;
 pub mod audit;
 pub mod circuit_breaker;
@@ -16,4 +17,5 @@ pub mod token_budget;
 pub mod tool_runner;
 pub mod tuning;
 pub mod tools;
+pub mod worker_tools;
 pub mod working_memory;

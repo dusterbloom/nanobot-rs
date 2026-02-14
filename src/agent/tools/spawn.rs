@@ -1,4 +1,7 @@
 //! Spawn tool for creating background subagents.
+//!
+//! Supports named agent profiles and model overrides for context-efficient
+//! delegation.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,9 +15,16 @@ use super::base::Tool;
 
 /// Type alias for the spawn callback.
 ///
-/// Arguments: (task, label, origin_channel, origin_chat_id) -> result string.
+/// Arguments: (task, label, agent_name, model_override, origin_channel, origin_chat_id) -> result string.
 pub type SpawnCallback = Arc<
-    dyn Fn(String, Option<String>, String, String) -> Pin<Box<dyn Future<Output = String> + Send>>
+    dyn Fn(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) -> Pin<Box<dyn Future<Output = String> + Send>>
         + Send
         + Sync,
 >;
@@ -22,7 +32,8 @@ pub type SpawnCallback = Arc<
 /// Tool to spawn a subagent for background task execution.
 ///
 /// The subagent runs asynchronously and announces its result back
-/// to the main agent when complete.
+/// to the main agent when complete. Supports named agent profiles
+/// for specialized behavior and model overrides for cost control.
 pub struct SpawnTool {
     spawn_callback: Arc<Mutex<Option<SpawnCallback>>>,
     origin_channel: Arc<Mutex<String>>,
@@ -66,7 +77,9 @@ impl Tool for SpawnTool {
     fn description(&self) -> &str {
         "Spawn a subagent to handle a task in the background. \
          Use this for complex or time-consuming tasks that can run independently. \
-         The subagent will complete the task and report back when done."
+         The subagent will complete the task and report back when done. \
+         Use 'agent' to pick a specialized profile (explore, reviewer, builder, researcher) \
+         and 'model' to control cost (e.g. 'haiku' for cheap/fast tasks)."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -80,6 +93,14 @@ impl Tool for SpawnTool {
                 "label": {
                     "type": "string",
                     "description": "Optional short label for the task (for display)"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent profile name (e.g. 'explore', 'reviewer', 'builder', 'researcher'). Omit for general-purpose."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model override. Use 'haiku' for fast/cheap, 'sonnet' for balanced, 'opus' for complex reasoning, 'local' for local model. Omit to use profile default or parent model."
                 }
             },
             "required": ["task"]
@@ -97,6 +118,16 @@ impl Tool for SpawnTool {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let agent = params
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let model = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let channel = self.origin_channel.lock().await.clone();
         let chat_id = self.origin_chat_id.lock().await.clone();
 
@@ -108,7 +139,7 @@ impl Tool for SpawnTool {
         // Drop the lock before awaiting.
         drop(callback_guard);
 
-        callback(task, label, channel, chat_id).await
+        callback(task, label, agent, model, channel, chat_id).await
     }
 }
 
@@ -134,6 +165,8 @@ mod tests {
         let desc = tool.description();
         assert!(!desc.is_empty());
         assert!(desc.contains("subagent") || desc.contains("background"));
+        assert!(desc.contains("agent"));
+        assert!(desc.contains("model"));
     }
 
     #[test]
@@ -142,8 +175,13 @@ mod tests {
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["task"].is_object());
+        assert!(params["properties"]["agent"].is_object());
+        assert!(params["properties"]["model"].is_object());
         let required = params["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task"));
+        // agent and model are optional
+        assert!(!required.iter().any(|v| v == "agent"));
+        assert!(!required.iter().any(|v| v == "model"));
     }
 
     #[tokio::test]
@@ -171,8 +209,6 @@ mod tests {
         let tool = SpawnTool::new();
         tool.set_context("discord", "guild_123").await;
 
-        // Verify context was updated by checking the internal state through
-        // execute (it will fail on callback, but won't fail on context).
         let mut params = HashMap::new();
         params.insert(
             "task".to_string(),
@@ -187,12 +223,19 @@ mod tests {
         let tool = SpawnTool::new();
 
         let callback: SpawnCallback = Arc::new(
-            |task: String, label: Option<String>, channel: String, chat_id: String| {
+            |task: String,
+             label: Option<String>,
+             agent: Option<String>,
+             model: Option<String>,
+             channel: String,
+             chat_id: String| {
                 Box::pin(async move {
                     format!(
-                        "spawned: task={}, label={}, channel={}, chat_id={}",
+                        "spawned: task={}, label={}, agent={}, model={}, channel={}, chat_id={}",
                         task,
                         label.unwrap_or_else(|| "none".to_string()),
+                        agent.unwrap_or_else(|| "none".to_string()),
+                        model.unwrap_or_else(|| "none".to_string()),
                         channel,
                         chat_id,
                     )
@@ -211,21 +254,44 @@ mod tests {
             "label".to_string(),
             serde_json::Value::String("data-analysis".to_string()),
         );
+        params.insert(
+            "agent".to_string(),
+            serde_json::Value::String("explore".to_string()),
+        );
+        params.insert(
+            "model".to_string(),
+            serde_json::Value::String("haiku".to_string()),
+        );
         let result = tool.execute(params).await;
         assert!(result.contains("spawned:"));
         assert!(result.contains("task=analyze data"));
         assert!(result.contains("label=data-analysis"));
+        assert!(result.contains("agent=explore"));
+        assert!(result.contains("model=haiku"));
         assert!(result.contains("channel=telegram"));
         assert!(result.contains("chat_id=42"));
     }
 
     #[tokio::test]
-    async fn test_execute_with_callback_no_label() {
+    async fn test_execute_with_callback_no_optional_params() {
         let tool = SpawnTool::new();
 
         let callback: SpawnCallback = Arc::new(
-            |task: String, label: Option<String>, _channel: String, _chat_id: String| {
-                Box::pin(async move { format!("task={}, has_label={}", task, label.is_some(),) })
+            |task: String,
+             label: Option<String>,
+             agent: Option<String>,
+             model: Option<String>,
+             _channel: String,
+             _chat_id: String| {
+                Box::pin(async move {
+                    format!(
+                        "task={}, has_label={}, has_agent={}, has_model={}",
+                        task,
+                        label.is_some(),
+                        agent.is_some(),
+                        model.is_some(),
+                    )
+                })
             },
         );
         tool.set_callback(callback).await;
@@ -238,5 +304,7 @@ mod tests {
         let result = tool.execute(params).await;
         assert!(result.contains("task=simple task"));
         assert!(result.contains("has_label=false"));
+        assert!(result.contains("has_agent=false"));
+        assert!(result.contains("has_model=false"));
     }
 }
