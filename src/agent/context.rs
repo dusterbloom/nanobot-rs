@@ -206,7 +206,10 @@ impl ContextBuilder {
                     "- NEVER use emoji, emoticons, or unicode symbols.\n",
                     "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
                     "- NEVER output code blocks or technical formatting.\n",
-                    "- If asked a complex question, give a brief spoken answer, not a written essay.",
+                    "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
+                    "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
+                    "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
+                    "Never say 'sorry I can not' without exhausting your options.",
                 ));
                 if let Some(lang) = detected_language {
                     if lang == "en" {

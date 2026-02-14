@@ -70,7 +70,7 @@ impl ReplContext {
     /// Replaces the 3x copy-pasted `while let Ok(line) = display_rx.try_recv()` pattern.
     pub fn drain_display(&mut self) {
         while let Ok(line) = self.display_rx.try_recv() {
-            println!("\r{}", line);
+            print!("\r{}", crate::syntax::render_response(&line));
         }
     }
 
