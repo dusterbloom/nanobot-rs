@@ -43,11 +43,18 @@ type TtsSentenceSender = Option<()>;
 // Helpers (testable, pure-ish)
 // ============================================================================
 
+/// Stall detection threshold: if no token arrives for this many seconds,
+/// show a yellow warning in the progress line.
+const STALL_THRESHOLD_SECS: f32 = 5.0;
+
 /// Format a compact progress line for streaming display.
 ///
 /// Shows word count, generation rate, and a trailing preview of the last ~50 characters.
+/// When `stall_secs` exceeds [`STALL_THRESHOLD_SECS`], the line turns yellow with a
+/// `⚠ stalled Ns` warning so the user knows the model may be stuck.
+///
 /// Used instead of raw token dumping to prevent scrollback pollution.
-fn format_progress_line(text: &str, elapsed_secs: f32) -> String {
+fn format_progress_line(text: &str, elapsed_secs: f32, stall_secs: f32) -> String {
     let word_count = text.split_whitespace().count();
     let rate = if elapsed_secs > 0.5 {
         (word_count as f32 / elapsed_secs) as usize
@@ -65,10 +72,24 @@ fn format_progress_line(text: &str, elapsed_secs: f32) -> String {
         text.replace('\n', " ")
     };
 
-    if rate > 0 {
-        format!("И {}w {}w/s ··· {}", word_count, rate, preview)
+    let stalled = stall_secs >= STALL_THRESHOLD_SECS;
+    let stall_tag = if stalled {
+        format!(" \x1b[33m⚠ stalled {}s\x1b[0m", stall_secs as usize)
     } else {
-        format!("И {}w ··· {}", word_count, preview)
+        String::new()
+    };
+
+    // Yellow when stalled, dim otherwise.
+    let (open, close) = if stalled {
+        ("\x1b[33m", "\x1b[0m")
+    } else {
+        ("\x1b[2m", "\x1b[0m")
+    };
+
+    if rate > 0 {
+        format!("{}И {}w {}w/s{} ··· {}{}", open, word_count, rate, stall_tag, preview, close)
+    } else {
+        format!("{}И {}w{} ··· {}{}", open, word_count, stall_tag, preview, close)
     }
 }
 
@@ -352,6 +373,7 @@ async fn stream_and_render_inner(
             // prevent scrollback pollution from long responses.
             let mut full_text = String::new();
             let progress_start = Instant::now();
+            let mut last_delta_time = Instant::now();
             let mut has_progress_line = false;
             loop {
                 if delta_done && tool_done {
@@ -363,10 +385,13 @@ async fn stream_and_render_inner(
                         match delta {
                             Some(d) => {
                                 full_text.push_str(&d);
+                                last_delta_time = Instant::now();
                                 let progress = format_progress_line(
-                                    &full_text, progress_start.elapsed().as_secs_f32(),
+                                    &full_text,
+                                    progress_start.elapsed().as_secs_f32(),
+                                    0.0, // just received a token — not stalled
                                 );
-                                print!("\r\x1b[K\x1b[2m{}\x1b[0m", progress);
+                                print!("\r\x1b[K{}", progress);
                                 std::io::stdout().flush().ok();
                                 has_progress_line = true;
                                 #[cfg(feature = "voice")]
@@ -386,6 +411,20 @@ async fn stream_and_render_inner(
                                     acc.flush();
                                 }
                             },
+                        }
+                    }
+                    // Periodic stall check: refresh progress line every second so
+                    // the user sees "⚠ stalled Ns" even when no events arrive.
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if !delta_done && has_progress_line => {
+                        let stall = last_delta_time.elapsed().as_secs_f32();
+                        if stall >= STALL_THRESHOLD_SECS {
+                            let progress = format_progress_line(
+                                &full_text,
+                                progress_start.elapsed().as_secs_f32(),
+                                stall,
+                            );
+                            print!("\r\x1b[K{}", progress);
+                            std::io::stdout().flush().ok();
                         }
                     }
                     event = tool_rx.recv(), if !tool_done => {
@@ -501,16 +540,45 @@ async fn stream_and_render_inner(
             let _ = tts_tx;
             let mut full_text = String::new();
             let progress_start = Instant::now();
-            while let Some(delta) = delta_rx.recv().await {
-                full_text.push_str(&delta);
-                let progress = format_progress_line(
-                    &full_text, progress_start.elapsed().as_secs_f32(),
-                );
-                print!("\r\x1b[K\x1b[2m{}\x1b[0m", progress);
-                std::io::stdout().flush().ok();
-                #[cfg(feature = "voice")]
-                if let Some(ref mut acc) = tts_acc {
-                    acc.push(&delta);
+            let mut last_delta_time = Instant::now();
+            let mut has_progress = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    delta = delta_rx.recv() => {
+                        match delta {
+                            Some(d) => {
+                                full_text.push_str(&d);
+                                last_delta_time = Instant::now();
+                                let progress = format_progress_line(
+                                    &full_text,
+                                    progress_start.elapsed().as_secs_f32(),
+                                    0.0,
+                                );
+                                print!("\r\x1b[K{}", progress);
+                                std::io::stdout().flush().ok();
+                                has_progress = true;
+                                #[cfg(feature = "voice")]
+                                if let Some(ref mut acc) = tts_acc {
+                                    acc.push(&d);
+                                }
+                            }
+                            None => break, // channel closed
+                        }
+                    }
+                    // Periodic stall check.
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if has_progress => {
+                        let stall = last_delta_time.elapsed().as_secs_f32();
+                        if stall >= STALL_THRESHOLD_SECS {
+                            let progress = format_progress_line(
+                                &full_text,
+                                progress_start.elapsed().as_secs_f32(),
+                                stall,
+                            );
+                            print!("\r\x1b[K{}", progress);
+                            std::io::stdout().flush().ok();
+                        }
+                    }
                 }
             }
             print!("\r\x1b[K"); // clear progress line
@@ -1333,7 +1401,7 @@ mod tests {
 
     #[test]
     fn test_format_progress_line_short() {
-        let line = format_progress_line("Hello world", 1.0);
+        let line = format_progress_line("Hello world", 1.0, 0.0);
         assert!(line.contains("2w"));
         assert!(line.contains("Hello world"));
         assert!(line.contains("И"));
@@ -1341,14 +1409,14 @@ mod tests {
 
     #[test]
     fn test_format_progress_line_rate_shown_after_half_second() {
-        let line = format_progress_line("one two three four five", 1.0);
+        let line = format_progress_line("one two three four five", 1.0, 0.0);
         assert!(line.contains("5w"));
         assert!(line.contains("w/s"));
     }
 
     #[test]
     fn test_format_progress_line_rate_hidden_below_half_second() {
-        let line = format_progress_line("one two three", 0.3);
+        let line = format_progress_line("one two three", 0.3, 0.0);
         assert!(line.contains("3w"));
         assert!(!line.contains("w/s"));
     }
@@ -1356,21 +1424,44 @@ mod tests {
     #[test]
     fn test_format_progress_line_truncates_long_text() {
         let text = "a ".repeat(100); // 200 chars, 100 words
-        let line = format_progress_line(&text, 2.0);
+        let line = format_progress_line(&text, 2.0, 0.0);
         assert!(line.contains("100w"));
         assert!(line.contains("…")); // truncation marker
     }
 
     #[test]
     fn test_format_progress_line_newlines_replaced() {
-        let line = format_progress_line("line1\nline2\nline3", 0.1);
+        let line = format_progress_line("line1\nline2\nline3", 0.1, 0.0);
         assert!(!line.contains('\n'));
         assert!(line.contains("line1 line2 line3"));
     }
 
     #[test]
     fn test_format_progress_line_empty() {
-        let line = format_progress_line("", 0.0);
+        let line = format_progress_line("", 0.0, 0.0);
         assert!(line.contains("0w"));
+    }
+
+    #[test]
+    fn test_format_progress_line_no_stall_below_threshold() {
+        let line = format_progress_line("some text", 2.0, 3.0);
+        assert!(!line.contains("stalled"));
+        assert!(line.contains("\x1b[2m")); // dim, not yellow
+    }
+
+    #[test]
+    fn test_format_progress_line_stall_at_threshold() {
+        let line = format_progress_line("some text", 10.0, 5.0);
+        assert!(line.contains("stalled"));
+        assert!(line.contains("5s"));
+        assert!(line.contains("\x1b[33m")); // yellow
+    }
+
+    #[test]
+    fn test_format_progress_line_stall_long() {
+        let line = format_progress_line("some text", 30.0, 25.0);
+        assert!(line.contains("stalled"));
+        assert!(line.contains("25s"));
+        assert!(line.contains("\x1b[33m")); // yellow
     }
 }
