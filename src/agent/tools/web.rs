@@ -358,7 +358,12 @@ impl Tool for WebFetchTool {
 
                 let truncated = text.len() > max_chars;
                 let final_text = if truncated {
-                    text[..max_chars].to_string()
+                    // Find a valid char boundary at or before max_chars.
+                    let mut end = max_chars;
+                    while !text.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    text[..end].to_string()
                 } else {
                     text
                 };

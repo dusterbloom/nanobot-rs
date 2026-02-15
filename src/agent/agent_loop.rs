@@ -1540,7 +1540,8 @@ impl AgentLoop {
                 // Notify REPL about inbound channel message.
                 if let Some(ref dtx) = display_tx {
                     let preview = if msg.content.len() > 120 {
-                        format!("{}...", &msg.content[..120])
+                        let end = crate::utils::helpers::floor_char_boundary(&msg.content, 120);
+                        format!("{}...", &msg.content[..end])
                     } else {
                         msg.content.clone()
                     };
@@ -1556,7 +1557,8 @@ impl AgentLoop {
                     // Notify REPL about outbound response.
                     if let Some(ref dtx) = display_tx {
                         let preview = if outbound.content.len() > 120 {
-                            format!("{}...", &outbound.content[..120])
+                            let end = crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
+                            format!("{}...", &outbound.content[..end])
                         } else {
                             outbound.content.clone()
                         };

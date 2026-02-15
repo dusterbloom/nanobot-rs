@@ -386,7 +386,7 @@ impl<'a> ClaimVerifier<'a> {
 
         // Try shorter substring match (partial).
         if content.len() >= 20 {
-            let short = &content[..20];
+            let short = &content[..crate::utils::helpers::floor_char_boundary(content, 20)];
             for entry in self.entries.iter().rev() {
                 if entry.result_data.contains(short) {
                     return ClaimStatus::Derived;

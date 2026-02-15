@@ -413,7 +413,8 @@ impl Channel for TelegramChannel {
                         match pipeline.synthesize_to_file(&tts_text, lang).await {
                             Ok(ogg_path) => {
                                 let caption = if msg.content.len() > 1024 {
-                                    &msg.content[..1024]
+                                    let end = crate::utils::helpers::floor_char_boundary(&msg.content, 1024);
+                                    &msg.content[..end]
                                 } else {
                                     &msg.content
                                 };

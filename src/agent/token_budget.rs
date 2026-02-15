@@ -190,7 +190,7 @@ impl TokenBudget {
                     if content.len() > 200 {
                         let summary = format!(
                             "[truncated: {}... ({} chars)]",
-                            &content[..100],
+                            &content[..crate::utils::helpers::floor_char_boundary(content, 100)],
                             content.len()
                         );
                         msgs[idx]["content"] = Value::String(summary);

@@ -651,9 +651,10 @@ pub fn format_results_for_context(result: &ToolRunResult, max_result_chars: usiz
 
     for (_, tool_name, data) in &result.tool_results {
         let truncated = if data.len() > max_result_chars {
+            let end = crate::utils::helpers::floor_char_boundary(data, max_result_chars);
             format!(
                 "{}… ({} chars total)",
-                &data[..max_result_chars],
+                &data[..end],
                 data.len()
             )
         } else {

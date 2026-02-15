@@ -79,6 +79,20 @@ pub fn timestamp() -> String {
     Local::now().to_rfc3339()
 }
 
+/// Find the largest byte index `<= idx` that lies on a UTF-8 char boundary.
+///
+/// Equivalent to the nightly `str::floor_char_boundary`.
+pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while !s.is_char_boundary(i) && i > 0 {
+        i -= 1;
+    }
+    i
+}
+
 /// Truncate a string to max length, adding a suffix if truncated.
 pub fn truncate_string(s: &str, max_len: usize) -> String {
     let suffix = "...";
@@ -86,9 +100,11 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
         return s.to_string();
     }
     if max_len <= suffix.len() {
-        return s[..max_len].to_string();
+        let end = floor_char_boundary(s, max_len);
+        return s[..end].to_string();
     }
-    let mut result = s[..max_len - suffix.len()].to_string();
+    let end = floor_char_boundary(s, max_len - suffix.len());
+    let mut result = s[..end].to_string();
     result.push_str(suffix);
     result
 }
@@ -178,5 +194,42 @@ mod tests {
         let p = expand_tilde("~/foo/bar");
         assert!(p.ends_with("foo/bar"));
         assert!(!p.to_string_lossy().contains('~'));
+    }
+
+    #[test]
+    fn test_floor_char_boundary_ascii() {
+        assert_eq!(floor_char_boundary("hello", 3), 3);
+        assert_eq!(floor_char_boundary("hello", 10), 5);
+        assert_eq!(floor_char_boundary("hello", 0), 0);
+    }
+
+    #[test]
+    fn test_floor_char_boundary_multibyte() {
+        // "héllo" — 'é' is 2 bytes (0xC3 0xA9), so byte indices 1..=2
+        let s = "héllo";
+        assert_eq!(s.len(), 6); // h(1) é(2) l(1) l(1) o(1)
+        assert_eq!(floor_char_boundary(s, 2), 1); // byte 2 is mid-char, floor to 1
+        assert_eq!(floor_char_boundary(s, 3), 3); // byte 3 is start of 'l'
+    }
+
+    #[test]
+    fn test_floor_char_boundary_emoji() {
+        // "a😀b" — '😀' is 4 bytes
+        let s = "a😀b";
+        assert_eq!(s.len(), 6); // a(1) 😀(4) b(1)
+        assert_eq!(floor_char_boundary(s, 1), 1); // end of 'a'
+        assert_eq!(floor_char_boundary(s, 2), 1); // mid-emoji, floor to 'a'
+        assert_eq!(floor_char_boundary(s, 3), 1);
+        assert_eq!(floor_char_boundary(s, 4), 1);
+        assert_eq!(floor_char_boundary(s, 5), 5); // start of 'b'
+    }
+
+    #[test]
+    fn test_truncate_string_multibyte() {
+        // Should not panic on multi-byte strings
+        let s = "café résumé";
+        let t = truncate_string(s, 6);
+        assert!(t.len() <= 9); // 6 + "..." at most
+        assert!(t.ends_with("..."));
     }
 }
