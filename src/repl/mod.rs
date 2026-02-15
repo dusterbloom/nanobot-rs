@@ -541,7 +541,10 @@ async fn stream_and_render_inner(
                     }
                 }
             }
-            println!();
+            // Use \r\n instead of println!() — raw mode (input watcher) makes
+            // \n LF-only, leaving cursor at non-zero column. \r ensures column 0.
+            print!("\r\n");
+            std::io::stdout().flush().ok();
             (tool_lines, collected)
         })
     } else {
@@ -600,7 +603,10 @@ async fn stream_and_render_inner(
             if let Some(acc) = tts_acc.take() {
                 acc.flush();
             }
-            println!();
+            // Use \r\n instead of println!() — raw mode (input watcher) makes
+            // \n LF-only, leaving cursor at non-zero column. \r ensures column 0.
+            print!("\r\n");
+            std::io::stdout().flush().ok();
             (0usize, Vec::<String>::new())
         })
     };
@@ -633,6 +639,8 @@ async fn stream_and_render_inner(
     // Signal watcher thread to stop and wait for it.
     watcher_done.store(true, Ordering::Relaxed);
     watcher.join().ok();
+    // Defensive: ensure raw mode is off even if watcher thread panicked.
+    termimad::crossterm::terminal::disable_raw_mode().ok();
 
     let cancelled = cancel_token.is_cancelled();
     let (tool_lines, tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
@@ -643,7 +651,7 @@ async fn stream_and_render_inner(
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
         let total_lines = tool_lines + 2; // +1 separator println, +1 trailing println
-        print!("\x1b[{}A\x1b[J", total_lines);
+        print!("\r\x1b[{}A\x1b[J", total_lines); // \r ensures column 0
         std::io::stdout().flush().ok();
 
         // Re-render tool events first so the user can see what the LLM actually did.

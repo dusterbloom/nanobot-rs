@@ -1166,6 +1166,31 @@ impl AgentLoopShared {
                     }
 
                     let start = std::time::Instant::now();
+
+                    // Spawn heartbeat that emits Progress every 2s for tools that
+                    // don't emit their own (everything except exec).
+                    let heartbeat = if let Some(ref tx) = tool_event_tx {
+                        let hb_tx = tx.clone();
+                        let hb_name = tc.name.clone();
+                        let hb_id = tc.id.clone();
+                        let hb_start = start;
+                        Some(tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(2));
+                            interval.tick().await; // skip first immediate tick
+                            loop {
+                                interval.tick().await;
+                                let _ = hb_tx.send(ToolEvent::Progress {
+                                    tool_name: hb_name.clone(),
+                                    tool_call_id: hb_id.clone(),
+                                    elapsed_ms: hb_start.elapsed().as_millis() as u64,
+                                    output_preview: None,
+                                });
+                            }
+                        }))
+                    } else {
+                        None
+                    };
+
                     let result = if let Some(ref tx) = tool_event_tx {
                         use crate::agent::tools::base::ToolExecutionContext;
                         let ctx = ToolExecutionContext {
@@ -1179,6 +1204,11 @@ impl AgentLoopShared {
                     } else {
                         tools.execute(&tc.name, tc.arguments.clone()).await
                     };
+
+                    // Stop heartbeat when tool finishes.
+                    if let Some(hb) = heartbeat {
+                        hb.abort();
+                    }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     debug!(
                         "Tool {} result ({}B, ok={}, {}ms)",
