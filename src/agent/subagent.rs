@@ -280,20 +280,25 @@ impl SubagentManager {
             // isn't consumed by process_direct().
             if let Some(ref dtx) = display_tx {
                 let status_color = if status == "completed" { "\x1b[32m" } else { "\x1b[31m" };
-                let header = format!(
-                    "\n  {status_color}\u{25cf}\x1b[0m \x1b[1mSubagent: {}\x1b[0m  \x1b[2m({})\x1b[0m  {status_color}{}\x1b[0m",
+                // Strip markdown formatting for terminal display
+                let clean_result = result_text
+                    .replace("**", "")
+                    .replace("__", "")
+                    .trim()
+                    .to_string();
+                let truncated = truncate_for_display(&clean_result, 30, 3000);
+
+                // Build a compact, clean result block.
+                // Use \x1b[RAW] prefix to bypass markdown rendering in the REPL.
+                let mut block = format!(
+                    "\x1b[RAW]\n  {status_color}\u{25cf}\x1b[0m \x1b[1mSubagent: {}\x1b[0m  \x1b[2m({})\x1b[0m  {status_color}{}\x1b[0m\n",
                     lbl, tid, status
                 );
-                // Strip markdown formatting for terminal display
-                let clean_result = result_text.replace("**", "").replace("__", "");
-                let truncated = truncate_for_display(&clean_result, 60, 6000);
-                let mut block = header;
-                block.push('\n');
-                block.push_str("    \x1b[2m\u{250c}\u{2500} result \u{2500}\x1b[0m\n");
+                // Indent each line under a dim gutter
                 for line in truncated.lines() {
-                    block.push_str(&format!("    \x1b[2m\u{2502}\x1b[0m {}\n", line));
+                    block.push_str(&format!("  \x1b[2m\u{2502}\x1b[0m \x1b[37m{}\x1b[0m\n", line));
                 }
-                block.push_str("    \x1b[2m\u{2514}\u{2500}\x1b[0m\n");
+                block.push_str("  \x1b[2m\u{2514}\u{2500}\x1b[0m\n");
                 let _ = dtx.send(block);
             }
 

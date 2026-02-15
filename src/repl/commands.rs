@@ -72,7 +72,11 @@ impl ReplContext {
     /// Replaces the 3x copy-pasted `while let Ok(line) = display_rx.try_recv()` pattern.
     pub fn drain_display(&mut self) {
         while let Ok(line) = self.display_rx.try_recv() {
-            print!("\r{}", crate::syntax::render_response(&line));
+            if line.starts_with("\x1b[RAW]") {
+                print!("\r{}", &line[6..]);
+            } else {
+                print!("\r{}", crate::syntax::render_response(&line));
+            }
         }
     }
 
@@ -105,7 +109,11 @@ impl ReplContext {
                         break readline_res;
                     }
                     Some(line) = self.display_rx.recv() => {
-                        let rendered = crate::syntax::render_response(&line);
+                        let rendered = if line.starts_with("\x1b[RAW]") {
+                            line[6..].to_string()
+                        } else {
+                            crate::syntax::render_response(&line)
+                        };
                         let _ = printer.print(rendered);
                     }
                 }
