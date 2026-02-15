@@ -295,11 +295,21 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or("stop")
         .to_string();
 
-    // Extract content.
-    let content = message
+    // Extract content, merging reasoning_content if present (GLM-4.7, DeepSeek-R1 style).
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let main_content = message
         .get("content")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .filter(|s| !s.is_empty());
+    let content = match (reasoning, main_content) {
+        (Some(r), Some(c)) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", r, c)),
+        (Some(r), None) => Some(format!("<thinking>\n{}\n</thinking>", r)),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    };
 
     // Extract tool calls.
     let mut tool_calls = Vec::new();
@@ -377,6 +387,7 @@ async fn parse_sse_stream(
 ) {
     let mut line_buffer = String::new();
     let mut full_content = String::new();
+    let mut full_reasoning = String::new();
     let mut finish_reason = String::from("stop");
     let mut usage: HashMap<String, i64> = HashMap::new();
 
@@ -413,11 +424,12 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
-                // Stream is complete
-                let content = if full_content.is_empty() {
-                    None
-                } else {
-                    Some(full_content.clone())
+                // Stream is complete — merge reasoning_content if present
+                let content = match (full_reasoning.is_empty(), full_content.is_empty()) {
+                    (false, false) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", full_reasoning, full_content)),
+                    (false, true) => Some(format!("<thinking>\n{}\n</thinking>", full_reasoning)),
+                    (true, false) => Some(full_content.clone()),
+                    (true, true) => None,
                 };
 
                 let mut tool_calls = Vec::new();
@@ -471,6 +483,13 @@ async fn parse_sse_stream(
                     }
 
                     if let Some(delta) = choice.get("delta") {
+                        // Reasoning content delta (GLM-4.7, DeepSeek-R1 style)
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                            if !reasoning.is_empty() {
+                                full_reasoning.push_str(reasoning);
+                            }
+                        }
+
                         // Text content delta
                         if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                             if !content.is_empty() {
@@ -521,11 +540,12 @@ async fn parse_sse_stream(
         }
     }
 
-    // Stream ended without [DONE] — emit whatever we have
-    let content = if full_content.is_empty() {
-        None
-    } else {
-        Some(full_content)
+    // Stream ended without [DONE] — emit whatever we have, merging reasoning_content
+    let content = match (full_reasoning.is_empty(), full_content.is_empty()) {
+        (false, false) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", full_reasoning, full_content)),
+        (false, true) => Some(format!("<thinking>\n{}\n</thinking>", full_reasoning)),
+        (true, false) => Some(full_content),
+        (true, true) => None,
     };
 
     let mut tool_calls = Vec::new();
