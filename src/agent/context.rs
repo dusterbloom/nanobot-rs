@@ -353,7 +353,9 @@ IMPORTANT: When responding to direct questions or conversations, reply directly 
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. When using tools, explain what you're doing."#
+Always be helpful, accurate, and concise. When using tools, explain what you're doing.
+
+If you see a [PRIORITY USER MESSAGE], the user typed this while you were working. Acknowledge it briefly and adjust your approach accordingly. This takes precedence over your current plan."#
         )
     }
 

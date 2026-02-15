@@ -474,6 +474,7 @@ impl AgentLoopShared {
         text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        mut priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Option<OutboundMessage> {
         let streaming = text_delta_tx.is_some();
 
@@ -757,6 +758,28 @@ impl AgentLoopShared {
                 }
             };
 
+            // Check for LLM provider errors before processing the response.
+            // openai_compat.rs wraps errors as Ok(LLMResponse { finish_reason: "error", ... })
+            // so they slip through as normal responses unless explicitly caught.
+            if response.finish_reason == "error" {
+                let err_msg = response.content.as_deref().unwrap_or("Unknown LLM error");
+                error!("LLM provider error: {}", err_msg);
+
+                // In local mode, check if the server is still alive.
+                if core.is_local {
+                    if let Some(base) = core.provider.get_api_base() {
+                        if !crate::server::check_health(base).await {
+                            error!("Local LLM server is down!");
+                            final_content = "[LLM Error] Local server crashed. Use /restart or /local to recover.".into();
+                            break;
+                        }
+                    }
+                }
+
+                final_content = format!("[LLM Error] {}", err_msg);
+                break;
+            }
+
             if response.has_tool_calls() {
                 // Auto-escalation: when context pressure is high, delegate
                 // even if tool_delegation isn't explicitly enabled. This
@@ -885,6 +908,7 @@ impl AgentLoopShared {
                             tool_names.join(", ")
                         );
 
+                        let delegation_start = std::time::Instant::now();
                         let run_result = tool_runner::run_tool_loop(
                             &runner_config,
                             &response.tool_calls,
@@ -892,6 +916,7 @@ impl AgentLoopShared {
                             &task_desc,
                         )
                         .await;
+                        let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
                         // If the runner returned no summary, the delegation
                         // LLM likely failed (server down). Mark it unhealthy
@@ -1027,8 +1052,11 @@ impl AgentLoopShared {
 
                         // Record learning + audit for all tool results.
                         let executor = format!("tool_runner:{}", tr_model);
+                        let n_results = run_result.tool_results.len().max(1) as u64;
                         for (tool_call_id, tool_name, data) in &run_result.tool_results {
                             let ok = !data.starts_with("Error:");
+                            // Distribute total delegation time across tool results.
+                            let per_tool_ms = delegation_elapsed_ms / n_results;
 
                             // Emit tool call end event.
                             if let Some(ref tx) = tool_event_tx {
@@ -1037,7 +1065,7 @@ impl AgentLoopShared {
                                     tool_call_id: tool_call_id.clone(),
                                     result_data: data.clone(),
                                     ok,
-                                    duration_ms: 0,
+                                    duration_ms: per_tool_ms,
                                 });
                             }
 
@@ -1049,7 +1077,7 @@ impl AgentLoopShared {
                                     &json!({}), // args not available from runner results
                                     data,
                                     ok,
-                                    0, // duration not tracked per-tool in runner
+                                    per_tool_ms,
                                     &executor,
                                 );
                             }
@@ -1229,6 +1257,17 @@ impl AgentLoopShared {
                 // Mistral/Ministral templates handle tool→generate
                 // natively. Do NOT add user continuation messages —
                 // they break the template's role alternation check.
+
+                // Check for priority user messages injected mid-task.
+                if let Some(ref mut rx) = priority_rx {
+                    if let Ok(msg) = rx.try_recv() {
+                        messages.push(json!({
+                            "role": "user",
+                            "content": format!("[PRIORITY USER MESSAGE]: {}", msg)
+                        }));
+                        // Continue to next LLM call — let the model see and adjust.
+                    }
+                }
 
                 // Check cancellation between tool call iterations.
                 if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
@@ -1584,7 +1623,7 @@ impl AgentLoop {
                     ));
                 }
 
-                let response = shared.process_message(&msg, None, None, None).await;
+                let response = shared.process_message(&msg, None, None, None, None).await;
 
                 if let Some(outbound) = response {
                     // Notify REPL about outbound response.
@@ -1658,7 +1697,7 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        match self.shared.process_message(&msg, None, None, None).await {
+        match self.shared.process_message(&msg, None, None, None, None).await {
             Some(response) => response.content,
             None => String::new(),
         }
@@ -1676,6 +1715,7 @@ impl AgentLoop {
         text_delta_tx: tokio::sync::mpsc::UnboundedSender<String>,
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> String {
         if !self.reflection_spawned.swap(true, Ordering::SeqCst) {
             Self::spawn_background_reflection(&self.shared);
@@ -1691,7 +1731,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, Some(text_delta_tx), tool_event_tx, cancellation_token)
+            .process_message(&msg, Some(text_delta_tx), tool_event_tx, cancellation_token, priority_rx)
             .await
         {
             Some(response) => response.content,

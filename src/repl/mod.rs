@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write as _};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
@@ -143,6 +143,89 @@ pub(crate) fn print_help() {
     println!("  Ctrl+C          - Exit\n");
 }
 
+// ============================================================================
+// Input Watcher (Full-Duplex REPL)
+// ============================================================================
+
+/// Spawn a key watcher thread that runs during agent streaming/tool execution.
+///
+/// Handles:
+/// - **ESC+ESC** (within 500ms): instant cancel via `cancel_token`
+/// - **Ctrl+C**: backup cancel via `cancel_token`
+/// - **Backtick (`)**: temporarily exits raw mode, reads an injection line
+///   from stdin, sends it through `inject_tx`, re-enters raw mode
+///
+/// The thread exits when `done` is set to `true`.
+///
+/// Modeled on `tui::spawn_interrupt_watcher()` (voice mode pattern).
+pub(crate) fn spawn_input_watcher(
+    cancel_token: tokio_util::sync::CancellationToken,
+    inject_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use termimad::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use termimad::crossterm::terminal;
+
+    std::thread::spawn(move || {
+        terminal::enable_raw_mode().ok();
+        let mut last_esc: Option<Instant> = None;
+
+        while !done.load(Ordering::Relaxed) {
+            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    // Ctrl+C → cancel
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        cancel_token.cancel();
+                        break;
+                    }
+
+                    // ESC double-tap → cancel
+                    if key.code == KeyCode::Esc {
+                        if let Some(prev) = last_esc {
+                            if prev.elapsed() < Duration::from_millis(500) {
+                                cancel_token.cancel();
+                                break;
+                            }
+                        }
+                        last_esc = Some(Instant::now());
+                        continue;
+                    }
+
+                    // Backtick → inject prompt
+                    if key.code == KeyCode::Char('`')
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        // Exit raw mode so the user gets normal line editing.
+                        terminal::disable_raw_mode().ok();
+                        print!("\n\x1b[33minject>\x1b[0m ");
+                        io::stdout().flush().ok();
+
+                        let mut line = String::new();
+                        if io::stdin().read_line(&mut line).is_ok() {
+                            let trimmed = line.trim().to_string();
+                            if !trimmed.is_empty() {
+                                let _ = inject_tx.send(trimmed);
+                            }
+                        }
+
+                        // Re-enter raw mode for continued watching.
+                        terminal::enable_raw_mode().ok();
+                        continue;
+                    }
+
+                    // Any other key clears the ESC state.
+                    last_esc = None;
+                }
+            }
+        }
+
+        terminal::disable_raw_mode().ok();
+    })
+}
+
 /// Stream an LLM response with live delta printing, then erase and re-render with syntax highlighting.
 ///
 /// This replaces the 3x copy-pasted pattern:
@@ -232,6 +315,10 @@ async fn stream_and_render_inner(
             let mut collected: Vec<String> = Vec::new();
             let mut delta_done = false;
             let mut tool_done = false;
+            // Track previous CallEnd to coalesce repeated status-check calls
+            // (e.g. spawn list polling). When the same tool fires consecutive
+            // CallEnd events, erase the previous box and overwrite in-place.
+            let mut prev_call_end: Option<(String, usize)> = None; // (tool_name, lines_printed)
             loop {
                 if delta_done && tool_done {
                     break;
@@ -284,13 +371,28 @@ async fn stream_and_render_inner(
                                 std::io::stdout().flush().ok();
                             }
                             Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
+                                // Coalesce repeated CallEnd for the same tool: erase
+                                // the previous box and overwrite it so e.g. 129 spawn-list
+                                // polls render as a single updating status instead of spam.
+                                if let Some((ref prev_name, prev_lines)) = prev_call_end {
+                                    if prev_name == tool_name && prev_lines > 0 {
+                                        // Move cursor up over the previous box and clear.
+                                        print!("\x1b[{}A\x1b[J", prev_lines);
+                                        std::io::stdout().flush().ok();
+                                        tool_lines = tool_lines.saturating_sub(prev_lines);
+                                        // Remove the collected lines from the previous box.
+                                        let keep = collected.len().saturating_sub(prev_lines);
+                                        collected.truncate(keep);
+                                    }
+                                }
+
                                 let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
                                 let status_line = format!(
                                     "\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
                                     tool_name, marker, duration_ms
                                 );
                                 println!("\r\x1b[K{}", status_line);
-                                tool_lines += 1;
+                                let mut this_box_lines = 1usize;
                                 collected.push(status_line);
 
                                 if ok && !result_data.is_empty() {
@@ -298,23 +400,26 @@ async fn stream_and_render_inner(
                                     if !truncated.is_empty() {
                                         println!("    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m");
                                         collected.push("    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m".to_string());
+                                        this_box_lines += 1;
                                         for line in truncated.lines() {
                                             let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
                                             println!("{}", formatted);
                                             collected.push(formatted);
-                                            tool_lines += 1;
+                                            this_box_lines += 1;
                                         }
                                         println!("    \x1b[2m\u{2514}\u{2500}\x1b[0m");
                                         collected.push("    \x1b[2m\u{2514}\u{2500}\x1b[0m".to_string());
-                                        tool_lines += 2;
+                                        this_box_lines += 1;
                                     }
                                 } else if !ok && !result_data.is_empty() {
                                     let preview: String = result_data.chars().take(80).collect();
                                     let err_line = format!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
                                     println!("{}", err_line);
                                     collected.push(err_line);
-                                    tool_lines += 1;
+                                    this_box_lines += 1;
                                 }
+                                tool_lines += this_box_lines;
+                                prev_call_end = Some((tool_name.clone(), this_box_lines));
                                 std::io::stdout().flush().ok();
                             }
                             None => tool_done = true,
@@ -351,23 +456,30 @@ async fn stream_and_render_inner(
 
     println!();
 
-    // Ctrl+C cancellation: create a token and spawn a SIGINT watcher.
-    // When the user presses Ctrl+C during tool execution, the token is
-    // cancelled, which propagates to ExecTool (kills child process) and
-    // the tool runner loop (stops between iterations).
+    // Full-duplex input watcher: handles ESC+ESC (cancel), Ctrl+C (cancel),
+    // and backtick (priority message injection) during streaming/tool execution.
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    let ct = cancel_token.clone();
-    let signal_task = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        ct.cancel();
-    });
+    let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher_done = Arc::new(AtomicBool::new(false));
+
+    let watcher = spawn_input_watcher(
+        cancel_token.clone(),
+        inject_tx,
+        watcher_done.clone(),
+    );
 
     let response = agent_loop
-        .process_direct_streaming(input, session_id, channel, "direct", lang, delta_tx, tool_event_tx, Some(cancel_token.clone()))
+        .process_direct_streaming(
+            input, session_id, channel, "direct", lang,
+            delta_tx, tool_event_tx,
+            Some(cancel_token.clone()),
+            Some(inject_rx),
+        )
         .await;
 
-    // Stop listening for SIGINT now that the request is done.
-    signal_task.abort();
+    // Signal watcher thread to stop and wait for it.
+    watcher_done.store(true, Ordering::Relaxed);
+    watcher.join().ok();
 
     let cancelled = cancel_token.is_cancelled();
     let (tool_lines, tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
@@ -456,19 +568,23 @@ impl ServerState {
     /// Kill the current llama process (if we own one) and any orphaned servers.
     pub fn kill_current(&mut self) {
         if let Some(ref mut child) = self.llama_process {
+            let pid = child.id();
             child.kill().ok();
             child.wait().ok();
+            server::unrecord_server_pid(pid);
         }
         self.llama_process = None;
-        server::kill_stale_llama_servers();
+        server::kill_tracked_servers();
     }
 
     /// Full shutdown: kill llama + compaction + delegation servers.
     pub fn shutdown(&mut self) {
         if let Some(ref mut child) = self.llama_process {
             println!("Stopping llama.cpp server...");
+            let pid = child.id();
             child.kill().ok();
             child.wait().ok();
+            server::unrecord_server_pid(pid);
         }
         self.llama_process = None;
         server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
@@ -488,6 +604,7 @@ pub(crate) async fn try_start_server(
     let port = server::find_available_port(8080);
     match server::spawn_llama_server(port, model_path, ctx_size) {
         Ok(child) => {
+            server::record_server_pid("main", child.id());
             state.llama_process = Some(child);
             if server::wait_for_server_ready(port, 120, &mut state.llama_process).await {
                 let port_str = port.to_string();
@@ -732,6 +849,19 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 true,
             );
             heartbeat.start().await;
+
+            // Start health watchdog for local servers (if any are running).
+            if is_local {
+                let mut ports = Vec::new();
+                ports.push(("main".to_string(), ctx.srv.local_port.clone()));
+                if let Some(ref cp) = ctx.srv.compaction_port {
+                    ports.push(("compaction".to_string(), cp.clone()));
+                }
+                if let Some(ref dp) = ctx.srv.delegation_port {
+                    ports.push(("delegation".to_string(), dp.clone()));
+                }
+                let _watchdog = server::start_health_watchdog(ports, ctx.display_tx.clone());
+            }
 
             loop {
                 // Drain any pending display messages from background channels.
