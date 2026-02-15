@@ -286,7 +286,7 @@ impl SubagentManager {
                 );
                 // Strip markdown formatting for terminal display
                 let clean_result = result_text.replace("**", "").replace("__", "");
-                let truncated = truncate_for_display(&clean_result, 20, 2000);
+                let truncated = truncate_for_display(&clean_result, 60, 6000);
                 let mut block = header;
                 block.push('\n');
                 block.push_str("    \x1b[2m\u{250c}\u{2500} result \u{2500}\x1b[0m\n");

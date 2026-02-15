@@ -303,7 +303,7 @@ pub const PROVIDER_PREFIXES: &[(&str, fn(&ProvidersConfig) -> &ProviderConfig, &
     ("anthropic/", |p| &p.anthropic, "https://api.anthropic.com/v1"),
     ("deepseek/", |p| &p.deepseek, "https://api.deepseek.com"),
     ("huggingface/", |p| &p.huggingface, "https://router.huggingface.co/v1"),
-    ("zhipu/", |p| &p.zhipu, "https://open.bigmodel.cn/api/paas/v4"),
+    ("zhipu/", |p| &p.zhipu, "https://api.z.ai/api/paas/v4"),
     ("openrouter/", |p| &p.openrouter, "https://openrouter.ai/api/v1"),
 ];
 
@@ -842,7 +842,13 @@ impl Config {
             return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
         }
         if !self.providers.zhipu.api_key.is_empty() {
-            return self.providers.zhipu.api_base.clone();
+            return Some(
+                self.providers
+                    .zhipu
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+            );
         }
         if !self.providers.groq.api_key.is_empty() {
             return Some("https://api.groq.com/openai/v1".to_string());
