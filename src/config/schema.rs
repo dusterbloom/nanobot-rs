@@ -285,6 +285,8 @@ pub struct ProvidersConfig {
     #[serde(default)]
     pub zhipu: ProviderConfig,
     #[serde(default)]
+    pub zhipu_coding: ProviderConfig,
+    #[serde(default)]
     pub vllm: ProviderConfig,
     #[serde(default)]
     pub gemini: ProviderConfig,
@@ -303,6 +305,7 @@ pub const PROVIDER_PREFIXES: &[(&str, fn(&ProvidersConfig) -> &ProviderConfig, &
     ("anthropic/", |p| &p.anthropic, "https://api.anthropic.com/v1"),
     ("deepseek/", |p| &p.deepseek, "https://api.deepseek.com"),
     ("huggingface/", |p| &p.huggingface, "https://router.huggingface.co/v1"),
+    ("zhipu-coding/", |p| &p.zhipu_coding, "https://api.z.ai/api/coding/paas/v4"),
     ("zhipu/", |p| &p.zhipu, "https://api.z.ai/api/paas/v4"),
     ("openrouter/", |p| &p.openrouter, "https://openrouter.ai/api/v1"),
 ];
@@ -797,6 +800,7 @@ impl Config {
             &self.providers.openai.api_key,
             &self.providers.gemini.api_key,
             &self.providers.zhipu.api_key,
+            &self.providers.zhipu_coding.api_key,
             &self.providers.groq.api_key,
             &self.providers.vllm.api_key,
         ];
@@ -848,6 +852,15 @@ impl Config {
                     .api_base
                     .clone()
                     .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+            );
+        }
+        if !self.providers.zhipu_coding.api_key.is_empty() {
+            return Some(
+                self.providers
+                    .zhipu_coding
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
             );
         }
         if !self.providers.groq.api_key.is_empty() {

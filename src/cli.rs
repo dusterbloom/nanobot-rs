@@ -1292,6 +1292,19 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         }
     }
 
+    // Try provider prefix resolution (e.g. "zhipu-coding/glm-5", "groq/llama-3.3-70b")
+    if let Some((api_key, api_base, stripped_model)) = config.resolve_provider_for_model(model) {
+        info!(
+            "create_provider: prefix resolved model={} → base={}, stripped={}",
+            model, api_base, stripped_model
+        );
+        return Arc::new(OpenAICompatProvider::new(
+            &api_key,
+            Some(api_base.as_str()),
+            Some(stripped_model.as_str()),
+        ));
+    }
+
     let api_key = config.get_api_key().unwrap_or_default();
 
     // No API key configured at all → try OAuth as last resort.
