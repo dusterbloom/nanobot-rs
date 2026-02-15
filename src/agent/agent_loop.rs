@@ -30,7 +30,7 @@ use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+    CancelCallback, ListCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -405,9 +405,42 @@ impl AgentLoopShared {
             let mgr = subagents_ref.clone();
             Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid).await })
         });
+        let subagents_ref2 = self.subagents.clone();
+        let list_cb: ListCallback = Arc::new(move || {
+            let mgr = subagents_ref2.clone();
+            Box::pin(async move {
+                let running = mgr.list_running().await;
+                if running.is_empty() {
+                    "No subagents currently running.".to_string()
+                } else {
+                    let mut out = format!("{} subagent(s) running:\n", running.len());
+                    for info in &running {
+                        let elapsed = info.started_at.elapsed().as_secs();
+                        out.push_str(&format!(
+                            "  • {} (id: {}) — running for {}s\n",
+                            info.label, info.task_id, elapsed
+                        ));
+                    }
+                    out
+                }
+            })
+        });
+        let subagents_ref3 = self.subagents.clone();
+        let cancel_cb: CancelCallback = Arc::new(move |task_id: String| {
+            let mgr = subagents_ref3.clone();
+            Box::pin(async move {
+                if mgr.cancel(&task_id).await {
+                    format!("Subagent '{}' cancelled.", task_id)
+                } else {
+                    format!("No running subagent found matching '{}'.", task_id)
+                }
+            })
+        });
         let spawn_tool = Arc::new(SpawnTool::new());
-        // Set callback and context before registering so they're ready for use.
+        // Set callbacks and context before registering so they're ready for use.
         spawn_tool.set_callback(spawn_cb).await;
+        spawn_tool.set_list_callback(list_cb).await;
+        spawn_tool.set_cancel_callback(cancel_cb).await;
         spawn_tool.set_context(channel, chat_id).await;
         tools.register(Box::new(SpawnToolProxy(spawn_tool)));
 
