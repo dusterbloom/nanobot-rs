@@ -220,7 +220,7 @@ async fn analyze_via_scratch_pad(
                 // Loop detection across rounds.
                 let call_key = normalize_call_key(&tc.name, &tc.arguments);
                 if seen_calls.contains(&call_key) {
-                    warn!("Scratch pad: duplicate call {} — skipping", tc.name);
+                    debug!("Scratch pad: duplicate call {} — skipping", call_key);
                     continue;
                 }
                 seen_calls.insert(call_key);
