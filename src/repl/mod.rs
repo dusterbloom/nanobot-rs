@@ -624,9 +624,13 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
     if !is_local {
         let api_key = config.get_api_key();
         let model = &config.agents.defaults.model;
-        if api_key.is_none() && !model.starts_with("bedrock/") && !model.starts_with("claude-code") {
+        let has_oauth = dirs::home_dir()
+            .map(|h| h.join(".claude").join(".credentials.json").exists())
+            .unwrap_or(false);
+        if api_key.is_none() && !model.starts_with("bedrock/") && !model.starts_with("claude-max") && !has_oauth {
             eprintln!("Error: No API key configured.");
             eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
+            eprintln!("Or authenticate with Claude CLI: claude login");
             eprintln!("Or use --local flag to use a local LLM server.");
             std::process::exit(1);
         }

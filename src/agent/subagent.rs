@@ -20,7 +20,9 @@ use crate::agent::tools::{
     WriteFileTool,
 };
 use crate::bus::events::InboundMessage;
+use crate::config::schema::ProvidersConfig;
 use crate::providers::base::LLMProvider;
+use crate::providers::openai_compat::OpenAICompatProvider;
 
 /// Maximum iterations for a subagent run (default when no profile overrides).
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
@@ -83,6 +85,10 @@ pub struct SubagentManager {
     is_local: bool,
     /// Loaded agent profiles (name → profile).
     profiles: HashMap<String, AgentProfile>,
+    /// Provider configs for multi-provider subagent routing. When a model
+    /// has a provider prefix (e.g. `groq/llama-3.3-70b`), the subagent
+    /// creates a dedicated provider instead of using the parent's.
+    providers_config: Option<ProvidersConfig>,
     /// Direct display channel for CLI/REPL mode. In gateway mode the bus
     /// delivers results to channels, but in CLI mode nobody reads the bus
     /// so we send directly to the terminal.
@@ -122,6 +128,7 @@ impl SubagentManager {
             restrict_to_workspace,
             is_local,
             profiles,
+            providers_config: None,
             display_tx: None,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -130,6 +137,12 @@ impl SubagentManager {
     /// Set the display channel for direct CLI/REPL result delivery.
     pub fn with_display_tx(mut self, tx: UnboundedSender<String>) -> Self {
         self.display_tx = Some(tx);
+        self
+    }
+
+    /// Set the providers config for multi-provider subagent routing.
+    pub fn with_providers_config(mut self, config: ProvidersConfig) -> Self {
+        self.providers_config = Some(config);
         self
     }
 
@@ -184,7 +197,7 @@ impl SubagentManager {
             self.model.clone()
         };
 
-        let config = SubagentConfig {
+        let mut config = SubagentConfig {
             model: effective_model,
             system_prompt: profile.as_ref().map(|p| p.system_prompt.clone()),
             tools_filter: profile.as_ref().and_then(|p| p.tools.clone()),
@@ -197,21 +210,35 @@ impl SubagentManager {
 
         let effective_model_for_display = config.model.clone();
 
-        info!(
-            "Spawning subagent {} (agent={:?}, model={}) for: {}",
-            task_id,
-            agent_name.as_deref().unwrap_or("default"),
-            effective_model_for_display,
-            display_label
-        );
-
-        let provider = self.provider.clone();
+        // Resolve provider for model prefix (groq/, gemini/, openai/, etc.)
+        let (provider, resolved_model) = self.resolve_provider_for_model(&config.model);
+        let routed_to_cloud = resolved_model != config.model;
+        if routed_to_cloud {
+            info!(
+                "Spawning subagent {} (agent={:?}, model={} → provider-routed as {}) for: {}",
+                task_id,
+                agent_name.as_deref().unwrap_or("default"),
+                effective_model_for_display,
+                resolved_model,
+                display_label
+            );
+            config.model = resolved_model;
+        } else {
+            info!(
+                "Spawning subagent {} (agent={:?}, model={}) for: {}",
+                task_id,
+                agent_name.as_deref().unwrap_or("default"),
+                effective_model_for_display,
+                display_label
+            );
+        }
         let workspace = self.workspace.clone();
         let bus_tx = self.bus_tx.clone();
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
-        let is_local = self.is_local;
+        // Cloud-routed subagents (groq/, gemini/, openai/, etc.) are never local.
+        let is_local = if routed_to_cloud { false } else { self.is_local };
         let display_tx = self.display_tx.clone();
         let running_tasks = self.running_tasks.clone();
         let tid = task_id.clone();
@@ -325,6 +352,30 @@ impl SubagentManager {
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
+
+    /// Resolve a model string to (provider, stripped_model).
+    ///
+    /// If the model has a provider prefix (e.g. `groq/llama-3.3-70b`), creates
+    /// a dedicated `OpenAICompatProvider` for that backend. Otherwise returns
+    /// the parent provider and the model unchanged.
+    fn resolve_provider_for_model(&self, model: &str) -> (Arc<dyn LLMProvider>, String) {
+        if let Some(ref pc) = self.providers_config {
+            if let Some((api_key, base, rest)) = pc.resolve_model_prefix(model) {
+                let prefix = model.split('/').next().unwrap_or("unknown");
+                info!(
+                    "Subagent using {} provider (base={}) for model {}",
+                    prefix, base, rest
+                );
+                let provider: Arc<dyn LLMProvider> = Arc::new(
+                    OpenAICompatProvider::new(&api_key, Some(&base), Some(&rest)),
+                );
+                return (provider, rest);
+            }
+        }
+
+        // No prefix match → use parent provider with model as-is.
+        (self.provider.clone(), model.to_string())
+    }
 
     /// Run the subagent agent loop.
     async fn _run_subagent(

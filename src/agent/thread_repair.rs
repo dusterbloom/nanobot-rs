@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Repair protocol violations in a message array.
 ///
@@ -102,7 +102,7 @@ fn dedup_tool_results(messages: &mut Vec<Value>) {
         }
     }
     for &i in remove_indices.iter().rev() {
-        warn!(
+        debug!(
             "Removing duplicate tool result at index {} (id: {})",
             i,
             messages[i]

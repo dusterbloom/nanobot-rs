@@ -288,6 +288,46 @@ pub struct ProvidersConfig {
     pub vllm: ProviderConfig,
     #[serde(default)]
     pub gemini: ProviderConfig,
+    #[serde(default)]
+    pub huggingface: ProviderConfig,
+}
+
+/// Known provider prefixes and their default base URLs.
+///
+/// Single source of truth used by both `Config::resolve_provider_for_model`
+/// and `SubagentManager::resolve_provider_for_model`.
+pub const PROVIDER_PREFIXES: &[(&str, fn(&ProvidersConfig) -> &ProviderConfig, &str)] = &[
+    ("groq/", |p| &p.groq, "https://api.groq.com/openai/v1"),
+    ("gemini/", |p| &p.gemini, "https://generativelanguage.googleapis.com/v1beta/openai"),
+    ("openai/", |p| &p.openai, "https://api.openai.com/v1"),
+    ("anthropic/", |p| &p.anthropic, "https://api.anthropic.com/v1"),
+    ("deepseek/", |p| &p.deepseek, "https://api.deepseek.com"),
+    ("huggingface/", |p| &p.huggingface, "https://router.huggingface.co/v1"),
+    ("zhipu/", |p| &p.zhipu, "https://open.bigmodel.cn/api/paas/v4"),
+    ("openrouter/", |p| &p.openrouter, "https://openrouter.ai/api/v1"),
+];
+
+impl ProvidersConfig {
+    /// Resolve a model string with a provider prefix (e.g. `groq/llama-3.3-70b`)
+    /// to `(api_key, api_base, stripped_model)`.
+    ///
+    /// Returns `None` if the prefix isn't recognized or the provider has no API key.
+    pub fn resolve_model_prefix(&self, model: &str) -> Option<(String, String, String)> {
+        for (prefix, accessor, default_base) in PROVIDER_PREFIXES {
+            if let Some(rest) = model.strip_prefix(prefix) {
+                let cfg = accessor(self);
+                if !cfg.api_key.is_empty() {
+                    let base = cfg.api_base.as_deref().unwrap_or(default_base);
+                    return Some((
+                        cfg.api_key.clone(),
+                        base.to_string(),
+                        rest.to_string(),
+                    ));
+                }
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +806,13 @@ impl Config {
             }
         }
         None
+    }
+
+    /// Resolve a model string with a provider prefix to (api_key, api_base, stripped_model).
+    ///
+    /// Delegates to `ProvidersConfig::resolve_model_prefix`.
+    pub fn resolve_provider_for_model(&self, model: &str) -> Option<(String, String, String)> {
+        self.providers.resolve_model_prefix(model)
     }
 
     /// Get the API base URL for the active provider.

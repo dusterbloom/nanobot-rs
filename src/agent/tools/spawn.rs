@@ -100,7 +100,7 @@ impl Tool for SpawnTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model override. Use 'haiku' for fast/cheap, 'sonnet' for balanced, 'opus' for complex reasoning, 'local' for local model. Omit to use profile default or parent model."
+                    "description": "Model override. Use 'haiku' for fast/cheap, 'sonnet' for balanced, 'opus' for complex reasoning, 'local' for local model. Use provider prefix for external models: 'groq/llama-3.3-70b-versatile', 'gemini/gemini-2.0-flash', 'openai/gpt-4o'. Omit to use profile default or parent model."
                 }
             },
             "required": ["task"]

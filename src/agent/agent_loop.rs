@@ -250,7 +250,7 @@ pub fn build_swappable_core(
         // "claude-code/opus" that the delegation server doesn't understand.
         let tr_model = if !tool_delegation.model.is_empty() {
             tool_delegation.model.clone()
-        } else if model.starts_with("claude-code") {
+        } else if model.starts_with("claude-max") {
             tr_provider.get_default_model().to_string()
         } else {
             model.clone()
@@ -1395,6 +1395,7 @@ impl AgentLoop {
         max_concurrent_chats: usize,
         email_config: Option<EmailConfig>,
         repl_display_tx: Option<UnboundedSender<String>>,
+        providers_config: Option<crate::config::schema::ProvidersConfig>,
     ) -> Self {
         // Read core to initialize the subagent manager.
         let core = core_handle.swappable();
@@ -1408,6 +1409,9 @@ impl AgentLoop {
             core.restrict_to_workspace,
             core.is_local,
         );
+        if let Some(pc) = providers_config {
+            subagent_mgr = subagent_mgr.with_providers_config(pc);
+        }
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
         }

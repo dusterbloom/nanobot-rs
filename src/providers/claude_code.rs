@@ -9,12 +9,27 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
+
+/// Global counter for tool call IDs — ensures uniqueness across the entire
+/// session. Without this, `parse_tool_calls` would reset to `cc_0` every
+/// response, causing `dedup_tool_results` to delete real results from
+/// subsequent turns. The prefix includes the PID so restored sessions
+/// from a previous process can't collide with new tool calls.
+static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TOOL_CALL_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn next_tool_call_id() -> String {
+    let pid = *TOOL_CALL_PID.get_or_init(std::process::id);
+    let seq = TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("cc_{pid}_{seq}")
+}
 
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
 
@@ -125,11 +140,12 @@ fn serialize_messages(messages: &[Value]) -> (String, String) {
 fn format_tool_instructions(tools: &[Value]) -> String {
     let mut out = String::from(
         "\n\n## Tool Calling\n\n\
-         You have access to the following tools. To call a tool, output a JSON \
-         object wrapped in <tool_call></tool_call> tags:\n\n\
+         Call tools by wrapping a single-line JSON object in <tool_call></tool_call> tags:\n\n\
          <tool_call>{\"name\": \"tool_name\", \"arguments\": {\"arg\": \"value\"}}</tool_call>\n\n\
-         You may include text before, between, or after tool calls. \
-         Include multiple <tool_call> blocks for parallel calls.\n\n\
+         Rules:\n\
+         - Each <tool_call> MUST contain valid JSON. Escape newlines as \\n in string values.\n\
+         - Output multiple <tool_call> blocks for parallel calls.\n\
+         - When calling tools, keep surrounding text minimal.\n\n\
          ### Available Tools\n\n",
     );
 
@@ -153,9 +169,72 @@ fn format_tool_instructions(tools: &[Value]) -> String {
 // Response parsing
 // ---------------------------------------------------------------------------
 
+/// Try to parse a JSON string, with a fallback that escapes raw newlines
+/// inside JSON string values. Models sometimes emit literal newlines in
+/// `<tool_call>` arguments (e.g. heredoc scripts) which breaks strict JSON.
+fn try_parse_json(json_str: &str) -> Option<Value> {
+    // Fast path: already valid JSON.
+    if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+        return Some(v);
+    }
+    // Fallback: walk char-by-char, escaping raw control characters inside
+    // JSON string values while leaving structure whitespace untouched.
+    let mut out = String::with_capacity(json_str.len() + 64);
+    let mut in_str = false;
+    let mut escape_next = false;
+    for ch in json_str.chars() {
+        if escape_next {
+            out.push(ch);
+            escape_next = false;
+            continue;
+        }
+        if in_str {
+            match ch {
+                '\\' => {
+                    out.push(ch);
+                    escape_next = true;
+                }
+                '"' => {
+                    out.push(ch);
+                    in_str = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        } else {
+            if ch == '"' {
+                in_str = true;
+            }
+            out.push(ch);
+        }
+    }
+    serde_json::from_str::<Value>(&out).ok()
+}
+
+/// Strip known Claude CLI boilerplate from response text.
+///
+/// The CLI appends messages like "I ran out of tool iterations" when
+/// `--max-turns 1` terminates a turn with pending tool calls. These are
+/// CLI artifacts, not model output — stripping them makes behavior match
+/// the native API.
+fn strip_cli_artifacts(text: &str) -> String {
+    let mut cleaned = text.to_string();
+    for artifact in CLI_ARTIFACT_PATTERNS {
+        cleaned = cleaned.replace(artifact, "");
+    }
+    // Collapse triple-newlines left by stripping.
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+    cleaned.trim().to_string()
+}
+
 /// Parse `<tool_call>` blocks from Claude's text response.
 ///
-/// Returns (clean_text, tool_calls) where clean_text has the blocks removed.
+/// Returns (clean_text, tool_calls) where clean_text has the blocks removed
+/// and CLI artifacts stripped.
 fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallRequest>) {
     let mut clean = String::new();
     let mut calls = Vec::new();
@@ -168,7 +247,7 @@ fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallRequest>) {
 
         if let Some(end_idx) = after_tag.find("</tool_call>") {
             let json_str = after_tag[..end_idx].trim();
-            if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
+            if let Some(parsed) = try_parse_json(json_str) {
                 let name = parsed["name"]
                     .as_str()
                     .unwrap_or("unknown")
@@ -179,7 +258,7 @@ fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallRequest>) {
                     .unwrap_or_default();
 
                 calls.push(ToolCallRequest {
-                    id: format!("cc_{}", calls.len()),
+                    id: next_tool_call_id(),
                     name,
                     arguments,
                 });
@@ -198,8 +277,130 @@ fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallRequest>) {
     }
     clean.push_str(remaining);
 
-    (clean.trim().to_string(), calls)
+    (strip_cli_artifacts(&clean), calls)
 }
+
+// ---------------------------------------------------------------------------
+// Stream filtering
+// ---------------------------------------------------------------------------
+
+/// Known CLI artifact strings to suppress from streaming output.
+/// These are injected by `claude -p --max-turns 1` when the CLI exits with
+/// pending work — they are not model output.
+const CLI_ARTIFACT_PATTERNS: &[&str] = &[
+    "I ran out of tool iterations before producing a final answer.",
+    "The actions above may be incomplete.",
+    "I need more turns to complete this task.",
+];
+
+/// Filters `<tool_call>...</tool_call>` blocks AND known CLI artifact strings
+/// from streaming text so the user only sees clean prose — matching the
+/// behavior of native API streaming where tool calls arrive as structured
+/// data, not inline text.
+struct ToolCallFilter {
+    buffer: String,
+    /// true while inside a `<tool_call>...</tool_call>` block (suppress all).
+    in_tool_block: bool,
+}
+
+impl ToolCallFilter {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            in_tool_block: false,
+        }
+    }
+
+    /// Feed a text delta and return the portion safe to emit.
+    fn feed(&mut self, text: &str) -> String {
+        self.buffer.push_str(text);
+        let mut emit = String::new();
+
+        loop {
+            // ── Inside a <tool_call> block: suppress until closing tag ──
+            if self.in_tool_block {
+                if let Some(end) = self.buffer.find("</tool_call>") {
+                    self.buffer = self.buffer[end + "</tool_call>".len()..].to_string();
+                    self.in_tool_block = false;
+                    continue;
+                }
+                break; // Still inside — suppress everything.
+            }
+
+            // ── Check for <tool_call> start ─────────────────────────────
+            if let Some(start) = self.buffer.find("<tool_call>") {
+                emit.push_str(&self.buffer[..start]);
+                self.buffer = self.buffer[start..].to_string();
+                self.in_tool_block = true;
+                continue;
+            }
+
+            // ── Check for complete CLI artifact strings ─────────────────
+            let mut found_artifact = false;
+            for artifact in CLI_ARTIFACT_PATTERNS {
+                if let Some(pos) = self.buffer.find(artifact) {
+                    emit.push_str(&self.buffer[..pos]);
+                    self.buffer = self.buffer[pos + artifact.len()..].to_string();
+                    found_artifact = true;
+                    break;
+                }
+            }
+            if found_artifact {
+                continue;
+            }
+
+            // ── Hold back partial prefix matches at the end ─────────────
+            // This catches both partial `<tool_call` tags and partial CLI
+            // artifact prefixes (e.g. "I ran out of tool iter" at buffer end).
+            let holdback = Self::max_partial_prefix(&self.buffer);
+            if holdback > 0 {
+                let safe = self.buffer.len() - holdback;
+                emit.push_str(&self.buffer[..safe]);
+                self.buffer = self.buffer[safe..].to_string();
+            } else {
+                emit.push_str(&self.buffer);
+                self.buffer.clear();
+            }
+            break;
+        }
+
+        emit
+    }
+
+    /// How many trailing bytes of `s` match a prefix of any suppressed pattern?
+    ///
+    /// This ensures we hold back text like "I ran out of tool" at the end of a
+    /// streaming delta until we can confirm it's part of an artifact (suppress)
+    /// or not (emit).
+    fn max_partial_prefix(s: &str) -> usize {
+        let mut max = 0;
+
+        // Check <tool_call> tag prefix.
+        let tag = "<tool_call>";
+        for len in (1..=tag.len().min(s.len())).rev() {
+            if s.ends_with(&tag[..len]) {
+                max = max.max(len);
+                break;
+            }
+        }
+
+        // Check CLI artifact prefixes.
+        for artifact in CLI_ARTIFACT_PATTERNS {
+            for len in (1..=artifact.len().min(s.len())).rev() {
+                if s.ends_with(&artifact[..len]) {
+                    max = max.max(len);
+                    break;
+                }
+            }
+        }
+
+        max
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON response parsing
+// ---------------------------------------------------------------------------
 
 /// Parse the JSON envelope returned by `claude -p --output-format json`.
 fn parse_json_response(stdout: &str) -> Result<(String, bool)> {
@@ -392,6 +593,7 @@ impl LLMProvider for ClaudeCodeProvider {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut full_text = String::new();
+            let mut filter = ToolCallFilter::new();
 
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.is_empty() {
@@ -410,7 +612,12 @@ impl LLMProvider for ClaudeCodeProvider {
                         if delta_type == "text_delta" {
                             if let Some(text) = json["event"]["delta"]["text"].as_str() {
                                 full_text.push_str(text);
-                                let _ = tx.send(StreamChunk::TextDelta(text.to_string()));
+                                // Filter out <tool_call> blocks so the user
+                                // only sees clean prose during streaming.
+                                let clean = filter.feed(text);
+                                if !clean.is_empty() {
+                                    let _ = tx.send(StreamChunk::TextDelta(clean));
+                                }
                             }
                         }
                     }
@@ -423,8 +630,11 @@ impl LLMProvider for ClaudeCodeProvider {
                                 if let Some(t) = block["text"].as_str() {
                                     if full_text.is_empty() {
                                         full_text.push_str(t);
-                                        let _ =
-                                            tx.send(StreamChunk::TextDelta(t.to_string()));
+                                        let clean = filter.feed(t);
+                                        if !clean.is_empty() {
+                                            let _ =
+                                                tx.send(StreamChunk::TextDelta(clean));
+                                        }
                                     }
                                 }
                             }
@@ -622,7 +832,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "ls");
-        assert_eq!(calls[0].id, "cc_0");
+        assert!(calls[0].id.starts_with("cc_"), "ID should have cc_ prefix");
     }
 
     #[test]
@@ -635,7 +845,7 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[1].name, "read_file");
-        assert_eq!(calls[1].id, "cc_1");
+        assert_ne!(calls[0].id, calls[1].id, "IDs must be unique");
     }
 
     #[test]
@@ -650,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_parse_malformed_json_preserved() {
-        let input = "text <tool_call>not json</tool_call> more";
+        let input = "text <tool_call>not json at all</tool_call> more";
         let (text, calls) = parse_tool_calls(input);
         // Malformed block should be preserved in the text.
         assert!(text.contains("not json") || text.contains("<tool_call>"));
@@ -664,6 +874,24 @@ mod tests {
         // Unclosed tag — entire remainder kept.
         assert!(text.contains("<tool_call>"));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_ids_unique_across_responses() {
+        // This is the exact bug: two parse_tool_calls invocations must
+        // produce globally unique IDs, not restart from cc_0.
+        let input1 = "<tool_call>{\"name\":\"exec\",\"arguments\":{\"command\":\"ls\"}}</tool_call>";
+        let input2 = "<tool_call>{\"name\":\"exec\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>";
+
+        let (_, calls1) = parse_tool_calls(input1);
+        let (_, calls2) = parse_tool_calls(input2);
+
+        assert_eq!(calls1.len(), 1);
+        assert_eq!(calls2.len(), 1);
+        assert_ne!(
+            calls1[0].id, calls2[0].id,
+            "Tool call IDs must be unique across separate parse_tool_calls invocations"
+        );
     }
 
     // ── JSON response parsing ──────────────────────────────────────
@@ -708,6 +936,183 @@ mod tests {
     fn test_strip_prefix_not_present() {
         assert_eq!(strip_routing_prefix("opus"), "opus");
         assert_eq!(strip_routing_prefix("claude-opus-4-6"), "claude-opus-4-6");
+    }
+
+    // ── Robust JSON parsing ──────────────────────────────────────
+
+    #[test]
+    fn test_try_parse_json_valid() {
+        let v = try_parse_json(r#"{"name":"exec","arguments":{"cmd":"ls"}}"#);
+        assert!(v.is_some());
+        assert_eq!(v.unwrap()["name"], "exec");
+    }
+
+    #[test]
+    fn test_try_parse_json_raw_newlines_in_string() {
+        // Model emits literal newlines inside a JSON string value.
+        let input = "{\"name\":\"exec\",\"arguments\":{\"command\":\"echo hello\necho world\"}}";
+        assert!(
+            serde_json::from_str::<Value>(input).is_err(),
+            "Raw newlines should fail strict JSON"
+        );
+        let v = try_parse_json(input);
+        assert!(v.is_some(), "Fallback parser should handle raw newlines");
+        let parsed = v.unwrap();
+        let cmd = parsed["arguments"]["command"].as_str().unwrap();
+        assert!(cmd.contains("\\n") || cmd.contains('\n'));
+    }
+
+    #[test]
+    fn test_try_parse_json_escaped_quotes_preserved() {
+        // Already-escaped sequences must not be double-escaped.
+        let input = r#"{"name":"exec","arguments":{"cmd":"echo \"hi\""}}"#;
+        let v = try_parse_json(input);
+        assert!(v.is_some());
+        assert!(v.unwrap()["arguments"]["cmd"].as_str().unwrap().contains("\"hi\""));
+    }
+
+    #[test]
+    fn test_try_parse_json_heredoc_with_fstring() {
+        // Reproduces the exact failure from the debug session: Python f-string
+        // with embedded braces and escaped quotes, plus literal newlines.
+        let input = "{\"name\":\"exec\",\"arguments\":{\"command\":\"python3 << 'EOF'\nimport json\nwith open('test.json') as f:\n    c = json.load(f)\nprint(f'  {\\\"YES\\\" if c.get(\\\"key\\\") else \\\"NO\\\"}')\\nEOF\"}}";
+        let v = try_parse_json(input);
+        assert!(v.is_some(), "Should parse heredoc with f-string: {:?}", v);
+        assert_eq!(v.unwrap()["name"], "exec");
+    }
+
+    #[test]
+    fn test_try_parse_json_totally_invalid() {
+        assert!(try_parse_json("not json").is_none());
+        assert!(try_parse_json("").is_none());
+    }
+
+    // ── CLI artifact stripping ────────────────────────────────────
+
+    #[test]
+    fn test_strip_cli_artifacts_clean() {
+        assert_eq!(strip_cli_artifacts("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_strip_cli_artifacts_iteration_message() {
+        let input = "Here's what I found.\n\nI ran out of tool iterations before producing a final answer. The actions above may be incomplete.";
+        assert_eq!(strip_cli_artifacts(input), "Here's what I found.");
+    }
+
+    #[test]
+    fn test_strip_cli_artifacts_only_boilerplate() {
+        let input = "I ran out of tool iterations before producing a final answer.";
+        assert_eq!(strip_cli_artifacts(input), "");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_strips_artifacts() {
+        let input = "Let me check.\n<tool_call>{\"name\":\"exec\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call>\nI ran out of tool iterations before producing a final answer.";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(text, "Let me check.");
+        assert!(!text.contains("ran out"));
+    }
+
+    #[test]
+    fn test_parse_tool_call_with_raw_newlines() {
+        // Tool call where the model put literal newlines in the command string.
+        let input = "<tool_call>{\"name\":\"exec\",\"arguments\":{\"command\":\"echo hello\necho world\"}}</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "Should parse despite raw newlines");
+        assert_eq!(calls[0].name, "exec");
+        assert!(text.is_empty());
+    }
+
+    // ── Stream filter ─────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_no_tool_calls() {
+        let mut f = ToolCallFilter::new();
+        assert_eq!(f.feed("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_filter_strips_tool_call_block() {
+        let mut f = ToolCallFilter::new();
+        let result = f.feed("Before <tool_call>{\"name\":\"exec\"}</tool_call> After");
+        assert_eq!(result, "Before  After");
+    }
+
+    #[test]
+    fn test_filter_multiple_blocks() {
+        let mut f = ToolCallFilter::new();
+        let result = f.feed(
+            "A <tool_call>{\"name\":\"a\"}</tool_call> B <tool_call>{\"name\":\"b\"}</tool_call> C",
+        );
+        assert_eq!(result, "A  B  C");
+    }
+
+    #[test]
+    fn test_filter_split_across_deltas() {
+        let mut f = ToolCallFilter::new();
+        let r1 = f.feed("Hello <tool_");
+        let r2 = f.feed("call>{\"name\":\"x\"}</tool_call> done");
+        assert_eq!(format!("{}{}", r1, r2), "Hello  done");
+    }
+
+    #[test]
+    fn test_filter_partial_tag_not_real() {
+        let mut f = ToolCallFilter::new();
+        let r1 = f.feed("Use <to");
+        let r2 = f.feed("ols wisely");
+        assert_eq!(format!("{}{}", r1, r2), "Use <tools wisely");
+    }
+
+    #[test]
+    fn test_filter_only_tool_calls() {
+        let mut f = ToolCallFilter::new();
+        let result =
+            f.feed("<tool_call>{\"name\":\"exec\",\"arguments\":{}}</tool_call>");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_filter_suppresses_cli_artifact_complete() {
+        let mut f = ToolCallFilter::new();
+        let result = f.feed(
+            "Here's the result.\n\nI ran out of tool iterations before producing a final answer.",
+        );
+        assert_eq!(result, "Here's the result.\n\n");
+    }
+
+    #[test]
+    fn test_filter_suppresses_artifact_split_across_deltas() {
+        let mut f = ToolCallFilter::new();
+        // Artifact arrives in two pieces.
+        let r1 = f.feed("Done.\n\nI ran out of tool iter");
+        let r2 = f.feed("ations before producing a final answer.");
+        let combined = format!("{}{}", r1, r2);
+        assert!(
+            !combined.contains("ran out"),
+            "Artifact should be suppressed even when split: {:?}",
+            combined
+        );
+    }
+
+    #[test]
+    fn test_filter_emits_non_artifact_starting_with_I() {
+        let mut f = ToolCallFilter::new();
+        // "I'll check" starts with "I" which is a prefix of "I ran out..."
+        // but should be emitted once the non-match is confirmed.
+        let r1 = f.feed("I");
+        let r2 = f.feed("'ll check that.");
+        assert_eq!(format!("{}{}", r1, r2), "I'll check that.");
+    }
+
+    #[test]
+    fn test_filter_artifact_plus_tool_call() {
+        let mut f = ToolCallFilter::new();
+        let result = f.feed(
+            "Result\n<tool_call>{\"name\":\"x\"}</tool_call>\nI ran out of tool iterations before producing a final answer.",
+        );
+        assert_eq!(result, "Result\n\n");
     }
 
     // ── Provider creation ──────────────────────────────────────────
