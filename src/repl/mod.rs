@@ -200,6 +200,8 @@ pub(crate) fn print_help() {
 /// Spawn a key watcher thread that runs during agent streaming/tool execution.
 ///
 /// Handles:
+/// - **Enter**: cancel via `cancel_token` + set `enter_interrupted` flag.
+///   In voice mode this signals "start recording"; in text mode it's a fast cancel.
 /// - **ESC+ESC** (within 500ms): instant cancel via `cancel_token`
 /// - **Ctrl+C**: backup cancel via `cancel_token`
 /// - **Backtick (`)**: temporarily exits raw mode, reads an injection line
@@ -212,6 +214,7 @@ pub(crate) fn spawn_input_watcher(
     cancel_token: tokio_util::sync::CancellationToken,
     inject_tx: tokio::sync::mpsc::UnboundedSender<String>,
     done: Arc<AtomicBool>,
+    enter_interrupted: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     use termimad::crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use termimad::crossterm::terminal;
@@ -223,6 +226,13 @@ pub(crate) fn spawn_input_watcher(
         while !done.load(Ordering::Relaxed) {
             if event::poll(Duration::from_millis(100)).unwrap_or(false) {
                 if let Ok(Event::Key(key)) = event::read() {
+                    // Enter → cancel + signal "user wants to input/record"
+                    if key.code == KeyCode::Enter {
+                        enter_interrupted.store(true, Ordering::Relaxed);
+                        cancel_token.cancel();
+                        break;
+                    }
+
                     // Ctrl+C → cancel
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -293,11 +303,14 @@ pub(crate) async fn stream_and_render(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
 ) -> String {
-    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, false, None).await
+    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, false, None).await.0
 }
 
 /// Like `stream_and_render` but skips the user text erase-and-reprint.
 /// Use when the caller has already rendered the user turn (e.g. voice recording).
+///
+/// Returns `(response_text, enter_interrupted)`. When `enter_interrupted` is true,
+/// the user pressed Enter to cancel — the voice loop should skip TTS and start recording.
 #[cfg(feature = "voice")]
 pub(crate) async fn stream_and_render_voice(
     agent_loop: &mut crate::agent::agent_loop::AgentLoop,
@@ -307,7 +320,7 @@ pub(crate) async fn stream_and_render_voice(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
     tts_sentence_tx: Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>,
-) -> String {
+) -> (String, bool) {
     stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, true, tts_sentence_tx).await
 }
 
@@ -320,7 +333,7 @@ async fn stream_and_render_inner(
     core_handle: &SharedCoreHandle,
     user_already_rendered: bool,
     tts_tx: TtsSentenceSender,
-) -> String {
+) -> (String, bool) {
     // Erase raw readline output and reprint user text in grey box (skip if caller already rendered).
     if !user_already_rendered && std::io::stdout().is_terminal() {
         use std::io::Write as _;
@@ -594,16 +607,18 @@ async fn stream_and_render_inner(
 
     println!();
 
-    // Full-duplex input watcher: handles ESC+ESC (cancel), Ctrl+C (cancel),
-    // and backtick (priority message injection) during streaming/tool execution.
+    // Full-duplex input watcher: handles Enter (cancel + record), ESC+ESC (cancel),
+    // Ctrl+C (cancel), and backtick (priority injection) during streaming/tool execution.
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel();
     let watcher_done = Arc::new(AtomicBool::new(false));
+    let enter_interrupted = Arc::new(AtomicBool::new(false));
 
     let watcher = spawn_input_watcher(
         cancel_token.clone(),
         inject_tx,
         watcher_done.clone(),
+        enter_interrupted.clone(),
     );
 
     let response = agent_loop
@@ -671,11 +686,17 @@ async fn stream_and_render_inner(
         }
     }
 
+    let was_enter = enter_interrupted.load(Ordering::Relaxed);
     if cancelled {
-        println!("\n  \x1b[33mCancelled.\x1b[0m");
+        if was_enter {
+            // Enter-interrupt: user wants to take over. Brief marker.
+            println!("\n  \x1b[2mInterrupted.\x1b[0m");
+        } else {
+            println!("\n  \x1b[33mCancelled.\x1b[0m");
+        }
     }
 
-    response
+    (response, was_enter)
 }
 
 // ============================================================================
@@ -1089,7 +1110,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 };
 
                                 // Phase 2: LLM call with parallel TTS feeding.
-                                let _response = stream_and_render_voice(
+                                let (_response, enter_pressed) = stream_and_render_voice(
                                     &mut ctx.agent_loop, &text, &ctx.session_id,
                                     "voice", Some(&tts_lang_owned), &ctx.core_handle,
                                     sentence_tx,
@@ -1100,7 +1121,13 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 ctx.print_status_bar().await;
 
                                 // Phase 3: Wait for TTS playback to finish.
-                                if let Some(jh) = join_handle {
+                                if enter_pressed {
+                                    // Enter-interrupt: skip TTS, start recording immediately.
+                                    if let Some(ref mut vs) = ctx.voice_session {
+                                        vs.stop_playback();
+                                    }
+                                    keep_recording = true;
+                                } else if let Some(jh) = join_handle {
                                     let cancel = ctx.voice_session.as_ref()
                                         .map(|vs| vs.cancel_flag())
                                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
