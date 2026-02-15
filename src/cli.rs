@@ -19,8 +19,9 @@ use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
 use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
+use anyhow::Context as _;
 use crate::providers::base::LLMProvider;
-use crate::providers::claude_code::ClaudeCodeProvider;
+use crate::providers::oauth::OAuthTokenManager;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
 
@@ -495,6 +496,7 @@ pub(crate) fn create_agent_loop(
         config.agents.defaults.max_concurrent_chats,
         email_config,
         repl_display_tx,
+        Some(config.providers.clone()),
     )
 }
 
@@ -548,6 +550,7 @@ pub(crate) async fn run_gateway_async(
         config.agents.defaults.max_concurrent_chats,
         None, // gateway agent uses bus for email, not tools
         repl_display_tx,
+        Some(config.providers.clone()),
     );
 
     // Initialize voice pipeline for channels (when voice feature is enabled).
@@ -866,13 +869,37 @@ pub(crate) fn validate_telegram_token(token: &str) -> bool {
 }
 
 /// Check that an LLM API key is configured, exit with error if not.
+///
+/// Allows through if OAuth credentials exist at `~/.claude/.credentials.json`
+/// (Claude Max auto-detection).
 pub(crate) fn check_api_key(config: &Config) {
     let model = &config.agents.defaults.model;
-    if config.get_api_key().is_none() && !model.starts_with("bedrock/") && !model.starts_with("claude-code") {
+    if config.get_api_key().is_none()
+        && !model.starts_with("bedrock/")
+        && !model.starts_with("claude-max")
+        && !has_oauth_credentials()
+    {
         eprintln!("Error: No API key configured.");
         eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
+        eprintln!("Or authenticate with Claude CLI: claude login");
         std::process::exit(1);
     }
+}
+
+/// Check if a model name refers to a Claude/Anthropic model.
+fn is_claude_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("claude")
+        || m.starts_with("opus")
+        || m.starts_with("sonnet")
+        || m.starts_with("haiku")
+}
+
+/// Check if Claude CLI OAuth credentials exist on disk.
+fn has_oauth_credentials() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".claude").join(".credentials.json").exists())
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -1195,24 +1222,92 @@ pub(crate) fn cmd_cron_enable(job_id: String, disable: bool) {
 // Helpers
 // ============================================================================
 
+/// Load a direct AnthropicProvider using OAuth tokens from Claude CLI.
+///
+/// Reads the access token from `~/.claude/.credentials.json`, refreshes if
+/// needed, and returns an `AnthropicProvider` with OAuth identity headers
+/// (same approach as OpenClaw — direct API, no proxy, no CLI subprocess).
+fn load_oauth_provider(sub_model: &str) -> anyhow::Result<Arc<dyn LLMProvider>> {
+    use crate::providers::anthropic::AnthropicProvider;
+    use tracing::info;
+
+    let mut mgr = OAuthTokenManager::load()?;
+
+    // Refresh synchronously at startup if needed (tokens last ~8h, so
+    // refreshing once at provider creation is sufficient for most sessions).
+    let rt = tokio::runtime::Handle::try_current();
+    let token = if let Ok(handle) = rt {
+        tokio::task::block_in_place(|| handle.block_on(mgr.access_token()))?
+    } else {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(mgr.access_token())?
+    };
+
+    info!(
+        "create_provider: AnthropicProvider (OAuth direct, model={}, token={}...)",
+        sub_model,
+        &token[..token.len().min(20)]
+    );
+
+    Ok(Arc::new(AnthropicProvider::new(&token, Some(sub_model))))
+}
+
 pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
     use tracing::info;
     let model = &config.agents.defaults.model;
 
-    // "claude-code" or "claude-code/opus" → use Claude CLI (Max plan, no API cost).
-    if model.starts_with("claude-code") {
+    // "claude-max" or "claude-max/opus" → OAuth token from Claude CLI credentials.
+    if model.starts_with("claude-max") {
         let sub_model = model
-            .strip_prefix("claude-code/")
-            .or_else(|| model.strip_prefix("claude-code"))
-            .filter(|s| !s.is_empty());
+            .strip_prefix("claude-max/")
+            .or_else(|| model.strip_prefix("claude-max"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("claude-opus-4-6");
+        match load_oauth_provider(sub_model) {
+            Ok(provider) => return provider,
+            Err(e) => {
+                eprintln!("Error: Failed to load Claude Max OAuth credentials: {}", e);
+                eprintln!("Make sure you're logged into Claude CLI: claude login");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Claude model + no Anthropic API key + OAuth credentials exist → use OAuth.
+    // This catches cases where other providers (OpenAI, Groq, etc.) have keys set
+    // but the user wants to use their Claude Max subscription for Claude models.
+    if is_claude_model(model)
+        && config.providers.anthropic.api_key.is_empty()
+        && has_oauth_credentials()
+    {
         info!(
-            "create_provider: using ClaudeCodeProvider (model={}, sub_model={:?})",
-            model, sub_model
+            "create_provider: Claude model '{}' with no Anthropic API key, using OAuth",
+            model
         );
-        return Arc::new(ClaudeCodeProvider::new(sub_model));
+        match load_oauth_provider(model) {
+            Ok(provider) => return provider,
+            Err(e) => {
+                info!("OAuth fallback failed ({}), continuing with key-based provider", e);
+            }
+        }
     }
 
     let api_key = config.get_api_key().unwrap_or_default();
+
+    // No API key configured at all → try OAuth as last resort.
+    if api_key.is_empty() && has_oauth_credentials() {
+        info!(
+            "create_provider: no API key configured, falling back to OAuth for model={}",
+            model
+        );
+        match load_oauth_provider(model) {
+            Ok(provider) => return provider,
+            Err(e) => {
+                info!("OAuth fallback failed ({}), continuing with empty key", e);
+            }
+        }
+    }
+
     let api_base = config.get_api_base();
     info!(
         "create_provider: using OpenAICompatProvider (model={}, base={:?})",
