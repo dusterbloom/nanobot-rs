@@ -89,4 +89,9 @@ pub trait LLMProvider: Send + Sync {
 
     /// Get the default model for this provider.
     fn get_default_model(&self) -> &str;
+
+    /// Get the API base URL (for health checks). Returns None for cloud providers.
+    fn get_api_base(&self) -> Option<&str> {
+        None
+    }
 }

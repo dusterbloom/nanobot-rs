@@ -865,10 +865,23 @@ impl AgentLoopShared {
                             depth: 0,
                             cancellation_token: cancellation_token.clone(),
                             verbatim,
-                            budget: Some(Budget::root(
-                                core.tool_delegation_config.max_iterations,
-                                2, // max delegation depth: parent → child → grandchild
-                            )),
+                            budget: {
+                                let cost_budget = core.tool_delegation_config.cost_budget;
+                                if cost_budget > 0.0 {
+                                    let prices = crate::agent::model_prices::ModelPrices::load().await;
+                                    Some(Budget::root_with_cost(
+                                        core.tool_delegation_config.max_iterations,
+                                        2,
+                                        cost_budget,
+                                        std::sync::Arc::new(prices),
+                                    ))
+                                } else {
+                                    Some(Budget::root(
+                                        core.tool_delegation_config.max_iterations,
+                                        2,
+                                    ))
+                                }
+                            },
                         };
 
                         // Emit tool call start events for delegated calls.

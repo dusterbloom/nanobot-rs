@@ -268,6 +268,10 @@ impl LLMProvider for OpenAICompatProvider {
     fn get_default_model(&self) -> &str {
         &self.default_model
     }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some(&self.api_base)
+    }
 }
 
 /// Parse the OpenAI-compatible JSON response into an `LLMResponse`.

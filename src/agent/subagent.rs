@@ -492,6 +492,13 @@ impl SubagentManager {
                 .chat(&messages, tool_defs_opt, Some(&config.model), 4096, 0.7)
                 .await?;
 
+            // Check for LLM provider errors (finish_reason == "error").
+            if response.finish_reason == "error" {
+                let err_msg = response.content.as_deref().unwrap_or("Unknown LLM error");
+                error!("Subagent {} LLM provider error: {}", task_id, err_msg);
+                return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
+            }
+
             if response.has_tool_calls() {
                 // Build tool_calls JSON for the assistant message.
                 let tc_json: Vec<Value> = response
