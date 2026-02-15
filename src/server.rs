@@ -4,6 +4,7 @@
 //! parsing GGUF model metadata for auto-sizing context windows, and detecting available
 //! system memory (VRAM/RAM).
 
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -159,6 +160,7 @@ pub(crate) async fn start_compaction_if_available(
 
     match spawn_compaction_server(port, &model_path, main_ctx_size) {
         Ok(child) => {
+            record_server_pid("compaction", child.id());
             *compaction_process = Some(child);
             if wait_for_server_ready(port, 15, compaction_process).await {
                 *compaction_port = Some(port.to_string());
@@ -200,8 +202,10 @@ pub(crate) fn stop_compaction_server(
     compaction_port: &mut Option<String>,
 ) {
     if let Some(ref mut child) = compaction_process {
+        let pid = child.id();
         child.kill().ok();
         child.wait().ok();
+        unrecord_server_pid(pid);
     }
     *compaction_process = None;
     *compaction_port = None;
@@ -295,6 +299,7 @@ pub(crate) async fn start_delegation_if_available(
 
     match spawn_delegation_server(port, &model_path, ctx_size, gpu_layers) {
         Ok(child) => {
+            record_server_pid("delegation", child.id());
             *delegation_process = Some(child);
             if wait_for_server_ready(port, 30, delegation_process).await {
                 *delegation_port = Some(port.to_string());
@@ -337,23 +342,95 @@ pub(crate) fn stop_delegation_server(
     delegation_port: &mut Option<String>,
 ) {
     if let Some(ref mut child) = delegation_process {
+        let pid = child.id();
         child.kill().ok();
         child.wait().ok();
+        unrecord_server_pid(pid);
     }
     *delegation_process = None;
     *delegation_port = None;
 }
 
-/// Kill any orphaned llama-server processes from previous runs.
-pub(crate) fn kill_stale_llama_servers() {
-    // Kill any orphaned llama-server processes from previous runs
-    let _ = Command::new("pkill")
-        .args(["-f", "llama-server"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// Path to the PID file for tracking spawned llama-server processes.
+fn pid_file_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".nanobot").join(".server-pids"))
+}
+
+/// Record a server PID in the tracking file (format: `role:pid` per line).
+pub(crate) fn record_server_pid(role: &str, pid: u32) {
+    if let Some(path) = pid_file_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "{}:{}", role, pid);
+        }
+    }
+}
+
+/// Remove a specific PID from the tracking file.
+pub(crate) fn unrecord_server_pid(pid: u32) {
+    if let Some(path) = pid_file_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            let remaining: Vec<&str> = contents
+                .lines()
+                .filter(|line| {
+                    line.split(':')
+                        .nth(1)
+                        .and_then(|p| p.parse::<u32>().ok())
+                        != Some(pid)
+                })
+                .collect();
+            if remaining.is_empty() {
+                std::fs::remove_file(&path).ok();
+            } else {
+                std::fs::write(&path, remaining.join("\n") + "\n").ok();
+            }
+        }
+    }
+}
+
+/// Kill llama-server processes tracked from previous nanobot runs.
+///
+/// Only kills PIDs recorded in `~/.nanobot/.server-pids`, not system-wide.
+/// Replaces the former `pkill -f llama-server` approach.
+pub(crate) fn kill_tracked_servers() {
+    let path = match pid_file_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return, // No PID file — nothing to kill
+    };
+
+    for line in contents.lines() {
+        if let Some(pid_str) = line.split(':').nth(1) {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                // Send SIGKILL to the specific PID (safe: only our tracked PIDs)
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    // Clean up the file
+    std::fs::remove_file(&path).ok();
     // Brief pause to let ports be released
     std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// Kill any orphaned llama-server processes from previous runs.
+///
+/// Uses PID-based tracking. Falls back to the tracking file only.
+pub(crate) fn kill_stale_llama_servers() {
+    kill_tracked_servers();
 }
 
 /// Parse architecture-specific metadata from a GGUF file header.
@@ -671,11 +748,19 @@ pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -
     }
 }
 
-pub(crate) fn spawn_compaction_server(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-) -> Result<Child, String> {
+/// Configuration for spawning a llama-server process.
+pub(crate) struct SpawnConfig<'a> {
+    pub port: u16,
+    pub model_path: &'a Path,
+    pub ctx_size: usize,
+    pub gpu_layers: u32,
+    pub role: &'a str, // "main", "compaction", "delegation" — for error messages
+}
+
+/// Spawn a llama-server with the given configuration.
+///
+/// Single implementation replacing the former per-role spawn functions.
+pub(crate) fn spawn_server(config: &SpawnConfig) -> Result<Child, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
     let server_path = home.join("llama.cpp/build/bin/llama-server");
 
@@ -685,24 +770,25 @@ pub(crate) fn spawn_compaction_server(
             server_path.display()
         ));
     }
-    if !model_path.exists() {
+    if !config.model_path.exists() {
         return Err(format!(
-            "Compaction model not found at {}",
-            model_path.display()
+            "{} model not found at {}",
+            capitalize(config.role),
+            config.model_path.display()
         ));
     }
 
     Command::new(&server_path)
         .arg("--model")
-        .arg(model_path)
+        .arg(config.model_path)
         .arg("--port")
-        .arg(port.to_string())
+        .arg(config.port.to_string())
         .arg("--ctx-size")
-        .arg(ctx_size.to_string())
+        .arg(config.ctx_size.to_string())
         .arg("--parallel")
         .arg("1")
         .arg("--n-gpu-layers")
-        .arg("10")
+        .arg(config.gpu_layers.to_string())
         .arg("--flash-attn")
         .arg("on")
         // Jinja required for tool calling (Mistral/Ministral templates).
@@ -712,93 +798,61 @@ pub(crate) fn spawn_compaction_server(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn compaction server: {}", e))
+        .map_err(|e| format!("Failed to spawn {} server: {}", config.role, e))
 }
 
-/// Spawn a llama-server for the delegation model with configurable GPU layers.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+/// Convenience wrapper: spawn the main model server (full GPU offload).
+pub(crate) fn spawn_llama_server(
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+) -> Result<Child, String> {
+    spawn_server(&SpawnConfig {
+        port,
+        model_path,
+        ctx_size,
+        gpu_layers: 99,
+        role: "main",
+    })
+}
+
+/// Convenience wrapper: spawn the compaction server (10 GPU layers).
+pub(crate) fn spawn_compaction_server(
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+) -> Result<Child, String> {
+    spawn_server(&SpawnConfig {
+        port,
+        model_path,
+        ctx_size,
+        gpu_layers: 10,
+        role: "compaction",
+    })
+}
+
+/// Convenience wrapper: spawn the delegation server (configurable GPU layers).
 pub(crate) fn spawn_delegation_server(
     port: u16,
     model_path: &Path,
     ctx_size: usize,
     gpu_layers: u32,
 ) -> Result<Child, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let server_path = home.join("llama.cpp/build/bin/llama-server");
-
-    if !server_path.exists() {
-        return Err(format!(
-            "llama-server not found at {}",
-            server_path.display()
-        ));
-    }
-    if !model_path.exists() {
-        return Err(format!(
-            "Delegation model not found at {}",
-            model_path.display()
-        ));
-    }
-
-    Command::new(&server_path)
-        .arg("--model")
-        .arg(model_path)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ctx-size")
-        .arg(ctx_size.to_string())
-        .arg("--parallel")
-        .arg("1")
-        .arg("--n-gpu-layers")
-        .arg(gpu_layers.to_string())
-        .arg("--flash-attn")
-        .arg("on")
-        .arg("--jinja")
-        .arg("--no-prefill-assistant")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn delegation server: {}", e))
-}
-
-/// Spawn a llama-server for the main model.
-pub(crate) fn spawn_llama_server(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-) -> Result<Child, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let server_path = home.join("llama.cpp/build/bin/llama-server");
-
-    if !server_path.exists() {
-        return Err(format!(
-            "llama-server not found at {}",
-            server_path.display()
-        ));
-    }
-    if !model_path.exists() {
-        return Err(format!("Model not found at {}", model_path.display()));
-    }
-
-    Command::new(&server_path)
-        .arg("--model")
-        .arg(model_path)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ctx-size")
-        .arg(ctx_size.to_string())
-        .arg("--parallel")
-        .arg("1")
-        .arg("--n-gpu-layers")
-        .arg("99")
-        .arg("--flash-attn")
-        .arg("on")
-        // Jinja required for tool calling (Mistral/Ministral templates).
-        .arg("--jinja")
-        // Prevent prefill errors when conversation ends with tool results.
-        .arg("--no-prefill-assistant")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn llama-server: {}", e))
+    spawn_server(&SpawnConfig {
+        port,
+        model_path,
+        ctx_size,
+        gpu_layers,
+        role: "delegation",
+    })
 }
 
 /// Wait for a llama-server to be healthy (responds to /health).
@@ -906,6 +960,81 @@ pub(crate) async fn wait_for_server_ready(
     print!("\r{}{}\r", crate::tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
     std::io::stdout().flush().ok();
     false
+}
+
+/// Quick health check: is the local llama-server at the given base URL alive?
+///
+/// Sends a GET to `/health` with a 2-second timeout. Returns `true` if the
+/// server responds with 200, `false` otherwise.
+pub(crate) async fn check_health(api_base: &str) -> bool {
+    // api_base is typically "http://localhost:PORT/v1" — strip to get the root.
+    let base = api_base
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let url = format!("{}/health", base);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    match client.get(&url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Background health watchdog for local llama-server processes.
+///
+/// Pings `/health` every 30 seconds on all active server ports. When a server
+/// goes down, sends a one-line warning to `alert_tx` (displayed in the REPL
+/// before the next prompt).
+pub(crate) fn start_health_watchdog(
+    ports: Vec<(String, String)>, // (role, port)
+    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        // Track which servers were healthy on last check.
+        let mut was_healthy: HashMap<String, bool> = ports
+            .iter()
+            .map(|(role, _)| (role.clone(), true))
+            .collect();
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            for (role, port) in &ports {
+                let url = format!("http://localhost:{}/health", port);
+                let healthy = match client.get(&url).send().await {
+                    Ok(resp) => resp.status().is_success(),
+                    Err(_) => false,
+                };
+
+                let prev = was_healthy.get(role).copied().unwrap_or(true);
+                if !healthy && prev {
+                    // Server just went down — alert once.
+                    let msg = format!(
+                        "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[31mDOWN\x1b[0m — use /restart or /local to recover\n",
+                        role, port
+                    );
+                    let _ = alert_tx.send(msg);
+                } else if healthy && !prev {
+                    // Server recovered.
+                    let msg = format!(
+                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[32mrecovered\x1b[0m\n",
+                        role, port
+                    );
+                    let _ = alert_tx.send(msg);
+                }
+
+                was_healthy.insert(role.clone(), healthy);
+            }
+        }
+    })
 }
 
 /// Query the local llama.cpp server for its actual context size (`n_ctx`).
@@ -1197,7 +1326,7 @@ mod tests {
             let result = spawn_llama_server(19877, &model_path, 8192);
             assert!(result.is_err());
             assert!(
-                result.unwrap_err().contains("Model not found"),
+                result.unwrap_err().contains("model not found"),
                 "Should report missing model"
             );
         }

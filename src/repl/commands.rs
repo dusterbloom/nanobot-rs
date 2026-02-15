@@ -272,29 +272,59 @@ impl ReplContext {
         let turn = counters.learning_turn_counter.load(Ordering::Relaxed);
         println!("  {}TURN{}      {}", tui::BOLD, tui::RESET, turn);
 
-        if is_local {
-            if let Some(ref cp) = self.srv.compaction_port {
-                println!("  {}COMPACT{}   on port {} (CPU)", tui::BOLD, tui::RESET, cp);
-            }
-        }
+        // Server health display (local mode or when delegation server is active).
+        {
+            let mut servers: Vec<String> = Vec::new();
 
-        // Delegation status.
-        if core.tool_delegation_config.enabled {
-            let healthy = counters.delegation_healthy.load(Ordering::Relaxed);
-            let port_info = self.srv.delegation_port.as_deref().unwrap_or("none");
-            let (status_color, status_label) = if healthy {
-                (tui::GREEN, "healthy")
-            } else {
-                (tui::RED, "DOWN")
-            };
-            println!(
-                "  {}DELEG{}     port {} ({}{}{}{})",
-                tui::BOLD, tui::RESET,
-                port_info,
-                status_color, tui::BOLD, status_label, tui::RESET
-            );
-            if !healthy {
-                println!("            use {}/restart{} to respawn delegation server", tui::BOLD, tui::RESET);
+            if is_local {
+                let main_health = crate::server::check_health(
+                    &format!("http://localhost:{}/v1", self.srv.local_port)
+                ).await;
+                let (color, label) = if main_health {
+                    (tui::GREEN, "healthy")
+                } else {
+                    (tui::RED, "DOWN")
+                };
+                servers.push(format!(
+                    "main:{} ({}{}{}{})",
+                    self.srv.local_port, color, tui::BOLD, label, tui::RESET
+                ));
+            }
+
+            if let Some(ref cp) = self.srv.compaction_port {
+                let health = crate::server::check_health(
+                    &format!("http://localhost:{}/v1", cp)
+                ).await;
+                let (color, label) = if health {
+                    (tui::GREEN, "healthy")
+                } else {
+                    (tui::RED, "DOWN")
+                };
+                servers.push(format!(
+                    "compact:{} ({}{}{}{})",
+                    cp, color, tui::BOLD, label, tui::RESET
+                ));
+            }
+
+            if let Some(ref dp) = self.srv.delegation_port {
+                let deleg_healthy = counters.delegation_healthy.load(Ordering::Relaxed);
+                let (color, label) = if deleg_healthy {
+                    (tui::GREEN, "healthy")
+                } else {
+                    (tui::RED, "DOWN")
+                };
+                servers.push(format!(
+                    "deleg:{} ({}{}{}{})",
+                    dp, color, tui::BOLD, label, tui::RESET
+                ));
+            }
+
+            if !servers.is_empty() {
+                println!(
+                    "  {}SERVERS{}   {}",
+                    tui::BOLD, tui::RESET,
+                    servers.join("  ")
+                );
             }
         }
 
