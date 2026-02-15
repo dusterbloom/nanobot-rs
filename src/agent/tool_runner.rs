@@ -112,6 +112,196 @@ fn normalize_call_key(name: &str, arguments: &HashMap<String, Value>) -> String 
     format!("{}:{}", name, normalized)
 }
 
+/// Build a compact state string from ContextStore for the analysis model.
+///
+/// Includes variable metadata (name, length, preview) and accumulated
+/// memory findings. Keeps output small (~200-400 chars) to leave the
+/// model's context budget free for reasoning.
+fn build_analysis_state(store: &ContextStore) -> String {
+    let mut parts = Vec::new();
+
+    // Variable metadata
+    let vars = store.variable_metadata();
+    if !vars.is_empty() {
+        let var_lines: Vec<String> = vars.iter()
+            .map(|(name, len, preview)| format!("  {} ({} chars, preview: \"{}\")", name, len, preview))
+            .collect();
+        parts.push(format!("Variables:\n{}", var_lines.join("\n")));
+    }
+
+    // Memory findings
+    let mem = store.mem_entries();
+    if !mem.is_empty() {
+        let mut sorted_keys: Vec<&String> = mem.keys().collect();
+        sorted_keys.sort();
+        let mem_lines: Vec<String> = sorted_keys.iter()
+            .map(|k| format!("  {}: {}", k, mem[*k]))
+            .collect();
+        parts.push(format!("Findings so far:\n{}", mem_lines.join("\n")));
+    }
+
+    parts.join("\n")
+}
+
+/// Run analysis using fresh single-turn LLM calls with scratch pad persistence.
+///
+/// Each round: build compact state from ContextStore → fresh LLM call →
+/// execute tools → update scratch pad. The model gets its FULL context
+/// budget every round (~300 tok input, ~3700 free).
+async fn analyze_via_scratch_pad(
+    config: &ToolRunnerConfig,
+    context_store: &mut ContextStore,
+    tool_defs: &[Value],
+    allowed_tools: &std::collections::HashSet<&str>,
+    tools: &ToolRegistry,
+    task_context: &str,
+    all_results: &mut Vec<(String, String, String)>,
+    max_rounds: usize,
+) -> Option<String> {
+    let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut id_counter: usize = 1000; // offset to avoid collision with iteration-0 IDs
+
+    let system_prompt = "You analyze stored data. Use micro-tools to inspect, mem_store to save findings.\nWhen you have enough information, write your final summary. STOP.\nPrevious findings are listed below — build on them, don't repeat work.\n/nothink";
+
+    for round in 0..max_rounds {
+        // Check cancellation.
+        if config.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+            return Some("Analysis cancelled.".to_string());
+        }
+
+        // Build compact state from ContextStore memory + variable metadata.
+        let state = build_analysis_state(context_store);
+
+        // Fresh messages each round — no growing conversation.
+        let messages = vec![
+            json!({ "role": "system", "content": system_prompt }),
+            json!({
+                "role": "user",
+                "content": format!("Task: {}\n\n{}", task_context, state)
+            }),
+        ];
+
+        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(tool_defs)
+        };
+
+        // Single LLM call with full context budget.
+        let response = match config.provider.chat(
+            &messages,
+            tool_defs_opt,
+            Some(&config.model),
+            config.max_tokens,
+            0.3,
+        ).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Scratch pad analysis LLM call failed (round {}): {}", round, e);
+                break; // Fall through to fallback
+            }
+        };
+
+        // Error response from provider — stop analyzing.
+        if response.finish_reason == "error" {
+            warn!("Scratch pad analysis got error response (round {}) — falling back", round);
+            break;
+        }
+
+        if response.has_tool_calls() {
+            // Execute tool calls against ContextStore.
+            for tc in &response.tool_calls {
+                // Block disallowed tools.
+                if !allowed_tools.contains(tc.name.as_str()) {
+                    warn!("Scratch pad: blocked disallowed tool '{}'", tc.name);
+                    continue;
+                }
+
+                // Loop detection across rounds.
+                let call_key = normalize_call_key(&tc.name, &tc.arguments);
+                if seen_calls.contains(&call_key) {
+                    warn!("Scratch pad: duplicate call {} — skipping", tc.name);
+                    continue;
+                }
+                seen_calls.insert(call_key);
+
+                if tc.name == "ctx_summarize" {
+                    let variable = tc.arguments.get("variable").and_then(|v| v.as_str()).unwrap_or("");
+                    let instruction = tc.arguments.get("instruction").and_then(|v| v.as_str()).unwrap_or("Summarize");
+                    let result = context_store::execute_ctx_summarize(
+                        context_store,
+                        variable,
+                        instruction,
+                        &config.provider,
+                        &config.model,
+                        config.depth,
+                        config.max_tokens,
+                    ).await;
+                    // Store summary as new variable + save finding in memory.
+                    let (var_name, _) = context_store.store(result.clone());
+                    context_store.mem_store(&format!("summary_{}", var_name), result);
+                } else if context_store::is_micro_tool(&tc.name) {
+                    let result = context_store::execute_micro_tool(context_store, &tc.name, &tc.arguments);
+                    // mem_store/mem_recall are already handled internally by execute_micro_tool.
+                    // For inspection tools (slice/grep/length), the model will use
+                    // mem_store in a subsequent call to persist findings.
+                    debug!("Scratch pad micro-tool {}: {} chars", tc.name, result.len());
+                } else if worker_tools::is_worker_tool(&tc.name) {
+                    let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                    let (_, _metadata) = context_store.store(result.clone());
+                    let original_id = format!("sp{:07}", id_counter);
+                    id_counter += 1;
+                    all_results.push((original_id, tc.name.clone(), result));
+                } else {
+                    // Real tool — execute and store in ContextStore.
+                    debug!("Scratch pad executing real tool: {}", tc.name);
+                    let result = if let Some(ref token) = config.cancellation_token {
+                        use crate::agent::tools::base::ToolExecutionContext;
+                        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let ctx = ToolExecutionContext {
+                            event_tx,
+                            cancellation_token: token.child_token(),
+                            tool_call_id: tc.id.clone(),
+                        };
+                        tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                    } else {
+                        tools.execute(&tc.name, tc.arguments.clone()).await
+                    };
+                    let (_, _metadata) = context_store.store(result.data.clone());
+                    let original_id = format!("sp{:07}", id_counter);
+                    id_counter += 1;
+                    all_results.push((original_id, tc.name.clone(), result.data));
+                }
+            }
+            // Continue to next round — fresh call with updated state.
+        } else {
+            // Model produced text — that's our summary.
+            if let Some(text) = response.content {
+                if !text.is_empty() {
+                    debug!("Scratch pad analysis complete after {} rounds", round + 1);
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    // Phase 4: Graceful fallback — synthesize from accumulated memory findings.
+    let keys = context_store.mem_keys();
+    if !keys.is_empty() {
+        let findings: Vec<String> = keys.iter()
+            .filter_map(|k| {
+                let v = context_store.mem_recall(k);
+                if v.starts_with("Key '") { None } else { Some(format!("{}: {}", k, v)) }
+            })
+            .collect();
+        if !findings.is_empty() {
+            debug!("Scratch pad fallback: synthesizing from {} memory findings", findings.len());
+            return Some(findings.join("\n"));
+        }
+    }
+    None
+}
+
 /// Run a delegated tool execution loop.
 ///
 /// Executes `initial_tool_calls` using the `tools` registry, then asks the
@@ -160,7 +350,7 @@ pub async fn run_tool_loop(
     // Keep the system prompt compact — the delegation model has limited context.
     let system_msg = json!({
         "role": "system",
-        "content": "You are a tool result analyst. You receive tool outputs as named variables.\n\nRULES:\n1. If results are clear and complete, write a concise summary with specific data points. STOP.\n2. If results are too large, use ctx_grep(variable, pattern) to find relevant sections.\n3. If grep isn't enough, use ctx_slice(variable, start, end) to read specific ranges.\n4. If you need a focused summary of a large result, use ctx_summarize(variable, instruction).\n5. NEVER re-execute the same tool with identical arguments.\n6. NEVER execute tools not in your allowed list.\n7. Prefer grep → slice → summarize (cheapest first).\n\nOUTPUT FORMAT:\n- Lead with the answer/finding\n- Include specific numbers, paths, error messages verbatim\n- If multiple tool results, organize by tool call"
+        "content": "You are a tool result analyst. You receive tool outputs as named variables.\n\nRULES:\n1. If results are clear and complete, write a concise summary with specific data points. STOP.\n2. If results are too large, use ctx_grep(variable, pattern) to find relevant sections.\n3. If grep isn't enough, use ctx_slice(variable, start, end) to read specific ranges.\n4. If you need a focused summary of a large result, use ctx_summarize(variable, instruction).\n5. NEVER re-execute the same tool with identical arguments.\n6. NEVER execute tools not in your allowed list.\n7. Prefer grep → slice → summarize (cheapest first).\n\nOUTPUT FORMAT:\n- Lead with the answer/finding\n- Include specific numbers, paths, error messages verbatim\n- If multiple tool results, organize by tool call\n/nothink"
     });
     let mut messages: Vec<Value> = vec![system_msg];
 
@@ -211,12 +401,6 @@ pub async fn run_tool_loop(
             }
         }));
     }
-
-    let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-        None
-    } else {
-        Some(&tool_defs)
-    };
 
     // Execute the initial tool calls from the main model.
     let mut pending_calls: Vec<ToolCallRequest> = initial_tool_calls.to_vec();
@@ -543,100 +727,38 @@ pub async fn run_tool_loop(
             }
         }
 
-        // Local models (llama-server) require conversations to end with
-        // a user message. Mistral/Ministral handle tool→generate natively
-        // and break if a user message is injected here.
-        if config.needs_user_continuation {
-            messages.push(json!({
-                "role": "user",
-                "content": "The tool results are shown above. Provide a brief, factual summary of what the results show. Do NOT call more tools unless execution clearly failed."
-            }));
-        }
-
-        // Ask the cheap model if more tools are needed.
-        // Always offer tools so the model can inspect results with micro-tools
-        // before deciding to summarize.
-        let tools_for_call = tool_defs_opt;
-        let response = match config
-            .provider
-            .chat(
-                &messages,
-                tools_for_call,
-                Some(&config.model),
-                config.max_tokens,
-                0.3, // low temperature for tool execution
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Tool runner LLM call failed: {}", e);
-                return ToolRunResult {
-                    tool_results: all_results,
-                    summary: Some(format!("Tool runner LLM error: {}", e)),
-                    iterations_used,
-                };
-            }
-        };
-
-        // If the delegation LLM returned an error (server down, OOM, etc.),
-        // don't treat the error text as a "summary". Return tool results
-        // collected so far and let the main model interpret them directly.
-        if response.finish_reason == "error" {
-            warn!("Delegation model returned error — returning raw tool results");
+        // After executing initial tool calls (iteration 0), hand off to
+        // scratch pad analysis. Each analysis round is a fresh single-turn
+        // LLM call with the ContextStore's memory acting as persistent state.
+        // This replaces the growing-message loop that caused context saturation.
+        if iteration == 0 {
+            debug!("Handing off to scratch pad analysis (up to 10 rounds)");
+            let summary = analyze_via_scratch_pad(
+                config,
+                &mut context_store,
+                &tool_defs,
+                &allowed_tools,
+                tools,
+                &task_context,
+                &mut all_results,
+                10, // max analysis rounds
+            ).await;
             return ToolRunResult {
                 tool_results: all_results,
-                summary: None,
-                iterations_used,
+                summary,
+                iterations_used: 1,
             };
         }
 
-        if response.has_tool_calls() {
-            // Filter out:
-            // 1. Tools not in the original request (prompt injection defense)
-            // 2. Duplicate tool calls (loop detection)
-            let mut new_calls: Vec<_> = Vec::new();
-            for tc in response.tool_calls {
-                // SAFETY: block tools the delegation model invented.
-                if !allowed_tools.contains(tc.name.as_str()) {
-                    warn!(
-                        "Delegation model requested '{}' — not in original tool set {:?} — BLOCKED",
-                        tc.name, allowed_tools
-                    );
-                    continue;
-                }
-                let call_key = normalize_call_key(&tc.name, &tc.arguments);
-                if seen_calls.contains(&call_key) {
-                    warn!("Delegation model re-requested {} with same args — breaking loop", tc.name);
-                } else {
-                    seen_calls.insert(call_key);
-                    new_calls.push(tc);
-                }
-            }
-            if new_calls.is_empty() {
-                // All requested calls are duplicates — model is looping.
-                debug!("All chained tool calls were duplicates — stopping delegation loop");
-                return ToolRunResult {
-                    tool_results: all_results,
-                    summary: Some("Tool execution complete (loop detected).".to_string()),
-                    iterations_used,
-                };
-            }
-            pending_calls = new_calls;
-        } else {
-            // Model is done — return its summary.
-            return ToolRunResult {
-                tool_results: all_results,
-                summary: response.content,
-                iterations_used,
-            };
-        }
+        // Fallback: iterations > 0 should not be reached (scratch pad
+        // takes over after iteration 0), but kept for safety.
+        break;
     }
 
-    // Ran out of iterations.
+    // Ran out of iterations or broke out of loop.
     ToolRunResult {
         tool_results: all_results,
-        summary: Some("Tool runner reached max iterations.".to_string()),
+        summary: None,
         iterations_used,
     }
 }
@@ -866,8 +988,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.iterations_used, 3);
-        assert!(result.summary.as_deref().unwrap().contains("max iterations"));
+        // Scratch pad runs internally after iteration 0; iterations_used is always 1.
+        assert_eq!(result.iterations_used, 1);
+        // Scratch pad exhausts rounds on pure tool-call responses and falls back.
+        assert!(result.tool_results.len() > 1, "Should have initial + scratch pad results");
     }
 
     #[tokio::test]
@@ -920,11 +1044,9 @@ mod tests {
         )
         .await;
 
-        // Should stop at iteration 2: initial + 1 chain, then duplicate detected
-        assert_eq!(result.iterations_used, 2, "Should stop after detecting duplicate");
-        assert_eq!(result.tool_results.len(), 2, "Should have 2 results (initial + 1 chain)");
-        assert!(result.summary.as_deref().unwrap().contains("loop detected"),
-            "Summary should mention loop: {:?}", result.summary);
+        // Scratch pad detects duplicates: first "same_args" call is new, subsequent skipped.
+        assert_eq!(result.iterations_used, 1);
+        assert_eq!(result.tool_results.len(), 2, "Initial + 1 new call from scratch pad (duplicates skipped)");
     }
 
     #[tokio::test]
@@ -1103,11 +1225,10 @@ mod tests {
 
         // Expected sequence: system, user, assistant(tool_calls), tool(result)
         // NO user continuation — Mistral handles tool→generate natively.
-        assert_eq!(messages.len(), 4, "Expected exactly 4 messages, got {}", messages.len());
+        // Scratch pad sends fresh [system, user] messages each round.
+        assert_eq!(messages.len(), 2, "Scratch pad should send fresh [system, user] messages, got {}", messages.len());
         assert_eq!(messages[0]["role"].as_str(), Some("system"));
         assert_eq!(messages[1]["role"].as_str(), Some("user"));
-        assert_eq!(messages[2]["role"].as_str(), Some("assistant"));
-        assert_eq!(messages[3]["role"].as_str(), Some("tool"));
     }
 
     #[tokio::test]
@@ -1164,7 +1285,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.iterations_used, 2);
+        // Scratch pad handles chaining: initial + 1 chained call, then "Chained done."
+        assert_eq!(result.iterations_used, 1);
         assert_eq!(result.tool_results.len(), 2);
         assert_eq!(result.summary.as_deref(), Some("Chained done."));
     }
@@ -1201,15 +1323,10 @@ mod tests {
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
 
-        // Should be: system, user, assistant(3 tool_calls), tool, tool, tool
-        let last = messages.last().unwrap();
-        assert_eq!(last["role"].as_str(), Some("tool"), "Last message should be tool result");
-
-        // Count tool messages — should be 3
-        let tool_count = messages.iter()
-            .filter(|m| m["role"].as_str() == Some("tool"))
-            .count();
-        assert_eq!(tool_count, 3, "Should have 3 tool result messages");
+        // Scratch pad sends fresh [system, user] messages each round.
+        assert_eq!(messages.len(), 2, "Scratch pad should send fresh [system, user] messages");
+        assert_eq!(messages[0]["role"].as_str(), Some("system"));
+        assert_eq!(messages[1]["role"].as_str(), Some("user"));
     }
 
     /// Mock provider that fails on the first call.
@@ -1266,12 +1383,8 @@ mod tests {
         // Tool was executed before the LLM call failed
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].1, "test_tool");
-        // Summary should contain the error
-        assert!(
-            result.summary.as_deref().unwrap().contains("error"),
-            "Summary should mention the error: {:?}",
-            result.summary
-        );
+        // Scratch pad LLM call fails, falls back to None (no memory findings).
+        assert!(result.summary.is_none(), "Provider error in scratch pad falls back to None: {:?}", result.summary);
         assert_eq!(result.iterations_used, 1);
     }
 
@@ -1378,20 +1491,8 @@ mod tests {
             "Results should preserve original tool call ID"
         );
 
-        // Messages sent to delegation model should use normalized 9-char IDs
-        let captured = provider.captured_messages.lock().await;
-        let messages = &captured[0];
-
-        // Find the assistant message with tool_calls
-        let assistant_msg = messages.iter().find(|m| m["role"].as_str() == Some("assistant")).unwrap();
-        let tc_id = assistant_msg["tool_calls"][0]["id"].as_str().unwrap();
-        assert_eq!(tc_id.len(), 9, "Tool call ID in messages should be 9 chars: {}", tc_id);
-
-        // Find the tool result message
-        let tool_msg = messages.iter().find(|m| m["role"].as_str() == Some("tool")).unwrap();
-        let result_id = tool_msg["tool_call_id"].as_str().unwrap();
-        assert_eq!(result_id.len(), 9, "Tool result ID should match normalized ID: {}", result_id);
-        assert_eq!(tc_id, result_id, "Tool call and result IDs should match");
+        // Scratch pad receives fresh [system, user] messages — no tool_call IDs in those.
+        // The key guarantee is original IDs in results (verified above).
     }
 
     #[tokio::test]
@@ -1514,20 +1615,17 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].2.len(), 500);
 
-        // Messages sent to delegation model should have metadata, not raw data
+        // Scratch pad receives variable metadata in the user message state.
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
-        let tool_msg = messages.iter()
-            .find(|m| m["role"].as_str() == Some("tool"))
+        let user_msg = messages.iter()
+            .find(|m| m["role"].as_str() == Some("user"))
             .unwrap();
-        let content = tool_msg["content"].as_str().unwrap();
-        assert!(content.contains("Variable 'output_0'"),
-            "Delegation model should see variable metadata, got: {}", content);
+        let content = user_msg["content"].as_str().unwrap();
+        assert!(content.contains("output_0"),
+            "Scratch pad state should contain variable metadata, got: {}", content);
         assert!(content.contains("500 chars"),
-            "Metadata should contain char count, got: {}", content);
-        assert!(content.len() < 300,
-            "Metadata should be much shorter than 500 chars, got {} chars",
-            content.len());
+            "State should contain char count, got: {}", content);
     }
 
     #[tokio::test]
@@ -1567,15 +1665,16 @@ mod tests {
         // Full data in both places
         assert_eq!(result.tool_results[0].2.len(), 50);
 
+        // Scratch pad receives variable metadata in user message state.
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
-        let tool_msg = messages.iter()
-            .find(|m| m["role"].as_str() == Some("tool"))
+        let user_msg = messages.iter()
+            .find(|m| m["role"].as_str() == Some("user"))
             .unwrap();
-        let content = tool_msg["content"].as_str().unwrap();
-        assert!(!content.contains("Variable '"),
-            "Small results should not use metadata");
-        assert_eq!(content, "x".repeat(50));
+        let content = user_msg["content"].as_str().unwrap();
+        // Even small results are stored as variables in ContextStore.
+        assert!(content.contains("output_0"),
+            "Scratch pad state should contain variable info, got: {}", content);
     }
 
     #[tokio::test]
@@ -2353,10 +2452,11 @@ mod tests {
         )
         .await;
 
-        // Should have the initial tool result but stopped before the chained call.
+        // Initial tool executes (1), scratch pad round 0 executes chained tool (1),
+        // then cancellation is detected at the top of round 1.
         assert_eq!(
-            result.tool_results.len(), 1,
-            "Should have only the initial result, not the chained one"
+            result.tool_results.len(), 2,
+            "Initial + 1 from scratch pad before cancellation detected"
         );
         assert!(
             result.summary.as_deref().unwrap().contains("cancelled"),
@@ -2539,5 +2639,218 @@ mod tests {
         let budget = Budget::root(10, 0);
         assert!(!budget.can_delegate());
         assert!(budget.child().is_none());
+    }
+
+    // -- build_analysis_state tests --
+
+    #[test]
+    fn test_build_analysis_state_empty_store() {
+        let store = context_store::ContextStore::new();
+        let state = build_analysis_state(&store);
+        assert!(state.is_empty(), "Empty store should produce empty state, got: {}", state);
+    }
+
+    #[test]
+    fn test_build_analysis_state_with_variables() {
+        let mut store = context_store::ContextStore::new();
+        store.store("hello world".to_string());
+        store.store("x".repeat(500));
+
+        let state = build_analysis_state(&store);
+        assert!(state.contains("output_0"), "State should contain variable name");
+        assert!(state.contains("11 chars"), "State should contain char count for output_0");
+        assert!(state.contains("output_1"), "State should contain second variable");
+        assert!(state.contains("500 chars"), "State should contain char count for output_1");
+    }
+
+    #[test]
+    fn test_build_analysis_state_with_memory() {
+        let mut store = context_store::ContextStore::new();
+        store.mem_store("file_type", "HTML page".to_string());
+        store.mem_store("relevant_section", "Lines 142-168".to_string());
+
+        let state = build_analysis_state(&store);
+        assert!(state.contains("Findings so far:"), "State should have findings section");
+        assert!(state.contains("file_type"), "State should contain memory key");
+        assert!(state.contains("HTML page"), "State should contain memory value");
+        assert!(state.contains("relevant_section"), "State should contain second key");
+    }
+
+    #[test]
+    fn test_build_analysis_state_with_both() {
+        let mut store = context_store::ContextStore::new();
+        store.store("some data".to_string());
+        store.mem_store("finding", "important result".to_string());
+
+        let state = build_analysis_state(&store);
+        assert!(state.contains("Variables:"), "Should have variables section");
+        assert!(state.contains("Findings so far:"), "Should have findings section");
+        assert!(state.contains("output_0"), "Should contain variable");
+        assert!(state.contains("important result"), "Should contain finding");
+    }
+
+    // -- Memory accumulation across scratch pad rounds --
+
+    #[tokio::test]
+    async fn test_scratch_pad_memory_accumulates_across_rounds() {
+        // Verify that mem_store findings from round N appear in the
+        // user message sent to the LLM in round N+1.
+        //
+        // Round 0: model calls mem_store("finding_1", "first result")
+        // Round 1: model sees "finding_1: first result" in state → returns summary
+
+        struct MemoryCapturingProvider {
+            captured_messages: tokio::sync::Mutex<Vec<Vec<Value>>>,
+            call_count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl LLMProvider for MemoryCapturingProvider {
+            async fn chat(
+                &self,
+                messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                self.captured_messages.lock().await.push(messages.to_vec());
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => {
+                        // Round 0: call mem_store to save a finding
+                        Ok(crate::providers::base::LLMResponse {
+                            content: None,
+                            tool_calls: vec![ToolCallRequest {
+                                id: "mem_0".to_string(),
+                                name: "mem_store".to_string(),
+                                arguments: {
+                                    let mut m = HashMap::new();
+                                    m.insert("key".to_string(), json!("finding_1"));
+                                    m.insert("value".to_string(), json!("discovered 5 endpoints"));
+                                    m
+                                },
+                            }],
+                            finish_reason: "tool_calls".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                    1 => {
+                        // Round 1: model should see the finding in state → produce summary
+                        Ok(crate::providers::base::LLMResponse {
+                            content: Some("Found 5 endpoints in the API.".to_string()),
+                            tool_calls: vec![],
+                            finish_reason: "stop".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                    _ => {
+                        Ok(crate::providers::base::LLMResponse {
+                            content: Some("Unexpected call.".to_string()),
+                            tool_calls: vec![],
+                            finish_reason: "stop".to_string(),
+                            usage: HashMap::new(),
+                        })
+                    }
+                }
+            }
+
+            fn get_default_model(&self) -> &str {
+                "memory-capturing"
+            }
+        }
+
+        let provider = Arc::new(MemoryCapturingProvider {
+            captured_messages: tokio::sync::Mutex::new(Vec::new()),
+            call_count: AtomicU32::new(0),
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider: provider.clone(),
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: false,
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: None,
+            verbatim: false,
+            budget: None,
+        };
+
+        let result = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        ).await;
+
+        assert_eq!(result.summary.as_deref(), Some("Found 5 endpoints in the API."));
+
+        // Verify round 1's user message contains the finding from round 0.
+        let captured = provider.captured_messages.lock().await;
+        assert!(captured.len() >= 2, "Should have at least 2 LLM calls (round 0 + round 1)");
+
+        let round1_messages = &captured[1];
+        let user_msg = round1_messages.iter()
+            .find(|m| m["role"].as_str() == Some("user"))
+            .expect("Round 1 should have a user message");
+        let content = user_msg["content"].as_str().unwrap();
+        assert!(content.contains("finding_1"),
+            "Round 1 state should contain memory key from round 0, got: {}", content);
+        assert!(content.contains("discovered 5 endpoints"),
+            "Round 1 state should contain memory value from round 0, got: {}", content);
+    }
+
+    // -- needs_user_continuation irrelevance for scratch pad --
+
+    #[tokio::test]
+    async fn test_scratch_pad_ignores_needs_user_continuation() {
+        // With needs_user_continuation=true (local llama-server mode),
+        // the scratch pad should still send only [system, user] messages.
+        // No extra user continuation should be injected.
+        let provider = Arc::new(CapturingProvider::new());
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::new()));
+
+        let config = ToolRunnerConfig {
+            provider: provider.clone(),
+            model: "mock".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            needs_user_continuation: true, // key: local model mode
+            max_tool_result_chars: 30000,
+            short_circuit_chars: 0,
+            depth: 0,
+            cancellation_token: None,
+            verbatim: false,
+            budget: None,
+        };
+
+        let _ = run_tool_loop(
+            &config,
+            &make_tool_calls(&["test_tool"]),
+            &tools,
+            "test context",
+        ).await;
+
+        let captured = provider.captured_messages.lock().await;
+        assert!(!captured.is_empty(), "Scratch pad should make at least 1 LLM call");
+
+        // Every call to the scratch pad should have exactly 2 messages: system + user.
+        // No extra user continuation injected.
+        for (i, messages) in captured.iter().enumerate() {
+            assert_eq!(messages.len(), 2,
+                "Scratch pad round {} should have [system, user], got {} messages", i, messages.len());
+            assert_eq!(messages[0]["role"].as_str(), Some("system"),
+                "Round {} message 0 should be system", i);
+            assert_eq!(messages[1]["role"].as_str(), Some("user"),
+                "Round {} message 1 should be user", i);
+        }
     }
 }

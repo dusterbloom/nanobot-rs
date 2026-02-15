@@ -116,6 +116,22 @@ impl ContextStore {
     pub fn mem_keys(&self) -> Vec<&str> {
         self.memory.keys().map(|k| k.as_str()).collect()
     }
+
+    /// Get all memory key-value pairs for state reconstruction.
+    pub fn mem_entries(&self) -> &HashMap<String, String> {
+        &self.memory
+    }
+
+    /// Get all variable metadata (name, length, preview) without full content.
+    pub fn variable_metadata(&self) -> Vec<(String, usize, String)> {
+        let mut entries: Vec<_> = self.variables.iter().map(|(name, data)| {
+            let preview: String = data.chars().take(100).collect();
+            let ellipsis = if data.chars().count() > 100 { "..." } else { "" };
+            (name.clone(), data.chars().count(), format!("{}{}", preview, ellipsis))
+        }).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
 }
 
 /// Check if a tool name is a micro-tool.
@@ -648,5 +664,38 @@ mod tests {
             .collect();
         assert!(names.contains(&"mem_store"), "Should include mem_store, got: {:?}", names);
         assert!(names.contains(&"mem_recall"), "Should include mem_recall, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_variable_metadata_returns_sorted_entries() {
+        let mut store = ContextStore::new();
+        store.store("short".to_string());
+        store.store("x".repeat(200));
+
+        let meta = store.variable_metadata();
+        assert_eq!(meta.len(), 2);
+
+        // Sorted by name: output_0 before output_1
+        assert_eq!(meta[0].0, "output_0");
+        assert_eq!(meta[0].1, 5); // "short" = 5 chars
+        assert_eq!(meta[0].2, "short"); // preview, no ellipsis
+
+        assert_eq!(meta[1].0, "output_1");
+        assert_eq!(meta[1].1, 200);
+        // Preview is first 100 chars + "..."
+        assert!(meta[1].2.ends_with("..."), "Long preview should have ellipsis: {}", meta[1].2);
+        assert_eq!(meta[1].2.len(), 103); // 100 x's + "..."
+    }
+
+    #[test]
+    fn test_mem_entries_returns_all_memory() {
+        let mut store = ContextStore::new();
+        store.mem_store("finding_a", "value_a".to_string());
+        store.mem_store("finding_b", "value_b".to_string());
+
+        let entries = store.mem_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get("finding_a").map(|s| s.as_str()), Some("value_a"));
+        assert_eq!(entries.get("finding_b").map(|s| s.as_str()), Some("value_b"));
     }
 }
