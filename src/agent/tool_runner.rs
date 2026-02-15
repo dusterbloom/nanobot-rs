@@ -50,7 +50,7 @@ pub struct ToolRunnerConfig {
     pub budget: Option<Budget>,
 }
 
-/// Resource budget for a worker. Controls iterations, depth, and timeouts.
+/// Resource budget for a worker. Controls iterations, depth, cost, and timeouts.
 #[derive(Debug, Clone)]
 pub struct Budget {
     /// Maximum LLM iterations for this worker.
@@ -61,6 +61,12 @@ pub struct Budget {
     pub current_depth: u32,
     /// Budget multiplier for children (0.5 = children get half).
     pub budget_multiplier: f32,
+    /// Maximum cost in USD for this delegation (0.0 = unlimited).
+    pub cost_limit: f64,
+    /// Accumulated cost in USD so far.
+    pub cost_spent: f64,
+    /// Model prices for cost calculation.
+    pub prices: Option<std::sync::Arc<crate::agent::model_prices::ModelPrices>>,
 }
 
 impl Budget {
@@ -71,6 +77,27 @@ impl Budget {
             max_depth,
             current_depth: 0,
             budget_multiplier: 0.5,
+            cost_limit: 0.0,
+            cost_spent: 0.0,
+            prices: None,
+        }
+    }
+
+    /// Create a root budget with cost tracking.
+    pub fn root_with_cost(
+        max_iterations: u32,
+        max_depth: u32,
+        cost_limit: f64,
+        prices: std::sync::Arc<crate::agent::model_prices::ModelPrices>,
+    ) -> Self {
+        Self {
+            max_iterations,
+            max_depth,
+            current_depth: 0,
+            budget_multiplier: 0.5,
+            cost_limit,
+            cost_spent: 0.0,
+            prices: Some(prices),
         }
     }
 
@@ -84,12 +111,33 @@ impl Budget {
             max_depth: self.max_depth,
             current_depth: self.current_depth + 1,
             budget_multiplier: self.budget_multiplier,
+            cost_limit: (self.cost_limit - self.cost_spent).max(0.0) * self.budget_multiplier as f64,
+            cost_spent: 0.0,
+            prices: self.prices.clone(),
         })
     }
 
     /// Check if delegation is allowed at current depth.
     pub fn can_delegate(&self) -> bool {
         self.current_depth < self.max_depth
+    }
+
+    /// Record cost from an LLM response and return the cost of this call.
+    pub fn record_cost(&mut self, model: &str, usage: &std::collections::HashMap<String, i64>) -> f64 {
+        let prices = match &self.prices {
+            Some(p) => p,
+            None => return 0.0,
+        };
+        let prompt_tokens = usage.get("prompt_tokens").copied().unwrap_or(0);
+        let completion_tokens = usage.get("completion_tokens").copied().unwrap_or(0);
+        let cost = prices.cost_of(model, prompt_tokens, completion_tokens);
+        self.cost_spent += cost;
+        cost
+    }
+
+    /// Check if the cost budget is exhausted.
+    pub fn is_over_budget(&self) -> bool {
+        self.cost_limit > 0.0 && self.cost_spent >= self.cost_limit
     }
 }
 
@@ -161,12 +209,23 @@ async fn analyze_via_scratch_pad(
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut id_counter: usize = 1000; // offset to avoid collision with iteration-0 IDs
 
+    // Cost tracking: accumulate across rounds, stop if budget exceeded.
+    let mut cost_spent: f64 = 0.0;
+    let cost_limit = config.budget.as_ref().map_or(0.0, |b| b.cost_limit);
+    let prices = config.budget.as_ref().and_then(|b| b.prices.clone());
+
     let system_prompt = "You analyze stored data. Use micro-tools to inspect, mem_store to save findings.\nWhen you have enough information, write your final summary. STOP.\nPrevious findings are listed below — build on them, don't repeat work.\n/nothink";
 
     for round in 0..max_rounds {
         // Check cancellation.
         if config.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
             return Some("Analysis cancelled.".to_string());
+        }
+
+        // Check cost budget.
+        if cost_limit > 0.0 && cost_spent >= cost_limit {
+            debug!("Cost budget exhausted (${:.6} / ${:.6}) after {} rounds", cost_spent, cost_limit, round);
+            break;
         }
 
         // Build compact state from ContextStore memory + variable metadata.
@@ -206,6 +265,16 @@ async fn analyze_via_scratch_pad(
         if response.finish_reason == "error" {
             warn!("Scratch pad analysis got error response (round {}) — falling back", round);
             break;
+        }
+
+        // Track cost from this LLM call.
+        if let Some(ref p) = prices {
+            let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
+            let completion_tokens = response.usage.get("completion_tokens").copied().unwrap_or(0);
+            let call_cost = p.cost_of(&config.model, prompt_tokens, completion_tokens);
+            cost_spent += call_cost;
+            debug!("Analysis round {} cost: ${:.6} (total: ${:.6} / limit: ${:.6})",
+                round, call_cost, cost_spent, cost_limit);
         }
 
         if response.has_tool_calls() {
@@ -2629,6 +2698,9 @@ mod tests {
             max_depth: 5,
             current_depth: 0,
             budget_multiplier: 0.5,
+            cost_limit: 0.0,
+            cost_spent: 0.0,
+            prices: None,
         };
         let child = budget.child().unwrap();
         assert_eq!(child.max_iterations, 1, "Should not go below 1 iteration");
@@ -2639,6 +2711,82 @@ mod tests {
         let budget = Budget::root(10, 0);
         assert!(!budget.can_delegate());
         assert!(budget.child().is_none());
+    }
+
+    #[test]
+    fn test_budget_cost_tracking() {
+        let mut prices = crate::agent::model_prices::ModelPrices::empty();
+        // $1/MTok prompt, $2/MTok completion → per-token: 0.000001, 0.000002
+        prices.prices.insert("test/model".to_string(), (0.000001, 0.000002));
+        let prices = std::sync::Arc::new(prices);
+
+        let mut budget = Budget::root_with_cost(10, 2, 0.01, prices);
+        assert!(!budget.is_over_budget());
+
+        // 1000 prompt + 500 completion = 0.001 + 0.001 = 0.002
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("prompt_tokens".to_string(), 1000i64);
+        usage.insert("completion_tokens".to_string(), 500);
+        let cost = budget.record_cost("test/model", &usage);
+        assert!((cost - 0.002).abs() < 1e-9, "cost was {}", cost);
+        assert!(!budget.is_over_budget());
+
+        // Push over budget: 5000 prompt + 2500 completion = 0.005 + 0.005 = 0.01
+        usage.insert("prompt_tokens".to_string(), 5000);
+        usage.insert("completion_tokens".to_string(), 2500);
+        let cost2 = budget.record_cost("test/model", &usage);
+        assert!((cost2 - 0.01).abs() < 1e-9, "cost2 was {}", cost2);
+        // Total: 0.002 + 0.01 = 0.012 >= 0.01 limit
+        assert!(budget.is_over_budget());
+    }
+
+    #[test]
+    fn test_budget_cost_unknown_model_is_free() {
+        let prices = std::sync::Arc::new(crate::agent::model_prices::ModelPrices::empty());
+        let mut budget = Budget::root_with_cost(10, 2, 0.01, prices);
+
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("prompt_tokens".to_string(), 1_000_000i64);
+        usage.insert("completion_tokens".to_string(), 1_000_000);
+        let cost = budget.record_cost("local/unknown", &usage);
+        assert_eq!(cost, 0.0);
+        assert!(!budget.is_over_budget());
+    }
+
+    #[test]
+    fn test_budget_no_prices_is_free() {
+        let mut budget = Budget::root(10, 2);
+        assert!(budget.prices.is_none());
+
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("prompt_tokens".to_string(), 1_000_000i64);
+        usage.insert("completion_tokens".to_string(), 1_000_000);
+        let cost = budget.record_cost("anything", &usage);
+        assert_eq!(cost, 0.0);
+        assert!(!budget.is_over_budget()); // cost_limit is 0.0 = unlimited
+    }
+
+    #[test]
+    fn test_budget_child_inherits_remaining_cost() {
+        let mut prices = crate::agent::model_prices::ModelPrices::empty();
+        prices.prices.insert("test/model".to_string(), (0.000001, 0.000002));
+        let prices = std::sync::Arc::new(prices);
+
+        let mut budget = Budget::root_with_cost(10, 2, 0.10, prices);
+
+        // Spend $0.04
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("prompt_tokens".to_string(), 20_000i64);
+        usage.insert("completion_tokens".to_string(), 10_000);
+        budget.record_cost("test/model", &usage);
+        assert!((budget.cost_spent - 0.04).abs() < 1e-9);
+
+        // Child gets (0.10 - 0.04) * 0.5 = 0.03
+        let child = budget.child().unwrap();
+        assert!((child.cost_limit - 0.03).abs() < 1e-9,
+            "child cost_limit was {}", child.cost_limit);
+        assert_eq!(child.cost_spent, 0.0);
+        assert!(child.prices.is_some());
     }
 
     // -- build_analysis_state tests --

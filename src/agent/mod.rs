@@ -7,6 +7,7 @@ pub mod context;
 pub mod context_store;
 pub mod learning;
 pub mod memory;
+pub mod model_prices;
 pub mod observer;
 pub mod provenance;
 pub mod reflector;
