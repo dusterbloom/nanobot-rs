@@ -59,7 +59,7 @@ impl AnthropicProvider {
 ///
 /// - `"opus"` → `"claude-opus-4-6"`
 /// - `"opus-4-6"` → `"claude-opus-4-6"`
-/// - `"sonnet"` → `"claude-sonnet-4-20250514"`
+/// - `"sonnet"` → `"claude-sonnet-4-5-20250929"`
 /// - Already-qualified names pass through unchanged.
 fn normalize_claude_model(name: &str) -> String {
     let lower = name.to_lowercase();
@@ -72,8 +72,8 @@ fn normalize_claude_model(name: &str) -> String {
     // Bare aliases.
     match lower.as_str() {
         "opus" => return "claude-opus-4-6".to_string(),
-        "sonnet" => return "claude-sonnet-4-20250514".to_string(),
-        "haiku" => return "claude-haiku-4-5-20250414".to_string(),
+        "sonnet" => return "claude-sonnet-4-5-20250929".to_string(),
+        "haiku" => return "claude-haiku-4-5-20251001".to_string(),
         _ => {}
     }
 
@@ -915,8 +915,8 @@ mod tests {
     #[test]
     fn test_normalize_short_names() {
         assert_eq!(normalize_claude_model("opus"), "claude-opus-4-6");
-        assert_eq!(normalize_claude_model("sonnet"), "claude-sonnet-4-20250514");
-        assert_eq!(normalize_claude_model("haiku"), "claude-haiku-4-5-20250414");
+        assert_eq!(normalize_claude_model("sonnet"), "claude-sonnet-4-5-20250929");
+        assert_eq!(normalize_claude_model("haiku"), "claude-haiku-4-5-20251001");
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn test_normalize_already_qualified() {
         assert_eq!(normalize_claude_model("claude-opus-4-6"), "claude-opus-4-6");
-        assert_eq!(normalize_claude_model("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514");
+        assert_eq!(normalize_claude_model("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514"); // legacy passthrough
     }
 
     #[test]

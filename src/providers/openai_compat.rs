@@ -40,8 +40,8 @@ fn normalize_model_name(name: &str) -> String {
     // Short aliases (bare word).
     match lower.as_str() {
         "opus" => return "claude-opus-4-6".to_string(),
-        "sonnet" => return "claude-sonnet-4-20250514".to_string(),
-        "haiku" => return "claude-haiku-4-5-20250414".to_string(),
+        "sonnet" => return "claude-sonnet-4-5-20250929".to_string(),
+        "haiku" => return "claude-haiku-4-5-20251001".to_string(),
         "local" => return name.to_string(),
         _ => {}
     }
@@ -829,11 +829,11 @@ mod tests {
     #[test]
     fn test_normalize_short_aliases() {
         assert_eq!(normalize_model_name("opus"), "claude-opus-4-6");
-        assert_eq!(normalize_model_name("sonnet"), "claude-sonnet-4-20250514");
-        assert_eq!(normalize_model_name("haiku"), "claude-haiku-4-5-20250414");
+        assert_eq!(normalize_model_name("sonnet"), "claude-sonnet-4-5-20250929");
+        assert_eq!(normalize_model_name("haiku"), "claude-haiku-4-5-20251001");
         // Case-insensitive.
         assert_eq!(normalize_model_name("Opus"), "claude-opus-4-6");
-        assert_eq!(normalize_model_name("SONNET"), "claude-sonnet-4-20250514");
+        assert_eq!(normalize_model_name("SONNET"), "claude-sonnet-4-5-20250929");
     }
 
     #[test]
@@ -844,8 +844,8 @@ mod tests {
             "claude-sonnet-4-5-20250929"
         );
         assert_eq!(
-            normalize_model_name("haiku-4-5-20250414"),
-            "claude-haiku-4-5-20250414"
+            normalize_model_name("haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
         );
     }
 

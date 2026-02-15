@@ -174,14 +174,14 @@ pub fn load_profiles(workspace: &Path) -> HashMap<String, AgentProfile> {
 ///
 /// Aliases:
 /// - "local" → kept as "local" (handled by provider selection)
-/// - "haiku" → "claude-haiku-4-5-20250414"
-/// - "sonnet" → "claude-sonnet-4-20250514"
+/// - "haiku" → "claude-haiku-4-5-20251001"
+/// - "sonnet" → "claude-sonnet-4-5-20250929"
 /// - "opus" → "claude-opus-4-6"
 /// - anything else → passed through as-is
 pub fn resolve_model_alias(alias: &str) -> String {
     match alias.to_lowercase().as_str() {
-        "haiku" => "claude-haiku-4-5-20250414".to_string(),
-        "sonnet" => "claude-sonnet-4-20250514".to_string(),
+        "haiku" => "claude-haiku-4-5-20251001".to_string(),
+        "sonnet" => "claude-sonnet-4-5-20250929".to_string(),
         "opus" => "claude-opus-4-6".to_string(),
         "local" => "local".to_string(),
         other => other.to_string(),
@@ -283,12 +283,12 @@ Do stuff."#;
 
     #[test]
     fn test_resolve_model_alias() {
-        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20250414");
-        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-20250514");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251001");
+        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-5-20250929");
         assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
         assert_eq!(
             resolve_model_alias("Haiku"),
-            "claude-haiku-4-5-20250414"
+            "claude-haiku-4-5-20251001"
         ); // case insensitive
         assert_eq!(resolve_model_alias("local"), "local");
         assert_eq!(resolve_model_alias("custom-model-v2"), "custom-model-v2");
