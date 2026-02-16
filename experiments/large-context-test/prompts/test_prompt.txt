@@ -1,0 +1,24 @@
+You have a CSV file at /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+
+This file contains ~500 ArXiv paper abstracts from cs.CL, cs.AI, and cs.LG categories.
+
+Your task:
+
+1. FIRST, explore the CSV to understand its structure. Read the first 20 rows to see the columns and format.
+
+2. SECOND, identify the TOP 5 most-published authors in this dataset. Count how many papers each author has.
+
+3. THIRD, for each of those 5 authors, spawn a SUBAGENT to:
+   - Find all their papers in the dataset
+   - Search for mentions of "emergent capabilities", "emergence", "scaling laws", or "phase transition" in their abstracts
+   - Extract relevant quotes or summarize what they say about these topics
+   - Return a structured summary
+
+   IMPORTANT: Spawn all 5 subagents IN PARALLEL, not sequentially. Each subagent should only receive the relevant author's paper abstracts, not the entire dataset.
+
+4. FOURTH, aggregate all subagent findings into a final summary that answers:
+   - Which authors discuss emergence/scaling phenomena?
+   - What are the key insights each author contributes?
+   - Are there any disagreements or different perspectives?
+
+Be efficient. Use parallel subagents. Report progress as you work.

@@ -1,0 +1,42 @@
+You have a CSV file at /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+
+## CRITICAL RULES
+1. NEVER use read_file on this CSV - it will consume too much context
+2. ONLY use the exec tool with shell commands for data operations
+3. Pre-filter data to temporary files BEFORE spawning subagents
+4. Each subagent should receive a path to a pre-filtered file, not the whole dataset
+
+## Task
+
+### Step 1: Explore Structure (exec only)
+Run: head -1 /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+Report the column names.
+
+### Step 2: Find Top 3 Authors (exec only)
+Use shell commands to count papers per author and find the top 3.
+The authors column is column 3, with multiple authors separated by semicolons.
+Commands to use: cut, tr, sort, uniq, head
+
+Example pipeline:
+cut -d',' -f3 file.csv | tail -n +2 | tr ';' '\n' | sed 's/^ *//;s/ *$//' | sort | uniq -c | sort -rn | head -3
+
+### Step 3: Pre-filter Data (exec only)
+For each of the top 3 authors found, create a filtered temp file:
+- grep -i "Author Name" /path/to/file.csv > /tmp/author_1.csv
+- grep -i "Author Name" /path/to/file.csv > /tmp/author_2.csv  
+- grep -i "Author Name" /path/to/file.csv > /tmp/author_3.csv
+
+Verify each file has data with wc -l
+
+### Step 4: Spawn Subagents (parallel)
+For each temp file, spawn a subagent with this exact task format:
+
+"Read the CSV at /tmp/author_N.csv using read_file. Search for any mentions of 'emergence', 'emergent', 'scaling', or 'phase transition' in the abstracts. Quote the relevant sentences and summarize what this author says about these topics. If no mentions found, say so."
+
+Spawn ALL 3 subagents at once in a SINGLE message with 3 spawn tool calls. Do not wait for one to finish before spawning the next.
+
+### Step 5: Synthesize
+After all subagents complete, write a final summary answering:
+- Which authors discuss emergence/scaling?
+- What are their key insights?
+- Are there any common themes or disagreements?

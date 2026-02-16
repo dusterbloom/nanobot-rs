@@ -1,0 +1,13 @@
+You have a CSV file at /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+
+This file contains ~88 ArXiv paper abstracts.
+
+Your task:
+
+1. Read the FIRST 20 ROWS of the CSV to understand the structure and see some data.
+
+2. From those 20 rows, count how many papers each author has. List the top 3 authors.
+
+3. For each of those 3 authors, spawn a SUBAGENT to search for mentions of "emergence" or "scaling" in their abstracts.
+
+Spawn subagents IN PARALLEL.

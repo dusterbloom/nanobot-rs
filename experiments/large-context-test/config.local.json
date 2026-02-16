@@ -1,0 +1,40 @@
+{
+    "agents": {
+        "defaults": {
+            "workspace": "/home/peppi/Dev/nanobot/experiments/large-context-test/workspace",
+            "model": "Ministral-8B-Instruct-Q4_K_M.gguf",
+            "maxTokens": 2048,
+            "temperature": 0.7,
+            "maxToolIterations": 30,
+            "maxContextTokens": 14000
+        }
+    },
+    "providers": {
+        "vllm": {
+            "apiKey": "none",
+            "apiBase": "http://localhost:8080/v1"
+        },
+        "groq": {
+            "apiKey": "none",
+            "apiBase": "http://localhost:8083/v1"
+        }
+    },
+    "toolDelegation": {
+        "enabled": false,
+        "defaultSubagentModel": "groq/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+    },
+    "memory": {
+        "lazySkills": true,
+        "workingMemoryBudget": 500,
+        "maxHistoryTurns": 5
+    },
+    "provenance": {
+        "enabled": false
+    },
+    "tools": {
+        "exec": {
+            "timeout": 300,
+            "restrictToWorkspace": false
+        }
+    }
+}

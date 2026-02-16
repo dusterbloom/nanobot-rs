@@ -1,0 +1,9 @@
+You have a CSV file at /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+
+Task:
+1. Use the exec tool to run: head -5 /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+   This shows you the first 5 lines.
+
+2. Use exec to count total rows: wc -l /home/peppi/Dev/nanobot/experiments/large-context-test/data/arxiv_papers.csv
+
+3. Report the column names and row count.

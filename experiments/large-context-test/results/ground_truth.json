@@ -1,0 +1,98 @@
+{
+  "metadata": {
+    "total_papers": 88,
+    "keywords_searched": [
+      "emergent capabilities",
+      "emergence",
+      "scaling laws",
+      "scaling law",
+      "phase transition",
+      "emergent ability",
+      "emergent behavior",
+      "few-shot",
+      "zero-shot",
+      "chain-of-thought"
+    ],
+    "top_authors": [
+      {
+        "name": "Zhan Qu",
+        "paper_count": 3
+      },
+      {
+        "name": "Michael Färber",
+        "paper_count": 3
+      },
+      {
+        "name": "Juneyoung Park",
+        "paper_count": 2
+      },
+      {
+        "name": "Ming Zhang",
+        "paper_count": 2
+      },
+      {
+        "name": "Yue Huang",
+        "paper_count": 2
+      }
+    ]
+  },
+  "authors": {
+    "Zhan Qu": {
+      "author": "Zhan Qu",
+      "paper_count": 3,
+      "papers_with_keywords": 0,
+      "total_keyword_matches": 0,
+      "findings": []
+    },
+    "Michael Färber": {
+      "author": "Michael Färber",
+      "paper_count": 3,
+      "papers_with_keywords": 0,
+      "total_keyword_matches": 0,
+      "findings": []
+    },
+    "Juneyoung Park": {
+      "author": "Juneyoung Park",
+      "paper_count": 2,
+      "papers_with_keywords": 0,
+      "total_keyword_matches": 0,
+      "findings": []
+    },
+    "Ming Zhang": {
+      "author": "Ming Zhang",
+      "paper_count": 2,
+      "papers_with_keywords": 1,
+      "total_keyword_matches": 2,
+      "findings": [
+        {
+          "title": "Constraint-Rectified Training for Efficient Chain-of-Thought",
+          "arxiv_id": "2602.12526v1",
+          "matches": [
+            {
+              "keyword": "emergence",
+              "context": "liable reasoning patterns and then refines accuracy under a learnt length budget, preventing the re-emergence of verbose CoT. Our comprehensive evaluation shows that this framework consistently reduces token u",
+              "position": 1319
+            },
+            {
+              "keyword": "chain-of-thought",
+              "context": "Chain-of-Thought (CoT) has significantly enhanced the reasoning capabilities of Large Language Models (LLMs), especi",
+              "position": 0
+            }
+          ]
+        }
+      ]
+    },
+    "Yue Huang": {
+      "author": "Yue Huang",
+      "paper_count": 2,
+      "papers_with_keywords": 0,
+      "total_keyword_matches": 0,
+      "findings": []
+    }
+  },
+  "summary": {
+    "authors_discussing_emergence": 1,
+    "total_keyword_matches": 2,
+    "most_discussed_author": "Ming Zhang"
+  }
+}

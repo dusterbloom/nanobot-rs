@@ -26,9 +26,9 @@ Zero-cost LLM inference via Claude Max subscription ($200/mo) with full fidelity
   - [x] Fix: UTF-8 safe string truncation — `floor_char_boundary()` helper, fixed 8 panic sites
   - [x] Fix: Subagent display styling — bypass markdown rendering for ANSI-formatted blocks
   - [x] Feat: Spawn tool list/cancel actions for subagent management
-- Now: Idle — core provider working, hardening complete
+- Now: [DONE] — All core phases complete
 - Remaining:
-  - [ ] Phase 4: Gate or delete `ClaudeCodeProvider` (`src/providers/claude_code.rs`)
+  - [x] Phase 4: Deleted `ClaudeCodeProvider` (`src/providers/claude_code.rs`) — zero external refs [2026-02-16]
   - [ ] Token auto-refresh mid-session (Option B from plan — needed if sessions exceed 8h)
   - [ ] Investigate delegation model "returned no summary" warning
   - [ ] End-to-end test: tool calling via OAuth path

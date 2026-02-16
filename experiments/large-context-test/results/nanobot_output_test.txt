@@ -1,0 +1,4 @@
+
+[2m2026-02-16T16:10:46.986486Z[0m [33m WARN[0m [2mnanobot::providers::anthropic[0m[2m:[0m Anthropic streaming API returned 404 Not Found: {"type":"error","error":{"type":"not_found_error","message":"model: local-main"},"request_id":"req_011CYC3J6yzh5HW3pKVKWTgT"}
+[2m2026-02-16T16:10:46.986550Z[0m [31mERROR[0m [2mnanobot::agent::agent_loop[0m[2m:[0m LLM provider error: Error calling Anthropic API (HTTP 404 Not Found): {"type":"error","error":{"type":"not_found_error","message":"model: local-main"},"request_id":"req_011CYC3J6yzh5HW3pKVKWTgT"}
+
