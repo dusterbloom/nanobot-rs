@@ -266,7 +266,7 @@ impl ReplContext {
 
         let thinking = counters.thinking_budget.load(Ordering::Relaxed);
         if thinking > 0 {
-            println!("  {}THINKING{}  \u{1f9e0} enabled (budget: {} tokens)", tui::BOLD, tui::RESET, thinking);
+            println!("  {}THINKING{}  {}\u{1f9e0}{} enabled (budget: {} tokens)", tui::BOLD, tui::RESET, tui::GREY, tui::RESET, thinking);
         }
 
         let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
@@ -560,7 +560,7 @@ impl ReplContext {
                 Ok(budget) => {
                     let clamped = budget.clamp(1024, 128000);
                     counters.thinking_budget.store(clamped, Ordering::Relaxed);
-                    println!("\n  \u{1f9e0} Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", clamped);
+                    println!("\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", clamped);
                 }
                 Err(_) => {
                     println!("\n  Usage: /think [budget]\n  Examples: /think, /think 16000, /think 0\n");
@@ -576,7 +576,7 @@ impl ReplContext {
                 // Default budget: half of max_tokens, clamped to [1024, 32000]
                 let default_budget = (core.max_tokens / 2).clamp(1024, 32000);
                 counters.thinking_budget.store(default_budget, Ordering::Relaxed);
-                println!("\n  \u{1f9e0} Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
+                println!("\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
             }
         }
     }

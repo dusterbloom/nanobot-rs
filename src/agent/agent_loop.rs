@@ -779,7 +779,7 @@ impl AgentLoopShared {
                             // Render thinking tokens as dimmed text
                             if !in_thinking {
                                 in_thinking = true;
-                                let _ = delta_tx.send("\x1b[2m🧠 ".to_string());
+                                let _ = delta_tx.send("\x1b[90m🧠 \x1b[2m".to_string());
                             }
                             let _ = delta_tx.send(delta);
                         }

@@ -20,6 +20,7 @@ pub const YELLOW: &str = "\x1b[33m";
 pub const RED: &str = "\x1b[31m";
 pub const MAGENTA: &str = "\x1b[35m";
 pub const WHITE: &str = "\x1b[97m";
+pub const GREY: &str = "\x1b[90m";
 pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 pub const HIDE_CURSOR: &str = "\x1b[?25l";
 pub const SHOW_CURSOR: &str = "\x1b[?25h";
@@ -77,6 +78,106 @@ pub(crate) fn format_thousands(n: usize) -> String {
 }
 
 // ============================================================================
+// Input Bar (Claude Code-style)
+// ============================================================================
+
+/// Get terminal width, defaulting to 80 if unavailable.
+pub(crate) fn terminal_width() -> usize {
+    termimad::crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+}
+
+/// Render a Claude Code-style input context bar below the prompt.
+///
+/// Layout:
+/// ```text
+/// ──────────────────────────────────────────────
+///   ~/Dev/nanobot · opus-4-6 · 🧠 thinking
+///   ⏵⏵ /t think · /l local · /v voice · ctx 12K/1M
+/// ```
+///
+/// Returns the number of lines printed (for cursor repositioning).
+pub(crate) fn render_input_bar(
+    core_handle: &crate::agent::agent_loop::SharedCoreHandle,
+    channel_names: &[&str],
+    subagent_count: usize,
+) -> usize {
+    use std::sync::atomic::Ordering;
+
+    let counters = &core_handle.counters;
+    let width = terminal_width().min(100);
+    let separator = "─".repeat(width);
+
+    // Gather info
+    let thinking_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+    let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
+    let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
+
+    // Line 1: separator
+    println!("{DIM}{separator}{RESET}");
+
+    // Line 2: cwd + model + thinking
+    let cwd = std::env::current_dir()
+        .map(|p| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let s = p.display().to_string();
+            if !home.is_empty() && s.starts_with(&home) {
+                format!("~{}", &s[home.len()..])
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|_| "?".into());
+
+    let model_name = {
+        let core = core_handle.swappable();
+        core.model.clone()
+    };
+
+    let think_str = if thinking_on {
+        format!(" · {GREY}\u{1f9e0} thinking{RESET}")
+    } else {
+        String::new()
+    };
+
+    println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
+
+    // Line 3: hints + stats
+    let mut hints: Vec<String> = Vec::new();
+    hints.push(format!("{DIM}⏵⏵ /t think · /l local · /v voice{RESET}"));
+
+    if subagent_count > 0 {
+        hints.push(format!(
+            "{CYAN}{} agent{}{RESET}",
+            subagent_count,
+            if subagent_count > 1 { "s" } else { "" }
+        ));
+    }
+
+    if !channel_names.is_empty() {
+        hints.push(format!("{CYAN}{}{RESET}", channel_names.join(" ")));
+    }
+
+    if max > 0 {
+        let pct = (used * 100) / max;
+        let ctx_color = match pct {
+            0..=49 => GREEN,
+            50..=79 => YELLOW,
+            _ => RED,
+        };
+        hints.push(format!(
+            "ctx {ctx_color}{}{RESET}/{DIM}{}{RESET}",
+            format_tokens(used),
+            format_tokens(max)
+        ));
+    }
+
+    println!("  {}", hints.join(" · "));
+
+    3 // lines printed
+}
+
 // Status Bar & Banners
 // ============================================================================
 
@@ -159,7 +260,7 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
 
     // Thinking mode indicator
     if core_handle.counters.thinking_budget.load(Ordering::Relaxed) > 0 {
-        parts.push("\u{1f9e0}".to_string());
+        parts.push(format!("{GREY}\u{1f9e0}{RESET}"));
     }
 
     parts.push(format!("t:{}", turn));

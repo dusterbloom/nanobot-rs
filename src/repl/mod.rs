@@ -158,7 +158,7 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 
 /// Build the REPL prompt string based on current mode.
 pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
-    let think_prefix = if thinking_on { "\u{1f9e0}" } else { "" };
+    let think_prefix = if thinking_on { "\x1b[90m\u{1f9e0}\x1b[0m" } else { "" };
     if voice_on {
         format!("{}{}{}~>{} ", think_prefix, crate::tui::BOLD, crate::tui::MAGENTA, crate::tui::RESET)
     } else if is_local {
@@ -1035,6 +1035,19 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 let thinking_on = ctx.core_handle.counters.thinking_budget.load(Ordering::SeqCst) > 0;
                 let prompt = build_prompt(is_local, voice_on, thinking_on);
 
+                // Render Claude Code-style input bar below the prompt line.
+                let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
+                ctx.active_channels.retain(|ch| !ch.handle.is_finished());
+                let ch_names: Vec<&str> = ctx.active_channels.iter()
+                    .map(|c| short_channel_name(&c.name))
+                    .collect();
+                let bar_lines = tui::render_input_bar(
+                    &ctx.core_handle, &ch_names, sa_count,
+                );
+                // Move cursor back up so readline draws on the line above the bar.
+                print!("\x1b[{}A", bar_lines);
+                io::stdout().flush().ok();
+
                 // === GET INPUT ===
                 let input_text: String;
                 let mut do_record = false;
@@ -1075,6 +1088,11 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         Err(_) => break,
                     }
                 }
+
+                // Erase the input bar lines below the cursor after input is received.
+                // Save cursor, move down, clear those lines, restore cursor.
+                print!("\x1b[s\x1b[J\x1b[u");
+                io::stdout().flush().ok();
 
                 // === VOICE RECORDING ===
                 // Uses the same stream_and_render pipeline as text mode for
