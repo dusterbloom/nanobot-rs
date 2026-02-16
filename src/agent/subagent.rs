@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use chrono::Utc;
 
 use crate::agent::agent_profiles::{self, AgentProfile};
 use crate::agent::context::ContextBuilder;
@@ -93,7 +94,7 @@ pub struct SubagentManager {
     /// delivers results to channels, but in CLI mode nobody reads the bus
     /// so we send directly to the terminal.
     display_tx: Option<UnboundedSender<String>>,
-    running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>)>>>,
+    running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>, broadcast::Sender<String>)>>>,
 }
 
 impl SubagentManager {
@@ -108,6 +109,9 @@ impl SubagentManager {
         restrict_to_workspace: bool,
         is_local: bool,
     ) -> Self {
+        // Rotate event log if >100MB before anything else.
+        Self::rotate_event_log(&workspace);
+
         // Load profiles from standard locations.
         let profiles = agent_profiles::load_profiles(&workspace);
         if !profiles.is_empty() {
@@ -265,6 +269,9 @@ impl SubagentManager {
                 Err(e) => (format!("Error: {}", e), "failed"),
             };
 
+            // Write result to scratch file for persistence across compaction.
+            Self::append_event(&workspace, &tid, &lbl, &tsk, &result_text, status);
+
             Self::_announce_result(
                 &bus_tx,
                 &tid,
@@ -302,10 +309,15 @@ impl SubagentManager {
                 let _ = dtx.send(block);
             }
 
-            // Remove self from running tasks.
+            // Broadcast result to any waiting subscribers, then remove from running tasks.
             let mut tasks = running_tasks.lock().await;
-            tasks.remove(&tid);
+            if let Some((_, _, result_tx)) = tasks.remove(&tid) {
+                let _ = result_tx.send(result_text);
+            }
         });
+
+        // Create a broadcast channel for wait subscribers (capacity 1 — single result).
+        let (result_tx, _) = broadcast::channel(1);
 
         // Track the task.
         {
@@ -315,7 +327,7 @@ impl SubagentManager {
                 started_at: std::time::Instant::now(),
             };
             let mut tasks = self.running_tasks.lock().await;
-            tasks.insert(task_id.clone(), (info, handle));
+            tasks.insert(task_id.clone(), (info, handle, result_tx));
         }
 
         let agent_note = agent_name
@@ -330,15 +342,15 @@ impl SubagentManager {
     /// Get the count of currently running subagent tasks.
     pub async fn get_running_count(&self) -> usize {
         let mut tasks = self.running_tasks.lock().await;
-        tasks.retain(|_, (_, h)| !h.is_finished());
+        tasks.retain(|_, (_, h, _)| !h.is_finished());
         tasks.len()
     }
 
     /// List all running subagent tasks.
     pub async fn list_running(&self) -> Vec<SubagentInfo> {
         let mut tasks = self.running_tasks.lock().await;
-        tasks.retain(|_, (_, h)| !h.is_finished());
-        tasks.values().map(|(info, _)| info.clone()).collect()
+        tasks.retain(|_, (_, h, _)| !h.is_finished());
+        tasks.values().map(|(info, _, _)| info.clone()).collect()
     }
 
     /// Cancel a running subagent by task ID (or prefix match).
@@ -346,12 +358,60 @@ impl SubagentManager {
         let mut tasks = self.running_tasks.lock().await;
         let key = tasks.keys().find(|k| k.starts_with(task_id)).cloned();
         if let Some(k) = key {
-            if let Some((_, handle)) = tasks.remove(&k) {
+            if let Some((_, handle, _)) = tasks.remove(&k) {
                 handle.abort();
                 return true;
             }
         }
         false
+    }
+
+    /// Wait for a running subagent to complete, returning its result.
+    ///
+    /// Subscribes to the broadcast channel for the given task and waits
+    /// up to `timeout` for the result. Returns the result text on success,
+    /// or an error message on timeout / not found.
+    pub async fn wait_for(&self, task_id: &str, timeout: std::time::Duration) -> String {
+        // Find the task and subscribe to its result channel.
+        let mut rx = {
+            let tasks = self.running_tasks.lock().await;
+            let key = tasks.keys().find(|k| k.starts_with(task_id)).cloned();
+            match key {
+                Some(k) => {
+                    let (info, _, result_tx) = tasks.get(&k).unwrap();
+                    // Check if already finished (JoinHandle done but not yet cleaned up).
+                    debug!("Waiting for subagent {} ({})", info.label, k);
+                    result_tx.subscribe()
+                }
+                None => {
+                    // Task not found — check event log for completed results.
+                    if let Some(result) = Self::read_event_result(&self.workspace, task_id) {
+                        return format!("Subagent already completed:\n\n{}", result);
+                    }
+                    return format!(
+                        "No running subagent found matching '{}'. It may have already completed \
+                         (check events.jsonl in workspace).",
+                        task_id
+                    );
+                }
+            }
+        };
+
+        // Wait for the result with timeout.
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Ok(result)) => {
+                // Result also persisted in events.jsonl.
+                result
+            }
+            Ok(Err(e)) => format!("Subagent result channel error: {}", e),
+            Err(_) => format!(
+                "Timed out waiting for subagent '{}' after {}s. \
+                 It is still running — use 'spawn list' to check status \
+                 or 'spawn cancel' to abort.",
+                task_id,
+                timeout.as_secs()
+            ),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -551,6 +611,86 @@ impl SubagentManager {
         }
 
         Ok(final_content)
+    }
+
+    /// Append a single JSONL event to `{workspace}/events.jsonl`.
+    ///
+    /// Replaces the old scratch-file approach: one append-only log that
+    /// survives compaction and is trivial to parse. Rotate is handled at
+    /// startup by `rotate_event_log()`.
+    fn append_event(
+        workspace: &PathBuf,
+        task_id: &str,
+        label: &str,
+        task: &str,
+        result: &str,
+        status: &str,
+    ) {
+        use std::io::Write;
+        let event_path = workspace.join("events.jsonl");
+        let event = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "kind": "subagent_result",
+            "task_id": task_id,
+            "label": label,
+            "task": task,
+            "status": status,
+            "result": result,
+        });
+        let line = format!("{}\n", event);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&event_path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    warn!("Failed to append event: {}", e);
+                }
+            }
+            Err(e) => warn!("Failed to open events.jsonl: {}", e),
+        }
+    }
+
+    /// Rotate event log if it exceeds 100 MB. Called once from `new()`.
+    fn rotate_event_log(workspace: &PathBuf) {
+        let event_path = workspace.join("events.jsonl");
+        if let Ok(meta) = std::fs::metadata(&event_path) {
+            if meta.len() > 100 * 1024 * 1024 {
+                let rotated = workspace.join("events.jsonl.old");
+                if let Err(e) = std::fs::rename(&event_path, &rotated) {
+                    warn!("Failed to rotate event log: {}", e);
+                } else {
+                    info!("Rotated events.jsonl ({:.1} MB)", meta.len() as f64 / 1e6);
+                }
+            }
+        }
+    }
+
+    /// Search event log for a completed subagent result by task_id prefix.
+    fn read_event_result(workspace: &PathBuf, task_id_prefix: &str) -> Option<String> {
+        let event_path = workspace.join("events.jsonl");
+        let content = std::fs::read_to_string(&event_path).ok()?;
+        // Scan lines in reverse (most recent first).
+        for line in content.lines().rev() {
+            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
+                if ev["kind"] == "subagent_result"
+                    && ev["task_id"]
+                        .as_str()
+                        .map(|id| id.starts_with(task_id_prefix))
+                        .unwrap_or(false)
+                {
+                    let status = ev["status"].as_str().unwrap_or("unknown");
+                    let result = ev["result"].as_str().unwrap_or("");
+                    let label = ev["label"].as_str().unwrap_or("");
+                    return Some(format!(
+                        "Subagent '{}' ({}) — status: {}\n\n{}",
+                        label, task_id_prefix, status, result
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Announce the subagent result to the bus as an InboundMessage.

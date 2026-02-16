@@ -39,6 +39,16 @@ pub type CancelCallback = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
 >;
 
+/// Type alias for the wait callback. Takes task_id prefix + timeout secs, returns result.
+pub type WaitCallback = Arc<
+    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
+>;
+
+/// Type alias for the pipeline callback. Takes (steps_json, ahead_by_k) -> result string.
+pub type PipelineCallback = Arc<
+    dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
+>;
+
 /// Tool to spawn a subagent for background task execution.
 ///
 /// The subagent runs asynchronously and announces its result back
@@ -51,6 +61,8 @@ pub struct SpawnTool {
     spawn_callback: Arc<Mutex<Option<SpawnCallback>>>,
     list_callback: Arc<Mutex<Option<ListCallback>>>,
     cancel_callback: Arc<Mutex<Option<CancelCallback>>>,
+    wait_callback: Arc<Mutex<Option<WaitCallback>>>,
+    pipeline_callback: Arc<Mutex<Option<PipelineCallback>>>,
     origin_channel: Arc<Mutex<String>>,
     origin_chat_id: Arc<Mutex<String>>,
 }
@@ -62,6 +74,8 @@ impl SpawnTool {
             spawn_callback: Arc::new(Mutex::new(None)),
             list_callback: Arc::new(Mutex::new(None)),
             cancel_callback: Arc::new(Mutex::new(None)),
+            wait_callback: Arc::new(Mutex::new(None)),
+            pipeline_callback: Arc::new(Mutex::new(None)),
             origin_channel: Arc::new(Mutex::new("cli".to_string())),
             origin_chat_id: Arc::new(Mutex::new("direct".to_string())),
         }
@@ -87,6 +101,16 @@ impl SpawnTool {
     pub async fn set_cancel_callback(&self, callback: CancelCallback) {
         *self.cancel_callback.lock().await = Some(callback);
     }
+
+    /// Set the wait callback for blocking until a subagent completes.
+    pub async fn set_wait_callback(&self, callback: WaitCallback) {
+        *self.wait_callback.lock().await = Some(callback);
+    }
+
+    /// Set the pipeline callback for running multi-step pipelines.
+    pub async fn set_pipeline_callback(&self, callback: PipelineCallback) {
+        *self.pipeline_callback.lock().await = Some(callback);
+    }
 }
 
 impl Default for SpawnTool {
@@ -102,9 +126,10 @@ impl Tool for SpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a task in the background, list running subagents, or cancel one. \
+        "Spawn a subagent to handle a task in the background, list running subagents, wait for one to finish, or cancel one. \
          Use action='spawn' (default) to start a new subagent. \
          Use action='list' to check status of running subagents. \
+         Use action='wait' with task_id to block until a subagent finishes and get its result (saves iterations vs polling). \
          Use action='cancel' with task_id to abort a stuck subagent. \
          Use 'agent' to pick a specialized profile (explore, reviewer, builder, researcher) \
          and 'model' to control cost (e.g. 'haiku' for cheap/fast tasks)."
@@ -116,8 +141,23 @@ impl Tool for SpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: 'spawn' (default), 'list', or 'cancel'",
-                    "enum": ["spawn", "list", "cancel"]
+                    "description": "Action to perform: 'spawn' (default), 'list', 'wait', 'cancel', or 'pipeline'",
+                    "enum": ["spawn", "list", "wait", "cancel", "pipeline"]
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "Pipeline steps array (for action='pipeline'). Each step: {prompt, expected?}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": { "type": "string" },
+                            "expected": { "type": "string" }
+                        }
+                    }
+                },
+                "ahead_by_k": {
+                    "type": "integer",
+                    "description": "MAKER voting margin (for action='pipeline'). 0 = no voting. Default: 0"
                 },
                 "task": {
                     "type": "string",
@@ -125,7 +165,11 @@ impl Tool for SpawnTool {
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Task ID or prefix to cancel (required for action='cancel')"
+                    "description": "Task ID or prefix to wait for or cancel (required for action='wait' and action='cancel')"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for action='wait' (default: 120)"
                 },
                 "label": {
                     "type": "string",
@@ -175,6 +219,45 @@ impl Tool for SpawnTool {
                         cb(task_id).await
                     }
                     None => "Error: Cancel callback not configured".to_string(),
+                }
+            }
+            "wait" => {
+                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+                    Some(id) => id.to_string(),
+                    None => return "Error: 'task_id' parameter is required for wait".to_string(),
+                };
+                let timeout = params
+                    .get("timeout")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120);
+                let cb_guard = self.wait_callback.lock().await;
+                match cb_guard.as_ref() {
+                    Some(cb) => {
+                        let cb = cb.clone();
+                        drop(cb_guard);
+                        cb(task_id, timeout).await
+                    }
+                    None => "Error: Wait callback not configured".to_string(),
+                }
+            }
+            "pipeline" => {
+                let steps_json = match params.get("steps") {
+                    Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
+                    None => return "Error: 'steps' parameter is required for pipeline".to_string(),
+                };
+                let ahead_by_k = params
+                    .get("ahead_by_k")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+
+                let cb_guard = self.pipeline_callback.lock().await;
+                match cb_guard.as_ref() {
+                    Some(cb) => {
+                        let cb = cb.clone();
+                        drop(cb_guard);
+                        cb(steps_json, ahead_by_k).await
+                    }
+                    None => "Error: Pipeline callback not configured".to_string(),
                 }
             }
             "spawn" | _ => {
