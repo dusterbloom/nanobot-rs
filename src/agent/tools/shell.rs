@@ -268,6 +268,21 @@ impl ExecTool {
 
         None
     }
+
+    /// Resolve the working directory from params, falling back to the
+    /// configured default, then `current_dir()`, then `"."`.
+    fn resolve_cwd(&self, params: &HashMap<String, serde_json::Value>) -> String {
+        params
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| self.working_dir.clone())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            })
+    }
 }
 
 #[async_trait]
@@ -303,18 +318,7 @@ impl Tool for ExecTool {
             None => return "Error: 'command' parameter is required".to_string(),
         };
 
-        let param_cwd = params
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let cwd = param_cwd
-            .or_else(|| self.working_dir.clone())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
+        let cwd = self.resolve_cwd(&params);
 
         // Safety guard.
         if let Some(error) = self.guard_command(command, &cwd) {
@@ -390,18 +394,7 @@ impl Tool for ExecTool {
             None => return "Error: 'command' parameter is required".to_string(),
         };
 
-        let param_cwd = params
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let cwd = param_cwd
-            .or_else(|| self.working_dir.clone())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
+        let cwd = self.resolve_cwd(&params);
 
         if let Some(error) = self.guard_command(command, &cwd) {
             return error;

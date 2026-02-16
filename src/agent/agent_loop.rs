@@ -401,9 +401,9 @@ impl AgentLoopShared {
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, agent, model, ch, cid| {
+        let spawn_cb: SpawnCallback = Arc::new(move |task, label, agent, model, ch, cid, working_dir| {
             let mgr = subagents_ref.clone();
-            Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid).await })
+            Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid, working_dir).await })
         });
         let subagents_ref2 = self.subagents.clone();
         let list_cb: ListCallback = Arc::new(move || {
@@ -710,6 +710,31 @@ impl AgentLoopShared {
 
             // Repair any protocol violations before calling the LLM.
             thread_repair::repair_messages(&mut messages);
+
+            // Local models via --jinja may require strict user/assistant alternation.
+            // Convert tool messages to user messages and tool_calls to text.
+            if core.is_local {
+                thread_repair::repair_for_strict_alternation(&mut messages);
+            }
+
+            // Pre-flight context size check: emergency trim if we're about to
+            // exceed the model's context window. The 95% threshold leaves room
+            // for the response tokens.
+            let estimated = TokenBudget::estimate_tokens(&messages);
+            let max_ctx = core.token_budget.max_context();
+            if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
+                warn!(
+                    "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
+                    estimated, max_ctx
+                );
+                // tool_def_tokens=0 is conservative (trims more aggressively).
+                messages = core.token_budget.trim_to_fit(&messages, 0);
+                // Re-run repair after trim in case truncation broke protocol.
+                thread_repair::repair_messages(&mut messages);
+                if core.is_local {
+                    thread_repair::repair_for_strict_alternation(&mut messages);
+                }
+            }
 
             // Call LLM — streaming or blocking depending on mode.
             let response = if let Some(ref delta_tx) = text_delta_tx {
@@ -1132,9 +1157,11 @@ impl AgentLoopShared {
                             }
                         }
 
-                        // Mistral/Ministral templates handle tool→generate
-                        // natively. Do NOT add user continuation messages —
-                        // they break the template's role alternation check.
+                        // Local models via --jinja require strict user/assistant alternation.
+                        // Tool results are folded into user messages by
+                        // repair_for_strict_alternation() at the top of the loop.
+                        // Do NOT add extra user continuation — it would create
+                        // consecutive user messages.
 
                         // Continue the main loop — the main LLM will see the results.
                         continue;
@@ -1314,9 +1341,11 @@ impl AgentLoopShared {
                     }
                 }
 
-                // Mistral/Ministral templates handle tool→generate
-                // natively. Do NOT add user continuation messages —
-                // they break the template's role alternation check.
+                // Local models via --jinja require strict user/assistant alternation.
+                // Tool results are folded into user messages by
+                // repair_for_strict_alternation() at the top of the loop.
+                // Do NOT add extra user continuation — it would create
+                // consecutive user messages.
 
                 // Check for priority user messages injected mid-task.
                 if let Some(ref mut rx) = priority_rx {

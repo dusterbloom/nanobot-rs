@@ -15,7 +15,7 @@ use super::base::Tool;
 
 /// Type alias for the spawn callback.
 ///
-/// Arguments: (task, label, agent_name, model_override, origin_channel, origin_chat_id) -> result string.
+/// Arguments: (task, label, agent_name, model_override, origin_channel, origin_chat_id, working_dir) -> result string.
 pub type SpawnCallback = Arc<
     dyn Fn(
             String,
@@ -24,6 +24,7 @@ pub type SpawnCallback = Arc<
             Option<String>,
             String,
             String,
+            Option<String>,
         ) -> Pin<Box<dyn Future<Output = String> + Send>>
         + Send
         + Sync,
@@ -182,6 +183,10 @@ impl Tool for SpawnTool {
                 "model": {
                     "type": "string",
                     "description": "Model override. Use 'haiku' for fast/cheap, 'sonnet' for balanced, 'opus' for complex reasoning, 'local' for local model. Use provider prefix for external models: 'groq/llama-3.3-70b-versatile', 'gemini/gemini-2.0-flash', 'openai/gpt-4o'. Omit to use profile default or parent model."
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Working directory for the subagent's exec tool. Defaults to the workspace directory."
                 }
             },
             "required": []
@@ -281,6 +286,11 @@ impl Tool for SpawnTool {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                let working_dir = params
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
                 let channel = self.origin_channel.lock().await.clone();
                 let chat_id = self.origin_chat_id.lock().await.clone();
 
@@ -292,7 +302,7 @@ impl Tool for SpawnTool {
                 // Drop the lock before awaiting.
                 drop(callback_guard);
 
-                callback(task, label, agent, model, channel, chat_id).await
+                callback(task, label, agent, model, channel, chat_id, working_dir).await
             }
         }
     }
@@ -461,16 +471,18 @@ mod tests {
              agent: Option<String>,
              model: Option<String>,
              channel: String,
-             chat_id: String| {
+             chat_id: String,
+             working_dir: Option<String>| {
                 Box::pin(async move {
                     format!(
-                        "spawned: task={}, label={}, agent={}, model={}, channel={}, chat_id={}",
+                        "spawned: task={}, label={}, agent={}, model={}, channel={}, chat_id={}, working_dir={}",
                         task,
                         label.unwrap_or_else(|| "none".to_string()),
                         agent.unwrap_or_else(|| "none".to_string()),
                         model.unwrap_or_else(|| "none".to_string()),
                         channel,
                         chat_id,
+                        working_dir.unwrap_or_else(|| "none".to_string()),
                     )
                 })
             },
@@ -515,7 +527,8 @@ mod tests {
              agent: Option<String>,
              model: Option<String>,
              _channel: String,
-             _chat_id: String| {
+             _chat_id: String,
+             _working_dir: Option<String>| {
                 Box::pin(async move {
                     format!(
                         "task={}, has_label={}, has_agent={}, has_model={}",
@@ -539,5 +552,41 @@ mod tests {
         assert!(result.contains("has_label=false"));
         assert!(result.contains("has_agent=false"));
         assert!(result.contains("has_model=false"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_working_dir() {
+        let tool = SpawnTool::new();
+
+        let callback: SpawnCallback = Arc::new(
+            |_task: String,
+             _label: Option<String>,
+             _agent: Option<String>,
+             _model: Option<String>,
+             _channel: String,
+             _chat_id: String,
+             working_dir: Option<String>| {
+                Box::pin(async move {
+                    format!(
+                        "working_dir={}",
+                        working_dir.unwrap_or_else(|| "none".to_string()),
+                    )
+                })
+            },
+        );
+        tool.set_callback(callback).await;
+
+        // With working_dir
+        let mut params = HashMap::new();
+        params.insert("task".to_string(), serde_json::json!("build project"));
+        params.insert("working_dir".to_string(), serde_json::json!("/tmp/project"));
+        let result = tool.execute(params).await;
+        assert!(result.contains("working_dir=/tmp/project"));
+
+        // Without working_dir
+        let mut params = HashMap::new();
+        params.insert("task".to_string(), serde_json::json!("build project"));
+        let result = tool.execute(params).await;
+        assert!(result.contains("working_dir=none"));
     }
 }

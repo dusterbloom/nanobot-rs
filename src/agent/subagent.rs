@@ -169,6 +169,7 @@ impl SubagentManager {
         model_override: Option<String>,
         origin_channel: String,
         origin_chat_id: String,
+        working_dir: Option<String>,
     ) -> String {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
 
@@ -237,6 +238,7 @@ impl SubagentManager {
             );
         }
         let workspace = self.workspace.clone();
+        let exec_working_dir = working_dir;
         let bus_tx = self.bus_tx.clone();
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
@@ -261,6 +263,7 @@ impl SubagentManager {
                 exec_timeout,
                 restrict_to_workspace,
                 is_local,
+                exec_working_dir.as_deref(),
             )
             .await;
 
@@ -454,6 +457,7 @@ impl SubagentManager {
         exec_timeout: u64,
         restrict_to_workspace: bool,
         is_local: bool,
+        exec_working_dir: Option<&str>,
     ) -> anyhow::Result<String> {
         debug!(
             "Subagent {} starting (model={}, max_iter={}, read_only={}, tools_filter={:?}): {}",
@@ -489,9 +493,12 @@ impl SubagentManager {
             tools.register(Box::new(ListDirTool));
         }
         if should_include("exec") {
+            let exec_cwd = exec_working_dir
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| workspace.to_string_lossy().to_string());
             tools.register(Box::new(ExecTool::new(
                 exec_timeout,
-                Some(workspace.to_string_lossy().to_string()),
+                Some(exec_cwd),
                 None,
                 None,
                 restrict_to_workspace,
@@ -838,6 +845,7 @@ mod tests {
             5,
             false,
             false, // is_local
+            None,  // exec_working_dir
         )
         .await
         .unwrap();
@@ -905,6 +913,7 @@ mod tests {
             5,
             false,
             false, // is_local
+            None,  // exec_working_dir
         )
         .await
         .unwrap();

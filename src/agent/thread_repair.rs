@@ -294,6 +294,130 @@ fn ensure_not_ending_with_assistant(messages: &mut Vec<Value>) {
     }
 }
 
+/// Repair messages for models that require strict user/assistant alternation.
+///
+/// Some local models (Ministral-8B, nanbeige, gemma-3n) served via llama-server
+/// with `--jinja` reject `role: "tool"` messages entirely. Their chat templates
+/// enforce strict `user/assistant/user/assistant/...` alternation.
+///
+/// This function:
+/// 1. Converts `role: "tool"` messages → `role: "user"` with labeled content
+/// 2. Converts assistant `tool_calls` → inline text description (preserving any
+///    existing content text)
+/// 3. Merges any resulting consecutive same-role messages
+///
+/// Call this AFTER `repair_messages()` and ONLY for local models.
+pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
+    if messages.is_empty() {
+        return;
+    }
+
+    // Pass 1: Convert assistant tool_calls to text descriptions.
+    for msg in messages.iter_mut() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+        let tool_calls = match msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+            Some(tc) if !tc.is_empty() => tc.clone(),
+            _ => continue,
+        };
+
+        // Build text description of tool calls.
+        let mut call_descriptions: Vec<String> = Vec::new();
+        for tc in &tool_calls {
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
+            let args = tc
+                .pointer("/function/arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}");
+            call_descriptions.push(format!("[Called {}({})]", name, args));
+        }
+
+        // Preserve existing content text if any.
+        let existing = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let new_content = if existing.is_empty() {
+            call_descriptions.join("\n")
+        } else {
+            format!("{}\n{}", existing, call_descriptions.join("\n"))
+        };
+
+        // Replace message: keep role, set content, remove tool_calls.
+        *msg = json!({
+            "role": "assistant",
+            "content": new_content
+        });
+    }
+
+    // Pass 2: Convert tool messages to user messages.
+    for msg in messages.iter_mut() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "tool" {
+            continue;
+        }
+        let call_id = msg
+            .get("tool_call_id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("?");
+        let tool_name = msg
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("tool");
+        let content = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        *msg = json!({
+            "role": "user",
+            "content": format!("[Tool result from {} ({})]: {}", tool_name, call_id, content)
+        });
+    }
+
+    // Pass 3: Merge consecutive same-role messages.
+    merge_consecutive_user_messages(messages);
+    merge_consecutive_assistant_messages(messages);
+}
+
+/// Merge consecutive assistant messages into a single message.
+fn merge_consecutive_assistant_messages(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        let is_assistant =
+            messages[i].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let next_is_assistant =
+            messages[i + 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+
+        if is_assistant && next_is_assistant {
+            let next_content = messages[i + 1]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let current_content = messages[i]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            messages[i]["content"] =
+                Value::String(format!("{}\n\n{}", current_content, next_content));
+            messages.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +764,189 @@ mod tests {
         let len_before = messages.len();
         repair_messages(&mut messages);
         assert_eq!(messages.len(), len_before);
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for repair_for_strict_alternation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_strict_alternation_converts_tool_to_user() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Read a file"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/foo\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "content": "File contents here"
+            }),
+        ];
+
+        repair_for_strict_alternation(&mut messages);
+
+        // No tool messages should remain.
+        assert!(
+            !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            "No tool messages should remain after strict alternation repair"
+        );
+        // No tool_calls keys should remain.
+        assert!(
+            !messages.iter().any(|m| m.get("tool_calls").is_some()),
+            "No tool_calls should remain after strict alternation repair"
+        );
+        // All messages should be system, user, or assistant.
+        for msg in &messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            assert!(
+                role == "system" || role == "user" || role == "assistant",
+                "Unexpected role: {}",
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_alternation_preserves_assistant_content() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Do something"}),
+            json!({
+                "role": "assistant",
+                "content": "Let me check that file.",
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "content": "data"
+            }),
+        ];
+
+        repair_for_strict_alternation(&mut messages);
+
+        // The assistant message should contain both original content and tool call description.
+        let assistant = messages.iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .expect("Should have an assistant message");
+        let content = assistant["content"].as_str().unwrap();
+        assert!(content.contains("Let me check that file."), "Should preserve original content");
+        assert!(content.contains("[Called read_file"), "Should describe tool call");
+    }
+
+    #[test]
+    fn test_strict_alternation_merges_consecutive_user_messages() {
+        // After converting tool → user, we may get consecutive user messages.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Read two files"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}},
+                    {"id": "tc_2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b\"}"}}
+                ]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "read_file",
+                "content": "contents of a"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_2",
+                "name": "read_file",
+                "content": "contents of b"
+            }),
+        ];
+
+        repair_for_strict_alternation(&mut messages);
+
+        // The two tool messages should be merged into one user message.
+        let user_msgs: Vec<&Value> = messages.iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .collect();
+        // Original user + merged tool results = 2 user messages.
+        assert_eq!(user_msgs.len(), 2, "Should have 2 user messages (original + merged tool results)");
+        // The merged message should contain both results.
+        let merged = user_msgs[1]["content"].as_str().unwrap();
+        assert!(merged.contains("contents of a"), "Should contain first result");
+        assert!(merged.contains("contents of b"), "Should contain second result");
+    }
+
+    #[test]
+    fn test_strict_alternation_no_tool_messages_no_op() {
+        // If there are no tool messages, the function should be a no-op.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "assistant", "content": "Hi there"}),
+        ];
+        let original = messages.clone();
+
+        repair_for_strict_alternation(&mut messages);
+
+        assert_eq!(messages, original, "Should not modify messages without tool roles");
+    }
+
+    #[test]
+    fn test_strict_alternation_role_pattern() {
+        // After repair, the pattern should be system, user, assistant, user, assistant, ...
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Run a command"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_1",
+                "name": "exec",
+                "content": "command output"
+            }),
+            json!({"role": "assistant", "content": "Done"}),
+            json!({"role": "user", "content": "Thanks"}),
+        ];
+
+        repair_for_strict_alternation(&mut messages);
+
+        // Verify strict alternation: after system, must alternate user/assistant.
+        let roles: Vec<&str> = messages.iter()
+            .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(roles[0], "system");
+        for i in 1..roles.len() - 1 {
+            if roles[i] == "user" {
+                assert!(roles[i + 1] == "assistant" || roles[i + 1] == "user",
+                    "After user at {}, got {} (expected assistant or user for merge)", i, roles[i + 1]);
+            }
+        }
+        // No tool messages.
+        assert!(!roles.contains(&"tool"), "No tool roles should remain");
+    }
+
+    #[test]
+    fn test_strict_alternation_empty_messages() {
+        let mut messages: Vec<Value> = vec![];
+        repair_for_strict_alternation(&mut messages);
+        assert!(messages.is_empty());
     }
 }
