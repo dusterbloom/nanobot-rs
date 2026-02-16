@@ -97,6 +97,29 @@ enum Commands {
         #[arg(short, long)]
         token: Option<String>,
     },
+    /// Ingest documents into the knowledge store for search.
+    Ingest {
+        /// File path(s) to ingest.
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// Custom source name (defaults to filename).
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Chunk size in characters. Default: 4096.
+        #[arg(long, default_value_t = 4096)]
+        chunk_size: usize,
+        /// Overlap between chunks in characters. Default: 256.
+        #[arg(long, default_value_t = 256)]
+        overlap: usize,
+    },
+    /// Search the knowledge store.
+    Search {
+        /// Search query.
+        query: String,
+        /// Maximum results. Default: 5.
+        #[arg(short, long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Quick-start Email channel.
     Email {
         /// IMAP host (prompted interactively if not provided).
@@ -112,6 +135,95 @@ enum Commands {
         #[arg(short, long)]
         password: Option<String>,
     },
+    /// Run evaluation benchmarks.
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvalAction {
+    /// Run Towers of Hanoi benchmark (MAKER replication).
+    Hanoi {
+        /// Number of disks. Default: 5.
+        #[arg(short, long, default_value_t = 5)]
+        disks: u8,
+        /// Run calibration (measure model accuracy on sampled steps).
+        #[arg(long)]
+        calibrate: bool,
+        /// Number of calibration samples. Default: 100.
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+        /// Run full solve with MAKER voting.
+        #[arg(long)]
+        solve: bool,
+        /// Enable CATTS confidence gating.
+        #[arg(long)]
+        catts: bool,
+        /// Ahead-by-k margin for voting. Default: 1.
+        #[arg(short, long, default_value_t = 1)]
+        k: usize,
+        /// Use local LLM (llama-server).
+        #[arg(short, long)]
+        local: bool,
+        /// Local server port. Default: 8080.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
+    /// Run Aggregation Haystack benchmark (Oolong-inspired).
+    Haystack {
+        /// Number of synthetic facts. Default: 50.
+        #[arg(long, default_value_t = 50)]
+        facts: usize,
+        /// Total document length in characters. Default: 100000.
+        #[arg(long, default_value_t = 100_000)]
+        length: usize,
+        /// Run Tier 2: aggregation tasks with LLM.
+        #[arg(long)]
+        aggregate: bool,
+        /// Use local LLM (llama-server).
+        #[arg(short, long)]
+        local: bool,
+        /// Local server port. Default: 8080.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
+    /// Run Learning Curve benchmark (SWE-Bench-CL inspired).
+    Learn {
+        /// Task family: arithmetic, fact-retrieval, tool-chain.
+        #[arg(long, default_value = "arithmetic")]
+        family: String,
+        /// Number of tasks in the curriculum. Default: 50.
+        #[arg(long, default_value_t = 50)]
+        tasks: usize,
+        /// Depth/complexity parameter. Default: 3.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Use local LLM (llama-server).
+        #[arg(short, long)]
+        local: bool,
+        /// Local server port. Default: 8080.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
+    /// Run Research Sprint compound benchmark.
+    Sprint {
+        /// Corpus size in characters. Default: 500000.
+        #[arg(long, default_value_t = 500_000)]
+        corpus_size: usize,
+        /// Number of questions. Default: 20.
+        #[arg(long, default_value_t = 20)]
+        questions: usize,
+        /// Use local LLM (llama-server).
+        #[arg(short, long)]
+        local: bool,
+        /// Local server port. Default: 8080.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
+    /// Show saved evaluation results.
+    Report,
 }
 
 #[derive(Subcommand)]
@@ -217,6 +329,8 @@ fn main() {
             CronAction::Remove { job_id } => cli::cmd_cron_remove(job_id),
             CronAction::Enable { job_id, disable } => cli::cmd_cron_enable(job_id, disable),
         },
+        Commands::Ingest { files, name, chunk_size, overlap } => cli::cmd_ingest(files, name, chunk_size, overlap),
+        Commands::Search { query, limit } => cli::cmd_search(query, limit),
         Commands::WhatsApp => cli::cmd_whatsapp(),
         Commands::Telegram { token } => cli::cmd_telegram(token),
         Commands::Email {
@@ -225,6 +339,21 @@ fn main() {
             username,
             password,
         } => cli::cmd_email(imap_host, smtp_host, username, password),
+        Commands::Eval { action } => match action {
+            EvalAction::Hanoi { disks, calibrate, samples, solve, catts, k, local, port } => {
+                cli::cmd_eval_hanoi(disks, calibrate, samples, solve, catts, k, local, port)
+            }
+            EvalAction::Haystack { facts, length, aggregate, local, port } => {
+                cli::cmd_eval_haystack(facts, length, aggregate, local, port)
+            }
+            EvalAction::Learn { family, tasks, depth, local, port } => {
+                cli::cmd_eval_learn(family, tasks, depth, local, port)
+            }
+            EvalAction::Sprint { corpus_size, questions, local, port } => {
+                cli::cmd_eval_sprint(corpus_size, questions, local, port)
+            }
+            EvalAction::Report => cli::cmd_eval_report(),
+        },
     }
 }
 
