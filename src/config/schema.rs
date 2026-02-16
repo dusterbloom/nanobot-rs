@@ -679,6 +679,13 @@ pub struct ToolDelegationConfig {
     /// Set to 0.0 to disable cost limiting. Prices fetched from OpenRouter.
     #[serde(default = "default_td_cost_budget")]
     pub cost_budget: f64,
+
+    /// Default model for spawned subagents when no explicit model is provided.
+    /// Prevents expensive main models from being used as workers.
+    /// Example: "haiku", "zhipu/glm-4.5-air", "local".
+    /// Empty string = fall back to main model (not recommended).
+    #[serde(default)]
+    pub default_subagent_model: String,
 }
 
 fn default_td_cost_budget() -> f64 {
@@ -701,6 +708,7 @@ impl Default for ToolDelegationConfig {
             max_result_preview_chars: default_td_preview_chars(),
             auto_local: true,
             cost_budget: default_td_cost_budget(),
+            default_subagent_model: String::new(),
         }
     }
 }
@@ -1021,6 +1029,7 @@ mod tests {
             max_result_preview_chars: 300,
             auto_local: true,
             cost_budget: 0.01,
+            default_subagent_model: String::new(),
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();

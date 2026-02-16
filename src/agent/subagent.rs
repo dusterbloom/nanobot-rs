@@ -80,6 +80,9 @@ pub struct SubagentManager {
     workspace: PathBuf,
     bus_tx: UnboundedSender<InboundMessage>,
     model: String,
+    /// Cheap default model for subagents when no explicit override is given.
+    /// Prevents the expensive main model from being used as a worker.
+    default_subagent_model: Option<String>,
     brave_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
@@ -127,6 +130,7 @@ impl SubagentManager {
             workspace,
             bus_tx,
             model,
+            default_subagent_model: None,
             brave_api_key,
             exec_timeout,
             restrict_to_workspace,
@@ -147,6 +151,14 @@ impl SubagentManager {
     /// Set the providers config for multi-provider subagent routing.
     pub fn with_providers_config(mut self, config: ProvidersConfig) -> Self {
         self.providers_config = Some(config);
+        self
+    }
+
+    /// Set the default cheap model for subagents (prevents main model leak).
+    pub fn with_default_subagent_model(mut self, model: String) -> Self {
+        if !model.is_empty() {
+            self.default_subagent_model = Some(model);
+        }
         self
     }
 
@@ -190,16 +202,24 @@ impl SubagentManager {
             }
         });
 
-        // Build config: model_override > profile.model > self.model
+        // Build config: model_override > profile.model > default_subagent_model > self.model (last resort)
         let effective_model = if let Some(ref m) = model_override {
             agent_profiles::resolve_model_alias(m)
         } else if let Some(ref p) = profile {
             p.model
                 .as_ref()
                 .map(|m| agent_profiles::resolve_model_alias(m))
-                .unwrap_or_else(|| self.model.clone())
+                .unwrap_or_else(|| {
+                    self.default_subagent_model.clone().unwrap_or_else(|| {
+                        warn!("EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config", self.model);
+                        self.model.clone()
+                    })
+                })
         } else {
-            self.model.clone()
+            self.default_subagent_model.clone().unwrap_or_else(|| {
+                warn!("EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config", self.model);
+                self.model.clone()
+            })
         };
 
         let mut config = SubagentConfig {

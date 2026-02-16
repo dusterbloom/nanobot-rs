@@ -823,9 +823,9 @@ impl AgentLoopShared {
             }
 
             if response.has_tool_calls() {
-                // Auto-escalation: when context pressure is high, delegate
-                // even if tool_delegation isn't explicitly enabled. This
-                // uses the main provider with slim results to save context.
+                // Context pressure check: if high, log a warning. The correct
+                // response is compaction, NOT spawning the main model as its
+                // own tool runner (which doubles cost for no benefit).
                 let context_tokens = TokenBudget::estimate_tokens(&messages);
                 let max_tokens = core.token_budget.max_context();
                 let pressure = if max_tokens > 0 {
@@ -833,15 +833,10 @@ impl AgentLoopShared {
                 } else {
                     0.0
                 };
-                let auto_escalate = !core.tool_delegation_config.enabled
-                    && pressure > 0.7
-                    && core.tool_runner_provider.is_none();
-
-                if auto_escalate {
-                    info!(
-                        "Context pressure {:.0}% — auto-delegating {} tool calls",
+                if pressure > 0.7 && !core.tool_delegation_config.enabled {
+                    debug!(
+                        "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
                         pressure * 100.0,
-                        response.tool_calls.len()
                     );
                 }
 
@@ -859,13 +854,11 @@ impl AgentLoopShared {
                         debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
                     }
                 }
-                let should_delegate = (core.tool_delegation_config.enabled || auto_escalate)
+                let should_delegate = core.tool_delegation_config.enabled
                     && delegation_alive;
-                // Resolve provider+model: explicit config, or fall back to main provider.
-                let delegation_provider = core.tool_runner_provider.clone()
-                    .or_else(|| if auto_escalate { Some(core.provider.clone()) } else { None });
-                let delegation_model = core.tool_runner_model.clone()
-                    .or_else(|| if auto_escalate { Some(core.model.clone()) } else { None });
+                // Resolve provider+model from explicit config.
+                let delegation_provider = core.tool_runner_provider.clone();
+                let delegation_model = core.tool_runner_model.clone();
 
                 if should_delegate {
                     if let (Some(ref tr_provider), Some(ref tr_model)) =
@@ -877,11 +870,9 @@ impl AgentLoopShared {
                             tr_model
                         );
 
-                        // Auto-escalation uses the main provider which may be
-                        // a local llama-server that requires user-last messages.
-                        // Explicit delegation providers (Ministral) handle
-                        // tool→generate natively and don't need it.
-                        let needs_user_cont = auto_escalate && core.is_local;
+                        // Local delegation providers (llama-server) require
+                        // user-last messages for tool→generate flow.
+                        let needs_user_cont = core.is_local;
 
                         // Detect [VERBATIM] marker: the main model is asking for
                         // raw tool output instead of a delegation summary.
@@ -1573,6 +1564,10 @@ impl AgentLoop {
         if let Some(pc) = providers_config {
             subagent_mgr = subagent_mgr.with_providers_config(pc);
         }
+        // Wire up the cheap default model for subagents from config.
+        subagent_mgr = subagent_mgr.with_default_subagent_model(
+            core.tool_delegation_config.default_subagent_model.clone(),
+        );
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
         }
