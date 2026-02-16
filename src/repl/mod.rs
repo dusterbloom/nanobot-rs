@@ -1044,9 +1044,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 let bar_lines = tui::render_input_bar(
                     &ctx.core_handle, &ch_names, sa_count,
                 );
-                // Move cursor back up so readline draws on the line above the bar.
-                print!("\x1b[{}A", bar_lines);
-                io::stdout().flush().ok();
+                let _ = bar_lines; // bar is pinned to bottom; cursor already restored
 
                 // === GET INPUT ===
                 let input_text: String;

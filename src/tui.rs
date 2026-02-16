@@ -88,25 +88,37 @@ pub(crate) fn terminal_width() -> usize {
         .unwrap_or(80)
 }
 
-/// Render a Claude Code-style input context bar below the prompt.
+pub(crate) fn terminal_height() -> usize {
+    termimad::crossterm::terminal::size()
+        .map(|(_, h)| h as usize)
+        .unwrap_or(24)
+}
+
+/// Render a Claude Code-style input context bar pinned to the bottom of the terminal.
 ///
-/// Layout:
+/// Layout (at terminal bottom):
 /// ```text
 /// ──────────────────────────────────────────────
 ///   ~/Dev/nanobot · opus-4-6 · 🧠 thinking
 ///   ⏵⏵ /t think · /l local · /v voice · ctx 12K/1M
 /// ```
 ///
-/// Returns the number of lines printed (for cursor repositioning).
+/// The bar is rendered at the bottom 3 rows of the terminal. The cursor is
+/// then repositioned so readline draws the prompt above the bar. The area
+/// between the current output and the bar is left empty (scroll region).
+///
+/// Returns the number of bar lines (for cleanup/erase after input).
 pub(crate) fn render_input_bar(
     core_handle: &crate::agent::agent_loop::SharedCoreHandle,
     channel_names: &[&str],
     subagent_count: usize,
 ) -> usize {
+    use std::io::Write as _;
     use std::sync::atomic::Ordering;
 
     let counters = &core_handle.counters;
     let width = terminal_width().min(100);
+    let height = terminal_height();
     let separator = "─".repeat(width);
 
     // Gather info
@@ -114,10 +126,6 @@ pub(crate) fn render_input_bar(
     let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
     let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
 
-    // Line 1: separator
-    println!("{DIM}{separator}{RESET}");
-
-    // Line 2: cwd + model + thinking
     let cwd = std::env::current_dir()
         .map(|p| {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -141,9 +149,6 @@ pub(crate) fn render_input_bar(
         String::new()
     };
 
-    println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
-
-    // Line 3: hints + stats
     let mut hints: Vec<String> = Vec::new();
     hints.push(format!("{DIM}⏵⏵ /t think · /l local · /v voice{RESET}"));
 
@@ -173,9 +178,23 @@ pub(crate) fn render_input_bar(
         ));
     }
 
-    println!("  {}", hints.join(" · "));
+    let bar_lines = 3usize;
+    // bar_row is the terminal row where the separator starts (1-indexed)
+    let bar_row = height.saturating_sub(bar_lines) + 1;
 
-    3 // lines printed
+    // Save cursor position, move to bar area, render, restore cursor.
+    // \x1b[s = save cursor, \x1b[u = restore cursor
+    // \x1b[{row};1H = move to absolute row, column 1
+    print!("\x1b[s");
+    print!("\x1b[{};1H", bar_row);
+    print!("\x1b[J"); // clear from bar_row to end of screen
+    println!("{DIM}{separator}{RESET}");
+    println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
+    print!("  {}", hints.join(" · "));
+    print!("\x1b[u"); // restore cursor to where prompt should be
+    std::io::stdout().flush().ok();
+
+    bar_lines
 }
 
 // Status Bar & Banners
