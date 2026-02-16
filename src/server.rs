@@ -219,6 +219,7 @@ pub(crate) fn stop_compaction_server(
 /// The first model found in `~/models/` wins.
 const DELEGATION_MODEL_PREFERENCES: &[&str] = &[
     "Ministral-3",
+    "nanbeige",
     "Qwen3-0.6B",
     "Ministral-8B",
     "Nemotron-Nano-9B",
@@ -1481,9 +1482,10 @@ mod tests {
     #[test]
     fn test_find_delegation_model_preference_constants() {
         assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-3");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "Qwen3-0.6B");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Ministral-8B");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[3], "Nemotron-Nano-9B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "nanbeige");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Qwen3-0.6B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[3], "Ministral-8B");
+        assert_eq!(DELEGATION_MODEL_PREFERENCES[4], "Nemotron-Nano-9B");
     }
 
     #[test]
@@ -1570,6 +1572,30 @@ mod tests {
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(result.is_some(), "Substring match should work");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_nanbeige_match() {
+        let models = vec![
+            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(result.is_some(), "nanbeige should match nanbeige4.1-3b-q8_0.gguf");
+    }
+
+    #[test]
+    fn test_pick_preferred_model_nanbeige_vs_qwen() {
+        // Nanbeige has higher priority than Qwen3-0.6B
+        let models = vec![
+            PathBuf::from("/models/Qwen3-0.6B-Q4.gguf"),
+            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
+        ];
+        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
+        assert!(
+            result.as_ref().unwrap().to_string_lossy().contains("nanbeige"),
+            "nanbeige should beat Qwen3-0.6B, got: {:?}",
+            result
+        );
     }
 
     #[test]

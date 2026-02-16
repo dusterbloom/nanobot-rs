@@ -212,13 +212,27 @@ impl ContextCompactor {
         let recent_budget = (remaining as f64 * 0.6) as usize;
 
         // Walk backwards from the end to find recent messages that fit in ~60% of budget.
+        // Messages containing subagent results are force-included to prevent
+        // compaction from summarizing away important delegated work.
         let body = &messages[1..];
         let mut recent_start = body.len();
         let mut recent_tokens = 0;
 
+        // First pass: identify subagent result messages to protect.
+        let protected: std::collections::HashSet<usize> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| {
+                let content = msg["content"].as_str().unwrap_or("");
+                content.contains("[Subagent ") || content.contains("subagent-")
+                    || content.contains("Result also saved to:")
+            })
+            .map(|(i, _)| i)
+            .collect();
+
         for (i, msg) in body.iter().enumerate().rev() {
             let msg_tokens = TokenBudget::estimate_tokens(&[msg.clone()]);
-            if recent_tokens + msg_tokens > recent_budget {
+            if recent_tokens + msg_tokens > recent_budget && !protected.contains(&i) {
                 recent_start = i + 1;
                 break;
             }

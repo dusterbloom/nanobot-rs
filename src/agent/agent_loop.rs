@@ -30,7 +30,7 @@ use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    CancelCallback, ListCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+    CancelCallback, ListCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -436,11 +436,20 @@ impl AgentLoopShared {
                 }
             })
         });
+        let subagents_ref4 = self.subagents.clone();
+        let wait_cb: WaitCallback = Arc::new(move |task_id: String, timeout_secs: u64| {
+            let mgr = subagents_ref4.clone();
+            Box::pin(async move {
+                let timeout = std::time::Duration::from_secs(timeout_secs);
+                mgr.wait_for(&task_id, timeout).await
+            })
+        });
         let spawn_tool = Arc::new(SpawnTool::new());
         // Set callbacks and context before registering so they're ready for use.
         spawn_tool.set_callback(spawn_cb).await;
         spawn_tool.set_list_callback(list_cb).await;
         spawn_tool.set_cancel_callback(cancel_cb).await;
+        spawn_tool.set_wait_callback(wait_cb).await;
         spawn_tool.set_context(channel, chat_id).await;
         tools.register(Box::new(SpawnToolProxy(spawn_tool)));
 
@@ -630,10 +639,18 @@ impl AgentLoopShared {
                 // endpoint strips mid-conversation system messages, which would
                 // leave the conversation ending with an assistant message and
                 // trigger a "does not support assistant message prefill" error.
+                let remaining = core.max_iterations.saturating_sub(iteration as u32 + 1);
+                let budget_note = if remaining <= 5 {
+                    format!(" [Budget: {}/{} iterations remaining — wrap up soon]", remaining, core.max_iterations)
+                } else {
+                    String::new()
+                };
                 messages.push(json!({
                     "role": "user",
-                    "content": "[system] You just executed a tool that modifies files or runs commands. \
-                                Report the result to the user before making additional tool calls."
+                    "content": format!(
+                        "[system] You just executed a tool that modifies files or runs commands. \
+                         Report the result to the user before making additional tool calls.{budget_note}"
+                    )
                 }));
                 force_response = false;
             }

@@ -91,6 +91,9 @@ whatlang = "0.16"
 # Mime type guessing
 mime_guess = "2"
 
+# SQLite with FTS5 (context store, budget calibrator, experience buffer)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Email channel (IMAP + SMTP)
 async-imap = "0.10"
 async-native-tls = "0.5"
