@@ -150,6 +150,8 @@ pub struct ToolRunResult {
     pub summary: Option<String>,
     /// How many iterations were used.
     pub iterations_used: u32,
+    /// Error message if the delegation LLM call failed.
+    pub error: Option<String>,
 }
 
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
@@ -490,6 +492,7 @@ pub async fn run_tool_loop(
                 tool_results: all_results,
                 summary: Some("Tool execution cancelled.".to_string()),
                 iterations_used,
+                error: None,
             };
         }
 
@@ -774,6 +777,7 @@ pub async fn run_tool_loop(
                 tool_results: all_results,
                 summary: None,
                 iterations_used,
+                error: None,
             };
         }
 
@@ -794,6 +798,7 @@ pub async fn run_tool_loop(
                     tool_results: all_results,
                     summary: None,
                     iterations_used,
+                    error: None,
                 };
             }
         }
@@ -818,6 +823,7 @@ pub async fn run_tool_loop(
                 tool_results: all_results,
                 summary,
                 iterations_used: 1,
+                error: None,
             };
         }
 
@@ -831,6 +837,7 @@ pub async fn run_tool_loop(
         tool_results: all_results,
         summary: None,
         iterations_used,
+        error: None,
     }
 }
 
@@ -1173,6 +1180,7 @@ mod tests {
             ],
             summary: Some("Read a file and ran a command.".to_string()),
             iterations_used: 1,
+            error: None,
         };
 
         let formatted = format_results_for_context(&result, 2000);
@@ -1188,6 +1196,7 @@ mod tests {
             tool_results: vec![("id1".into(), "big_tool".into(), long_data)],
             summary: None,
             iterations_used: 1,
+            error: None,
         };
 
         let formatted = format_results_for_context(&result, 2000);
@@ -1204,6 +1213,7 @@ mod tests {
             ],
             summary: Some("Found a large file.".to_string()),
             iterations_used: 1,
+            error: None,
         };
 
         // Slim mode: 200 char preview.

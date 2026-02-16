@@ -50,6 +50,21 @@ pub type PipelineCallback = Arc<
     dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
 >;
 
+/// Type alias for the loop callback.
+/// Takes (task, max_rounds, tools, stop_condition, model, working_dir) -> result string.
+pub type LoopCallback = Arc<
+    dyn Fn(
+            String,
+            u32,
+            Option<Vec<String>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) -> Pin<Box<dyn Future<Output = String> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Tool to spawn a subagent for background task execution.
 ///
 /// The subagent runs asynchronously and announces its result back
@@ -64,6 +79,7 @@ pub struct SpawnTool {
     cancel_callback: Arc<Mutex<Option<CancelCallback>>>,
     wait_callback: Arc<Mutex<Option<WaitCallback>>>,
     pipeline_callback: Arc<Mutex<Option<PipelineCallback>>>,
+    loop_callback: Arc<Mutex<Option<LoopCallback>>>,
     origin_channel: Arc<Mutex<String>>,
     origin_chat_id: Arc<Mutex<String>>,
 }
@@ -77,6 +93,7 @@ impl SpawnTool {
             cancel_callback: Arc::new(Mutex::new(None)),
             wait_callback: Arc::new(Mutex::new(None)),
             pipeline_callback: Arc::new(Mutex::new(None)),
+            loop_callback: Arc::new(Mutex::new(None)),
             origin_channel: Arc::new(Mutex::new("cli".to_string())),
             origin_chat_id: Arc::new(Mutex::new("direct".to_string())),
         }
@@ -112,6 +129,11 @@ impl SpawnTool {
     pub async fn set_pipeline_callback(&self, callback: PipelineCallback) {
         *self.pipeline_callback.lock().await = Some(callback);
     }
+
+    /// Set the loop callback for autonomous refinement loops.
+    pub async fn set_loop_callback(&self, callback: LoopCallback) {
+        *self.loop_callback.lock().await = Some(callback);
+    }
 }
 
 impl Default for SpawnTool {
@@ -127,11 +149,14 @@ impl Tool for SpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a task in the background, list running subagents, wait for one to finish, or cancel one. \
+        "Spawn a subagent to handle a task in the background, list running subagents, wait for one to finish, cancel one, \
+         run a multi-step pipeline, or run an autonomous refinement loop. \
          Use action='spawn' (default) to start a new subagent. \
          Use action='list' to check status of running subagents. \
          Use action='wait' with task_id to block until a subagent finishes and get its result (saves iterations vs polling). \
          Use action='cancel' with task_id to abort a stuck subagent. \
+         Use action='pipeline' with steps array for multi-step execution with optional tool use per step. \
+         Use action='loop' with task and max_rounds for autonomous iterative refinement with tools. \
          Use 'agent' to pick a specialized profile (explore, reviewer, builder, researcher) \
          and 'model' to control cost (e.g. 'haiku' for cheap/fast tasks)."
     }
@@ -142,17 +167,26 @@ impl Tool for SpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: 'spawn' (default), 'list', 'wait', 'cancel', or 'pipeline'",
-                    "enum": ["spawn", "list", "wait", "cancel", "pipeline"]
+                    "description": "Action to perform: 'spawn' (default), 'list', 'wait', 'cancel', 'pipeline', or 'loop'",
+                    "enum": ["spawn", "list", "wait", "cancel", "pipeline", "loop"]
                 },
                 "steps": {
                     "type": "array",
-                    "description": "Pipeline steps array (for action='pipeline'). Each step: {prompt, expected?}",
+                    "description": "Pipeline steps array (for action='pipeline'). Each step: {prompt, expected?, tools?, max_iterations?}",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "prompt": { "type": "string" },
-                            "expected": { "type": "string" }
+                            "prompt": { "type": "string", "description": "The prompt/task for this step" },
+                            "expected": { "type": "string", "description": "Expected answer for verification" },
+                            "tools": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tool names this step can use (e.g. ['exec', 'read_file']). Omit for text-only steps."
+                            },
+                            "max_iterations": {
+                                "type": "integer",
+                                "description": "Max tool iterations for this step (default: 5). Only used when tools are specified."
+                            }
                         }
                     }
                 },
@@ -187,6 +221,19 @@ impl Tool for SpawnTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Working directory for the subagent's exec tool. Defaults to the workspace directory."
+                },
+                "max_rounds": {
+                    "type": "integer",
+                    "description": "Maximum rounds for action='loop' (default: 5). Each round runs a full agent iteration."
+                },
+                "tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Tool names for action='loop' (e.g. ['read_file', 'exec', 'write_file'])"
+                },
+                "stop_condition": {
+                    "type": "string",
+                    "description": "Stop condition text for action='loop'. Loop stops when output contains this text or 'DONE'."
                 }
             },
             "required": []
@@ -263,6 +310,42 @@ impl Tool for SpawnTool {
                         cb(steps_json, ahead_by_k).await
                     }
                     None => "Error: Pipeline callback not configured".to_string(),
+                }
+            }
+            "loop" => {
+                let task = match params.get("task").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => return "Error: 'task' parameter is required for loop".to_string(),
+                };
+                let max_rounds = params
+                    .get("max_rounds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5) as u32;
+                let tools_filter: Option<Vec<String>> = params
+                    .get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+                let stop_condition = params
+                    .get("stop_condition")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let model = params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let working_dir = params
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let cb_guard = self.loop_callback.lock().await;
+                match cb_guard.as_ref() {
+                    Some(cb) => {
+                        let cb = cb.clone();
+                        drop(cb_guard);
+                        cb(task, max_rounds, tools_filter, stop_condition, model, working_dir).await
+                    }
+                    None => "Error: Loop callback not configured".to_string(),
                 }
             }
             "spawn" | _ => {

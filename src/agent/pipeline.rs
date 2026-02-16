@@ -4,17 +4,28 @@
 //! one step at a time is just as reliable as Opus, because it gets a fresh
 //! context every step. The event log (events.jsonl) is below the model layer.
 //!
-//! Supports MAKER-style first-to-ahead-by-k voting and crash resume from
-//! the event log.
+//! Supports MAKER-style first-to-ahead-by-k voting, crash resume from
+//! the event log, tool-equipped steps, and context chaining between steps.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
+use crate::agent::context::ContextBuilder;
+use crate::agent::thread_repair;
+use crate::agent::tools::{
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteFileTool,
+};
 use crate::providers::base::LLMProvider;
+
+/// Default max iterations per tool-equipped step.
+const DEFAULT_STEP_MAX_ITERATIONS: u32 = 5;
 
 /// A single step in a pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +36,12 @@ pub struct PipelineStep {
     pub prompt: String,
     /// Optional expected answer (for voting verification).
     pub expected: Option<String>,
+    /// Optional tool names for this step (None = no tools, text-only).
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Iteration budget per step when tools are enabled (default: 5).
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
 }
 
 /// Result of executing one pipeline step.
@@ -35,6 +52,9 @@ pub struct StepResult {
     pub correct: Option<bool>,
     pub voters_used: usize,
     pub duration_ms: u64,
+    /// Full output text to chain to the next step.
+    #[serde(default)]
+    pub context: String,
 }
 
 /// Pipeline configuration.
@@ -66,6 +86,8 @@ pub struct PipelineResult {
 ///
 /// Resumes from the last completed step found in the event log.
 /// Each step result is appended to events.jsonl immediately.
+/// Steps with `tools` set run a mini agent loop; otherwise plain LLM call.
+/// Each step receives accumulated context from all previous steps.
 pub async fn run_pipeline(
     config: &PipelineConfig,
     provider: &dyn LLMProvider,
@@ -85,20 +107,53 @@ pub async fn run_pipeline(
         results.extend(completed);
     }
 
+    // Build accumulated context from resumed steps.
+    let mut context_so_far = String::new();
+    for sr in &results {
+        if !sr.context.is_empty() {
+            context_so_far.push_str(&format!("## Step {} output\n{}\n\n", sr.index, sr.context));
+        } else if !sr.answer.is_empty() {
+            context_so_far.push_str(&format!("## Step {} output\n{}\n\n", sr.index, sr.answer));
+        }
+    }
+
     for step in config.steps.iter().skip(resume_from) {
         debug!(
-            "Pipeline {} step {}/{}",
+            "Pipeline {} step {}/{} (tools: {:?})",
             config.pipeline_id,
             step.index + 1,
-            config.steps.len()
+            config.steps.len(),
+            step.tools,
         );
 
         let step_start = Instant::now();
-        let (answer, voters_used) = if config.ahead_by_k > 0 {
-            vote_on_step(provider, &config.model, &step.prompt, config.ahead_by_k, config.max_voters).await
+
+        let (answer, voters_used) = if step.tools.is_some() {
+            // Tool-equipped step: run a mini agent loop.
+            let ans = execute_step_with_tools(
+                provider,
+                &config.model,
+                step,
+                &context_so_far,
+                workspace,
+            )
+            .await;
+            (ans, 1) // No voting for tool-equipped steps.
+        } else if config.ahead_by_k > 0 {
+            // Plain step with voting.
+            let prompt_with_context = build_step_prompt(&step.prompt, &context_so_far);
+            vote_on_step(
+                provider,
+                &config.model,
+                &prompt_with_context,
+                config.ahead_by_k,
+                config.max_voters,
+            )
+            .await
         } else {
-            // Single call, no voting.
-            let ans = call_llm(provider, &config.model, &step.prompt).await;
+            // Plain single-call step.
+            let prompt_with_context = build_step_prompt(&step.prompt, &context_so_far);
+            let ans = call_llm(provider, &config.model, &prompt_with_context).await;
             (ans, 1)
         };
 
@@ -106,16 +161,23 @@ pub async fn run_pipeline(
             exp.trim().to_lowercase() == answer.trim().to_lowercase()
         });
 
+        // The context for chaining is the full answer.
+        let step_context = answer.clone();
+
         let step_result = StepResult {
             index: step.index,
             answer: answer.clone(),
             correct,
             voters_used,
             duration_ms: step_start.elapsed().as_millis() as u64,
+            context: step_context.clone(),
         };
 
         // Persist immediately to event log.
         append_pipeline_event(workspace, &config.pipeline_id, &step_result);
+
+        // Accumulate context for subsequent steps.
+        context_so_far.push_str(&format!("## Step {} output\n{}\n\n", step.index, step_context));
 
         results.push(step_result);
     }
@@ -127,6 +189,168 @@ pub async fn run_pipeline(
         results,
         total_duration_ms: start.elapsed().as_millis() as u64,
     }
+}
+
+/// Build a step prompt that includes accumulated context from previous steps.
+fn build_step_prompt(prompt: &str, context_so_far: &str) -> String {
+    if context_so_far.is_empty() {
+        prompt.to_string()
+    } else {
+        format!(
+            "## Previous steps\n{}\n## Your task\n{}",
+            context_so_far, prompt
+        )
+    }
+}
+
+/// Execute a tool-equipped pipeline step as a mini agent loop.
+///
+/// Builds a ToolRegistry with the requested tools, then runs an
+/// iterative LLM → tool execution → LLM loop until the model
+/// produces a text-only response or hits the iteration limit.
+async fn execute_step_with_tools(
+    provider: &dyn LLMProvider,
+    model: &str,
+    step: &PipelineStep,
+    context_so_far: &str,
+    workspace: &Path,
+) -> String {
+    let max_iter = step.max_iterations.unwrap_or(DEFAULT_STEP_MAX_ITERATIONS);
+    let tool_names = step.tools.as_deref().unwrap_or(&[]);
+
+    // Build a tool registry with only the requested tools.
+    let mut tools = ToolRegistry::new();
+    let should_include = |name: &str| -> bool {
+        tool_names.iter().any(|t| t == name)
+    };
+
+    if should_include("read_file") {
+        tools.register(Box::new(ReadFileTool));
+    }
+    if should_include("write_file") {
+        tools.register(Box::new(WriteFileTool));
+    }
+    if should_include("edit_file") {
+        tools.register(Box::new(EditFileTool));
+    }
+    if should_include("list_dir") {
+        tools.register(Box::new(ListDirTool));
+    }
+    if should_include("exec") {
+        tools.register(Box::new(ExecTool::new(
+            30, // timeout
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+            None,
+            false, // restrict_to_workspace
+            30000, // max_result_chars
+        )));
+    }
+    if should_include("web_search") {
+        tools.register(Box::new(WebSearchTool::new(None, 5)));
+    }
+    if should_include("web_fetch") {
+        tools.register(Box::new(WebFetchTool::new(50_000)));
+    }
+
+    let tool_defs = tools.get_definitions();
+    let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+        None
+    } else {
+        Some(&tool_defs)
+    };
+
+    // Build initial messages with context from previous steps.
+    let system_prompt = format!(
+        "You are a pipeline step executor. Complete the task using the available tools.\n\
+         When done, provide your final answer as plain text (no tool calls)."
+    );
+
+    let user_prompt = build_step_prompt(&step.prompt, context_so_far);
+
+    let mut messages: Vec<Value> = vec![
+        json!({"role": "system", "content": system_prompt}),
+        json!({"role": "user", "content": user_prompt}),
+    ];
+
+    let mut final_content = String::new();
+
+    // Detect local models for strict alternation repair.
+    let is_local = model.starts_with("local:") || model.starts_with("local/");
+
+    for iteration in 0..max_iter {
+        debug!(
+            "Pipeline step {} tool iteration {}/{}",
+            step.index,
+            iteration + 1,
+            max_iter
+        );
+
+        // Local models with Jinja templates require strict user/assistant alternation.
+        // Repair tool messages before each LLM call.
+        if is_local && iteration > 0 {
+            thread_repair::repair_for_strict_alternation(&mut messages);
+        }
+
+        let response = match provider
+            .chat(&messages, tool_defs_opt, Some(model), 4096, 0.7, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Pipeline step {} LLM call failed: {}", step.index, e);
+                return format!("Error: {}", e);
+            }
+        };
+
+        if response.finish_reason == "error" {
+            let err = response.content.as_deref().unwrap_or("Unknown error");
+            error!("Pipeline step {} LLM error: {}", step.index, err);
+            return format!("Error: {}", err);
+        }
+
+        if response.has_tool_calls() {
+            // Build assistant message with tool calls.
+            let tc_json: Vec<Value> = response
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })
+                })
+                .collect();
+
+            ContextBuilder::add_assistant_message(
+                &mut messages,
+                response.content.as_deref(),
+                Some(&tc_json),
+            );
+
+            // Execute each tool call.
+            for tc in &response.tool_calls {
+                debug!("Pipeline step {} calling tool: {}", step.index, tc.name);
+                let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
+            }
+        } else {
+            // No tool calls — step is done.
+            final_content = response.content.unwrap_or_default();
+            break;
+        }
+    }
+
+    if final_content.is_empty() {
+        final_content = "Pipeline step completed but produced no final text.".to_string();
+    }
+
+    final_content
 }
 
 /// MAKER-style first-to-ahead-by-k voting.
@@ -236,6 +460,7 @@ fn load_completed_steps(workspace: &Path, pipeline_id: &str) -> Vec<StepResult> 
                     correct: ev["correct"].as_bool(),
                     voters_used: ev["voters_used"].as_u64().unwrap_or(1) as usize,
                     duration_ms: ev["duration_ms"].as_u64().unwrap_or(0),
+                    context: ev["answer"].as_str().unwrap_or("").to_string(),
                 });
             }
         }
@@ -304,9 +529,9 @@ mod tests {
         let config = PipelineConfig {
             pipeline_id: "test-1".to_string(),
             steps: vec![
-                PipelineStep { index: 0, prompt: "Q1".into(), expected: Some("42".into()) },
-                PipelineStep { index: 1, prompt: "Q2".into(), expected: None },
-                PipelineStep { index: 2, prompt: "Q3".into(), expected: Some("done".into()) },
+                PipelineStep { index: 0, prompt: "Q1".into(), expected: Some("42".into()), tools: None, max_iterations: None },
+                PipelineStep { index: 1, prompt: "Q2".into(), expected: None, tools: None, max_iterations: None },
+                PipelineStep { index: 2, prompt: "Q3".into(), expected: Some("done".into()), tools: None, max_iterations: None },
             ],
             ahead_by_k: 0,
             max_voters: 1,
@@ -348,8 +573,8 @@ mod tests {
         let config = PipelineConfig {
             pipeline_id: "resume-test".to_string(),
             steps: vec![
-                PipelineStep { index: 0, prompt: "Q1".into(), expected: None },
-                PipelineStep { index: 1, prompt: "Q2".into(), expected: None },
+                PipelineStep { index: 0, prompt: "Q1".into(), expected: None, tools: None, max_iterations: None },
+                PipelineStep { index: 1, prompt: "Q2".into(), expected: None, tools: None, max_iterations: None },
             ],
             ahead_by_k: 0,
             max_voters: 1,
@@ -371,5 +596,41 @@ mod tests {
         let (answer, voters) = vote_on_step(&provider, "mock", "test", 1, 5).await;
         assert_eq!(answer.trim().to_lowercase(), "a");
         assert!(voters <= 3);
+    }
+
+    #[tokio::test]
+    async fn test_context_chaining() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each answer builds on context from previous steps.
+        let provider = MockPipelineProvider::new(vec!["first_result", "second_result"]);
+        let config = PipelineConfig {
+            pipeline_id: "chain-test".to_string(),
+            steps: vec![
+                PipelineStep { index: 0, prompt: "Do step 1".into(), expected: None, tools: None, max_iterations: None },
+                PipelineStep { index: 1, prompt: "Do step 2".into(), expected: None, tools: None, max_iterations: None },
+            ],
+            ahead_by_k: 0,
+            max_voters: 1,
+            model: "mock".to_string(),
+        };
+
+        let result = run_pipeline(&config, &provider, dir.path()).await;
+        assert_eq!(result.steps_completed, 2);
+        assert_eq!(result.results[0].context, "first_result");
+        assert_eq!(result.results[1].context, "second_result");
+    }
+
+    #[tokio::test]
+    async fn test_build_step_prompt_no_context() {
+        let prompt = build_step_prompt("What is 2+2?", "");
+        assert_eq!(prompt, "What is 2+2?");
+    }
+
+    #[tokio::test]
+    async fn test_build_step_prompt_with_context() {
+        let prompt = build_step_prompt("What is 2+2?", "## Step 0 output\n4\n\n");
+        assert!(prompt.contains("Previous steps"));
+        assert!(prompt.contains("Step 0 output"));
+        assert!(prompt.contains("What is 2+2?"));
     }
 }

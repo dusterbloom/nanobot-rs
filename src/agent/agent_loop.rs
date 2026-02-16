@@ -30,9 +30,10 @@ use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    CancelCallback, ListCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
+    CancelCallback, ListCallback, LoopCallback, PipelineCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use crate::agent::pipeline;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
 use crate::config::schema::{EmailConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig};
@@ -448,12 +449,94 @@ impl AgentLoopShared {
                 mgr.wait_for(&task_id, timeout).await
             })
         });
+        // Pipeline callback: parse steps JSON, build PipelineConfig, run pipeline.
+        // Uses the delegation provider/model (cheap) for pipeline LLM calls.
+        let pipeline_provider = core.tool_runner_provider.clone()
+            .unwrap_or_else(|| core.provider.clone());
+        let pipeline_model = core.tool_runner_model.clone()
+            .unwrap_or_else(|| core.model.clone());
+        let pipeline_workspace = core.workspace.clone();
+        let pipeline_cb: PipelineCallback = Arc::new(move |steps_json: String, ahead_by_k: usize| {
+            let provider = pipeline_provider.clone();
+            let model = pipeline_model.clone();
+            let workspace = pipeline_workspace.clone();
+            Box::pin(async move {
+                // Parse steps from JSON.
+                let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
+                    Ok(s) => s,
+                    Err(e) => return format!("Error parsing pipeline steps: {}", e),
+                };
+                let pipeline_steps: Vec<pipeline::PipelineStep> = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| pipeline::PipelineStep {
+                        index: i,
+                        prompt: s["prompt"].as_str().unwrap_or("").to_string(),
+                        expected: s["expected"].as_str().map(|s| s.to_string()),
+                        tools: s["tools"].as_array().map(|arr| {
+                            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                        }),
+                        max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
+                    })
+                    .collect();
+                if pipeline_steps.is_empty() {
+                    return "Error: no valid pipeline steps provided.".to_string();
+                }
+                let config = pipeline::PipelineConfig {
+                    pipeline_id: format!("pipe-{}", chrono::Utc::now().timestamp_millis() % 100_000_000),
+                    steps: pipeline_steps,
+                    ahead_by_k,
+                    max_voters: if ahead_by_k > 0 { ahead_by_k * 2 + 1 } else { 1 },
+                    model: model.clone(),
+                };
+                let result = pipeline::run_pipeline(&config, provider.as_ref(), &workspace).await;
+                // Format result for the agent.
+                let mut output = format!(
+                    "Pipeline '{}' completed: {}/{} steps\n",
+                    result.pipeline_id, result.steps_completed, result.steps_total
+                );
+                for sr in &result.results {
+                    let correct_str = match sr.correct {
+                        Some(true) => " ✓",
+                        Some(false) => " ✗",
+                        None => "",
+                    };
+                    output.push_str(&format!(
+                        "  Step {}: {}{} ({}ms, {} voters)\n",
+                        sr.index,
+                        sr.answer.chars().take(200).collect::<String>(),
+                        correct_str,
+                        sr.duration_ms,
+                        sr.voters_used
+                    ));
+                }
+                output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
+                output
+            })
+        });
+
+        // Loop callback: run an autonomous refinement loop via SubagentManager.
+        let subagents_ref5 = self.subagents.clone();
+        let loop_cb: LoopCallback = Arc::new(move |task: String,
+                                                     max_rounds: u32,
+                                                     tools_filter: Option<Vec<String>>,
+                                                     stop_condition: Option<String>,
+                                                     model: Option<String>,
+                                                     working_dir: Option<String>| {
+            let mgr = subagents_ref5.clone();
+            Box::pin(async move {
+                mgr.run_loop(task, max_rounds, tools_filter, stop_condition, model, working_dir).await
+            })
+        });
+
         let spawn_tool = Arc::new(SpawnTool::new());
         // Set callbacks and context before registering so they're ready for use.
         spawn_tool.set_callback(spawn_cb).await;
         spawn_tool.set_list_callback(list_cb).await;
         spawn_tool.set_cancel_callback(cancel_cb).await;
         spawn_tool.set_wait_callback(wait_cb).await;
+        spawn_tool.set_pipeline_callback(pipeline_cb).await;
+        spawn_tool.set_loop_callback(loop_cb).await;
         spawn_tool.set_context(channel, chat_id).await;
         tools.register(Box::new(SpawnToolProxy(spawn_tool)));
 
@@ -994,14 +1077,30 @@ impl AgentLoopShared {
                         .await;
                         let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
-                        // If the runner returned no summary, the delegation
-                        // LLM likely failed (server down). Mark it unhealthy
-                        // so future calls go inline without wasting time.
+                        // If the runner returned no summary, diagnose why and
+                        // mark unhealthy so future calls go inline.
                         if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+                            let reason = if let Some(ref err) = run_result.error {
+                                format!("delegation model errored: {}", err)
+                            } else if delegation_elapsed_ms > 30_000 {
+                                "delegation model timed out (>30s)".to_string()
+                            } else {
+                                "delegation model returned empty".to_string()
+                            };
+                            let results_preview: String = run_result.tool_results
+                                .first()
+                                .map(|(_, name, data)| {
+                                    format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
+                                })
+                                .unwrap_or_default();
                             warn!(
-                                "Delegation model returned no summary — marking provider unhealthy. \
-                                 Tool results will flow to main model directly. \
-                                 Restart servers or toggle /local to recover."
+                                "Delegation failed — {}. model={}, iterations={}, results={}, preview={}. \
+                                 Marking unhealthy. Restart servers or toggle /local to recover.",
+                                reason,
+                                tr_model,
+                                run_result.iterations_used,
+                                run_result.tool_results.len(),
+                                results_preview,
                             );
                             counters.delegation_healthy.store(false, Ordering::Relaxed);
                         } else if !counters.delegation_healthy.load(Ordering::Relaxed) {

@@ -16,6 +16,7 @@ use chrono::Utc;
 
 use crate::agent::agent_profiles::{self, AgentProfile};
 use crate::agent::context::ContextBuilder;
+use crate::agent::thread_repair;
 use crate::agent::tools::{
     EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
     WriteFileTool,
@@ -27,6 +28,9 @@ use crate::providers::openai_compat::OpenAICompatProvider;
 
 /// Maximum iterations for a subagent run (default when no profile overrides).
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
+
+/// Maximum spawn depth to prevent infinite recursion.
+const MAX_SPAWN_DEPTH: u32 = 3;
 
 /// Configuration passed to `_run_subagent`, derived from profile + overrides.
 #[derive(Debug, Clone)]
@@ -97,6 +101,9 @@ pub struct SubagentManager {
     /// delivers results to channels, but in CLI mode nobody reads the bus
     /// so we send directly to the terminal.
     display_tx: Option<UnboundedSender<String>>,
+    /// Current spawn depth (0 = root). Children get depth + 1.
+    /// Spawns are rejected when depth >= MAX_SPAWN_DEPTH.
+    depth: u32,
     running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>, broadcast::Sender<String>)>>>,
 }
 
@@ -138,6 +145,7 @@ impl SubagentManager {
             profiles,
             providers_config: None,
             display_tx: None,
+            depth: 0,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -151,6 +159,12 @@ impl SubagentManager {
     /// Set the providers config for multi-provider subagent routing.
     pub fn with_providers_config(mut self, config: ProvidersConfig) -> Self {
         self.providers_config = Some(config);
+        self
+    }
+
+    /// Set the spawn depth (for nested subagents).
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
         self
     }
 
@@ -183,6 +197,18 @@ impl SubagentManager {
         origin_chat_id: String,
         working_dir: Option<String>,
     ) -> String {
+        // Depth limit check: prevent infinite recursion.
+        if self.depth >= MAX_SPAWN_DEPTH {
+            warn!(
+                "Spawn rejected: depth {} >= MAX_SPAWN_DEPTH {}",
+                self.depth, MAX_SPAWN_DEPTH
+            );
+            return format!(
+                "Error: spawn depth limit reached ({}/{}). Cannot spawn nested subagents beyond depth {}.",
+                self.depth, MAX_SPAWN_DEPTH, MAX_SPAWN_DEPTH
+            );
+        }
+
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
 
         // Resolve agent profile if specified.
@@ -222,21 +248,33 @@ impl SubagentManager {
             })
         };
 
+        // Budget halving: each depth level gets half the iterations.
+        // depth 0 → full budget, depth 1 → half, depth 2 → quarter.
+        let base_iterations = profile
+            .as_ref()
+            .and_then(|p| p.max_iterations)
+            .unwrap_or(MAX_SUBAGENT_ITERATIONS);
+        let depth_budget = base_iterations >> self.depth; // halve per depth level
+        let effective_iterations = depth_budget.max(3); // minimum 3 iterations
+        if self.depth > 0 {
+            info!(
+                "Subagent depth={}, budget={} iterations (base={}, halved {} times)",
+                self.depth, effective_iterations, base_iterations, self.depth
+            );
+        }
+
         let mut config = SubagentConfig {
             model: effective_model,
             system_prompt: profile.as_ref().map(|p| p.system_prompt.clone()),
             tools_filter: profile.as_ref().and_then(|p| p.tools.clone()),
             read_only: profile.as_ref().map(|p| p.read_only).unwrap_or(false),
-            max_iterations: profile
-                .as_ref()
-                .and_then(|p| p.max_iterations)
-                .unwrap_or(MAX_SUBAGENT_ITERATIONS),
+            max_iterations: effective_iterations,
         };
 
         let effective_model_for_display = config.model.clone();
 
         // Resolve provider for model prefix (groq/, gemini/, openai/, etc.)
-        let (provider, resolved_model) = self.resolve_provider_for_model(&config.model);
+        let (provider, resolved_model, targets_local) = self.resolve_provider_for_model(&config.model);
         let routed_to_cloud = resolved_model != config.model;
         if routed_to_cloud {
             info!(
@@ -263,8 +301,10 @@ impl SubagentManager {
         let brave_api_key = self.brave_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
-        // Cloud-routed subagents (groq/, gemini/, openai/, etc.) are never local.
-        let is_local = if routed_to_cloud { false } else { self.is_local };
+        // Provider-routed subagents: check if the resolved API base is localhost.
+        // A groq/ prefix pointing to localhost:8083 is still a local llama-server
+        // and needs strict alternation repair.
+        let is_local = if routed_to_cloud { targets_local } else { self.is_local };
         let display_tx = self.display_tx.clone();
         let running_tasks = self.running_tasks.clone();
         let tid = task_id.clone();
@@ -437,32 +477,164 @@ impl SubagentManager {
         }
     }
 
+    /// Run an autonomous refinement loop: repeated rounds of agent work
+    /// with accumulated history and a stop condition.
+    ///
+    /// Each round runs `_run_subagent` with the task augmented by previous
+    /// round summaries. The loop stops when:
+    /// - The agent's output contains "DONE" (case-insensitive)
+    /// - `max_rounds` is reached
+    /// - The stop condition text appears in the output
+    ///
+    /// Returns all round summaries concatenated.
+    pub async fn run_loop(
+        &self,
+        task: String,
+        max_rounds: u32,
+        tools_filter: Option<Vec<String>>,
+        stop_condition: Option<String>,
+        model_override: Option<String>,
+        working_dir: Option<String>,
+    ) -> String {
+        let effective_model = model_override
+            .or_else(|| self.default_subagent_model.clone())
+            .unwrap_or_else(|| self.model.clone());
+
+        let (provider, resolved_model, targets_local) = self.resolve_provider_for_model(&effective_model);
+        let is_local = if resolved_model != effective_model { targets_local } else { self.is_local };
+
+        info!(
+            "Starting agent loop: max_rounds={}, model={}, stop={:?}",
+            max_rounds, resolved_model, stop_condition
+        );
+
+        let config = SubagentConfig {
+            model: resolved_model.clone(),
+            system_prompt: None,
+            tools_filter,
+            read_only: false,
+            max_iterations: MAX_SUBAGENT_ITERATIONS,
+        };
+
+        let mut round_summaries: Vec<String> = Vec::new();
+
+        for round in 0..max_rounds {
+            // Build task with accumulated context from previous rounds.
+            let round_task = if round_summaries.is_empty() {
+                task.clone()
+            } else {
+                let history = round_summaries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!("## Round {} results\n{}", i + 1, s))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                format!(
+                    "{}\n\n## Previous rounds\n{}\n\n## Round {} of {}\n{}",
+                    task,
+                    history,
+                    round + 1,
+                    max_rounds,
+                    stop_condition
+                        .as_ref()
+                        .map(|s| format!("Stop condition: {}", s))
+                        .unwrap_or_default()
+                )
+            };
+
+            let task_id = format!("loop-r{}", round + 1);
+            info!("Agent loop round {}/{}", round + 1, max_rounds);
+
+            let result = Self::_run_subagent(
+                &task_id,
+                &round_task,
+                &format!("loop-round-{}", round + 1),
+                provider.as_ref(),
+                &self.workspace,
+                &config,
+                self.brave_api_key.as_deref(),
+                self.exec_timeout,
+                self.restrict_to_workspace,
+                is_local,
+                working_dir.as_deref(),
+            )
+            .await;
+
+            let round_text = match result {
+                Ok(text) => text,
+                Err(e) => {
+                    let err = format!("Round {} error: {}", round + 1, e);
+                    warn!("{}", err);
+                    round_summaries.push(err);
+                    break;
+                }
+            };
+
+            // Persist round result to event log.
+            Self::append_event(
+                &self.workspace,
+                &task_id,
+                &format!("loop-round-{}", round + 1),
+                &task,
+                &round_text,
+                "completed",
+            );
+
+            // Check stop condition.
+            let done = round_text.to_lowercase().contains("done")
+                || stop_condition
+                    .as_ref()
+                    .map(|sc| round_text.to_lowercase().contains(&sc.to_lowercase()))
+                    .unwrap_or(false);
+
+            round_summaries.push(format!("Round {}: {}", round + 1, round_text));
+
+            if done {
+                info!("Agent loop stop condition met at round {}/{}", round + 1, max_rounds);
+                break;
+            }
+        }
+
+        // Build final output.
+        let mut output = format!("Agent loop completed ({} rounds):\n\n", round_summaries.len());
+        for summary in &round_summaries {
+            output.push_str(summary);
+            output.push_str("\n\n---\n\n");
+        }
+        output
+    }
+
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 
-    /// Resolve a model string to (provider, stripped_model).
+    /// Resolve a model string to (provider, stripped_model, targets_local_server).
     ///
     /// If the model has a provider prefix (e.g. `groq/llama-3.3-70b`), creates
     /// a dedicated `OpenAICompatProvider` for that backend. Otherwise returns
     /// the parent provider and the model unchanged.
-    fn resolve_provider_for_model(&self, model: &str) -> (Arc<dyn LLMProvider>, String) {
+    ///
+    /// The third return value is `true` when the resolved API base points to
+    /// localhost, which means strict alternation repair is still needed even
+    /// though the model was "routed" via a provider prefix.
+    fn resolve_provider_for_model(&self, model: &str) -> (Arc<dyn LLMProvider>, String, bool) {
         if let Some(ref pc) = self.providers_config {
             if let Some((api_key, base, rest)) = pc.resolve_model_prefix(model) {
                 let prefix = model.split('/').next().unwrap_or("unknown");
+                let targets_local = base.contains("localhost") || base.contains("127.0.0.1");
                 info!(
-                    "Subagent using {} provider (base={}) for model {}",
-                    prefix, base, rest
+                    "Subagent using {} provider (base={}, local={}) for model {}",
+                    prefix, base, targets_local, rest
                 );
                 let provider: Arc<dyn LLMProvider> = Arc::new(
                     OpenAICompatProvider::new(&api_key, Some(&base), Some(&rest)),
                 );
-                return (provider, rest);
+                return (provider, rest, targets_local);
             }
         }
 
         // No prefix match → use parent provider with model as-is.
-        (self.provider.clone(), model.to_string())
+        (self.provider.clone(), model.to_string(), false)
     }
 
     /// Run the subagent agent loop.
@@ -617,14 +789,12 @@ impl SubagentManager {
                     ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
                 }
 
-                // Local models (llama-server) require conversations to end
-                // with a user message. Mistral/Ministral handle tool→generate
-                // natively and break if a user message is injected here.
+                // Local models with strict Jinja templates require strict user/assistant alternation.
+                // Tool results use "role": "tool" which breaks this. Repair converts
+                // tool→user and merges consecutive same-role messages, so the thread
+                // already ends with a user message. No extra continuation needed.
                 if is_local {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": "Based on the tool results above, continue with your task. Call more tools if needed, or provide your final answer."
-                    }));
+                    thread_repair::repair_for_strict_alternation(&mut messages);
                 }
             } else {
                 // No tool calls -- the subagent is done.
