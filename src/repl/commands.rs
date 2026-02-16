@@ -198,7 +198,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/v" => "/voice",
         "/wa" => "/whatsapp",
         "/tg" => "/telegram",
-        "/p" => "/paste",
+        "/p" => "/provenance",
         "/h" | "/?" => "/help",
         "/a" => "/agents",
         "/s" => "/status",
@@ -230,7 +230,7 @@ impl ReplContext {
             "/verify" => { self.cmd_verify().await; }
             "/kill" => { self.cmd_kill(arg).await; }
             "/stop" => { self.cmd_stop().await; }
-            "/paste" => { self.cmd_paste().await; }
+
             "/replay" => { self.cmd_replay(arg).await; }
             "/provenance" => { self.cmd_provenance(); }
             "/restart" => { self.cmd_restart().await; }
@@ -611,31 +611,6 @@ impl ReplContext {
             self.active_channels.clear();
             println!("  All channels stopped.\n");
         }
-    }
-
-    /// /paste — multiline paste mode.
-    async fn cmd_paste(&mut self) {
-        let voice_on = self.voice_on();
-        println!("  {}Paste mode: type or paste text, then enter --- on its own line to send{}", tui::DIM, tui::RESET);
-        let mut lines: Vec<String> = Vec::new();
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) if l.trim() == "---" => break,
-                Ok(l) => lines.push(l),
-                Err(_) => break,
-            }
-        }
-        let pasted = lines.join("\n").trim().to_string();
-        if pasted.is_empty() {
-            return;
-        }
-        let _ = self.rl.add_history_entry(&pasted);
-        let channel = if voice_on { "voice" } else { "cli" };
-        super::stream_and_render(&mut self.agent_loop, &pasted, &self.session_id, channel, None, &self.core_handle).await;
-        self.drain_display();
-        println!();
-        self.print_status_bar().await;
     }
 
     /// /replay — show session message history.
@@ -1153,7 +1128,7 @@ mod tests {
         assert_eq!(normalize_alias("/v"), "/voice");
         assert_eq!(normalize_alias("/wa"), "/whatsapp");
         assert_eq!(normalize_alias("/tg"), "/telegram");
-        assert_eq!(normalize_alias("/p"), "/paste");
+        assert_eq!(normalize_alias("/prov"), "/provenance");
         assert_eq!(normalize_alias("/h"), "/help");
         assert_eq!(normalize_alias("/?"), "/help");
         assert_eq!(normalize_alias("/a"), "/agents");

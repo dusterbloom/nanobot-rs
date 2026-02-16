@@ -181,17 +181,30 @@ pub(crate) fn render_input_bar(
     let bar_lines = 3usize;
     // bar_row is the terminal row where the separator starts (1-indexed)
     let bar_row = height.saturating_sub(bar_lines) + 1;
+    // prompt_row is where the user types — just above the bar
+    let prompt_row = bar_row.saturating_sub(1);
 
-    // Save cursor position, move to bar area, render, restore cursor.
-    // \x1b[s = save cursor, \x1b[u = restore cursor
-    // \x1b[{row};1H = move to absolute row, column 1
-    print!("\x1b[s");
+    // 1. Reset scroll region to full screen temporarily so we can draw everywhere
+    print!("\x1b[r");
+
+    // 2. Scroll content up to make room: move to bottom and emit newlines
+    print!("\x1b[{};1H", height); // move to last row
+    for _ in 0..bar_lines + 1 {
+        println!(); // push content up by scrolling
+    }
+
+    // 3. Render the bar at its fixed position (outside scroll region)
     print!("\x1b[{};1H", bar_row);
     print!("\x1b[J"); // clear from bar_row to end of screen
     println!("{DIM}{separator}{RESET}");
     println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
     print!("  {}", hints.join(" · "));
-    print!("\x1b[u"); // restore cursor to where prompt should be
+
+    // 4. Set scroll region to rows 1..prompt_row so text never overwrites the bar
+    print!("\x1b[1;{}r", prompt_row);
+
+    // 5. Position cursor at prompt_row within the scroll region
+    print!("\x1b[{};1H\x1b[2K", prompt_row);
     std::io::stdout().flush().ok();
 
     bar_lines
@@ -199,6 +212,102 @@ pub(crate) fn render_input_bar(
 
 // Status Bar & Banners
 // ============================================================================
+
+/// Update the input bar content in place (after AI response).
+/// Re-renders the bar at the bottom and positions cursor for next input.
+pub(crate) fn update_input_bar(
+    core_handle: &crate::agent::agent_loop::SharedCoreHandle,
+    channel_names: &[&str],
+    subagent_count: usize,
+) {
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+
+    let counters = &core_handle.counters;
+    let width = terminal_width().min(100);
+    let height = terminal_height();
+    let separator = "─".repeat(width);
+
+    // Gather info
+    let thinking_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+    let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
+    let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
+
+    let cwd = std::env::current_dir()
+        .map(|p| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let s = p.display().to_string();
+            if !home.is_empty() && s.starts_with(&home) {
+                format!("~{}", &s[home.len()..])
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|_| "?".into());
+
+    let model_name = {
+        let core = core_handle.swappable();
+        core.model.clone()
+    };
+
+    let think_str = if thinking_on {
+        format!(" · {GREY}\u{1f9e0} thinking{RESET}")
+    } else {
+        String::new()
+    };
+
+    let mut hints: Vec<String> = Vec::new();
+    hints.push(format!("{DIM}⏵⏵ /t think · /l local · /v voice{RESET}"));
+
+    if subagent_count > 0 {
+        hints.push(format!(
+            "{CYAN}{} agent{}{RESET}",
+            subagent_count,
+            if subagent_count > 1 { "s" } else { "" }
+        ));
+    }
+
+    if !channel_names.is_empty() {
+        hints.push(format!("{CYAN}{}{RESET}", channel_names.join(" ")));
+    }
+
+    if max > 0 {
+        let pct = (used * 100) / max;
+        let ctx_color = match pct {
+            0..=49 => GREEN,
+            50..=79 => YELLOW,
+            _ => RED,
+        };
+        hints.push(format!(
+            "ctx {ctx_color}{}{RESET}/{DIM}{}{RESET}",
+            format_tokens(used),
+            format_tokens(max)
+        ));
+    }
+
+    let bar_lines = 3usize;
+    // bar_row is the terminal row where the separator starts (1-indexed)
+    let bar_row = height.saturating_sub(bar_lines) + 1;
+    // prompt_row is where the user types — just above the bar
+    let _prompt_row = bar_row.saturating_sub(1);
+
+    // Save cursor, move to bar position, redraw, restore cursor
+    print!("\x1b[s"); // save cursor
+    print!("\x1b[{};1H", bar_row); // move to bar start
+    print!("\x1b[J"); // clear from here to end
+    println!("{DIM}{separator}{RESET}");
+    println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
+    print!("  {}", hints.join(" · "));
+    print!("\x1b[u"); // restore cursor
+    std::io::stdout().flush().ok();
+}
+
+/// Reset the terminal scroll region to the full screen.
+/// Call this before AI output starts streaming so text can use all rows.
+pub(crate) fn reset_scroll_region() {
+    print!("\x1b[r"); // reset scroll region to full terminal
+    std::io::stdout().flush().ok();
+}
 
 /// Format token count as compact string (e.g. 12430 -> "12.4K", 1200000 -> "1.2M").
 fn format_tokens(n: usize) -> String {

@@ -179,7 +179,7 @@ pub(crate) fn print_help() {
     println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
     println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
     println!("  /email          - Start Email channel (runs alongside chat)");
-    println!("  /paste, /p      - Paste mode: multiline input until --- on its own line");
+
     println!("  /stop           - Stop all running channels");
     println!("  /agents, /a     - List running background agents");
     println!("  /kill <id>      - Cancel a background agent");
@@ -982,8 +982,14 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
             // Readline editor with history
             let history_path = get_data_dir().join("history.txt");
-            let rl = rustyline::DefaultEditor::new()
+            let mut rl = rustyline::DefaultEditor::new()
                 .expect("Failed to create line editor");
+
+            // Alt+Enter inserts a newline (multi-line editing) instead of submitting.
+            rl.bind_sequence(
+                rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::ALT),
+                rustyline::Cmd::Newline,
+            );
 
             // Build ReplContext — all mutable REPL state in one struct.
             let mut ctx = commands::ReplContext {
@@ -1087,9 +1093,9 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     }
                 }
 
-                // Erase the input bar lines below the cursor after input is received.
-                // Save cursor, move down, clear those lines, restore cursor.
-                print!("\x1b[s\x1b[J\x1b[u");
+                // Clear only the input line (not the bar).
+                // The scroll region stays intact so the bar remains pinned at bottom.
+                print!("\x1b[2K\r"); // clear current line, return to column 0
                 io::stdout().flush().ok();
 
                 // === VOICE RECORDING ===
@@ -1187,7 +1193,11 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 let response = stream_and_render(&mut ctx.agent_loop, input, &ctx.session_id, channel, None, &ctx.core_handle).await;
                 ctx.drain_display();
                 println!();
-                ctx.print_status_bar().await;
+
+                // Update the input bar in place (keeps it pinned at bottom)
+                let ch_names: Vec<&str> = ctx.active_channels.iter().map(|c| c.name.as_str()).collect();
+                let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
+                tui::update_input_bar(&ctx.core_handle, &ch_names, sa_count);
 
                 #[cfg(feature = "voice")]
                 if let Some(ref mut vs) = ctx.voice_session {
