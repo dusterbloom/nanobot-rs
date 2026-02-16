@@ -336,6 +336,7 @@ impl ContextCompactor {
                 Some(&self.model),
                 self.summary_max_tokens,
                 0.3, // low temperature for factual summaries
+                None,
             )
             .await?;
 
@@ -513,6 +514,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> Result<LLMResponse> {
             Ok(LLMResponse {
                 content: Some(self.response.clone()),
@@ -539,6 +541,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> Result<LLMResponse> {
             Err(anyhow::anyhow!("LLM unavailable"))
         }
@@ -561,6 +564,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> Result<LLMResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("LLM unavailable"))

@@ -727,6 +727,8 @@ pub(crate) struct SentenceAccumulator {
     /// Sentences waiting to be batched into a chunk.
     pending: String,
     in_code_block: bool,
+    /// Track whether we're inside a `<thinking>` block (reasoning content to suppress).
+    in_thinking_block: bool,
     sentence_tx: std_mpsc::Sender<TtsCommand>,
     /// When true, send each sentence immediately instead of batching to 250 chars.
     /// Use for streaming TTS where latency matters more than batching efficiency.
@@ -741,6 +743,7 @@ impl SentenceAccumulator {
             buffer: String::new(),
             pending: String::new(),
             in_code_block: false,
+            in_thinking_block: false,
             sentence_tx,
             eager: false,
             first_buffered: None,
@@ -755,6 +758,7 @@ impl SentenceAccumulator {
             buffer: String::new(),
             pending: String::new(),
             in_code_block: false,
+            in_thinking_block: false,
             sentence_tx,
             eager: true,
             first_buffered: None,
@@ -766,12 +770,55 @@ impl SentenceAccumulator {
     /// is flushed as-is so the user hears audio before the first period.
     pub fn push(&mut self, delta: &str) {
         self.buffer.push_str(delta);
+
+        // Filter out <thinking>...</thinking> blocks that arrive token-by-token.
+        // These are internal chain-of-thought from reasoning models.
+        self.strip_thinking_from_buffer();
+
         if self.first_buffered.is_none() && !self.buffer.trim().is_empty() {
             self.first_buffered = Some(std::time::Instant::now());
         }
         self.extract_sentences();
         if self.eager && !self.in_code_block {
             self.try_timeout_flush();
+        }
+    }
+
+    /// Strip `<thinking>...</thinking>` blocks from the buffer, handling the case
+    /// where tags arrive across multiple `push()` calls (token-by-token streaming).
+    fn strip_thinking_from_buffer(&mut self) {
+        loop {
+            if self.in_thinking_block {
+                // We're inside a thinking block — look for closing tag
+                if let Some(end) = self.buffer.find("</thinking>") {
+                    // Discard everything up to and including </thinking>
+                    self.buffer = self.buffer[end + "</thinking>".len()..].to_string();
+                    self.in_thinking_block = false;
+                    // Loop to check for another <thinking> in remaining text
+                } else {
+                    // No closing tag yet — discard entire buffer, wait for more data
+                    self.buffer.clear();
+                    return;
+                }
+            } else if let Some(start) = self.buffer.find("<thinking>") {
+                // Found opening tag — keep text before it, discard tag + content
+                let before = self.buffer[..start].to_string();
+                let after_tag = self.buffer[start + "<thinking>".len()..].to_string();
+                self.in_thinking_block = true;
+                // Check if closing tag is also in this chunk
+                if let Some(end) = after_tag.find("</thinking>") {
+                    let remaining = after_tag[end + "</thinking>".len()..].to_string();
+                    self.buffer = format!("{}{}", before, remaining);
+                    self.in_thinking_block = false;
+                    // Loop to check for more <thinking> blocks
+                } else {
+                    // No closing tag yet — keep the before part only
+                    self.buffer = before;
+                    return;
+                }
+            } else {
+                return; // No thinking tags found
+            }
         }
     }
 
@@ -1049,5 +1096,46 @@ mod tests {
             }
             Err(e) => panic!("Pocket TTS init failed: {}", e),
         }
+    }
+
+    #[test]
+    fn test_sentence_accumulator_strips_thinking_block() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut acc = SentenceAccumulator::new(tx);
+        // Simulate token-by-token arrival of a thinking block followed by real content
+        acc.push("<thinking>\nLet me think...\n</thinking>\n\nThe answer is 42.");
+        acc.flush();
+        // Collect all synthesized sentences
+        let mut sentences = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let TtsCommand::Synthesize(s) = cmd {
+                sentences.push(s);
+            }
+        }
+        let combined = sentences.join(" ");
+        assert!(!combined.contains("thinking"), "Thinking block should be stripped, got: {}", combined);
+        assert!(!combined.contains("Let me think"), "Thinking content should be stripped, got: {}", combined);
+        assert!(combined.contains("The answer is 42"), "Real content should remain, got: {}", combined);
+    }
+
+    #[test]
+    fn test_sentence_accumulator_strips_thinking_across_pushes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut acc = SentenceAccumulator::new(tx);
+        // Thinking tag arrives as a whole token, but content streams in multiple pushes
+        acc.push("<thinking>");
+        acc.push("\nInternal reasoning here.\n");
+        acc.push("</thinking>");
+        acc.push("\nHello world.");
+        acc.flush();
+        let mut sentences = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let TtsCommand::Synthesize(s) = cmd {
+                sentences.push(s);
+            }
+        }
+        let combined = sentences.join(" ");
+        assert!(!combined.contains("Internal reasoning"), "Thinking content should be stripped, got: {}", combined);
+        assert!(combined.contains("Hello world"), "Real content should remain, got: {}", combined);
     }
 }

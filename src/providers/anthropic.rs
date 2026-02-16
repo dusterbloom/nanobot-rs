@@ -356,6 +356,7 @@ impl LLMProvider for AnthropicProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        thinking_budget: Option<u32>,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_claude_model(m.split('/').last().unwrap_or(m)));
         let model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -370,6 +371,16 @@ impl LLMProvider for AnthropicProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
+
+        // Extended thinking: add thinking block with budget
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+            // Anthropic requires temperature=1 when thinking is enabled
+            body["temperature"] = json!(1);
+        }
 
         // OAuth requires Claude Code identity in the system prompt.
         if oauth {
@@ -451,6 +462,7 @@ impl LLMProvider for AnthropicProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_claude_model(m.split('/').last().unwrap_or(m)));
         let model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -466,6 +478,16 @@ impl LLMProvider for AnthropicProvider {
             "temperature": temperature,
             "stream": true,
         });
+
+        // Extended thinking: add thinking block with budget
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+            // Anthropic requires temperature=1 when thinking is enabled
+            body["temperature"] = json!(1);
+        }
 
         // OAuth requires Claude Code identity in the system prompt.
         if oauth {
@@ -633,6 +655,11 @@ async fn parse_anthropic_sse(
                             if let Some(text) = delta["text"].as_str() {
                                 full_content.push_str(text);
                                 let _ = tx.send(StreamChunk::TextDelta(text.to_string()));
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(thinking) = delta["thinking"].as_str() {
+                                let _ = tx.send(StreamChunk::ThinkingDelta(thinking.to_string()));
                             }
                         }
                         "input_json_delta" => {

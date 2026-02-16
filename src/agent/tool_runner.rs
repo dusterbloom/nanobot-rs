@@ -253,6 +253,7 @@ async fn analyze_via_scratch_pad(
             Some(&config.model),
             config.max_tokens,
             0.3,
+            None,
         ).await {
             Ok(r) => r,
             Err(e) => {
@@ -649,6 +650,7 @@ pub async fn run_tool_loop(
                     Some(&config.model),
                     config.max_tokens,
                     0.3,
+                    None,
                 ).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -900,6 +902,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             let mut responses = self.responses.lock().await;
             if responses.is_empty() {
@@ -1238,6 +1241,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             self.captured_messages
                 .lock()
@@ -1410,6 +1414,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             Err(anyhow::anyhow!("Connection refused"))
         }
@@ -2096,6 +2101,7 @@ mod tests {
                 _model: Option<&str>,
                 _max_tokens: u32,
                 _temperature: f64,
+                _thinking_budget: Option<u32>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
                 if let Some(t) = tools {
                     self.captured_tools
@@ -2296,6 +2302,7 @@ mod tests {
                 _model: Option<&str>,
                 _max_tokens: u32,
                 _temperature: f64,
+                _thinking_budget: Option<u32>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);
                 match n {
@@ -2457,6 +2464,7 @@ mod tests {
                 _model: Option<&str>,
                 _max_tokens: u32,
                 _temperature: f64,
+                _thinking_budget: Option<u32>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
@@ -2861,6 +2869,7 @@ mod tests {
                 _model: Option<&str>,
                 _max_tokens: u32,
                 _temperature: f64,
+                _thinking_budget: Option<u32>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
                 self.captured_messages.lock().await.push(messages.to_vec());
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);

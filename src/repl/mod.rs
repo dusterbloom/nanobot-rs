@@ -157,13 +157,14 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 }
 
 /// Build the REPL prompt string based on current mode.
-pub(crate) fn build_prompt(is_local: bool, voice_on: bool) -> String {
+pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
+    let think_prefix = if thinking_on { "\u{1f9e0}" } else { "" };
     if voice_on {
-        format!("{}{}~>{} ", crate::tui::BOLD, crate::tui::MAGENTA, crate::tui::RESET)
+        format!("{}{}{}~>{} ", think_prefix, crate::tui::BOLD, crate::tui::MAGENTA, crate::tui::RESET)
     } else if is_local {
-        format!("{}{}L>{} ", crate::tui::BOLD, crate::tui::YELLOW, crate::tui::RESET)
+        format!("{}{}{}L>{} ", think_prefix, crate::tui::BOLD, crate::tui::YELLOW, crate::tui::RESET)
     } else {
-        format!("{}{}>{} ", crate::tui::BOLD, crate::tui::GREEN, crate::tui::RESET)
+        format!("{}{}{}>{} ", think_prefix, crate::tui::BOLD, crate::tui::GREEN, crate::tui::RESET)
     }
 }
 
@@ -173,6 +174,7 @@ pub(crate) fn print_help() {
     println!("  /local, /l      - Toggle between local and cloud mode");
     println!("  /model, /m      - Select local model from ~/models/");
     println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
+    println!("  /think, /t      - Toggle extended thinking / reasoning mode");
     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
     println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
     println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
@@ -998,6 +1000,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 cron_service,
                 email_config,
                 rl,
+                watchdog_handle: None,
                 #[cfg(feature = "voice")]
                 voice_session: None,
             };
@@ -1020,15 +1023,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
             // Start health watchdog for local servers (if any are running).
             if is_local {
-                let mut ports = Vec::new();
-                ports.push(("main".to_string(), ctx.srv.local_port.clone()));
-                if let Some(ref cp) = ctx.srv.compaction_port {
-                    ports.push(("compaction".to_string(), cp.clone()));
-                }
-                if let Some(ref dp) = ctx.srv.delegation_port {
-                    ports.push(("delegation".to_string(), dp.clone()));
-                }
-                let _watchdog = server::start_health_watchdog(ports, ctx.display_tx.clone());
+                ctx.restart_watchdog();
             }
 
             loop {
@@ -1037,7 +1032,8 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
                 let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
                 let voice_on = ctx.voice_on();
-                let prompt = build_prompt(is_local, voice_on);
+                let thinking_on = ctx.core_handle.counters.thinking_budget.load(Ordering::SeqCst) > 0;
+                let prompt = build_prompt(is_local, voice_on, thinking_on);
 
                 // === GET INPUT ===
                 let input_text: String;
@@ -1311,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_cloud() {
-        let p = build_prompt(false, false);
+        let p = build_prompt(false, false, false);
         assert!(p.contains(">"));
         // Cloud prompt uses GREEN
         assert!(p.contains(crate::tui::GREEN));
@@ -1319,16 +1315,23 @@ mod tests {
 
     #[test]
     fn test_build_prompt_local() {
-        let p = build_prompt(true, false);
+        let p = build_prompt(true, false, false);
         assert!(p.contains("L>"));
         assert!(p.contains(crate::tui::YELLOW));
     }
 
     #[test]
     fn test_build_prompt_voice() {
-        let p = build_prompt(false, true);
+        let p = build_prompt(false, true, false);
         assert!(p.contains("~>"));
         assert!(p.contains(crate::tui::MAGENTA));
+    }
+
+    #[test]
+    fn test_build_prompt_thinking() {
+        let p = build_prompt(false, false, true);
+        assert!(p.contains("\u{1f9e0}"));
+        assert!(p.contains(">"));
     }
 
     // --- ServerState ---

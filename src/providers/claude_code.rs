@@ -475,6 +475,7 @@ impl LLMProvider for ClaudeCodeProvider {
         model: Option<&str>,
         _max_tokens: u32,
         _temperature: f64,
+        _thinking_budget: Option<u32>,
     ) -> Result<LLMResponse> {
         let (system, conversation) = serialize_messages(messages);
         let mut full_system = system;
@@ -551,6 +552,7 @@ impl LLMProvider for ClaudeCodeProvider {
         model: Option<&str>,
         _max_tokens: u32,
         _temperature: f64,
+        _thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
         let (system, conversation) = serialize_messages(messages);
         let mut full_system = system;

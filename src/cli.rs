@@ -1475,7 +1475,7 @@ fn make_llm_caller(
         let p = provider.clone();
         Box::pin(async move {
             let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-            p.chat(&messages, None, None, 512, 0.3)
+            p.chat(&messages, None, None, 512, 0.3, None)
                 .await
                 .map(|r| r.content.unwrap_or_default())
                 .map_err(|e| e.to_string())

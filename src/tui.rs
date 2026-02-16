@@ -157,6 +157,11 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
         ));
     }
 
+    // Thinking mode indicator
+    if core_handle.counters.thinking_budget.load(Ordering::Relaxed) > 0 {
+        parts.push("\u{1f9e0}".to_string());
+    }
+
     parts.push(format!("t:{}", turn));
 
     println!("  {}{}{}", DIM, parts.join(" | "), RESET);
@@ -247,14 +252,41 @@ pub(crate) fn print_startup_splash(local_port: &str) {
 // Voice Mode Helpers
 // ============================================================================
 
+/// Strip `<thinking>...</thinking>` blocks from text. These contain internal
+/// chain-of-thought from reasoning models and should never be spoken or displayed.
+/// Works across single-line and multi-line blocks.
+#[cfg(feature = "voice")]
+fn strip_thinking_blocks(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<thinking>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</thinking>") {
+            let after_tag = start + end + "</thinking>".len();
+            remaining = &remaining[after_tag..];
+            // Skip leading whitespace/newlines after the closing tag
+            remaining = remaining.trim_start_matches(|c: char| c == '\n' || c == '\r');
+        } else {
+            // Unclosed tag — discard everything from <thinking> onward
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
 /// Strip markdown formatting, code blocks, emojis, and special characters
 /// so that TTS receives only clean natural language text.
 #[cfg(feature = "voice")]
 pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
+    // First: strip any <thinking>...</thinking> blocks (safety net — these
+    // should already be removed at the provider level, but defense in depth).
+    let cleaned_text = strip_thinking_blocks(text);
     let mut out = String::new();
     let mut in_code_block = false;
 
-    for line in text.lines() {
+    for line in cleaned_text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;

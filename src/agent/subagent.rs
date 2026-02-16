@@ -576,7 +576,7 @@ impl SubagentManager {
             );
 
             let response = provider
-                .chat(&messages, tool_defs_opt, Some(&config.model), 4096, 0.7)
+                .chat(&messages, tool_defs_opt, Some(&config.model), 4096, 0.7, None)
                 .await?;
 
             // Check for LLM provider errors (finish_reason == "error").
@@ -800,6 +800,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<LLMResponse> {
             let mut captured = self.captured.lock().await;
             let call_num = captured.len();
@@ -909,6 +910,7 @@ mod tests {
                 _model: Option<&str>,
                 _max_tokens: u32,
                 _temperature: f64,
+                _thinking_budget: Option<u32>,
             ) -> anyhow::Result<LLMResponse> {
                 Ok(LLMResponse {
                     content: Some("Immediate answer.".to_string()),

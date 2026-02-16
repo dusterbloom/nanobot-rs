@@ -35,6 +35,8 @@ impl LLMResponse {
 pub enum StreamChunk {
     /// Incremental text content from the LLM.
     TextDelta(String),
+    /// Incremental thinking/reasoning content (extended thinking).
+    ThinkingDelta(String),
     /// Stream complete — contains the fully assembled response.
     Done(LLMResponse),
 }
@@ -58,6 +60,7 @@ pub trait LLMProvider: Send + Sync {
     /// * `model` - Model identifier (provider-specific).
     /// * `max_tokens` - Maximum tokens in response.
     /// * `temperature` - Sampling temperature.
+    /// * `thinking_budget` - If Some, enable extended thinking with this token budget.
     async fn chat(
         &self,
         messages: &[serde_json::Value],
@@ -65,6 +68,7 @@ pub trait LLMProvider: Send + Sync {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        thinking_budget: Option<u32>,
     ) -> Result<LLMResponse>;
 
     /// Send a streaming chat completion request.
@@ -77,8 +81,9 @@ pub trait LLMProvider: Send + Sync {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
-        let response = self.chat(messages, tools, model, max_tokens, temperature).await?;
+        let response = self.chat(messages, tools, model, max_tokens, temperature, thinking_budget).await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(ref content) = response.content {
             let _ = tx.send(StreamChunk::TextDelta(content.clone()));

@@ -107,6 +107,7 @@ impl LLMProvider for OpenAICompatProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        _thinking_budget: Option<u32>,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -206,6 +207,7 @@ impl LLMProvider for OpenAICompatProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
+        _thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -299,21 +301,21 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or("stop")
         .to_string();
 
-    // Extract content, merging reasoning_content if present (GLM-4.7, DeepSeek-R1 style).
-    let reasoning = message
+    // Extract content. reasoning_content (GLM-4.7, DeepSeek-R1 style) is logged
+    // but NOT merged into the user-facing content — it's internal chain-of-thought
+    // that pollutes display, TTS, and conversation history.
+    if let Some(reasoning) = message
         .get("reasoning_content")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let main_content = message
+        .filter(|s| !s.is_empty())
+    {
+        debug!("Model returned reasoning_content ({} chars), discarding from output", reasoning.len());
+    }
+    let content = message
         .get("content")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let content = match (reasoning, main_content) {
-        (Some(r), Some(c)) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", r, c)),
-        (Some(r), None) => Some(format!("<thinking>\n{}\n</thinking>", r)),
-        (None, Some(c)) => Some(c.to_string()),
-        (None, None) => None,
-    };
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     // Extract tool calls.
     let mut tool_calls = Vec::new();
@@ -428,12 +430,14 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
-                // Stream is complete — merge reasoning_content if present
-                let content = match (full_reasoning.is_empty(), full_content.is_empty()) {
-                    (false, false) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", full_reasoning, full_content)),
-                    (false, true) => Some(format!("<thinking>\n{}\n</thinking>", full_reasoning)),
-                    (true, false) => Some(full_content.clone()),
-                    (true, true) => None,
+                // Stream is complete — discard reasoning_content (internal chain-of-thought)
+                if !full_reasoning.is_empty() {
+                    debug!("Streaming: discarding reasoning_content ({} chars)", full_reasoning.len());
+                }
+                let content = if !full_content.is_empty() {
+                    Some(full_content.clone())
+                } else {
+                    None
                 };
 
                 let mut tool_calls = Vec::new();
@@ -491,6 +495,7 @@ async fn parse_sse_stream(
                         if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                             if !reasoning.is_empty() {
                                 full_reasoning.push_str(reasoning);
+                                let _ = tx.send(StreamChunk::ThinkingDelta(reasoning.to_string()));
                             }
                         }
 
@@ -544,12 +549,14 @@ async fn parse_sse_stream(
         }
     }
 
-    // Stream ended without [DONE] — emit whatever we have, merging reasoning_content
-    let content = match (full_reasoning.is_empty(), full_content.is_empty()) {
-        (false, false) => Some(format!("<thinking>\n{}\n</thinking>\n\n{}", full_reasoning, full_content)),
-        (false, true) => Some(format!("<thinking>\n{}\n</thinking>", full_reasoning)),
-        (true, false) => Some(full_content),
-        (true, true) => None,
+    // Stream ended without [DONE] — emit whatever we have, discarding reasoning_content
+    if !full_reasoning.is_empty() {
+        debug!("Streaming (no DONE): discarding reasoning_content ({} chars)", full_reasoning.len());
+    }
+    let content = if !full_content.is_empty() {
+        Some(full_content)
+    } else {
+        None
     };
 
     let mut tool_calls = Vec::new();
@@ -758,6 +765,43 @@ mod tests {
             tc.arguments.get("raw").and_then(|v| v.as_str()),
             Some("this is not json")
         );
+    }
+
+    #[test]
+    fn test_parse_response_reasoning_content_discarded() {
+        // reasoning_content from reasoning models (GLM-4.7, DeepSeek-R1) should
+        // be discarded, NOT merged into the user-facing content.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "Let me think about this step by step...",
+                    "content": "The answer is 42."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        // Only the main content should appear — no <thinking> tags
+        assert_eq!(resp.content.as_deref(), Some("The answer is 42."));
+        assert!(!resp.content.unwrap_or_default().contains("<thinking>"));
+    }
+
+    #[test]
+    fn test_parse_response_reasoning_only_no_content() {
+        // If model returns ONLY reasoning_content with no main content,
+        // the response should be None (not a <thinking> block).
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "Hmm, let me think...",
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert!(resp.content.is_none(), "reasoning-only response should have no content");
     }
 
     // ── Provider creation / detection tests ───────────────────────

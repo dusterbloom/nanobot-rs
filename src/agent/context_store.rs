@@ -369,7 +369,7 @@ pub async fn execute_ctx_summarize(
     // Mini 3-iteration loop: model can use micro-tools to inspect, then summarize.
     for _ in 0..3 {
         let response = match provider
-            .chat(&messages, tool_defs_ref, Some(model), max_tokens, 0.3)
+            .chat(&messages, tool_defs_ref, Some(model), max_tokens, 0.3, None)
             .await
         {
             Ok(r) => r,

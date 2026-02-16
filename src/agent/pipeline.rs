@@ -182,7 +182,7 @@ async fn vote_on_step(
 /// Single LLM call for pipeline steps.
 async fn call_llm(provider: &dyn LLMProvider, model: &str, prompt: &str) -> String {
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-    match provider.chat(&messages, None, Some(model), 512, 0.3).await {
+    match provider.chat(&messages, None, Some(model), 512, 0.3, None).await {
         Ok(resp) => resp.content.unwrap_or_default(),
         Err(e) => {
             error!("Pipeline LLM call failed: {}", e);
@@ -281,6 +281,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<LLMResponse> {
             let idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let answer = self.answers.get(idx % self.answers.len())

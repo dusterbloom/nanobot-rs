@@ -45,6 +45,8 @@ pub(crate) struct ReplContext {
     pub cron_service: Arc<CronService>,
     pub email_config: Option<EmailConfig>,
     pub rl: rustyline::DefaultEditor,
+    /// Health watchdog task handle — aborted on mode switch, restarted on `/local`.
+    pub watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     #[cfg(feature = "voice")]
     pub voice_session: Option<crate::voice::VoiceSession>,
 }
@@ -65,6 +67,34 @@ impl ReplContext {
             self.email_config.clone(),
             Some(self.display_tx.clone()),
         );
+    }
+
+    /// (Re)start the health watchdog for all active local servers.
+    ///
+    /// Aborts any previous watchdog task, collects current server ports, and
+    /// spawns a fresh watchdog. Called on REPL init and on `/local` toggle-on.
+    pub fn restart_watchdog(&mut self) {
+        if let Some(handle) = self.watchdog_handle.take() {
+            handle.abort();
+        }
+        let mut ports = Vec::new();
+        ports.push(("main".to_string(), self.srv.local_port.clone()));
+        if let Some(ref cp) = self.srv.compaction_port {
+            ports.push(("compaction".to_string(), cp.clone()));
+        }
+        if let Some(ref dp) = self.srv.delegation_port {
+            ports.push(("delegation".to_string(), dp.clone()));
+        }
+        self.watchdog_handle = Some(
+            crate::server::start_health_watchdog(ports, self.display_tx.clone()),
+        );
+    }
+
+    /// Stop the health watchdog (e.g. when switching to cloud mode).
+    pub fn stop_watchdog(&mut self) {
+        if let Some(handle) = self.watchdog_handle.take() {
+            handle.abort();
+        }
     }
 
     /// Drain pending display messages from background channels/subagents.
@@ -164,6 +194,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
     match cmd {
         "/l" => "/local",
         "/m" => "/model",
+        "/t" => "/think",
         "/v" => "/voice",
         "/wa" => "/whatsapp",
         "/tg" => "/telegram",
@@ -190,6 +221,7 @@ impl ReplContext {
         let cmd = normalize_alias(cmd);
         match cmd {
             "/help" => { super::print_help(); }
+            "/think" => { self.cmd_think(arg); }
             "/status" => { self.cmd_status().await; }
             "/context" => { self.cmd_context(); }
             "/memory" => { self.cmd_memory(); }
@@ -231,6 +263,11 @@ impl ReplContext {
 
         println!();
         println!("  {}MODE{}      {} ({})", tui::BOLD, tui::RESET, mode_label, model_name);
+
+        let thinking = counters.thinking_budget.load(Ordering::Relaxed);
+        if thinking > 0 {
+            println!("  {}THINKING{}  \u{1f9e0} enabled (budget: {} tokens)", tui::BOLD, tui::RESET, thinking);
+        }
 
         let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
         let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
@@ -507,6 +544,43 @@ impl ReplContext {
 // ============================================================================
 
 impl ReplContext {
+    /// /think, /t — toggle extended thinking / reasoning mode.
+    /// /think <budget> — enable with specific token budget (e.g. /think 16000).
+    fn cmd_think(&self, arg: &str) {
+        let counters = &self.core_handle.counters;
+        let core = self.core_handle.swappable();
+
+        if !arg.is_empty() {
+            // Parse explicit budget
+            match arg.parse::<u32>() {
+                Ok(budget) if budget == 0 => {
+                    counters.thinking_budget.store(0, Ordering::Relaxed);
+                    println!("\n  Thinking \x1b[33mdisabled\x1b[0m\n");
+                }
+                Ok(budget) => {
+                    let clamped = budget.clamp(1024, 128000);
+                    counters.thinking_budget.store(clamped, Ordering::Relaxed);
+                    println!("\n  \u{1f9e0} Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", clamped);
+                }
+                Err(_) => {
+                    println!("\n  Usage: /think [budget]\n  Examples: /think, /think 16000, /think 0\n");
+                }
+            }
+        } else {
+            // Toggle: off → default budget, on → off
+            let was_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+            if was_on {
+                counters.thinking_budget.store(0, Ordering::Relaxed);
+                println!("\n  Thinking \x1b[33mdisabled\x1b[0m\n");
+            } else {
+                // Default budget: half of max_tokens, clamped to [1024, 32000]
+                let default_budget = (core.max_tokens / 2).clamp(1024, 32000);
+                counters.thinking_budget.store(default_budget, Ordering::Relaxed);
+                println!("\n  \u{1f9e0} Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
+            }
+        }
+    }
+
     /// /kill <id> — cancel a background subagent.
     async fn cmd_kill(&self, arg: &str) {
         let id = arg.trim();
@@ -844,6 +918,7 @@ impl ReplContext {
                 }
                 cli::rebuild_core(&self.core_handle, &self.config, &self.srv.local_port, self.current_model_path.file_name().and_then(|n| n.to_str()), self.srv.compaction_port.as_deref(), self.srv.delegation_port.as_deref());
                 self.rebuild_agent_loop();
+                self.restart_watchdog();
                 tui::print_mode_banner(&self.srv.local_port);
             } else {
                 // Kill any orphaned servers from previous runs
@@ -859,6 +934,7 @@ impl ReplContext {
                             server::start_delegation_if_available(&mut self.srv.delegation_process, &mut self.srv.delegation_port).await;
                         }
                         self.apply_and_rebuild();
+                        self.restart_watchdog();
                         tui::print_mode_banner(&self.srv.local_port);
                     }
                     Err(e) => {
@@ -875,6 +951,7 @@ impl ReplContext {
             }
             self.srv.llama_process = None;
             server::stop_compaction_server(&mut self.srv.compaction_process, &mut self.srv.compaction_port);
+            self.stop_watchdog();
             crate::LOCAL_MODE.store(false, Ordering::SeqCst);
 
             // Re-spawn delegation if it wasn't already running
@@ -1072,6 +1149,7 @@ mod tests {
     fn test_normalize_alias_all_aliases() {
         assert_eq!(normalize_alias("/l"), "/local");
         assert_eq!(normalize_alias("/m"), "/model");
+        assert_eq!(normalize_alias("/t"), "/think");
         assert_eq!(normalize_alias("/v"), "/voice");
         assert_eq!(normalize_alias("/wa"), "/whatsapp");
         assert_eq!(normalize_alias("/tg"), "/telegram");

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +102,9 @@ pub struct RuntimeCounters {
     /// periodically re-probe: every 10 inline calls, try delegation once
     /// more in case the server recovered.
     pub delegation_retry_counter: AtomicU64,
+    /// Extended thinking budget in tokens. 0 = disabled, >0 = enabled with that budget.
+    /// Toggled by `/think` or `/t`. `/think 16000` sets a specific budget.
+    pub thinking_budget: AtomicU32,
 }
 
 impl RuntimeCounters {
@@ -115,6 +118,7 @@ impl RuntimeCounters {
             last_tools_called: std::sync::Mutex::new(Vec::new()),
             delegation_healthy: AtomicBool::new(true),
             delegation_retry_counter: AtomicU64::new(0),
+            thinking_budget: AtomicU32::new(0),
         }
     }
 }
@@ -737,6 +741,14 @@ impl AgentLoopShared {
             }
 
             // Call LLM — streaming or blocking depending on mode.
+            let thinking_budget = {
+                let stored = counters.thinking_budget.load(Ordering::Relaxed);
+                if stored > 0 {
+                    Some(stored)
+                } else {
+                    None
+                }
+            };
             let response = if let Some(ref delta_tx) = text_delta_tx {
                 // Streaming path: forward text deltas as they arrive.
                 let mut stream = match core
@@ -747,6 +759,7 @@ impl AgentLoopShared {
                         Some(&core.model),
                         core.max_tokens,
                         core.temperature,
+                        thinking_budget,
                     )
                     .await
                 {
@@ -759,12 +772,28 @@ impl AgentLoopShared {
                 };
 
                 let mut streamed_response = None;
+                let mut in_thinking = false;
                 while let Some(chunk) = stream.rx.recv().await {
                     match chunk {
+                        StreamChunk::ThinkingDelta(delta) => {
+                            // Render thinking tokens as dimmed text
+                            if !in_thinking {
+                                in_thinking = true;
+                                let _ = delta_tx.send("\x1b[2m🧠 ".to_string());
+                            }
+                            let _ = delta_tx.send(delta);
+                        }
                         StreamChunk::TextDelta(delta) => {
+                            if in_thinking {
+                                in_thinking = false;
+                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                            }
                             let _ = delta_tx.send(delta);
                         }
                         StreamChunk::Done(resp) => {
+                            if in_thinking {
+                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                            }
                             streamed_response = Some(resp);
                         }
                     }
@@ -788,6 +817,7 @@ impl AgentLoopShared {
                         Some(&core.model),
                         core.max_tokens,
                         core.temperature,
+                        thinking_budget,
                     )
                     .await
                 {
@@ -1919,6 +1949,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
+            _thinking_budget: Option<u32>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             Ok(crate::providers::base::LLMResponse {
                 content: Some("mock".to_string()),
