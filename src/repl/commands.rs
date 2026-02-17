@@ -1090,7 +1090,7 @@ impl ReplContext {
             match crate::voice::VoiceSession::with_lang(self.lang.as_deref()).await {
                 Ok(vs) => {
                     self.voice_session = Some(vs);
-                    println!("\nVoice mode ON. Ctrl+Space or Enter to speak, type for text.\n");
+                    println!("\nVoice mode ON. Ctrl+Space or Enter to speak/interrupt, type for text.\n");
                 }
                 Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
             }

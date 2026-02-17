@@ -269,7 +269,7 @@ impl VoiceSession {
             Some(_) => "Kokoro only",
             None => "Pocket + Kokoro",
         };
-        println!("Initializing voice mode ({label})...");
+        tracing::info!("Initializing voice mode ({label})...");
 
         // Fail fast: check that parec exists
         Command::new("parec")
@@ -281,7 +281,7 @@ impl VoiceSession {
                 "parec not found. Install: sudo apt install pulseaudio-utils".to_string()
             })?;
 
-        println!("Checking models...");
+        tracing::info!("Checking models...");
 
         let progress = &TerminalProgress;
         for bundle in models::MODEL_BUNDLES {
@@ -319,7 +319,7 @@ impl VoiceSession {
             {
                 Ok(tts) => {
                     let engine = tts.engine_type();
-                    println!("  {} TTS ready (English) [engine: {}]",
+                    tracing::info!("{} TTS ready (English) [engine: {}]",
                         if engine == "pocket" { "Pocket" } else { engine }, engine);
                     Some(Arc::new(Mutex::new(tts)))
                 }
@@ -340,7 +340,7 @@ impl VoiceSession {
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
-                    println!("  Kokoro TTS ready (multilingual)");
+                    tracing::info!("Kokoro TTS ready (multilingual)");
                     Some(Arc::new(Mutex::new(tts)))
                 }
                 Err(e) => {

@@ -1091,9 +1091,15 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                     }
                 }
 
-                // Clear only the input line (not the bar).
+                // Clear the input line and the prompt line above it (not the bar).
                 // The scroll region stays intact so the bar remains pinned at bottom.
-                print!("\x1b[2K\r"); // clear current line, return to column 0
+                // In voice mode, voice_read_input() prints \r\n leaving the ~> prompt
+                // on the line above — move up and clear both lines.
+                if do_record {
+                    print!("\x1b[A\x1b[2K\x1b[2K\r"); // up, clear prompt line, clear current line
+                } else {
+                    print!("\x1b[2K\r"); // clear current line
+                }
                 io::stdout().flush().ok();
 
                 // === VOICE RECORDING ===
@@ -1143,6 +1149,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 ctx.drain_display();
                                 println!();
                                 ctx.print_status_bar().await;
+                                println!(); // breathing room before next input bar
 
                                 // Phase 3: Wait for TTS playback to finish.
                                 if enter_pressed {
