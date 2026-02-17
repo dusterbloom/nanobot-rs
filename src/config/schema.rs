@@ -823,7 +823,7 @@ impl Config {
             &self.providers.vllm.api_key,
         ];
         for key in candidates {
-            if !key.is_empty() {
+            if !key.is_empty() && key != "none" && key != "NONE" {
                 return Some(key.clone());
             }
         }
@@ -881,8 +881,17 @@ impl Config {
                     .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
             );
         }
-        if !self.providers.groq.api_key.is_empty() {
-            return Some("https://api.groq.com/openai/v1".to_string());
+        if !self.providers.groq.api_key.is_empty()
+            && self.providers.groq.api_key != "none"
+            && self.providers.groq.api_key != "NONE"
+        {
+            return Some(
+                self.providers
+                    .groq
+                    .api_base
+                    .clone()
+                    .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
+            );
         }
         if self.providers.vllm.api_base.is_some() {
             return self.providers.vllm.api_base.clone();
