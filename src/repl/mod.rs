@@ -246,7 +246,7 @@ pub(crate) fn spawn_input_watcher(
                     // ESC double-tap → cancel
                     if key.code == KeyCode::Esc {
                         if let Some(prev) = last_esc {
-                            if prev.elapsed() < Duration::from_millis(500) {
+                            if prev.elapsed() < Duration::from_millis(2000) {
                                 cancel_token.cancel();
                                 break;
                             }
