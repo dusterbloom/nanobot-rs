@@ -58,6 +58,15 @@ fn normalize_model_name(name: &str) -> String {
 }
 
 impl OpenAICompatProvider {
+    /// Returns true when the provider supports Anthropic-style `cache_control`
+    /// breakpoints. Currently: direct Anthropic API and OpenRouter.
+    fn supports_cache_control(&self, model: &str) -> bool {
+        let is_anthropic_direct = self.api_base.contains("anthropic");
+        let is_openrouter = self.api_base.contains("openrouter");
+        let is_claude_model = model.contains("claude") || model.contains("anthropic");
+        is_anthropic_direct || (is_openrouter && is_claude_model)
+    }
+
     /// Create a new provider.
     ///
     /// Provider detection logic (porting from `LiteLLMProvider.__init__`):
@@ -120,15 +129,27 @@ impl LLMProvider for OpenAICompatProvider {
         };
         let url = format!("{}/chat/completions", self.api_base);
 
+        // Inject cache_control breakpoints for Anthropic prompt caching.
+        let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
+            inject_cache_control(messages, tools)
+        } else {
+            (messages.to_vec(), tools.map(|t| t.to_vec()))
+        };
+
         // Build request body.
         let mut body = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": cached_msgs,
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
 
-        if let Some(tool_defs) = tools {
+        if let Some(ref tool_defs) = cached_tools {
+            if !tool_defs.is_empty() {
+                body["tools"] = serde_json::Value::Array(tool_defs.clone());
+                body["tool_choice"] = serde_json::json!("auto");
+            }
+        } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
                 body["tool_choice"] = serde_json::json!("auto");
@@ -218,15 +239,27 @@ impl LLMProvider for OpenAICompatProvider {
         };
         let url = format!("{}/chat/completions", self.api_base);
 
+        // Inject cache_control breakpoints for Anthropic prompt caching.
+        let (cached_msgs, cached_tools) = if self.supports_cache_control(model) {
+            inject_cache_control(messages, tools)
+        } else {
+            (messages.to_vec(), tools.map(|t| t.to_vec()))
+        };
+
         let mut body = serde_json::json!({
             "model": model,
-            "messages": messages,
+            "messages": cached_msgs,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": true,
         });
 
-        if let Some(tool_defs) = tools {
+        if let Some(ref tool_defs) = cached_tools {
+            if !tool_defs.is_empty() {
+                body["tools"] = serde_json::Value::Array(tool_defs.clone());
+                body["tool_choice"] = serde_json::json!("auto");
+            }
+        } else if let Some(tool_defs) = tools {
             if !tool_defs.is_empty() {
                 body["tools"] = serde_json::Value::Array(tool_defs.to_vec());
                 body["tool_choice"] = serde_json::json!("auto");
@@ -274,6 +307,49 @@ impl LLMProvider for OpenAICompatProvider {
     fn get_api_base(&self) -> Option<&str> {
         Some(&self.api_base)
     }
+}
+
+/// Inject `cache_control` breakpoints into messages and tool definitions
+/// for Anthropic prompt caching.
+///
+/// Transforms the system message content from a plain string to a content
+/// array with `cache_control: {"type": "ephemeral"}`. This tells Anthropic
+/// (and OpenRouter) to cache the system prompt prefix across turns, reducing
+/// input token cost by ~90% for the cached portion.
+///
+/// Also marks the last tool definition with a cache breakpoint so tool schemas
+/// are cached too.
+fn inject_cache_control(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+) -> (Vec<serde_json::Value>, Option<Vec<serde_json::Value>>) {
+    let mut msgs = messages.to_vec();
+
+    // Transform system message (typically index 0) to use content array.
+    if let Some(msg) = msgs.first_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                msg["content"] = serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]);
+            }
+        }
+    }
+
+    // Mark the last tool definition with cache_control so tool schemas are cached.
+    let cached_tools = tools.map(|defs| {
+        let mut tool_defs = defs.to_vec();
+        if let Some(last) = tool_defs.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+        tool_defs
+    });
+
+    (msgs, cached_tools)
 }
 
 /// Parse the OpenAI-compatible JSON response into an `LLMResponse`.
@@ -945,5 +1021,80 @@ mod tests {
         // Config has "opus-4-6" → provider should normalize to "claude-opus-4-6".
         let provider = OpenAICompatProvider::new("sk-or-key", None, Some("opus-4-6"));
         assert_eq!(provider.default_model, "claude-opus-4-6");
+    }
+
+    // ── Cache control tests ──────────────────────────────────────
+
+    #[test]
+    fn test_supports_cache_control_anthropic_direct() {
+        let provider = OpenAICompatProvider::new("sk-ant-abc", None, Some("claude-opus-4-6"));
+        assert!(provider.supports_cache_control("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_supports_cache_control_openrouter_with_claude() {
+        let provider = OpenAICompatProvider::new("sk-or-abc", None, Some("anthropic/claude-opus-4-6"));
+        assert!(provider.supports_cache_control("anthropic/claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_no_cache_control_openrouter_non_claude() {
+        let provider = OpenAICompatProvider::new("sk-or-abc", None, Some("meta-llama/llama-3-70b"));
+        assert!(!provider.supports_cache_control("meta-llama/llama-3-70b"));
+    }
+
+    #[test]
+    fn test_no_cache_control_local() {
+        let provider = OpenAICompatProvider::new("none", Some("http://localhost:8080/v1"), Some("local"));
+        assert!(!provider.supports_cache_control("local"));
+    }
+
+    #[test]
+    fn test_inject_cache_control_system_message() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "Hello"}),
+        ];
+        let (cached, _) = inject_cache_control(&messages, None);
+
+        // System message should now have content as array with cache_control.
+        let sys_content = &cached[0]["content"];
+        assert!(sys_content.is_array(), "system content should be array");
+        let block = &sys_content[0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "You are helpful.");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+
+        // User message should be unchanged.
+        assert_eq!(cached[1]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_inject_cache_control_tools() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "test"}),
+        ];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "tool_a"}}),
+            serde_json::json!({"type": "function", "function": {"name": "tool_b"}}),
+        ];
+        let (_, cached_tools) = inject_cache_control(&messages, Some(&tools));
+
+        let tools = cached_tools.unwrap();
+        // First tool: no cache_control.
+        assert!(tools[0].get("cache_control").is_none());
+        // Last tool: has cache_control.
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_inject_cache_control_no_system_message() {
+        // Edge case: no system message — should not panic.
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+        ];
+        let (cached, _) = inject_cache_control(&messages, None);
+        // User message should be unchanged (not treated as system).
+        assert_eq!(cached[0]["content"], "Hello");
     }
 }
