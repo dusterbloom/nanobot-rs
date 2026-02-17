@@ -4,6 +4,7 @@
 //! pipeline, and background channel management.
 
 mod commands;
+mod incremental;
 
 use std::io::{self, IsTerminal, Write as _};
 use std::net::TcpListener;
@@ -43,56 +44,6 @@ type TtsSentenceSender = Option<()>;
 // Helpers (testable, pure-ish)
 // ============================================================================
 
-/// Stall detection threshold: if no token arrives for this many seconds,
-/// show a yellow warning in the progress line.
-const STALL_THRESHOLD_SECS: f32 = 5.0;
-
-/// Format a compact progress line for streaming display.
-///
-/// Shows word count, generation rate, and a trailing preview of the last ~50 characters.
-/// When `stall_secs` exceeds [`STALL_THRESHOLD_SECS`], the line turns yellow with a
-/// `⚠ stalled Ns` warning so the user knows the model may be stuck.
-///
-/// Used instead of raw token dumping to prevent scrollback pollution.
-fn format_progress_line(text: &str, elapsed_secs: f32, stall_secs: f32) -> String {
-    let word_count = text.split_whitespace().count();
-    let rate = if elapsed_secs > 0.5 {
-        (word_count as f32 / elapsed_secs) as usize
-    } else {
-        0
-    };
-
-    // Take last ~50 bytes as preview, respecting UTF-8 boundaries.
-    let preview_max = 50;
-    let preview = if text.len() > preview_max {
-        let mut start = text.len() - preview_max;
-        while !text.is_char_boundary(start) { start += 1; }
-        format!("…{}", text[start..].replace('\n', " "))
-    } else {
-        text.replace('\n', " ")
-    };
-
-    let stalled = stall_secs >= STALL_THRESHOLD_SECS;
-    let stall_tag = if stalled {
-        format!(" \x1b[33m⚠ stalled {}s\x1b[0m", stall_secs as usize)
-    } else {
-        String::new()
-    };
-
-    // Yellow when stalled, dim otherwise.
-    let (open, close) = if stalled {
-        ("\x1b[33m", "\x1b[0m")
-    } else {
-        ("\x1b[2m", "\x1b[0m")
-    };
-
-    if rate > 0 {
-        format!("{}И {}w {}w/s{} ··· {}{}", open, word_count, rate, stall_tag, preview, close)
-    } else {
-        format!("{}И {}w{} ··· {}{}", open, word_count, stall_tag, preview, close)
-    }
-}
-
 /// Truncate tool output for verbatim display: max `max_lines` lines or `max_chars` characters.
 fn truncate_output(data: &str, max_lines: usize, max_chars: usize) -> String {
     let mut out = String::new();
@@ -119,6 +70,66 @@ fn truncate_output(data: &str, max_lines: usize, max_chars: usize) -> String {
         lines += 1;
     }
     out
+}
+
+/// Extract a short context label from tool result data for display.
+///
+/// For `read_file`, extracts the file path from the `# /path/to/file (lines ...)`
+/// header. For `exec`, extracts the command if short enough. Returns empty
+/// string if no useful context can be extracted.
+fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
+    match tool_name {
+        "read_file" => {
+            // Result starts with "# /path/to/file.rs (lines N-M of T)"
+            if let Some(line) = result_data.lines().next() {
+                if let Some(rest) = line.strip_prefix("# ") {
+                    // Extract just the filename, not the full path
+                    if let Some(paren) = rest.find(" (") {
+                        let path = &rest[..paren];
+                        // Show just filename or last 2 components
+                        let short: String = path
+                            .rsplit('/')
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        return short;
+                    }
+                }
+            }
+            // Fallback: check for error messages
+            if result_data.starts_with("Error:") {
+                let preview: String = result_data.chars().take(60).collect();
+                return preview;
+            }
+            String::new()
+        }
+        "exec" => {
+            // For exec, result_data is the output, not the command.
+            // We don't have the command here, so skip.
+            String::new()
+        }
+        "edit_file" => {
+            if result_data.contains("Successfully edited") {
+                if let Some(path) = result_data.strip_prefix("Successfully edited ") {
+                    let path = path.trim();
+                    let short: String = path
+                        .rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    return short;
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Parse a `/ctx` argument into a byte count.
@@ -370,254 +381,168 @@ async fn stream_and_render_inner(
         (None, None)
     };
 
-    // Spawn combined print task handling both text deltas and tool events.
-    // Returns (tool_line_count, collected_tool_lines) so we can replay tool events after re-render.
-    let print_task = if let Some(mut tool_rx) = tool_rx_opt {
-        tokio::spawn(async move {
-            use std::io::Write as _;
-            #[cfg(feature = "voice")]
-            let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
-            #[cfg(not(feature = "voice"))]
-            let _ = tts_tx;
-            let mut tool_lines = 0usize;
-            let mut collected: Vec<String> = Vec::new();
-            let mut delta_done = false;
-            let mut tool_done = false;
-            // Track previous CallEnd to coalesce repeated status-check calls
-            // (e.g. spawn list polling). When the same tool fires consecutive
-            // CallEnd events, erase the previous box and overwrite in-place.
-            let mut prev_call_end: Option<(String, usize)> = None; // (tool_name, lines_printed)
-            // Compact progress line state — replaces raw token streaming to
-            // prevent scrollback pollution from long responses.
-            let mut full_text = String::new();
-            let progress_start = Instant::now();
-            let mut last_delta_time = Instant::now();
-            let mut has_progress_line = false;
-            loop {
-                if delta_done && tool_done {
-                    break;
-                }
-                tokio::select! {
-                    biased;
-                    delta = delta_rx.recv(), if !delta_done => {
-                        match delta {
-                            Some(d) => {
-                                full_text.push_str(&d);
-                                last_delta_time = Instant::now();
-                                let progress = format_progress_line(
-                                    &full_text,
-                                    progress_start.elapsed().as_secs_f32(),
-                                    0.0, // just received a token — not stalled
-                                );
-                                print!("\r\x1b[K{}", progress);
-                                std::io::stdout().flush().ok();
-                                has_progress_line = true;
-                                #[cfg(feature = "voice")]
-                                if let Some(ref mut acc) = tts_acc {
-                                    acc.push(&d);
-                                }
-                            }
-                            None => {
-                                delta_done = true;
-                                if has_progress_line {
-                                    print!("\r\x1b[K");
-                                    std::io::stdout().flush().ok();
-                                    has_progress_line = false;
-                                }
-                                #[cfg(feature = "voice")]
-                                if let Some(acc) = tts_acc.take() {
-                                    acc.flush();
-                                }
-                            },
-                        }
-                    }
-                    // Periodic stall check: refresh progress line every second so
-                    // the user sees "⚠ stalled Ns" even when no events arrive.
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if !delta_done && has_progress_line => {
-                        let stall = last_delta_time.elapsed().as_secs_f32();
-                        if stall >= STALL_THRESHOLD_SECS {
-                            let progress = format_progress_line(
-                                &full_text,
-                                progress_start.elapsed().as_secs_f32(),
-                                stall,
-                            );
-                            print!("\r\x1b[K{}", progress);
-                            std::io::stdout().flush().ok();
-                        }
-                    }
-                    event = tool_rx.recv(), if !tool_done => {
-                        match event {
-                            Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
-                                if has_progress_line {
-                                    print!("\r\x1b[K");
-                                    has_progress_line = false;
-                                }
-                                let line = format!(
-                                    "\x1b[36m  \u{25b6} {}({})\x1b[0m",
-                                    tool_name, arguments_preview
-                                );
-                                print!("\r{}\x1b[K", line);
-                                std::io::stdout().flush().ok();
-                                // CallStart line gets overwritten by CallEnd, don't collect.
-                            }
-                            Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
-                                if has_progress_line {
-                                    print!("\r\x1b[K");
-                                    has_progress_line = false;
-                                }
-                                let preview_str = output_preview.as_deref().unwrap_or("");
-                                let line = format!(
-                                    "\x1b[36m  \u{25b6} {}\x1b[0m  \x1b[2m{}s{}\x1b[0m",
-                                    tool_name,
-                                    elapsed_ms / 1000,
-                                    if preview_str.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!(" {}", preview_str)
-                                    }
-                                );
-                                print!("\r\x1b[K{}", line);
-                                std::io::stdout().flush().ok();
-                            }
-                            Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
-                                // Clear progress line before coalescing/cursor-up.
-                                if has_progress_line {
-                                    print!("\r\x1b[K");
-                                    std::io::stdout().flush().ok();
-                                    has_progress_line = false;
-                                }
-                                // Coalesce repeated CallEnd for the same tool: erase
-                                // the previous box and overwrite it so e.g. 129 spawn-list
-                                // polls render as a single updating status instead of spam.
-                                if let Some((ref prev_name, prev_lines)) = prev_call_end {
-                                    if prev_name == tool_name && prev_lines > 0 {
-                                        // Move cursor up over the previous box and clear line-by-line
-                                        // (avoid \x1b[J which can wipe the pinned input bar).
-                                        print!("\x1b[{}A", prev_lines);
-                                        for _ in 0..prev_lines { print!("\x1b[2K\r\n"); }
-                                        print!("\x1b[{}A", prev_lines);
-                                        std::io::stdout().flush().ok();
-                                        tool_lines = tool_lines.saturating_sub(prev_lines);
-                                        // Remove the collected lines from the previous box.
-                                        let keep = collected.len().saturating_sub(prev_lines);
-                                        collected.truncate(keep);
-                                    }
-                                }
+    // Spawn unified print task: incremental renderer for text deltas,
+    // tool events interleaved via clear_partial/restore_partial.
+    let has_tool_rx = tool_rx_opt.is_some();
+    let mut tool_rx_opt = tool_rx_opt;
+    let print_task = tokio::spawn(async move {
+        use std::io::Write as _;
+        #[cfg(feature = "voice")]
+        let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
+        #[cfg(not(feature = "voice"))]
+        let _ = tts_tx;
 
-                                let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
-                                let status_line = format!(
+        let mut renderer = incremental::IncrementalRenderer::new();
+        let mut full_text = String::new();
+        let mut tool_lines = 0usize;
+        let mut collected: Vec<String> = Vec::new();
+        let mut delta_done = false;
+        let mut tool_done = !has_tool_rx;
+        // Track previous CallEnd to coalesce repeated status-check calls.
+        let mut prev_call_end: Option<(String, usize)> = None;
+
+        loop {
+            if delta_done && tool_done {
+                break;
+            }
+            tokio::select! {
+                biased;
+                delta = delta_rx.recv(), if !delta_done => {
+                    match delta {
+                        Some(d) => {
+                            full_text.push_str(&d);
+                            renderer.push(&d);
+                            #[cfg(feature = "voice")]
+                            if let Some(ref mut acc) = tts_acc {
+                                acc.push(&d);
+                            }
+                        }
+                        None => {
+                            delta_done = true;
+                            renderer.finish();
+                            #[cfg(feature = "voice")]
+                            if let Some(acc) = tts_acc.take() {
+                                acc.flush();
+                            }
+                        },
+                    }
+                }
+                event = async {
+                    match tool_rx_opt {
+                        Some(ref mut rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !tool_done => {
+                    match event {
+                        Some(ToolEvent::CallStart { ref tool_name, ref arguments_preview, .. }) => {
+                            renderer.flush_pending();
+                            renderer.clear_partial();
+                            renderer.emit_marker();
+                            let line = format!(
+                                "\x1b[36m  \u{25b6} {}({})\x1b[0m",
+                                tool_name, arguments_preview
+                            );
+                            print!("\r{}\x1b[K", line);
+                            std::io::stdout().flush().ok();
+                            renderer.restore_partial();
+                        }
+                        Some(ToolEvent::Progress { ref tool_name, elapsed_ms, ref output_preview, .. }) => {
+                            renderer.flush_pending();
+                            renderer.clear_partial();
+                            renderer.emit_marker();
+                            let preview_str = output_preview.as_deref().unwrap_or("");
+                            let line = format!(
+                                "\x1b[36m  \u{25b6} {}\x1b[0m  \x1b[2m{}s{}\x1b[0m",
+                                tool_name,
+                                elapsed_ms / 1000,
+                                if preview_str.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {}", preview_str)
+                                }
+                            );
+                            print!("\r\x1b[K{}", line);
+                            std::io::stdout().flush().ok();
+                            renderer.restore_partial();
+                        }
+                        Some(ToolEvent::CallEnd { ref tool_name, ok, duration_ms, ref result_data, .. }) => {
+                            renderer.flush_pending();
+                            renderer.clear_partial();
+                            renderer.emit_marker();
+                            // Coalesce repeated CallEnd for the same tool.
+                            if let Some((ref prev_name, prev_lines)) = prev_call_end {
+                                if prev_name == tool_name && prev_lines > 0 {
+                                    print!("\x1b[{}A", prev_lines);
+                                    for _ in 0..prev_lines { print!("\x1b[2K\r\n"); }
+                                    print!("\x1b[{}A", prev_lines);
+                                    std::io::stdout().flush().ok();
+                                    tool_lines = tool_lines.saturating_sub(prev_lines);
+                                    let keep = collected.len().saturating_sub(prev_lines);
+                                    collected.truncate(keep);
+                                }
+                            }
+
+                            let marker = if ok { "\x1b[32m\u{2713}\x1b[0m" } else { "\x1b[31m\u{2717}\x1b[0m" };
+                            // Extract a short context label from result data.
+                            let context = extract_tool_context(tool_name, result_data);
+                            let status_line = if context.is_empty() {
+                                format!(
                                     "\x1b[36m  \u{25b6} {}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
                                     tool_name, marker, duration_ms
-                                );
-                                println!("\r\x1b[K{}", status_line);
-                                let mut this_box_lines = 1usize;
-                                collected.push(status_line);
+                                )
+                            } else {
+                                format!(
+                                    "\x1b[36m  \u{25b6} {}\x1b[0m \x1b[2m{}\x1b[0m  {} \x1b[2m{}ms\x1b[0m",
+                                    tool_name, context, marker, duration_ms
+                                )
+                            };
+                            println!("\r\x1b[K{}", status_line);
+                            let mut this_box_lines = 1usize;
+                            collected.push(status_line);
 
-                                if ok && !result_data.is_empty() {
-                                    let truncated = truncate_output(result_data, 40, 2000);
-                                    if !truncated.is_empty() {
-                                        // \r prefix on every line: raw mode (from input watcher)
-                                        // disables ONLCR, so \n alone doesn't carriage-return.
-                                        let header = "    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m";
-                                        println!("\r{}", header);
-                                        collected.push(header.to_string());
-                                        this_box_lines += 1;
-                                        for line in truncated.lines() {
-                                            let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
-                                            println!("\r{}", formatted);
-                                            collected.push(formatted);
-                                            this_box_lines += 1;
-                                        }
-                                        let footer = "    \x1b[2m\u{2514}\u{2500}\x1b[0m";
-                                        println!("\r{}", footer);
-                                        collected.push(footer.to_string());
+                            if ok && !result_data.is_empty() {
+                                let truncated = truncate_output(result_data, 40, 2000);
+                                if !truncated.is_empty() {
+                                    let header = "    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m";
+                                    println!("\r{}", header);
+                                    collected.push(header.to_string());
+                                    this_box_lines += 1;
+                                    for line in truncated.lines() {
+                                        let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
+                                        println!("\r{}", formatted);
+                                        collected.push(formatted);
                                         this_box_lines += 1;
                                     }
-                                } else if !ok && !result_data.is_empty() {
-                                    let preview: String = result_data.chars().take(80).collect();
-                                    let err_line = format!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
-                                    println!("\r{}", err_line);
-                                    collected.push(err_line);
+                                    let footer = "    \x1b[2m\u{2514}\u{2500}\x1b[0m";
+                                    println!("\r{}", footer);
+                                    collected.push(footer.to_string());
                                     this_box_lines += 1;
                                 }
-                                tool_lines += this_box_lines;
-                                prev_call_end = Some((tool_name.clone(), this_box_lines));
-                                std::io::stdout().flush().ok();
+                            } else if !ok && !result_data.is_empty() {
+                                let preview: String = result_data.chars().take(80).collect();
+                                let err_line = format!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
+                                println!("\r{}", err_line);
+                                collected.push(err_line);
+                                this_box_lines += 1;
                             }
-                            None => tool_done = true,
-                        }
-                    }
-                }
-            }
-            // Use \r\n instead of println!() — raw mode (input watcher) makes
-            // \n LF-only, leaving cursor at non-zero column. \r ensures column 0.
-            print!("\r\n");
-            std::io::stdout().flush().ok();
-            (tool_lines, collected)
-        })
-    } else {
-        tokio::spawn(async move {
-            use std::io::Write as _;
-            #[cfg(feature = "voice")]
-            let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
-            #[cfg(not(feature = "voice"))]
-            let _ = tts_tx;
-            let mut full_text = String::new();
-            let progress_start = Instant::now();
-            let mut last_delta_time = Instant::now();
-            let mut has_progress = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    delta = delta_rx.recv() => {
-                        match delta {
-                            Some(d) => {
-                                full_text.push_str(&d);
-                                last_delta_time = Instant::now();
-                                let progress = format_progress_line(
-                                    &full_text,
-                                    progress_start.elapsed().as_secs_f32(),
-                                    0.0,
-                                );
-                                print!("\r\x1b[K{}", progress);
-                                std::io::stdout().flush().ok();
-                                has_progress = true;
-                                #[cfg(feature = "voice")]
-                                if let Some(ref mut acc) = tts_acc {
-                                    acc.push(&d);
-                                }
-                            }
-                            None => break, // channel closed
-                        }
-                    }
-                    // Periodic stall check.
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if has_progress => {
-                        let stall = last_delta_time.elapsed().as_secs_f32();
-                        if stall >= STALL_THRESHOLD_SECS {
-                            let progress = format_progress_line(
-                                &full_text,
-                                progress_start.elapsed().as_secs_f32(),
-                                stall,
-                            );
-                            print!("\r\x1b[K{}", progress);
+                            tool_lines += this_box_lines;
+                            prev_call_end = Some((tool_name.clone(), this_box_lines));
                             std::io::stdout().flush().ok();
+                            renderer.restore_partial();
                         }
+                        None => tool_done = true,
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_secs(1)), if !delta_done => {
+                    renderer.tick();
+                }
             }
-            print!("\r\x1b[K"); // clear progress line
-            std::io::stdout().flush().ok();
-            #[cfg(feature = "voice")]
-            if let Some(acc) = tts_acc.take() {
-                acc.flush();
-            }
-            // Use \r\n instead of println!() — raw mode (input watcher) makes
-            // \n LF-only, leaving cursor at non-zero column. \r ensures column 0.
-            print!("\r\n");
-            std::io::stdout().flush().ok();
-            (0usize, Vec::<String>::new())
-        })
-    };
+        }
+        // Use \r\n — raw mode (input watcher) makes \n LF-only.
+        print!("\r\n");
+        std::io::stdout().flush().ok();
+        (tool_lines, collected)
+    });
 
     println!();
 
@@ -653,9 +578,8 @@ async fn stream_and_render_inner(
     let cancelled = cancel_token.is_cancelled();
     let (_tool_lines, _tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
 
-    // Tool events were already rendered inline during streaming.
-    // Only erase the trailing blank line from the print task, then render the
-    // final response text with markdown/provenance formatting.
+    // Response was already rendered incrementally by IncrementalRenderer.
+    // Only clean up trailing blank line and optionally append provenance footer.
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
         // Erase the trailing \r\n from the print task (1 line).
@@ -671,7 +595,8 @@ async fn stream_and_render_inner(
             );
         }
 
-        // Render with provenance claim verification if enabled.
+        // Provenance: append claim summary footer (no full re-render — text
+        // was already printed incrementally by IncrementalRenderer).
         if verify_claims {
             let audit = AuditLog::new(&workspace, session_id);
             let entries = audit.get_entries();
@@ -686,11 +611,7 @@ async fn stream_and_render_inner(
                 };
                 (c.span.0, c.span.1, status, c.text.clone())
             }).collect();
-            print!("{}", syntax::render_turn_with_provenance(
-                &response, syntax::TurnRole::Assistant, &claims, strict_mode,
-            ));
-        } else {
-            print!("{}", syntax::render_turn(&response, syntax::TurnRole::Assistant));
+            print!("{}", syntax::render_provenance_footer(&claims, strict_mode));
         }
     }
 
@@ -1502,71 +1423,4 @@ mod tests {
         }
     }
 
-    // --- format_progress_line ---
-
-    #[test]
-    fn test_format_progress_line_short() {
-        let line = format_progress_line("Hello world", 1.0, 0.0);
-        assert!(line.contains("2w"));
-        assert!(line.contains("Hello world"));
-        assert!(line.contains("И"));
-    }
-
-    #[test]
-    fn test_format_progress_line_rate_shown_after_half_second() {
-        let line = format_progress_line("one two three four five", 1.0, 0.0);
-        assert!(line.contains("5w"));
-        assert!(line.contains("w/s"));
-    }
-
-    #[test]
-    fn test_format_progress_line_rate_hidden_below_half_second() {
-        let line = format_progress_line("one two three", 0.3, 0.0);
-        assert!(line.contains("3w"));
-        assert!(!line.contains("w/s"));
-    }
-
-    #[test]
-    fn test_format_progress_line_truncates_long_text() {
-        let text = "a ".repeat(100); // 200 chars, 100 words
-        let line = format_progress_line(&text, 2.0, 0.0);
-        assert!(line.contains("100w"));
-        assert!(line.contains("…")); // truncation marker
-    }
-
-    #[test]
-    fn test_format_progress_line_newlines_replaced() {
-        let line = format_progress_line("line1\nline2\nline3", 0.1, 0.0);
-        assert!(!line.contains('\n'));
-        assert!(line.contains("line1 line2 line3"));
-    }
-
-    #[test]
-    fn test_format_progress_line_empty() {
-        let line = format_progress_line("", 0.0, 0.0);
-        assert!(line.contains("0w"));
-    }
-
-    #[test]
-    fn test_format_progress_line_no_stall_below_threshold() {
-        let line = format_progress_line("some text", 2.0, 3.0);
-        assert!(!line.contains("stalled"));
-        assert!(line.contains("\x1b[2m")); // dim, not yellow
-    }
-
-    #[test]
-    fn test_format_progress_line_stall_at_threshold() {
-        let line = format_progress_line("some text", 10.0, 5.0);
-        assert!(line.contains("stalled"));
-        assert!(line.contains("5s"));
-        assert!(line.contains("\x1b[33m")); // yellow
-    }
-
-    #[test]
-    fn test_format_progress_line_stall_long() {
-        let line = format_progress_line("some text", 30.0, 25.0);
-        assert!(line.contains("stalled"));
-        assert!(line.contains("25s"));
-        assert!(line.contains("\x1b[33m")); // yellow
-    }
 }

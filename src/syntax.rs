@@ -12,8 +12,8 @@ use syntect::util::as_24_bit_terminal_escaped;
 use termimad::crossterm::style::Color;
 use termimad::MadSkin;
 
-static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_defaults_newlines());
-static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
+pub(crate) static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_defaults_newlines());
+pub(crate) static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 /// Shared termimad skin for prose rendering.
 static SKIN: Lazy<MadSkin> = Lazy::new(|| {
@@ -144,6 +144,57 @@ pub fn render_turn_with_provenance(
     output
 }
 
+/// Render only the provenance annotation footer (no full response re-render).
+///
+/// Use this when the response was already rendered incrementally and we only
+/// need to append claim verification summary.
+pub fn render_provenance_footer(
+    claims: &[(usize, usize, u8, String)],
+    strict: bool,
+) -> String {
+    let mut output = String::new();
+
+    // If there are claimed items in strict mode, append a summary.
+    if strict {
+        let claimed: Vec<&(usize, usize, u8, String)> = claims.iter().filter(|c| c.2 == 2).collect();
+        if !claimed.is_empty() {
+            output.push_str(&format!(
+                "\n\x1b[33m\x1b[1m⚠ {} unverified claim(s):\x1b[0m\n",
+                claimed.len()
+            ));
+            for (_, _, _, ref claim_text) in &claimed {
+                let preview: String = claim_text.chars().take(60).collect();
+                output.push_str(&format!("  \x1b[33m⚠\x1b[0m {}\n", preview));
+            }
+        }
+    }
+
+    // Append per-claim status markers as a footer block.
+    if !claims.is_empty() {
+        let observed = claims.iter().filter(|c| c.2 == 0).count();
+        let derived = claims.iter().filter(|c| c.2 == 1).count();
+        let claimed_count = claims.iter().filter(|c| c.2 == 2).count();
+        let recalled = claims.iter().filter(|c| c.2 == 3).count();
+
+        let mut parts = Vec::new();
+        if observed > 0 {
+            parts.push(format!("\x1b[32m✓{}\x1b[0m", observed));
+        }
+        if derived > 0 {
+            parts.push(format!("\x1b[34m~{}\x1b[0m", derived));
+        }
+        if claimed_count > 0 {
+            parts.push(format!("\x1b[33m⚠{}\x1b[0m", claimed_count));
+        }
+        if recalled > 0 {
+            parts.push(format!("\x1b[2m◇{}\x1b[0m", recalled));
+        }
+        output.push_str(&format!("\x1b[2mprovenance: {}\x1b[0m\n", parts.join(" ")));
+    }
+
+    output
+}
+
 /// Render an LLM response with termimad prose formatting and syntect code highlighting.
 ///
 /// Splits input into prose and fenced code segments:
@@ -204,7 +255,7 @@ pub fn render_response(text: &str) -> String {
 ///
 /// No side borders — code lines are clean for copy-paste.
 /// Top/bottom rules sized to content width.
-fn render_code_block(code: &str, lang: &str) -> String {
+pub(crate) fn render_code_block(code: &str, lang: &str) -> String {
     let mut output = String::new();
 
     // Determine rule width from content (minimum 40, capped at 80)
