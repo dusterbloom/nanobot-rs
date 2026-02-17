@@ -342,7 +342,9 @@ async fn stream_and_render_inner(
         use std::io::Write as _;
         let prompt_and_input = format!("> {}", input);
         let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
-        print!("\x1b[{}A\x1b[J", raw_lines);
+        print!("\x1b[{}A", raw_lines);
+        for _ in 0..raw_lines { print!("\x1b[2K\r\n"); }
+        print!("\x1b[{}A", raw_lines);
         std::io::stdout().flush().ok();
         print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
     }
@@ -489,8 +491,11 @@ async fn stream_and_render_inner(
                                 // polls render as a single updating status instead of spam.
                                 if let Some((ref prev_name, prev_lines)) = prev_call_end {
                                     if prev_name == tool_name && prev_lines > 0 {
-                                        // Move cursor up over the previous box and clear.
-                                        print!("\x1b[{}A\x1b[J", prev_lines);
+                                        // Move cursor up over the previous box and clear line-by-line
+                                        // (avoid \x1b[J which can wipe the pinned input bar).
+                                        print!("\x1b[{}A", prev_lines);
+                                        for _ in 0..prev_lines { print!("\x1b[2K\r\n"); }
+                                        print!("\x1b[{}A", prev_lines);
                                         std::io::stdout().flush().ok();
                                         tool_lines = tool_lines.saturating_sub(prev_lines);
                                         // Remove the collected lines from the previous box.
@@ -654,7 +659,7 @@ async fn stream_and_render_inner(
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
         // Erase the trailing \r\n from the print task (1 line).
-        print!("\r\x1b[1A\x1b[J");
+        print!("\r\x1b[1A\x1b[2K");
         std::io::stdout().flush().ok();
 
         // Show redaction warning if strict mode removed fabricated claims.

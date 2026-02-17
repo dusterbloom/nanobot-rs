@@ -3,7 +3,7 @@
 //! Each session gets a file at `{workspace}/memory/sessions/SESSION_{hash}.md`
 //! containing YAML frontmatter + markdown body. Compaction overwrites session
 //! content with a structured template (CONTEXT.md protocol) and also writes
-//! to `{workspace}/CONTEXT.md` for direct system prompt injection.
+//! to `{workspace}/CONTEXT-{channel}.md` for direct system prompt injection.
 //!
 //! Completed sessions can be archived for later reflection by the reflector.
 
@@ -170,7 +170,7 @@ impl WorkingMemoryStore {
     ///
     /// Overwrites instead of appending — the structured template output
     /// from each compaction is a complete snapshot, not an increment.
-    /// Also writes to `{workspace}/CONTEXT.md` for system prompt injection.
+    /// Also writes to `{workspace}/CONTEXT-{channel}.md` for system prompt injection.
     pub fn update_from_compaction(&self, session_key: &str, summary: &str) {
         let mut session = self.get_or_create(session_key);
 
@@ -179,10 +179,14 @@ impl WorkingMemoryStore {
         session.updated = Utc::now();
         self.save(&session);
 
-        // Also write to CONTEXT.md for direct system prompt injection.
-        let context_path = self.workspace.join("CONTEXT.md");
+        // Write per-channel context file for system prompt injection.
+        // Each channel gets its own file (CONTEXT-cli.md, CONTEXT-telegram.md)
+        // so concurrent sessions don't clobber each other.
+        let channel = session_key.split(':').next().unwrap_or("default");
+        let context_filename = format!("CONTEXT-{}.md", channel);
+        let context_path = self.workspace.join(&context_filename);
         if let Err(e) = std::fs::write(&context_path, summary.trim()) {
-            warn!("Failed to write CONTEXT.md: {}", e);
+            warn!("Failed to write {}: {}", context_filename, e);
         }
     }
 
@@ -478,7 +482,7 @@ mod tests {
     fn test_integration_compaction_to_working_memory_to_context() {
         // Full pipeline: compaction overwrites summary → working memory stores it →
         // get_context returns it for system prompt injection.
-        // Also writes CONTEXT.md to workspace root.
+        // Also writes per-channel CONTEXT-{channel}.md to workspace root.
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
 
@@ -497,11 +501,11 @@ mod tests {
         let session_file = tmp.path().join("memory").join("sessions").join(format!("SESSION_{}.md", hash));
         assert!(session_file.exists(), "Session file should exist on disk");
 
-        // Verify CONTEXT.md was written.
-        let context_file = tmp.path().join("CONTEXT.md");
-        assert!(context_file.exists(), "CONTEXT.md should exist");
+        // Verify per-channel CONTEXT-cli.md was written (channel extracted from session key).
+        let context_file = tmp.path().join("CONTEXT-cli.md");
+        assert!(context_file.exists(), "CONTEXT-cli.md should exist");
         let context_content = std::fs::read_to_string(&context_file).unwrap();
-        assert!(context_content.contains("async next"), "CONTEXT.md should have latest snapshot");
+        assert!(context_content.contains("async next"), "CONTEXT-cli.md should have latest snapshot");
     }
 
     #[test]
@@ -557,7 +561,7 @@ mod tests {
         std::fs::write(mem_dir.join("MEMORY.md"), "- User likes Rust").unwrap();
 
         let cb = ContextBuilder::new(tmp.path());
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
 
         // Observations should NOT be in the prompt.
         assert!(!prompt.contains("Old observation data"), "Observations must not be in system prompt");

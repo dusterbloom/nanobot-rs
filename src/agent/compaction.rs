@@ -421,11 +421,15 @@ fn format_message_for_transcript(msg: &Value) -> String {
         .unwrap_or("unknown");
     let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
-    // Skip very long tool results - just note they existed.
+    // Truncate long tool results — keep first 600 + last 400 chars to
+    // preserve file paths at the start and statuses/errors at the end.
     if role == "tool" {
         let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-        if content.len() > 500 {
-            return format!("{}: [result from {} - {} chars]", role, name, content.len());
+        if content.len() > 1200 {
+            let first: String = content.chars().take(600).collect();
+            let last: String = content.chars().rev().take(400).collect::<String>().chars().rev().collect();
+            return format!("{} ({}): {}...[{} chars omitted]...{}",
+                role, name, first, content.len() - 1000, last);
         }
         return format!("{} ({}): {}", role, name, content);
     }

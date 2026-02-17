@@ -71,7 +71,7 @@ pub(crate) fn list_local_models() -> Vec<PathBuf> {
 
 /// Ensure the dedicated compaction model is available locally.
 ///
-/// Downloads Qwen3-0.6B Q4_K_M (~500MB) to `~/.nanobot/models/` if not already
+/// Downloads Qwen3-1.7B Q4_K_M (~1.1GB) to `~/.nanobot/models/` if not already
 /// present. Returns `None` on failure (graceful degradation — compaction just
 /// gets skipped and the system falls back to `trim_to_fit`).
 pub(crate) fn ensure_compaction_model() -> Option<PathBuf> {

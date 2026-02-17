@@ -422,7 +422,7 @@ impl ReplContext {
         println!("  {}Context Breakdown{}", tui::BOLD, tui::RESET);
         // System prompt component breakdown.
         let identity_tokens = {
-            let identity = core.context.build_system_prompt(None);
+            let identity = core.context.build_system_prompt(None, None);
             crate::agent::token_budget::TokenBudget::estimate_str_tokens(&identity)
         };
         let bootstrap_budget = core.context.bootstrap_budget;

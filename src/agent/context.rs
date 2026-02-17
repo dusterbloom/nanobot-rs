@@ -92,7 +92,10 @@ impl ContextBuilder {
     // ------------------------------------------------------------------
 
     /// Build the system prompt from bootstrap files, memory, and skills.
-    pub fn build_system_prompt(&self, skill_names: Option<&[String]>) -> String {
+    ///
+    /// When `channel` is provided, reads `CONTEXT-{channel}.md` for per-channel
+    /// session context (falls back to `CONTEXT.md` for backwards compatibility).
+    pub fn build_system_prompt(&self, skill_names: Option<&[String]>, channel: Option<&str>) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // Core identity.
@@ -120,8 +123,16 @@ impl ContextBuilder {
             parts.push(bootstrap);
         }
 
-        // Session context (CONTEXT.md) — structured snapshot from last compaction.
-        let context_path = self.workspace.join("CONTEXT.md");
+        // Session context — structured snapshot from last compaction.
+        // Per-channel file (CONTEXT-cli.md, CONTEXT-telegram.md) prevents
+        // concurrent sessions from clobbering each other. Falls back to
+        // legacy CONTEXT.md for backwards compatibility.
+        let context_path = if let Some(ch) = channel {
+            let per_channel = self.workspace.join(format!("CONTEXT-{}.md", ch));
+            if per_channel.exists() { per_channel } else { self.workspace.join("CONTEXT.md") }
+        } else {
+            self.workspace.join("CONTEXT.md")
+        };
         if context_path.exists() {
             if let Ok(ctx) = fs::read_to_string(&context_path) {
                 if !ctx.trim().is_empty() {
@@ -204,7 +215,7 @@ impl ContextBuilder {
         let mut messages: Vec<Value> = Vec::new();
 
         // System prompt.
-        let mut system_prompt = self.build_system_prompt(skill_names);
+        let mut system_prompt = self.build_system_prompt(skill_names, channel);
         if let (Some(ch), Some(cid)) = (channel, chat_id) {
             system_prompt.push_str(&format!(
                 "\n\n## Current Session\nChannel: {}\nChat ID: {}",
@@ -592,7 +603,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_contains_nanobot_identity() {
         let (_tmp, cb) = make_context();
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         assert!(
             prompt.contains("nanobot"),
             "system prompt should contain 'nanobot' identity"
@@ -606,7 +617,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_contains_workspace_path() {
         let (_tmp, cb) = make_context();
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         let workspace_str = cb
             .workspace
             .canonicalize()
@@ -625,7 +636,7 @@ mod tests {
         // Write a bootstrap file that ContextBuilder looks for.
         fs::write(tmp.path().join("SOUL.md"), "I am a helpful bot").unwrap();
         let cb = ContextBuilder::new(tmp.path());
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         assert!(
             prompt.contains("I am a helpful bot"),
             "system prompt should include content from SOUL.md"
@@ -639,7 +650,7 @@ mod tests {
         fs::create_dir_all(&memory_dir).unwrap();
         fs::write(memory_dir.join("MEMORY.md"), "User prefers dark mode").unwrap();
         let cb = ContextBuilder::new(tmp.path());
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         assert!(
             prompt.contains("User prefers dark mode"),
             "system prompt should include long-term memory"
@@ -652,7 +663,7 @@ mod tests {
         fs::write(tmp.path().join("AGENTS.md"), "x".repeat(4000)).unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
         cb.bootstrap_budget = 40; // Too small to fit AGENTS.md
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         // File should be skipped entirely — never truncated mid-content.
         assert!(!prompt.contains("[truncated"));
         // Model should be told the file exists and can be fetched.
@@ -845,7 +856,7 @@ mod tests {
         fs::write(memory_dir.join("MEMORY.md"), &content).unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
         cb.long_term_memory_budget = 20; // very tight
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         assert!(prompt.contains("NEWEST FACT"), "newest fact should survive tight budget");
     }
 
@@ -860,7 +871,7 @@ mod tests {
         )
         .unwrap();
         let cb = ContextBuilder::new(tmp.path());
-        let prompt = cb.build_system_prompt(None);
+        let prompt = cb.build_system_prompt(None, None);
         assert!(
             !prompt.contains("Observations from Past Conversations"),
             "observations should no longer be injected into system prompt"
