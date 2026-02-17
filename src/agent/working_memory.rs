@@ -1,8 +1,9 @@
 //! Per-session working memory for active task state.
 //!
 //! Each session gets a file at `{workspace}/memory/sessions/SESSION_{hash}.md`
-//! containing YAML frontmatter + markdown body. Compaction summaries are
-//! appended here instead of being written to the observations directory.
+//! containing YAML frontmatter + markdown body. Compaction overwrites session
+//! content with a structured template (CONTEXT.md protocol) and also writes
+//! to `{workspace}/CONTEXT.md` for direct system prompt injection.
 //!
 //! Completed sessions can be archived for later reflection by the reflector.
 
@@ -58,6 +59,7 @@ pub struct WorkingSession {
 
 /// Persistent store for per-session working memory files.
 pub struct WorkingMemoryStore {
+    workspace: PathBuf,
     sessions_dir: PathBuf,
     archived_dir: PathBuf,
 }
@@ -68,6 +70,7 @@ impl WorkingMemoryStore {
         let sessions_dir = ensure_dir(workspace.join("memory").join("sessions"));
         let archived_dir = sessions_dir.join("archived");
         Self {
+            workspace: workspace.to_path_buf(),
             sessions_dir,
             archived_dir,
         }
@@ -145,24 +148,42 @@ impl WorkingMemoryStore {
             return session.content.clone();
         }
 
-        // Truncate to fit budget.
+        // Silently truncate at line boundaries — no visible markers.
         let max_chars = budget.saturating_mul(4);
-        let marker = "\n\n[truncated to fit working memory budget]";
-        let keep = max_chars.saturating_sub(marker.len());
-        let mut out: String = session.content.chars().take(keep).collect();
-        out.push_str(marker);
-        out
+        let lines: Vec<&str> = session.content.lines().collect();
+        let mut kept: Vec<&str> = Vec::new();
+        let mut char_count = 0;
+
+        for line in &lines {
+            let line_cost = line.len() + 1;
+            if char_count + line_cost > max_chars && !kept.is_empty() {
+                break;
+            }
+            kept.push(line);
+            char_count += line_cost;
+        }
+
+        kept.join("\n")
     }
 
-    /// Append a compaction summary to the session's working memory.
+    /// Replace working memory with the latest compaction summary.
+    ///
+    /// Overwrites instead of appending — the structured template output
+    /// from each compaction is a complete snapshot, not an increment.
+    /// Also writes to `{workspace}/CONTEXT.md` for system prompt injection.
     pub fn update_from_compaction(&self, session_key: &str, summary: &str) {
         let mut session = self.get_or_create(session_key);
-        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        let entry = format!("\n## Compaction Summary ({})\n\n{}\n", timestamp, summary.trim());
-        session.content.push_str(&entry);
+        // Overwrite, not append — each compaction is a complete snapshot.
+        session.content = summary.trim().to_string();
         session.updated = Utc::now();
         self.save(&session);
+
+        // Also write to CONTEXT.md for direct system prompt injection.
+        let context_path = self.workspace.join("CONTEXT.md");
+        if let Err(e) = std::fs::write(&context_path, summary.trim()) {
+            warn!("Failed to write CONTEXT.md: {}", e);
+        }
     }
 
     /// Mark a session as completed.
@@ -334,18 +355,18 @@ mod tests {
         store.update_from_compaction("cli:default", "User asked about Rust memory management.");
 
         let session = store.get_or_create("cli:default");
-        assert!(session.content.contains("Compaction Summary"));
         assert!(session.content.contains("Rust memory management"));
     }
 
     #[test]
-    fn test_multiple_compactions_append() {
+    fn test_multiple_compactions_overwrite() {
         let (_tmp, store) = make_store();
         store.update_from_compaction("cli:default", "First summary.");
         store.update_from_compaction("cli:default", "Second summary.");
 
         let session = store.get_or_create("cli:default");
-        assert!(session.content.contains("First summary."));
+        // Overwrite semantics: only latest snapshot survives.
+        assert!(!session.content.contains("First summary."));
         assert!(session.content.contains("Second summary."));
     }
 
@@ -368,9 +389,14 @@ mod tests {
     #[test]
     fn test_get_context_truncated() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", &"x".repeat(10000));
+        // Use multi-line content so line-boundary truncation kicks in.
+        let content = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        store.update_from_compaction("cli:default", &content);
         let ctx = store.get_context("cli:default", 50);
-        assert!(ctx.contains("[truncated to fit working memory budget]"));
+        // Should be silently truncated — no marker visible to the model.
+        assert!(!ctx.contains("[truncated"));
+        assert!(ctx.contains("line 0")); // keeps from head
+        assert!(ctx.len() < content.len()); // actually truncated
     }
 
     #[test]
@@ -450,26 +476,32 @@ mod tests {
 
     #[test]
     fn test_integration_compaction_to_working_memory_to_context() {
-        // Full pipeline: compaction writes summary → working memory stores it →
+        // Full pipeline: compaction overwrites summary → working memory stores it →
         // get_context returns it for system prompt injection.
+        // Also writes CONTEXT.md to workspace root.
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
 
-        // Simulate 3 compaction cycles.
+        // Simulate 3 compaction cycles — overwrite semantics.
         wm.update_from_compaction("cli:session1", "Discussed Rust ownership model.");
         wm.update_from_compaction("cli:session1", "Implemented borrow checker example.");
         wm.update_from_compaction("cli:session1", "User wants to learn async next.");
 
-        // Verify all 3 summaries are present.
+        // Only the latest snapshot survives (overwrite, not append).
         let ctx = wm.get_context("cli:session1", 10000);
-        assert!(ctx.contains("ownership model"));
-        assert!(ctx.contains("borrow checker"));
-        assert!(ctx.contains("async next"));
+        assert!(!ctx.contains("ownership model"), "older snapshots should be overwritten");
+        assert!(ctx.contains("async next"), "latest snapshot should survive");
 
         // Verify the session file exists on disk.
         let hash = WorkingMemoryStore::session_hash("cli:session1");
         let session_file = tmp.path().join("memory").join("sessions").join(format!("SESSION_{}.md", hash));
         assert!(session_file.exists(), "Session file should exist on disk");
+
+        // Verify CONTEXT.md was written.
+        let context_file = tmp.path().join("CONTEXT.md");
+        assert!(context_file.exists(), "CONTEXT.md should exist");
+        let context_content = std::fs::read_to_string(&context_file).unwrap();
+        assert!(context_content.contains("async next"), "CONTEXT.md should have latest snapshot");
     }
 
     #[test]

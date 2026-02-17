@@ -195,6 +195,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/l" => "/local",
         "/m" => "/model",
         "/t" => "/think",
+        "/nt" => "/nothink",
         "/v" => "/voice",
         "/wa" => "/whatsapp",
         "/tg" => "/telegram",
@@ -222,6 +223,7 @@ impl ReplContext {
         match cmd {
             "/help" => { super::print_help(); }
             "/think" => { self.cmd_think(arg); }
+            "/nothink" => { self.cmd_nothink(); }
             "/status" => { self.cmd_status().await; }
             "/context" => { self.cmd_context(); }
             "/memory" => { self.cmd_memory(); }
@@ -232,6 +234,7 @@ impl ReplContext {
             "/stop" => { self.cmd_stop().await; }
 
             "/replay" => { self.cmd_replay(arg).await; }
+            "/long" => { self.cmd_long(arg); }
             "/provenance" => { self.cmd_provenance(); }
             "/restart" => { self.cmd_restart().await; }
             "/ctx" => { self.cmd_ctx(arg).await; }
@@ -308,6 +311,32 @@ impl ReplContext {
 
         let turn = counters.learning_turn_counter.load(Ordering::Relaxed);
         println!("  {}TURN{}      {}", tui::BOLD, tui::RESET, turn);
+
+        // Token telemetry.
+        let est_prompt = counters.last_estimated_prompt_tokens.load(Ordering::Relaxed);
+        let act_prompt = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
+        let act_completion = counters.last_actual_completion_tokens.load(Ordering::Relaxed);
+        if act_prompt > 0 || est_prompt > 0 {
+            let drift = if act_prompt > 0 && est_prompt > 0 {
+                let diff = (act_prompt as f64 - est_prompt as f64) / act_prompt as f64 * 100.0;
+                format!(" (drift: {:+.0}%)", diff)
+            } else {
+                String::new()
+            };
+            println!(
+                "  {}TOKENS{}    est:{} actual:{}+{}{}",
+                tui::BOLD, tui::RESET,
+                tui::format_thousands(est_prompt as usize),
+                tui::format_thousands(act_prompt as usize),
+                tui::format_thousands(act_completion as usize),
+                drift,
+            );
+        }
+
+        let long_remaining = counters.long_mode_turns.load(Ordering::Relaxed);
+        if long_remaining > 0 {
+            println!("  {}LONG{}      {} turns remaining", tui::BOLD, tui::RESET, long_remaining);
+        }
 
         // Server health display (local mode or when delegation server is active).
         {
@@ -391,10 +420,31 @@ impl ReplContext {
 
         println!();
         println!("  {}Context Breakdown{}", tui::BOLD, tui::RESET);
+        // System prompt component breakdown.
+        let identity_tokens = {
+            let identity = core.context.build_system_prompt(None);
+            crate::agent::token_budget::TokenBudget::estimate_str_tokens(&identity)
+        };
+        let bootstrap_budget = core.context.bootstrap_budget;
+        let ltm_budget = core.context.long_term_memory_budget;
+
         println!("  {}System prompt:    {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(system_tokens), tui::RESET);
+        println!("  {}  identity:       {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(identity_tokens), tui::RESET);
+        println!("  {}  bootstrap cap:  {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(bootstrap_budget), tui::RESET);
+        println!("  {}  memory cap:     {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(ltm_budget), tui::RESET);
         println!("  {}History:          {} {:>6} messages{}", tui::DIM, tui::RESET, msg_count, tui::RESET);
         println!("  {}Working memory:   {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(wm_tokens), tui::RESET);
         println!("  {}Turn:             {} {:>6}{}", tui::DIM, tui::RESET, turn, tui::RESET);
+
+        // Token accuracy comparison.
+        let counters = &self.core_handle.counters;
+        let est = counters.last_estimated_prompt_tokens.load(Ordering::Relaxed);
+        let act = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
+        if act > 0 && est > 0 {
+            let drift_pct = (act as f64 - est as f64) / act as f64 * 100.0;
+            println!("  {}Estimation drift: {} {:>+5.1}%{}", tui::DIM, tui::RESET, drift_pct, tui::RESET);
+        }
+
         println!("  {}─────────────────────────────{}", tui::DIM, tui::RESET);
         println!(
             "  {}Total:            {} {:>6} / {} tokens ({:.1}%){}",
@@ -578,6 +628,47 @@ impl ReplContext {
                 counters.thinking_budget.store(default_budget, Ordering::Relaxed);
                 println!("\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
             }
+        }
+    }
+
+    /// /nothink, /nt — suppress thinking tokens from output (and TTS).
+    /// Sets thinking budget to 0 and enables suppress_thinking_in_tts.
+    fn cmd_nothink(&self) {
+        let counters = &self.core_handle.counters;
+        let was_suppressed = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+        if was_suppressed {
+            // Toggle off — re-enable thinking display (but thinking budget stays 0)
+            counters.suppress_thinking_in_tts.store(false, Ordering::Relaxed);
+            println!("\n  Thinking display \x1b[32mrestored\x1b[0m (use /think to re-enable thinking)\n");
+        } else {
+            counters.thinking_budget.store(0, Ordering::Relaxed);
+            counters.suppress_thinking_in_tts.store(true, Ordering::Relaxed);
+            println!("\n  Thinking \x1b[33msuppressed\x1b[0m — no thinking tokens sent to output or TTS\n");
+        }
+    }
+
+    /// /long [N] — boost max_tokens to 8192 for the next N turns (default 3).
+    /// /long 0 resets to normal adaptive mode.
+    fn cmd_long(&self, arg: &str) {
+        let counters = &self.core_handle.counters;
+        if !arg.is_empty() {
+            match arg.parse::<u32>() {
+                Ok(0) => {
+                    counters.long_mode_turns.store(0, std::sync::atomic::Ordering::Relaxed);
+                    println!("\n  Long mode \x1b[33mdisabled\x1b[0m — back to adaptive.\n");
+                }
+                Ok(n) => {
+                    let clamped = n.min(20);
+                    counters.long_mode_turns.store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    println!("\n  Long mode \x1b[32menabled\x1b[0m for {} turn{} (max_tokens=8192).\n", clamped, if clamped > 1 { "s" } else { "" });
+                }
+                Err(_) => {
+                    println!("\n  Usage: /long [turns]  (default: 3, 0 to disable)\n");
+                }
+            }
+        } else {
+            counters.long_mode_turns.store(3, std::sync::atomic::Ordering::Relaxed);
+            println!("\n  Long mode \x1b[32menabled\x1b[0m for 3 turns (max_tokens=8192).\n");
         }
     }
 
@@ -823,6 +914,10 @@ impl ReplContext {
         self.current_model_path = selected.clone();
         let name = selected.file_name().unwrap().to_string_lossy();
         println!("\nSelected: {}", name);
+
+        // Persist the selection to config.
+        self.config.agents.defaults.local_model = name.to_string();
+        save_config(&self.config, None);
 
         // If local mode is active, restart the server with the new model
         if crate::LOCAL_MODE.load(Ordering::SeqCst) {
@@ -1085,11 +1180,15 @@ impl ReplContext {
                 vs.stop_playback();
             }
             self.voice_session = None;
+            // Restore thinking display when voice mode turns off.
+            self.core_handle.counters.suppress_thinking_in_tts.store(false, Ordering::Relaxed);
             println!("\nVoice mode OFF\n");
         } else {
             match crate::voice::VoiceSession::with_lang(self.lang.as_deref()).await {
                 Ok(vs) => {
                     self.voice_session = Some(vs);
+                    // Auto-suppress thinking tokens from TTS.
+                    self.core_handle.counters.suppress_thinking_in_tts.store(true, Ordering::Relaxed);
                     println!("\nVoice mode ON. Ctrl+Space or Enter to speak/interrupt, type for text.\n");
                 }
                 Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
@@ -1125,6 +1224,7 @@ mod tests {
         assert_eq!(normalize_alias("/l"), "/local");
         assert_eq!(normalize_alias("/m"), "/model");
         assert_eq!(normalize_alias("/t"), "/think");
+        assert_eq!(normalize_alias("/nt"), "/nothink");
         assert_eq!(normalize_alias("/v"), "/voice");
         assert_eq!(normalize_alias("/wa"), "/whatsapp");
         assert_eq!(normalize_alias("/tg"), "/telegram");

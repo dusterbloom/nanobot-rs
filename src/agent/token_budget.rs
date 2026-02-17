@@ -1,11 +1,13 @@
 //! Token budget management for context window overflow prevention.
 //!
-//! Uses character-based estimation (1 token ~ 4 chars) rather than a
-//! tokenizer crate. Good enough for budget management.
+//! Uses tiktoken-rs (cl100k_base BPE) for accurate token counting,
+//! with a char/4 fallback if the encoder fails to initialize.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde_json::Value;
+use tiktoken_rs::CoreBPE;
 
 /// Manages the token budget for LLM context windows.
 pub struct TokenBudget {
@@ -32,10 +34,15 @@ impl TokenBudget {
         self.max_context
     }
 
-    /// Estimate token count for a string (~4 chars per token).
+    /// Estimate token count for a string using BPE (cl100k_base).
+    /// Falls back to char/4 heuristic if the encoder is unavailable.
     pub fn estimate_str_tokens(s: &str) -> usize {
-        // Add 1 to avoid underestimating short strings.
-        (s.len() + 3) / 4
+        static ENCODER: OnceLock<Option<CoreBPE>> = OnceLock::new();
+        let enc = ENCODER.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+        match enc {
+            Some(e) => e.encode_ordinary(s).len(),
+            None => (s.len() + 3) / 4, // fallback
+        }
     }
 
     /// Estimate token count for a single message Value (public variant).
@@ -297,13 +304,14 @@ mod tests {
 
     #[test]
     fn test_estimate_str_tokens() {
-        // "hello" = 5 chars → (5+3)/4 = 2 tokens
-        assert_eq!(TokenBudget::estimate_str_tokens("hello"), 2);
-        // Empty string → (0+3)/4 = 0
+        // With tiktoken (cl100k_base): "hello" is 1 token.
+        assert_eq!(TokenBudget::estimate_str_tokens("hello"), 1);
+        // Empty string → 0
         assert_eq!(TokenBudget::estimate_str_tokens(""), 0);
-        // 100 chars → 25 tokens
+        // Longer strings should produce reasonable counts.
         let s = "a".repeat(100);
-        assert_eq!(TokenBudget::estimate_str_tokens(&s), 25);
+        let tokens = TokenBudget::estimate_str_tokens(&s);
+        assert!(tokens > 0 && tokens < 50, "100 'a' chars should be <50 tokens, got {}", tokens);
     }
 
     #[test]

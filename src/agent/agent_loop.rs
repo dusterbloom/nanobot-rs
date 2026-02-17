@@ -19,6 +19,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::agent::agent_profiles;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
@@ -30,7 +31,7 @@ use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    CancelCallback, ListCallback, LoopCallback, PipelineCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
+    CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::agent::pipeline;
@@ -95,9 +96,9 @@ pub struct RuntimeCounters {
     pub last_working_memory_tokens: AtomicU64,
     pub last_tools_called: std::sync::Mutex<Vec<String>>,
     /// Tracks whether the delegation provider is alive. Set to `false` when
-    /// the delegation LLM returns an error, causing subsequent calls to fall
-    /// through to inline execution. Reset to `true` when the core is rebuilt
-    /// (e.g. `/local` toggle restarts servers).
+    /// the delegation LLM returns a hard error or times out, causing subsequent
+    /// calls to fall through to inline execution. Reset to `true` on core
+    /// rebuild (`rebuild_core`) and `/restart` command.
     pub delegation_healthy: AtomicBool,
     /// Counts tool calls since delegation was marked unhealthy. Used to
     /// periodically re-probe: every 10 inline calls, try delegation once
@@ -106,6 +107,17 @@ pub struct RuntimeCounters {
     /// Extended thinking budget in tokens. 0 = disabled, >0 = enabled with that budget.
     /// Toggled by `/think` or `/t`. `/think 16000` sets a specific budget.
     pub thinking_budget: AtomicU32,
+    /// Remaining turns with boosted max_tokens (set by `/long`). Counts down to 0.
+    pub long_mode_turns: AtomicU32,
+    /// Last actual prompt tokens from LLM provider (for telemetry).
+    pub last_actual_prompt_tokens: AtomicU64,
+    /// Last actual completion tokens from LLM provider (for telemetry).
+    pub last_actual_completion_tokens: AtomicU64,
+    /// Last estimated prompt tokens (our estimate, for comparison).
+    pub last_estimated_prompt_tokens: AtomicU64,
+    /// When true, ThinkingDelta tokens are NOT sent to delta_tx (suppressed
+    /// from TTS). Auto-set when voice mode is active; toggled by `/nothink`.
+    pub suppress_thinking_in_tts: AtomicBool,
 }
 
 impl RuntimeCounters {
@@ -120,6 +132,11 @@ impl RuntimeCounters {
             delegation_healthy: AtomicBool::new(true),
             delegation_retry_counter: AtomicU64::new(0),
             thinking_budget: AtomicU32::new(0),
+            long_mode_turns: AtomicU32::new(0),
+            last_actual_prompt_tokens: AtomicU64::new(0),
+            last_actual_completion_tokens: AtomicU64::new(0),
+            last_estimated_prompt_tokens: AtomicU64::new(0),
+            suppress_thinking_in_tts: AtomicBool::new(false),
         }
     }
 }
@@ -185,6 +202,13 @@ pub fn build_swappable_core(
     } else {
         ContextBuilder::new(&workspace)
     };
+    // Scale prompt budgets proportionally to the model's context window.
+    // Without this, a 1M-context model gets the same tiny fixed caps as a 16K model.
+    if is_local {
+        context.set_lite_mode(max_context_tokens);
+    } else {
+        context.scale_budgets(max_context_tokens);
+    }
     context.model_name = model.clone();
     // Inject provenance verification rules when enabled.
     if provenance.enabled && provenance.system_prompt_rules {
@@ -192,6 +216,10 @@ pub fn build_swappable_core(
     }
     // RLM lazy skills: skills loaded as summaries, fetched on demand.
     context.lazy_skills = memory_config.lazy_skills;
+    // Wire subagent profiles into the system prompt so the model knows
+    // what agents exist and when to delegate instead of doing everything itself.
+    let profiles = agent_profiles::load_profiles(&workspace);
+    context.agent_profiles = agent_profiles::profiles_summary(&profiles);
     let sessions = SessionManager::new(&workspace);
 
     // When local, use dedicated compaction provider if available, else main provider.
@@ -238,6 +266,7 @@ pub fn build_swappable_core(
 
     // Build tool runner provider if delegation is enabled.
     let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
+        let is_auto_local = delegation_provider.is_some();
         let tr_provider: Arc<dyn LLMProvider> = if let Some(dp) = delegation_provider {
             dp // Auto-spawned local delegation server
         } else if let Some(ref tr_cfg) = tool_delegation.provider {
@@ -251,11 +280,12 @@ pub fn build_swappable_core(
         };
         // Pick the delegation model. When config is empty, fall back to the
         // delegation provider's own default (e.g. local server's model) rather
-        // than the main model — the main model may be a special prefix like
-        // "claude-code/opus" that the delegation server doesn't understand.
+        // than the main model — the main model may be a cloud name like
+        // "anthropic/claude-opus-4-5" that the local server doesn't understand.
         let tr_model = if !tool_delegation.model.is_empty() {
             tool_delegation.model.clone()
-        } else if model.starts_with("claude-max") {
+        } else if is_auto_local || model.starts_with("claude-max") || model.contains('/') {
+            // Auto-spawned local delegation, or cloud model name — use provider default.
             tr_provider.get_default_model().to_string()
         } else {
             model.clone()
@@ -278,7 +308,13 @@ pub fn build_swappable_core(
         compactor,
         learning,
         working_memory,
-        working_memory_budget: memory_config.working_memory_budget,
+        // Scale working memory like other budgets. If the user left it at
+        // the default (600), apply proportional scaling; otherwise respect their override.
+        working_memory_budget: if memory_config.working_memory_budget == 600 {
+            (max_context_tokens * 15 / 1000).clamp(300, 15_000) // 1.5%
+        } else {
+            memory_config.working_memory_budget
+        },
         brave_api_key,
         exec_timeout,
         restrict_to_workspace,
@@ -411,14 +447,19 @@ impl AgentLoopShared {
             Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid, working_dir).await })
         });
         let subagents_ref2 = self.subagents.clone();
+        let list_workspace = core.workspace.clone();
         let list_cb: ListCallback = Arc::new(move || {
             let mgr = subagents_ref2.clone();
+            let ws = list_workspace.clone();
             Box::pin(async move {
                 let running = mgr.list_running().await;
+                let mut out = String::new();
+
+                // Running subagents
                 if running.is_empty() {
-                    "No subagents currently running.".to_string()
+                    out.push_str("No subagents currently running.\n");
                 } else {
-                    let mut out = format!("{} subagent(s) running:\n", running.len());
+                    out.push_str(&format!("{} subagent(s) running:\n", running.len()));
                     for info in &running {
                         let elapsed = info.started_at.elapsed().as_secs();
                         out.push_str(&format!(
@@ -426,8 +467,19 @@ impl AgentLoopShared {
                             info.label, info.task_id, elapsed
                         ));
                     }
-                    out
                 }
+
+                // Recently completed (from events.jsonl)
+                let recent = SubagentManager::read_recent_completed(&ws, 10);
+                if !recent.is_empty() {
+                    out.push_str(&format!("\nRecently completed ({}):\n", recent.len()));
+                    for entry in &recent {
+                        out.push_str(entry);
+                        out.push('\n');
+                    }
+                }
+
+                out
             })
         });
         let subagents_ref3 = self.subagents.clone();
@@ -447,6 +499,16 @@ impl AgentLoopShared {
             Box::pin(async move {
                 let timeout = std::time::Duration::from_secs(timeout_secs);
                 mgr.wait_for(&task_id, timeout).await
+            })
+        });
+        let check_workspace = core.workspace.clone();
+        let check_cb: CheckCallback = Arc::new(move |task_id: String| {
+            let ws = check_workspace.clone();
+            Box::pin(async move {
+                match SubagentManager::read_event_result(&ws, &task_id) {
+                    Some(result) => result,
+                    None => format!("No completed result found for task_id '{}'.", task_id),
+                }
             })
         });
         // Pipeline callback: parse steps JSON, build PipelineConfig, run pipeline.
@@ -535,6 +597,7 @@ impl AgentLoopShared {
         spawn_tool.set_list_callback(list_cb).await;
         spawn_tool.set_cancel_callback(cancel_cb).await;
         spawn_tool.set_wait_callback(wait_cb).await;
+        spawn_tool.set_check_callback(check_cb).await;
         spawn_tool.set_pipeline_callback(pipeline_cb).await;
         spawn_tool.set_loop_callback(loop_cb).await;
         spawn_tool.set_context(channel, chat_id).await;
@@ -823,6 +886,43 @@ impl AgentLoopShared {
                 }
             }
 
+            // Adaptive max_tokens: size the response budget to the task.
+            let effective_max_tokens = {
+                let base = core.max_tokens;
+                // Check for /long override (temporary boost).
+                let long_override = counters.long_mode_turns.load(Ordering::Relaxed);
+                if long_override > 0 {
+                    counters.long_mode_turns.fetch_sub(1, Ordering::Relaxed);
+                    base.max(8192)
+                } else {
+                    // Detect long-form triggers in the user message.
+                    let user_text = messages.last()
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let lower = user_text.to_lowercase();
+                    let is_long_form = lower.contains("explain in detail")
+                        || lower.contains("write a ")
+                        || lower.contains("create a script")
+                        || lower.contains("write code")
+                        || lower.contains("implement ")
+                        || lower.contains("full example")
+                        || lower.starts_with("write ")
+                        || user_text.len() > 500;
+                    // Count recent tool calls: if tool-heavy, use smaller budget.
+                    let recent_tool_calls = messages.iter().rev().take(6)
+                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                        .count();
+                    if is_long_form {
+                        base.max(4096)
+                    } else if recent_tool_calls > 3 {
+                        base.min(1024).max(512)
+                    } else {
+                        base
+                    }
+                }
+            };
+
             // Call LLM — streaming or blocking depending on mode.
             let thinking_budget = {
                 let stored = counters.thinking_budget.load(Ordering::Relaxed);
@@ -840,7 +940,7 @@ impl AgentLoopShared {
                         &messages,
                         tool_defs_opt,
                         Some(&core.model),
-                        core.max_tokens,
+                        effective_max_tokens,
                         core.temperature,
                         thinking_budget,
                     )
@@ -856,9 +956,14 @@ impl AgentLoopShared {
 
                 let mut streamed_response = None;
                 let mut in_thinking = false;
+                let suppress_thinking = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
                 while let Some(chunk) = stream.rx.recv().await {
                     match chunk {
                         StreamChunk::ThinkingDelta(delta) => {
+                            if suppress_thinking {
+                                // Skip thinking tokens entirely (voice mode / /nothink)
+                                continue;
+                            }
                             // Render thinking tokens as dimmed text
                             if !in_thinking {
                                 in_thinking = true;
@@ -898,7 +1003,7 @@ impl AgentLoopShared {
                         &messages,
                         tool_defs_opt,
                         Some(&core.model),
-                        core.max_tokens,
+                        effective_max_tokens,
                         core.temperature,
                         thinking_budget,
                     )
@@ -933,6 +1038,25 @@ impl AgentLoopShared {
 
                 final_content = format!("[LLM Error] {}", err_msg);
                 break;
+            }
+
+            // Token telemetry: log actual vs estimated usage.
+            {
+                let estimated_prompt = TokenBudget::estimate_tokens(&messages);
+                let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
+                let actual_completion = response.usage.get("completion_tokens").copied().unwrap_or(-1);
+                info!(
+                    "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}, max_tokens={}",
+                    estimated_prompt, actual_prompt, actual_completion, effective_max_tokens
+                );
+                // Store actual tokens for /status display.
+                if actual_prompt > 0 {
+                    counters.last_actual_prompt_tokens.store(actual_prompt as u64, Ordering::Relaxed);
+                }
+                if actual_completion > 0 {
+                    counters.last_actual_completion_tokens.store(actual_completion as u64, Ordering::Relaxed);
+                }
+                counters.last_estimated_prompt_tokens.store(estimated_prompt as u64, Ordering::Relaxed);
             }
 
             if response.has_tool_calls() {
@@ -985,7 +1109,9 @@ impl AgentLoopShared {
 
                         // Local delegation providers (llama-server) require
                         // user-last messages for tool→generate flow.
-                        let needs_user_cont = core.is_local;
+                        // Check delegation provider's locality, not the main model's.
+                        let needs_user_cont = core.is_local
+                            || delegation_provider.is_some();
 
                         // Detect [VERBATIM] marker: the main model is asking for
                         // raw tool output instead of a delegation summary.
@@ -993,12 +1119,12 @@ impl AgentLoopShared {
                             .map(|c| c.contains("[VERBATIM]"))
                             .unwrap_or(false);
 
-                        // The delegation model typically has a small context (4K tokens).
-                        // Cap tool results to ~1500 tokens (~6000 chars) so the system
+                        // The delegation model has a small context (8K tokens).
+                        // Cap tool results to ~750 tokens (~3000 chars) so the system
                         // prompt, tool call messages, and response all fit comfortably.
                         // Use the main model's limit only if it's already smaller.
                         let delegation_result_limit = core.max_tool_result_chars
-                            .min(6000);
+                            .min(3000);
 
                         let runner_config = ToolRunnerConfig {
                             provider: tr_provider.clone(),
@@ -1077,15 +1203,15 @@ impl AgentLoopShared {
                         .await;
                         let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
-                        // If the runner returned no summary, diagnose why and
-                        // mark unhealthy so future calls go inline.
-                        if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+                        // Only mark unhealthy on actual errors or timeout —
+                        // "no summary" alone is a quality issue, not a health issue.
+                        let is_hard_failure = run_result.error.is_some()
+                            || delegation_elapsed_ms > 30_000;
+                        if is_hard_failure && !run_result.tool_results.is_empty() {
                             let reason = if let Some(ref err) = run_result.error {
                                 format!("delegation model errored: {}", err)
-                            } else if delegation_elapsed_ms > 30_000 {
-                                "delegation model timed out (>30s)".to_string()
                             } else {
-                                "delegation model returned empty".to_string()
+                                "delegation model timed out (>30s)".to_string()
                             };
                             let results_preview: String = run_result.tool_results
                                 .first()
@@ -1103,6 +1229,11 @@ impl AgentLoopShared {
                                 results_preview,
                             );
                             counters.delegation_healthy.store(false, Ordering::Relaxed);
+                        } else if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+                            debug!(
+                                "Delegation returned no summary (model={}, iters={}), using results inline",
+                                tr_model, run_result.iterations_used,
+                            );
                         } else if !counters.delegation_healthy.load(Ordering::Relaxed) {
                             // Re-probe succeeded — server recovered!
                             info!("Delegation provider recovered — re-enabling delegation");

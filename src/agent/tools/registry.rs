@@ -99,7 +99,7 @@ impl ToolRegistry {
 
     /// Core tools that are always included in tool definitions.
     const CORE_TOOLS: &'static [&'static str] =
-        &["read_file", "write_file", "edit_file", "list_dir", "exec"];
+        &["read_file", "write_file", "edit_file", "list_dir", "exec", "spawn"];
 
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[

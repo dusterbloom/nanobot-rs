@@ -98,6 +98,9 @@ lingua = { version = "1.7", default-features = false, features = [
 # Mime type guessing
 mime_guess = "2"
 
+# Accurate BPE token counting (cl100k_base, compatible with OpenAI/Claude)
+tiktoken-rs = "0.6"
+
 # SQLite with FTS5 (context store, budget calibrator, experience buffer)
 rusqlite = { version = "0.32", features = ["bundled"] }
 

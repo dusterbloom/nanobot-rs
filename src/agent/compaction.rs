@@ -18,17 +18,48 @@ use crate::providers::base::LLMProvider;
 
 /// Summarization prompt sent to the LLM.
 const SUMMARIZE_PROMPT: &str = "\
-Summarize this conversation history concisely. Focus on:
-- Key facts and decisions made
-- Current task/topic being discussed
-- Any pending actions or commitments
-Keep it under 500 words.";
+Extract facts from this conversation into the template below.
+Rules:
+1. Copy technical terms, file paths, numbers EXACTLY
+2. One sentence per bullet, max 10 bullets per section
+3. Skip anything you're unsure about
+4. No meta-commentary (no 'I should...', 'Let me...')
+5. ONLY output the filled template, nothing else
+
+## Task
+[What is the user doing?]
+
+## Decisions
+[What was decided?]
+
+## Facts
+[What was discovered?]
+
+## Pending
+[What's still to do?]
+
+## Errors
+[What went wrong?]";
 
 /// Prompt for merging already-compressed chunk summaries.
 const MERGE_SUMMARIES_PROMPT: &str = "\
-Merge these partial conversation summaries into one coherent summary.
-Preserve concrete facts, decisions, and pending actions.
-Avoid repetition. Keep it under 500 words.";
+Merge these context summaries into one using the same template.
+Rules: copy exact terms, one sentence per bullet, max 10 per section, no meta-commentary.
+
+## Task
+[Combined task description]
+
+## Decisions
+[All decisions]
+
+## Facts
+[All facts]
+
+## Pending
+[All pending items]
+
+## Errors
+[All errors]";
 
 // SUMMARIZER_INPUT_BUDGET_TOKENS removed — now dynamically computed via
 // ContextCompactor::input_budget() based on the compaction server's ctx size.
@@ -357,8 +388,30 @@ impl ContextCompactor {
             anyhow::bail!("Summarization failed: {}", text);
         }
 
+        // Strip thinking tags that leak from small models (e.g. Qwen3).
+        let text = strip_thinking_tags(&text);
         Ok(text)
     }
+}
+
+/// Strip `<thinking>...</thinking>` blocks from model output.
+///
+/// Small models (Qwen3-0.6B, 1.7B) sometimes leak chain-of-thought tags
+/// into their output. This prevents garbage from leaking into summaries.
+fn strip_thinking_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<thinking>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</thinking>") {
+            remaining = &remaining[start + end + "</thinking>".len()..];
+        } else {
+            // Unclosed tag — drop everything after <thinking>
+            return result.trim().to_string();
+        }
+    }
+    result.push_str(remaining);
+    result.trim().to_string()
 }
 
 fn format_message_for_transcript(msg: &Value) -> String {

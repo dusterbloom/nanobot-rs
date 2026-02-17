@@ -45,6 +45,11 @@ pub type WaitCallback = Arc<
     dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
 >;
 
+/// Type alias for the check callback. Takes task_id prefix, returns result without blocking.
+pub type CheckCallback = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
+>;
+
 /// Type alias for the pipeline callback. Takes (steps_json, ahead_by_k) -> result string.
 pub type PipelineCallback = Arc<
     dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
@@ -78,6 +83,7 @@ pub struct SpawnTool {
     list_callback: Arc<Mutex<Option<ListCallback>>>,
     cancel_callback: Arc<Mutex<Option<CancelCallback>>>,
     wait_callback: Arc<Mutex<Option<WaitCallback>>>,
+    check_callback: Arc<Mutex<Option<CheckCallback>>>,
     pipeline_callback: Arc<Mutex<Option<PipelineCallback>>>,
     loop_callback: Arc<Mutex<Option<LoopCallback>>>,
     origin_channel: Arc<Mutex<String>>,
@@ -92,6 +98,7 @@ impl SpawnTool {
             list_callback: Arc::new(Mutex::new(None)),
             cancel_callback: Arc::new(Mutex::new(None)),
             wait_callback: Arc::new(Mutex::new(None)),
+            check_callback: Arc::new(Mutex::new(None)),
             pipeline_callback: Arc::new(Mutex::new(None)),
             loop_callback: Arc::new(Mutex::new(None)),
             origin_channel: Arc::new(Mutex::new("cli".to_string())),
@@ -125,6 +132,11 @@ impl SpawnTool {
         *self.wait_callback.lock().await = Some(callback);
     }
 
+    /// Set the check callback for non-blocking result lookup.
+    pub async fn set_check_callback(&self, callback: CheckCallback) {
+        *self.check_callback.lock().await = Some(callback);
+    }
+
     /// Set the pipeline callback for running multi-step pipelines.
     pub async fn set_pipeline_callback(&self, callback: PipelineCallback) {
         *self.pipeline_callback.lock().await = Some(callback);
@@ -149,11 +161,13 @@ impl Tool for SpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent to handle a task in the background, list running subagents, wait for one to finish, cancel one, \
+        "Spawn a subagent to handle a task in the background, list running and recently completed subagents, \
+         check a specific result, wait for one to finish, cancel one, \
          run a multi-step pipeline, or run an autonomous refinement loop. \
          Use action='spawn' (default) to start a new subagent. \
-         Use action='list' to check status of running subagents. \
-         Use action='wait' with task_id to block until a subagent finishes and get its result (saves iterations vs polling). \
+         Use action='list' to see running subagents AND recently completed ones. \
+         Use action='check' with task_id to retrieve a completed subagent's result (non-blocking). \
+         Use action='wait' with task_id to block until a subagent finishes and get its result. \
          Use action='cancel' with task_id to abort a stuck subagent. \
          Use action='pipeline' with steps array for multi-step execution with optional tool use per step. \
          Use action='loop' with task and max_rounds for autonomous iterative refinement with tools. \
@@ -167,8 +181,8 @@ impl Tool for SpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: 'spawn' (default), 'list', 'wait', 'cancel', 'pipeline', or 'loop'",
-                    "enum": ["spawn", "list", "wait", "cancel", "pipeline", "loop"]
+                    "description": "Action to perform: 'spawn' (default), 'list', 'check', 'wait', 'cancel', 'pipeline', or 'loop'",
+                    "enum": ["spawn", "list", "check", "wait", "cancel", "pipeline", "loop"]
                 },
                 "steps": {
                     "type": "array",
@@ -256,6 +270,21 @@ impl Tool for SpawnTool {
                         cb().await
                     }
                     None => "Error: List callback not configured".to_string(),
+                }
+            }
+            "check" => {
+                let task_id = match params.get("task_id").and_then(|v| v.as_str()) {
+                    Some(id) => id.to_string(),
+                    None => return "Error: 'task_id' parameter is required for check".to_string(),
+                };
+                let cb_guard = self.check_callback.lock().await;
+                match cb_guard.as_ref() {
+                    Some(cb) => {
+                        let cb = cb.clone();
+                        drop(cb_guard);
+                        cb(task_id).await
+                    }
+                    None => "Error: Check callback not configured".to_string(),
                 }
             }
             "cancel" => {

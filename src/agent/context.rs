@@ -32,6 +32,9 @@ pub struct ContextBuilder {
     /// When true, all skills are loaded as summaries only (RLM lazy mode).
     /// The agent uses `read_skill` to fetch full content on demand.
     pub lazy_skills: bool,
+    /// Pre-rendered subagent profiles section (from `profiles_summary()`).
+    /// Injected into the system prompt when non-empty.
+    pub agent_profiles: String,
 }
 
 impl ContextBuilder {
@@ -42,10 +45,11 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
-            bootstrap_budget: 3000,
-            long_term_memory_budget: 800,
+            bootstrap_budget: 1500,
+            long_term_memory_budget: 400,
             provenance_enabled: false,
             lazy_skills: false,
+            agent_profiles: String::new(),
         }
     }
 
@@ -63,13 +67,24 @@ impl ContextBuilder {
             long_term_memory_budget: 200,
             provenance_enabled: false,
             lazy_skills: false,
+            agent_profiles: String::new(),
         }
     }
 
     /// Convert this builder to lite mode (for local models).
-    pub fn set_lite_mode(&mut self) {
-        self.bootstrap_budget = 500;
-        self.long_term_memory_budget = 200;
+    pub fn set_lite_mode(&mut self, max_context_tokens: usize) {
+        // Local models: scale down but with tighter clamps.
+        self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
+        self.long_term_memory_budget = (max_context_tokens / 100).clamp(100, 1_000); // 1%
+    }
+
+    /// Scale prompt component budgets proportionally to the model's context window.
+    ///
+    /// Without this, a 1M-context model gets the same 1500-token bootstrap cap
+    /// as a 16K model — wasting 99.85% of available system prompt space.
+    pub fn scale_budgets(&mut self, max_context_tokens: usize) {
+        self.bootstrap_budget = (max_context_tokens / 50).clamp(500, 20_000); // 2%
+        self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 10_000); // 1%
     }
 
     // ------------------------------------------------------------------
@@ -87,38 +102,32 @@ impl ContextBuilder {
         if self.provenance_enabled {
             parts.push(
                 "## Verification Protocol\n\n\
-                 CRITICAL: Every tool call is recorded in an immutable audit log. Your output is \
-                 mechanically verified against this log. Unverified claims are automatically redacted.\n\n\
-                 RULES:\n\
-                 1. QUOTE VERBATIM — copy tool output exactly. Do NOT paraphrase, summarize, or \
-                    approximate. If a tool returned \"42 files found\", say \"42 files found\", not \
-                    \"about 40 files\" or \"many files\".\n\
-                 2. NEVER FABRICATE — do not invent file contents, command outputs, paths, numbers, \
-                    or error messages. If you don't know, say so.\n\
-                 3. REPORT ERRORS — if a tool returned an error, report the exact error message.\n\
-                 4. NO PHANTOM ACTIONS — never say \"I read/wrote/ran X\" unless that exact tool call \
-                    appears in your conversation. If you didn't call the tool, don't claim you did.\n\
-                 5. STATE UNCERTAINTY — if output was truncated, say \"output was truncated\". If a \
-                    tool timed out, say \"timed out\". Never fill in what you think the output was.\n\
-                 6. USE TOOL OUTPUT MARKERS — tool results are wrapped in [VERBATIM TOOL OUTPUT] \
-                    blocks. Quote from these blocks directly.\n\n\
-                 CONSEQUENCE: Claims that cannot be traced to an actual tool output will be \
-                 automatically removed from your response before the user sees it.\n\n\
-                 CRITICAL ANTI-FABRICATION RULE:\n\
-                 Every \"let me\" is a PROMISE. \"Let me check\" REQUIRES a tool call immediately \
-                 after. \"Let me write\" REQUIRES a write_file call. If you say \"let me\" and then \
-                 generate text without calling the corresponding tool, you are FABRICATING. The system \
-                 will detect this and prepend a [PHANTOM WARNING] to your response. The user will see \
-                 that you lied. NEVER generate fake tool output in your text response."
+                 Tool calls are audit-logged and mechanically verified. Unverified claims are redacted.\n\
+                 1. QUOTE VERBATIM — exact tool output, no paraphrasing.\n\
+                 2. NEVER FABRICATE — no invented paths, outputs, or numbers.\n\
+                 3. REPORT ERRORS — exact error messages from tools.\n\
+                 4. NO PHANTOM ACTIONS — only claim actions with matching tool calls.\n\
+                 5. STATE UNCERTAINTY — say \"truncated\" or \"timed out\" when applicable.\n\
+                 6. USE [VERBATIM TOOL OUTPUT] markers — quote from these blocks directly.\n\
+                 Every \"let me\" is a PROMISE requiring an immediate tool call."
                     .to_string(),
             );
         }
 
-        // Bootstrap files.
-        let bootstrap =
-            Self::_truncate_to_budget(&self._load_bootstrap_files(), self.bootstrap_budget);
+        // Bootstrap files — include complete files in priority order, skip the rest.
+        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget);
         if !bootstrap.is_empty() {
             parts.push(bootstrap);
+        }
+
+        // Session context (CONTEXT.md) — structured snapshot from last compaction.
+        let context_path = self.workspace.join("CONTEXT.md");
+        if context_path.exists() {
+            if let Ok(ctx) = fs::read_to_string(&context_path) {
+                if !ctx.trim().is_empty() {
+                    parts.push(format!("# Session Context\n\n{}", ctx.trim()));
+                }
+            }
         }
 
         // Memory context (long-term facts only — observations, daily notes, and
@@ -160,6 +169,11 @@ impl ContextBuilder {
                  {}",
                 fetch_hint, skills_summary
             ));
+        }
+
+        // Subagent profiles — tells the model what agents exist and when to delegate.
+        if !self.agent_profiles.is_empty() {
+            parts.push(self.agent_profiles.clone());
         }
 
         // Explicitly requested skills (always loaded in full, even in lazy mode).
@@ -321,58 +335,92 @@ impl ContextBuilder {
             format!("\n\n## Model\nYou are powered by: {}", self.model_name)
         };
 
+        // Cost-aware delegation hint for expensive models.
+        let is_expensive = self.model_name.contains("opus")
+            || self.model_name.contains("gpt-4o")
+            || self.model_name.contains("claude-max");
+        let delegation_hint = if is_expensive && !self.agent_profiles.is_empty() {
+            "\n\n## Cost Efficiency\n\
+             You are an expensive model. Delegate mechanical tasks to cheap subagents via `spawn`:\n\
+             - File writes, web fetches, shell commands whose output you don't need immediately\n\
+             - Multi-step research that would burn >1000 tokens of intermediate results\n\
+             - Build/test cycles\n\
+             Only do it yourself when the result feeds directly into your next sentence."
+        } else {
+            ""
+        };
+
         format!(
             r#"# nanobot
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
+You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, messaging, and subagents.
 
-## Current Time
-{now}{model_section}
+## Context
+Time: {now}{model_section}
+Workspace: {workspace_path}
 
-## Workspace
-Your workspace is at: {workspace_path}
-- Long-term facts: {workspace_path}/memory/MEMORY.md (bullet-point facts, updated by reflector)
-- Working sessions: {workspace_path}/memory/sessions/ (per-session state, auto-managed)
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+Be concise (1-5 sentences) unless asked for detail. Use tools to verify; never fabricate.
+Reply directly for conversation; use 'message' tool only for chat channels.{delegation_hint}
 
-## Memory System
-You have a layered memory system:
-1. **Working Memory** — your current session context is automatically injected below. It tracks compaction summaries from this conversation.
-2. **Long-term Memory** — distilled facts in MEMORY.md, loaded into your system prompt. Write permanent facts here.
-3. **Recall** — use the `recall` tool to search across all memory (sessions, facts, archived conversations).
+## Memory
+Working Memory is injected automatically (session state). Long-term facts: {workspace_path}/memory/MEMORY.md.
+Use `recall` to search all memory (sessions, facts, archives).
 
-When you learn a permanent fact about the user, write it to {workspace_path}/memory/MEMORY.md as a bullet point.
-Do NOT write session-specific state there — that goes into working memory automatically.
-
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
-
-Always be helpful, accurate, and concise. When using tools, explain what you're doing.
-
-If you see a [PRIORITY USER MESSAGE], the user typed this while you were working. Acknowledge it briefly and adjust your approach accordingly. This takes precedence over your current plan."#
+If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach — it takes precedence."#
         )
     }
 
-    /// Load all bootstrap files from workspace.
-    fn _load_bootstrap_files(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+    /// Load bootstrap files within budget using file-granularity inclusion.
+    ///
+    /// Each file is included in full if it fits the remaining budget; otherwise
+    /// it is skipped entirely. Skipped files are listed in a brief note so the
+    /// model knows they exist and can fetch them with `read_file`.
+    ///
+    /// This avoids mid-content truncation that would show broken/incomplete
+    /// instructions to the model — a complete file or nothing.
+    fn _load_bootstrap_files_within_budget(&self, budget_tokens: usize) -> String {
+        if budget_tokens == 0 {
+            return String::new();
+        }
+
+        let mut included: Vec<String> = Vec::new();
+        let mut skipped: Vec<&str> = Vec::new();
+        let mut remaining = budget_tokens;
 
         for filename in BOOTSTRAP_FILES {
             let file_path = self.workspace.join(filename);
-            if file_path.exists() {
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    parts.push(format!("## {}\n\n{}", filename, content));
-                }
+            if !file_path.exists() {
+                continue;
+            }
+            let content = match fs::read_to_string(&file_path) {
+                Ok(c) if !c.trim().is_empty() => c,
+                _ => continue,
+            };
+
+            let section = format!("## {}\n\n{}", filename, content);
+            let cost = TokenBudget::estimate_str_tokens(&section);
+
+            if cost <= remaining {
+                included.push(section);
+                remaining = remaining.saturating_sub(cost);
+            } else {
+                skipped.push(filename);
             }
         }
 
-        parts.join("\n\n")
+        // Tell the model about skipped files (never a "truncated" marker).
+        if !skipped.is_empty() {
+            let note = format!(
+                "_Workspace files available via read_file: {}_",
+                skipped.join(", ")
+            );
+            let note_cost = TokenBudget::estimate_str_tokens(&note);
+            if note_cost <= remaining {
+                included.push(note);
+            }
+        }
+
+        included.join("\n\n")
     }
 
     /// Build user message content with optional base64-encoded images.
@@ -416,9 +464,11 @@ If you see a [PRIORITY USER MESSAGE], the user typed this while you were working
         Value::Array(images)
     }
 
-    /// Truncate keeping the TAIL of the text (newest content).
+    /// Truncate keeping the TAIL of the text (newest content), silently.
     ///
     /// Used for MEMORY.md where the reflector appends new facts at the bottom.
+    /// Truncates at line boundaries — never mid-line, never with a visible marker.
+    /// The model sees clean content, not broken instructions.
     fn _truncate_to_budget_tail(text: &str, max_tokens: usize) -> String {
         if text.is_empty() || max_tokens == 0 {
             return String::new();
@@ -428,33 +478,25 @@ If you see a [PRIORITY USER MESSAGE], the user typed this while you were working
             return text.to_string();
         }
 
+        // Keep roughly max_tokens worth of text from the tail, at line boundaries.
         let max_chars = max_tokens.saturating_mul(4);
-        let marker = "[earlier memory truncated]\n\n";
-        let keep_chars = max_chars.saturating_sub(marker.len());
-        let total_chars = text.chars().count();
-        let skip = total_chars.saturating_sub(keep_chars);
-        let mut out = String::from(marker);
-        out.extend(text.chars().skip(skip));
-        out
-    }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut kept: Vec<&str> = Vec::new();
+        let mut char_count = 0;
 
-    /// Truncate a section to fit an approximate token budget.
-    fn _truncate_to_budget(text: &str, max_tokens: usize) -> String {
-        if text.is_empty() || max_tokens == 0 {
-            return String::new();
+        for line in lines.iter().rev() {
+            let line_cost = line.len() + 1; // +1 for newline
+            if char_count + line_cost > max_chars && !kept.is_empty() {
+                break;
+            }
+            kept.push(line);
+            char_count += line_cost;
         }
 
-        if TokenBudget::estimate_str_tokens(text) <= max_tokens {
-            return text.to_string();
-        }
-
-        let max_chars = max_tokens.saturating_mul(4);
-        let marker = "\n\n[truncated to fit token budget]";
-        let keep_chars = max_chars.saturating_sub(marker.len());
-        let mut out: String = text.chars().take(keep_chars).collect();
-        out.push_str(marker);
-        out
+        kept.reverse();
+        kept.join("\n")
     }
+
 }
 
 /// Map ISO 639-1 language code to a human-readable name for LLM instruction.
@@ -609,9 +651,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("AGENTS.md"), "x".repeat(4000)).unwrap();
         let mut cb = ContextBuilder::new(tmp.path());
-        cb.bootstrap_budget = 40;
+        cb.bootstrap_budget = 40; // Too small to fit AGENTS.md
         let prompt = cb.build_system_prompt(None);
-        assert!(prompt.contains("[truncated to fit token budget]"));
+        // File should be skipped entirely — never truncated mid-content.
+        assert!(!prompt.contains("[truncated"));
+        // Model should be told the file exists and can be fetched.
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(prompt.contains("read_file"));
     }
 
 
@@ -765,12 +811,15 @@ mod tests {
 
     #[test]
     fn test_truncate_to_budget_tail_keeps_newest() {
-        // Long text should keep the tail (newest facts).
-        let text = format!("OLD FACT\n{}\nNEW FACT", "x".repeat(4000));
+        // Long text should keep the tail (newest facts), silently.
+        let lines: Vec<String> = (0..500).map(|i| format!("FACT {}", i)).collect();
+        let text = lines.join("\n");
         let result = ContextBuilder::_truncate_to_budget_tail(&text, 40);
-        assert!(result.contains("NEW FACT"), "newest facts should survive tail truncation");
-        assert!(!result.contains("OLD FACT"), "oldest facts should be dropped");
-        assert!(result.contains("[earlier memory truncated]"));
+        assert!(result.contains("FACT 499"), "newest facts should survive tail truncation");
+        assert!(!result.contains("FACT 0"), "oldest facts should be dropped");
+        // No truncation marker visible to the model.
+        assert!(!result.contains("[truncated"), "no truncation markers");
+        assert!(!result.contains("[earlier"), "no earlier-memory markers");
     }
 
     #[test]

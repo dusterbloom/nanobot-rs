@@ -184,6 +184,10 @@ pub struct AgentDefaults {
     pub workspace: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// Preferred local GGUF model filename (e.g. "Qwen3-8B-Q4_K_M.gguf").
+    /// Empty = use hardcoded DEFAULT_LOCAL_MODEL fallback.
+    #[serde(default)]
+    pub local_model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
@@ -208,7 +212,7 @@ fn default_model() -> String {
 }
 
 fn default_max_tokens() -> u32 {
-    8192
+    2048
 }
 
 fn default_temperature() -> f64 {
@@ -228,7 +232,7 @@ fn default_max_concurrent_chats() -> usize {
 }
 
 fn default_max_tool_result_chars() -> usize {
-    30000
+    10_000
 }
 
 impl Default for AgentDefaults {
@@ -236,6 +240,7 @@ impl Default for AgentDefaults {
         Self {
             workspace: default_workspace(),
             model: default_model(),
+            local_model: String::new(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             max_tool_iterations: default_max_tool_iterations(),
@@ -518,7 +523,7 @@ fn default_observation_budget() -> usize {
 }
 
 fn default_working_memory_budget() -> usize {
-    1500
+    600
 }
 
 fn default_session_complete_after_secs() -> u64 {
@@ -559,7 +564,7 @@ impl Default for MemoryConfig {
             compaction_threshold_tokens: default_compaction_threshold_tokens(),
             max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),
-            lazy_skills: false,
+            lazy_skills: true,
         }
     }
 }
@@ -628,7 +633,7 @@ fn default_td_max_iterations() -> u32 {
 }
 
 fn default_td_max_tokens() -> u32 {
-    4096
+    1024
 }
 
 /// Configuration for delegating tool execution loops to a cheaper model.
@@ -1017,7 +1022,7 @@ mod tests {
         assert!(td.model.is_empty());
         assert!(td.provider.is_none());
         assert_eq!(td.max_iterations, 10);
-        assert_eq!(td.max_tokens, 4096);
+        assert_eq!(td.max_tokens, 1024);
         assert!(td.slim_results);
         assert_eq!(td.max_result_preview_chars, 200);
         assert!(td.auto_local);
@@ -1056,7 +1061,7 @@ mod tests {
         assert!(cfg.tool_delegation.enabled);
         assert_eq!(cfg.tool_delegation.model, "small-model");
         assert_eq!(cfg.tool_delegation.max_iterations, 5);
-        assert_eq!(cfg.tool_delegation.max_tokens, 4096); // default
+        assert_eq!(cfg.tool_delegation.max_tokens, 1024); // default
     }
 
     #[test]

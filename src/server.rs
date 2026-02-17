@@ -19,8 +19,8 @@ use tracing::debug;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
 
 const COMPACTION_MODEL_URL: &str =
-    "https://huggingface.co/MaziyarPanahi/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B.Q4_K_M.gguf";
-const COMPACTION_MODEL_FILENAME: &str = "Qwen3-0.6B.Q4_K_M.gguf";
+    "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf";
+const COMPACTION_MODEL_FILENAME: &str = "Qwen3-1.7B-Q4_K_M.gguf";
 
 // ============================================================================
 // GGUF Metadata
@@ -84,7 +84,7 @@ pub(crate) fn ensure_compaction_model() -> Option<PathBuf> {
     }
 
     println!(
-        "  {}{}Downloading{} compaction model (Qwen3-0.6B, ~500MB)...",
+        "  {}{}Downloading{} compaction model (Qwen3-1.7B, ~1.1GB)...",
         crate::tui::BOLD,
         crate::tui::YELLOW,
         crate::tui::RESET
@@ -165,7 +165,7 @@ pub(crate) async fn start_compaction_if_available(
             if wait_for_server_ready(port, 15, compaction_process).await {
                 *compaction_port = Some(port.to_string());
                 println!(
-                    "  {}{}Compaction server ready{} (Qwen3-0.6B on GPU)",
+                    "  {}{}Compaction server ready{} (Qwen3-1.7B on GPU)",
                     crate::tui::BOLD,
                     crate::tui::GREEN,
                     crate::tui::RESET
@@ -275,7 +275,7 @@ pub(crate) async fn start_delegation_if_available(
         .and_then(|n| n.to_str())
         .unwrap_or("delegation-model");
     let port = find_available_port(8091);
-    let ctx_size = 4096; // Tool work is short — no need for large context
+    let ctx_size = 8192; // Small models handle 8K fine; 4K caused ctx overflow
 
     // Compute GPU layers based on available VRAM (after main model is loaded).
     let gpu_layers = compute_gpu_layers_for_model(&model_path, ctx_size);

@@ -921,7 +921,13 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
     runtime.block_on(async {
         // Create shared core and initial agent loop.
-        let core_handle = cli::build_core_handle(&config, &local_port, Some(server::DEFAULT_LOCAL_MODEL), None, None);
+        // Use persisted local model name if available, else hardcoded default.
+        let local_model_name = if config.agents.defaults.local_model.is_empty() {
+            server::DEFAULT_LOCAL_MODEL
+        } else {
+            &config.agents.defaults.local_model
+        };
+        let core_handle = cli::build_core_handle(&config, &local_port, Some(local_model_name), None, None);
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
 
@@ -953,7 +959,21 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             tui::print_startup_splash(&local_port);
 
             let mut srv = ServerState::new(local_port.clone());
-            let default_model = dirs::home_dir().unwrap().join("models").join(server::DEFAULT_LOCAL_MODEL);
+            // Load persisted local model preference, falling back to hardcoded default.
+            let default_model = {
+                let models_dir = dirs::home_dir().unwrap().join("models");
+                let saved = &config.agents.defaults.local_model;
+                if !saved.is_empty() {
+                    let saved_path = models_dir.join(saved);
+                    if saved_path.exists() {
+                        saved_path
+                    } else {
+                        models_dir.join(server::DEFAULT_LOCAL_MODEL)
+                    }
+                } else {
+                    models_dir.join(server::DEFAULT_LOCAL_MODEL)
+                }
+            };
 
             // Auto-spawn delegation server for cloud mode
             if !is_local
@@ -968,7 +988,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 if srv.delegation_port.is_some() {
                     cli::rebuild_core(
                         &core_handle, &config, &local_port,
-                        Some(server::DEFAULT_LOCAL_MODEL), None,
+                        Some(local_model_name), None,
                         srv.delegation_port.as_deref(),
                     );
                 }

@@ -474,6 +474,9 @@ pub(crate) fn rebuild_core(
     handle.swap_core(new_core);
     // Update max context since the new model may have a different size.
     handle.counters.last_context_max.store(max_context_tokens as u64, Ordering::Relaxed);
+    // Reset delegation health — new core may have a fresh delegation server.
+    handle.counters.delegation_healthy.store(true, Ordering::Relaxed);
+    handle.counters.delegation_retry_counter.store(0, Ordering::Relaxed);
 }
 
 /// Create an agent loop with per-instance channels, using the shared core handle.

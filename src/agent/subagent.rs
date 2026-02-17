@@ -864,8 +864,36 @@ impl SubagentManager {
         }
     }
 
+    /// Read the last N completed subagent results from events.jsonl.
+    pub fn read_recent_completed(workspace: &PathBuf, max_entries: usize) -> Vec<String> {
+        let event_path = workspace.join("events.jsonl");
+        let content = match std::fs::read_to_string(&event_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let mut results = Vec::new();
+        for line in content.lines().rev() {
+            if results.len() >= max_entries {
+                break;
+            }
+            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
+                if ev["kind"] == "subagent_result" {
+                    let task_id = ev["task_id"].as_str().unwrap_or("?");
+                    let label = ev["label"].as_str().unwrap_or("");
+                    let status = ev["status"].as_str().unwrap_or("unknown");
+                    let ts = ev["ts"].as_str().unwrap_or("");
+                    results.push(format!(
+                        "  • {} (id: {}) — {} [{}]",
+                        label, task_id, status, ts
+                    ));
+                }
+            }
+        }
+        results
+    }
+
     /// Search event log for a completed subagent result by task_id prefix.
-    fn read_event_result(workspace: &PathBuf, task_id_prefix: &str) -> Option<String> {
+    pub fn read_event_result(workspace: &PathBuf, task_id_prefix: &str) -> Option<String> {
         let event_path = workspace.join("events.jsonl");
         let content = std::fs::read_to_string(&event_path).ok()?;
         // Scan lines in reverse (most recent first).
