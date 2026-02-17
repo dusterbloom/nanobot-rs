@@ -379,7 +379,11 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
     )
 }
 
-/// Expand a leading `~` to the user's home directory.
+/// Expand a path: `~` → home dir, relative paths → workspace-relative.
+///
+/// Small/delegation models sometimes omit the full workspace prefix and
+/// pass bare filenames like `MEMORY.md`. Resolving against the workspace
+/// makes these succeed instead of failing with "File not found".
 fn expand_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -387,7 +391,19 @@ fn expand_path(path: &str) -> PathBuf {
     } else if path == "~" {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
     } else {
-        PathBuf::from(path)
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            p
+        } else {
+            // Resolve relative paths against the workspace directory.
+            let workspace = crate::utils::helpers::get_workspace_path(None);
+            let resolved = workspace.join(&p);
+            if resolved.exists() {
+                resolved
+            } else {
+                p // fall back to CWD-relative (original behavior)
+            }
+        }
     }
 }
 
