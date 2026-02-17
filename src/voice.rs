@@ -516,19 +516,19 @@ impl VoiceSession {
                     break;
                 }
                 tracing::debug!("Synthesizing sentence {}/{}...", i + 1, sentences.len());
-                match guard.synthesize(sentence) {
-                    Ok(output) => {
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let chunk = AudioChunk {
-                            data: samples_to_f32le_bytes(&output.samples),
-                            sample_rate: output.sample_rate,
-                        };
-                        if audio_tx.send(chunk).is_err() {
-                            break; // playback thread gone
-                        }
+                let cancel_ref = &cancel;
+                let tx_ref = &audio_tx;
+                match guard.synthesize_streaming(sentence, |samples, sample_rate| {
+                    if cancel_ref.load(Ordering::Relaxed) {
+                        return false;
                     }
+                    let chunk = AudioChunk {
+                        data: samples_to_f32le_bytes(samples),
+                        sample_rate,
+                    };
+                    tx_ref.send(chunk).is_ok()
+                }) {
+                    Ok(_) => {}
                     Err(e) => {
                         tracing::error!("TTS synthesis failed: {}", e);
                         break;
@@ -639,23 +639,23 @@ impl VoiceSession {
                             break;
                         }
                         tracing::debug!("Streaming TTS: synthesizing \"{}\"", &sentence[..sentence.len().min(40)]);
-                        match guard.synthesize(&sentence) {
-                            Ok(output) => {
-                                if cancel_synth.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                // Display sentence text synchronized with audio readiness
-                                if let Some(ref dtx) = display_tx {
-                                    let _ = dtx.send(sentence.clone());
-                                }
-                                let chunk = AudioChunk {
-                                    data: samples_to_f32le_bytes(&output.samples),
-                                    sample_rate: output.sample_rate,
-                                };
-                                if audio_tx.send(chunk).is_err() {
-                                    break;
-                                }
+                        // Display sentence text as synthesis begins (audio will follow in ~80ms)
+                        if let Some(ref dtx) = display_tx {
+                            let _ = dtx.send(sentence.clone());
+                        }
+                        let cancel_ref = &cancel_synth;
+                        let tx_ref = &audio_tx;
+                        match guard.synthesize_streaming(&sentence, |samples, sample_rate| {
+                            if cancel_ref.load(Ordering::Relaxed) {
+                                return false;
                             }
+                            let chunk = AudioChunk {
+                                data: samples_to_f32le_bytes(samples),
+                                sample_rate,
+                            };
+                            tx_ref.send(chunk).is_ok()
+                        }) {
+                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!("Streaming TTS synthesis failed: {}", e);
                                 break;
@@ -1124,6 +1124,35 @@ mod tests {
             }
             Err(e) => panic!("Pocket TTS init failed: {}", e),
         }
+    }
+
+    /// Test native streaming: Pocket should yield multiple chunks for a sentence.
+    #[test]
+    fn test_pocket_tts_streaming() {
+        use jack_voice::{TextToSpeech, TtsEngine};
+        let mut tts = TextToSpeech::with_engine(TtsEngine::Pocket)
+            .expect("Pocket TTS init failed");
+
+        let mut chunk_count = 0u32;
+        let mut total_samples = 0usize;
+        let mut rate = 0u32;
+
+        let sr = tts.synthesize_streaming(
+            "Hello, this is a streaming test. The audio should arrive in multiple chunks.",
+            |samples, sample_rate| {
+                chunk_count += 1;
+                total_samples += samples.len();
+                rate = sample_rate;
+                println!("  chunk {}: {} samples @ {}Hz", chunk_count, samples.len(), sample_rate);
+                true // continue
+            },
+        ).expect("Streaming synthesis failed");
+
+        assert!(sr > 0, "Expected non-zero sample rate from return, got {sr}");
+        assert_eq!(sr, rate, "Return sample rate should match callback sample rate");
+        assert!(total_samples > 100, "Expected audio samples, got {total_samples}");
+        assert!(chunk_count > 1, "Expected multiple streaming chunks, got {chunk_count}");
+        println!("Streaming OK: {chunk_count} chunks, {total_samples} samples @ {rate}Hz");
     }
 
     #[test]

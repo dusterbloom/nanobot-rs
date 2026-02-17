@@ -193,11 +193,13 @@ impl VoicePipeline {
             let mut sample_rate = 0u32;
 
             for sentence in &sentences {
-                let output = guard
-                    .synthesize(sentence)
+                sample_rate = guard
+                    .synthesize_streaming(sentence, |samples, rate| {
+                        sample_rate = rate;
+                        all_samples.extend_from_slice(samples);
+                        true
+                    })
                     .map_err(|e| format!("TTS failed: {e}"))?;
-                sample_rate = output.sample_rate;
-                all_samples.extend_from_slice(&output.samples);
             }
 
             Ok::<(Vec<f32>, u32), String>((all_samples, sample_rate))
