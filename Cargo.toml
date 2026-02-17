@@ -79,6 +79,9 @@ termimad = "0.30"
 syntect = "5"
 once_cell = "1"
 
+# Unicode display width (terminal column counting)
+unicode-width = "0.2"
+
 # Unix terminal control (stdin flush after voice recording)
 libc = "0.2"
 

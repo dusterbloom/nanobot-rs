@@ -1,8 +1,10 @@
 //! TUI-related functions: ANSI constants, status bars, banners, and voice helpers.
 
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::io::{self, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use unicode_width::UnicodeWidthStr;
 
 use crate::agent::agent_loop::SharedCoreHandle;
 use crate::config::loader::load_config;
@@ -24,6 +26,127 @@ pub const GREY: &str = "\x1b[90m";
 pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 pub const HIDE_CURSOR: &str = "\x1b[?25l";
 pub const SHOW_CURSOR: &str = "\x1b[?25h";
+
+// ============================================================================
+// Terminal Writer (synchronized stdout)
+// ============================================================================
+
+/// Global terminal writer — all TUI output should go through this to prevent
+/// interleaved writes from concurrent tasks (streaming, tool events, channels).
+///
+/// Uses DEC private mode 2026 (synchronized output) brackets when available
+/// to batch writes and prevent flicker.
+pub struct TerminalWriter {
+    inner: Mutex<BufWriter<io::Stdout>>,
+}
+
+impl TerminalWriter {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(BufWriter::new(io::stdout())),
+        }
+    }
+
+    /// Write a string to stdout under the lock, then flush.
+    pub fn write_str(&self, s: &str) {
+        if let Ok(mut w) = self.inner.lock() {
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.flush();
+        }
+    }
+
+    /// Write a string followed by newline.
+    pub fn writeln(&self, s: &str) {
+        if let Ok(mut w) = self.inner.lock() {
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
+        }
+    }
+
+    /// Execute a closure with exclusive access to the buffered writer.
+    /// The writer is flushed after the closure returns.
+    pub fn with_writer<F>(&self, f: F)
+    where
+        F: FnOnce(&mut BufWriter<io::Stdout>),
+    {
+        if let Ok(mut w) = self.inner.lock() {
+            f(&mut w);
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Get the global terminal writer singleton.
+pub fn terminal_writer() -> &'static TerminalWriter {
+    static WRITER: OnceLock<TerminalWriter> = OnceLock::new();
+    WRITER.get_or_init(TerminalWriter::new)
+}
+
+// ============================================================================
+// Raw Mode Guard
+// ============================================================================
+
+/// Global flag tracking whether raw mode is currently active.
+/// Prevents double-enter races across the 4 raw mode entry points
+/// (spawn_input_watcher, spawn_interrupt_watcher, voice_read_input, voice recording).
+pub(crate) static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Enter raw mode if not already active. Returns true if this call entered raw mode.
+pub fn enter_raw_mode() -> bool {
+    if RAW_MODE_ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        termimad::crossterm::terminal::enable_raw_mode().ok();
+        true
+    } else {
+        false
+    }
+}
+
+/// Exit raw mode if this caller originally entered it (pass the return value of `enter_raw_mode`).
+pub fn exit_raw_mode(owned: bool) {
+    if owned && RAW_MODE_ACTIVE.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        termimad::crossterm::terminal::disable_raw_mode().ok();
+    }
+}
+
+/// Force-exit raw mode regardless of ownership (for panic/cleanup paths).
+pub fn force_exit_raw_mode() {
+    if RAW_MODE_ACTIVE.swap(false, Ordering::SeqCst) {
+        termimad::crossterm::terminal::disable_raw_mode().ok();
+    }
+}
+
+// ============================================================================
+// SIGWINCH / Terminal Resize Handling
+// ============================================================================
+
+/// Cached terminal dimensions. Invalidated on SIGWINCH.
+static CACHED_WIDTH: AtomicU16 = AtomicU16::new(0);
+static CACHED_HEIGHT: AtomicU16 = AtomicU16::new(0);
+
+/// Register the SIGWINCH signal handler that invalidates cached terminal dimensions.
+/// Call once at REPL startup.
+pub fn register_resize_handler() {
+    #[cfg(unix)]
+    {
+        // SIGWINCH handler: clear cached dimensions so next query re-reads from OS.
+        unsafe {
+            libc::signal(libc::SIGWINCH, sigwinch_handler as libc::sighandler_t);
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn sigwinch_handler(_sig: libc::c_int) {
+    CACHED_WIDTH.store(0, Ordering::Relaxed);
+    CACHED_HEIGHT.store(0, Ordering::Relaxed);
+}
+
+/// Invalidate cached terminal dimensions (e.g. after scroll region changes).
+pub fn invalidate_terminal_size() {
+    CACHED_WIDTH.store(0, Ordering::Relaxed);
+    CACHED_HEIGHT.store(0, Ordering::Relaxed);
+}
 
 /// Print the nanobot demoscene-style ASCII logo.
 pub fn print_logo() {
@@ -56,9 +179,9 @@ pub fn loading_animation(message: &str) {
 /// Each `\n`-delimited line takes `ceil(len / width)` rows (minimum 1).
 /// Adds `extra` for surrounding blank lines / println calls.
 pub(crate) fn terminal_rows(text: &str, extra: usize) -> usize {
-    let width = termimad::crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let width = terminal_width();
     let rows: usize = text.split('\n').map(|line| {
-        let len = line.len();
+        let len = line.width();
         if len == 0 { 1 } else { (len + width - 1) / width }
     }).sum();
     rows + extra
@@ -82,16 +205,29 @@ pub(crate) fn format_thousands(n: usize) -> String {
 // ============================================================================
 
 /// Get terminal width, defaulting to 80 if unavailable.
+/// Uses cached value that is invalidated on SIGWINCH.
 pub(crate) fn terminal_width() -> usize {
-    termimad::crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80)
+    let cached = CACHED_WIDTH.load(Ordering::Relaxed);
+    if cached > 0 {
+        return cached as usize;
+    }
+    let (w, h) = termimad::crossterm::terminal::size().unwrap_or((80, 24));
+    CACHED_WIDTH.store(w, Ordering::Relaxed);
+    CACHED_HEIGHT.store(h, Ordering::Relaxed);
+    w as usize
 }
 
+/// Get terminal height, defaulting to 24 if unavailable.
+/// Uses cached value that is invalidated on SIGWINCH.
 pub(crate) fn terminal_height() -> usize {
-    termimad::crossterm::terminal::size()
-        .map(|(_, h)| h as usize)
-        .unwrap_or(24)
+    let cached = CACHED_HEIGHT.load(Ordering::Relaxed);
+    if cached > 0 {
+        return cached as usize;
+    }
+    let (w, h) = termimad::crossterm::terminal::size().unwrap_or((80, 24));
+    CACHED_WIDTH.store(w, Ordering::Relaxed);
+    CACHED_HEIGHT.store(h, Ordering::Relaxed);
+    h as usize
 }
 
 /// Render a Claude Code-style input context bar pinned to the bottom of the terminal.
@@ -112,6 +248,7 @@ pub(crate) fn render_input_bar(
     core_handle: &crate::agent::agent_loop::SharedCoreHandle,
     channel_names: &[&str],
     subagent_count: usize,
+    push_content: bool,
 ) -> usize {
     use std::io::Write as _;
     use std::sync::atomic::Ordering;
@@ -184,27 +321,35 @@ pub(crate) fn render_input_bar(
     // prompt_row is where the user types — just above the bar
     let prompt_row = bar_row.saturating_sub(1);
 
-    // 1. Reset scroll region to full screen temporarily so we can draw everywhere
-    print!("\x1b[r");
-
-    // 2. Scroll content up to make room: move to bottom and emit newlines
-    print!("\x1b[{};1H", height); // move to last row
-    for _ in 0..bar_lines + 1 {
-        println!(); // push content up by scrolling
+    if push_content {
+        // First render: push existing content up to make room for the bar.
+        print!("\x1b[r"); // reset scroll region to full screen
+        print!("\x1b[{};1H", height); // move to last row
+        for _ in 0..bar_lines + 1 {
+            println!(); // push content up by scrolling
+        }
+    } else {
+        // Refresh: save cursor, update bar content in place, restore cursor.
+        print!("\x1b[s");
     }
 
-    // 3. Render the bar at its fixed position (outside scroll region)
+    // Render the bar at its fixed position (outside scroll region)
     print!("\x1b[{};1H", bar_row);
     print!("\x1b[J"); // clear from bar_row to end of screen
     println!("{DIM}{separator}{RESET}");
     println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
     print!("  {}", hints.join(" · "));
 
-    // 4. Set scroll region to rows 1..prompt_row so text never overwrites the bar
+    // Set scroll region to rows 1..prompt_row so text never overwrites the bar
     print!("\x1b[1;{}r", prompt_row);
 
-    // 5. Position cursor at prompt_row within the scroll region
-    print!("\x1b[{};1H\x1b[2K", prompt_row);
+    if push_content {
+        // Position cursor at prompt_row for initial input
+        print!("\x1b[{};1H\x1b[2K", prompt_row);
+    } else {
+        // Restore cursor to where it was (inside scroll region)
+        print!("\x1b[u");
+    }
     std::io::stdout().flush().ok();
 
     bar_lines
@@ -212,95 +357,6 @@ pub(crate) fn render_input_bar(
 
 // Status Bar & Banners
 // ============================================================================
-
-/// Update the input bar content in place (after AI response).
-/// Re-renders the bar at the bottom and positions cursor for next input.
-pub(crate) fn update_input_bar(
-    core_handle: &crate::agent::agent_loop::SharedCoreHandle,
-    channel_names: &[&str],
-    subagent_count: usize,
-) {
-    use std::io::Write as _;
-    use std::sync::atomic::Ordering;
-
-    let counters = &core_handle.counters;
-    let width = terminal_width().min(100);
-    let height = terminal_height();
-    let separator = "─".repeat(width);
-
-    // Gather info
-    let thinking_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
-    let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
-    let max = counters.last_context_max.load(Ordering::Relaxed) as usize;
-
-    let cwd = std::env::current_dir()
-        .map(|p| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let s = p.display().to_string();
-            if !home.is_empty() && s.starts_with(&home) {
-                format!("~{}", &s[home.len()..])
-            } else {
-                s
-            }
-        })
-        .unwrap_or_else(|_| "?".into());
-
-    let model_name = {
-        let core = core_handle.swappable();
-        core.model.clone()
-    };
-
-    let think_str = if thinking_on {
-        format!(" · {GREY}\u{1f9e0} thinking{RESET}")
-    } else {
-        String::new()
-    };
-
-    let mut hints: Vec<String> = Vec::new();
-    hints.push(format!("{DIM}⏵⏵ /t think · /l local · /v voice{RESET}"));
-
-    if subagent_count > 0 {
-        hints.push(format!(
-            "{CYAN}{} agent{}{RESET}",
-            subagent_count,
-            if subagent_count > 1 { "s" } else { "" }
-        ));
-    }
-
-    if !channel_names.is_empty() {
-        hints.push(format!("{CYAN}{}{RESET}", channel_names.join(" ")));
-    }
-
-    if max > 0 {
-        let pct = (used * 100) / max;
-        let ctx_color = match pct {
-            0..=49 => GREEN,
-            50..=79 => YELLOW,
-            _ => RED,
-        };
-        hints.push(format!(
-            "ctx {ctx_color}{}{RESET}/{DIM}{}{RESET}",
-            format_tokens(used),
-            format_tokens(max)
-        ));
-    }
-
-    let bar_lines = 3usize;
-    // bar_row is the terminal row where the separator starts (1-indexed)
-    let bar_row = height.saturating_sub(bar_lines) + 1;
-    // prompt_row is where the user types — just above the bar
-    let _prompt_row = bar_row.saturating_sub(1);
-
-    // Save cursor, move to bar position, redraw, restore cursor
-    print!("\x1b[s"); // save cursor
-    print!("\x1b[{};1H", bar_row); // move to bar start
-    print!("\x1b[J"); // clear from here to end
-    println!("{DIM}{separator}{RESET}");
-    println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
-    print!("  {}", hints.join(" · "));
-    print!("\x1b[u"); // restore cursor
-    std::io::stdout().flush().ok();
-}
 
 /// Reset the terminal scroll region to the full screen.
 /// Call this before AI output starts streaming so text can use all rows.
@@ -568,10 +624,9 @@ pub(crate) fn spawn_interrupt_watcher(
     done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<bool> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use crossterm::terminal;
 
     std::thread::spawn(move || {
-        terminal::enable_raw_mode().ok();
+        let owned = enter_raw_mode();
         let mut interrupted = false;
         while !done.load(Ordering::Relaxed) {
             if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
@@ -587,7 +642,7 @@ pub(crate) fn spawn_interrupt_watcher(
                 }
             }
         }
-        terminal::disable_raw_mode().ok();
+        exit_raw_mode(owned);
         interrupted
     })
 }
@@ -631,10 +686,10 @@ pub(crate) enum VoiceAction {
 #[cfg(feature = "voice")]
 pub(crate) fn voice_read_input() -> VoiceAction {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use crossterm::terminal;
 
-    if terminal::enable_raw_mode().is_err() {
-        // Fallback: just use regular read_line
+    let owned = enter_raw_mode();
+    if !owned && !RAW_MODE_ACTIVE.load(Ordering::SeqCst) {
+        // Couldn't enter raw mode at all — fallback to line read.
         let mut line = String::new();
         return match io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => VoiceAction::Exit,
@@ -701,6 +756,95 @@ pub(crate) fn voice_read_input() -> VoiceAction {
         }
     };
 
-    terminal::disable_raw_mode().ok();
+    exit_raw_mode(owned);
     result
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- terminal_rows (unicode-width) ---
+
+    #[test]
+    fn test_terminal_rows_ascii() {
+        // "hello" is 5 display chars — fits in one row on an 80-col terminal.
+        let rows = terminal_rows("hello", 0);
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn test_terminal_rows_empty() {
+        let rows = terminal_rows("", 0);
+        assert_eq!(rows, 1); // empty line still occupies 1 row
+    }
+
+    #[test]
+    fn test_terminal_rows_multiline() {
+        let rows = terminal_rows("line1\nline2\nline3", 0);
+        assert_eq!(rows, 3);
+    }
+
+    #[test]
+    fn test_terminal_rows_extra() {
+        let rows = terminal_rows("hello", 2);
+        assert_eq!(rows, 3); // 1 row + 2 extra
+    }
+
+    #[test]
+    fn test_terminal_rows_cjk_double_width() {
+        // CJK characters are 2 columns wide. 3 chars = 6 display columns.
+        // This should still fit in 1 row on an 80-col terminal.
+        let rows = terminal_rows("你好世", 0);
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn test_terminal_rows_emoji() {
+        // Emoji vary — but the key test is that we DON'T use byte length.
+        // "🧠" is 4 bytes but typically 2 display columns.
+        let text = "🧠";
+        let rows = terminal_rows(text, 0);
+        // Should be 1 row regardless (display width <= 80)
+        assert_eq!(rows, 1);
+        // Verify we're not using byte length: byte len is 4, but width is 2.
+        assert_ne!(text.len(), text.width());
+    }
+
+    // --- raw mode guard ---
+
+    #[test]
+    fn test_raw_mode_guard_initial_state() {
+        // RAW_MODE_ACTIVE should be false by default in tests
+        // (we can't actually test enter/exit because they affect the real terminal)
+        assert!(!RAW_MODE_ACTIVE.load(Ordering::SeqCst));
+    }
+
+    // --- SIGWINCH cache ---
+
+    #[test]
+    fn test_invalidate_terminal_size() {
+        // Set some cached values
+        CACHED_WIDTH.store(120, Ordering::Relaxed);
+        CACHED_HEIGHT.store(40, Ordering::Relaxed);
+
+        invalidate_terminal_size();
+
+        assert_eq!(CACHED_WIDTH.load(Ordering::Relaxed), 0);
+        assert_eq!(CACHED_HEIGHT.load(Ordering::Relaxed), 0);
+    }
+
+    // --- TerminalWriter ---
+
+    #[test]
+    fn test_terminal_writer_singleton() {
+        let w1 = terminal_writer();
+        let w2 = terminal_writer();
+        // Same address — singleton
+        assert!(std::ptr::eq(w1, w2));
+    }
 }

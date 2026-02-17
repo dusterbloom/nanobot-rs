@@ -22,6 +22,7 @@ mod voice;
 #[cfg(feature = "voice")]
 mod voice_pipeline;
 
+use std::io::IsTerminal;
 use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
@@ -280,9 +281,15 @@ enum CronAction {
 }
 
 fn main() {
-    // Safety net: kill orphaned llama-server on panic so it doesn't hold VRAM
+    // Safety net: restore terminal state and kill orphaned llama-server on panic
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Restore terminal before printing panic message
+        tui::force_exit_raw_mode();
+        print!("\x1b[r");  // reset scroll region
+        print!("\x1b[?25h"); // show cursor
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
         let _ = std::process::Command::new("pkill")
             .args(["-f", "llama-server"])
             .stdout(std::process::Stdio::null())
@@ -293,13 +300,43 @@ fn main() {
 
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("warn,ort=off,pocket_tts=off,html5ever=error")
-            }),
-        )
-        .init();
+    // Detect interactive REPL mode: `nanobot agent` with no -m message and a TTY.
+    let is_interactive_repl = matches!(&cli.command, Commands::Agent { message: None, .. })
+        && std::io::stdout().is_terminal();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("warn,ort=off,pocket_tts=off,html5ever=error")
+    });
+
+    if is_interactive_repl {
+        // Redirect tracing to a log file to prevent WARN logs from interleaving
+        // with streaming output on stderr. Logs are still available in the file.
+        let log_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nanobot")
+            .join("nanobot.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+        if let Some(file) = log_file {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        } else {
+            // Fallback: just write to stderr if we can't open the log file.
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+        }
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     match cli.command {
         Commands::Onboard => cli::cmd_onboard(),

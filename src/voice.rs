@@ -362,7 +362,8 @@ impl VoiceSession {
 
         // Wait for stop keypress
         tokio::task::block_in_place(|| {
-            if terminal::enable_raw_mode().is_ok() {
+            let owned = crate::tui::enter_raw_mode();
+            if owned || crate::tui::RAW_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
                 loop {
                     if let Ok(Event::Key(key)) = event::read() {
                         let is_stop = key.code == KeyCode::Enter
@@ -375,7 +376,7 @@ impl VoiceSession {
                         }
                     }
                 }
-                terminal::disable_raw_mode().ok();
+                crate::tui::exit_raw_mode(owned);
             } else {
                 // Fallback: wait for Enter
                 let mut line = String::new();

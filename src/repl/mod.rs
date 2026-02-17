@@ -158,7 +158,7 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 
 /// Build the REPL prompt string based on current mode.
 pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
-    let think_prefix = if thinking_on { "\x1b[90m\u{1f9e0}\x1b[0m" } else { "" };
+    let think_prefix = if thinking_on { "\x1b[2m\u{1f9e0}\x1b[0m" } else { "" };
     if voice_on {
         format!("{}{}{}~>{} ", think_prefix, crate::tui::BOLD, crate::tui::MAGENTA, crate::tui::RESET)
     } else if is_local {
@@ -222,7 +222,7 @@ pub(crate) fn spawn_input_watcher(
     use termimad::crossterm::terminal;
 
     std::thread::spawn(move || {
-        terminal::enable_raw_mode().ok();
+        let owned = tui::enter_raw_mode();
         let mut last_esc: Option<Instant> = None;
 
         while !done.load(Ordering::Relaxed) {
@@ -261,7 +261,7 @@ pub(crate) fn spawn_input_watcher(
                         && !key.modifiers.contains(KeyModifiers::ALT)
                     {
                         // Exit raw mode so the user gets normal line editing.
-                        terminal::disable_raw_mode().ok();
+                        tui::exit_raw_mode(owned);
                         print!("\n\x1b[33minject>\x1b[0m ");
                         io::stdout().flush().ok();
 
@@ -274,7 +274,8 @@ pub(crate) fn spawn_input_watcher(
                         }
 
                         // Re-enter raw mode for continued watching.
-                        terminal::enable_raw_mode().ok();
+                        // Note: we don't update `owned` here because we already own the mode.
+                        tui::enter_raw_mode();
                         continue;
                     }
 
@@ -284,7 +285,7 @@ pub(crate) fn spawn_input_watcher(
             }
         }
 
-        terminal::disable_raw_mode().ok();
+        tui::exit_raw_mode(owned);
     })
 }
 
@@ -642,27 +643,19 @@ async fn stream_and_render_inner(
     watcher_done.store(true, Ordering::Relaxed);
     watcher.join().ok();
     // Defensive: ensure raw mode is off even if watcher thread panicked.
-    termimad::crossterm::terminal::disable_raw_mode().ok();
+    tui::force_exit_raw_mode();
 
     let cancelled = cancel_token.is_cancelled();
-    let (tool_lines, tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
+    let (_tool_lines, _tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));
 
-    // Erase tool event lines + separator/trailing newlines, then re-render.
-    // The progress line was compact (single in-place line, already cleared by
-    // print_task), so no raw text pollutes scrollback.
+    // Tool events were already rendered inline during streaming.
+    // Only erase the trailing blank line from the print task, then render the
+    // final response text with markdown/provenance formatting.
     if !response.is_empty() && std::io::stdout().is_terminal() {
         use std::io::Write as _;
-        let total_lines = tool_lines + 2; // +1 separator println, +1 trailing println
-        print!("\r\x1b[{}A\x1b[J", total_lines); // \r ensures column 0
+        // Erase the trailing \r\n from the print task (1 line).
+        print!("\r\x1b[1A\x1b[J");
         std::io::stdout().flush().ok();
-
-        // Re-render tool events first so the user can see what the LLM actually did.
-        if !tool_event_lines.is_empty() {
-            for line in &tool_event_lines {
-                println!("{}", line);
-            }
-            println!();
-        }
 
         // Show redaction warning if strict mode removed fabricated claims.
         let redaction_count = response.matches("[unverified claim removed]").count();
@@ -673,7 +666,7 @@ async fn stream_and_render_inner(
             );
         }
 
-        // Re-render with provenance claim verification if enabled.
+        // Render with provenance claim verification if enabled.
         if verify_claims {
             let audit = AuditLog::new(&workspace, session_id);
             let entries = audit.get_entries();
@@ -956,6 +949,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             index_sessions_background();
         } else {
             // Interactive REPL mode.
+            tui::register_resize_handler();
             tui::print_startup_splash(&local_port);
 
             let mut srv = ServerState::new(local_port.clone());
@@ -1032,6 +1026,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 ctx.restart_watchdog();
             }
 
+            // First bar render pushes content up to make room; all subsequent
+            // renders refresh in place so we never get a duplicate bar.
+            let mut bar_needs_push = true;
+
             loop {
                 // Drain any pending display messages from background channels.
                 ctx.drain_display();
@@ -1047,10 +1045,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 let ch_names: Vec<&str> = ctx.active_channels.iter()
                     .map(|c| short_channel_name(&c.name))
                     .collect();
-                let bar_lines = tui::render_input_bar(
-                    &ctx.core_handle, &ch_names, sa_count,
+                tui::render_input_bar(
+                    &ctx.core_handle, &ch_names, sa_count, bar_needs_push,
                 );
-                let _ = bar_lines; // bar is pinned to bottom; cursor already restored
+                bar_needs_push = false;
 
                 // === GET INPUT ===
                 let input_text: String;
@@ -1194,10 +1192,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 ctx.drain_display();
                 println!();
 
-                // Update the input bar in place (keeps it pinned at bottom)
+                // Refresh the input bar in place (no scroll push — just update content).
                 let ch_names: Vec<&str> = ctx.active_channels.iter().map(|c| c.name.as_str()).collect();
                 let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
-                tui::update_input_bar(&ctx.core_handle, &ch_names, sa_count);
+                tui::render_input_bar(&ctx.core_handle, &ch_names, sa_count, false);
 
                 #[cfg(feature = "voice")]
                 if let Some(ref mut vs) = ctx.voice_session {
@@ -1224,6 +1222,17 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             #[cfg(feature = "voice")]
             if let Some(vs) = ctx.voice_session.take() {
                 vs.shutdown();
+            }
+
+            // Reset terminal: clear the pinned input bar and restore full scroll region
+            // so the shell prompt returns to a clean state.
+            {
+                use std::io::Write as _;
+                print!("\x1b[r");      // reset scroll region to full terminal
+                let h = tui::terminal_height();
+                print!("\x1b[{};1H", h); // move to last row
+                print!("\x1b[J");      // clear from cursor to end of screen
+                std::io::stdout().flush().ok();
             }
 
             // Cleanup: stop heartbeat, save readline history, kill servers
