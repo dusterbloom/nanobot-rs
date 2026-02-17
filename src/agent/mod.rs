@@ -7,6 +7,7 @@ pub mod circuit_breaker;
 pub mod compaction;
 pub mod confidence_gate;
 pub mod context;
+pub mod context_gate;
 pub mod context_store;
 pub mod eval;
 pub mod knowledge_store;

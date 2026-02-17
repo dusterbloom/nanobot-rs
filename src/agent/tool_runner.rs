@@ -843,24 +843,32 @@ pub async fn run_tool_loop(
 
 /// Format tool run results for injection into the main LLM context.
 ///
-/// `max_result_chars` controls how much of each tool result to include.
-/// Use a small value (e.g. 200) for slim/RLM mode where the summary
-/// carries the meaning, or a large value for full-detail mode.
-pub fn format_results_for_context(result: &ToolRunResult, max_result_chars: usize) -> String {
+/// If a `ContentGate` is provided, each result goes through the gate for
+/// budget-aware sizing. Otherwise falls back to `max_result_chars` truncation.
+pub fn format_results_for_context(
+    result: &ToolRunResult,
+    max_result_chars: usize,
+    mut gate: Option<&mut crate::agent::context_gate::ContentGate>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     for (_, tool_name, data) in &result.tool_results {
-        let truncated = if data.len() > max_result_chars {
-            let end = crate::utils::helpers::floor_char_boundary(data, max_result_chars);
-            format!(
-                "{}… ({} chars total)",
-                &data[..end],
-                data.len()
-            )
+        let sized = if let Some(gate) = gate.as_mut() {
+            gate.admit_simple(data).into_text()
         } else {
-            data.clone()
+            // Legacy fallback: hard char truncation.
+            if data.len() > max_result_chars {
+                let end = crate::utils::helpers::floor_char_boundary(data, max_result_chars);
+                format!(
+                    "{}… ({} chars total)",
+                    &data[..end],
+                    data.len()
+                )
+            } else {
+                data.clone()
+            }
         };
-        parts.push(format!("[{}]: {}", tool_name, truncated));
+        parts.push(format!("[{}]: {}", tool_name, sized));
     }
 
     if let Some(ref summary) = result.summary {
@@ -1183,7 +1191,7 @@ mod tests {
             error: None,
         };
 
-        let formatted = format_results_for_context(&result, 2000);
+        let formatted = format_results_for_context(&result, 2000, None);
         assert!(formatted.contains("[read_file]: file contents here"));
         assert!(formatted.contains("[exec]: command output"));
         assert!(formatted.contains("Summary: Read a file and ran a command."));
@@ -1199,7 +1207,7 @@ mod tests {
             error: None,
         };
 
-        let formatted = format_results_for_context(&result, 2000);
+        let formatted = format_results_for_context(&result, 2000, None);
         assert!(formatted.contains("chars total"));
         assert!(formatted.len() < 3000);
 
@@ -1217,12 +1225,12 @@ mod tests {
         };
 
         // Slim mode: 200 char preview.
-        let slim = format_results_for_context(&result, 200);
+        let slim = format_results_for_context(&result, 200, None);
         assert!(slim.contains("500 chars total"));
         assert!(slim.len() < 400);
 
         // Full mode: 2000 char limit — 500 chars fits.
-        let full = format_results_for_context(&result, 2000);
+        let full = format_results_for_context(&result, 2000, None);
         assert!(!full.contains("chars total"));
         assert!(full.contains(&"x".repeat(500)));
     }

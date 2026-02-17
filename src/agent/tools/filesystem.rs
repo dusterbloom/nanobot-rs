@@ -21,7 +21,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file at the given path."
+        "Read the contents of a file at the given path. Optionally read a specific line range."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -31,6 +31,10 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "The file path to read"
+                },
+                "lines": {
+                    "type": "string",
+                    "description": "Optional line range to read, e.g. \"10:50\" (1-indexed, inclusive). Omit to read the entire file."
                 }
             },
             "required": ["path"]
@@ -52,16 +56,23 @@ impl Tool for ReadFileTool {
             return format!("Error: Not a file: {}", path);
         }
 
-        match tokio::fs::read_to_string(&file_path).await {
-            Ok(content) => content,
+        let content = match tokio::fs::read_to_string(&file_path).await {
+            Ok(c) => c,
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                return if e.kind() == std::io::ErrorKind::PermissionDenied {
                     format!("Error: Permission denied: {}", path)
                 } else {
                     format!("Error reading file: {}", e)
                 }
             }
+        };
+
+        // If lines parameter is provided, extract the range.
+        if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
+            return extract_line_range(&content, lines_param, path);
         }
+
+        content
     }
 }
 
@@ -322,6 +333,52 @@ impl Tool for ListDirTool {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Extract a line range from content.
+///
+/// `range` format: "start:end" (1-indexed, inclusive) or "start:" (to end).
+fn extract_line_range(content: &str, range: &str, path: &str) -> String {
+    let parts: Vec<&str> = range.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return format!("Error: Invalid lines format '{}'. Use 'start:end' (e.g. '10:50').", range);
+    }
+
+    let start: usize = match parts[0].trim().parse() {
+        Ok(n) if n >= 1 => n,
+        _ => return format!("Error: Invalid start line '{}'. Must be a positive integer.", parts[0]),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    let end: usize = if parts[1].trim().is_empty() {
+        total
+    } else {
+        match parts[1].trim().parse::<usize>() {
+            Ok(n) => n.min(total),
+            _ => return format!("Error: Invalid end line '{}'. Must be a positive integer.", parts[1]),
+        }
+    };
+
+    if start > total {
+        return format!("Error: Start line {} exceeds file length ({} lines).", start, total);
+    }
+    if start > end {
+        return format!("Error: Start line {} is after end line {}.", start, end);
+    }
+
+    let selected: Vec<String> = lines[start - 1..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>4}: {}", start + i, line))
+        .collect();
+
+    format!(
+        "# {} (lines {}-{} of {})\n{}",
+        path, start, end, total,
+        selected.join("\n")
+    )
+}
+
 /// Expand a leading `~` to the user's home directory.
 fn expand_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -430,6 +487,70 @@ mod tests {
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["path"].is_object());
+        assert!(params["properties"]["lines"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_line_range() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("lines.txt");
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool;
+        let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
+        params.insert("lines".to_string(), serde_json::json!("5:10"));
+        let result = tool.execute(params).await;
+
+        assert!(result.contains("lines 5-10 of 20"));
+        assert!(result.contains("line 5"));
+        assert!(result.contains("line 10"));
+        assert!(!result.contains("line 4\n"));
+        assert!(!result.contains("line 11"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_lines_open_end() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("open.txt");
+        let content = (1..=5)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool;
+        let mut params = make_params(&[("path", file_path.to_str().unwrap())]);
+        params.insert("lines".to_string(), serde_json::json!("3:"));
+        let result = tool.execute(params).await;
+
+        assert!(result.contains("lines 3-5 of 5"));
+        assert!(result.contains("line 3"));
+        assert!(result.contains("line 5"));
+    }
+
+    #[test]
+    fn test_extract_line_range_basic() {
+        let content = "alpha\nbeta\ngamma\ndelta\nepsilon";
+        let result = extract_line_range(content, "2:4", "test.txt");
+        assert!(result.contains("lines 2-4 of 5"));
+        assert!(result.contains("beta"));
+        assert!(result.contains("delta"));
+    }
+
+    #[test]
+    fn test_extract_line_range_invalid_format() {
+        let result = extract_line_range("content", "bad", "test.txt");
+        assert!(result.contains("Error"));
+    }
+
+    #[test]
+    fn test_extract_line_range_out_of_bounds() {
+        let result = extract_line_range("one\ntwo", "5:10", "test.txt");
+        assert!(result.contains("exceeds file length"));
     }
 
     // -----------------------------------------------------------------------

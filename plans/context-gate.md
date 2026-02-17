@@ -1,6 +1,6 @@
 # Context Gate: Intelligent Content Management for LLM Agents
 
-**Status:** Proposed
+**Status:** Implemented (core)
 **Date:** 2026-02-17
 **Author:** Peppi + Nanobot
 

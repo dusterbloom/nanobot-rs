@@ -784,6 +784,17 @@ impl AgentLoopShared {
             Arc::new(tokio::sync::Mutex::new(None));
         let compaction_in_flight = Arc::new(AtomicBool::new(false));
 
+        // Context gate: budget-aware content sizing for this turn.
+        let cache_dir = crate::utils::helpers::get_data_path().join("cache").join("tool_outputs");
+        let mut content_gate = crate::agent::context_gate::ContentGate::new(
+            core.token_budget.max_context(),
+            0.20,
+            cache_dir,
+        );
+        // Pre-consume the tokens already used by system prompt + history.
+        let initial_tokens = TokenBudget::estimate_tokens(&messages);
+        content_gate.budget.consume(initial_tokens);
+
         // Response boundary: after exec/write_file, force a text response.
         let mut force_response = false;
 
@@ -1320,12 +1331,7 @@ impl AgentLoopShared {
                         );
 
                         // Add tool results from the runner to the main context.
-                        // In slim mode, truncate results to save context budget —
-                        // the runner's summary carries the meaning.
-                        // Verbatim mode: never slim, the agent wants full output.
-                        let slim = !verbatim
-                            && core.tool_delegation_config.enabled
-                            && core.tool_delegation_config.slim_results;
+                        // ContentGate handles budget-aware sizing.
                         let preview_max = core.tool_delegation_config.max_result_preview_chars;
 
                         for tc in &response.tool_calls {
@@ -1337,15 +1343,7 @@ impl AgentLoopShared {
                                 .map(|(_, _, data)| data.as_str())
                                 .unwrap_or("(no result)");
 
-                            let injected = if slim && full_data.len() > preview_max {
-                                format!(
-                                    "{}… ({} chars total)",
-                                    &full_data[..preview_max],
-                                    full_data.len()
-                                )
-                            } else {
-                                full_data.to_string()
-                            };
+                            let injected = content_gate.admit_simple(full_data).into_text();
 
                             if core.provenance_config.enabled {
                                 ContextBuilder::add_tool_result_immutable(
@@ -1374,6 +1372,7 @@ impl AgentLoopShared {
                                 let extra = tool_runner::format_results_for_context(
                                     &run_result,
                                     preview_max,
+                                    None, // TODO: wire ContentGate here
                                 );
                                 format!(
                                     "[Tool runner executed {} additional calls]\n{}",
@@ -1562,20 +1561,8 @@ impl AgentLoopShared {
                         result.ok,
                         duration_ms
                     );
-                    // Cap tool result size to avoid blowing context (UTF-8 safe).
-                    let data = if result.data.len() > core.max_tool_result_chars {
-                        let safe_end = result.data.char_indices()
-                            .take_while(|(i, _)| *i < core.max_tool_result_chars)
-                            .last()
-                            .map(|(i, c)| i + c.len_utf8())
-                            .unwrap_or(0);
-                        format!(
-                            "{}\n\n[truncated: {} total chars, showing first {}]",
-                            &result.data[..safe_end], result.data.len(), safe_end
-                        )
-                    } else {
-                        result.data.clone()
-                    };
+                    // Gate tool result through context budget.
+                    let data = content_gate.admit_simple(&result.data).into_text();
                     if core.provenance_config.enabled {
                         ContextBuilder::add_tool_result_immutable(&mut messages, &tc.id, &tc.name, &data);
                     } else {

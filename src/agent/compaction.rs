@@ -41,6 +41,32 @@ Rules:
 ## Errors
 [What went wrong?]";
 
+/// Briefing prompt for structural content summaries (used by ContentGate).
+///
+/// Unlike SUMMARIZE_PROMPT (conversation facts), this produces a navigable
+/// structural map of a single piece of content (e.g., a large file or tool output).
+pub const BRIEFING_PROMPT: &str = "\
+Create a structural map of this content for an AI agent that needs to navigate it.
+
+Rules:
+1. Show the structure as line ranges with brief descriptions
+2. Include key function/struct/class signatures verbatim
+3. Note important values, paths, and identifiers exactly
+4. End with a navigation hint: 'To inspect a section, use: read_file with lines parameter'
+5. Be concise — this is a table of contents, not a summary
+6. ONLY output the structural map, nothing else
+
+Format:
+# [filename or content type] (N lines, M bytes)
+
+## Structure
+- Lines X-Y: [description]
+  - [key item] at line Z
+- Lines A-B: [description]
+
+## Key Definitions
+- [verbatim signatures or important values]";
+
 /// Prompt for merging already-compressed chunk summaries.
 const MERGE_SUMMARIES_PROMPT: &str = "\
 Merge these context summaries into one using the same template.
@@ -345,6 +371,66 @@ impl ContextCompactor {
         }
 
         Ok(summaries.remove(0))
+    }
+
+    /// Produce a structural briefing of content (not a conversation summary).
+    ///
+    /// Used by ContentGate when content doesn't fit the context budget.
+    /// Returns a structural map: line ranges, key definitions, navigation hints.
+    pub async fn summarize_for_briefing(&self, content: &str, target_tokens: usize) -> Result<String> {
+        // Truncate input to fit the compaction model's context, keeping head + tail.
+        let input_budget = self.input_budget();
+        let input = if TokenBudget::estimate_str_tokens(content) > input_budget {
+            let char_budget = input_budget * 4; // ~4 chars per token
+            let half = char_budget / 2;
+            let head: String = content.chars().take(half).collect();
+            let tail: String = content.chars().rev().take(half).collect::<String>().chars().rev().collect();
+            let total_lines = content.lines().count();
+            format!(
+                "{}\n\n[... {} lines omitted ...]\n\n{}",
+                head, total_lines.saturating_sub(content[..head.len()].lines().count() + content[content.len()-tail.len()..].lines().count()), tail
+            )
+        } else {
+            content.to_string()
+        };
+
+        // Cap response tokens to target_tokens (clamped to summary_max_tokens).
+        let max_response = (target_tokens as u32).min(self.summary_max_tokens);
+
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": BRIEFING_PROMPT
+            }),
+            json!({
+                "role": "user",
+                "content": input
+            }),
+        ];
+
+        let response = self
+            .provider
+            .chat(
+                &messages,
+                None,
+                Some(&self.model),
+                max_response,
+                0.2, // very low temperature for structural output
+                None,
+            )
+            .await?;
+
+        if response.finish_reason == "error" {
+            anyhow::bail!("Briefing generation failed: {}",
+                response.content.as_deref().unwrap_or("unknown error"));
+        }
+
+        let text = response
+            .content
+            .ok_or_else(|| anyhow::anyhow!("Briefing returned no content"))?;
+
+        let text = strip_thinking_tags(&text);
+        Ok(text)
     }
 
     async fn summarize_text(&self, input: &str, prompt: &str) -> Result<String> {
