@@ -391,6 +391,8 @@ struct AgentLoopShared {
     cron_service: Option<Arc<CronService>>,
     email_config: Option<EmailConfig>,
     repl_display_tx: Option<UnboundedSender<String>>,
+    /// Cached memory bulletin for system prompt injection (zero-cost reads).
+    bulletin_cache: Arc<arc_swap::ArcSwap<String>>,
 }
 
 impl AgentLoopShared {
@@ -738,6 +740,31 @@ impl AgentLoopShared {
             }
         }
 
+        // Auto-inject background task status into system prompt so the agent
+        // is naturally aware of running/completed subagents without explicit tool calls.
+        {
+            let running = self.subagents.list_running().await;
+            let recent = crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
+            let status = crate::agent::subagent::format_status_block(&running, &recent);
+            if !status.is_empty() {
+                if let Some(sys) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+                    messages[0]["content"] = Value::String(format!("{}{}", sys, status));
+                }
+            }
+        }
+
+        // Inject memory bulletin if available (zero-cost Arc load).
+        {
+            let bulletin = self.bulletin_cache.load_full();
+            if !bulletin.is_empty() {
+                if let Some(sys) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+                    messages[0]["content"] = Value::String(format!(
+                        "{}\n\n## Memory Briefing\n\n{}", sys, &*bulletin
+                    ));
+                }
+            }
+        }
+
         // Tag the current user message (last in the array) with turn number
         // for age-based eviction in trim_to_fit.
         if let Some(last) = messages.last_mut() {
@@ -957,32 +984,50 @@ impl AgentLoopShared {
                 let mut streamed_response = None;
                 let mut in_thinking = false;
                 let suppress_thinking = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
-                while let Some(chunk) = stream.rx.recv().await {
-                    match chunk {
-                        StreamChunk::ThinkingDelta(delta) => {
-                            if suppress_thinking {
-                                // Skip thinking tokens entirely (voice mode / /nothink)
-                                continue;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = async {
+                            if let Some(ref token) = cancellation_token {
+                                token.cancelled().await;
+                            } else {
+                                std::future::pending::<()>().await;
                             }
-                            // Render thinking tokens as dimmed text
-                            if !in_thinking {
-                                in_thinking = true;
-                                let _ = delta_tx.send("\x1b[90m🧠 \x1b[2m".to_string());
-                            }
-                            let _ = delta_tx.send(delta);
+                        } => {
+                            // Cancelled — drop stream to signal provider task.
+                            drop(stream);
+                            break;
                         }
-                        StreamChunk::TextDelta(delta) => {
-                            if in_thinking {
-                                in_thinking = false;
-                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                        chunk = stream.rx.recv() => {
+                            match chunk {
+                                Some(StreamChunk::ThinkingDelta(delta)) => {
+                                    if suppress_thinking {
+                                        // Skip thinking tokens entirely (voice mode / /nothink)
+                                        continue;
+                                    }
+                                    // Render thinking tokens as dimmed text
+                                    if !in_thinking {
+                                        in_thinking = true;
+                                        let _ = delta_tx.send("\x1b[90m🧠 \x1b[2m".to_string());
+                                    }
+                                    let _ = delta_tx.send(delta);
+                                }
+                                Some(StreamChunk::TextDelta(delta)) => {
+                                    if in_thinking {
+                                        in_thinking = false;
+                                        let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                                    }
+                                    let _ = delta_tx.send(delta);
+                                }
+                                Some(StreamChunk::Done(resp)) => {
+                                    if in_thinking {
+                                        let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                                    }
+                                    streamed_response = Some(resp);
+                                    break;
+                                }
+                                None => break,
                             }
-                            let _ = delta_tx.send(delta);
-                        }
-                        StreamChunk::Done(resp) => {
-                            if in_thinking {
-                                let _ = delta_tx.send("\x1b[0m\n\n".to_string());
-                            }
-                            streamed_response = Some(resp);
                         }
                     }
                 }
@@ -990,6 +1035,11 @@ impl AgentLoopShared {
                 match streamed_response {
                     Some(r) => r,
                     None => {
+                        // Stream ended without Done — either cancelled or genuine error.
+                        if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                            // Cancelled mid-stream — exit cleanly.
+                            break;
+                        }
                         error!("LLM stream ended without Done");
                         final_content = "I encountered a streaming error.".to_string();
                         break;
@@ -1833,6 +1883,16 @@ impl AgentLoop {
         }
         let subagents = Arc::new(subagent_mgr);
 
+        // Load persisted bulletin from disk (warm start).
+        let bulletin_cache = {
+            let core = core_handle.swappable();
+            let cache = crate::agent::bulletin::BulletinCache::new();
+            if let Some(persisted) = crate::agent::bulletin::load_persisted_bulletin(&core.workspace) {
+                cache.update(persisted);
+            }
+            cache.handle()
+        };
+
         let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
@@ -1841,6 +1901,7 @@ impl AgentLoop {
             cron_service,
             email_config,
             repl_display_tx,
+            bulletin_cache,
         });
 
         Self {
@@ -1850,6 +1911,38 @@ impl AgentLoop {
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
         }
+    }
+
+    /// Spawn a periodic bulletin refresh task (compaction model, when idle).
+    fn spawn_bulletin_refresh(shared: &Arc<AgentLoopShared>, running: &Arc<AtomicBool>) {
+        let core = shared.core_handle.swappable();
+        if !core.memory_enabled {
+            return;
+        }
+        let provider = core.memory_provider.clone();
+        let model = core.memory_model.clone();
+        let workspace = core.workspace.clone();
+        let cache = shared.bulletin_cache.clone();
+        let running = running.clone();
+
+        tokio::spawn(async move {
+            // Initial delay: let the system settle before first bulletin.
+            tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+
+            while running.load(Ordering::Relaxed) {
+                debug!("Bulletin: refreshing...");
+                if let Err(e) = crate::agent::bulletin::refresh_bulletin(
+                    provider.as_ref(), &model, &workspace, &cache,
+                ).await {
+                    warn!("Bulletin refresh failed: {}", e);
+                }
+                // Sleep until next refresh.
+                tokio::time::sleep(Duration::from_secs(
+                    crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S,
+                )).await;
+            }
+        });
+        info!("Bulletin refresh task spawned (every {}min)", crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S / 60);
     }
 
     /// Spawn a background reflection task if observations exceed threshold.
@@ -1890,6 +1983,9 @@ impl AgentLoop {
         // Spawn background reflection if observations have accumulated.
         Self::spawn_background_reflection(&self.shared);
 
+        // Spawn periodic bulletin refresh (compaction model synthesizes briefing).
+        Self::spawn_bulletin_refresh(&self.shared, &self.running);
+
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
         // Per-session locks to serialize messages within the same conversation.
         let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -1905,6 +2001,51 @@ impl AgentLoop {
                     break;
                 }
                 Err(_) => continue, // timeout - loop and check running flag
+            };
+
+            // Coalesce rapid messages from the same session (Telegram, WhatsApp).
+            // Waits up to 400ms for follow-up messages before processing.
+            let msg = if crate::bus::events::should_coalesce(&msg.channel) {
+                let session = msg.session_key();
+                let mut batch = vec![msg];
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+                loop {
+                    match tokio::time::timeout_at(deadline, self.bus_inbound_rx.recv()).await {
+                        Ok(Some(next)) if next.session_key() == session => {
+                            batch.push(next);
+                        }
+                        Ok(Some(other)) => {
+                            // Different session — coalesce what we have, push other back.
+                            // Can't push back into mpsc, so process inline as separate spawn.
+                            let other_key = other.session_key();
+                            let other_lock = {
+                                let mut locks = session_locks.lock().await;
+                                locks.entry(other_key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+                            };
+                            let other_shared = self.shared.clone();
+                            let other_outbound_tx = self.shared.bus_outbound_tx.clone();
+                            let other_display_tx = self.shared.repl_display_tx.clone();
+                            let other_sem = semaphore.clone();
+                            tokio::spawn(async move {
+                                if let Ok(permit) = other_sem.acquire_owned().await {
+                                    let _guard = other_lock.lock().await;
+                                    if let Some(resp) = other_shared.process_message(&other, None, None, None, None).await {
+                                        let _ = other_outbound_tx.send(resp);
+                                    }
+                                    drop(permit);
+                                }
+                            });
+                            break;
+                        }
+                        _ => break, // timeout or channel closed
+                    }
+                }
+                if batch.len() > 1 {
+                    debug!("Coalesced {} messages for session", batch.len());
+                }
+                crate::bus::events::coalesce_messages(batch)
+            } else {
+                msg
             };
 
             // System messages (subagent announces) are handled inline (fast).

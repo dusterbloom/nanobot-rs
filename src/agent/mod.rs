@@ -2,6 +2,7 @@ pub mod agent_profiles;
 pub mod agent_loop;
 pub mod audit;
 pub mod budget_calibrator;
+pub mod bulletin;
 pub mod circuit_breaker;
 pub mod compaction;
 pub mod confidence_gate;

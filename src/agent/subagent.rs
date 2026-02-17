@@ -969,6 +969,27 @@ Your workspace is at: {workspace_str}
     }
 }
 
+/// Format a compact status block for system prompt injection.
+///
+/// Returns empty string when nothing is running and no recent completions,
+/// so callers can skip injection entirely.
+pub fn format_status_block(running: &[SubagentInfo], recent_completed: &[String]) -> String {
+    if running.is_empty() && recent_completed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n## Background Status\n");
+    if !running.is_empty() {
+        for info in running {
+            let elapsed = info.started_at.elapsed().as_secs();
+            out.push_str(&format!("- RUNNING: {} (id:{}, {}s)\n", info.label, info.task_id, elapsed));
+        }
+    }
+    for entry in recent_completed.iter().take(3) {
+        out.push_str(&format!("- {}\n", entry.trim_start_matches("  • ")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,5 +1220,64 @@ mod tests {
         assert!(!should_include("exec"));
         assert!(!should_include("write_file"));
         assert!(!should_include("web_search"));
+    }
+
+    // ---------------------------------------------------------------
+    // format_status_block tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_status_block_empty_when_nothing() {
+        let result = format_status_block(&[], &[]);
+        assert!(result.is_empty(), "Should return empty when nothing to report");
+    }
+
+    #[test]
+    fn test_status_block_shows_running() {
+        let running = vec![SubagentInfo {
+            task_id: "abc12345".into(),
+            label: "research-api".into(),
+            started_at: std::time::Instant::now(),
+        }];
+        let result = format_status_block(&running, &[]);
+        assert!(result.contains("## Background Status"));
+        assert!(result.contains("RUNNING: research-api"));
+        assert!(result.contains("id:abc12345"));
+    }
+
+    #[test]
+    fn test_status_block_shows_recent_completed() {
+        let completed = vec![
+            "  • fetch-docs (id: def456) — completed [2026-02-17T12:00:00Z]".into(),
+        ];
+        let result = format_status_block(&[], &completed);
+        assert!(result.contains("## Background Status"));
+        assert!(result.contains("fetch-docs"));
+        // Leading bullet should be stripped
+        assert!(!result.contains("  • "));
+    }
+
+    #[test]
+    fn test_status_block_caps_recent_at_3() {
+        let completed: Vec<String> = (0..5)
+            .map(|i| format!("  • task-{} (id: {}) — completed", i, i))
+            .collect();
+        let result = format_status_block(&[], &completed);
+        assert!(result.contains("task-0"));
+        assert!(result.contains("task-2"));
+        assert!(!result.contains("task-3"), "Should cap at 3 recent entries");
+    }
+
+    #[test]
+    fn test_status_block_combined() {
+        let running = vec![SubagentInfo {
+            task_id: "aaa".into(),
+            label: "worker-1".into(),
+            started_at: std::time::Instant::now(),
+        }];
+        let completed = vec!["  • done-task (id: bbb) — completed".into()];
+        let result = format_status_block(&running, &completed);
+        assert!(result.contains("RUNNING: worker-1"));
+        assert!(result.contains("done-task"));
     }
 }
