@@ -88,8 +88,12 @@ libc = "0.2"
 # URL parsing
 url = "2"
 
-# Language detection
-whatlang = "0.16"
+# Language detection (only used by voice mode for TTS routing)
+# Per-language features keep binary small: ~12MB for 8 langs vs ~110MB for all 75.
+lingua = { version = "1.7", default-features = false, features = [
+    "english", "spanish", "french", "hindi",
+    "italian", "japanese", "portuguese", "chinese",
+], optional = true }
 
 # Mime type guessing
 mime_guess = "2"
@@ -109,7 +113,7 @@ tempfile = "3"
 
 [features]
 default = []
-voice = ["dep:jack-voice", "dep:crossterm"]
+voice = ["dep:jack-voice", "dep:crossterm", "dep:lingua"]
 
 [dependencies.jack-voice]
 path = "../jack-voice/jack-voice"

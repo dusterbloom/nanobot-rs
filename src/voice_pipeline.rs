@@ -15,9 +15,7 @@ use jack_voice::{
     SpeechToText, SttMode, TextToSpeech, TtsEngine,
 };
 use tracing::{debug, info};
-use whatlang;
-
-use crate::voice::split_tts_sentences;
+use crate::voice::{detect_language, split_tts_sentences};
 
 /// Shared voice pipeline for channel voice message processing.
 ///
@@ -214,30 +212,6 @@ impl VoicePipeline {
         );
         Ok(output_path)
     }
-}
-
-/// Detect language from text, returns ISO 639-1 code (e.g. "en", "es", "fr").
-/// whatlang returns ISO 639-3 (3-letter) codes; we map to 2-letter for Kokoro.
-fn detect_language(text: &str) -> String {
-    whatlang::detect(text)
-        .map(|info| iso639_3_to_1(info.lang().code()))
-        .unwrap_or_else(|| "en".to_string())
-}
-
-/// Map ISO 639-3 (whatlang) codes to ISO 639-1 (Kokoro) codes.
-fn iso639_3_to_1(code: &str) -> String {
-    match code {
-        "eng" => "en",
-        "spa" => "es",
-        "fra" => "fr",
-        "hin" => "hi",
-        "ita" => "it",
-        "jpn" => "ja",
-        "por" => "pt",
-        "cmn" | "zho" => "zh",
-        _ => code, // pass through unknown codes
-    }
-    .to_string()
 }
 
 /// Map ISO 639-1 language code to a default Kokoro voice ID and language code.

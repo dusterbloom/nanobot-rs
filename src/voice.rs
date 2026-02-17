@@ -10,7 +10,44 @@ use jack_voice::{
     models::{self, ModelProgressCallback},
     SpeechToText, SttMode, TextToSpeech, TtsEngine,
 };
-use whatlang;
+use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+use once_cell::sync::Lazy;
+
+/// Shared language detector for TTS routing. Restricted to the 8 languages
+/// we have TTS voices for — keeps detection fast and accurate on short text.
+/// lingua achieves 100% accuracy on English single words (vs whatlang's 17.9%).
+static LANG_DETECTOR: Lazy<LanguageDetector> = Lazy::new(|| {
+    LanguageDetectorBuilder::from_languages(&[
+        Language::English,
+        Language::Spanish,
+        Language::French,
+        Language::Hindi,
+        Language::Italian,
+        Language::Japanese,
+        Language::Portuguese,
+        Language::Chinese,
+    ])
+    .build()
+});
+
+/// Detect language from text, returns ISO 639-1 code (e.g. "en", "es").
+pub(crate) fn detect_language(text: &str) -> String {
+    LANG_DETECTOR
+        .detect_language_of(text)
+        .map(|lang| match lang {
+            Language::English => "en",
+            Language::Spanish => "es",
+            Language::French => "fr",
+            Language::Hindi => "hi",
+            Language::Italian => "it",
+            Language::Japanese => "ja",
+            Language::Portuguese => "pt",
+            Language::Chinese => "zh",
+            _ => "en",
+        })
+        .unwrap_or("en")
+        .to_string()
+}
 
 /// Max chunk size in characters for TTS batching.
 /// Pocket TTS runs faster-than-real-time on CPU (~200ms latency per chunk).
@@ -411,22 +448,7 @@ impl VoiceSession {
             return Ok(None);
         }
 
-        let lang = whatlang::detect(&text)
-            .map(|info| {
-                match info.lang().code() {
-                    "eng" => "en",
-                    "spa" => "es",
-                    "fra" => "fr",
-                    "hin" => "hi",
-                    "ita" => "it",
-                    "jpn" => "ja",
-                    "por" => "pt",
-                    "cmn" | "zho" => "zh",
-                    other => other,
-                }
-                .to_string()
-            })
-            .unwrap_or_else(|| "en".to_string());
+        let lang = detect_language(&text);
 
         // Transcription text returned to REPL for formatted display.
         Ok(Some((text, lang)))
@@ -1020,31 +1042,36 @@ impl ModelProgressCallback for TerminalProgress {
 mod tests {
     use super::*;
 
-    /// whatlang is unreliable for short/informal speech — it misdetects English
-    /// as Estonian, etc. This test documents the problem so we don't rely on
-    /// per-utterance detection for TTS routing. The REPL uses the session-level
-    /// language setting (from config/CLI) instead.
+    /// lingua correctly detects short informal English that whatlang misdetected
+    /// as Estonian. This was the motivating case for the switch from whatlang.
     #[test]
-    fn test_whatlang_misdetects_short_english() {
-        // This phrase gets detected as Estonian ("est"), not English.
-        // This is why we use session-level lang for TTS routing, not per-utterance.
+    fn test_lingua_detects_short_english() {
         let text = "You just tell me a joke testing uh your pocket";
-        let detected = whatlang::detect(text).map(|i| i.lang().code().to_string());
-        assert_ne!(detected.as_deref(), Some("eng"),
-            "If whatlang starts detecting this correctly, the session-level override is still correct but not strictly necessary");
+        let detected = detect_language(text);
+        assert_eq!(detected, "en",
+            "lingua should detect short informal English correctly");
     }
 
-    /// Longer English text IS correctly detected.
+    /// Longer English text is also correctly detected.
     #[test]
-    fn test_whatlang_detects_longer_english() {
+    fn test_lingua_detects_longer_english() {
         let text = "Hello, how are you doing today? I wanted to ask you about the weather forecast for this weekend.";
-        let detected = whatlang::detect(text).map(|info| {
-            match info.lang().code() {
-                "eng" => "en",
-                other => other,
-            }.to_string()
-        }).unwrap_or_else(|| "en".to_string());
+        let detected = detect_language(text);
         assert_eq!(detected, "en");
+    }
+
+    /// Spanish text routes to "es".
+    #[test]
+    fn test_lingua_detects_spanish() {
+        let detected = detect_language("Hola, cómo estás hoy? Quiero preguntarte sobre el clima.");
+        assert_eq!(detected, "es");
+    }
+
+    /// Japanese text routes to "ja".
+    #[test]
+    fn test_lingua_detects_japanese() {
+        let detected = detect_language("今日の天気はどうですか？");
+        assert_eq!(detected, "ja");
     }
 
     #[test]
