@@ -500,6 +500,7 @@ pub(crate) fn create_agent_loop(
         email_config,
         repl_display_tx,
         Some(config.providers.clone()),
+        config.proprioception.clone(),
     )
 }
 
@@ -554,6 +555,7 @@ pub(crate) async fn run_gateway_async(
         None, // gateway agent uses bus for email, not tools
         repl_display_tx,
         Some(config.providers.clone()),
+        config.proprioception.clone(),
     );
 
     // Initialize voice pipeline for channels (when voice feature is enabled).

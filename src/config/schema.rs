@@ -764,6 +764,77 @@ impl Default for WorkerConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Proprioception config
+// ---------------------------------------------------------------------------
+
+fn default_grounding_interval() -> u32 {
+    8
+}
+
+fn default_raw_window() -> usize {
+    5
+}
+
+fn default_light_window() -> usize {
+    20
+}
+
+/// Configuration for the ensemble proprioception system.
+///
+/// Controls shared body awareness, tool scoping, audience-aware compaction,
+/// heartbeat grounding, gradient memory, and priority interrupts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProprioceptionConfig {
+    /// Enable the proprioception system (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Phase-aware tool scoping for delegation model (default: true).
+    #[serde(default = "default_true")]
+    pub dynamic_tool_scoping: bool,
+
+    /// Audience-aware compaction prompts (default: true).
+    #[serde(default = "default_true")]
+    pub audience_aware_compaction: bool,
+
+    /// Turns between grounding injections. 0 = disabled (default: 8).
+    #[serde(default = "default_grounding_interval")]
+    pub grounding_interval: u32,
+
+    /// Enable gradient memory (3-tier compaction) (default: true).
+    #[serde(default = "default_true")]
+    pub gradient_memory: bool,
+
+    /// Number of most recent turns kept raw (default: 5).
+    #[serde(default = "default_raw_window")]
+    pub raw_window: usize,
+
+    /// Number of turns in the light-compression tier (default: 20).
+    #[serde(default = "default_light_window")]
+    pub light_window: usize,
+
+    /// Enable the aha channel for priority interrupts (default: true).
+    #[serde(default = "default_true")]
+    pub aha_channel: bool,
+}
+
+impl Default for ProprioceptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dynamic_tool_scoping: true,
+            audience_aware_compaction: true,
+            grounding_interval: default_grounding_interval(),
+            gradient_memory: true,
+            raw_window: default_raw_window(),
+            light_window: default_light_window(),
+            aha_channel: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice config
 // ---------------------------------------------------------------------------
 
@@ -804,6 +875,8 @@ pub struct Config {
     pub voice: VoiceConfig,
     #[serde(default)]
     pub worker: WorkerConfig,
+    #[serde(default)]
+    pub proprioception: ProprioceptionConfig,
 }
 
 impl Config {

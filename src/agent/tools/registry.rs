@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
+use crate::agent::system_state::TaskPhase;
 
 /// Registry for agent tools.
 ///
@@ -192,6 +193,103 @@ impl ToolRegistry {
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
             .collect::<Vec<&str>>()
             .join(" ")
+    }
+
+    /// Get the tool names appropriate for a given task phase.
+    ///
+    /// Returns `None` for phases where all tools should be available
+    /// (Idle, Understanding, Planning, Reflection).
+    pub fn tools_for_phase(phase: &TaskPhase) -> Option<&'static [&'static str]> {
+        match phase {
+            TaskPhase::FileEditing => Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"]),
+            TaskPhase::CodeExecution => Some(&["exec", "read_file", "list_dir"]),
+            TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "read_file"]),
+            TaskPhase::Communication => Some(&["message", "send_email", "check_inbox"]),
+            _ => None, // Idle/Understanding/Planning/Reflection -> all tools
+        }
+    }
+
+    /// Get tool definitions scoped for the main agent (additive).
+    ///
+    /// Includes phase tools + keyword-triggered tools + used tools.
+    /// This is a gentle scoping — tools are added, not removed.
+    pub fn get_scoped_definitions(
+        &self,
+        phase: &TaskPhase,
+        messages: &[serde_json::Value],
+        used_tools: &HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut relevant: HashSet<String> = HashSet::new();
+
+        // Phase-specific tools (if any).
+        if let Some(phase_tools) = Self::tools_for_phase(phase) {
+            for name in phase_tools {
+                if self.tools.contains_key(*name) {
+                    relevant.insert(name.to_string());
+                }
+            }
+        }
+
+        // Always include core tools.
+        for name in Self::CORE_TOOLS {
+            if self.tools.contains_key(*name) {
+                relevant.insert(name.to_string());
+            }
+        }
+
+        // Include any tools already used in this conversation.
+        for name in used_tools {
+            if self.tools.contains_key(name) {
+                relevant.insert(name.clone());
+            }
+        }
+
+        // Scan recent messages for keyword triggers.
+        let recent_text = Self::extract_recent_text(messages, 5);
+        let lower_text = recent_text.to_lowercase();
+
+        for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
+            if self.tools.contains_key(*tool_name) {
+                for kw in *keywords {
+                    if lower_text.contains(kw) {
+                        relevant.insert(tool_name.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If we end up with all tools anyway, just return everything.
+        if relevant.len() >= self.tools.len() {
+            return self.get_definitions();
+        }
+
+        self.tools
+            .iter()
+            .filter(|(name, _)| relevant.contains(name.as_str()))
+            .map(|(_, tool)| tool.to_schema())
+            .collect()
+    }
+
+    /// Get tool definitions scoped for the delegation model (strict).
+    ///
+    /// Only returns tools appropriate for the current phase.
+    /// For phases with no specific tool set, returns all tools.
+    pub fn get_delegation_definitions(
+        &self,
+        phase: &TaskPhase,
+    ) -> Vec<serde_json::Value> {
+        match Self::tools_for_phase(phase) {
+            Some(phase_tools) => {
+                let allowed: HashSet<&str> = phase_tools.iter().copied().collect();
+                self.tools
+                    .iter()
+                    .filter(|(name, _)| allowed.contains(name.as_str()))
+                    .map(|(_, tool)| tool.to_schema())
+                    .collect()
+            }
+            None => self.get_definitions(),
+        }
     }
 
     /// Get list of registered tool names.
@@ -518,5 +616,105 @@ mod tests {
         let result = registry.execute_with_context("nonexistent", HashMap::new(), &ctx).await;
         assert!(!result.ok);
         assert!(result.data.contains("not found"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Dynamic Tool Scoping tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tools_for_phase_file_editing() {
+        let tools = ToolRegistry::tools_for_phase(&TaskPhase::FileEditing).unwrap();
+        assert!(tools.contains(&"read_file"));
+        assert!(tools.contains(&"edit_file"));
+        assert!(tools.contains(&"write_file"));
+        assert_eq!(tools.len(), 5);
+    }
+
+    #[test]
+    fn test_tools_for_phase_code_execution() {
+        let tools = ToolRegistry::tools_for_phase(&TaskPhase::CodeExecution).unwrap();
+        assert!(tools.contains(&"exec"));
+        assert!(tools.contains(&"read_file"));
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn test_tools_for_phase_web_research() {
+        let tools = ToolRegistry::tools_for_phase(&TaskPhase::WebResearch).unwrap();
+        assert!(tools.contains(&"web_search"));
+        assert!(tools.contains(&"web_fetch"));
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn test_tools_for_phase_idle_returns_none() {
+        assert!(ToolRegistry::tools_for_phase(&TaskPhase::Idle).is_none());
+    }
+
+    #[test]
+    fn test_tools_for_phase_understanding_returns_none() {
+        assert!(ToolRegistry::tools_for_phase(&TaskPhase::Understanding).is_none());
+    }
+
+    #[test]
+    fn test_tools_for_phase_planning_returns_none() {
+        assert!(ToolRegistry::tools_for_phase(&TaskPhase::Planning).is_none());
+    }
+
+    #[test]
+    fn test_delegation_defs_file_editing_strict() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "write_file", "edit_file", "list_dir", "exec", "web_search", "message"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let defs = registry.get_delegation_definitions(&TaskPhase::FileEditing);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // Strict: only phase tools, no web_search or message
+        assert_eq!(names.len(), 5);
+        assert!(names.contains("read_file"));
+        assert!(names.contains("write_file"));
+        assert!(names.contains("edit_file"));
+        assert!(!names.contains("web_search"));
+        assert!(!names.contains("message"));
+    }
+
+    #[test]
+    fn test_delegation_defs_idle_returns_all() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "web_search", "exec"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let defs = registry.get_delegation_definitions(&TaskPhase::Idle);
+        assert_eq!(defs.len(), 3); // All tools returned for Idle
+    }
+
+    #[test]
+    fn test_scoped_defs_includes_phase_and_used() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "write_file", "edit_file", "list_dir", "exec", "web_search", "web_fetch"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "edit the code"})];
+        let mut used = HashSet::new();
+        used.insert("web_fetch".to_string());
+
+        let defs = registry.get_scoped_definitions(&TaskPhase::FileEditing, &messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // Should include phase tools + used tools (web_fetch)
+        assert!(names.contains("read_file"));
+        assert!(names.contains("edit_file"));
+        assert!(names.contains("web_fetch")); // used tool, added back
     }
 }

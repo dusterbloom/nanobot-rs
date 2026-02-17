@@ -37,7 +37,8 @@ use crate::agent::tools::{
 use crate::agent::pipeline;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
-use crate::config::schema::{EmailConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig};
+use crate::agent::system_state::{self, AhaSignal, AhaPriority, SystemState};
+use crate::config::schema::{EmailConfig, MemoryConfig, ProprioceptionConfig, ProvenanceConfig, ToolDelegationConfig};
 use crate::cron::service::CronService;
 use crate::providers::base::{LLMProvider, StreamChunk};
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -393,6 +394,14 @@ struct AgentLoopShared {
     repl_display_tx: Option<UnboundedSender<String>>,
     /// Cached memory bulletin for system prompt injection (zero-cost reads).
     bulletin_cache: Arc<arc_swap::ArcSwap<String>>,
+    /// Shared system state for ensemble proprioception.
+    system_state: Arc<arc_swap::ArcSwap<SystemState>>,
+    /// Proprioception config (feature toggles).
+    proprioception_config: ProprioceptionConfig,
+    /// Receiver for priority signals from subagents (aha channel).
+    aha_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<AhaSignal>>>,
+    /// Sender for priority signals (given to subagent manager).
+    aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
 }
 
 impl AgentLoopShared {
@@ -798,9 +807,91 @@ impl AgentLoopShared {
         // Response boundary: after exec/write_file, force a text response.
         let mut force_response = false;
 
+        // Track turns since last compaction for proprioception.
+        let mut turns_since_compaction: u32 = 0;
+
         // Agent loop: call LLM, handle tool calls, repeat.
         for iteration in 0..core.max_iterations {
             debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
+
+            // --- Proprioception: update SystemState ---
+            if self.proprioception_config.enabled {
+                let tools_list: Vec<String> = if let Ok(guard) = counters.last_tools_called.lock() {
+                    guard.clone()
+                } else {
+                    Vec::new()
+                };
+                let tool_refs: Vec<&str> = tools_list.iter().map(|s| s.as_str()).collect();
+                let phase = system_state::infer_phase(&tool_refs);
+                let active_subs = self.subagents.list_running().await.len().min(255) as u8;
+                let state = SystemState::snapshot(
+                    phase,
+                    counters.last_context_used.load(Ordering::Relaxed),
+                    counters.last_context_max.load(Ordering::Relaxed),
+                    turn_count,
+                    messages.len() as u64,
+                    turns_since_compaction,
+                    counters.delegation_healthy.load(Ordering::Relaxed),
+                    0, // recent_tool_failures — not tracked yet
+                    true, // last_tool_ok
+                    active_subs,
+                    0, // pending_aha_signals filled below
+                );
+                self.system_state.store(Arc::new(state));
+            }
+
+            // --- Aha Channel: poll priority signals from subagents ---
+            if self.proprioception_config.enabled && self.proprioception_config.aha_channel {
+                if let Ok(mut rx) = self.aha_rx.try_lock() {
+                    while let Ok(signal) = rx.try_recv() {
+                        match signal.priority {
+                            AhaPriority::Critical => {
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "[ALERT from subagent {}] {}",
+                                        signal.agent_id, signal.message
+                                    )
+                                }));
+                            }
+                            AhaPriority::High => {
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": format!(
+                                        "[Signal from subagent {}] {}",
+                                        signal.agent_id, signal.message
+                                    )
+                                }));
+                            }
+                            AhaPriority::Normal => {
+                                // Normal signals are informational — logged only.
+                                debug!(
+                                    "Aha signal (normal) from {}: {}",
+                                    signal.agent_id, signal.message
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Heartbeat: inject grounding message ---
+            if self.proprioception_config.enabled {
+                let state = self.system_state.load_full();
+                if system_state::should_ground(
+                    iteration,
+                    self.proprioception_config.grounding_interval,
+                    state.context_pressure,
+                ) {
+                    let grounding = system_state::format_grounding(&state);
+                    messages.push(json!({
+                        "role": "user",
+                        "content": grounding
+                    }));
+                }
+            }
+
+            turns_since_compaction += 1;
 
             // Check if background compaction finished — swap in compacted messages.
             if let Ok(mut guard) = compaction_slot.try_lock() {
@@ -815,6 +906,7 @@ impl AgentLoopShared {
                     // After compaction, all messages in the array are "new" from
                     // the perspective of persistence (the session file was rebuilt).
                     new_start = messages.len();
+                    turns_since_compaction = 0;
                 }
             }
 
@@ -843,8 +935,13 @@ impl AgentLoopShared {
                 force_response = false;
             }
 
-            // Filter tool definitions to relevant tools.
-            let mut tool_defs = tools.get_relevant_definitions(&messages, &used_tools);
+            // Filter tool definitions to relevant tools (phase-scoped when proprioception is active).
+            let current_phase = self.system_state.load_full().task_phase;
+            let mut tool_defs = if self.proprioception_config.enabled && self.proprioception_config.dynamic_tool_scoping {
+                tools.get_scoped_definitions(&current_phase, &messages, &used_tools)
+            } else {
+                tools.get_relevant_definitions(&messages, &used_tools)
+            };
             if boundary_active {
                 tool_defs.retain(|def| {
                     let name = def
@@ -879,11 +976,21 @@ impl AgentLoopShared {
                 let watermark = messages.len();
                 in_flight.store(true, Ordering::SeqCst);
 
+                let bg_proprio = self.proprioception_config.clone();
                 tokio::spawn(async move {
-                    let result = bg_core
-                        .compactor
-                        .compact(&bg_messages, &bg_core.token_budget, 0)
-                        .await;
+                    let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
+                        bg_core.compactor.compact_gradient(
+                            &bg_messages, &bg_core.token_budget, 0,
+                            bg_proprio.raw_window, bg_proprio.light_window,
+                        ).await
+                    } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
+                        let reader = crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                        bg_core.compactor.compact_for_reader(
+                            &bg_messages, &bg_core.token_budget, 0, &reader
+                        ).await
+                    } else {
+                        bg_core.compactor.compact(&bg_messages, &bg_core.token_budget, 0).await
+                    };
                     if bg_core.memory_enabled {
                         if let Some(ref summary) = result.observation {
                             bg_core.working_memory.update_from_compaction(&bg_session_key, summary);
@@ -1845,6 +1952,7 @@ impl AgentLoop {
         email_config: Option<EmailConfig>,
         repl_display_tx: Option<UnboundedSender<String>>,
         providers_config: Option<crate::config::schema::ProvidersConfig>,
+        proprioception_config: ProprioceptionConfig,
     ) -> Self {
         // Read core to initialize the subagent manager.
         let core = core_handle.swappable();
@@ -1868,6 +1976,13 @@ impl AgentLoop {
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
         }
+
+        // Create aha channel before subagent manager so we can pass the sender.
+        let (aha_tx, aha_rx) = tokio::sync::mpsc::unbounded_channel();
+        if proprioception_config.aha_channel {
+            subagent_mgr = subagent_mgr.with_aha_tx(aha_tx.clone());
+        }
+
         let subagents = Arc::new(subagent_mgr);
 
         // Load persisted bulletin from disk (warm start).
@@ -1880,6 +1995,8 @@ impl AgentLoop {
             cache.handle()
         };
 
+        let system_state = Arc::new(arc_swap::ArcSwap::from_pointee(SystemState::default()));
+
         let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
@@ -1889,6 +2006,10 @@ impl AgentLoop {
             email_config,
             repl_display_tx,
             bulletin_cache,
+            system_state,
+            proprioception_config,
+            aha_rx: Arc::new(Mutex::new(aha_rx)),
+            aha_tx,
         });
 
         Self {

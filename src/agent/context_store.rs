@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::providers::base::LLMProvider;
 
 /// Names of micro-tools that operate on the ContextStore.
-pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize", "mem_store", "mem_recall"];
+pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize", "mem_store", "mem_recall", "set_phase"];
 
 /// Stores full tool outputs as named variables for micro-tool inspection.
 pub struct ContextStore {
@@ -231,6 +231,20 @@ pub fn micro_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "set_phase",
+                "description": "Explicitly set the current task phase. This adjusts which tools are available. Valid phases: idle, understanding, planning, file_editing, code_execution, web_research, communication, reflection.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phase": {"type": "string", "description": "Phase name (e.g. 'file_editing', 'web_research')"}
+                    },
+                    "required": ["phase"]
+                }
+            }
+        }),
     ]
 }
 
@@ -296,6 +310,16 @@ pub fn execute_micro_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             store.mem_recall(key)
+        }
+        "set_phase" => {
+            let phase_str = args
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match crate::agent::system_state::TaskPhase::from_str_loose(phase_str) {
+                Some(phase) => format!("Phase set to: {}", phase),
+                None => format!("Error: unknown phase '{}'. Valid: idle, understanding, planning, file_editing, code_execution, web_research, communication, reflection.", phase_str),
+            }
         }
         _ => format!("Error: unknown micro-tool '{}'.", name),
     }

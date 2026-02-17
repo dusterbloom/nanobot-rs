@@ -23,6 +23,7 @@ pub mod reflector;
 pub mod skills;
 pub mod step_voter;
 pub mod subagent;
+pub mod system_state;
 pub mod thread_repair;
 pub mod token_budget;
 pub mod tool_runner;

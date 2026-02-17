@@ -16,6 +16,155 @@ use tracing::{debug, warn};
 use crate::agent::token_budget::TokenBudget;
 use crate::providers::base::LLMProvider;
 
+// ---------------------------------------------------------------------------
+// Audience-Aware Compaction (Proprioception Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Capability level of a model reading the compacted output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderCapability {
+    /// 3B models — ultra-precise, structured, no ambiguity, no pronouns.
+    Minimal,
+    /// 8-70B models — balanced.
+    Standard,
+    /// 200K+ cloud models — brief, decisions + pointers only.
+    Advanced,
+}
+
+/// Profile of the model that will read the compacted output.
+#[derive(Debug, Clone)]
+pub struct ReaderProfile {
+    pub context_budget: usize,
+    pub capability: ReaderCapability,
+}
+
+impl ReaderProfile {
+    /// Infer reader capability from model name.
+    pub fn from_model(model: &str) -> Self {
+        let lower = model.to_lowercase();
+        let capability = if lower.contains("3b") || lower.contains("0.5b")
+            || lower.contains("1.7b") || lower.contains("1b")
+            || lower.contains("ministral") || lower.contains("nanbeige")
+        {
+            ReaderCapability::Minimal
+        } else if lower.contains("claude") || lower.contains("gpt-4")
+            || lower.contains("opus") || lower.contains("sonnet")
+            || lower.contains("gemini-2") || lower.contains("gemini-1.5")
+        {
+            ReaderCapability::Advanced
+        } else {
+            ReaderCapability::Standard
+        };
+        // Default context budget — callers should override.
+        let context_budget = match capability {
+            ReaderCapability::Minimal => 4096,
+            ReaderCapability::Standard => 32768,
+            ReaderCapability::Advanced => 200000,
+        };
+        Self { context_budget, capability }
+    }
+}
+
+/// Select the appropriate summarization prompt for a given reader.
+pub fn select_summarize_prompt(reader: &ReaderProfile) -> &'static str {
+    match reader.capability {
+        ReaderCapability::Minimal => SUMMARIZE_PROMPT_MINIMAL,
+        ReaderCapability::Standard => SUMMARIZE_PROMPT,
+        ReaderCapability::Advanced => SUMMARIZE_PROMPT_ADVANCED,
+    }
+}
+
+/// Summarization prompt for minimal-capability models (3B).
+///
+/// Every fact explicit, no pronouns without antecedents, structured key-value pairs.
+const SUMMARIZE_PROMPT_MINIMAL: &str = "\
+Extract facts into structured key-value pairs.
+Rules:
+1. NO pronouns — use full names/paths every time
+2. Each fact = one line: KEY: VALUE
+3. File paths always absolute
+4. Numbers exact, no approximations
+5. No abbreviations, no meta-commentary
+6. Max 10 items per section
+
+TASK: [full sentence describing goal]
+DECIDED: [key=value for each decision]
+FACTS: [key=value for each fact]
+PENDING: [numbered list of remaining steps]
+ERRORS: [key=value for each error]";
+
+/// Summarization prompt for advanced-capability models (200K+ cloud).
+///
+/// Key decisions only, one-liners, minimal.
+const SUMMARIZE_PROMPT_ADVANCED: &str = "\
+Compress this conversation to essential decisions and pointers.
+Rules:
+1. One-liner per decision or fact — omit details the model can re-derive
+2. Use 'see turn N' pointers instead of repeating content
+3. Max 5 bullets total
+4. No template, no headers — just the bullets
+5. Skip errors unless unresolved";
+
+// ---------------------------------------------------------------------------
+// Gradient Memory (Proprioception Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Memory tier for gradient compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageTier {
+    /// Most recent turns — kept raw/untouched.
+    Raw,
+    /// Middle-aged turns — light compression (truncate tool results).
+    Light,
+    /// Old turns — facts only (LLM summarization).
+    Facts,
+}
+
+/// Classify a message into a memory tier based on its position from the end.
+///
+/// `msg_index_from_end`: 0 = most recent, 1 = second most recent, etc.
+pub fn classify_tier(msg_index_from_end: usize, raw_window: usize, light_window: usize) -> MessageTier {
+    if msg_index_from_end <= raw_window {
+        MessageTier::Raw
+    } else if msg_index_from_end <= light_window {
+        MessageTier::Light
+    } else {
+        MessageTier::Facts
+    }
+}
+
+/// Light-compress a message: truncate tool results, keep user/assistant text.
+pub fn compress_light(msg: &Value) -> Value {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+    if role == "tool" {
+        // Truncate tool content to 200 chars.
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if content.len() > 200 {
+            let truncated: String = content.chars().take(200).collect();
+            let mut new_msg = msg.clone();
+            new_msg["content"] = Value::String(format!("{}... [truncated, {} chars total]", truncated, content.len()));
+            return new_msg;
+        }
+    }
+
+    if role == "assistant" {
+        // If assistant has tool_calls, keep them but truncate text content.
+        if msg.get("tool_calls").is_some() {
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if content.len() > 300 {
+                let mut new_msg = msg.clone();
+                let truncated: String = content.chars().take(300).collect();
+                new_msg["content"] = Value::String(format!("{}...", truncated));
+                return new_msg;
+            }
+        }
+    }
+
+    // User and short assistant messages pass through unchanged.
+    msg.clone()
+}
+
 /// Summarization prompt sent to the LLM.
 const SUMMARIZE_PROMPT: &str = "\
 Extract facts from this conversation into the template below.
@@ -373,6 +522,94 @@ impl ContextCompactor {
         Ok(summaries.remove(0))
     }
 
+    /// Compact messages using gradient memory (3-tier approach).
+    ///
+    /// Instead of a binary "summarize everything old", messages are classified:
+    /// - Raw (recent): kept untouched
+    /// - Light (middle): tool results truncated
+    /// - Facts (old): LLM-summarized
+    pub async fn compact_gradient(
+        &self,
+        messages: &[Value],
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+        raw_window: usize,
+        light_window: usize,
+    ) -> CompactionResult {
+        if self.disabled.load(Ordering::Relaxed) {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
+
+        let available = budget.available_budget(tool_def_tokens);
+        let current = TokenBudget::estimate_tokens(messages);
+        let threshold = self.effective_threshold(available);
+        if current <= threshold {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
+
+        if messages.is_empty() {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
+
+        // Always keep system message.
+        let system_msg = messages[0].clone();
+        let body = &messages[1..];
+        let body_len = body.len();
+
+        // Partition messages into tiers.
+        let mut facts_messages = Vec::new();
+        let mut light_messages = Vec::new();
+        let mut raw_messages = Vec::new();
+
+        for (i, msg) in body.iter().enumerate() {
+            let from_end = body_len.saturating_sub(i + 1);
+            match classify_tier(from_end, raw_window, light_window) {
+                MessageTier::Raw => raw_messages.push(msg.clone()),
+                MessageTier::Light => light_messages.push(compress_light(msg)),
+                MessageTier::Facts => facts_messages.push(msg.clone()),
+            }
+        }
+
+        // Summarize facts-tier messages via LLM (if any).
+        let summary = if !facts_messages.is_empty() {
+            match self.summarize(&facts_messages).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Gradient compaction summarization failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Assemble: system + [summary] + light + raw
+        let mut result = Vec::with_capacity(2 + light_messages.len() + raw_messages.len());
+        result.push(system_msg);
+        if let Some(ref s) = summary {
+            result.push(json!({
+                "role": "user",
+                "content": format!("[Conversation summary: {}]", s)
+            }));
+        }
+        result.extend(light_messages);
+        result.extend(raw_messages);
+
+        CompactionResult {
+            messages: result,
+            observation: summary,
+        }
+    }
+
     /// Produce a structural briefing of content (not a conversation summary).
     ///
     /// Used by ContentGate when content doesn't fit the context budget.
@@ -431,6 +668,157 @@ impl ContextCompactor {
 
         let text = strip_thinking_tags(&text);
         Ok(text)
+    }
+
+    /// Compact messages for a specific reader profile (audience-aware).
+    ///
+    /// Uses the reader-appropriate summarization prompt instead of the default.
+    pub async fn compact_for_reader(
+        &self,
+        messages: &[Value],
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+        reader: &ReaderProfile,
+    ) -> CompactionResult {
+        if self.disabled.load(Ordering::Relaxed) {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
+
+        let available = budget.available_budget(tool_def_tokens);
+        let current = TokenBudget::estimate_tokens(messages);
+        let threshold = self.effective_threshold(available);
+        if current <= threshold {
+            return CompactionResult {
+                messages: messages.to_vec(),
+                observation: None,
+            };
+        }
+
+        let prompt = select_summarize_prompt(reader);
+
+        match self.compact_via_summary_with_prompt(messages, available, budget, prompt).await {
+            Ok((compacted, summary)) => CompactionResult {
+                messages: compacted,
+                observation: Some(summary),
+            },
+            Err(e) => {
+                if !self.disabled.swap(true, Ordering::SeqCst) {
+                    warn!("Audience-aware compaction failed; disabling: {}", e);
+                }
+                CompactionResult {
+                    messages: messages.to_vec(),
+                    observation: None,
+                }
+            }
+        }
+    }
+
+    /// compact_via_summary with a custom prompt.
+    async fn compact_via_summary_with_prompt(
+        &self,
+        messages: &[Value],
+        available_budget: usize,
+        budget: &TokenBudget,
+        prompt: &str,
+    ) -> Result<(Vec<Value>, String)> {
+        if messages.is_empty() {
+            return Ok((messages.to_vec(), String::new()));
+        }
+
+        let system_msg = messages[0].clone();
+        let system_tokens = TokenBudget::estimate_tokens(&[system_msg.clone()]);
+        let summary_headroom = 400;
+        let remaining = available_budget
+            .saturating_sub(system_tokens)
+            .saturating_sub(summary_headroom);
+        if remaining == 0 {
+            anyhow::bail!("Budget too small for summarization");
+        }
+        let recent_budget = (remaining as f64 * 0.6) as usize;
+
+        let body = &messages[1..];
+        let mut recent_start = body.len();
+        let mut recent_tokens = 0;
+
+        let protected: std::collections::HashSet<usize> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| {
+                let content = msg["content"].as_str().unwrap_or("");
+                content.contains("[Subagent ") || content.contains("subagent-")
+                    || content.contains("Result also saved to:")
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        for (i, msg) in body.iter().enumerate().rev() {
+            let msg_tokens = TokenBudget::estimate_tokens(&[msg.clone()]);
+            if recent_tokens + msg_tokens > recent_budget && !protected.contains(&i) {
+                recent_start = i + 1;
+                break;
+            }
+            recent_tokens += msg_tokens;
+            if i == 0 {
+                recent_start = 0;
+            }
+        }
+
+        if recent_start == 0 {
+            anyhow::bail!("All messages fit as recent; nothing to summarize");
+        }
+
+        let old_messages = &body[..recent_start];
+        let recent_messages = &body[recent_start..];
+
+        // Use the custom prompt for summarization.
+        let summary = self.summarize_with_prompt(old_messages, prompt).await?;
+
+        let mut result = Vec::with_capacity(2 + recent_messages.len());
+        result.push(system_msg);
+        result.push(json!({
+            "role": "user",
+            "content": format!("[Conversation summary: {}]", summary)
+        }));
+        result.extend_from_slice(recent_messages);
+
+        Ok((result, summary))
+    }
+
+    /// Summarize messages with a custom prompt.
+    async fn summarize_with_prompt(&self, messages: &[Value], prompt: &str) -> Result<String> {
+        if messages.is_empty() {
+            return Ok(String::new());
+        }
+        let mut summaries: Vec<String> = Vec::new();
+        for (start, end) in split_message_ranges_by_budget(messages, self.input_budget()) {
+            let transcript = build_transcript(&messages[start..end]);
+            let s = self.summarize_text(&transcript, prompt).await?;
+            summaries.push(s);
+        }
+        let mut rounds = 0usize;
+        while summaries.len() > 1 {
+            rounds += 1;
+            if rounds > MAX_MERGE_ROUNDS {
+                anyhow::bail!("Exceeded merge rounds (chunks={})", summaries.len());
+            }
+            let mut merged: Vec<String> = Vec::new();
+            for (start, end) in split_summary_ranges_by_budget(&summaries, self.input_budget()) {
+                let mut block = String::new();
+                for (i, s) in summaries[start..end].iter().enumerate() {
+                    block.push_str(&format!("Summary {}:\n{}\n\n", i + 1, s));
+                }
+                let next = self.summarize_text(&block, MERGE_SUMMARIES_PROMPT).await?;
+                merged.push(next);
+            }
+            if merged.len() >= summaries.len() {
+                anyhow::bail!("Summary merge made no progress");
+            }
+            summaries = merged;
+        }
+        Ok(summaries.remove(0))
     }
 
     async fn summarize_text(&self, input: &str, prompt: &str) -> Result<String> {
@@ -880,5 +1268,115 @@ mod tests {
             .with_thresholds(50.0, 200);
         // available = 1000. 50% of 1000 = 500. Token cap = 200. min(500, 200) = 200.
         assert_eq!(compactor.effective_threshold(1000), 200);
+    }
+
+    // -- Audience-Aware Compaction (Phase 3) tests --
+
+    #[test]
+    fn test_select_summarize_prompt_minimal() {
+        let reader = ReaderProfile {
+            context_budget: 4096,
+            capability: ReaderCapability::Minimal,
+        };
+        let prompt = select_summarize_prompt(&reader);
+        assert!(prompt.contains("NO pronouns"), "Minimal prompt should ban pronouns");
+        assert!(prompt.contains("key-value"), "Minimal prompt should require key-value format");
+    }
+
+    #[test]
+    fn test_select_summarize_prompt_advanced() {
+        let reader = ReaderProfile {
+            context_budget: 200_000,
+            capability: ReaderCapability::Advanced,
+        };
+        let prompt = select_summarize_prompt(&reader);
+        assert!(prompt.contains("decisions"), "Advanced prompt should focus on decisions");
+    }
+
+    #[test]
+    fn test_select_summarize_prompt_standard() {
+        let reader = ReaderProfile {
+            context_budget: 32768,
+            capability: ReaderCapability::Standard,
+        };
+        let prompt = select_summarize_prompt(&reader);
+        assert!(prompt.contains("Extract facts"), "Standard prompt should extract facts");
+    }
+
+    #[test]
+    fn test_reader_profile_from_model_minimal() {
+        let reader = ReaderProfile::from_model("nanbeige-3b");
+        assert_eq!(reader.capability, ReaderCapability::Minimal);
+    }
+
+    #[test]
+    fn test_reader_profile_from_model_advanced() {
+        let reader = ReaderProfile::from_model("claude-opus");
+        assert_eq!(reader.capability, ReaderCapability::Advanced);
+
+        let reader = ReaderProfile::from_model("gpt-4o");
+        assert_eq!(reader.capability, ReaderCapability::Advanced);
+    }
+
+    #[test]
+    fn test_reader_profile_from_model_standard() {
+        let reader = ReaderProfile::from_model("qwen2-8b");
+        assert_eq!(reader.capability, ReaderCapability::Standard);
+    }
+
+    // -- Gradient Memory (Phase 5) tests --
+
+    #[test]
+    fn test_classify_tier_raw() {
+        assert_eq!(classify_tier(0, 5, 20), MessageTier::Raw);
+        assert_eq!(classify_tier(5, 5, 20), MessageTier::Raw);
+    }
+
+    #[test]
+    fn test_classify_tier_light() {
+        assert_eq!(classify_tier(6, 5, 20), MessageTier::Light);
+        assert_eq!(classify_tier(20, 5, 20), MessageTier::Light);
+    }
+
+    #[test]
+    fn test_classify_tier_facts() {
+        assert_eq!(classify_tier(21, 5, 20), MessageTier::Facts);
+        assert_eq!(classify_tier(100, 5, 20), MessageTier::Facts);
+    }
+
+    #[test]
+    fn test_compress_light_tool_message() {
+        let tool_msg = json!({
+            "role": "tool",
+            "name": "read_file",
+            "content": "x".repeat(3000),
+            "tool_call_id": "call_1"
+        });
+        let compressed = compress_light(&tool_msg);
+        let content = compressed["content"].as_str().unwrap();
+        assert!(content.len() < 300, "Compressed tool result should be < 300 chars, got {}", content.len());
+        assert!(content.contains("[truncated"), "Should have truncation marker");
+    }
+
+    #[test]
+    fn test_compress_light_user_message_unchanged() {
+        let user_msg = json!({
+            "role": "user",
+            "content": "Hello, how are you?"
+        });
+        let compressed = compress_light(&user_msg);
+        assert_eq!(compressed, user_msg, "User messages should be unchanged");
+    }
+
+    #[test]
+    fn test_compress_light_short_tool_unchanged() {
+        let tool_msg = json!({
+            "role": "tool",
+            "name": "list_dir",
+            "content": "file1.rs\nfile2.rs",
+            "tool_call_id": "call_2"
+        });
+        let compressed = compress_light(&tool_msg);
+        assert_eq!(compressed, tool_msg, "Short tool results should be unchanged");
     }
 }

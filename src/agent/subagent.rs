@@ -105,6 +105,8 @@ pub struct SubagentManager {
     /// Spawns are rejected when depth >= MAX_SPAWN_DEPTH.
     depth: u32,
     running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>, broadcast::Sender<String>)>>>,
+    /// Priority signal sender for the aha channel (proprioception Phase 6).
+    aha_tx: Option<UnboundedSender<crate::agent::system_state::AhaSignal>>,
 }
 
 impl SubagentManager {
@@ -147,7 +149,14 @@ impl SubagentManager {
             display_tx: None,
             depth: 0,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
+            aha_tx: None,
         }
+    }
+
+    /// Set the aha channel sender for priority signals (proprioception).
+    pub fn with_aha_tx(mut self, tx: UnboundedSender<crate::agent::system_state::AhaSignal>) -> Self {
+        self.aha_tx = Some(tx);
+        self
     }
 
     /// Set the display channel for direct CLI/REPL result delivery.
@@ -310,6 +319,7 @@ impl SubagentManager {
         let tid = task_id.clone();
         let lbl = display_label.clone();
         let tsk = task.clone();
+        let aha_tx = self.aha_tx.clone();
 
         let handle = tokio::spawn(async move {
             let result = Self::_run_subagent(
@@ -331,6 +341,24 @@ impl SubagentManager {
                 Ok(text) => (text, "completed"),
                 Err(e) => (format!("Error: {}", e), "failed"),
             };
+
+            // Emit aha signal if result matches priority patterns.
+            if let Some(ref tx) = aha_tx {
+                use crate::agent::system_state::{classify_signal, AhaSignal};
+                if let Some(priority) = classify_signal(&result_text) {
+                    let category = if status == "failed" {
+                        "error".to_string()
+                    } else {
+                        "complete".to_string()
+                    };
+                    let _ = tx.send(AhaSignal {
+                        priority,
+                        agent_id: tid.clone(),
+                        category,
+                        message: truncate_for_display(&result_text, 5, 500),
+                    });
+                }
+            }
 
             // Write result to scratch file for persistence across compaction.
             Self::append_event(&workspace, &tid, &lbl, &tsk, &result_text, status);
