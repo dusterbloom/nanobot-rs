@@ -1201,7 +1201,7 @@ pub(crate) fn cmd_agent(
                 display_rx,
                 cron_service,
                 email_config,
-                rl,
+                rl: Some(rl),
                 watchdog_handle: None,
                 restart_tx: restart_tx.clone(),
                 restart_rx,
@@ -1209,66 +1209,50 @@ pub(crate) fn cmd_agent(
                 voice_session: None,
             };
 
-            let _ = ctx.rl.load_history(&history_path);
+            let _ = ctx.rl.as_mut().unwrap().load_history(&history_path);
 
-            // Pre-flight health check: ensure main server can handle requests before starting REPL.
+            // Pre-flight health check: wait for llama-server to finish loading, then verify chat works.
             if is_local {
-                let max_attempts = 10;
-                let mut attempt = 0;
                 let main_port = ctx.srv.local_port.clone();
-                
-                print!(
-                    "  {}{}Verifying{} server readiness... ",
-                    tui::BOLD, tui::YELLOW, tui::RESET
-                );
-                io::stdout().flush().ok();
+                let health_url = format!("http://localhost:{}/health", main_port);
 
-                while attempt < max_attempts {
-                    // Use deep health check that actually tests chat endpoint
-                    if server::check_chat_health(&main_port).await {
-                        println!("{}{}OK{}", tui::BOLD, tui::GREEN, tui::RESET);
-                        break;
-                    }
-                    attempt += 1;
-                    if attempt < max_attempts {
-                        print!(
-                            "  {}{}attempt {}/{}{}\r",
-                            tui::BOLD, tui::YELLOW, attempt, max_attempts, tui::RESET
-                        );
-                        io::stdout().flush().ok();
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                }
-
-                if attempt >= max_attempts {
-                    println!(
-                        "\n  {}{}Server not ready after {} attempts. Attempting restart...{}",
-                        tui::BOLD, tui::RED, max_attempts, tui::RESET
-                    );
-                    ctx.cmd_restart().await;
-                    
-                    // Wait for restart to complete and verify
-                    print!(
-                        "  {}{}Waiting{} for server... ",
-                        tui::BOLD, tui::YELLOW, tui::RESET
-                    );
-                    io::stdout().flush().ok();
-                    
-                    for i in 0..10 {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        if server::check_chat_health(&ctx.srv.local_port).await {
-                            println!("{}{}OK{}", tui::BOLD, tui::GREEN, tui::RESET);
+                // Phase 1: wait for /health (lightweight — just checks the process is up).
+                let mut server_up = false;
+                for _ in 0..20 {
+                    if let Ok(resp) = reqwest::get(&health_url).await {
+                        if resp.status().is_success() {
+                            server_up = true;
                             break;
                         }
-                        if i == 9 {
-                            println!(
-                                "{}{}FAILED{}",
-                                tui::BOLD, tui::RED, tui::RESET
-                            );
-                            println!(
-                                "  {}{}ERROR: Server failed to start. Check llama.cpp logs.{}",
-                                tui::BOLD, tui::RED, tui::RESET
-                            );
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+
+                if server_up {
+                    // Phase 2: one deep check to confirm chat completions work.
+                    if !server::check_chat_health(&main_port).await {
+                        println!(
+                            "  {}{}Server responded to /health but chat endpoint failed — restarting...{}",
+                            tui::BOLD, tui::RED, tui::RESET
+                        );
+                        ctx.cmd_restart().await;
+                        for _ in 0..10 {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            if server::check_chat_health(&ctx.srv.local_port).await {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    println!(
+                        "  {}{}Server not responding — restarting...{}",
+                        tui::BOLD, tui::RED, tui::RESET
+                    );
+                    ctx.cmd_restart().await;
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if server::check_chat_health(&ctx.srv.local_port).await {
+                            break;
                         }
                     }
                 }
@@ -1410,7 +1394,7 @@ pub(crate) fn cmd_agent(
                 } else {
                     match ctx.readline_async(&prompt).await {
                         Ok(line) => {
-                            let _ = ctx.rl.add_history_entry(&line);
+                            let _ = ctx.rl.as_mut().unwrap().add_history_entry(&line);
                             input_text = line;
                         }
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -1422,7 +1406,7 @@ pub(crate) fn cmd_agent(
                 {
                     match ctx.readline_async(&prompt).await {
                         Ok(line) => {
-                            let _ = ctx.rl.add_history_entry(&line);
+                            let _ = ctx.rl.as_mut().unwrap().add_history_entry(&line);
                             input_text = line;
                         }
                         Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -1609,7 +1593,7 @@ pub(crate) fn cmd_agent(
 
             // Cleanup: stop heartbeat, save readline history, kill servers
             heartbeat.stop().await;
-            let _ = ctx.rl.save_history(&history_path);
+            let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
             ctx.srv.shutdown();
 
             // Re-index qmd sessions collection so the latest conversation is

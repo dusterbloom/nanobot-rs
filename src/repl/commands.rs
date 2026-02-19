@@ -44,7 +44,7 @@ pub(crate) struct ReplContext {
     pub display_rx: mpsc::UnboundedReceiver<String>,
     pub cron_service: Arc<CronService>,
     pub email_config: Option<EmailConfig>,
-    pub rl: rustyline::DefaultEditor,
+    pub rl: Option<rustyline::DefaultEditor>,
     /// Health watchdog task handle — aborted on mode switch, restarted on `/local`.
     pub watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     /// Sender for auto-restart requests (passed to watchdog).
@@ -93,6 +93,7 @@ impl ReplContext {
             ports,
             self.display_tx.clone(),
             self.restart_tx.clone(),
+            Arc::clone(&self.core_handle.counters.inference_active),
         ));
     }
 
@@ -144,13 +145,33 @@ impl ReplContext {
                     &mut self.srv.delegation_port,
                 ).await;
                 if self.srv.delegation_port.is_some() {
-                    self.core_handle
-                        .counters
-                        .delegation_healthy
-                        .store(true, Ordering::Relaxed);
-                    let _ = self.display_tx.send(format!(
-                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Delegation server \x1b[32mready\x1b[0m\n"
-                    ));
+                    // Wait for delegation server to become healthy before declaring ready
+                    let port = self.srv.delegation_port.as_ref().unwrap().clone();
+                    let mut ready = false;
+                    for i in 0..10 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let url = format!("http://localhost:{}/health", port);
+                        if let Ok(resp) = reqwest::get(&url).await {
+                            if resp.status().is_success() {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        if i == 9 {
+                            let _ = self.display_tx.send(format!(
+                                "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Delegation server failed to start\n"
+                            ));
+                        }
+                    }
+                    if ready {
+                        self.core_handle
+                            .counters
+                            .delegation_healthy
+                            .store(true, Ordering::Relaxed);
+                        let _ = self.display_tx.send(format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Delegation server \x1b[32mready\x1b[0m\n"
+                        ));
+                    }
                 }
                 restarted = true;
             } else if req.role == "compaction" {
@@ -168,6 +189,22 @@ impl ReplContext {
                     ctx_size,
                 ).await;
                 if self.srv.compaction_port.is_some() {
+                    // Wait for compaction server to become healthy before declaring ready
+                    let port = self.srv.compaction_port.as_ref().unwrap().clone();
+                    for i in 0..10 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let url = format!("http://localhost:{}/health", port);
+                        if let Ok(resp) = reqwest::get(&url).await {
+                            if resp.status().is_success() {
+                                break;
+                            }
+                        }
+                        if i == 9 {
+                            let _ = self.display_tx.send(format!(
+                                "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Compaction server failed to start\n"
+                            ));
+                        }
+                    }
                     let _ = self.display_tx.send(format!(
                         "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Compaction server \x1b[32mready\x1b[0m\n"
                     ));
@@ -197,13 +234,11 @@ impl ReplContext {
     /// while `readline()` blocks on a background thread.  This way results
     /// appear immediately instead of waiting until the next user input.
     pub async fn readline_async(&mut self, prompt: &str) -> Result<String, ReadlineError> {
-        let printer_result = self.rl.create_external_printer();
+        // Take the editor out of the Option — no placeholder DefaultEditor created,
+        // so no second SIGWINCH handler is registered.
+        let mut rl = self.rl.take().expect("editor already borrowed");
+        let printer_result = rl.create_external_printer();
 
-        // Move the editor to a blocking thread so we can select! on display_rx.
-        let mut rl = std::mem::replace(
-            &mut self.rl,
-            rustyline::DefaultEditor::new().expect("DefaultEditor::new"),
-        );
         let prompt_owned = prompt.to_string();
         let handle = tokio::task::spawn_blocking(move || {
             let result = rl.readline(&prompt_owned);
@@ -216,7 +251,7 @@ impl ReplContext {
                 tokio::select! {
                     res = &mut handle => {
                         let (rl_back, readline_res) = res.expect("readline task panicked");
-                        self.rl = rl_back;
+                        self.rl = Some(rl_back);
                         break readline_res;
                     }
                     Some(line) = self.display_rx.recv() => {
@@ -232,7 +267,7 @@ impl ReplContext {
         } else {
             // No external printer available — just wait for readline.
             let (rl_back, readline_res) = handle.await.expect("readline task panicked");
-            self.rl = rl_back;
+            self.rl = Some(rl_back);
             readline_res
         };
 
@@ -1398,7 +1433,7 @@ impl ReplContext {
             println!("  [{}] {} ({} MB){}", i + 1, name, size_mb, marker);
         }
         let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", models.len());
-        let choice = match self.rl.readline(&model_prompt) {
+        let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
             Ok(line) => line,
             Err(_) => {
                 return;
@@ -1711,7 +1746,7 @@ impl ReplContext {
             println!("  No Telegram bot token found.");
             println!("  Get one from @BotFather on Telegram.\n");
             let tok_prompt = "  Enter bot token: ";
-            let t = match self.rl.readline(tok_prompt) {
+            let t = match self.rl.as_mut().unwrap().readline(tok_prompt) {
                 Ok(line) => line.trim().to_string(),
                 Err(_) => {
                     return;
@@ -1731,7 +1766,7 @@ impl ReplContext {
                 return;
             }
             let save_prompt = "  Save token to config for next time? [Y/n] ";
-            if let Ok(answer) = self.rl.readline(save_prompt) {
+            if let Ok(answer) = self.rl.as_mut().unwrap().readline(save_prompt) {
                 if !answer.trim().eq_ignore_ascii_case("n") {
                     let mut save_cfg = load_config(None);
                     save_cfg.channels.telegram.token = t.clone();
