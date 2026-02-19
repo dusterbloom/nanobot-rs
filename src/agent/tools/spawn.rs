@@ -217,7 +217,7 @@ impl Tool for SpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action to perform: 'spawn' (default), 'list', 'check', 'wait', 'cancel', 'pipeline', or 'loop'",
+                    "description": "Action to perform: 'spawn' (default, requires 'task'), 'check'/'wait'/'cancel' (require 'task_id'), 'pipeline' (requires 'steps'), 'loop' (requires 'task'), or 'list'",
                     "enum": ["spawn", "list", "check", "wait", "cancel", "pipeline", "loop"]
                 },
                 "steps": {
@@ -286,57 +286,7 @@ impl Tool for SpawnTool {
                     "description": "Stop condition text for action='loop'. Loop stops when output contains this text or 'DONE'."
                 }
             },
-            "required": [],
-            "oneOf": [
-                {
-                    "description": "Spawn a new subagent (default action)",
-                    "properties": {
-                        "action": { "enum": ["spawn"] }
-                    },
-                    "required": ["task"]
-                },
-                {
-                    "description": "Check a completed result by task id",
-                    "properties": {
-                        "action": { "enum": ["check"] }
-                    },
-                    "required": ["task_id"]
-                },
-                {
-                    "description": "Wait for completion by task id",
-                    "properties": {
-                        "action": { "enum": ["wait"] }
-                    },
-                    "required": ["task_id"]
-                },
-                {
-                    "description": "Cancel a running task by task id",
-                    "properties": {
-                        "action": { "enum": ["cancel"] }
-                    },
-                    "required": ["task_id"]
-                },
-                {
-                    "description": "Run a multi-step pipeline",
-                    "properties": {
-                        "action": { "enum": ["pipeline"] }
-                    },
-                    "required": ["steps"]
-                },
-                {
-                    "description": "Run an autonomous loop",
-                    "properties": {
-                        "action": { "enum": ["loop"] }
-                    },
-                    "required": ["task"]
-                },
-                {
-                    "description": "List running/recent tasks",
-                    "properties": {
-                        "action": { "enum": ["list"] }
-                    }
-                }
-            ]
+            "required": []
         })
     }
 
@@ -555,9 +505,8 @@ mod tests {
         // No required params (task only needed for spawn, not list/cancel)
         let required = params["required"].as_array().unwrap();
         assert!(required.is_empty());
-        // Action-specific requirements are encoded via oneOf.
-        let one_of = params["oneOf"].as_array().unwrap();
-        assert!(one_of.len() >= 6);
+        // No oneOf — Anthropic rejects it. Requirements are in action description.
+        assert!(params.get("oneOf").is_none());
     }
 
     #[tokio::test]
