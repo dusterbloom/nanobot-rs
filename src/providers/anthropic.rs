@@ -78,10 +78,7 @@ fn normalize_claude_model(name: &str) -> String {
     }
 
     // Partial names without "claude-" prefix (e.g. "opus-4-6", "sonnet-4-5-20250929").
-    if lower.starts_with("opus")
-        || lower.starts_with("sonnet")
-        || lower.starts_with("haiku")
-    {
+    if lower.starts_with("opus") || lower.starts_with("sonnet") || lower.starts_with("haiku") {
         return format!("claude-{}", name);
     }
 
@@ -405,7 +402,12 @@ impl LLMProvider for AnthropicProvider {
             }
         }
 
-        debug!("AnthropicProvider::chat model={} oauth={} messages={}", model, oauth, anthropic_messages.len());
+        debug!(
+            "AnthropicProvider::chat model={} oauth={} messages={}",
+            model,
+            oauth,
+            anthropic_messages.len()
+        );
 
         let mut req = self
             .client
@@ -442,7 +444,10 @@ impl LLMProvider for AnthropicProvider {
         if !status.is_success() {
             warn!("Anthropic API returned {} : {}", status, response_text);
             return Ok(LLMResponse {
-                content: Some(format!("Error calling Anthropic API (HTTP {}): {}", status, response_text)),
+                content: Some(format!(
+                    "Error calling Anthropic API (HTTP {}): {}",
+                    status, response_text
+                )),
                 tool_calls: Vec::new(),
                 finish_reason: "error".to_string(),
                 usage: HashMap::new(),
@@ -512,7 +517,12 @@ impl LLMProvider for AnthropicProvider {
             }
         }
 
-        debug!("AnthropicProvider::chat_stream model={} oauth={} messages={}", model, oauth, anthropic_messages.len());
+        debug!(
+            "AnthropicProvider::chat_stream model={} oauth={} messages={}",
+            model,
+            oauth,
+            anthropic_messages.len()
+        );
 
         let mut req = self
             .client
@@ -535,10 +545,16 @@ impl LLMProvider for AnthropicProvider {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            warn!("Anthropic streaming API returned {}: {}", status, error_text);
+            warn!(
+                "Anthropic streaming API returned {}: {}",
+                status, error_text
+            );
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamChunk::Done(LLMResponse {
-                content: Some(format!("Error calling Anthropic API (HTTP {}): {}", status, error_text)),
+                content: Some(format!(
+                    "Error calling Anthropic API (HTTP {}): {}",
+                    status, error_text
+                )),
                 tool_calls: Vec::new(),
                 finish_reason: "error".to_string(),
                 usage: HashMap::new(),
@@ -604,7 +620,9 @@ async fn parse_anthropic_sse(
         line_buffer.push_str(&text);
 
         while let Some(newline_pos) = line_buffer.find('\n') {
-            let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+            let line = line_buffer[..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
             line_buffer = line_buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() || line.starts_with("event:") {
@@ -634,11 +652,9 @@ async fn parse_anthropic_sse(
                     }
                 }
                 "content_block_start" => {
-                    current_block_index =
-                        data["index"].as_u64().unwrap_or(current_block_index);
+                    current_block_index = data["index"].as_u64().unwrap_or(current_block_index);
                     let block = &data["content_block"];
-                    current_block_type =
-                        block["type"].as_str().unwrap_or("text").to_string();
+                    current_block_type = block["type"].as_str().unwrap_or("text").to_string();
 
                     if current_block_type == "tool_use" {
                         let id = block["id"].as_str().unwrap_or("").to_string();
@@ -738,8 +754,7 @@ async fn parse_anthropic_sse(
     indices.sort();
     for idx in indices {
         let (id, name, args_str) = tool_blocks.remove(&idx).unwrap();
-        let arguments: HashMap<String, Value> =
-            serde_json::from_str(&args_str).unwrap_or_default();
+        let arguments: HashMap<String, Value> = serde_json::from_str(&args_str).unwrap_or_default();
         tool_calls.push(ToolCallRequest {
             id,
             name,
@@ -942,20 +957,29 @@ mod tests {
     #[test]
     fn test_normalize_short_names() {
         assert_eq!(normalize_claude_model("opus"), "claude-opus-4-6");
-        assert_eq!(normalize_claude_model("sonnet"), "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            normalize_claude_model("sonnet"),
+            "claude-sonnet-4-5-20250929"
+        );
         assert_eq!(normalize_claude_model("haiku"), "claude-haiku-4-5-20251001");
     }
 
     #[test]
     fn test_normalize_partial_names() {
         assert_eq!(normalize_claude_model("opus-4-6"), "claude-opus-4-6");
-        assert_eq!(normalize_claude_model("sonnet-4-5-20250929"), "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            normalize_claude_model("sonnet-4-5-20250929"),
+            "claude-sonnet-4-5-20250929"
+        );
     }
 
     #[test]
     fn test_normalize_already_qualified() {
         assert_eq!(normalize_claude_model("claude-opus-4-6"), "claude-opus-4-6");
-        assert_eq!(normalize_claude_model("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514"); // legacy passthrough
+        assert_eq!(
+            normalize_claude_model("claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        ); // legacy passthrough
     }
 
     #[test]

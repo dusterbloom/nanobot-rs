@@ -171,7 +171,9 @@ pub fn generate_arithmetic_task(index: usize, depth: usize, seed: u64) -> Curric
 pub fn generate_fact_retrieval_task(index: usize, num_facts: usize, seed: u64) -> CurriculumTask {
     let mut rng = SimpleRng::new(seed.wrapping_add(index as u64));
 
-    let names = ["Alice", "Bob", "Carol", "David", "Eve", "Frank", "Grace", "Henry"];
+    let names = [
+        "Alice", "Bob", "Carol", "David", "Eve", "Frank", "Grace", "Henry",
+    ];
     let attribute_types = ["age", "height_cm", "score"];
 
     let attr_type = attribute_types[rng.next_range(0, attribute_types.len() as i32) as usize];
@@ -257,7 +259,10 @@ pub fn generate_tool_chain_task(index: usize, num_steps: usize, seed: u64) -> Cu
         }
     }
 
-    steps.push(format!("Step {}: Round to nearest integer. What is the result?", num_steps + 1));
+    steps.push(format!(
+        "Step {}: Round to nearest integer. What is the result?",
+        num_steps + 1
+    ));
 
     let expected = current_value.round() as i64;
     let difficulty = ((num_steps - 1).min(4) + 1) as u8;
@@ -272,18 +277,29 @@ pub fn generate_tool_chain_task(index: usize, num_steps: usize, seed: u64) -> Cu
 }
 
 /// Generate the full curriculum by dispatching to the appropriate generator.
-pub fn generate_curriculum(family: &TaskFamily, num_tasks: usize, seed: u64) -> Vec<CurriculumTask> {
+pub fn generate_curriculum(
+    family: &TaskFamily,
+    num_tasks: usize,
+    seed: u64,
+) -> Vec<CurriculumTask> {
     (0..num_tasks)
         .map(|index| match family {
             TaskFamily::ArithmeticChain { depth } => generate_arithmetic_task(index, *depth, seed),
-            TaskFamily::FactRetrieval { num_facts } => generate_fact_retrieval_task(index, *num_facts, seed),
-            TaskFamily::ToolChain { num_steps } => generate_tool_chain_task(index, *num_steps, seed),
+            TaskFamily::FactRetrieval { num_facts } => {
+                generate_fact_retrieval_task(index, *num_facts, seed)
+            }
+            TaskFamily::ToolChain { num_steps } => {
+                generate_tool_chain_task(index, *num_steps, seed)
+            }
         })
         .collect()
 }
 
 /// Compute sliding window metrics. Each window of `window_size` tasks produces one WindowMetrics.
-pub fn compute_sliding_window(executions: &[TaskExecution], window_size: usize) -> Vec<WindowMetrics> {
+pub fn compute_sliding_window(
+    executions: &[TaskExecution],
+    window_size: usize,
+) -> Vec<WindowMetrics> {
     if executions.len() < window_size {
         return Vec::new();
     }
@@ -327,8 +343,10 @@ pub fn compute_forward_transfer(executions: &[TaskExecution]) -> f64 {
     let first_half = &executions[..mid];
     let second_half = &executions[mid..];
 
-    let first_success = first_half.iter().filter(|e| e.success).count() as f64 / first_half.len() as f64;
-    let second_success = second_half.iter().filter(|e| e.success).count() as f64 / second_half.len() as f64;
+    let first_success =
+        first_half.iter().filter(|e| e.success).count() as f64 / first_half.len() as f64;
+    let second_success =
+        second_half.iter().filter(|e| e.success).count() as f64 / second_half.len() as f64;
 
     if first_success == 0.0 {
         return 1.0;
@@ -423,7 +441,10 @@ mod tests {
         assert!(!task.expected_answer.is_empty());
 
         // Verify the answer is a valid number
-        let answer: i32 = task.expected_answer.parse().expect("Answer should be a number");
+        let answer: i32 = task
+            .expected_answer
+            .parse()
+            .expect("Answer should be a number");
         assert!(answer >= 0, "Answer should be non-negative");
     }
 
@@ -436,7 +457,9 @@ mod tests {
         assert!(!task.expected_answer.is_empty());
 
         // The answer should be one of the standard names
-        let valid_names = ["Alice", "Bob", "Carol", "David", "Eve", "Frank", "Grace", "Henry"];
+        let valid_names = [
+            "Alice", "Bob", "Carol", "David", "Eve", "Frank", "Grace", "Henry",
+        ];
         assert!(valid_names.contains(&task.expected_answer.as_str()));
     }
 

@@ -274,7 +274,10 @@ impl ContentGate {
         let target_tokens = available / 2;
 
         // Try LLM briefing, fall back to mechanical briefing on failure.
-        let summary = match compactor.summarize_for_briefing(content, target_tokens).await {
+        let summary = match compactor
+            .summarize_for_briefing(content, target_tokens)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("Briefing LLM failed, using simple briefing: {}", e);
@@ -364,11 +367,8 @@ mod tests {
     use std::path::Path;
 
     fn test_cache_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nanobot_gate_test_{}_{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nanobot_gate_test_{}_{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir); // clean slate
         let _ = std::fs::create_dir_all(&dir);
         dir
@@ -534,9 +534,7 @@ mod tests {
         let mut gate = ContentGate::new(50, 0.20, dir.clone());
 
         let content = "a\n".repeat(200);
-        let result = gate.admit(&content, |_c, _target| {
-            "custom briefing".to_string()
-        });
+        let result = gate.admit(&content, |_c, _target| "custom briefing".to_string());
         match result {
             GateResult::Briefing { summary, .. } => {
                 assert_eq!(summary, "custom briefing");

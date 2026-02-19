@@ -18,12 +18,14 @@ use tracing::{debug, info, warn};
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::provenance::{ClaimVerifier, ClaimStatus};
+use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
 use crate::cli;
 use crate::config::loader::{get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
-use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
+use crate::heartbeat::service::{
+    HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
+};
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::server;
@@ -147,7 +149,10 @@ pub(crate) fn parse_ctx_arg(arg: &str) -> Result<Option<usize>, &'static str> {
     }
     let lower = s.to_lowercase();
     let n = if let Some(prefix) = lower.strip_suffix('k') {
-        prefix.parse::<usize>().map(|n| n * 1024).map_err(|_| "invalid number")?
+        prefix
+            .parse::<usize>()
+            .map(|n| n * 1024)
+            .map_err(|_| "invalid number")?
     } else {
         lower.parse::<usize>().map_err(|_| "invalid number")?
     };
@@ -169,13 +174,35 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 
 /// Build the REPL prompt string based on current mode.
 pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
-    let think_prefix = if thinking_on { "\x1b[2m\u{1f9e0}\x1b[0m" } else { "" };
-    if voice_on {
-        format!("{}{}{}~>{} ", think_prefix, crate::tui::BOLD, crate::tui::MAGENTA, crate::tui::RESET)
-    } else if is_local {
-        format!("{}{}{}L>{} ", think_prefix, crate::tui::BOLD, crate::tui::YELLOW, crate::tui::RESET)
+    let think_prefix = if thinking_on {
+        "\x1b[2m\u{1f9e0}\x1b[0m"
     } else {
-        format!("{}{}{}>{} ", think_prefix, crate::tui::BOLD, crate::tui::GREEN, crate::tui::RESET)
+        ""
+    };
+    if voice_on {
+        format!(
+            "{}{}{}~>{} ",
+            think_prefix,
+            crate::tui::BOLD,
+            crate::tui::MAGENTA,
+            crate::tui::RESET
+        )
+    } else if is_local {
+        format!(
+            "{}{}{}L>{} ",
+            think_prefix,
+            crate::tui::BOLD,
+            crate::tui::YELLOW,
+            crate::tui::RESET
+        )
+    } else {
+        format!(
+            "{}{}{}>{} ",
+            think_prefix,
+            crate::tui::BOLD,
+            crate::tui::GREEN,
+            crate::tui::RESET
+        )
     }
 }
 
@@ -185,7 +212,7 @@ pub(crate) fn print_help() {
     println!("  /local, /l      - Toggle between local and cloud mode");
     println!("  /model, /m      - Select local model from ~/models/");
     println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
-    println!("  /think, /t      - Toggle extended thinking / reasoning mode");
+    println!("  /think, /t      - Toggle extended thinking (/thinking on|off|N)");
     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
     println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
     println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
@@ -198,7 +225,7 @@ pub(crate) fn print_help() {
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
     println!("  /memory         - Show working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
-    println!("  /restart, /rd   - Restart delegation server");
+    println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
@@ -317,7 +344,18 @@ pub(crate) async fn stream_and_render(
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
 ) -> String {
-    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, false, None).await.0
+    stream_and_render_inner(
+        agent_loop,
+        input,
+        session_id,
+        channel,
+        lang,
+        core_handle,
+        false,
+        None,
+    )
+    .await
+    .0
 }
 
 /// Like `stream_and_render` but skips the user text erase-and-reprint.
@@ -335,7 +373,17 @@ pub(crate) async fn stream_and_render_voice(
     core_handle: &SharedCoreHandle,
     tts_sentence_tx: Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>,
 ) -> (String, bool) {
-    stream_and_render_inner(agent_loop, input, session_id, channel, lang, core_handle, true, tts_sentence_tx).await
+    stream_and_render_inner(
+        agent_loop,
+        input,
+        session_id,
+        channel,
+        lang,
+        core_handle,
+        true,
+        tts_sentence_tx,
+    )
+    .await
 }
 
 async fn stream_and_render_inner(
@@ -354,7 +402,9 @@ async fn stream_and_render_inner(
         let prompt_and_input = format!("> {}", input);
         let raw_lines = tui::terminal_rows(&prompt_and_input, 0);
         print!("\x1b[{}A", raw_lines);
-        for _ in 0..raw_lines { print!("\x1b[2K\r\n"); }
+        for _ in 0..raw_lines {
+            print!("\x1b[2K\r\n");
+        }
         print!("\x1b[{}A", raw_lines);
         std::io::stdout().flush().ok();
         print!("{}", syntax::render_turn(input, syntax::TurnRole::User));
@@ -562,8 +612,13 @@ async fn stream_and_render_inner(
 
     let response = agent_loop
         .process_direct_streaming(
-            input, session_id, channel, "direct", lang,
-            delta_tx, tool_event_tx,
+            input,
+            session_id,
+            channel,
+            "direct",
+            lang,
+            delta_tx,
+            tool_event_tx,
             Some(cancel_token.clone()),
             Some(inject_rx),
         )
@@ -602,15 +657,18 @@ async fn stream_and_render_inner(
             let entries = audit.get_entries();
             let verifier = ClaimVerifier::new(&entries);
             let annotated = verifier.verify(&response);
-            let claims: Vec<(usize, usize, u8, String)> = annotated.iter().map(|c| {
-                let status = match c.status {
-                    ClaimStatus::Observed => 0u8,
-                    ClaimStatus::Derived => 1,
-                    ClaimStatus::Claimed => 2,
-                    ClaimStatus::Recalled => 3,
-                };
-                (c.span.0, c.span.1, status, c.text.clone())
-            }).collect();
+            let claims: Vec<(usize, usize, u8, String)> = annotated
+                .iter()
+                .map(|c| {
+                    let status = match c.status {
+                        ClaimStatus::Observed => 0u8,
+                        ClaimStatus::Derived => 1,
+                        ClaimStatus::Claimed => 2,
+                        ClaimStatus::Recalled => 3,
+                    };
+                    (c.span.0, c.span.1, status, c.text.clone())
+                })
+                .collect();
             print!("{}", syntax::render_provenance_footer(&claims, strict_mode));
         }
     }
@@ -639,6 +697,8 @@ pub(crate) struct ServerState {
     pub compaction_port: Option<String>,
     pub delegation_process: Option<std::process::Child>,
     pub delegation_port: Option<String>,
+    pub specialist_process: Option<std::process::Child>,
+    pub specialist_port: Option<String>,
     pub local_port: String,
 }
 
@@ -651,6 +711,8 @@ impl ServerState {
             delegation_process: None,
             delegation_port: None,
             local_port: port,
+            specialist_process: None,
+            specialist_port: None,
         }
     }
 
@@ -664,6 +726,9 @@ impl ServerState {
         }
         self.llama_process = None;
         server::kill_tracked_servers();
+        server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
+        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
+        self.stop_specialist();
     }
 
     /// Full shutdown: kill llama + compaction + delegation servers.
@@ -678,38 +743,137 @@ impl ServerState {
         self.llama_process = None;
         server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
         server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
+        self.stop_specialist();
+    }
+
+    fn stop_specialist(&mut self) {
+        server::stop_custom_server(&mut self.specialist_process, &mut self.specialist_port);
+    }
+
+    async fn start_router(&mut self, config: &Config) {
+        if !config.trio.enabled || config.trio.router_model.is_empty() {
+            return;
+        }
+        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
+        if let Some(model_path) = server::resolve_local_model_path(&config.trio.router_model) {
+            server::start_custom_server(
+                &mut self.delegation_process,
+                &mut self.delegation_port,
+                config.trio.router_port,
+                &model_path,
+                config.trio.router_ctx_tokens,
+                "trio-router",
+            )
+            .await;
+        } else {
+            println!(
+                "  {}{}Router model not found:{} {}{}",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                config.trio.router_model,
+                tui::RESET
+            );
+        }
+    }
+
+    async fn start_specialist(&mut self, config: &Config) {
+        self.stop_specialist();
+        if !config.trio.enabled || config.trio.specialist_model.is_empty() {
+            return;
+        }
+        if let Some(model_path) = server::resolve_local_model_path(&config.trio.specialist_model) {
+            server::start_custom_server(
+                &mut self.specialist_process,
+                &mut self.specialist_port,
+                config.trio.specialist_port,
+                &model_path,
+                config.trio.specialist_ctx_tokens,
+                "trio-specialist",
+            )
+            .await;
+        } else {
+            println!(
+                "  {}{}Specialist model not found:{} {}{}",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                config.trio.specialist_model,
+                tui::RESET
+            );
+        }
+    }
+
+    pub async fn start_trio_servers(&mut self, config: &Config) {
+        if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
+            self.stop_specialist();
+            return;
+        }
+        if config.trio.enabled {
+            // Trio lane must not run with legacy compaction/delegation stack.
+            server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
+            let main_base = format!("http://localhost:{}/v1", self.local_port);
+            if !server::check_health(&main_base).await {
+                println!(
+                    "  {}{}Main server is unhealthy; skipping trio startup to avoid cascade failure.{}",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                return;
+            }
+            self.start_router(config).await;
+            if !server::check_health(&main_base).await {
+                println!(
+                    "  {}{}Router startup destabilized main server; stopping trio lanes.{}",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
+                self.stop_specialist();
+                return;
+            }
+            self.start_specialist(config).await;
+            if !server::check_health(&main_base).await {
+                println!(
+                    "  {}{}Specialist startup destabilized main server; stopping trio lanes.{}",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
+                self.stop_specialist();
+            }
+        }
     }
 }
 
 /// Try to start a llama server with the given model and context size.
 ///
-/// On success: updates `state.local_port` and `state.llama_process`, returns `Ok(port_string)`.
+/// Deterministic policy: always bind the pinned `state.local_port`.
+///
+/// On success: updates `state.llama_process`, returns `Ok(port_string)`.
 /// On failure: cleans up and returns `Err(message)`.
 pub(crate) async fn try_start_server(
     state: &mut ServerState,
     model_path: &std::path::Path,
     ctx_size: usize,
 ) -> Result<String, String> {
-    let port = server::find_available_port(8080);
-    match server::spawn_llama_server(port, model_path, ctx_size) {
-        Ok(child) => {
+    let port = state.local_port.parse::<u16>().unwrap_or(8080);
+    state.local_port = port.to_string();
+    match server::spawn_main_server_adaptive(port, model_path, ctx_size).await {
+        Ok((child, used_layers)) => {
             server::record_server_pid("main", child.id());
             state.llama_process = Some(child);
-            if server::wait_for_server_ready(port, 120, &mut state.llama_process).await {
-                let port_str = port.to_string();
-                state.local_port = port_str.clone();
-                Ok(port_str)
-            } else {
-                // Server started but didn't become healthy
-                if let Some(ref mut child) = state.llama_process {
-                    child.kill().ok();
-                    child.wait().ok();
-                }
-                state.llama_process = None;
-                Err("server failed to become ready".to_string())
-            }
+            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
+            println!("  {}Main server allocation: {}{}", tui::DIM, run_mode, tui::RESET);
+            Ok(state.local_port.clone())
         }
-        Err(e) => Err(format!("failed to spawn server: {}", e)),
+        Err(e) => Err(format!(
+            "failed to spawn server on pinned port {}: {}",
+            port, e
+        )),
     }
 }
 
@@ -729,6 +893,7 @@ pub(crate) fn apply_server_change(
         model_path.file_name().and_then(|n| n.to_str()),
         state.compaction_port.as_deref(),
         state.delegation_port.as_deref(),
+        state.specialist_port.as_deref(),
     );
 }
 
@@ -758,7 +923,10 @@ pub(crate) async fn start_with_fallback(
         Err(e) => {
             println!(
                 "  {}{}Server failed:{} {}",
-                tui::BOLD, tui::YELLOW, tui::RESET, e
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                e
             );
         }
     }
@@ -781,7 +949,10 @@ pub(crate) async fn start_with_fallback(
             Err(e) => {
                 println!(
                     "  {}{}Fallback also failed:{} {}",
-                    tui::BOLD, tui::YELLOW, tui::RESET, e
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET,
+                    e
                 );
             }
         }
@@ -790,7 +961,9 @@ pub(crate) async fn start_with_fallback(
     // Both failed — switch to cloud
     println!(
         "  {}{}Switching to cloud mode{}",
-        tui::BOLD, tui::YELLOW, tui::RESET
+        tui::BOLD,
+        tui::YELLOW,
+        tui::RESET
     );
     crate::LOCAL_MODE.store(false, Ordering::SeqCst);
     StartOutcome::CloudFallback
@@ -807,7 +980,12 @@ pub(crate) struct ActiveChannel {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
-pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag: bool, lang: Option<String>) {
+pub(crate) fn cmd_agent(
+    message: Option<String>,
+    session_id: String,
+    local_flag: bool,
+    lang: Option<String>,
+) {
     let config = load_config(None);
 
     // Resolve voice language: CLI --lang > config voice.language > None (auto)
@@ -834,7 +1012,12 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
         let has_oauth = dirs::home_dir()
             .map(|h| h.join(".claude").join(".credentials.json").exists())
             .unwrap_or(false);
-        if api_key.is_none() && !has_prefix && !model.starts_with("bedrock/") && !model.starts_with("claude-max") && !has_oauth {
+        if api_key.is_none()
+            && !has_prefix
+            && !model.starts_with("bedrock/")
+            && !model.starts_with("claude-max")
+            && !has_oauth
+        {
             eprintln!("Error: No API key configured.");
             eprintln!("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey");
             eprintln!("Or authenticate with Claude CLI: claude login");
@@ -853,7 +1036,60 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
         } else {
             &config.agents.defaults.local_model
         };
-        let core_handle = cli::build_core_handle(&config, &local_port, Some(local_model_name), None, None);
+
+        // In local mode with single-message (-m), just start main server.
+        // Trio is for interactive sessions - single messages use inline tools.
+        let mut trio_state: Option<ServerState> = None;
+        let (delegation_port, specialist_port) = if is_local && message.is_some() {
+            let mut srv = ServerState::new(local_port.clone());
+            
+            // Resolve model path
+            let models_dir = dirs::home_dir().unwrap().join("models");
+            let model_path = if !config.agents.defaults.local_model.is_empty() {
+                let saved_path = models_dir.join(&config.agents.defaults.local_model);
+                if saved_path.exists() { saved_path } else { models_dir.join(server::DEFAULT_LOCAL_MODEL) }
+            } else {
+                models_dir.join(server::DEFAULT_LOCAL_MODEL)
+            };
+            
+            // Start main server only (no trio for single-message mode)
+            let ctx_size = config.agents.defaults.max_context_tokens;
+            match try_start_server(&mut srv, &model_path, ctx_size).await {
+                Ok(_) => {
+                    // Wait for main server to be healthy
+                    let main_base = format!("http://localhost:{}/v1", srv.local_port);
+                    for i in 0..30 {
+                        if server::check_health(&main_base).await {
+                            break;
+                        }
+                        if i == 29 {
+                            eprintln!("Warning: Main server health check timed out");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to start local server: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            
+            trio_state = Some(srv);
+            (None::<String>, None::<String>) // No trio in single-message mode
+        } else {
+            (None, None)
+        };
+
+        // For single-message mode: no trio, use inline tools.
+        // For interactive mode: trio starts after splash if VRAM allows.
+        let core_handle = cli::build_core_handle(
+            &config,
+            &local_port,
+            Some(local_model_name),
+            None,
+            delegation_port.as_deref(),
+            specialist_port.as_deref(),
+        );
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
 
@@ -871,13 +1107,27 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
         let (display_tx, display_rx) = mpsc::unbounded_channel::<String>();
 
         let agent_loop = cli::create_agent_loop(
-            core_handle.clone(), &config, Some(cron_service.clone()), email_config.clone(), Some(display_tx.clone()),
+            core_handle.clone(),
+            &config,
+            Some(cron_service.clone()),
+            email_config.clone(),
+            Some(display_tx.clone()),
         );
 
         if let Some(msg) = message {
             // Single-message mode: process and exit.
+            // Keep trio servers alive during processing (they're dropped at end of scope).
+            let _servers = &trio_state;
             let mut agent_loop = agent_loop;
-            stream_and_render(&mut agent_loop, &msg, &session_id, "cli", None, &core_handle).await;
+            stream_and_render(
+                &mut agent_loop,
+                &msg,
+                &session_id,
+                "cli",
+                None,
+                &core_handle,
+            )
+            .await;
             index_sessions_background();
         } else {
             // Interactive REPL mode.
@@ -903,6 +1153,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
             // Auto-spawn delegation server for cloud mode
             if !is_local
+                && !config.trio.enabled
                 && config.tool_delegation.enabled
                 && config.tool_delegation.auto_local
                 && config.tool_delegation.provider.is_none()
@@ -910,20 +1161,24 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 server::start_delegation_if_available(
                     &mut srv.delegation_process,
                     &mut srv.delegation_port,
-                ).await;
+                )
+                .await;
                 if srv.delegation_port.is_some() {
                     cli::rebuild_core(
-                        &core_handle, &config, &local_port,
-                        Some(local_model_name), None,
+                        &core_handle,
+                        &config,
+                        &local_port,
+                        Some(local_model_name),
+                        None,
                         srv.delegation_port.as_deref(),
+                        None,
                     );
                 }
             }
 
             // Readline editor with history
             let history_path = get_data_dir().join("history.txt");
-            let mut rl = rustyline::DefaultEditor::new()
-                .expect("Failed to create line editor");
+            let mut rl = rustyline::DefaultEditor::new().expect("Failed to create line editor");
 
             // Alt+Enter inserts a newline (multi-line editing) instead of submitting.
             rl.bind_sequence(
@@ -932,6 +1187,7 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             );
 
             // Build ReplContext — all mutable REPL state in one struct.
+            let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut ctx = commands::ReplContext {
                 config,
                 core_handle,
@@ -947,11 +1203,140 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 email_config,
                 rl,
                 watchdog_handle: None,
+                restart_tx: restart_tx.clone(),
+                restart_rx,
                 #[cfg(feature = "voice")]
                 voice_session: None,
             };
 
             let _ = ctx.rl.load_history(&history_path);
+
+            // Pre-flight health check: ensure main server can handle requests before starting REPL.
+            if is_local {
+                let max_attempts = 10;
+                let mut attempt = 0;
+                let main_port = ctx.srv.local_port.clone();
+                
+                print!(
+                    "  {}{}Verifying{} server readiness... ",
+                    tui::BOLD, tui::YELLOW, tui::RESET
+                );
+                io::stdout().flush().ok();
+
+                while attempt < max_attempts {
+                    // Use deep health check that actually tests chat endpoint
+                    if server::check_chat_health(&main_port).await {
+                        println!("{}{}OK{}", tui::BOLD, tui::GREEN, tui::RESET);
+                        break;
+                    }
+                    attempt += 1;
+                    if attempt < max_attempts {
+                        print!(
+                            "  {}{}attempt {}/{}{}\r",
+                            tui::BOLD, tui::YELLOW, attempt, max_attempts, tui::RESET
+                        );
+                        io::stdout().flush().ok();
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+
+                if attempt >= max_attempts {
+                    println!(
+                        "\n  {}{}Server not ready after {} attempts. Attempting restart...{}",
+                        tui::BOLD, tui::RED, max_attempts, tui::RESET
+                    );
+                    ctx.cmd_restart().await;
+                    
+                    // Wait for restart to complete and verify
+                    print!(
+                        "  {}{}Waiting{} for server... ",
+                        tui::BOLD, tui::YELLOW, tui::RESET
+                    );
+                    io::stdout().flush().ok();
+                    
+                    for i in 0..10 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if server::check_chat_health(&ctx.srv.local_port).await {
+                            println!("{}{}OK{}", tui::BOLD, tui::GREEN, tui::RESET);
+                            break;
+                        }
+                        if i == 9 {
+                            println!(
+                                "{}{}FAILED{}",
+                                tui::BOLD, tui::RED, tui::RESET
+                            );
+                            println!(
+                                "  {}{}ERROR: Server failed to start. Check llama.cpp logs.{}",
+                                tui::BOLD, tui::RED, tui::RESET
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Start trio servers in local mode if configured.
+            // This must happen after main server is healthy but before first user message.
+            if is_local && ctx.config.trio.enabled {
+                print!(
+                    "  {}{}Starting{} trio servers... ",
+                    tui::BOLD, tui::YELLOW, tui::RESET
+                );
+                io::stdout().flush().ok();
+                
+                ctx.srv.start_trio_servers(&ctx.config).await;
+                
+                let router_ok = ctx.srv.delegation_port.is_some();
+                let specialist_ok = ctx.srv.specialist_port.is_some();
+                
+                if router_ok || specialist_ok {
+                    println!(
+                        "{}{}OK{} (router={}, specialist={})",
+                        tui::BOLD, tui::GREEN, tui::RESET,
+                        if router_ok { "up" } else { "down" },
+                        if specialist_ok { "up" } else { "down" }
+                    );
+                    
+                    // Rebuild core with trio ports
+                    let model_name = ctx.current_model_path
+                        .file_name()
+                        .and_then(|n| n.to_str());
+                    cli::rebuild_core(
+                        &ctx.core_handle,
+                        &ctx.config,
+                        &ctx.srv.local_port,
+                        model_name,
+                        ctx.srv.compaction_port.as_deref(),
+                        ctx.srv.delegation_port.as_deref(),
+                        ctx.srv.specialist_port.as_deref(),
+                    );
+                    ctx.agent_loop = cli::create_agent_loop(
+                        ctx.core_handle.clone(),
+                        &ctx.config,
+                        Some(ctx.cron_service.clone()),
+                        ctx.email_config.clone(),
+                        Some(ctx.display_tx.clone()),
+                    );
+                } else {
+                    println!(
+                        "{}{}SKIPPED{} (trio models not found)",
+                        tui::BOLD, tui::YELLOW, tui::RESET
+                    );
+                }
+                
+                // Safety check: strictNoToolsMain requires working router
+                if ctx.config.tool_delegation.strict_no_tools_main
+                    && ctx.config.tool_delegation.strict_router_schema
+                    && ctx.core_handle.swappable().router_provider.is_none()
+                {
+                    println!(
+                        "  {}{}WARNING:{} strictNoToolsMain is enabled but trio router is not available.",
+                        tui::BOLD, tui::YELLOW, tui::RESET
+                    );
+                    println!(
+                        "  Tools will be unavailable. Start trio servers or disable strictNoToolsMain."
+                    );
+                }
+            }
 
             // Start heartbeat: maintenance commands run on every tick (no LLM).
             let maintenance_cmds: Vec<String> = DEFAULT_MAINTENANCE_COMMANDS
@@ -980,20 +1365,28 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                 // Drain any pending display messages from background channels.
                 ctx.drain_display();
 
+                // Handle auto-restart requests from watchdog.
+                ctx.handle_restart_requests().await;
+
                 let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
                 let voice_on = ctx.voice_on();
-                let thinking_on = ctx.core_handle.counters.thinking_budget.load(Ordering::SeqCst) > 0;
+                let thinking_on = ctx
+                    .core_handle
+                    .counters
+                    .thinking_budget
+                    .load(Ordering::SeqCst)
+                    > 0;
                 let prompt = build_prompt(is_local, voice_on, thinking_on);
 
                 // Render Claude Code-style input bar below the prompt line.
                 let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
                 ctx.active_channels.retain(|ch| !ch.handle.is_finished());
-                let ch_names: Vec<&str> = ctx.active_channels.iter()
+                let ch_names: Vec<&str> = ctx
+                    .active_channels
+                    .iter()
                     .map(|c| short_channel_name(&c.name))
                     .collect();
-                tui::render_input_bar(
-                    &ctx.core_handle, &ch_names, sa_count, bar_needs_push,
-                );
+                tui::render_input_bar(&ctx.core_handle, &ch_names, sa_count, bar_needs_push);
                 bar_needs_push = false;
 
                 // === GET INPUT ===
@@ -1063,7 +1456,9 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                         keep_recording = false;
 
                         // Phase 1: Record and transcribe (borrows vs briefly).
-                        let transcription = ctx.voice_session.as_mut()
+                        let transcription = ctx
+                            .voice_session
+                            .as_mut()
                             .and_then(|vs| vs.record_and_transcribe().transpose())
                             .transpose();
 
@@ -1072,14 +1467,16 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                 let tts_lang_owned = ctx.lang.clone().unwrap_or(detected_lang);
 
                                 // Render user text with purple ● marker.
-                                print!("{}", syntax::render_turn(&text, syntax::TurnRole::VoiceUser));
+                                print!(
+                                    "{}",
+                                    syntax::render_turn(&text, syntax::TurnRole::VoiceUser)
+                                );
 
                                 // Start streaming TTS pipeline BEFORE LLM call.
-                                let tts_parts = ctx.voice_session.as_mut()
-                                    .and_then(|vs| {
-                                        vs.clear_cancel();
-                                        vs.start_streaming_speak(&tts_lang_owned, None).ok()
-                                    });
+                                let tts_parts = ctx.voice_session.as_mut().and_then(|vs| {
+                                    vs.clear_cancel();
+                                    vs.start_streaming_speak(&tts_lang_owned, None).ok()
+                                });
                                 let (sentence_tx, join_handle) = match tts_parts {
                                     Some((tx, jh)) => (Some(tx), Some(jh)),
                                     None => (None, None),
@@ -1087,10 +1484,15 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
                                 // Phase 2: LLM call with parallel TTS feeding.
                                 let (_response, enter_pressed) = stream_and_render_voice(
-                                    &mut ctx.agent_loop, &text, &ctx.session_id,
-                                    "voice", Some(&tts_lang_owned), &ctx.core_handle,
+                                    &mut ctx.agent_loop,
+                                    &text,
+                                    &ctx.session_id,
+                                    "voice",
+                                    Some(&tts_lang_owned),
+                                    &ctx.core_handle,
                                     sentence_tx,
-                                ).await;
+                                )
+                                .await;
 
                                 ctx.drain_display();
                                 println!();
@@ -1105,13 +1507,16 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
                                     }
                                     keep_recording = true;
                                 } else if let Some(jh) = join_handle {
-                                    let cancel = ctx.voice_session.as_ref()
+                                    let cancel = ctx
+                                        .voice_session
+                                        .as_ref()
                                         .map(|vs| vs.cancel_flag())
                                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                                     let done = Arc::new(AtomicBool::new(false));
                                     let done2 = done.clone();
-                                    let watcher = tui::spawn_interrupt_watcher(cancel.clone(), done2);
-                                    let _ = jh.join();  // blocks until all audio played
+                                    let watcher =
+                                        tui::spawn_interrupt_watcher(cancel.clone(), done2);
+                                    let _ = jh.join(); // blocks until all audio played
                                     done.store(true, Ordering::Relaxed);
                                     let interrupted = watcher.join().unwrap_or(false);
                                     if interrupted {
@@ -1132,7 +1537,9 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
                 // === TEXT INPUT ===
                 let input = input_text.trim();
-                if input.is_empty() { continue; }
+                if input.is_empty() {
+                    continue;
+                }
 
                 // Dispatch slash commands.
                 if input.starts_with('/') && ctx.dispatch(input).await {
@@ -1141,12 +1548,24 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
 
                 // Process message (streaming)
                 let channel = if voice_on { "voice" } else { "cli" };
-                let response = stream_and_render(&mut ctx.agent_loop, input, &ctx.session_id, channel, None, &ctx.core_handle).await;
+                let response = stream_and_render(
+                    &mut ctx.agent_loop,
+                    input,
+                    &ctx.session_id,
+                    channel,
+                    None,
+                    &ctx.core_handle,
+                )
+                .await;
                 ctx.drain_display();
                 println!();
 
                 // Refresh the input bar in place (no scroll push — just update content).
-                let ch_names: Vec<&str> = ctx.active_channels.iter().map(|c| c.name.as_str()).collect();
+                let ch_names: Vec<&str> = ctx
+                    .active_channels
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
                 let sa_count = ctx.agent_loop.subagent_manager().get_running_count().await;
                 tui::render_input_bar(&ctx.core_handle, &ch_names, sa_count, false);
 
@@ -1181,10 +1600,10 @@ pub(crate) fn cmd_agent(message: Option<String>, session_id: String, local_flag:
             // so the shell prompt returns to a clean state.
             {
                 use std::io::Write as _;
-                print!("\x1b[r");      // reset scroll region to full terminal
+                print!("\x1b[r"); // reset scroll region to full terminal
                 let h = tui::terminal_height();
                 print!("\x1b[{};1H", h); // move to last row
-                print!("\x1b[J");      // clear from cursor to end of screen
+                print!("\x1b[J"); // clear from cursor to end of screen
                 std::io::stdout().flush().ok();
             }
 
@@ -1384,7 +1803,10 @@ mod tests {
 
     #[test]
     fn test_truncate_output_max_lines() {
-        let data = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let data = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = truncate_output(&data, 5, 10000);
         assert!(result.lines().count() <= 6); // 5 lines + truncated marker
         assert!(result.contains("...[truncated]"));
@@ -1422,5 +1844,4 @@ mod tests {
             }
         }
     }
-
 }

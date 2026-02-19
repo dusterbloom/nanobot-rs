@@ -56,8 +56,9 @@ impl Tool for ReadFileTool {
             return format!("Error: Not a file: {}", path);
         }
 
-        let content = match tokio::fs::read_to_string(&file_path).await {
-            Ok(c) => c,
+        // Read raw bytes first for binary detection.
+        let bytes = match tokio::fs::read(&file_path).await {
+            Ok(b) => b,
             Err(e) => {
                 return if e.kind() == std::io::ErrorKind::PermissionDenied {
                     format!("Error: Permission denied: {}", path)
@@ -66,6 +67,14 @@ impl Tool for ReadFileTool {
                 }
             }
         };
+
+        // Binary detection: null bytes in first 512 bytes.
+        let check_len = bytes.len().min(512);
+        if bytes[..check_len].contains(&0u8) {
+            return format!("[Binary file: {}, {} bytes]", path, bytes.len());
+        }
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
 
         // If lines parameter is provided, extract the range.
         if let Some(lines_param) = params.get("lines").and_then(|v| v.as_str()) {
@@ -339,12 +348,20 @@ impl Tool for ListDirTool {
 fn extract_line_range(content: &str, range: &str, path: &str) -> String {
     let parts: Vec<&str> = range.splitn(2, ':').collect();
     if parts.len() != 2 {
-        return format!("Error: Invalid lines format '{}'. Use 'start:end' (e.g. '10:50').", range);
+        return format!(
+            "Error: Invalid lines format '{}'. Use 'start:end' (e.g. '10:50').",
+            range
+        );
     }
 
     let start: usize = match parts[0].trim().parse() {
         Ok(n) if n >= 1 => n,
-        _ => return format!("Error: Invalid start line '{}'. Must be a positive integer.", parts[0]),
+        _ => {
+            return format!(
+                "Error: Invalid start line '{}'. Must be a positive integer.",
+                parts[0]
+            )
+        }
     };
 
     let lines: Vec<&str> = content.lines().collect();
@@ -355,12 +372,20 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
     } else {
         match parts[1].trim().parse::<usize>() {
             Ok(n) => n.min(total),
-            _ => return format!("Error: Invalid end line '{}'. Must be a positive integer.", parts[1]),
+            _ => {
+                return format!(
+                    "Error: Invalid end line '{}'. Must be a positive integer.",
+                    parts[1]
+                )
+            }
         }
     };
 
     if start > total {
-        return format!("Error: Start line {} exceeds file length ({} lines).", start, total);
+        return format!(
+            "Error: Start line {} exceeds file length ({} lines).",
+            start, total
+        );
     }
     if start > end {
         return format!("Error: Start line {} is after end line {}.", start, end);
@@ -374,7 +399,10 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
 
     format!(
         "# {} (lines {}-{} of {})\n{}",
-        path, start, end, total,
+        path,
+        start,
+        end,
+        total,
         selected.join("\n")
     )
 }
@@ -762,5 +790,27 @@ mod tests {
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert!(result.contains("'path' parameter is required"));
+    }
+
+    #[tokio::test]
+    async fn test_read_binary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("test.bin");
+        // Write binary content with null bytes.
+        std::fs::write(&bin_path, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+
+        let tool = ReadFileTool;
+        let mut params = HashMap::new();
+        params.insert(
+            "path".to_string(),
+            serde_json::Value::String(bin_path.to_string_lossy().to_string()),
+        );
+        let result = tool.execute(params).await;
+        assert!(
+            result.starts_with("[Binary file:"),
+            "Expected binary detection, got: {}",
+            result
+        );
+        assert!(result.contains("bytes]"));
     }
 }

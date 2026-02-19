@@ -66,7 +66,9 @@ pub fn infer_phase(recent_tools: &[&str]) -> TaskPhase {
     let last3: Vec<&str> = recent_tools.iter().rev().take(3).copied().collect();
 
     // Most-specific first: check for file editing (read + write/edit combo).
-    let has_file_write = last3.iter().any(|t| *t == "write_file" || *t == "edit_file");
+    let has_file_write = last3
+        .iter()
+        .any(|t| *t == "write_file" || *t == "edit_file");
     let has_file_read = last3.iter().any(|t| *t == "read_file" || *t == "list_dir");
     if has_file_write {
         return TaskPhase::FileEditing;
@@ -78,7 +80,10 @@ pub fn infer_phase(recent_tools: &[&str]) -> TaskPhase {
     }
 
     // Web research.
-    if last3.iter().any(|t| *t == "web_search" || *t == "web_fetch") {
+    if last3
+        .iter()
+        .any(|t| *t == "web_search" || *t == "web_fetch")
+    {
         return TaskPhase::WebResearch;
     }
 
@@ -192,7 +197,11 @@ pub fn format_grounding(state: &SystemState) -> String {
         state.turn_number,
         state.context_pressure * 100.0,
         state.task_phase,
-        if state.delegation_healthy { "ok" } else { "down" },
+        if state.delegation_healthy {
+            "ok"
+        } else {
+            "down"
+        },
         state.active_subagents,
         if state.pending_aha_signals > 0 {
             format!(" {} pending signals.", state.pending_aha_signals)
@@ -249,8 +258,12 @@ pub fn classify_signal(content: &str) -> Option<AhaPriority> {
     let lower = content.to_lowercase();
 
     // Critical: errors, failures, security issues.
-    if lower.contains("error") || lower.contains("failed") || lower.contains("panic")
-        || lower.contains("security") || lower.contains("vulnerability") || lower.contains("unsafe")
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("security")
+        || lower.contains("vulnerability")
+        || lower.contains("unsafe")
     {
         return Some(AhaPriority::Critical);
     }
@@ -352,19 +365,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_zero_max_context() {
-        let state = SystemState::snapshot(
-            TaskPhase::Idle,
-            50_000,
-            0,
-            1,
-            2,
-            0,
-            true,
-            0,
-            true,
-            0,
-            0,
-        );
+        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 0, 1, 2, 0, true, 0, true, 0, 0);
         assert_eq!(state.context_pressure, 0.0);
     }
 
@@ -446,19 +447,8 @@ mod tests {
 
     #[test]
     fn test_format_grounding_with_signals() {
-        let state = SystemState::snapshot(
-            TaskPhase::Idle,
-            0,
-            100_000,
-            1,
-            1,
-            0,
-            true,
-            0,
-            true,
-            0,
-            3,
-        );
+        let state =
+            SystemState::snapshot(TaskPhase::Idle, 0, 100_000, 1, 1, 0, true, 0, true, 0, 3);
         let text = format_grounding(&state);
         assert!(text.contains("3 pending signals"));
     }
@@ -483,10 +473,7 @@ mod tests {
 
     #[test]
     fn test_classify_signal_normal_completion() {
-        assert_eq!(
-            classify_signal("task complete"),
-            Some(AhaPriority::Normal)
-        );
+        assert_eq!(classify_signal("task complete"), Some(AhaPriority::Normal));
     }
 
     #[test]
@@ -512,8 +499,14 @@ mod tests {
 
     #[test]
     fn test_task_phase_from_str_loose() {
-        assert_eq!(TaskPhase::from_str_loose("file_editing"), Some(TaskPhase::FileEditing));
-        assert_eq!(TaskPhase::from_str_loose("FileEditing"), Some(TaskPhase::FileEditing));
+        assert_eq!(
+            TaskPhase::from_str_loose("file_editing"),
+            Some(TaskPhase::FileEditing)
+        );
+        assert_eq!(
+            TaskPhase::from_str_loose("FileEditing"),
+            Some(TaskPhase::FileEditing)
+        );
         assert_eq!(TaskPhase::from_str_loose("idle"), Some(TaskPhase::Idle));
         assert_eq!(TaskPhase::from_str_loose("nonsense"), None);
     }

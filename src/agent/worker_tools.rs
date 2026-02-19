@@ -465,7 +465,11 @@ fn json_to_md_table(input: &str) -> String {
     // Separator.
     lines.push(format!(
         "| {} |",
-        headers.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+        headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
     ));
     // Data rows.
     for item in &arr {
@@ -605,7 +609,11 @@ mod tests {
         args.insert("command".to_string(), json!("false")); // exit code 1
         args.insert("expect_exit_code".to_string(), json!(1));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("PASS"), "Expected PASS with exit 1, got: {}", result);
+        assert!(
+            result.starts_with("PASS"),
+            "Expected PASS with exit 1, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -613,7 +621,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("rm -rf /"));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("BLOCKED"), "Expected BLOCKED, got: {}", result);
+        assert!(
+            result.starts_with("BLOCKED"),
+            "Expected BLOCKED, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -621,7 +633,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("command".to_string(), json!("echo test"));
         let result = execute_verify(&args).await;
-        assert!(result.starts_with("PASS"), "Expected PASS with no expectations, got: {}", result);
+        assert!(
+            result.starts_with("PASS"),
+            "Expected PASS with no expectations, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -637,7 +653,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("raise ValueError('oops')"));
         let result = execute_python_eval(&args).await;
-        assert!(result.starts_with("Error:"), "Expected error, got: {}", result);
+        assert!(
+            result.starts_with("Error:"),
+            "Expected error, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -653,18 +673,31 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("code".to_string(), json!("print('x' * 5000)"));
         let result = execute_python_eval(&args).await;
-        assert!(result.len() <= 2000, "Output should be truncated to 2000 chars, got {}", result.len());
+        assert!(
+            result.len() <= 2000,
+            "Output should be truncated to 2000 chars, got {}",
+            result.len()
+        );
     }
 
     #[tokio::test]
     async fn test_diff_apply_missing_file() {
         let mut args = HashMap::new();
-        args.insert("path".to_string(), json!("/tmp/nonexistent_nanobot_test_file.txt"));
-        args.insert("diff".to_string(), json!("--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new"));
+        args.insert(
+            "path".to_string(),
+            json!("/tmp/nonexistent_nanobot_test_file.txt"),
+        );
+        args.insert(
+            "diff".to_string(),
+            json!("--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new"),
+        );
         let result = execute_diff_apply(&args, None).await;
         // Patch should fail since file doesn't exist
-        assert!(result.contains("fail") || result.contains("Error") || result.contains("Patch"),
-            "Expected failure for missing file, got: {}", result);
+        assert!(
+            result.contains("fail") || result.contains("Error") || result.contains("Patch"),
+            "Expected failure for missing file, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -682,11 +715,19 @@ mod tests {
         args.insert("path".to_string(), json!(file_path.to_str().unwrap()));
         args.insert("diff".to_string(), json!(diff));
         let result = execute_diff_apply(&args, None).await;
-        assert!(result.contains("success"), "Expected success, got: {}", result);
+        assert!(
+            result.contains("success"),
+            "Expected success, got: {}",
+            result
+        );
 
         // Verify file was patched.
         let content = std::fs::read_to_string(&file_path).unwrap();
-        assert!(content.contains("line TWO"), "File should be patched, got: {}", content);
+        assert!(
+            content.contains("line TWO"),
+            "File should be patched, got: {}",
+            content
+        );
     }
 
     #[test]
@@ -726,7 +767,10 @@ mod tests {
     #[tokio::test]
     async fn test_fmt_convert_json_to_csv() {
         let mut args = HashMap::new();
-        args.insert("input".to_string(), json!(r#"[{"name":"Alice","age":30},{"name":"Bob","age":25}]"#));
+        args.insert(
+            "input".to_string(),
+            json!(r#"[{"name":"Alice","age":30},{"name":"Bob","age":25}]"#),
+        );
         args.insert("from".to_string(), json!("json"));
         args.insert("to".to_string(), json!("csv"));
         let result = execute_fmt_convert(&args).await;
@@ -750,11 +794,18 @@ mod tests {
     #[tokio::test]
     async fn test_fmt_convert_json_to_md_table() {
         let mut args = HashMap::new();
-        args.insert("input".to_string(), json!(r#"[{"name":"Alice","score":95}]"#));
+        args.insert(
+            "input".to_string(),
+            json!(r#"[{"name":"Alice","score":95}]"#),
+        );
         args.insert("from".to_string(), json!("json"));
         args.insert("to".to_string(), json!("md_table"));
         let result = execute_fmt_convert(&args).await;
-        assert!(result.contains("|"), "Should be a markdown table: {}", result);
+        assert!(
+            result.contains("|"),
+            "Should be a markdown table: {}",
+            result
+        );
         assert!(result.contains("---"), "Should have separator: {}", result);
         assert!(result.contains("Alice"), "Should have data: {}", result);
     }
@@ -779,7 +830,10 @@ mod tests {
         args.insert("from".to_string(), json!("csv"));
         args.insert("to".to_string(), json!("csv"));
         let result = execute_fmt_convert(&args).await;
-        assert_eq!(result, "some data", "Identity conversion should return input unchanged");
+        assert_eq!(
+            result, "some data",
+            "Identity conversion should return input unchanged"
+        );
     }
 
     #[tokio::test]
@@ -789,7 +843,11 @@ mod tests {
         args.insert("from".to_string(), json!("xml"));
         args.insert("to".to_string(), json!("json"));
         let result = execute_fmt_convert(&args).await;
-        assert!(result.contains("unsupported"), "Should report unsupported: {}", result);
+        assert!(
+            result.contains("unsupported"),
+            "Should report unsupported: {}",
+            result
+        );
     }
 
     #[test]
@@ -799,6 +857,10 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        assert!(names.contains(&"fmt_convert"), "Should include fmt_convert, got: {:?}", names);
+        assert!(
+            names.contains(&"fmt_convert"),
+            "Should include fmt_convert, got: {:?}",
+            names
+        );
     }
 }

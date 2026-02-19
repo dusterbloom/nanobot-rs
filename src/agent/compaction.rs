@@ -6,8 +6,8 @@
 //!
 //! Stage 1 is handled here. Stage 2 is `TokenBudget::trim_to_fit()` in agent_loop.rs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -42,14 +42,20 @@ impl ReaderProfile {
     /// Infer reader capability from model name.
     pub fn from_model(model: &str) -> Self {
         let lower = model.to_lowercase();
-        let capability = if lower.contains("3b") || lower.contains("0.5b")
-            || lower.contains("1.7b") || lower.contains("1b")
-            || lower.contains("ministral") || lower.contains("nanbeige")
+        let capability = if lower.contains("3b")
+            || lower.contains("0.5b")
+            || lower.contains("1.7b")
+            || lower.contains("1b")
+            || lower.contains("ministral")
+            || lower.contains("nanbeige")
         {
             ReaderCapability::Minimal
-        } else if lower.contains("claude") || lower.contains("gpt-4")
-            || lower.contains("opus") || lower.contains("sonnet")
-            || lower.contains("gemini-2") || lower.contains("gemini-1.5")
+        } else if lower.contains("claude")
+            || lower.contains("gpt-4")
+            || lower.contains("opus")
+            || lower.contains("sonnet")
+            || lower.contains("gemini-2")
+            || lower.contains("gemini-1.5")
         {
             ReaderCapability::Advanced
         } else {
@@ -61,7 +67,10 @@ impl ReaderProfile {
             ReaderCapability::Standard => 32768,
             ReaderCapability::Advanced => 200000,
         };
-        Self { context_budget, capability }
+        Self {
+            context_budget,
+            capability,
+        }
     }
 }
 
@@ -123,7 +132,11 @@ pub enum MessageTier {
 /// Classify a message into a memory tier based on its position from the end.
 ///
 /// `msg_index_from_end`: 0 = most recent, 1 = second most recent, etc.
-pub fn classify_tier(msg_index_from_end: usize, raw_window: usize, light_window: usize) -> MessageTier {
+pub fn classify_tier(
+    msg_index_from_end: usize,
+    raw_window: usize,
+    light_window: usize,
+) -> MessageTier {
     if msg_index_from_end <= raw_window {
         MessageTier::Raw
     } else if msg_index_from_end <= light_window {
@@ -143,7 +156,11 @@ pub fn compress_light(msg: &Value) -> Value {
         if content.len() > 200 {
             let truncated: String = content.chars().take(200).collect();
             let mut new_msg = msg.clone();
-            new_msg["content"] = Value::String(format!("{}... [truncated, {} chars total]", truncated, content.len()));
+            new_msg["content"] = Value::String(format!(
+                "{}... [truncated, {} chars total]",
+                truncated,
+                content.len()
+            ));
             return new_msg;
         }
     }
@@ -273,7 +290,11 @@ impl ContextCompactor {
     /// (in tokens). The input budget for summarization chunks is derived from
     /// this dynamically, so a 4K model produces ~2.5K budgets while a 32K
     /// model can summarize in a single call.
-    pub fn new(provider: Arc<dyn LLMProvider>, model: String, compaction_context_size: usize) -> Self {
+    pub fn new(
+        provider: Arc<dyn LLMProvider>,
+        model: String,
+        compaction_context_size: usize,
+    ) -> Self {
         Self {
             provider,
             model,
@@ -308,7 +329,12 @@ impl ContextCompactor {
     }
 
     /// Check whether the conversation needs compaction.
-    pub fn needs_compaction(&self, messages: &[Value], budget: &TokenBudget, tool_def_tokens: usize) -> bool {
+    pub fn needs_compaction(
+        &self,
+        messages: &[Value],
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+    ) -> bool {
         if self.disabled.load(Ordering::Relaxed) {
             return false;
         }
@@ -430,7 +456,8 @@ impl ContextCompactor {
             .enumerate()
             .filter(|(_, msg)| {
                 let content = msg["content"].as_str().unwrap_or("");
-                content.contains("[Subagent ") || content.contains("subagent-")
+                content.contains("[Subagent ")
+                    || content.contains("subagent-")
                     || content.contains("Result also saved to:")
             })
             .map(|(i, _)| i)
@@ -498,9 +525,7 @@ impl ContextCompactor {
             }
 
             let mut merged: Vec<String> = Vec::new();
-            for (start, end) in
-                split_summary_ranges_by_budget(&summaries, self.input_budget())
-            {
+            for (start, end) in split_summary_ranges_by_budget(&summaries, self.input_budget()) {
                 let mut block = String::new();
                 for (i, s) in summaries[start..end].iter().enumerate() {
                     block.push_str(&format!("Summary {}:\n{}\n\n", i + 1, s));
@@ -614,18 +639,34 @@ impl ContextCompactor {
     ///
     /// Used by ContentGate when content doesn't fit the context budget.
     /// Returns a structural map: line ranges, key definitions, navigation hints.
-    pub async fn summarize_for_briefing(&self, content: &str, target_tokens: usize) -> Result<String> {
+    pub async fn summarize_for_briefing(
+        &self,
+        content: &str,
+        target_tokens: usize,
+    ) -> Result<String> {
         // Truncate input to fit the compaction model's context, keeping head + tail.
         let input_budget = self.input_budget();
         let input = if TokenBudget::estimate_str_tokens(content) > input_budget {
             let char_budget = input_budget * 4; // ~4 chars per token
             let half = char_budget / 2;
             let head: String = content.chars().take(half).collect();
-            let tail: String = content.chars().rev().take(half).collect::<String>().chars().rev().collect();
+            let tail: String = content
+                .chars()
+                .rev()
+                .take(half)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             let total_lines = content.lines().count();
             format!(
                 "{}\n\n[... {} lines omitted ...]\n\n{}",
-                head, total_lines.saturating_sub(content[..head.len()].lines().count() + content[content.len()-tail.len()..].lines().count()), tail
+                head,
+                total_lines.saturating_sub(
+                    content[..head.len()].lines().count()
+                        + content[content.len() - tail.len()..].lines().count()
+                ),
+                tail
             )
         } else {
             content.to_string()
@@ -658,8 +699,10 @@ impl ContextCompactor {
             .await?;
 
         if response.finish_reason == "error" {
-            anyhow::bail!("Briefing generation failed: {}",
-                response.content.as_deref().unwrap_or("unknown error"));
+            anyhow::bail!(
+                "Briefing generation failed: {}",
+                response.content.as_deref().unwrap_or("unknown error")
+            );
         }
 
         let text = response
@@ -699,7 +742,10 @@ impl ContextCompactor {
 
         let prompt = select_summarize_prompt(reader);
 
-        match self.compact_via_summary_with_prompt(messages, available, budget, prompt).await {
+        match self
+            .compact_via_summary_with_prompt(messages, available, budget, prompt)
+            .await
+        {
             Ok((compacted, summary)) => CompactionResult {
                 messages: compacted,
                 observation: Some(summary),
@@ -748,7 +794,8 @@ impl ContextCompactor {
             .enumerate()
             .filter(|(_, msg)| {
                 let content = msg["content"].as_str().unwrap_or("");
-                content.contains("[Subagent ") || content.contains("subagent-")
+                content.contains("[Subagent ")
+                    || content.contains("subagent-")
                     || content.contains("Result also saved to:")
             })
             .map(|(i, _)| i)
@@ -901,9 +948,22 @@ fn format_message_for_transcript(msg: &Value) -> String {
         let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
         if content.len() > 1200 {
             let first: String = content.chars().take(600).collect();
-            let last: String = content.chars().rev().take(400).collect::<String>().chars().rev().collect();
-            return format!("{} ({}): {}...[{} chars omitted]...{}",
-                role, name, first, content.len() - 1000, last);
+            let last: String = content
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return format!(
+                "{} ({}): {}...[{} chars omitted]...{}",
+                role,
+                name,
+                first,
+                content.len() - 1000,
+                last
+            );
         }
         return format!("{} ({}): {}", role, name, content);
     }
@@ -1219,8 +1279,8 @@ mod tests {
     #[test]
     fn test_configurable_threshold_percent() {
         let provider = Arc::new(MockProvider::new("Summary."));
-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
-            .with_thresholds(20.0, 100_000);
+        let compactor =
+            ContextCompactor::new(provider, "test".into(), 100_000).with_thresholds(20.0, 100_000);
         let budget = TokenBudget::new(1200, 200);
         // available = 1200 - 200 = 1000. threshold = 20% of 1000 = 200 tokens.
 
@@ -1237,7 +1297,11 @@ mod tests {
             messages.push(json!({"role": "user", "content": format!("Message number {} with enough content to push us past the threshold surely.", i)}));
         }
         let est = TokenBudget::estimate_tokens(&messages);
-        assert!(est > 200, "messages should be above threshold, got {} tokens", est);
+        assert!(
+            est > 200,
+            "messages should be above threshold, got {} tokens",
+            est
+        );
         assert!(compactor.needs_compaction(&messages, &budget, 0));
     }
 
@@ -1245,8 +1309,8 @@ mod tests {
     fn test_configurable_threshold_tokens() {
         let provider = Arc::new(MockProvider::new("Summary."));
         // Set token threshold very low (50 tokens), percent very high (99%).
-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
-            .with_thresholds(99.0, 50);
+        let compactor =
+            ContextCompactor::new(provider, "test".into(), 100_000).with_thresholds(99.0, 50);
         let budget = TokenBudget::new(100_000, 8192);
 
         // Even though 99% of budget is huge, the 50-token cap fires first.
@@ -1264,8 +1328,8 @@ mod tests {
     #[test]
     fn test_effective_threshold_uses_minimum() {
         let provider = Arc::new(MockProvider::new("Summary."));
-        let compactor = ContextCompactor::new(provider, "test".into(), 100_000)
-            .with_thresholds(50.0, 200);
+        let compactor =
+            ContextCompactor::new(provider, "test".into(), 100_000).with_thresholds(50.0, 200);
         // available = 1000. 50% of 1000 = 500. Token cap = 200. min(500, 200) = 200.
         assert_eq!(compactor.effective_threshold(1000), 200);
     }
@@ -1279,8 +1343,14 @@ mod tests {
             capability: ReaderCapability::Minimal,
         };
         let prompt = select_summarize_prompt(&reader);
-        assert!(prompt.contains("NO pronouns"), "Minimal prompt should ban pronouns");
-        assert!(prompt.contains("key-value"), "Minimal prompt should require key-value format");
+        assert!(
+            prompt.contains("NO pronouns"),
+            "Minimal prompt should ban pronouns"
+        );
+        assert!(
+            prompt.contains("key-value"),
+            "Minimal prompt should require key-value format"
+        );
     }
 
     #[test]
@@ -1290,7 +1360,10 @@ mod tests {
             capability: ReaderCapability::Advanced,
         };
         let prompt = select_summarize_prompt(&reader);
-        assert!(prompt.contains("decisions"), "Advanced prompt should focus on decisions");
+        assert!(
+            prompt.contains("decisions"),
+            "Advanced prompt should focus on decisions"
+        );
     }
 
     #[test]
@@ -1300,7 +1373,10 @@ mod tests {
             capability: ReaderCapability::Standard,
         };
         let prompt = select_summarize_prompt(&reader);
-        assert!(prompt.contains("Extract facts"), "Standard prompt should extract facts");
+        assert!(
+            prompt.contains("Extract facts"),
+            "Standard prompt should extract facts"
+        );
     }
 
     #[test]
@@ -1354,8 +1430,15 @@ mod tests {
         });
         let compressed = compress_light(&tool_msg);
         let content = compressed["content"].as_str().unwrap();
-        assert!(content.len() < 300, "Compressed tool result should be < 300 chars, got {}", content.len());
-        assert!(content.contains("[truncated"), "Should have truncation marker");
+        assert!(
+            content.len() < 300,
+            "Compressed tool result should be < 300 chars, got {}",
+            content.len()
+        );
+        assert!(
+            content.contains("[truncated"),
+            "Should have truncation marker"
+        );
     }
 
     #[test]
@@ -1377,6 +1460,9 @@ mod tests {
             "tool_call_id": "call_2"
         });
         let compressed = compress_light(&tool_msg);
-        assert_eq!(compressed, tool_msg, "Short tool results should be unchanged");
+        assert_eq!(
+            compressed, tool_msg,
+            "Short tool results should be unchanged"
+        );
     }
 }

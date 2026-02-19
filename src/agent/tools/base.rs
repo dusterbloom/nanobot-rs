@@ -295,7 +295,10 @@ mod tests {
 
         let tool = MockTool;
         let mut params = HashMap::new();
-        params.insert("input".to_string(), serde_json::Value::String("hello".to_string()));
+        params.insert(
+            "input".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
 
         // execute_with_context should return same result as execute
         let result = tool.execute_with_context(params.clone(), &ctx).await;
@@ -318,7 +321,10 @@ mod tests {
 
         let tool = MockTool;
         let mut params = HashMap::new();
-        params.insert("input".to_string(), serde_json::Value::String("test".to_string()));
+        params.insert(
+            "input".to_string(),
+            serde_json::Value::String("test".to_string()),
+        );
 
         let result = tool.execute_with_result_and_context(params, &ctx).await;
         assert!(result.ok);

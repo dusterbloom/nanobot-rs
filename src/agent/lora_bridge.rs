@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 // =============================================================================
 // Experience Buffer (SQLite-backed)
@@ -41,7 +41,8 @@ impl ExperienceBuffer {
     /// Open or create the experience buffer database.
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
 
@@ -61,7 +62,8 @@ impl ExperienceBuffer {
             CREATE INDEX IF NOT EXISTS idx_experiences_surprise ON experiences(surprise DESC);
             CREATE INDEX IF NOT EXISTS idx_experiences_exported ON experiences(exported);
             CREATE INDEX IF NOT EXISTS idx_experiences_quality ON experiences(quality DESC);
-        ")?;
+        ",
+        )?;
         Ok(Self { conn })
     }
 
@@ -78,7 +80,15 @@ impl ExperienceBuffer {
     }
 
     /// Record a new experience.
-    pub fn record(&self, prompt: &str, tool_trace: &str, response: &str, success: bool, quality: f64, model: &str) -> Result<i64> {
+    pub fn record(
+        &self,
+        prompt: &str,
+        tool_trace: &str,
+        response: &str,
+        success: bool,
+        quality: f64,
+        model: &str,
+    ) -> Result<i64> {
         let surprise = compute_surprise(prompt, tool_trace);
         self.conn.execute(
             "INSERT INTO experiences (prompt, tool_trace, response, success, quality, model, surprise) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -114,13 +124,18 @@ impl ExperienceBuffer {
 
     /// Mark experiences as exported.
     pub fn mark_exported(&self, ids: &[i64]) -> Result<usize> {
-        if ids.is_empty() { return Ok(0); }
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
         let sql = format!(
             "UPDATE experiences SET exported = 1 WHERE id IN ({})",
             placeholders.join(",")
         );
-        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let count = self.conn.execute(&sql, params.as_slice())?;
         Ok(count)
     }
@@ -130,7 +145,11 @@ impl ExperienceBuffer {
     pub fn export_jsonl(&self, output_path: &Path, limit: usize) -> Result<ExportResult> {
         let experiences = self.top_unexported(limit)?;
         if experiences.is_empty() {
-            return Ok(ExportResult { path: output_path.to_path_buf(), count: 0, ids: vec![] });
+            return Ok(ExportResult {
+                path: output_path.to_path_buf(),
+                count: 0,
+                ids: vec![],
+            });
         }
 
         if let Some(parent) = output_path.parent() {
@@ -167,13 +186,30 @@ impl ExperienceBuffer {
 
     /// Get buffer statistics.
     pub fn stats(&self) -> Result<BufferStats> {
-        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM experiences", [], |r| r.get(0))?;
-        let successful: i64 = self.conn.query_row("SELECT COUNT(*) FROM experiences WHERE success = 1", [], |r| r.get(0))?;
-        let unexported: i64 = self.conn.query_row("SELECT COUNT(*) FROM experiences WHERE exported = 0 AND success = 1", [], |r| r.get(0))?;
-        let avg_surprise: f64 = self.conn.query_row(
-            "SELECT COALESCE(AVG(surprise), 0.0) FROM experiences WHERE success = 1", [], |r| r.get(0)
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM experiences", [], |r| r.get(0))?;
+        let successful: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM experiences WHERE success = 1",
+            [],
+            |r| r.get(0),
         )?;
-        Ok(BufferStats { total, successful, unexported, avg_surprise })
+        let unexported: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM experiences WHERE exported = 0 AND success = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let avg_surprise: f64 = self.conn.query_row(
+            "SELECT COALESCE(AVG(surprise), 0.0) FROM experiences WHERE success = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(BufferStats {
+            total,
+            successful,
+            unexported,
+            avg_surprise,
+        })
     }
 }
 
@@ -228,7 +264,8 @@ pub fn compute_surprise(prompt: &str, tool_trace: &str) -> f64 {
 fn count_unique_tools(tool_trace: &str) -> usize {
     // Try to parse as JSON array
     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(tool_trace) {
-        let names: std::collections::HashSet<&str> = arr.iter()
+        let names: std::collections::HashSet<&str> = arr
+            .iter()
             .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
             .collect();
         names.len()
@@ -290,11 +327,7 @@ pub async fn apply_lora_adapter(config: &LoraConfig) -> Result<HotSwapResult> {
         serde_json::json!([])
     };
 
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await?;
+    let resp = client.post(&url).json(&body).send().await?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -303,14 +336,20 @@ pub async fn apply_lora_adapter(config: &LoraConfig) -> Result<HotSwapResult> {
         Ok(HotSwapResult {
             success: true,
             message: format!("LoRA adapter applied successfully: {}", text),
-            adapter_path: config.adapter_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            adapter_path: config
+                .adapter_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             scale: config.scale,
         })
     } else {
         Ok(HotSwapResult {
             success: false,
             message: format!("LoRA hot-swap failed ({}): {}", status, text),
-            adapter_path: config.adapter_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            adapter_path: config
+                .adapter_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             scale: config.scale,
         })
     }
@@ -322,7 +361,8 @@ pub async fn remove_lora_adapters(server_url: &str) -> Result<HotSwapResult> {
         server_url: server_url.to_string(),
         adapter_path: None,
         scale: 0.0,
-    }).await
+    })
+    .await
 }
 
 /// Check if the llama-server supports LoRA hot-swap.
@@ -381,7 +421,11 @@ pub fn check_training_status(buffer: &ExperienceBuffer) -> Result<TrainingStatus
     Ok(TrainingStatus {
         active: false, // Would be tracked by a PID file
         pending_experiences: stats.unexported,
-        latest_adapter: if has_adapter { Some(adapter_path) } else { None },
+        latest_adapter: if has_adapter {
+            Some(adapter_path)
+        } else {
+            None
+        },
         adapter_loaded: false, // Would need to query llama-server
     })
 }
@@ -393,8 +437,8 @@ pub fn check_training_status(buffer: &ExperienceBuffer) -> Result<TrainingStatus
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_experience_buffer_open() {
@@ -415,14 +459,16 @@ mod tests {
         let db_path = dir.path().join("experience.db");
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
-        let id = buffer.record(
-            "Test task",
-            r#"[{"name":"read_file","arguments":{},"result":"ok"}]"#,
-            "Task complete",
-            true,
-            0.8,
-            "test-model"
-        ).unwrap();
+        let id = buffer
+            .record(
+                "Test task",
+                r#"[{"name":"read_file","arguments":{},"result":"ok"}]"#,
+                "Task complete",
+                true,
+                0.8,
+                "test-model",
+            )
+            .unwrap();
 
         assert_eq!(id, 1);
 
@@ -491,9 +537,36 @@ mod tests {
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
         // Record multiple experiences
-        buffer.record("task1", r#"[{"name":"tool1"}]"#, "done1", true, 0.9, "model1").unwrap();
-        buffer.record("task2", r#"[{"name":"tool2"}]"#, "done2", true, 0.7, "model2").unwrap();
-        buffer.record("task3", r#"[{"name":"tool3"}]"#, "done3", false, 0.5, "model3").unwrap(); // Failed - won't export
+        buffer
+            .record(
+                "task1",
+                r#"[{"name":"tool1"}]"#,
+                "done1",
+                true,
+                0.9,
+                "model1",
+            )
+            .unwrap();
+        buffer
+            .record(
+                "task2",
+                r#"[{"name":"tool2"}]"#,
+                "done2",
+                true,
+                0.7,
+                "model2",
+            )
+            .unwrap();
+        buffer
+            .record(
+                "task3",
+                r#"[{"name":"tool3"}]"#,
+                "done3",
+                false,
+                0.5,
+                "model3",
+            )
+            .unwrap(); // Failed - won't export
 
         let output_path = dir.path().join("training").join("export.jsonl");
         let result = buffer.export_jsonl(&output_path, 10).unwrap();
@@ -526,8 +599,12 @@ mod tests {
         let db_path = dir.path().join("experience.db");
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
-        let id1 = buffer.record("task1", "[]", "done1", true, 0.8, "model").unwrap();
-        let id2 = buffer.record("task2", "[]", "done2", true, 0.8, "model").unwrap();
+        let id1 = buffer
+            .record("task1", "[]", "done1", true, 0.8, "model")
+            .unwrap();
+        let id2 = buffer
+            .record("task2", "[]", "done2", true, 0.8, "model")
+            .unwrap();
 
         // Before marking
         let unexported = buffer.top_unexported(10).unwrap();
@@ -553,9 +630,15 @@ mod tests {
         let db_path = dir.path().join("experience.db");
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
-        buffer.record("task1", "[]", "done1", true, 0.8, "model").unwrap();
-        buffer.record("task2", "[]", "done2", true, 0.9, "model").unwrap();
-        buffer.record("task3", "[]", "done3", false, 0.5, "model").unwrap();
+        buffer
+            .record("task1", "[]", "done1", true, 0.8, "model")
+            .unwrap();
+        buffer
+            .record("task2", "[]", "done2", true, 0.9, "model")
+            .unwrap();
+        buffer
+            .record("task3", "[]", "done3", false, 0.5, "model")
+            .unwrap();
 
         let stats = buffer.stats().unwrap();
         assert_eq!(stats.total, 3);
@@ -615,7 +698,9 @@ mod tests {
         let db_path = dir.path().join("experience.db");
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
-        buffer.record("task1", "[]", "done1", true, 0.8, "model").unwrap();
+        buffer
+            .record("task1", "[]", "done1", true, 0.8, "model")
+            .unwrap();
 
         let status = check_training_status(&buffer).unwrap();
         assert!(!status.active);
@@ -631,9 +716,15 @@ mod tests {
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
         // Record with different surprise scores
-        buffer.record("low", "x", "done", true, 0.5, "model").unwrap();
-        buffer.record("high", &"x".repeat(10000), "done", true, 0.9, "model").unwrap();
-        buffer.record("medium", &"x".repeat(1000), "done", true, 0.7, "model").unwrap();
+        buffer
+            .record("low", "x", "done", true, 0.5, "model")
+            .unwrap();
+        buffer
+            .record("high", &"x".repeat(10000), "done", true, 0.9, "model")
+            .unwrap();
+        buffer
+            .record("medium", &"x".repeat(1000), "done", true, 0.7, "model")
+            .unwrap();
 
         // Top unexported should be ordered by surprise DESC
         let experiences = buffer.top_unexported(10).unwrap();

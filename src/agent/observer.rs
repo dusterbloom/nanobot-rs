@@ -9,10 +9,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
-
 use crate::agent::token_budget::TokenBudget;
-use crate::utils::helpers::ensure_dir;
+use crate::utils::helpers::{ensure_dir, move_file};
 
 /// A single observation (loaded from disk).
 pub struct Observation {
@@ -100,11 +98,12 @@ impl ObservationStore {
     pub fn archive(&self, paths: &[PathBuf]) -> anyhow::Result<()> {
         ensure_dir(&self.archived_dir);
         for path in paths {
+            if !path.exists() {
+                continue;
+            }
             if let Some(filename) = path.file_name() {
                 let dest = self.archived_dir.join(filename);
-                if let Err(e) = fs::rename(path, &dest) {
-                    warn!("Failed to archive {}: {}", path.display(), e);
-                }
+                move_file(path, &dest)?;
             }
         }
         Ok(())

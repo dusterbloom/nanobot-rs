@@ -256,11 +256,7 @@ mod tests {
         }
     }
 
-    fn setup_workspace_with_sessions(
-        tmp: &TempDir,
-        count: usize,
-        content_size: usize,
-    ) -> PathBuf {
+    fn setup_workspace_with_sessions(tmp: &TempDir, count: usize, content_size: usize) -> PathBuf {
         let workspace = tmp.path().to_path_buf();
         let mem_dir = workspace.join("memory");
         std::fs::create_dir_all(&mem_dir).unwrap();
@@ -333,7 +329,9 @@ mod tests {
     async fn test_reflect_updates_memory_md_from_sessions() {
         let tmp = TempDir::new().unwrap();
         let workspace = setup_workspace_with_sessions(&tmp, 3, 100);
-        let provider = Arc::new(MockProvider::new("- User prefers Rust\n- Dark mode enabled"));
+        let provider = Arc::new(MockProvider::new(
+            "- User prefers Rust\n- Dark mode enabled",
+        ));
         let reflector = Reflector::new(provider, "test".into(), &workspace, 0);
 
         reflector.reflect().await.unwrap();
@@ -360,10 +358,7 @@ mod tests {
         );
 
         // Archived directory should have files.
-        let archived_dir = workspace
-            .join("memory")
-            .join("sessions")
-            .join("archived");
+        let archived_dir = workspace.join("memory").join("sessions").join("archived");
         assert!(archived_dir.exists());
         let archived_count = std::fs::read_dir(&archived_dir).unwrap().count();
         assert_eq!(archived_count, 3);

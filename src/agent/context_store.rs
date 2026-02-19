@@ -12,7 +12,15 @@ use serde_json::{json, Value};
 use crate::providers::base::LLMProvider;
 
 /// Names of micro-tools that operate on the ContextStore.
-pub const MICRO_TOOLS: &[&str] = &["ctx_slice", "ctx_grep", "ctx_length", "ctx_summarize", "mem_store", "mem_recall", "set_phase"];
+pub const MICRO_TOOLS: &[&str] = &[
+    "ctx_slice",
+    "ctx_grep",
+    "ctx_length",
+    "ctx_summarize",
+    "mem_store",
+    "mem_recall",
+    "set_phase",
+];
 
 /// Stores full tool outputs as named variables for micro-tool inspection.
 pub struct ContextStore {
@@ -38,7 +46,11 @@ impl ContextStore {
         self.counter += 1;
 
         let preview: String = data.chars().take(150).collect();
-        let ellipsis = if data.chars().count() > 150 { "..." } else { "" };
+        let ellipsis = if data.chars().count() > 150 {
+            "..."
+        } else {
+            ""
+        };
         let metadata = format!(
             "Variable '{}': {} chars. Preview: {}{}",
             name,
@@ -64,7 +76,11 @@ impl ContextStore {
         let clamped_end = end.min(char_count).max(clamped_start);
         let max_len = 2000;
         let effective_end = clamped_end.min(clamped_start + max_len);
-        let result: String = data.chars().skip(clamped_start).take(effective_end - clamped_start).collect();
+        let result: String = data
+            .chars()
+            .skip(clamped_start)
+            .take(effective_end - clamped_start)
+            .collect();
         Some(result)
     }
 
@@ -124,11 +140,23 @@ impl ContextStore {
 
     /// Get all variable metadata (name, length, preview) without full content.
     pub fn variable_metadata(&self) -> Vec<(String, usize, String)> {
-        let mut entries: Vec<_> = self.variables.iter().map(|(name, data)| {
-            let preview: String = data.chars().take(100).collect();
-            let ellipsis = if data.chars().count() > 100 { "..." } else { "" };
-            (name.clone(), data.chars().count(), format!("{}{}", preview, ellipsis))
-        }).collect();
+        let mut entries: Vec<_> = self
+            .variables
+            .iter()
+            .map(|(name, data)| {
+                let preview: String = data.chars().take(100).collect();
+                let ellipsis = if data.chars().count() > 100 {
+                    "..."
+                } else {
+                    ""
+                };
+                (
+                    name.clone(),
+                    data.chars().count(),
+                    format!("{}{}", preview, ellipsis),
+                )
+            })
+            .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
@@ -254,31 +282,19 @@ pub fn execute_micro_tool(
     name: &str,
     args: &HashMap<String, Value>,
 ) -> String {
-    let variable = args
-        .get("variable")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let variable = args.get("variable").and_then(|v| v.as_str()).unwrap_or("");
 
     match name {
         "ctx_slice" => {
-            let start = args
-                .get("start")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            let end = args
-                .get("end")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let start = args.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let end = args.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             match store.slice(variable, start, end) {
                 Some(s) => s,
                 None => format!("Error: variable '{}' not found.", variable),
             }
         }
         "ctx_grep" => {
-            let pattern = args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             match store.grep(variable, pattern) {
                 Some(s) => s,
                 None => format!("Error: variable '{}' not found.", variable),
@@ -289,10 +305,7 @@ pub fn execute_micro_tool(
             None => format!("Error: variable '{}' not found.", variable),
         },
         "mem_store" => {
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let value = args
                 .get("value")
                 .and_then(|v| v.as_str())
@@ -305,17 +318,11 @@ pub fn execute_micro_tool(
             }
         }
         "mem_recall" => {
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
             store.mem_recall(key)
         }
         "set_phase" => {
-            let phase_str = args
-                .get("phase")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let phase_str = args.get("phase").and_then(|v| v.as_str()).unwrap_or("");
             match crate::agent::system_state::TaskPhase::from_str_loose(phase_str) {
                 Some(phase) => format!("Phase set to: {}", phase),
                 None => format!("Error: unknown phase '{}'. Valid: idle, understanding, planning, file_editing, code_execution, web_research, communication, reflection.", phase_str),
@@ -332,11 +339,7 @@ pub const MAX_SUMMARIZE_DEPTH: u32 = 2;
 fn sync_micro_tool_definitions() -> Vec<Value> {
     micro_tool_definitions()
         .into_iter()
-        .filter(|d| {
-            d.pointer("/function/name")
-                .and_then(|v| v.as_str())
-                != Some("ctx_summarize")
-        })
+        .filter(|d| d.pointer("/function/name").and_then(|v| v.as_str()) != Some("ctx_summarize"))
         .collect()
 }
 
@@ -447,7 +450,9 @@ pub async fn execute_ctx_summarize(
             }
         } else {
             // Model produced a text response — that's our summary.
-            return response.content.unwrap_or_else(|| "No summary produced.".to_string());
+            return response
+                .content
+                .unwrap_or_else(|| "No summary produced.".to_string());
         }
     }
 
@@ -473,7 +478,11 @@ mod tests {
         let mut store = ContextStore::new();
         let data = "x".repeat(45230);
         let (_, metadata) = store.store(data);
-        assert!(metadata.len() < 250, "Metadata should be compact, got {} chars", metadata.len());
+        assert!(
+            metadata.len() < 250,
+            "Metadata should be compact, got {} chars",
+            metadata.len()
+        );
         assert!(metadata.contains("output_0"));
         assert!(metadata.contains("45230 chars"));
         assert!(metadata.contains("Preview:"));
@@ -533,17 +542,27 @@ mod tests {
     fn test_grep_no_match() {
         let mut store = ContextStore::new();
         store.store("hello world".to_string());
-        assert_eq!(store.grep("output_0", "zzz"), Some("No matching lines.".to_string()));
+        assert_eq!(
+            store.grep("output_0", "zzz"),
+            Some("No matching lines.".to_string())
+        );
     }
 
     #[test]
     fn test_grep_max_lines() {
         let mut store = ContextStore::new();
-        let data: String = (0..50).map(|i| format!("match line {}", i)).collect::<Vec<_>>().join("\n");
+        let data: String = (0..50)
+            .map(|i| format!("match line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         store.store(data);
         let result = store.grep("output_0", "match").unwrap();
         let line_count = result.lines().count();
-        assert!(line_count <= 20, "Grep should stop after 20 matches, got {}", line_count);
+        assert!(
+            line_count <= 20,
+            "Grep should stop after 20 matches, got {}",
+            line_count
+        );
     }
 
     #[test]
@@ -585,7 +604,11 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("variable".to_string(), json!("nonexistent"));
         let result = execute_micro_tool(&mut store, "ctx_length", &args);
-        assert!(result.contains("not found"), "Should report missing variable: {}", result);
+        assert!(
+            result.contains("not found"),
+            "Should report missing variable: {}",
+            result
+        );
     }
 
     #[test]
@@ -621,7 +644,10 @@ mod tests {
             .unwrap();
         let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(req_names.contains(&"variable"), "Should require 'variable'");
-        assert!(req_names.contains(&"instruction"), "Should require 'instruction'");
+        assert!(
+            req_names.contains(&"instruction"),
+            "Should require 'instruction'"
+        );
     }
 
     #[test]
@@ -686,8 +712,16 @@ mod tests {
             .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
-        assert!(names.contains(&"mem_store"), "Should include mem_store, got: {:?}", names);
-        assert!(names.contains(&"mem_recall"), "Should include mem_recall, got: {:?}", names);
+        assert!(
+            names.contains(&"mem_store"),
+            "Should include mem_store, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"mem_recall"),
+            "Should include mem_recall, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -707,7 +741,11 @@ mod tests {
         assert_eq!(meta[1].0, "output_1");
         assert_eq!(meta[1].1, 200);
         // Preview is first 100 chars + "..."
-        assert!(meta[1].2.ends_with("..."), "Long preview should have ellipsis: {}", meta[1].2);
+        assert!(
+            meta[1].2.ends_with("..."),
+            "Long preview should have ellipsis: {}",
+            meta[1].2
+        );
         assert_eq!(meta[1].2.len(), 103); // 100 x's + "..."
     }
 
@@ -719,7 +757,13 @@ mod tests {
 
         let entries = store.mem_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries.get("finding_a").map(|s| s.as_str()), Some("value_a"));
-        assert_eq!(entries.get("finding_b").map(|s| s.as_str()), Some("value_b"));
+        assert_eq!(
+            entries.get("finding_a").map(|s| s.as_str()),
+            Some("value_a")
+        );
+        assert_eq!(
+            entries.get("finding_b").map(|s| s.as_str()),
+            Some("value_b")
+        );
     }
 }

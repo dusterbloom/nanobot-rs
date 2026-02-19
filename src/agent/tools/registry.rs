@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde_json::Value;
+
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use crate::agent::system_state::TaskPhase;
 
@@ -13,6 +15,115 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Normalize model-emitted tool names/params into canonical tool contract.
+    ///
+    /// This keeps small/local models focused by repairing common drift:
+    /// - alias tool names (`wait/check/list/cancel` -> `spawn` with action)
+    /// - parameter aliases (`q` -> `query`, `file` -> `path`, etc.)
+    /// - strict required-arg validation by action
+    fn normalize_tool_request(
+        name: &str,
+        mut params: HashMap<String, Value>,
+    ) -> Result<(String, HashMap<String, Value>), String> {
+        let canonical_name = match name {
+            "wait" | "check" | "list" | "cancel" => "spawn",
+            other => other,
+        };
+
+        if canonical_name == "spawn" {
+            // If the model called alias tools directly, translate to spawn actions.
+            if !params.contains_key("action") {
+                if matches!(name, "wait" | "check" | "list" | "cancel") {
+                    params.insert("action".to_string(), Value::String(name.to_string()));
+                }
+            }
+
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("spawn")
+                .to_ascii_lowercase();
+            params.insert("action".to_string(), Value::String(action.clone()));
+
+            // Alias normalization for task_id.
+            if !params.contains_key("task_id") {
+                if let Some(id) = params.get("id").cloned() {
+                    params.insert("task_id".to_string(), id);
+                }
+            }
+
+            match action.as_str() {
+                "spawn" | "loop" => {
+                    Self::require_non_empty_string(&params, "task", "spawn")?;
+                }
+                "check" | "wait" | "cancel" => {
+                    Self::require_non_empty_string(&params, "task_id", "spawn")?;
+                }
+                "pipeline" => match params.get("steps").and_then(|v| v.as_array()) {
+                    Some(arr) if !arr.is_empty() => {}
+                    _ => {
+                        return Err(
+                            "Tool 'spawn' with action='pipeline' requires non-empty 'steps' array"
+                                .to_string(),
+                        )
+                    }
+                },
+                "list" => {}
+                _ => {
+                    return Err(format!(
+                        "Tool 'spawn' has invalid action '{}'. Allowed: spawn, list, check, wait, cancel, pipeline, loop",
+                        action
+                    ))
+                }
+            }
+        }
+
+        if canonical_name == "web_search" {
+            if !params.contains_key("query") {
+                if let Some(v) = params.get("q").cloned() {
+                    params.insert("query".to_string(), v);
+                } else if let Some(v) = params.get("search_query").cloned() {
+                    params.insert("query".to_string(), v);
+                }
+            }
+            Self::require_non_empty_string(&params, "query", "web_search")?;
+        }
+
+        if canonical_name == "web_fetch" {
+            if !params.contains_key("url") {
+                if let Some(v) = params.get("link").cloned() {
+                    params.insert("url".to_string(), v);
+                }
+            }
+            Self::require_non_empty_string(&params, "url", "web_fetch")?;
+        }
+
+        if canonical_name == "read_file" {
+            if !params.contains_key("path") {
+                if let Some(v) = params.get("file").cloned() {
+                    params.insert("path".to_string(), v);
+                }
+            }
+            Self::require_non_empty_string(&params, "path", "read_file")?;
+        }
+
+        Ok((canonical_name.to_string(), params))
+    }
+
+    fn require_non_empty_string(
+        params: &HashMap<String, Value>,
+        key: &str,
+        tool_name: &str,
+    ) -> Result<(), String> {
+        match params.get(key).and_then(|v| v.as_str()).map(str::trim) {
+            Some(s) if !s.is_empty() => Ok(()),
+            _ => Err(format!(
+                "Tool '{}' requires non-empty '{}' parameter",
+                tool_name, key
+            )),
+        }
+    }
+
     /// Create a new, empty registry.
     pub fn new() -> Self {
         Self {
@@ -56,7 +167,12 @@ impl ToolRegistry {
         name: &str,
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
-        let tool = match self.tools.get(name) {
+        let (name, params) = match Self::normalize_tool_request(name, params) {
+            Ok(v) => v,
+            Err(e) => return ToolExecutionResult::failure(e),
+        };
+
+        let tool = match self.tools.get(&name) {
             Some(t) => t,
             None => {
                 return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
@@ -82,7 +198,12 @@ impl ToolRegistry {
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
-        let tool = match self.tools.get(name) {
+        let (name, params) = match Self::normalize_tool_request(name, params) {
+            Ok(v) => v,
+            Err(e) => return ToolExecutionResult::failure(e),
+        };
+
+        let tool = match self.tools.get(&name) {
             Some(t) => t,
             None => {
                 return ToolExecutionResult::failure(format!("Tool '{}' not found", name));
@@ -99,8 +220,14 @@ impl ToolRegistry {
     }
 
     /// Core tools that are always included in tool definitions.
-    const CORE_TOOLS: &'static [&'static str] =
-        &["read_file", "write_file", "edit_file", "list_dir", "exec", "spawn"];
+    const CORE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "exec",
+        "spawn",
+    ];
 
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
@@ -122,7 +249,15 @@ impl ToolRegistry {
             "spawn",
         ),
         (
-            &["recall", "remember", "memory", "past", "previous", "earlier", "last time"],
+            &[
+                "recall",
+                "remember",
+                "memory",
+                "past",
+                "previous",
+                "earlier",
+                "last time",
+            ],
             "recall",
         ),
         (
@@ -201,7 +336,9 @@ impl ToolRegistry {
     /// (Idle, Understanding, Planning, Reflection).
     pub fn tools_for_phase(phase: &TaskPhase) -> Option<&'static [&'static str]> {
         match phase {
-            TaskPhase::FileEditing => Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"]),
+            TaskPhase::FileEditing => {
+                Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"])
+            }
             TaskPhase::CodeExecution => Some(&["exec", "read_file", "list_dir"]),
             TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "read_file"]),
             TaskPhase::Communication => Some(&["message", "send_email", "check_inbox"]),
@@ -275,10 +412,7 @@ impl ToolRegistry {
     ///
     /// Only returns tools appropriate for the current phase.
     /// For phases with no specific tool set, returns all tools.
-    pub fn get_delegation_definitions(
-        &self,
-        phase: &TaskPhase,
-    ) -> Vec<serde_json::Value> {
+    pub fn get_delegation_definitions(&self, phase: &TaskPhase) -> Vec<serde_json::Value> {
         match Self::tools_for_phase(phase) {
             Some(phase_tools) => {
                 let allowed: HashSet<&str> = phase_tools.iter().copied().collect();
@@ -334,6 +468,41 @@ mod tests {
             Self {
                 tool_name: name.to_string(),
             }
+        }
+    }
+
+    /// Echoes the full params as JSON (used to validate request normalization).
+    struct ParamEchoTool {
+        tool_name: String,
+    }
+
+    impl ParamEchoTool {
+        fn new(name: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ParamEchoTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "Echo params as JSON"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+            serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string())
         }
     }
 
@@ -509,6 +678,75 @@ mod tests {
             .contains("not found"));
     }
 
+    #[tokio::test]
+    async fn test_execute_alias_wait_maps_to_spawn_action() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("spawn")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "task_id".to_string(),
+            serde_json::Value::String("abc123".to_string()),
+        );
+
+        let result = registry.execute("wait", params).await;
+        assert!(result.ok, "{}", result.data);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["action"], "wait");
+        assert_eq!(parsed["task_id"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_execute_spawn_requires_task_for_spawn_action() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("spawn")));
+
+        let result = registry.execute("spawn", HashMap::new()).await;
+        assert!(!result.ok);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requires non-empty 'task'"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_spawn_check_requires_task_id() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("spawn")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "action".to_string(),
+            serde_json::Value::String("check".to_string()),
+        );
+
+        let result = registry.execute("spawn", params).await;
+        assert!(!result.ok);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requires non-empty 'task_id'"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_web_search_normalizes_q_to_query() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("web_search")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            serde_json::Value::String("latest news".to_string()),
+        );
+
+        let result = registry.execute("web_search", params).await;
+        assert!(result.ok, "{}", result.data);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["query"], "latest news");
+    }
+
     // -----------------------------------------------------------------------
     // get_relevant_definitions tests
     // -----------------------------------------------------------------------
@@ -613,7 +851,9 @@ mod tests {
             tool_call_id: "call_missing".to_string(),
         };
 
-        let result = registry.execute_with_context("nonexistent", HashMap::new(), &ctx).await;
+        let result = registry
+            .execute_with_context("nonexistent", HashMap::new(), &ctx)
+            .await;
         assert!(!result.ok);
         assert!(result.data.contains("not found"));
     }
@@ -665,7 +905,15 @@ mod tests {
     #[test]
     fn test_delegation_defs_file_editing_strict() {
         let mut registry = ToolRegistry::new();
-        for name in &["read_file", "write_file", "edit_file", "list_dir", "exec", "web_search", "message"] {
+        for name in &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "web_search",
+            "message",
+        ] {
             registry.register(Box::new(MockTool::new(name)));
         }
 
@@ -698,7 +946,15 @@ mod tests {
     #[test]
     fn test_scoped_defs_includes_phase_and_used() {
         let mut registry = ToolRegistry::new();
-        for name in &["read_file", "write_file", "edit_file", "list_dir", "exec", "web_search", "web_fetch"] {
+        for name in &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "web_search",
+            "web_fetch",
+        ] {
             registry.register(Box::new(MockTool::new(name)));
         }
 

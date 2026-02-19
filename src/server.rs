@@ -69,6 +69,41 @@ pub(crate) fn list_local_models() -> Vec<PathBuf> {
     models
 }
 
+/// Resolve a local model path given a filename or absolute/relative path.
+pub(crate) fn resolve_local_model_path(name: &str) -> Option<PathBuf> {
+    if name.trim().is_empty() {
+        return None;
+    }
+
+    let expanded = if name.starts_with("~/") || name == "~" {
+        if let Some(home) = dirs::home_dir() {
+            let without_tilde = name.trim_start_matches("~/");
+            if without_tilde.is_empty() {
+                home
+            } else {
+                home.join(without_tilde)
+            }
+        } else {
+            PathBuf::from(name)
+        }
+    } else {
+        PathBuf::from(name)
+    };
+
+    if expanded.exists() {
+        return Some(expanded);
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join("models").join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 /// Ensure the dedicated compaction model is available locally.
 ///
 /// Downloads Qwen3-1.7B Q4_K_M (~1.1GB) to `~/.nanobot/models/` if not already
@@ -158,31 +193,30 @@ pub(crate) async fn start_compaction_if_available(
         main_ctx_size / 1024,
     );
 
-    match spawn_compaction_server(port, &model_path, main_ctx_size) {
-        Ok(child) => {
+    let (reserve, cap) = role_gpu_policy("compaction");
+    let gpu_layers = compute_gpu_layers_with_policy(&model_path, main_ctx_size, reserve, cap);
+    match spawn_server_with_adaptive_layers(
+        port,
+        &model_path,
+        main_ctx_size,
+        "compaction",
+        15,
+        gpu_layers,
+    )
+    .await
+    {
+        Ok((child, used_layers)) => {
             record_server_pid("compaction", child.id());
             *compaction_process = Some(child);
-            if wait_for_server_ready(port, 15, compaction_process).await {
-                *compaction_port = Some(port.to_string());
-                println!(
-                    "  {}{}Compaction server ready{} (Qwen3-1.7B on GPU)",
-                    crate::tui::BOLD,
-                    crate::tui::GREEN,
-                    crate::tui::RESET
-                );
-            } else {
-                println!(
-                    "  {}{}Compaction server failed to start{} (using trim_to_fit fallback)",
-                    crate::tui::BOLD,
-                    crate::tui::YELLOW,
-                    crate::tui::RESET
-                );
-                if let Some(ref mut child) = compaction_process {
-                    child.kill().ok();
-                    child.wait().ok();
-                }
-                *compaction_process = None;
-            }
+            *compaction_port = Some(port.to_string());
+            let gpu_label = if used_layers == 0 { "CPU fallback" } else { "GPU" };
+            println!(
+                "  {}{}Compaction server ready{} (Qwen3-1.7B on {})",
+                crate::tui::BOLD,
+                crate::tui::GREEN,
+                crate::tui::RESET,
+                gpu_label
+            );
         }
         Err(e) => {
             println!(
@@ -192,6 +226,7 @@ pub(crate) async fn start_compaction_if_available(
                 crate::tui::RESET,
                 e
             );
+            *compaction_process = None;
         }
     }
 }
@@ -278,7 +313,8 @@ pub(crate) async fn start_delegation_if_available(
     let ctx_size = 8192; // Small models handle 8K fine; 4K caused ctx overflow
 
     // Compute GPU layers based on available VRAM (after main model is loaded).
-    let gpu_layers = compute_gpu_layers_for_model(&model_path, ctx_size);
+    let (reserve, cap) = role_gpu_policy("delegation");
+    let gpu_layers = compute_gpu_layers_with_policy(&model_path, ctx_size, reserve, cap);
     let gpu_label = if gpu_layers >= 99 {
         "full GPU".to_string()
     } else if gpu_layers == 0 {
@@ -298,32 +334,29 @@ pub(crate) async fn start_delegation_if_available(
         gpu_label,
     );
 
-    match spawn_delegation_server(port, &model_path, ctx_size, gpu_layers) {
-        Ok(child) => {
+    match spawn_server_with_adaptive_layers(
+        port,
+        &model_path,
+        ctx_size,
+        "delegation",
+        30,
+        gpu_layers,
+    )
+    .await
+    {
+        Ok((child, used_layers)) => {
             record_server_pid("delegation", child.id());
             *delegation_process = Some(child);
-            if wait_for_server_ready(port, 30, delegation_process).await {
-                *delegation_port = Some(port.to_string());
-                println!(
-                    "  {}{}Delegation server ready{} ({} on GPU)",
-                    crate::tui::BOLD,
-                    crate::tui::GREEN,
-                    crate::tui::RESET,
-                    model_name,
-                );
-            } else {
-                println!(
-                    "  {}{}Delegation server failed to start{} (tool delegation will use main model)",
-                    crate::tui::BOLD,
-                    crate::tui::YELLOW,
-                    crate::tui::RESET,
-                );
-                if let Some(ref mut child) = delegation_process {
-                    child.kill().ok();
-                    child.wait().ok();
-                }
-                *delegation_process = None;
-            }
+            *delegation_port = Some(port.to_string());
+            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
+            println!(
+                "  {}{}Delegation server ready{} ({} on {})",
+                crate::tui::BOLD,
+                crate::tui::GREEN,
+                crate::tui::RESET,
+                model_name,
+                run_mode,
+            );
         }
         Err(e) => {
             println!(
@@ -333,6 +366,7 @@ pub(crate) async fn start_delegation_if_available(
                 crate::tui::RESET,
                 e,
             );
+            *delegation_process = None;
         }
     }
 }
@@ -350,6 +384,80 @@ pub(crate) fn stop_delegation_server(
     }
     *delegation_process = None;
     *delegation_port = None;
+}
+
+/// Start a custom llama.cpp server (router/specialist) using a known port.
+pub(crate) async fn start_custom_server(
+    process: &mut Option<Child>,
+    port_slot: &mut Option<String>,
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+    role: &str,
+) {
+    if process.is_some() {
+        return;
+    }
+
+    let model_name = model_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(role);
+
+    println!(
+        "  {}{}Starting{} {} server (port {}, ctx: {}K)...",
+        crate::tui::BOLD,
+        crate::tui::YELLOW,
+        crate::tui::RESET,
+        model_name,
+        port,
+        ctx_size / 1024,
+    );
+
+    let (reserve, cap) = role_gpu_policy(role);
+    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
+    match spawn_server_with_adaptive_layers(port, model_path, ctx_size, role, 30, gpu_layers).await
+    {
+        Ok((child, used_layers)) => {
+            record_server_pid(role, child.id());
+            *process = Some(child);
+            *port_slot = Some(port.to_string());
+            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
+            println!(
+                "  {}{}{} server ready{} ({})",
+                crate::tui::BOLD,
+                crate::tui::GREEN,
+                model_name,
+                crate::tui::RESET,
+                run_mode
+            );
+        }
+        Err(e) => {
+            println!(
+                "  {}{}{} server failed:{} {}{}",
+                crate::tui::BOLD,
+                crate::tui::YELLOW,
+                model_name,
+                crate::tui::RESET,
+                e,
+                crate::tui::RESET,
+            );
+            *process = None;
+            *port_slot = None;
+        }
+    }
+}
+
+/// Stop a custom server and clear its port record.
+pub(crate) fn stop_custom_server(process: &mut Option<Child>, port_slot: &mut Option<String>) {
+    if let Some(ref mut child) = process {
+        let pid = child.id();
+        child.kill().ok();
+        child.wait().ok();
+        unrecord_server_pid(pid);
+    }
+    *process = None;
+    *port_slot = None;
 }
 
 /// Path to the PID file for tracking spawned llama-server processes.
@@ -381,10 +489,7 @@ pub(crate) fn unrecord_server_pid(pid: u32) {
             let remaining: Vec<&str> = contents
                 .lines()
                 .filter(|line| {
-                    line.split(':')
-                        .nth(1)
-                        .and_then(|p| p.parse::<u32>().ok())
-                        != Some(pid)
+                    line.split(':').nth(1).and_then(|p| p.parse::<u32>().ok()) != Some(pid)
                 })
                 .collect();
             if remaining.is_empty() {
@@ -726,16 +831,30 @@ pub(crate) fn estimate_model_vram(model_path: &Path, ctx_size: usize) -> u64 {
 /// If the model fits entirely, returns 99 (full offload). Otherwise,
 /// proportionally allocates layers based on how much VRAM is free.
 pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -> u32 {
+    compute_gpu_layers_with_policy(model_path, ctx_size, 0, None)
+}
+
+/// Compute GPU layers with explicit reserve/cap policy.
+///
+/// - `reserve_vram_bytes`: VRAM to keep free for stability.
+/// - `max_layers_cap`: hard ceiling for auxiliary lanes.
+pub(crate) fn compute_gpu_layers_with_policy(
+    model_path: &Path,
+    ctx_size: usize,
+    reserve_vram_bytes: u64,
+    max_layers_cap: Option<u32>,
+) -> u32 {
     let (vram, _ram) = detect_available_memory();
     let Some(free_vram) = vram else {
         return 0; // No GPU detected
     };
+    let usable_vram = free_vram.saturating_sub(reserve_vram_bytes);
 
     let needed = estimate_model_vram(model_path, ctx_size);
 
-    if free_vram >= needed {
+    let mut layers = if usable_vram >= needed {
         99 // Full offload — plenty of room
-    } else if free_vram < 512 * 1024 * 1024 {
+    } else if usable_vram < 512 * 1024 * 1024 {
         0 // Less than 512MB free — CPU only
     } else {
         // Proportional: if we have 60% of needed VRAM, use ~60% of layers.
@@ -743,9 +862,33 @@ pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -
         let total_layers = parse_gguf_metadata(model_path)
             .map(|m| m.n_layers)
             .unwrap_or(32) as u64;
-        let proportion = free_vram as f64 / needed as f64;
+        let proportion = usable_vram as f64 / needed as f64;
         let layers = (total_layers as f64 * proportion).floor() as u32;
         layers.max(1) // At least 1 layer on GPU
+    };
+
+    if let Some(cap) = max_layers_cap {
+        if layers == 99 {
+            layers = cap.max(1);
+        } else {
+            layers = layers.min(cap.max(1));
+        }
+    }
+
+    layers
+}
+
+/// Role-aware defaults to reduce VRAM contention between lanes.
+fn role_gpu_policy(role: &str) -> (u64, Option<u32>) {
+    const MAIN_RESERVE: u64 = 1024 * 1024 * 1024; // 1GB headroom
+    const AUX_RESERVE: u64 = 2 * 1024 * 1024 * 1024; // 2GB headroom
+    match role {
+        "main" => (MAIN_RESERVE, None),
+        "compaction" => (AUX_RESERVE, Some(8)),
+        "delegation" => (AUX_RESERVE, Some(12)),
+        "trio-router" => (AUX_RESERVE, Some(6)),
+        "trio-specialist" => (AUX_RESERVE, Some(10)),
+        _ => (AUX_RESERVE, Some(12)),
     }
 }
 
@@ -779,6 +922,15 @@ pub(crate) fn spawn_server(config: &SpawnConfig) -> Result<Child, String> {
         ));
     }
 
+    // Compute optimal thread count (leave 2 for system)
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get().saturating_sub(2))
+        .unwrap_or(4)
+        .max(1);
+    
+    // Batch size: smaller for stability with large contexts
+    let batch_size = if config.ctx_size > 32000 { 256 } else { 512 };
+
     Command::new(&server_path)
         .arg("--model")
         .arg(config.model_path)
@@ -790,12 +942,21 @@ pub(crate) fn spawn_server(config: &SpawnConfig) -> Result<Child, String> {
         .arg("1")
         .arg("--n-gpu-layers")
         .arg(config.gpu_layers.to_string())
+        .arg("--threads")
+        .arg(num_threads.to_string())
+        .arg("--batch-size")
+        .arg(batch_size.to_string())
+        .arg("--ubatch-size")
+        .arg("128")
         .arg("--flash-attn")
         .arg("on")
-        // Jinja required for tool calling (Mistral/Ministral templates).
         .arg("--jinja")
-        // Prevent prefill errors when conversation ends with tool results.
         .arg("--no-prefill-assistant")
+        // Memory-mapped for stability (don't load full model to RAM)
+        .arg("--mlock")
+        // Graceful handling of long contexts
+        .arg("--cache-reuse")
+        .arg("256")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -816,26 +977,122 @@ pub(crate) fn spawn_llama_server(
     model_path: &Path,
     ctx_size: usize,
 ) -> Result<Child, String> {
+    let (reserve, cap) = role_gpu_policy("main");
+    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
     spawn_server(&SpawnConfig {
         port,
         model_path,
         ctx_size,
-        gpu_layers: 99,
+        gpu_layers,
         role: "main",
     })
 }
 
-/// Convenience wrapper: spawn the compaction server (10 GPU layers).
+/// Start main server with adaptive GPU-layer retries for VRAM stability.
+pub(crate) async fn spawn_main_server_adaptive(
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+) -> Result<(Child, u32), String> {
+    let (reserve, cap) = role_gpu_policy("main");
+    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
+    spawn_server_with_adaptive_layers(port, model_path, ctx_size, "main", 120, gpu_layers).await
+}
+
+fn gpu_layer_retry_plan(initial_layers: u32) -> Vec<u32> {
+    let mut plan = Vec::new();
+    let mut push_unique = |layers: u32| {
+        if !plan.contains(&layers) {
+            plan.push(layers);
+        }
+    };
+
+    push_unique(initial_layers);
+    if initial_layers > 16 {
+        push_unique(initial_layers / 2);
+    }
+    if initial_layers > 8 {
+        push_unique(8);
+    }
+    if initial_layers > 4 {
+        push_unique(4);
+    }
+    push_unique(0);
+    plan
+}
+
+async fn spawn_server_with_adaptive_layers(
+    port: u16,
+    model_path: &Path,
+    ctx_size: usize,
+    role: &str,
+    timeout_secs: u64,
+    initial_layers: u32,
+) -> Result<(Child, u32), String> {
+    let plan = gpu_layer_retry_plan(initial_layers);
+    let mut last_err: Option<String> = None;
+
+    for (idx, layers) in plan.iter().enumerate() {
+        if idx > 0 {
+            println!(
+                "  {}{}Retrying {} with {} GPU layers...{}",
+                crate::tui::BOLD,
+                crate::tui::YELLOW,
+                role,
+                layers,
+                crate::tui::RESET
+            );
+        }
+
+        match spawn_server(&SpawnConfig {
+            port,
+            model_path,
+            ctx_size,
+            gpu_layers: *layers,
+            role,
+        }) {
+            Ok(child) => {
+                let mut process = Some(child);
+                if wait_for_server_ready(port, timeout_secs, &mut process).await {
+                    if let Some(ready_child) = process.take() {
+                        return Ok((ready_child, *layers));
+                    }
+                    last_err = Some(format!(
+                        "Internal error: {} server became ready but process handle was missing",
+                        role
+                    ));
+                } else {
+                    if let Some(mut failed_child) = process.take() {
+                        failed_child.kill().ok();
+                        failed_child.wait().ok();
+                    }
+                    last_err = Some(format!(
+                        "{} failed health checks with {} GPU layers",
+                        role, layers
+                    ));
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| format!("{} failed to start", role)))
+}
+
+/// Convenience wrapper: spawn the compaction server.
 pub(crate) fn spawn_compaction_server(
     port: u16,
     model_path: &Path,
     ctx_size: usize,
+    gpu_layers: u32,
 ) -> Result<Child, String> {
     spawn_server(&SpawnConfig {
         port,
         model_path,
         ctx_size,
-        gpu_layers: 10,
+        gpu_layers,
         role: "compaction",
     })
 }
@@ -951,14 +1208,22 @@ pub(crate) async fn wait_for_server_ready(
                 );
                 std::io::stdout().flush().ok();
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                print!("\r{}{}\r", crate::tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+                print!(
+                    "\r{}{}\r",
+                    crate::tui::SHOW_CURSOR,
+                    " ".repeat(bar_width + 30)
+                );
                 std::io::stdout().flush().ok();
                 return true;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    print!("\r{}{}\r", crate::tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+    print!(
+        "\r{}{}\r",
+        crate::tui::SHOW_CURSOR,
+        " ".repeat(bar_width + 30)
+    );
     std::io::stdout().flush().ok();
     false
 }
@@ -984,6 +1249,45 @@ pub(crate) async fn check_health(api_base: &str) -> bool {
     }
 }
 
+/// Deep health check: verify server can actually handle a chat completion.
+///
+/// Sends a minimal chat request and checks for a valid response.
+/// This catches cases where /health returns 200 but the model isn't loaded.
+pub(crate) async fn check_chat_health(port: &str) -> bool {
+    let url = format!("http://localhost:{}/v1/chat/completions", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    
+    let body = serde_json::json!({
+        "model": "local",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1
+    });
+    
+    match client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                return false;
+            }
+            // Verify response has expected structure
+            if let Ok(text) = resp.text().await {
+                text.contains("\"choices\"") || text.contains("\"content\"")
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Background health watchdog for local llama-server processes.
 ///
 /// Pings `/health` every 30 seconds on all active server ports. When a server
@@ -1000,10 +1304,8 @@ pub(crate) fn start_health_watchdog(
             .unwrap_or_default();
 
         // Track which servers were healthy on last check.
-        let mut was_healthy: HashMap<String, bool> = ports
-            .iter()
-            .map(|(role, _)| (role.clone(), true))
-            .collect();
+        let mut was_healthy: HashMap<String, bool> =
+            ports.iter().map(|(role, _)| (role.clone(), true)).collect();
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1038,6 +1340,96 @@ pub(crate) fn start_health_watchdog(
     })
 }
 
+/// Request to restart a specific server role.
+#[derive(Debug, Clone)]
+pub struct RestartRequest {
+    pub role: String,
+}
+
+/// Background health watchdog with auto-repair for local llama-server processes.
+///
+/// Pings `/health` every 30 seconds on all active server ports. When a server
+/// fails 2 consecutive health checks, sends a restart request through `restart_tx`.
+pub(crate) fn start_health_watchdog_with_autorepair(
+    ports: Vec<(String, String)>, // (role, port)
+    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+
+        // Track which servers were healthy on last check.
+        let mut was_healthy: HashMap<String, bool> =
+            ports.iter().map(|(role, _)| (role.clone(), true)).collect();
+
+        // Track consecutive failures per role.
+        let mut consecutive_failures: HashMap<String, u32> =
+            ports.iter().map(|(role, _)| (role.clone(), 0)).collect();
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            for (role, port) in &ports {
+                // Use deep health check for main server, simple check for others
+                let healthy = if role == "main" {
+                    check_chat_health(port).await
+                } else {
+                    let url = format!("http://localhost:{}/health", port);
+                    match client.get(&url).send().await {
+                        Ok(resp) => resp.status().is_success(),
+                        Err(_) => false,
+                    }
+                };
+
+                let prev = was_healthy.get(role).copied().unwrap_or(true);
+
+                if !healthy {
+                    *consecutive_failures.get_mut(role).unwrap() += 1;
+                    let failures = consecutive_failures[role];
+
+                    if failures == 1 && prev {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt 1/2)\n",
+                            role, port
+                        );
+                        let _ = alert_tx.send(msg);
+                    } else if failures >= 2 {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m auto-restarting...\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                        let _ = restart_tx.send(RestartRequest { role: role.clone() });
+                        consecutive_failures.insert(role.clone(), 0);
+                    }
+                } else {
+                    let was_failed = consecutive_failures[role] > 0;
+                    consecutive_failures.insert(role.clone(), 0);
+
+                    if !prev {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mrecovered\x1b[0m\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                    } else if was_failed {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mhealthy\x1b[0m\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                    }
+                }
+
+                was_healthy.insert(role.clone(), healthy);
+            }
+        }
+    })
+}
+
 /// Query the local llama.cpp server for its actual context size (`n_ctx`).
 ///
 /// Returns the server's context window with 5% headroom subtracted (to account
@@ -1045,9 +1437,50 @@ pub(crate) fn start_health_watchdog(
 /// unreachable or the response is unexpected.
 pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
     let url = format!("http://localhost:{}/props", port);
-    let props = reqwest::blocking::get(&url)
+    let props = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::try_current();
+        match rt {
+            Ok(handle) => handle.block_on(async {
+                reqwest::Client::new()
+                    .get(&url)
+                    .send()
+                    .await
+                    .ok()?
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+            }),
+            Err(_) => reqwest::blocking::get(&url)
+                .ok()?
+                .json::<serde_json::Value>()
+                .ok(),
+        }
+    })?;
+    let n_ctx = props
+        .get("default_generation_settings")
+        .and_then(|v| v.get("n_ctx"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| props.get("n_ctx").and_then(|v| v.as_u64()))? as usize;
+    let n_parallel = props
+        .get("default_generation_settings")
+        .and_then(|v| v.get("n_parallel"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| props.get("n_parallel").and_then(|v| v.as_u64()))
+        .unwrap_or(1)
+        .max(1) as usize;
+    let per_request_ctx = (n_ctx / n_parallel).max(1);
+    Some((per_request_ctx as f64 * 0.95) as usize)
+}
+
+pub(crate) async fn query_local_context_size_async(port: &str) -> Option<usize> {
+    let url = format!("http://localhost:{}/props", port);
+    let props = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
         .ok()?
         .json::<serde_json::Value>()
+        .await
         .ok()?;
     let n_ctx = props
         .get("default_generation_settings")
@@ -1062,7 +1495,6 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
         .unwrap_or(1)
         .max(1) as usize;
     let per_request_ctx = (n_ctx / n_parallel).max(1);
-    // Apply 5% headroom — our char/4 estimator can overshoot slightly.
     Some((per_request_ctx as f64 * 0.95) as usize)
 }
 
@@ -1074,6 +1506,10 @@ pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn can_bind_localhost() -> bool {
+        std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok()
+    }
 
     // -- practical_context_cap tests --
 
@@ -1119,6 +1555,12 @@ mod tests {
 
     #[test]
     fn test_find_available_port_returns_valid_port() {
+        if !can_bind_localhost() {
+            eprintln!(
+                "skipping test_find_available_port_returns_valid_port: localhost bind unavailable"
+            );
+            return;
+        }
         let port = find_available_port(19000);
         assert!(port >= 19000);
         assert!(port <= 19099);
@@ -1128,6 +1570,12 @@ mod tests {
 
     #[test]
     fn test_find_available_port_skips_occupied() {
+        if !can_bind_localhost() {
+            eprintln!(
+                "skipping test_find_available_port_skips_occupied: localhost bind unavailable"
+            );
+            return;
+        }
         // Bind a port, then ask for one starting at the same number
         let listener = TcpListener::bind(("127.0.0.1", 19200)).unwrap();
         let port = find_available_port(19200);
@@ -1184,13 +1632,25 @@ mod tests {
         // 2. {arch}.block_count
         write_u32_kv(&mut buf, &format!("{}.block_count", arch), n_layers);
         // 3. {arch}.attention.head_count_kv
-        write_u32_kv(&mut buf, &format!("{}.attention.head_count_kv", arch), n_kv_heads);
+        write_u32_kv(
+            &mut buf,
+            &format!("{}.attention.head_count_kv", arch),
+            n_kv_heads,
+        );
         // 4. {arch}.attention.head_count
         write_u32_kv(&mut buf, &format!("{}.attention.head_count", arch), n_heads);
         // 5. {arch}.embedding_length
-        write_u32_kv(&mut buf, &format!("{}.embedding_length", arch), embedding_dim);
+        write_u32_kv(
+            &mut buf,
+            &format!("{}.embedding_length", arch),
+            embedding_dim,
+        );
         // 6. {arch}.context_length
-        write_u32_kv(&mut buf, &format!("{}.context_length", arch), context_length);
+        write_u32_kv(
+            &mut buf,
+            &format!("{}.context_length", arch),
+            context_length,
+        );
 
         buf
     }
@@ -1333,6 +1793,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_gpu_layer_retry_plan_includes_cpu_fallback() {
+        let plan = gpu_layer_retry_plan(24);
+        assert_eq!(plan.first().copied(), Some(24));
+        assert_eq!(plan.last().copied(), Some(0));
+    }
+
+    #[test]
+    fn test_gpu_layer_retry_plan_for_cpu_only_is_single_step() {
+        let plan = gpu_layer_retry_plan(0);
+        assert_eq!(plan, vec![0]);
+    }
+
     // -- wait_for_server_ready --
 
     #[tokio::test]
@@ -1351,6 +1824,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_finds_healthy_server() {
+        if !can_bind_localhost() {
+            eprintln!("skipping test_wait_finds_healthy_server: localhost bind unavailable");
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -1374,6 +1851,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_retries_on_503_then_succeeds() {
+        if !can_bind_localhost() {
+            eprintln!(
+                "skipping test_wait_retries_on_503_then_succeeds: localhost bind unavailable"
+            );
+            return;
+        }
         use std::sync::atomic::AtomicUsize;
 
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -1425,16 +1908,41 @@ mod tests {
                 Some(info) => {
                     // Sanity checks — all real models should have sane values
                     assert!(info.n_layers > 0, "{}: n_layers should be > 0", name);
-                    assert!(info.n_layers <= 256, "{}: n_layers {} seems too high", name, info.n_layers);
+                    assert!(
+                        info.n_layers <= 256,
+                        "{}: n_layers {} seems too high",
+                        name,
+                        info.n_layers
+                    );
                     assert!(info.n_heads > 0, "{}: n_heads should be > 0", name);
                     assert!(info.n_kv_heads > 0, "{}: n_kv_heads should be > 0", name);
-                    assert!(info.n_kv_heads <= info.n_heads, "{}: n_kv_heads {} > n_heads {}", name, info.n_kv_heads, info.n_heads);
-                    assert!(info.embedding_dim >= 64, "{}: embedding_dim {} too small", name, info.embedding_dim);
-                    assert!(info.context_length >= 512, "{}: context_length {} too small", name, info.context_length);
+                    assert!(
+                        info.n_kv_heads <= info.n_heads,
+                        "{}: n_kv_heads {} > n_heads {}",
+                        name,
+                        info.n_kv_heads,
+                        info.n_heads
+                    );
+                    assert!(
+                        info.embedding_dim >= 64,
+                        "{}: embedding_dim {} too small",
+                        name,
+                        info.embedding_dim
+                    );
+                    assert!(
+                        info.context_length >= 512,
+                        "{}: context_length {} too small",
+                        name,
+                        info.context_length
+                    );
                     eprintln!(
                         "  OK: {} — layers={}, heads={}/{}, embed={}, ctx={}",
-                        name, info.n_layers, info.n_heads, info.n_kv_heads,
-                        info.embedding_dim, info.context_length
+                        name,
+                        info.n_layers,
+                        info.n_heads,
+                        info.n_kv_heads,
+                        info.embedding_dim,
+                        info.context_length
                     );
                 }
                 None => {
@@ -1459,7 +1967,12 @@ mod tests {
             assert!(ctx >= 4096, "{}: ctx {} < 4096", name, ctx);
             assert_eq!(ctx % 1024, 0, "{}: ctx {} not aligned to 1024", name, ctx);
             let file_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-            eprintln!("  OK: {} ({:.1}GB) → {}K context", name, file_size as f64 / 1e9, ctx / 1024);
+            eprintln!(
+                "  OK: {} ({:.1}GB) → {}K context",
+                name,
+                file_size as f64 / 1e9,
+                ctx / 1024
+            );
         }
     }
 
@@ -1471,7 +1984,11 @@ mod tests {
         if let Some(v) = vram {
             // If VRAM detected, should be at least 256 MB
             assert!(v >= 256 * 1024 * 1024, "VRAM {} seems too low", v);
-            eprintln!("  VRAM: {:.1} GB, RAM: {:.1} GB", v as f64 / 1e9, ram as f64 / 1e9);
+            eprintln!(
+                "  VRAM: {:.1} GB, RAM: {:.1} GB",
+                v as f64 / 1e9,
+                ram as f64 / 1e9
+            );
         } else {
             eprintln!("  No GPU detected. RAM: {:.1} GB", ram as f64 / 1e9);
         }
@@ -1525,7 +2042,11 @@ mod tests {
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(
-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+            result
+                .as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("Ministral-3"),
             "Ministral-3 should beat Nemotron, got: {:?}",
             result
         );
@@ -1540,7 +2061,11 @@ mod tests {
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(
-            result.as_ref().unwrap().to_string_lossy().contains("Ministral-3"),
+            result
+                .as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("Ministral-3"),
             "Ministral-3 is highest priority, got: {:?}",
             result
         );
@@ -1548,39 +2073,37 @@ mod tests {
 
     #[test]
     fn test_pick_preferred_model_case_insensitive() {
-        let models = vec![
-            PathBuf::from("/models/MINISTRAL-8B-INSTRUCT.gguf"),
-        ];
+        let models = vec![PathBuf::from("/models/MINISTRAL-8B-INSTRUCT.gguf")];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(result.is_some(), "Should match case-insensitively");
     }
 
     #[test]
     fn test_pick_preferred_model_mixed_case() {
-        let models = vec![
-            PathBuf::from("/models/ministral-8b-instruct-Q4_K_M.gguf"),
-        ];
+        let models = vec![PathBuf::from("/models/ministral-8b-instruct-Q4_K_M.gguf")];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(result.is_some(), "Should match lowercase filename against mixed-case preference");
+        assert!(
+            result.is_some(),
+            "Should match lowercase filename against mixed-case preference"
+        );
     }
 
     #[test]
     fn test_pick_preferred_model_substring_match() {
         // "Ministral-3" should match "Ministral-3B-Instruct-Q4.gguf" via substring
-        let models = vec![
-            PathBuf::from("/models/Ministral-3B-Instruct-Q4.gguf"),
-        ];
+        let models = vec![PathBuf::from("/models/Ministral-3B-Instruct-Q4.gguf")];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(result.is_some(), "Substring match should work");
     }
 
     #[test]
     fn test_pick_preferred_model_nanbeige_match() {
-        let models = vec![
-            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
-        ];
+        let models = vec![PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf")];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(result.is_some(), "nanbeige should match nanbeige4.1-3b-q8_0.gguf");
+        assert!(
+            result.is_some(),
+            "nanbeige should match nanbeige4.1-3b-q8_0.gguf"
+        );
     }
 
     #[test]
@@ -1592,7 +2115,11 @@ mod tests {
         ];
         let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
         assert!(
-            result.as_ref().unwrap().to_string_lossy().contains("nanbeige"),
+            result
+                .as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("nanbeige"),
             "nanbeige should beat Qwen3-0.6B, got: {:?}",
             result
         );
@@ -1614,7 +2141,11 @@ mod tests {
             let matches_any = DELEGATION_MODEL_PREFERENCES
                 .iter()
                 .any(|pref| name.contains(&pref.to_lowercase()));
-            assert!(matches_any, "Real match '{}' should be in preferences", name);
+            assert!(
+                matches_any,
+                "Real match '{}' should be in preferences",
+                name
+            );
             eprintln!("  Found delegation model: {}", path.display());
         } else {
             eprintln!("  No delegation model in ~/models/ (OK in CI)");
@@ -1666,9 +2197,7 @@ mod tests {
             assert!(port.is_none());
 
             // Verify the process is actually dead
-            let status = Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status();
+            let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
             // kill -0 should fail (process doesn't exist)
             if let Ok(s) = status {
                 assert!(!s.success(), "Process {} should be dead after stop", pid);

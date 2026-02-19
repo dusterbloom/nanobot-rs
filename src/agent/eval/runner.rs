@@ -9,13 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use super::hanoi;
-use super::sprint::{self, SprintConfig, QuestionExecution, SprintScorecard};
-use super::results::{self, EvalResult, BenchmarkData, BenchmarkType};
-use crate::agent::step_voter::{
-    CalibrationResult, CalibrationSample, VoterConfig,
-    estimate_voters_needed, parse_and_validate,
-};
+use super::results::{self, BenchmarkData, BenchmarkType, EvalResult};
+use super::sprint::{self, QuestionExecution, SprintConfig, SprintScorecard};
 use crate::agent::confidence_gate::ConfidenceGateConfig;
+use crate::agent::step_voter::{
+    estimate_voters_needed, parse_and_validate, CalibrationResult, CalibrationSample, VoterConfig,
+};
 
 // ============================================================================
 // Hanoi Calibration
@@ -297,15 +296,15 @@ fn verify_aggregation_answer(task: &super::haystack::AggregationTask, response: 
         super::haystack::AggregationTask::Count { expected, .. } => {
             response_lower.contains(&expected.to_string())
         }
-        super::haystack::AggregationTask::Distribution { expected_top_job, .. } => {
-            response_lower.contains(&expected_top_job.to_lowercase())
-        }
-        super::haystack::AggregationTask::Filter { expected_names, .. } => {
-            expected_names.iter().all(|name| response_lower.contains(&name.to_lowercase()))
-        }
-        super::haystack::AggregationTask::CrossRef { expected_names, .. } => {
-            expected_names.iter().all(|name| response_lower.contains(&name.to_lowercase()))
-        }
+        super::haystack::AggregationTask::Distribution {
+            expected_top_job, ..
+        } => response_lower.contains(&expected_top_job.to_lowercase()),
+        super::haystack::AggregationTask::Filter { expected_names, .. } => expected_names
+            .iter()
+            .all(|name| response_lower.contains(&name.to_lowercase())),
+        super::haystack::AggregationTask::CrossRef { expected_names, .. } => expected_names
+            .iter()
+            .all(|name| response_lower.contains(&name.to_lowercase())),
         super::haystack::AggregationTask::Temporal { expected_name, .. } => {
             response_lower.contains(&expected_name.to_lowercase())
         }
@@ -335,7 +334,11 @@ mod tests {
         assert_eq!(result.benchmark, BenchmarkType::Hanoi);
         assert_eq!(result.model, "test-model");
         match result.data {
-            BenchmarkData::HanoiCalibration { accuracy, num_disks, .. } => {
+            BenchmarkData::HanoiCalibration {
+                accuracy,
+                num_disks,
+                ..
+            } => {
                 assert!((accuracy - 0.85).abs() < 1e-9);
                 assert_eq!(num_disks, 10);
             }
@@ -366,7 +369,8 @@ mod tests {
             // Extract expected move from prompt context (very simple mock)
             // Just return a valid-looking move
             Ok("0->2".to_string())
-        }).await;
+        })
+        .await;
 
         assert_eq!(cal.num_samples, 5);
         // Some will be correct by chance (0->2 is the first move for 3-disk)

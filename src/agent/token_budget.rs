@@ -311,7 +311,11 @@ mod tests {
         // Longer strings should produce reasonable counts.
         let s = "a".repeat(100);
         let tokens = TokenBudget::estimate_str_tokens(&s);
-        assert!(tokens > 0 && tokens < 50, "100 'a' chars should be <50 tokens, got {}", tokens);
+        assert!(
+            tokens > 0 && tokens < 50,
+            "100 'a' chars should be <50 tokens, got {}",
+            tokens
+        );
     }
 
     #[test]
@@ -447,7 +451,10 @@ mod tests {
             .filter_map(|m| m["content"].as_str())
             .collect();
         assert!(contents.contains(&"latest"), "latest message must survive");
-        assert!(contents.contains(&"tiny"), "earlier small message should survive when oversized one is skipped");
+        assert!(
+            contents.contains(&"tiny"),
+            "earlier small message should survive when oversized one is skipped"
+        );
     }
 
     #[test]
@@ -479,7 +486,9 @@ mod tests {
 
         // Add messages with turn tags. Turns 1-10 are "old", turn 50 is current.
         for turn in 1..=10 {
-            messages.push(json!({"role": "user", "content": format!("Old msg turn {}", turn), "_turn": turn}));
+            messages.push(
+                json!({"role": "user", "content": format!("Old msg turn {}", turn), "_turn": turn}),
+            );
             messages.push(json!({"role": "assistant", "content": format!("Old reply {}", turn), "_turn": turn}));
         }
         // Recent messages.
@@ -491,7 +500,10 @@ mod tests {
         let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
 
         // Old messages (turns 1-10) should be evicted, system + recent kept.
-        assert!(trimmed.len() < original_count, "should have evicted old messages");
+        assert!(
+            trimmed.len() < original_count,
+            "should have evicted old messages"
+        );
         assert_eq!(trimmed[0]["role"], "system");
         let last = trimmed.last().unwrap();
         assert_eq!(last["content"], "Recent question");
@@ -504,7 +516,8 @@ mod tests {
 
         // All messages are recent (turns 45-50, threshold=40 with max_age=10, current=50).
         for turn in 45..=50 {
-            messages.push(json!({"role": "user", "content": format!("Msg {}", turn), "_turn": turn}));
+            messages
+                .push(json!({"role": "user", "content": format!("Msg {}", turn), "_turn": turn}));
         }
 
         let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
@@ -524,10 +537,19 @@ mod tests {
 
         let trimmed = budget.trim_to_fit_with_age(&messages, 500, 50, 10);
         // Untagged message preserved, old tagged dropped.
-        let contents: Vec<&str> = trimmed.iter().filter_map(|m| m["content"].as_str()).collect();
-        assert!(contents.contains(&"No turn tag"), "untagged messages must survive");
+        let contents: Vec<&str> = trimmed
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            contents.contains(&"No turn tag"),
+            "untagged messages must survive"
+        );
         assert!(contents.contains(&"Recent"), "recent messages must survive");
-        assert!(!contents.contains(&"Old"), "old tagged messages should be evicted");
+        assert!(
+            !contents.contains(&"Old"),
+            "old tagged messages should be evicted"
+        );
     }
 
     #[test]
@@ -553,14 +575,16 @@ mod tests {
                     a.get("tool_calls")
                         .and_then(|tc| tc.as_array())
                         .map(|tcs| {
-                            tcs.iter().any(|t| {
-                                t.get("id").and_then(|i| i.as_str()) == Some("tc_1")
-                            })
+                            tcs.iter()
+                                .any(|t| t.get("id").and_then(|i| i.as_str()) == Some("tc_1"))
                         })
                         .unwrap_or(false)
                 })
         });
-        assert!(!has_orphan, "Tool result must not survive when its assistant is dropped");
+        assert!(
+            !has_orphan,
+            "Tool result must not survive when its assistant is dropped"
+        );
     }
 
     #[test]
@@ -593,9 +617,8 @@ mod tests {
                     a.get("tool_calls")
                         .and_then(|tc| tc.as_array())
                         .map(|tcs| {
-                            tcs.iter().any(|t| {
-                                t.get("id").and_then(|i| i.as_str()) == Some(tool_call_id)
-                            })
+                            tcs.iter()
+                                .any(|t| t.get("id").and_then(|i| i.as_str()) == Some(tool_call_id))
                         })
                         .unwrap_or(false)
                 });

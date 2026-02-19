@@ -247,11 +247,7 @@ fn parse_peg(s: &str) -> Option<u8> {
         .unwrap_or(&s)
         .trim()
         .strip_prefix(":")
-        .unwrap_or_else(|| {
-            s.strip_prefix("peg")
-                .unwrap_or(&s)
-                .trim()
-        });
+        .unwrap_or_else(|| s.strip_prefix("peg").unwrap_or(&s).trim());
 
     // Try letter format (A/B/C)
     if s.len() == 1 {

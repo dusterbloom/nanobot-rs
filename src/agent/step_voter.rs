@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Configuration for the step voter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,8 +99,18 @@ pub fn parse_and_validate(raw: &str) -> (Option<String>, bool, Option<String>) {
     }
 
     // Red-flag: response is just an error message
-    if trimmed.starts_with("Error:") || trimmed.starts_with("I'm sorry") || trimmed.starts_with("I cannot") {
-        return (None, true, Some(format!("Error/refusal response: {}", &trimmed[..trimmed.len().min(50)])));
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("I'm sorry")
+        || trimmed.starts_with("I cannot")
+    {
+        return (
+            None,
+            true,
+            Some(format!(
+                "Error/refusal response: {}",
+                &trimmed[..trimmed.len().min(50)]
+            )),
+        );
     }
 
     // Red-flag: response exceeds reasonable length (likely hallucination/runaway)
@@ -124,7 +134,9 @@ pub fn vote(responses: &[VoterResponse], config: &VoterConfig) -> VoteResult {
     let red_flagged = responses.len() - valid.len();
 
     // Check if too many red flags
-    if responses.is_empty() || (red_flagged as f64 / responses.len() as f64) > config.max_red_flag_rate {
+    if responses.is_empty()
+        || (red_flagged as f64 / responses.len() as f64) > config.max_red_flag_rate
+    {
         return VoteResult {
             winner: None,
             valid_votes: valid.len(),
@@ -155,7 +167,8 @@ pub fn vote(responses: &[VoterResponse], config: &VoterConfig) -> VoteResult {
 
             // Check if this answer is ahead by margin over all others
             let my_count = *count;
-            let max_other = running_counts.iter()
+            let max_other = running_counts
+                .iter()
                 .filter(|(k, _)| *k != answer)
                 .map(|(_, v)| *v)
                 .max()
@@ -171,14 +184,19 @@ pub fn vote(responses: &[VoterResponse], config: &VoterConfig) -> VoteResult {
 
     // Fallback: majority vote
     let winner = early_winner.or_else(|| {
-        vote_counts.iter()
+        vote_counts
+            .iter()
             .max_by_key(|(_, count)| *count)
             .map(|(answer, _)| answer.clone())
     });
 
     let confidence = if let Some(ref w) = winner {
         let winner_votes = vote_counts.get(w).copied().unwrap_or(0);
-        if valid.is_empty() { 0.0 } else { winner_votes as f64 / valid.len() as f64 }
+        if valid.is_empty() {
+            0.0
+        } else {
+            winner_votes as f64 / valid.len() as f64
+        }
     } else {
         0.0
     };
@@ -207,7 +225,8 @@ pub fn estimate_voters_needed(p: f64, target_p: f64, max_k: usize) -> Option<usi
         return Some(1); // Model is already good enough
     }
 
-    for k in (1..=max_k).step_by(2) { // Odd numbers only for clean majority
+    for k in (1..=max_k).step_by(2) {
+        // Odd numbers only for clean majority
         let majority = k / 2 + 1;
         let mut prob_correct = 0.0;
 
@@ -226,8 +245,12 @@ pub fn estimate_voters_needed(p: f64, target_p: f64, max_k: usize) -> Option<usi
 
 /// Compute binomial coefficient C(n, k) as f64.
 fn binomial_coefficient(n: usize, k: usize) -> f64 {
-    if k > n { return 0.0; }
-    if k == 0 || k == n { return 1.0; }
+    if k > n {
+        return 0.0;
+    }
+    if k == 0 || k == n {
+        return 1.0;
+    }
     let k = k.min(n - k); // Optimization: C(n,k) = C(n,n-k)
     let mut result = 1.0;
     for i in 0..k {

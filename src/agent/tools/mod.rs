@@ -21,5 +21,8 @@ pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
 pub use registry::ToolRegistry;
 pub use shell::ExecTool;
-pub use spawn::{CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback, SpawnTool, WaitCallback};
+pub use spawn::{
+    CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, SpawnCallback,
+    SpawnTool, WaitCallback,
+};
 pub use web::{WebFetchTool, WebSearchTool};

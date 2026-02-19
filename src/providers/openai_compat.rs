@@ -47,10 +47,7 @@ fn normalize_model_name(name: &str) -> String {
     }
 
     // Claude model without the "claude-" prefix (e.g. "opus-4-6", "sonnet-4-5-20250929").
-    if lower.starts_with("opus")
-        || lower.starts_with("sonnet")
-        || lower.starts_with("haiku")
-    {
+    if lower.starts_with("opus") || lower.starts_with("sonnet") || lower.starts_with("haiku") {
         return format!("claude-{}", name);
     }
 
@@ -75,9 +72,8 @@ impl OpenAICompatProvider {
     /// - vLLM / custom: when an explicit `api_base` is provided that isn't OpenRouter
     /// - Default fallback: OpenRouter (`https://openrouter.ai/api/v1`)
     pub fn new(api_key: &str, api_base: Option<&str>, default_model: Option<&str>) -> Self {
-        let default_model = normalize_model_name(
-            default_model.unwrap_or("anthropic/claude-opus-4-5"),
-        );
+        let default_model =
+            normalize_model_name(default_model.unwrap_or("anthropic/claude-opus-4-5"));
 
         let resolved_base = if let Some(base) = api_base {
             // Use whatever was explicitly provided.
@@ -107,6 +103,153 @@ impl OpenAICompatProvider {
     }
 }
 
+const THINK_OPEN_TAGS: [&str; 2] = ["<thinking>", "<think>"];
+const THINK_CLOSE_TAGS: [&str; 2] = ["</thinking>", "</think>"];
+
+#[derive(Default)]
+struct ThinkSplitState {
+    in_think_block: bool,
+    carry: String,
+}
+
+fn is_local_api_base(api_base: &str) -> bool {
+    let lower = api_base.to_ascii_lowercase();
+    lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("0.0.0.0")
+}
+
+/// Apply llama.cpp local reasoning controls when talking to localhost.
+///
+/// - `chat_template_kwargs.enable_thinking` toggles model reasoning mode for
+///   templates that support it (Qwen3, etc.).
+/// - `reasoning_budget` enforces a token budget for reasoning traces.
+/// - `reasoning_format` tells llama-server how to split visible vs reasoning text.
+fn apply_local_reasoning_controls(
+    body: &mut serde_json::Value,
+    api_base: &str,
+    thinking_budget: Option<u32>,
+) {
+    if !is_local_api_base(api_base) {
+        return;
+    }
+
+    let enable_thinking = thinking_budget.is_some();
+    body["chat_template_kwargs"] = serde_json::json!({
+        "enable_thinking": enable_thinking
+    });
+
+    match thinking_budget {
+        Some(budget) => {
+            body["reasoning_budget"] = serde_json::json!(budget);
+            body["reasoning_format"] = serde_json::json!("deepseek");
+        }
+        None => {
+            body["reasoning_budget"] = serde_json::json!(0);
+            body["reasoning_format"] = serde_json::json!("none");
+        }
+    }
+}
+
+fn find_first_tag(haystack: &str, tags: &[&str]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for tag in tags {
+        if let Some(idx) = haystack.find(tag) {
+            let should_replace = match best {
+                None => true,
+                Some((best_idx, best_len)) => {
+                    idx < best_idx || (idx == best_idx && tag.len() > best_len)
+                }
+            };
+            if should_replace {
+                best = Some((idx, tag.len()));
+            }
+        }
+    }
+    best
+}
+
+fn trailing_partial_tag_len(buffer: &str, tags: &[&str]) -> usize {
+    let Some(start) = buffer.rfind('<') else {
+        return 0;
+    };
+    let suffix = &buffer[start..];
+    if tags.iter().any(|tag| tag.starts_with(suffix)) {
+        suffix.len()
+    } else {
+        0
+    }
+}
+
+/// Split one streamed content delta into visible text and reasoning text by
+/// extracting `<think>...</think>` / `<thinking>...</thinking>` blocks.
+fn split_thinking_from_content_delta(state: &mut ThinkSplitState, delta: &str) -> (String, String) {
+    state.carry.push_str(delta);
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+
+    loop {
+        if state.in_think_block {
+            if let Some((idx, close_len)) = find_first_tag(&state.carry, &THINK_CLOSE_TAGS) {
+                reasoning.push_str(&state.carry[..idx]);
+                state.carry = state.carry[idx + close_len..].to_string();
+                state.in_think_block = false;
+                continue;
+            }
+
+            let keep = trailing_partial_tag_len(&state.carry, &THINK_CLOSE_TAGS);
+            let emit_len = state.carry.len().saturating_sub(keep);
+            if emit_len > 0 {
+                reasoning.push_str(&state.carry[..emit_len]);
+                state.carry = state.carry[emit_len..].to_string();
+            }
+            break;
+        }
+
+        if let Some((idx, open_len)) = find_first_tag(&state.carry, &THINK_OPEN_TAGS) {
+            visible.push_str(&state.carry[..idx]);
+            state.carry = state.carry[idx + open_len..].to_string();
+            state.in_think_block = true;
+            continue;
+        }
+
+        let keep = trailing_partial_tag_len(&state.carry, &THINK_OPEN_TAGS);
+        let emit_len = state.carry.len().saturating_sub(keep);
+        if emit_len > 0 {
+            visible.push_str(&state.carry[..emit_len]);
+            state.carry = state.carry[emit_len..].to_string();
+        }
+        break;
+    }
+
+    (visible, reasoning)
+}
+
+fn flush_thinking_split_state(state: &mut ThinkSplitState) -> (String, String) {
+    if state.carry.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    let tail = std::mem::take(&mut state.carry);
+    if state.in_think_block {
+        state.in_think_block = false;
+        (String::new(), tail)
+    } else {
+        (tail, String::new())
+    }
+}
+
+fn extract_reasoning_delta(delta: &serde_json::Value) -> Option<&str> {
+    delta
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            delta
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 #[async_trait]
 impl LLMProvider for OpenAICompatProvider {
     async fn chat(
@@ -116,7 +259,7 @@ impl LLMProvider for OpenAICompatProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
-        _thinking_budget: Option<u32>,
+        thinking_budget: Option<u32>,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -143,6 +286,7 @@ impl LLMProvider for OpenAICompatProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
+        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -228,7 +372,7 @@ impl LLMProvider for OpenAICompatProvider {
         model: Option<&str>,
         max_tokens: u32,
         temperature: f64,
-        _thinking_budget: Option<u32>,
+        thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -253,6 +397,7 @@ impl LLMProvider for OpenAICompatProvider {
             "temperature": temperature,
             "stream": true,
         });
+        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -278,10 +423,16 @@ impl LLMProvider for OpenAICompatProvider {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            warn!("LLM streaming API returned status {} (base={}): {}", status, self.api_base, error_text);
+            warn!(
+                "LLM streaming API returned status {} (base={}): {}",
+                status, self.api_base, error_text
+            );
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamChunk::Done(LLMResponse {
-                content: Some(format!("Error calling LLM (HTTP {}): {}", status, error_text)),
+                content: Some(format!(
+                    "Error calling LLM (HTTP {}): {}",
+                    status, error_text
+                )),
                 tool_calls: Vec::new(),
                 finish_reason: "error".to_string(),
                 usage: HashMap::new(),
@@ -377,21 +528,46 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or("stop")
         .to_string();
 
-    // Extract content. reasoning_content (GLM-4.7, DeepSeek-R1 style) is logged
+    // Extract content. reasoning_content/reasoning deltas are logged
     // but NOT merged into the user-facing content — it's internal chain-of-thought
     // that pollutes display, TTS, and conversation history.
     if let Some(reasoning) = message
         .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
-        debug!("Model returned reasoning_content ({} chars), discarding from output", reasoning.len());
+        debug!(
+            "Model returned reasoning_content ({} chars), discarding from output",
+            reasoning.len()
+        );
     }
     let content = message
         .get("content")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .and_then(|raw| {
+            if raw.is_empty() {
+                return None;
+            }
+            let mut split_state = ThinkSplitState::default();
+            let (mut visible, mut inline_reasoning) =
+                split_thinking_from_content_delta(&mut split_state, raw);
+            let (tail_visible, tail_reasoning) = flush_thinking_split_state(&mut split_state);
+            visible.push_str(&tail_visible);
+            inline_reasoning.push_str(&tail_reasoning);
+            if !inline_reasoning.is_empty() {
+                debug!(
+                    "Model returned inline think tags ({} chars), discarding from output",
+                    inline_reasoning.len()
+                );
+            }
+            let cleaned = visible.trim().to_string();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            }
+        });
 
     // Extract tool calls.
     let mut tool_calls = Vec::new();
@@ -470,6 +646,7 @@ async fn parse_sse_stream(
     let mut line_buffer = String::new();
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
+    let mut split_state = ThinkSplitState::default();
     let mut finish_reason = String::from("stop");
     let mut usage: HashMap<String, i64> = HashMap::new();
 
@@ -492,7 +669,9 @@ async fn parse_sse_stream(
 
         // Process complete lines
         while let Some(newline_pos) = line_buffer.find('\n') {
-            let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+            let line = line_buffer[..newline_pos]
+                .trim_end_matches('\r')
+                .to_string();
             line_buffer = line_buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
@@ -506,9 +685,22 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
+                let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
+                if !tail_reasoning.is_empty() {
+                    full_reasoning.push_str(&tail_reasoning);
+                    let _ = tx.send(StreamChunk::ThinkingDelta(tail_reasoning));
+                }
+                if !tail_content.is_empty() {
+                    full_content.push_str(&tail_content);
+                    let _ = tx.send(StreamChunk::TextDelta(tail_content));
+                }
+
                 // Stream is complete — discard reasoning_content (internal chain-of-thought)
                 if !full_reasoning.is_empty() {
-                    debug!("Streaming: discarding reasoning_content ({} chars)", full_reasoning.len());
+                    debug!(
+                        "Streaming: discarding reasoning_content ({} chars)",
+                        full_reasoning.len()
+                    );
                 }
                 let content = if !full_content.is_empty() {
                     Some(full_content.clone())
@@ -526,10 +718,7 @@ async fn parse_sse_stream(
                             Ok(map) => map,
                             Err(_) => {
                                 let mut m = HashMap::new();
-                                m.insert(
-                                    "raw".to_string(),
-                                    serde_json::Value::String(args_str),
-                                );
+                                m.insert("raw".to_string(), serde_json::Value::String(args_str));
                                 m
                             }
                         };
@@ -567,31 +756,37 @@ async fn parse_sse_stream(
                     }
 
                     if let Some(delta) = choice.get("delta") {
-                        // Reasoning content delta (GLM-4.7, DeepSeek-R1 style)
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                        // Reasoning content delta (reasoning_content / reasoning field).
+                        if let Some(reasoning) = extract_reasoning_delta(delta) {
                             if !reasoning.is_empty() {
                                 full_reasoning.push_str(reasoning);
                                 let _ = tx.send(StreamChunk::ThinkingDelta(reasoning.to_string()));
                             }
                         }
 
-                        // Text content delta
+                        // Text content delta (may include inline <think> blocks).
                         if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                             if !content.is_empty() {
-                                full_content.push_str(content);
-                                let _ = tx.send(StreamChunk::TextDelta(content.to_string()));
+                                let (visible, inline_reasoning) =
+                                    split_thinking_from_content_delta(&mut split_state, content);
+                                if !inline_reasoning.is_empty() {
+                                    full_reasoning.push_str(&inline_reasoning);
+                                    let _ = tx.send(StreamChunk::ThinkingDelta(inline_reasoning));
+                                }
+                                if !visible.is_empty() {
+                                    full_content.push_str(&visible);
+                                    let _ = tx.send(StreamChunk::TextDelta(visible));
+                                }
                             }
                         }
 
                         // Tool call deltas
-                        if let Some(tc_array) = delta.get("tool_calls").and_then(|v| v.as_array())
-                        {
+                        if let Some(tc_array) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for tc in tc_array {
-                                let index =
-                                    tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let entry = tool_calls_acc
-                                    .entry(index)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let entry = tool_calls_acc.entry(index).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                });
 
                                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                     entry.0 = id.to_string();
@@ -625,9 +820,22 @@ async fn parse_sse_stream(
         }
     }
 
+    let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
+    if !tail_reasoning.is_empty() {
+        full_reasoning.push_str(&tail_reasoning);
+        let _ = tx.send(StreamChunk::ThinkingDelta(tail_reasoning));
+    }
+    if !tail_content.is_empty() {
+        full_content.push_str(&tail_content);
+        let _ = tx.send(StreamChunk::TextDelta(tail_content));
+    }
+
     // Stream ended without [DONE] — emit whatever we have, discarding reasoning_content
     if !full_reasoning.is_empty() {
-        debug!("Streaming (no DONE): discarding reasoning_content ({} chars)", full_reasoning.len());
+        debug!(
+            "Streaming (no DONE): discarding reasoning_content ({} chars)",
+            full_reasoning.len()
+        );
     }
     let content = if !full_content.is_empty() {
         Some(full_content)
@@ -877,7 +1085,42 @@ mod tests {
         });
 
         let resp = parse_response(&data).expect("parse should succeed");
-        assert!(resp.content.is_none(), "reasoning-only response should have no content");
+        assert!(
+            resp.content.is_none(),
+            "reasoning-only response should have no content"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_strips_inline_think_tags() {
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Answer: <think>chain of thought</think>42"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.content.as_deref(), Some("Answer: 42"));
+    }
+
+    #[test]
+    fn test_split_thinking_from_content_delta_handles_split_tags() {
+        let mut state = ThinkSplitState::default();
+
+        let (v1, r1) = split_thinking_from_content_delta(&mut state, "Hello <thi");
+        assert_eq!(v1, "Hello ");
+        assert!(r1.is_empty());
+
+        let (v2, r2) = split_thinking_from_content_delta(&mut state, "nk>secret</th");
+        assert!(v2.is_empty());
+        assert_eq!(r2, "secret");
+
+        let (v3, r3) = split_thinking_from_content_delta(&mut state, "ink> world");
+        assert_eq!(v3, " world");
+        assert!(r3.is_empty());
     }
 
     // ── Provider creation / detection tests ───────────────────────
@@ -995,10 +1238,7 @@ mod tests {
 
     #[test]
     fn test_normalize_already_correct() {
-        assert_eq!(
-            normalize_model_name("claude-opus-4-6"),
-            "claude-opus-4-6"
-        );
+        assert_eq!(normalize_model_name("claude-opus-4-6"), "claude-opus-4-6");
         assert_eq!(
             normalize_model_name("anthropic/claude-opus-4-6"),
             "anthropic/claude-opus-4-6"
@@ -1033,7 +1273,8 @@ mod tests {
 
     #[test]
     fn test_supports_cache_control_openrouter_with_claude() {
-        let provider = OpenAICompatProvider::new("sk-or-abc", None, Some("anthropic/claude-opus-4-6"));
+        let provider =
+            OpenAICompatProvider::new("sk-or-abc", None, Some("anthropic/claude-opus-4-6"));
         assert!(provider.supports_cache_control("anthropic/claude-opus-4-6"));
     }
 
@@ -1045,8 +1286,24 @@ mod tests {
 
     #[test]
     fn test_no_cache_control_local() {
-        let provider = OpenAICompatProvider::new("none", Some("http://localhost:8080/v1"), Some("local"));
+        let provider =
+            OpenAICompatProvider::new("none", Some("http://localhost:8080/v1"), Some("local"));
         assert!(!provider.supports_cache_control("local"));
+    }
+
+    #[test]
+    fn test_apply_local_reasoning_controls_local_and_remote() {
+        let mut local_body = serde_json::json!({"model": "local-model"});
+        apply_local_reasoning_controls(&mut local_body, "http://localhost:18080/v1", Some(4096));
+        assert_eq!(local_body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(local_body["reasoning_budget"], 4096);
+        assert_eq!(local_body["reasoning_format"], "deepseek");
+
+        let mut remote_body = serde_json::json!({"model": "gpt-4o"});
+        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", Some(4096));
+        assert!(remote_body.get("chat_template_kwargs").is_none());
+        assert!(remote_body.get("reasoning_budget").is_none());
+        assert!(remote_body.get("reasoning_format").is_none());
     }
 
     #[test]
@@ -1071,9 +1328,7 @@ mod tests {
 
     #[test]
     fn test_inject_cache_control_tools() {
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": "test"}),
-        ];
+        let messages = vec![serde_json::json!({"role": "system", "content": "test"})];
         let tools = vec![
             serde_json::json!({"type": "function", "function": {"name": "tool_a"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_b"}}),
@@ -1090,9 +1345,7 @@ mod tests {
     #[test]
     fn test_inject_cache_control_no_system_message() {
         // Edge case: no system message — should not panic.
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "Hello"}),
-        ];
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hello"})];
         let (cached, _) = inject_cache_control(&messages, None);
         // User message should be unchanged (not treated as system).
         assert_eq!(cached[0]["content"], "Hello");

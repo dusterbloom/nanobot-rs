@@ -305,14 +305,34 @@ pub struct ProvidersConfig {
 /// and `SubagentManager::resolve_provider_for_model`.
 pub const PROVIDER_PREFIXES: &[(&str, fn(&ProvidersConfig) -> &ProviderConfig, &str)] = &[
     ("groq/", |p| &p.groq, "https://api.groq.com/openai/v1"),
-    ("gemini/", |p| &p.gemini, "https://generativelanguage.googleapis.com/v1beta/openai"),
+    (
+        "gemini/",
+        |p| &p.gemini,
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
     ("openai/", |p| &p.openai, "https://api.openai.com/v1"),
-    ("anthropic/", |p| &p.anthropic, "https://api.anthropic.com/v1"),
+    (
+        "anthropic/",
+        |p| &p.anthropic,
+        "https://api.anthropic.com/v1",
+    ),
     ("deepseek/", |p| &p.deepseek, "https://api.deepseek.com"),
-    ("huggingface/", |p| &p.huggingface, "https://router.huggingface.co/v1"),
-    ("zhipu-coding/", |p| &p.zhipu_coding, "https://api.z.ai/api/coding/paas/v4"),
+    (
+        "huggingface/",
+        |p| &p.huggingface,
+        "https://router.huggingface.co/v1",
+    ),
+    (
+        "zhipu-coding/",
+        |p| &p.zhipu_coding,
+        "https://api.z.ai/api/coding/paas/v4",
+    ),
     ("zhipu/", |p| &p.zhipu, "https://api.z.ai/api/paas/v4"),
-    ("openrouter/", |p| &p.openrouter, "https://openrouter.ai/api/v1"),
+    (
+        "openrouter/",
+        |p| &p.openrouter,
+        "https://openrouter.ai/api/v1",
+    ),
 ];
 
 impl ProvidersConfig {
@@ -326,11 +346,7 @@ impl ProvidersConfig {
                 let cfg = accessor(self);
                 if !cfg.api_key.is_empty() {
                     let base = cfg.api_base.as_deref().unwrap_or(default_base);
-                    return Some((
-                        cfg.api_key.clone(),
-                        base.to_string(),
-                        rest.to_string(),
-                    ));
+                    return Some((cfg.api_key.clone(), base.to_string(), rest.to_string()));
                 }
             }
         }
@@ -438,6 +454,108 @@ pub struct ToolsConfig {
     pub web: WebToolsConfig,
     #[serde(default, rename = "exec")]
     pub exec_: ExecToolConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Trio router config
+// ---------------------------------------------------------------------------
+
+fn default_trio_router_port() -> u16 {
+    8094
+}
+
+fn default_trio_router_ctx_tokens() -> usize {
+    4096
+}
+
+fn default_trio_router_temperature() -> f64 {
+    0.6
+}
+
+fn default_trio_router_top_p() -> f64 {
+    0.95
+}
+
+fn default_trio_router_no_think() -> bool {
+    true
+}
+
+fn default_trio_main_no_think() -> bool {
+    true
+}
+
+fn default_trio_specialist_port() -> u16 {
+    8095
+}
+
+fn default_trio_specialist_ctx_tokens() -> usize {
+    8192
+}
+
+fn default_trio_specialist_temperature() -> f64 {
+    0.7
+}
+
+/// Configuration for the SLM trio (router + specialist helpers).
+/// Uses Nemotron-Orchestrator-8B as router with /no_think mode for direct JSON output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrioConfig {
+    /// Enable the trio workflow (defaults to false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Use /no_think mode for main model (Nemotron-Nano) to output directly to content.
+    #[serde(default = "default_trio_main_no_think")]
+    pub main_no_think: bool,
+    /// Local GGUF filename for the router (Nemotron-Orchestrator-8B). Stored in ~/models/.
+    #[serde(default)]
+    pub router_model: String,
+    /// TCP port for the router server (default: 8094).
+    #[serde(default = "default_trio_router_port")]
+    pub router_port: u16,
+    /// Context size for the router (default: 4096).
+    #[serde(default = "default_trio_router_ctx_tokens")]
+    pub router_ctx_tokens: usize,
+    /// Temperature for router sampling (default: 0.6).
+    #[serde(default = "default_trio_router_temperature")]
+    pub router_temperature: f64,
+    /// Top-p for router sampling (default: 0.95).
+    #[serde(default = "default_trio_router_top_p")]
+    pub router_top_p: f64,
+    /// Use /no_think mode for direct JSON output (default: true).
+    #[serde(default = "default_trio_router_no_think")]
+    pub router_no_think: bool,
+    /// Specialist SLM (summary/coder) filename stored in ~/models/.
+    #[serde(default)]
+    pub specialist_model: String,
+    /// Port for the specialist server (default: 8095).
+    #[serde(default = "default_trio_specialist_port")]
+    pub specialist_port: u16,
+    /// Context size for the specialist (default: 8192).
+    #[serde(default = "default_trio_specialist_ctx_tokens")]
+    pub specialist_ctx_tokens: usize,
+    /// Temperature for the specialist LLM (default: 0.7).
+    #[serde(default = "default_trio_specialist_temperature")]
+    pub specialist_temperature: f64,
+}
+
+impl Default for TrioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            main_no_think: default_trio_main_no_think(),
+            router_model: String::new(),
+            router_port: default_trio_router_port(),
+            router_ctx_tokens: default_trio_router_ctx_tokens(),
+            router_temperature: default_trio_router_temperature(),
+            router_top_p: default_trio_router_top_p(),
+            router_no_think: default_trio_router_no_think(),
+            specialist_model: String::new(),
+            specialist_port: default_trio_specialist_port(),
+            specialist_ctx_tokens: default_trio_specialist_ctx_tokens(),
+            specialist_temperature: default_trio_specialist_temperature(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +809,35 @@ pub struct ToolDelegationConfig {
     /// Empty string = fall back to main model (not recommended).
     #[serde(default)]
     pub default_subagent_model: String,
+
+    /// When true, reject direct tool calls emitted by the main model.
+    /// The main model is forced into conversation/orchestration-only behavior.
+    #[serde(default)]
+    pub strict_no_tools_main: bool,
+
+    /// When true, require router outputs to match strict JSON schema.
+    #[serde(default)]
+    pub strict_router_schema: bool,
+
+    /// When true, build and use role-scoped context packs per turn.
+    #[serde(default)]
+    pub role_scoped_context_packs: bool,
+
+    /// When true, force all subagents/tools to local-only model choices.
+    #[serde(default)]
+    pub strict_local_only: bool,
+
+    /// When true, validate normalized ToolPlan before any tool execution.
+    #[serde(default = "default_true")]
+    pub strict_toolplan_validation: bool,
+
+    /// When true, use deterministic fallback routing when router output is invalid.
+    #[serde(default = "default_true")]
+    pub deterministic_router_fallback: bool,
+
+    /// Maximum identical tool calls allowed in one turn (dedup guard).
+    #[serde(default = "default_td_max_same_tool_call")]
+    pub max_same_tool_call_per_turn: u32,
 }
 
 fn default_td_cost_budget() -> f64 {
@@ -699,6 +846,10 @@ fn default_td_cost_budget() -> f64 {
 
 fn default_td_preview_chars() -> usize {
     200
+}
+
+fn default_td_max_same_tool_call() -> u32 {
+    1
 }
 
 impl Default for ToolDelegationConfig {
@@ -714,6 +865,13 @@ impl Default for ToolDelegationConfig {
             auto_local: true,
             cost_budget: default_td_cost_budget(),
             default_subagent_model: String::new(),
+            strict_no_tools_main: false,
+            strict_router_schema: false,
+            role_scoped_context_packs: false,
+            strict_local_only: false,
+            strict_toolplan_validation: true,
+            deterministic_router_fallback: true,
+            max_same_tool_call_per_turn: default_td_max_same_tool_call(),
         }
     }
 }
@@ -877,9 +1035,15 @@ pub struct Config {
     pub worker: WorkerConfig,
     #[serde(default)]
     pub proprioception: ProprioceptionConfig,
+    #[serde(default)]
+    pub trio: TrioConfig,
 }
 
 impl Config {
+    fn is_provider_key_enabled(key: &str) -> bool {
+        !key.is_empty() && !key.eq_ignore_ascii_case("none")
+    }
+
     /// Get the expanded workspace path.
     pub fn workspace_path(&self) -> PathBuf {
         let ws = &self.agents.defaults.workspace;
@@ -901,7 +1065,7 @@ impl Config {
             &self.providers.vllm.api_key,
         ];
         for key in candidates {
-            if !key.is_empty() && key != "none" && key != "NONE" {
+            if Self::is_provider_key_enabled(key) {
                 return Some(key.clone());
             }
         }
@@ -920,7 +1084,7 @@ impl Config {
     /// Detection order matches `get_api_key()` priority so that the key and
     /// base always refer to the same provider.
     pub fn get_api_base(&self) -> Option<String> {
-        if !self.providers.openrouter.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.openrouter.api_key) {
             return Some(
                 self.providers
                     .openrouter
@@ -929,19 +1093,19 @@ impl Config {
                     .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
             );
         }
-        if !self.providers.deepseek.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.deepseek.api_key) {
             return Some("https://api.deepseek.com".to_string());
         }
-        if !self.providers.anthropic.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.anthropic.api_key) {
             return Some("https://api.anthropic.com/v1".to_string());
         }
-        if !self.providers.openai.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.openai.api_key) {
             return Some("https://api.openai.com/v1".to_string());
         }
-        if !self.providers.gemini.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.gemini.api_key) {
             return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
         }
-        if !self.providers.zhipu.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.zhipu.api_key) {
             return Some(
                 self.providers
                     .zhipu
@@ -950,7 +1114,7 @@ impl Config {
                     .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
             );
         }
-        if !self.providers.zhipu_coding.api_key.is_empty() {
+        if Self::is_provider_key_enabled(&self.providers.zhipu_coding.api_key) {
             return Some(
                 self.providers
                     .zhipu_coding
@@ -959,10 +1123,7 @@ impl Config {
                     .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
             );
         }
-        if !self.providers.groq.api_key.is_empty()
-            && self.providers.groq.api_key != "none"
-            && self.providers.groq.api_key != "NONE"
-        {
+        if Self::is_provider_key_enabled(&self.providers.groq.api_key) {
             return Some(
                 self.providers
                     .groq
@@ -1089,6 +1250,23 @@ mod tests {
     }
 
     #[test]
+    fn test_local_vllm_provider_selected_when_cloud_disabled() {
+        let mut cfg = Config::default();
+        cfg.providers.openrouter.api_key = "none".to_string();
+        cfg.providers.anthropic.api_key.clear();
+        cfg.providers.openai.api_key.clear();
+        cfg.providers.groq.api_key = "none".to_string();
+        cfg.providers.vllm.api_key = "local".to_string();
+        cfg.providers.vllm.api_base = Some("http://127.0.0.1:18080/v1".to_string());
+
+        assert_eq!(cfg.get_api_key(), Some("local".to_string()));
+        assert_eq!(
+            cfg.get_api_base(),
+            Some("http://127.0.0.1:18080/v1".to_string())
+        );
+    }
+
+    #[test]
     fn test_tool_delegation_config_defaults() {
         let td = ToolDelegationConfig::default();
         assert!(td.enabled);
@@ -1099,6 +1277,13 @@ mod tests {
         assert!(td.slim_results);
         assert_eq!(td.max_result_preview_chars, 200);
         assert!(td.auto_local);
+        assert!(!td.strict_no_tools_main);
+        assert!(!td.strict_router_schema);
+        assert!(!td.role_scoped_context_packs);
+        assert!(!td.strict_local_only);
+        assert!(td.strict_toolplan_validation);
+        assert!(td.deterministic_router_fallback);
+        assert_eq!(td.max_same_tool_call_per_turn, 1);
     }
 
     #[test]
@@ -1117,6 +1302,13 @@ mod tests {
             auto_local: true,
             cost_budget: 0.01,
             default_subagent_model: String::new(),
+            strict_no_tools_main: true,
+            strict_router_schema: true,
+            role_scoped_context_packs: true,
+            strict_local_only: true,
+            strict_toolplan_validation: true,
+            deterministic_router_fallback: true,
+            max_same_tool_call_per_turn: 1,
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
@@ -1125,11 +1317,19 @@ mod tests {
         assert_eq!(td2.max_iterations, 10);
         assert_eq!(td2.max_tokens, 2048);
         assert!(td2.provider.is_some());
+        assert!(td2.strict_no_tools_main);
+        assert!(td2.strict_router_schema);
+        assert!(td2.role_scoped_context_packs);
+        assert!(td2.strict_local_only);
+        assert!(td2.strict_toolplan_validation);
+        assert!(td2.deterministic_router_fallback);
+        assert_eq!(td2.max_same_tool_call_per_turn, 1);
     }
 
     #[test]
     fn test_tool_delegation_config_in_root() {
-        let json = r#"{"toolDelegation": {"enabled": true, "model": "small-model", "maxIterations": 5}}"#;
+        let json =
+            r#"{"toolDelegation": {"enabled": true, "model": "small-model", "maxIterations": 5}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.tool_delegation.enabled);
         assert_eq!(cfg.tool_delegation.model, "small-model");
@@ -1202,14 +1402,20 @@ mod tests {
         // When auto_local is absent from JSON, it should default to true
         let json = r#"{"enabled": true, "model": "small-model"}"#;
         let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-        assert!(td.auto_local, "auto_local should default to true when absent");
+        assert!(
+            td.auto_local,
+            "auto_local should default to true when absent"
+        );
     }
 
     #[test]
     fn test_auto_local_explicit_false() {
         let json = r#"{"enabled": true, "autoLocal": false}"#;
         let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-        assert!(!td.auto_local, "auto_local should be false when explicitly set");
+        assert!(
+            !td.auto_local,
+            "auto_local should be false when explicitly set"
+        );
     }
 
     #[test]
@@ -1257,6 +1463,9 @@ mod tests {
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
-        assert!(!td2.auto_local, "Roundtrip should preserve auto_local=false");
+        assert!(
+            !td2.auto_local,
+            "Roundtrip should preserve auto_local=false"
+        );
     }
 }

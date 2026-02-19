@@ -63,7 +63,10 @@ impl ModelPrices {
                 if let Ok(cached) = serde_json::from_str::<ModelPrices>(&data) {
                     let now = chrono::Utc::now().timestamp();
                     if now - cached.fetched_at < CACHE_MAX_AGE_SECS {
-                        debug!("Model prices loaded from cache ({} models)", cached.prices.len());
+                        debug!(
+                            "Model prices loaded from cache ({} models)",
+                            cached.prices.len()
+                        );
                         return cached;
                     }
                     debug!("Model price cache is stale, re-fetching");
@@ -83,7 +86,10 @@ impl ModelPrices {
                         let _ = tokio::fs::write(&path, json).await;
                     }
                 }
-                debug!("Fetched {} model prices from OpenRouter", prices.prices.len());
+                debug!(
+                    "Fetched {} model prices from OpenRouter",
+                    prices.prices.len()
+                );
                 prices
             }
             Err(e) => {
@@ -161,10 +167,9 @@ mod tests {
         let mut prices = ModelPrices::empty();
         // GLM-4.5-air: $0.13/MTok prompt, $0.85/MTok completion
         // Per-token: 0.00000013, 0.00000085
-        prices.prices.insert(
-            "z-ai/glm-4.5-air".to_string(),
-            (0.00000013, 0.00000085),
-        );
+        prices
+            .prices
+            .insert("z-ai/glm-4.5-air".to_string(), (0.00000013, 0.00000085));
 
         // 1000 prompt tokens, 500 completion tokens
         let cost = prices.cost_of("z-ai/glm-4.5-air", 1000, 500);
@@ -182,7 +187,9 @@ mod tests {
     #[test]
     fn test_cost_of_zero_tokens() {
         let mut prices = ModelPrices::empty();
-        prices.prices.insert("test/model".to_string(), (0.001, 0.002));
+        prices
+            .prices
+            .insert("test/model".to_string(), (0.001, 0.002));
         assert_eq!(prices.cost_of("test/model", 0, 0), 0.0);
     }
 
@@ -234,11 +241,17 @@ mod tests {
         let result = ModelPrices::fetch().await;
         match result {
             Ok(prices) => {
-                assert!(prices.prices.len() > 100, "Expected 100+ models, got {}", prices.prices.len());
+                assert!(
+                    prices.prices.len() > 100,
+                    "Expected 100+ models, got {}",
+                    prices.prices.len()
+                );
                 // Verify a known model exists.
-                assert!(prices.prices.contains_key("anthropic/claude-opus-4.6")
-                    || prices.prices.contains_key("anthropic/claude-3.5-sonnet"),
-                    "Should contain at least one Anthropic model");
+                assert!(
+                    prices.prices.contains_key("anthropic/claude-opus-4.6")
+                        || prices.prices.contains_key("anthropic/claude-3.5-sonnet"),
+                    "Should contain at least one Anthropic model"
+                );
                 // Verify prices are non-negative.
                 for (model, (p, c)) in &prices.prices {
                     assert!(*p >= 0.0, "Negative prompt price for {}", model);

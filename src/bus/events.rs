@@ -100,7 +100,10 @@ impl OutboundMessage {
 /// Messages are merged in order with timing annotations so the LLM sees them
 /// as a single turn with context. Media and metadata are combined.
 pub fn coalesce_messages(mut messages: Vec<InboundMessage>) -> InboundMessage {
-    assert!(!messages.is_empty(), "coalesce_messages requires at least 1 message");
+    assert!(
+        !messages.is_empty(),
+        "coalesce_messages requires at least 1 message"
+    );
     if messages.len() == 1 {
         return messages.remove(0);
     }
@@ -118,7 +121,10 @@ pub fn coalesce_messages(mut messages: Vec<InboundMessage>) -> InboundMessage {
         if i == 0 {
             parts.push(msg.content.clone());
         } else {
-            let delta_ms = msg.timestamp.signed_duration_since(timestamp).num_milliseconds();
+            let delta_ms = msg
+                .timestamp
+                .signed_duration_since(timestamp)
+                .num_milliseconds();
             parts.push(format!("[+{}ms] {}", delta_ms, msg.content));
         }
         all_media.extend(msg.media.iter().cloned());

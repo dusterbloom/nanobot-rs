@@ -10,12 +10,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::voice::{detect_language, split_tts_sentences};
 use jack_voice::{
     models::{self, ModelProgressCallback},
     SpeechToText, SttMode, TextToSpeech, TtsEngine,
 };
 use tracing::{debug, info};
-use crate::voice::{detect_language, split_tts_sentences};
 
 /// Shared voice pipeline for channel voice message processing.
 ///
@@ -64,38 +64,36 @@ impl VoicePipeline {
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
         // Init Pocket (English TTS)
-        let tts_en = match tokio::task::spawn_blocking(|| {
-            TextToSpeech::with_engine(TtsEngine::Pocket)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking join error: {e}"))?
-        {
-            Ok(tts) => {
-                info!("Pocket TTS ready (English)");
-                Some(tts)
-            }
-            Err(e) => {
-                info!("Pocket TTS not available, English will use Kokoro: {e}");
-                None
-            }
-        };
+        let tts_en =
+            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
+            {
+                Ok(tts) => {
+                    info!("Pocket TTS ready (English)");
+                    Some(tts)
+                }
+                Err(e) => {
+                    info!("Pocket TTS not available, English will use Kokoro: {e}");
+                    None
+                }
+            };
 
         // Init Kokoro (multilingual TTS)
-        let tts_multi = match tokio::task::spawn_blocking(|| {
-            TextToSpeech::with_engine(TtsEngine::Kokoro)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking join error: {e}"))?
-        {
-            Ok(tts) => {
-                info!("Kokoro TTS ready (multilingual)");
-                Some(tts)
-            }
-            Err(e) => {
-                info!("Kokoro TTS not available: {e}");
-                None
-            }
-        };
+        let tts_multi =
+            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
+            {
+                Ok(tts) => {
+                    info!("Kokoro TTS ready (multilingual)");
+                    Some(tts)
+                }
+                Err(e) => {
+                    info!("Kokoro TTS not available: {e}");
+                    None
+                }
+            };
 
         if tts_en.is_none() && tts_multi.is_none() {
             return Err("No TTS engine could be initialized".to_string());

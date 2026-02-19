@@ -94,7 +94,10 @@ pub(crate) static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Enter raw mode if not already active. Returns true if this call entered raw mode.
 pub fn enter_raw_mode() -> bool {
-    if RAW_MODE_ACTIVE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    if RAW_MODE_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         termimad::crossterm::terminal::enable_raw_mode().ok();
         true
     } else {
@@ -104,7 +107,11 @@ pub fn enter_raw_mode() -> bool {
 
 /// Exit raw mode if this caller originally entered it (pass the return value of `enter_raw_mode`).
 pub fn exit_raw_mode(owned: bool) {
-    if owned && RAW_MODE_ACTIVE.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    if owned
+        && RAW_MODE_ACTIVE
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
         termimad::crossterm::terminal::disable_raw_mode().ok();
     }
 }
@@ -180,10 +187,17 @@ pub fn loading_animation(message: &str) {
 /// Adds `extra` for surrounding blank lines / println calls.
 pub(crate) fn terminal_rows(text: &str, extra: usize) -> usize {
     let width = terminal_width();
-    let rows: usize = text.split('\n').map(|line| {
-        let len = line.width();
-        if len == 0 { 1 } else { (len + width - 1) / width }
-    }).sum();
+    let rows: usize = text
+        .split('\n')
+        .map(|line| {
+            let len = line.width();
+            if len == 0 {
+                1
+            } else {
+                (len + width - 1) / width
+            }
+        })
+        .sum();
     rows + extra
 }
 
@@ -379,7 +393,11 @@ fn format_tokens(n: usize) -> String {
 /// Print a compact status bar after each agent response.
 ///
 /// Shows: ctx tokens/max | msgs | tools called | working memory | channels | agents | turn
-pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[&str], subagent_count: usize) {
+pub(crate) fn print_status_bar(
+    core_handle: &SharedCoreHandle,
+    channel_names: &[&str],
+    subagent_count: usize,
+) {
     // Read counters directly — no RwLock needed.
     let counters = &core_handle.counters;
     let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
@@ -411,7 +429,9 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
     parts.push(format!("msgs:{}", msg_count));
 
     // Tools called this turn
-    let tools_called: Vec<String> = counters.last_tools_called.lock()
+    let tools_called: Vec<String> = counters
+        .last_tools_called
+        .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
     if !tools_called.is_empty() {
@@ -426,12 +446,7 @@ pub(crate) fn print_status_bar(core_handle: &SharedCoreHandle, channel_names: &[
     }
 
     if !channel_names.is_empty() {
-        parts.push(format!(
-            "{}{}{}",
-            CYAN,
-            channel_names.join(" "),
-            RESET
-        ));
+        parts.push(format!("{}{}{}", CYAN, channel_names.join(" "), RESET));
     }
 
     if subagent_count > 0 {
@@ -526,7 +541,10 @@ pub(crate) fn print_startup_splash(local_port: &str) {
             config.agents.defaults.model
         );
     }
-    println!("  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}", crate::VERSION);
+    println!(
+        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}",
+        crate::VERSION
+    );
     println!();
 
     // Brief loading animation
@@ -650,7 +668,11 @@ pub(crate) fn spawn_interrupt_watcher(
 /// Speak with TTS while watching for user interrupt (Enter or Ctrl+Space).
 /// Returns true if the user interrupted (wants to speak next).
 #[cfg(feature = "voice")]
-pub(crate) fn speak_interruptible(vs: &mut crate::voice::VoiceSession, text: &str, lang: &str) -> bool {
+pub(crate) fn speak_interruptible(
+    vs: &mut crate::voice::VoiceSession,
+    text: &str,
+    lang: &str,
+) -> bool {
     vs.clear_cancel();
     let cancel = vs.cancel_flag();
     let done = Arc::new(AtomicBool::new(false));

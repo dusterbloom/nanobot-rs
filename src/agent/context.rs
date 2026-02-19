@@ -14,6 +14,47 @@ use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
 use crate::agent::token_budget::TokenBudget;
 
+/// Sanitize a tool result before injecting into context.
+///
+/// - Detects binary content (null bytes in first 512 bytes)
+/// - Detects base64 blobs (>50% alphanumeric+/= chars and length > 1000)
+/// - Truncates to `max_chars` if too long
+/// - Returns the original string unchanged otherwise
+pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
+    if result.is_empty() || max_chars == 0 {
+        return result.to_string();
+    }
+
+    // Binary detection: null bytes in first 512 bytes.
+    let check_len = result.len().min(512);
+    if result.as_bytes()[..check_len].contains(&0u8) {
+        return format!("[Binary content, {} bytes]", result.len());
+    }
+
+    // Base64 detection: >50% base64-alphabet chars and length > 1000.
+    if result.len() > 1000 {
+        let b64_chars = result
+            .bytes()
+            .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
+            .count();
+        if b64_chars * 2 > result.len() {
+            return format!("[Base64 data, {} chars]", result.len());
+        }
+    }
+
+    // Truncation.
+    if result.len() > max_chars {
+        let end = crate::utils::helpers::floor_char_boundary(result, max_chars);
+        return format!(
+            "{}\n... [truncated, {} chars total]",
+            &result[..end],
+            result.len()
+        );
+    }
+
+    result.to_string()
+}
+
 /// Well-known files that are loaded from the workspace root when present.
 const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
 
@@ -27,6 +68,14 @@ pub struct ContextBuilder {
     pub bootstrap_budget: usize,
     /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
     pub long_term_memory_budget: usize,
+    /// Max tokens for skills (always-loaded + summary) in the system prompt.
+    pub skills_budget: usize,
+    /// Max tokens for subagent profiles in the system prompt.
+    pub profiles_budget: usize,
+    /// Hard cap on the total assembled system prompt (0 = no cap).
+    /// Acts as end-to-end safety net: even if individual component budgets
+    /// sum to more than this, the final prompt is truncated to fit.
+    pub system_prompt_cap: usize,
     /// Whether to inject provenance verification rules into the system prompt.
     pub provenance_enabled: bool,
     /// When true, all skills are loaded as summaries only (RLM lazy mode).
@@ -47,6 +96,9 @@ impl ContextBuilder {
             model_name: String::new(),
             bootstrap_budget: 1500,
             long_term_memory_budget: 400,
+            skills_budget: 1000,
+            profiles_budget: 500,
+            system_prompt_cap: 0, // no cap by default (cloud models)
             provenance_enabled: false,
             lazy_skills: false,
             agent_profiles: String::new(),
@@ -65,6 +117,9 @@ impl ContextBuilder {
             model_name: String::new(),
             bootstrap_budget: 500,
             long_term_memory_budget: 200,
+            skills_budget: 300,
+            profiles_budget: 200,
+            system_prompt_cap: 800, // ~20% of typical 4K local model
             provenance_enabled: false,
             lazy_skills: false,
             agent_profiles: String::new(),
@@ -76,6 +131,10 @@ impl ContextBuilder {
         // Local models: scale down but with tighter clamps.
         self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(100, 1_000); // 1%
+        self.skills_budget = (max_context_tokens / 50).clamp(200, 1_500); // 2%
+        self.profiles_budget = (max_context_tokens / 100).clamp(100, 800); // 1%
+        // Hard cap: 30% of context for system prompt, leaving 70% for conversation.
+        self.system_prompt_cap = (max_context_tokens * 3 / 10).clamp(500, 4_000);
     }
 
     /// Scale prompt component budgets proportionally to the model's context window.
@@ -85,6 +144,10 @@ impl ContextBuilder {
     pub fn scale_budgets(&mut self, max_context_tokens: usize) {
         self.bootstrap_budget = (max_context_tokens / 50).clamp(500, 20_000); // 2%
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 10_000); // 1%
+        self.skills_budget = (max_context_tokens / 25).clamp(500, 20_000); // 4%
+        self.profiles_budget = (max_context_tokens / 50).clamp(300, 10_000); // 2%
+        // Cloud models: generous cap (40% of context), or 0 to disable.
+        self.system_prompt_cap = max_context_tokens * 2 / 5; // 40%
     }
 
     // ------------------------------------------------------------------
@@ -95,7 +158,11 @@ impl ContextBuilder {
     ///
     /// When `channel` is provided, reads `CONTEXT-{channel}.md` for per-channel
     /// session context (falls back to `CONTEXT.md` for backwards compatibility).
-    pub fn build_system_prompt(&self, skill_names: Option<&[String]>, channel: Option<&str>) -> String {
+    pub fn build_system_prompt(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // Core identity.
@@ -129,7 +196,11 @@ impl ContextBuilder {
         // legacy CONTEXT.md for backwards compatibility.
         let context_path = if let Some(ch) = channel {
             let per_channel = self.workspace.join(format!("CONTEXT-{}.md", ch));
-            if per_channel.exists() { per_channel } else { self.workspace.join("CONTEXT.md") }
+            if per_channel.exists() {
+                per_channel
+            } else {
+                self.workspace.join("CONTEXT.md")
+            }
         } else {
             self.workspace.join("CONTEXT.md")
         };
@@ -144,18 +215,23 @@ impl ContextBuilder {
         // Memory context (long-term facts only â€” observations, daily notes, and
         // learnings have been moved out of the system prompt).
         // Use tail truncation so newest facts (appended by reflector) survive.
-        let long_term =
-            Self::_truncate_to_budget_tail(&self.memory.read_long_term(), self.long_term_memory_budget);
+        let long_term = Self::_truncate_to_budget_tail(
+            &self.memory.read_long_term(),
+            self.long_term_memory_budget,
+        );
         if !long_term.is_empty() {
             parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
         }
 
-        // Skills -- progressive loading (with lazy/RLM mode support):
+        // Skills -- progressive loading (with lazy/RLM mode support).
+        // All skills content is accumulated then capped at skills_budget.
         let fetch_hint = if self.lazy_skills {
             "Use the read_skill tool to load a skill's full instructions."
         } else {
             "To use a skill, read its SKILL.md file using the read_file tool."
         };
+
+        let mut skills_parts: Vec<String> = Vec::new();
 
         if !self.lazy_skills {
             // Eager mode: always-loaded skills get full content.
@@ -163,7 +239,7 @@ impl ContextBuilder {
             if !always_skills.is_empty() {
                 let always_content = self.skills.load_skills_for_context(&always_skills);
                 if !always_content.is_empty() {
-                    parts.push(format!("# Active Skills\n\n{}", always_content));
+                    skills_parts.push(format!("# Active Skills\n\n{}", always_content));
                 }
             }
         }
@@ -172,7 +248,7 @@ impl ContextBuilder {
         // Available skills: summary only (name + description).
         let skills_summary = self.skills.build_skills_summary();
         if !skills_summary.is_empty() {
-            parts.push(format!(
+            skills_parts.push(format!(
                 "# Skills\n\n\
                  The following skills extend your capabilities. {}\n\
                  Skills with available=\"false\" need dependencies installed first \
@@ -182,9 +258,24 @@ impl ContextBuilder {
             ));
         }
 
+        if !skills_parts.is_empty() {
+            let combined = skills_parts.join("\n\n");
+            let capped = Self::_truncate_to_budget_head(&combined, self.skills_budget);
+            if !capped.is_empty() {
+                parts.push(capped);
+            }
+        }
+
         // Subagent profiles â€” tells the model what agents exist and when to delegate.
+        // Capped at profiles_budget to avoid blowing context for small models.
         if !self.agent_profiles.is_empty() {
-            parts.push(self.agent_profiles.clone());
+            let capped = Self::_truncate_to_budget_head(
+                &self.agent_profiles,
+                self.profiles_budget,
+            );
+            if !capped.is_empty() {
+                parts.push(capped);
+            }
         }
 
         // Explicitly requested skills (always loaded in full, even in lazy mode).
@@ -197,7 +288,14 @@ impl ContextBuilder {
             }
         }
 
-        parts.join("\n\n---\n\n")
+        let assembled = parts.join("\n\n---\n\n");
+
+        // End-to-end safety net: hard cap on total system prompt size.
+        if self.system_prompt_cap > 0 {
+            Self::_truncate_to_budget_head(&assembled, self.system_prompt_cap)
+        } else {
+            assembled
+        }
     }
 
     /// Build the complete message list for an LLM call.
@@ -475,6 +573,36 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
         Value::Array(images)
     }
 
+    /// Truncate keeping the HEAD of the text (most important content first).
+    ///
+    /// Used for skills and profiles where the beginning is most relevant.
+    /// Truncates at line boundaries.
+    fn _truncate_to_budget_head(text: &str, max_tokens: usize) -> String {
+        if text.is_empty() || max_tokens == 0 {
+            return String::new();
+        }
+
+        if TokenBudget::estimate_str_tokens(text) <= max_tokens {
+            return text.to_string();
+        }
+
+        let max_chars = max_tokens.saturating_mul(4);
+        let mut kept = String::new();
+
+        for line in text.lines() {
+            let line_cost = line.len() + 1;
+            if kept.len() + line_cost > max_chars && !kept.is_empty() {
+                break;
+            }
+            if !kept.is_empty() {
+                kept.push('\n');
+            }
+            kept.push_str(line);
+        }
+
+        kept
+    }
+
     /// Truncate keeping the TAIL of the text (newest content), silently.
     ///
     /// Used for MEMORY.md where the reflector appends new facts at the bottom.
@@ -507,7 +635,6 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
         kept.reverse();
         kept.join("\n")
     }
-
 }
 
 /// Map ISO 639-1 language code to a human-readable name for LLM instruction.
@@ -671,8 +798,6 @@ mod tests {
         assert!(prompt.contains("read_file"));
     }
 
-
-
     // ----- build_messages -----
 
     #[test]
@@ -799,7 +924,12 @@ mod tests {
     #[test]
     fn test_add_tool_result_immutable_wraps_content() {
         let mut messages: Vec<Value> = Vec::new();
-        ContextBuilder::add_tool_result_immutable(&mut messages, "call_1", "read_file", "file content");
+        ContextBuilder::add_tool_result_immutable(
+            &mut messages,
+            "call_1",
+            "read_file",
+            "file content",
+        );
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "tool");
@@ -826,7 +956,10 @@ mod tests {
         let lines: Vec<String> = (0..500).map(|i| format!("FACT {}", i)).collect();
         let text = lines.join("\n");
         let result = ContextBuilder::_truncate_to_budget_tail(&text, 40);
-        assert!(result.contains("FACT 499"), "newest facts should survive tail truncation");
+        assert!(
+            result.contains("FACT 499"),
+            "newest facts should survive tail truncation"
+        );
         assert!(!result.contains("FACT 0"), "oldest facts should be dropped");
         // No truncation marker visible to the model.
         assert!(!result.contains("[truncated"), "no truncation markers");
@@ -857,7 +990,10 @@ mod tests {
         let mut cb = ContextBuilder::new(tmp.path());
         cb.long_term_memory_budget = 20; // very tight
         let prompt = cb.build_system_prompt(None, None);
-        assert!(prompt.contains("NEWEST FACT"), "newest fact should survive tight budget");
+        assert!(
+            prompt.contains("NEWEST FACT"),
+            "newest fact should survive tight budget"
+        );
     }
 
     #[test]
@@ -876,5 +1012,100 @@ mod tests {
             !prompt.contains("Observations from Past Conversations"),
             "observations should no longer be injected into system prompt"
         );
+    }
+
+    // ----- sanitize_tool_result -----
+
+    #[test]
+    fn test_sanitize_passthrough() {
+        let result = sanitize_tool_result("normal text output", 30000);
+        assert_eq!(result, "normal text output");
+    }
+
+    #[test]
+    fn test_sanitize_binary_detection() {
+        let mut data = "some text\0with null bytes".to_string();
+        let result = sanitize_tool_result(&data, 30000);
+        assert!(result.starts_with("[Binary content,"));
+    }
+
+    #[test]
+    fn test_sanitize_base64_detection() {
+        // Create a string that's >50% base64 characters and >1000 chars
+        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+            .repeat(20);
+        let result = sanitize_tool_result(&b64, 30000);
+        assert!(result.starts_with("[Base64 data,"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_sanitize_truncation() {
+        let long = "x".repeat(1000);
+        let result = sanitize_tool_result(&long, 100);
+        assert!(result.len() < 200); // 100 + truncation message
+        assert!(result.contains("[truncated, 1000 chars total]"));
+    }
+
+    #[test]
+    fn test_sanitize_empty() {
+        assert_eq!(sanitize_tool_result("", 100), "");
+    }
+
+    // ----- _truncate_to_budget_head -----
+
+    #[test]
+    fn test_system_prompt_cap_truncates() {
+        let tmp = TempDir::new().unwrap();
+        // Create a large AGENTS.md to blow the budget.
+        fs::write(tmp.path().join("AGENTS.md"), "A".repeat(10_000)).unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.system_prompt_cap = 50; // very tight cap
+        let prompt = cb.build_system_prompt(None, None);
+        let tokens = TokenBudget::estimate_str_tokens(&prompt);
+        assert!(
+            tokens <= 60, // allow slight overshoot due to line boundary
+            "system prompt ({} tokens) should be near cap (50)",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_no_cap_by_default() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "A".repeat(10_000)).unwrap();
+        let cb = ContextBuilder::new(tmp.path()); // default: cap=0 (disabled)
+        let prompt = cb.build_system_prompt(None, None);
+        assert!(
+            prompt.contains("AAAA"),
+            "without cap, large content should pass through"
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_budget_head_keeps_beginning() {
+        let lines: Vec<String> = (0..500).map(|i| format!("SKILL {}", i)).collect();
+        let text = lines.join("\n");
+        let result = ContextBuilder::_truncate_to_budget_head(&text, 40);
+        assert!(
+            result.contains("SKILL 0"),
+            "beginning should survive head truncation"
+        );
+        assert!(
+            !result.contains("SKILL 499"),
+            "end should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_budget_head_short_passthrough() {
+        let text = "Short text.";
+        let result = ContextBuilder::_truncate_to_budget_head(text, 100);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_truncate_to_budget_head_empty() {
+        assert_eq!(ContextBuilder::_truncate_to_budget_head("", 100), "");
+        assert_eq!(ContextBuilder::_truncate_to_budget_head("hello", 0), "");
     }
 }

@@ -157,23 +157,25 @@ impl OAuthTokenManager {
         let file = CredentialsFile {
             claude_ai_oauth: self.credentials.clone(),
         };
-        let content = serde_json::to_string_pretty(&file)
-            .context("Cannot serialize credentials")?;
+        let content =
+            serde_json::to_string_pretty(&file).context("Cannot serialize credentials")?;
 
         // Atomic write: write to temp file, then rename.
         let tmp = self.credentials_path.with_extension("tmp");
         std::fs::write(&tmp, &content)
             .with_context(|| format!("Cannot write to {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.credentials_path)
-            .with_context(|| {
-                format!(
-                    "Cannot rename {} → {}",
-                    tmp.display(),
-                    self.credentials_path.display()
-                )
-            })?;
+        std::fs::rename(&tmp, &self.credentials_path).with_context(|| {
+            format!(
+                "Cannot rename {} → {}",
+                tmp.display(),
+                self.credentials_path.display()
+            )
+        })?;
 
-        debug!("Saved refreshed credentials to {}", self.credentials_path.display());
+        debug!(
+            "Saved refreshed credentials to {}",
+            self.credentials_path.display()
+        );
         Ok(())
     }
 }

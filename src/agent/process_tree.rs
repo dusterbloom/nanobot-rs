@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
-use std::fs;
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Status of a worker node in the process tree.
@@ -204,7 +204,9 @@ impl StatusCounts {
 
     pub fn progress_pct(&self) -> f64 {
         let total = self.total();
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         (self.completed as f64 / total as f64) * 100.0
     }
 }
@@ -392,7 +394,10 @@ mod tests {
         node2.start();
         node2.fail("Error occurred".to_string(), 5678);
 
-        assert_eq!(node2.status, NodeStatus::Failed("Error occurred".to_string()));
+        assert_eq!(
+            node2.status,
+            NodeStatus::Failed("Error occurred".to_string())
+        );
         assert_eq!(node2.error, Some("Error occurred".to_string()));
         assert_eq!(node2.duration_ms, Some(5678));
         assert!(node2.finished_at.is_some());

@@ -24,9 +24,7 @@ enum StreamState {
     },
     /// Thinking deltas (dimmed). Transition in when we see `\x1b[90m`,
     /// transition out on `\x1b[0m\n\n`.
-    Thinking {
-        lines_printed: usize,
-    },
+    Thinking { lines_printed: usize },
 }
 
 /// Incremental line renderer that prints formatted text as it streams.
@@ -79,32 +77,49 @@ impl IncrementalRenderer {
             return;
         }
 
-        // Detect thinking end: "\x1b[0m\n\n"
+        // Detect thinking end: agent_loop sends "\x1b[0m\n\n" before normal text.
         if matches!(self.state, StreamState::Thinking { .. }) {
-            if delta.contains("\x1b[0m") {
-                let lines_printed = match self.state {
+            if let Some(reset_pos) = delta.find("\x1b[0m") {
+                let before_reset = &delta[..reset_pos];
+                let lines_printed = match &mut self.state {
                     StreamState::Thinking { lines_printed } => lines_printed,
-                    _ => 0,
+                    _ => unreachable!(),
                 };
-                // Collapse thinking output
-                self.clear_partial_internal();
-                if lines_printed > 0 {
-                    // Erase the thinking lines we printed
-                    for _ in 0..lines_printed {
-                        print!("\x1b[1A\x1b[2K");
+
+                for ch in before_reset.chars() {
+                    if ch == '\n' {
+                        println!("\r");
+                        *lines_printed += 1;
+                        self.has_partial = false;
+                    } else {
+                        print!("{}", ch);
+                        self.has_partial = true;
                     }
                 }
-                // Print collapsed summary
-                println!("\r\x1b[2m🧠 thinking ({} lines)\x1b[0m", lines_printed);
+
+                // Exit dim mode and preserve the blank separator lines.
+                print!("\x1b[0m");
+                let after_reset = &delta[reset_pos + "\x1b[0m".len()..];
+                let mut split_at = 0usize;
+                for (idx, ch) in after_reset.char_indices() {
+                    if ch == '\n' || ch == '\r' {
+                        split_at = idx + ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if split_at > 0 {
+                    print!("{}", &after_reset[..split_at]);
+                }
                 std::io::stdout().flush().ok();
+
                 self.has_partial = false;
                 self.state = StreamState::Prose;
-                // Process any text after the reset sequence
-                if let Some(after) = delta.split("\x1b[0m").last() {
-                    let trimmed = after.trim_start_matches('\n');
-                    if !trimmed.is_empty() {
-                        self.push(trimmed);
-                    }
+
+                // Process any content after the reset/newline suffix.
+                let remaining = &after_reset[split_at..];
+                if !remaining.is_empty() {
+                    self.push(remaining);
                 }
                 return;
             }
@@ -184,11 +199,7 @@ impl IncrementalRenderer {
                 }
                 _ => {
                     // Opening fence: extract language, create highlighter
-                    let lang = trimmed
-                        .strip_prefix("```")
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
+                    let lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
                     let lang_display = if lang.is_empty() { "code" } else { &lang };
 
                     // Print header rule
@@ -234,7 +245,10 @@ impl IncrementalRenderer {
                     println!("\r  {}", rendered);
                 }
             }
-            StreamState::CodeBlock { ref mut highlighter, .. } => {
+            StreamState::CodeBlock {
+                ref mut highlighter,
+                ..
+            } => {
                 // Syntax-highlight the line
                 match highlighter.highlight_line(line, &SYNTAX_SET) {
                     Ok(ranges) => {
@@ -359,8 +373,16 @@ impl IncrementalRenderer {
     fn compute_partial_rows(&self) -> usize {
         let width = crate::tui::terminal_width();
         let display_len = unicode_width::UnicodeWidthStr::width(self.line_buffer.as_str())
-            + if matches!(self.state, StreamState::CodeBlock { .. }) { 2 } else { 0 };
-        if display_len == 0 { 1 } else { (display_len + width - 1) / width }
+            + if matches!(self.state, StreamState::CodeBlock { .. }) {
+                2
+            } else {
+                0
+            };
+        if display_len == 0 {
+            1
+        } else {
+            (display_len + width - 1) / width
+        }
     }
 
     /// Erase `n` terminal rows (current row + n-1 rows above).
@@ -376,7 +398,11 @@ impl IncrementalRenderer {
 
     /// Erase all terminal rows occupied by the current partial line.
     fn erase_partial_rows(&self) {
-        let rows = if self.partial_rows > 0 { self.partial_rows } else { self.compute_partial_rows() };
+        let rows = if self.partial_rows > 0 {
+            self.partial_rows
+        } else {
+            self.compute_partial_rows()
+        };
         self.erase_n_rows(rows);
     }
 
@@ -459,7 +485,12 @@ fn try_strip_numbered(line: &str) -> Option<String> {
     if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
         let rest = &trimmed[num_end + 2..];
         let indent_str = " ".repeat(indent);
-        Some(format!("{}{}. {}", indent_str, num_part, format_inline(rest)))
+        Some(format!(
+            "{}{}. {}",
+            indent_str,
+            num_part,
+            format_inline(rest)
+        ))
     } else {
         None
     }

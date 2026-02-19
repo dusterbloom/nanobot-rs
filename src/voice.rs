@@ -84,7 +84,11 @@ pub(crate) fn split_tts_sentences(text: &str) -> Vec<String> {
     let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = normalized.trim();
     if trimmed.len() <= 500 {
-        return if trimmed.is_empty() { vec![] } else { vec![trimmed.to_string()] };
+        return if trimmed.is_empty() {
+            vec![]
+        } else {
+            vec![trimmed.to_string()]
+        };
     }
 
     let sentences = split_sentences(&normalized);
@@ -163,7 +167,7 @@ pub(crate) enum TtsCommand {
 
 /// A chunk of synthesized audio ready for playback.
 struct AudioChunk {
-    data: Vec<u8>,    // f32le raw bytes
+    data: Vec<u8>, // f32le raw bytes
     sample_rate: u32,
 }
 
@@ -311,16 +315,17 @@ impl VoiceSession {
         // creates a tokio Runtime for async model loading (which panics if
         // called from within an existing runtime).
         let tts_en = if load_pocket {
-            match tokio::task::spawn_blocking(|| {
-                TextToSpeech::with_engine(TtsEngine::Pocket)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking join error: {e}"))?
+            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
                     let engine = tts.engine_type();
-                    tracing::info!("{} TTS ready (English) [engine: {}]",
-                        if engine == "pocket" { "Pocket" } else { engine }, engine);
+                    tracing::info!(
+                        "{} TTS ready (English) [engine: {}]",
+                        if engine == "pocket" { "Pocket" } else { engine },
+                        engine
+                    );
                     Some(Arc::new(Mutex::new(tts)))
                 }
                 Err(e) => {
@@ -333,11 +338,9 @@ impl VoiceSession {
         };
 
         let tts_multi = if load_kokoro {
-            match tokio::task::spawn_blocking(|| {
-                TextToSpeech::with_engine(TtsEngine::Kokoro)
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking join error: {e}"))?
+            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
                     tracing::info!("Kokoro TTS ready (multilingual)");
@@ -468,7 +471,11 @@ impl VoiceSession {
         .clone();
 
         let is_pocket = tts.lock().unwrap().engine_type() == "pocket";
-        tracing::debug!("TTS engine selected: {} for lang={}", if is_pocket { "pocket" } else { "kokoro" }, lang);
+        tracing::debug!(
+            "TTS engine selected: {} for lang={}",
+            if is_pocket { "pocket" } else { "kokoro" },
+            lang
+        );
         let voice_id = if is_pocket {
             "alba"
         } else {
@@ -638,7 +645,10 @@ impl VoiceSession {
                         if cancel_synth.load(Ordering::Relaxed) {
                             break;
                         }
-                        tracing::debug!("Streaming TTS: synthesizing \"{}\"", &sentence[..sentence.len().min(40)]);
+                        tracing::debug!(
+                            "Streaming TTS: synthesizing \"{}\"",
+                            &sentence[..sentence.len().min(40)]
+                        );
                         // Display sentence text as synthesis begins (audio will follow in ~80ms)
                         if let Some(ref dtx) = display_tx {
                             let _ = dtx.send(sentence.clone());
@@ -670,13 +680,20 @@ impl VoiceSession {
         // Pre-spawn paplay so PA connection is established while LLM streams.
         // Both Pocket and Kokoro output 24kHz; verified at runtime via debug log.
         let mut paplay = Command::new("paplay")
-            .args(["--raw", "--format=float32le", "--channels=1", "--rate=24000"])
+            .args([
+                "--raw",
+                "--format=float32le",
+                "--channels=1",
+                "--rate=24000",
+            ])
             .env("PULSE_SERVER", pulse_server())
             .env("PULSE_LATENCY_MSEC", "10")
             .stdin(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils"))?;
+            .map_err(|e| {
+                format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils")
+            })?;
         let paplay_stdin = paplay.stdin.take().unwrap();
 
         // --- Playback thread: writes audio chunks to pre-opened stdin ---
@@ -848,8 +865,7 @@ impl SentenceAccumulator {
     /// Flush buffer contents if 500ms has passed without a sentence boundary.
     fn try_timeout_flush(&mut self) {
         if let Some(t) = self.first_buffered {
-            if t.elapsed() >= std::time::Duration::from_millis(500)
-                && self.buffer.trim().len() > 20
+            if t.elapsed() >= std::time::Duration::from_millis(500) && self.buffer.trim().len() > 20
             {
                 let text = std::mem::take(&mut self.buffer);
                 let cleaned = strip_inline_markdown(text.trim());
@@ -885,7 +901,9 @@ impl SentenceAccumulator {
     /// or immediately in eager (streaming) mode.
     fn enqueue_sentence(&mut self, sentence: &str) {
         if self.eager {
-            let _ = self.sentence_tx.send(TtsCommand::Synthesize(sentence.to_string()));
+            let _ = self
+                .sentence_tx
+                .send(TtsCommand::Synthesize(sentence.to_string()));
             self.first_buffered = None;
             return;
         }
@@ -1048,8 +1066,10 @@ mod tests {
     fn test_lingua_detects_short_english() {
         let text = "You just tell me a joke testing uh your pocket";
         let detected = detect_language(text);
-        assert_eq!(detected, "en",
-            "lingua should detect short informal English correctly");
+        assert_eq!(
+            detected, "en",
+            "lingua should detect short informal English correctly"
+        );
     }
 
     /// Longer English text is also correctly detected.
@@ -1112,12 +1132,21 @@ mod tests {
                 let result = tts.synthesize("Hello, this is a test.");
                 match result {
                     Ok(output) => {
-                        assert!(output.samples.len() > 100,
-                            "Expected audio samples, got {} samples", output.samples.len());
-                        assert!(output.sample_rate > 0,
-                            "Expected non-zero sample rate, got {}", output.sample_rate);
-                        println!("Pocket TTS OK: {} samples @ {}Hz",
-                            output.samples.len(), output.sample_rate);
+                        assert!(
+                            output.samples.len() > 100,
+                            "Expected audio samples, got {} samples",
+                            output.samples.len()
+                        );
+                        assert!(
+                            output.sample_rate > 0,
+                            "Expected non-zero sample rate, got {}",
+                            output.sample_rate
+                        );
+                        println!(
+                            "Pocket TTS OK: {} samples @ {}Hz",
+                            output.samples.len(),
+                            output.sample_rate
+                        );
                     }
                     Err(e) => panic!("Pocket TTS synthesis failed: {}", e),
                 }
@@ -1130,28 +1159,46 @@ mod tests {
     #[test]
     fn test_pocket_tts_streaming() {
         use jack_voice::{TextToSpeech, TtsEngine};
-        let mut tts = TextToSpeech::with_engine(TtsEngine::Pocket)
-            .expect("Pocket TTS init failed");
+        let mut tts = TextToSpeech::with_engine(TtsEngine::Pocket).expect("Pocket TTS init failed");
 
         let mut chunk_count = 0u32;
         let mut total_samples = 0usize;
         let mut rate = 0u32;
 
-        let sr = tts.synthesize_streaming(
-            "Hello, this is a streaming test. The audio should arrive in multiple chunks.",
-            |samples, sample_rate| {
-                chunk_count += 1;
-                total_samples += samples.len();
-                rate = sample_rate;
-                println!("  chunk {}: {} samples @ {}Hz", chunk_count, samples.len(), sample_rate);
-                true // continue
-            },
-        ).expect("Streaming synthesis failed");
+        let sr = tts
+            .synthesize_streaming(
+                "Hello, this is a streaming test. The audio should arrive in multiple chunks.",
+                |samples, sample_rate| {
+                    chunk_count += 1;
+                    total_samples += samples.len();
+                    rate = sample_rate;
+                    println!(
+                        "  chunk {}: {} samples @ {}Hz",
+                        chunk_count,
+                        samples.len(),
+                        sample_rate
+                    );
+                    true // continue
+                },
+            )
+            .expect("Streaming synthesis failed");
 
-        assert!(sr > 0, "Expected non-zero sample rate from return, got {sr}");
-        assert_eq!(sr, rate, "Return sample rate should match callback sample rate");
-        assert!(total_samples > 100, "Expected audio samples, got {total_samples}");
-        assert!(chunk_count > 1, "Expected multiple streaming chunks, got {chunk_count}");
+        assert!(
+            sr > 0,
+            "Expected non-zero sample rate from return, got {sr}"
+        );
+        assert_eq!(
+            sr, rate,
+            "Return sample rate should match callback sample rate"
+        );
+        assert!(
+            total_samples > 100,
+            "Expected audio samples, got {total_samples}"
+        );
+        assert!(
+            chunk_count > 1,
+            "Expected multiple streaming chunks, got {chunk_count}"
+        );
         println!("Streaming OK: {chunk_count} chunks, {total_samples} samples @ {rate}Hz");
     }
 
@@ -1170,9 +1217,21 @@ mod tests {
             }
         }
         let combined = sentences.join(" ");
-        assert!(!combined.contains("thinking"), "Thinking block should be stripped, got: {}", combined);
-        assert!(!combined.contains("Let me think"), "Thinking content should be stripped, got: {}", combined);
-        assert!(combined.contains("The answer is 42"), "Real content should remain, got: {}", combined);
+        assert!(
+            !combined.contains("thinking"),
+            "Thinking block should be stripped, got: {}",
+            combined
+        );
+        assert!(
+            !combined.contains("Let me think"),
+            "Thinking content should be stripped, got: {}",
+            combined
+        );
+        assert!(
+            combined.contains("The answer is 42"),
+            "Real content should remain, got: {}",
+            combined
+        );
     }
 
     #[test]
@@ -1192,7 +1251,15 @@ mod tests {
             }
         }
         let combined = sentences.join(" ");
-        assert!(!combined.contains("Internal reasoning"), "Thinking content should be stripped, got: {}", combined);
-        assert!(combined.contains("Hello world"), "Real content should remain, got: {}", combined);
+        assert!(
+            !combined.contains("Internal reasoning"),
+            "Thinking content should be stripped, got: {}",
+            combined
+        );
+        assert!(
+            combined.contains("Hello world"),
+            "Real content should remain, got: {}",
+            combined
+        );
     }
 }

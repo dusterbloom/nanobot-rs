@@ -146,6 +146,8 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 |---------|-------------|
 | `/local`, `/l` | Toggle local/cloud mode |
 | `/model`, `/m` | Select local GGUF model |
+| `/think`, `/t`, `/thinking` | Toggle/adjust thinking (`on`, `off`, or budget tokens) |
+| `/nothink`, `/nt` | Suppress streamed thinking output |
 | `/voice`, `/v` | Toggle voice mode |
 | `/telegram`, `/tg` | Start Telegram channel in background |
 | `/whatsapp`, `/wa` | Start WhatsApp channel in background |

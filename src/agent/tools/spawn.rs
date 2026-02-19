@@ -31,29 +31,23 @@ pub type SpawnCallback = Arc<
 >;
 
 /// Type alias for the list callback. Returns formatted list of running subagents.
-pub type ListCallback = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
->;
+pub type ListCallback = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// Type alias for the cancel callback. Takes task_id prefix, returns success message.
-pub type CancelCallback = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
->;
+pub type CancelCallback =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// Type alias for the wait callback. Takes task_id prefix + timeout secs, returns result.
-pub type WaitCallback = Arc<
-    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
->;
+pub type WaitCallback =
+    Arc<dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// Type alias for the check callback. Takes task_id prefix, returns result without blocking.
-pub type CheckCallback = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
->;
+pub type CheckCallback =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// Type alias for the pipeline callback. Takes (steps_json, ahead_by_k) -> result string.
-pub type PipelineCallback = Arc<
-    dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync,
->;
+pub type PipelineCallback =
+    Arc<dyn Fn(String, usize) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// Type alias for the loop callback.
 /// Takes (task, max_rounds, tools, stop_condition, model, working_dir) -> result string.
@@ -250,7 +244,57 @@ impl Tool for SpawnTool {
                     "description": "Stop condition text for action='loop'. Loop stops when output contains this text or 'DONE'."
                 }
             },
-            "required": []
+            "required": [],
+            "oneOf": [
+                {
+                    "description": "Spawn a new subagent (default action)",
+                    "properties": {
+                        "action": { "enum": ["spawn"] }
+                    },
+                    "required": ["task"]
+                },
+                {
+                    "description": "Check a completed result by task id",
+                    "properties": {
+                        "action": { "enum": ["check"] }
+                    },
+                    "required": ["task_id"]
+                },
+                {
+                    "description": "Wait for completion by task id",
+                    "properties": {
+                        "action": { "enum": ["wait"] }
+                    },
+                    "required": ["task_id"]
+                },
+                {
+                    "description": "Cancel a running task by task id",
+                    "properties": {
+                        "action": { "enum": ["cancel"] }
+                    },
+                    "required": ["task_id"]
+                },
+                {
+                    "description": "Run a multi-step pipeline",
+                    "properties": {
+                        "action": { "enum": ["pipeline"] }
+                    },
+                    "required": ["steps"]
+                },
+                {
+                    "description": "Run an autonomous loop",
+                    "properties": {
+                        "action": { "enum": ["loop"] }
+                    },
+                    "required": ["task"]
+                },
+                {
+                    "description": "List running/recent tasks",
+                    "properties": {
+                        "action": { "enum": ["list"] }
+                    }
+                }
+            ]
         })
     }
 
@@ -350,10 +394,12 @@ impl Tool for SpawnTool {
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5) as u32;
-                let tools_filter: Option<Vec<String>> = params
-                    .get("tools")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+                let tools_filter: Option<Vec<String>> =
+                    params.get("tools").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    });
                 let stop_condition = params
                     .get("stop_condition")
                     .and_then(|v| v.as_str())
@@ -372,7 +418,15 @@ impl Tool for SpawnTool {
                     Some(cb) => {
                         let cb = cb.clone();
                         drop(cb_guard);
-                        cb(task, max_rounds, tools_filter, stop_condition, model, working_dir).await
+                        cb(
+                            task,
+                            max_rounds,
+                            tools_filter,
+                            stop_condition,
+                            model,
+                            working_dir,
+                        )
+                        .await
                     }
                     None => "Error: Loop callback not configured".to_string(),
                 }
@@ -459,6 +513,9 @@ mod tests {
         // No required params (task only needed for spawn, not list/cancel)
         let required = params["required"].as_array().unwrap();
         assert!(required.is_empty());
+        // Action-specific requirements are encoded via oneOf.
+        let one_of = params["oneOf"].as_array().unwrap();
+        assert!(one_of.len() >= 6);
     }
 
     #[tokio::test]
@@ -524,9 +581,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_with_mock_callback() {
         let tool = SpawnTool::new();
-        let list_cb: ListCallback = Arc::new(|| {
-            Box::pin(async { "No subagents currently running.".to_string() })
-        });
+        let list_cb: ListCallback =
+            Arc::new(|| Box::pin(async { "No subagents currently running.".to_string() }));
         tool.set_list_callback(list_cb).await;
 
         let mut params = HashMap::new();
@@ -541,9 +597,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_with_mock_callback() {
         let tool = SpawnTool::new();
-        let cancel_cb: CancelCallback = Arc::new(|id: String| {
-            Box::pin(async move { format!("Cancelled {}", id) })
-        });
+        let cancel_cb: CancelCallback =
+            Arc::new(|id: String| Box::pin(async move { format!("Cancelled {}", id) }));
         tool.set_cancel_callback(cancel_cb).await;
 
         let mut params = HashMap::new();

@@ -25,15 +25,24 @@ fn main() {
         if let Ok(out_dir) = std::env::var("OUT_DIR") {
             // Walk up from OUT_DIR to find the profile dir (target/release or target/debug).
             let mut target_dir = std::path::PathBuf::from(&out_dir);
-            while target_dir.file_name().map_or(false, |f| f != "release" && f != "debug") {
-                if !target_dir.pop() { break; }
+            while target_dir
+                .file_name()
+                .map_or(false, |f| f != "release" && f != "debug")
+            {
+                if !target_dir.pop() {
+                    break;
+                }
             }
 
             // Find the sherpa-onnx libs in the cache.
             let home = std::env::var("HOME").unwrap_or_default();
             let sherpa_cache = std::path::PathBuf::from(&home).join(".cache/sherpa-rs");
             if sherpa_cache.exists() {
-                let libs = ["libsherpa-onnx-c-api.so", "libonnxruntime.so", "libsherpa-onnx-cxx-api.so"];
+                let libs = [
+                    "libsherpa-onnx-c-api.so",
+                    "libonnxruntime.so",
+                    "libsherpa-onnx-cxx-api.so",
+                ];
                 let local_lib = std::path::PathBuf::from(&home).join(".local/lib");
                 let _ = std::fs::create_dir_all(&local_lib);
 
@@ -59,7 +68,8 @@ fn main() {
                 for entry in walkdir(&build_dir) {
                     if entry.ends_with("share/espeak-ng-data/phontab") {
                         if let Some(espeak_data_dir) = entry.parent() {
-                            let local_share = std::path::PathBuf::from(&home).join(".local/share/espeak-ng-data");
+                            let local_share =
+                                std::path::PathBuf::from(&home).join(".local/share/espeak-ng-data");
                             copy_dir_recursive(espeak_data_dir, &local_share);
                             break;
                         }

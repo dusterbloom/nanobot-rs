@@ -81,10 +81,7 @@ impl RecallTool {
                     .filter(|line| line.to_lowercase().contains(&lower_query))
                     .collect();
                 if !matching_lines.is_empty() {
-                    results.push(format!(
-                        "## MEMORY.md\n{}",
-                        matching_lines.join("\n")
-                    ));
+                    results.push(format!("## MEMORY.md\n{}", matching_lines.join("\n")));
                 }
             }
         }
@@ -108,7 +105,8 @@ impl RecallTool {
                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
                         let lower_query = query.to_lowercase();
                         if content.to_lowercase().contains(&lower_query) {
-                            let filename = path.file_name()
+                            let filename = path
+                                .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("unknown");
                             // Extract a relevant snippet (lines containing the query).
@@ -117,11 +115,7 @@ impl RecallTool {
                                 .filter(|line| line.to_lowercase().contains(&lower_query))
                                 .take(5)
                                 .collect();
-                            results.push(format!(
-                                "## {}\n{}",
-                                filename,
-                                snippet.join("\n")
-                            ));
+                            results.push(format!("## {}\n{}", filename, snippet.join("\n")));
                         }
                     }
                 }
@@ -223,7 +217,11 @@ impl Tool for RecallTool {
             let output = sections.join("\n\n");
             if output.len() > 8000 {
                 let truncated: String = output.chars().take(8000).collect();
-                format!("{}\n\n[truncated — {} total chars]", truncated, output.len())
+                format!(
+                    "{}\n\n[truncated — {} total chars]",
+                    truncated,
+                    output.len()
+                )
             } else {
                 output
             }
@@ -275,7 +273,8 @@ mod tests {
         std::fs::write(
             tmp.path().join("memory").join("MEMORY.md"),
             "- User prefers dark mode\n- Favorite language is Rust\n- Lives in Helsinki",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("Rust"));
@@ -288,15 +287,22 @@ mod tests {
     async fn test_recall_grep_finds_session_files() {
         let (tmp, tool) = make_tool();
         std::fs::write(
-            tmp.path().join("memory").join("sessions").join("SESSION_abc12345.md"),
+            tmp.path()
+                .join("memory")
+                .join("sessions")
+                .join("SESSION_abc12345.md"),
             "---\nsession_key: \"cli:test\"\nstatus: active\n---\n\nDiscussed async Rust patterns.",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!("async"));
         params.insert("mode".to_string(), json!("keyword"));
         let result = tool.execute(params).await;
-        assert!(result.contains("async"), "Should find async in session file");
+        assert!(
+            result.contains("async"),
+            "Should find async in session file"
+        );
     }
 
     #[tokio::test]
@@ -315,11 +321,16 @@ mod tests {
         std::fs::write(
             archived_dir.join("SESSION_old.md"),
             "---\nsession_key: \"cli:old\"\nstatus: archived\n---\n\nDiscussed UTF-8 encoding.",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Test grep_memory directly to bypass qmd.
         let result = tool.grep_memory("UTF-8", 10).await;
-        assert!(result.contains("UTF-8"), "Should find UTF-8 in archived session file: {}", result);
+        assert!(
+            result.contains("UTF-8"),
+            "Should find UTF-8 in archived session file: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -327,14 +338,15 @@ mod tests {
         let (tmp, tool) = make_tool();
         // Write a MEMORY.md with multi-byte UTF-8 characters that would panic with byte slicing.
         let cjk_content = "日本語テスト\n".repeat(2000); // ~12K chars of CJK
-        std::fs::write(
-            tmp.path().join("memory").join("MEMORY.md"),
-            &cjk_content,
-        ).unwrap();
+        std::fs::write(tmp.path().join("memory").join("MEMORY.md"), &cjk_content).unwrap();
 
         // Test grep_memory directly — the old &output[..8000] byte slice would panic on CJK.
         let result = tool.grep_memory("日本語", 10).await;
-        assert!(result.contains("日本語"), "Should find CJK text: {}", &result[..result.len().min(200)]);
+        assert!(
+            result.contains("日本語"),
+            "Should find CJK text: {}",
+            &result[..result.len().min(200)]
+        );
     }
 
     #[tokio::test]

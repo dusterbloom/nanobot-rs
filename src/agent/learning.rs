@@ -477,7 +477,15 @@ mod tests {
         let (_tmp, store) = make_store();
         // Record several slow entries (>5s average).
         for _ in 0..3 {
-            store.record_extended("web_fetch", true, "fetch page", None, None, None, Some(8000));
+            store.record_extended(
+                "web_fetch",
+                true,
+                "fetch page",
+                None,
+                None,
+                None,
+                Some(8000),
+            );
         }
 
         let context = store.get_learning_context();

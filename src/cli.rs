@@ -5,12 +5,14 @@
 
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::agent::agent_loop::{build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle};
+use crate::agent::agent_loop::{
+    build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle,
+};
 use crate::agent::tuning::{score_feasible_profiles, select_optimal_from_input, OptimizationInput};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::manager::ChannelManager;
@@ -18,23 +20,43 @@ use crate::config::loader::{get_config_path, get_data_dir, load_config, save_con
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
-use crate::heartbeat::service::{HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS};
-use anyhow::Context as _;
+use crate::heartbeat::service::{
+    HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
+};
 use crate::providers::base::LLMProvider;
 use crate::providers::oauth::OAuthTokenManager;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
+use anyhow::Context as _;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
+
+    struct LocalModeGuard {
+        previous: bool,
+    }
+
+    impl Drop for LocalModeGuard {
+        fn drop(&mut self) {
+            crate::LOCAL_MODE.store(self.previous, Ordering::SeqCst);
+        }
+    }
+
+    fn set_local_mode(value: bool) -> LocalModeGuard {
+        let previous = crate::LOCAL_MODE.swap(value, Ordering::SeqCst);
+        LocalModeGuard { previous }
+    }
 
     #[test]
     #[ignore] // Requires network access to Telegram API
     fn test_validate_telegram_token_valid() {
-        assert!(validate_telegram_token("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"));
+        assert!(validate_telegram_token(
+            "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+        ));
     }
 
     #[test]
@@ -154,14 +176,20 @@ mod tests {
     fn test_effective_max_iterations_cloud_1m() {
         // Cloud model with 1M context should get ~50 iterations
         let result = effective_max_iterations(20, 1_000_000, false);
-        assert_eq!(result, 50, "1M context cloud model should get 50 iterations");
+        assert_eq!(
+            result, 50,
+            "1M context cloud model should get 50 iterations"
+        );
     }
 
     #[test]
     fn test_effective_max_iterations_cloud_128k() {
         // Cloud model with 128K context
         let result = effective_max_iterations(20, 128_000, false);
-        assert_eq!(result, 32, "128K context cloud model should get 32 iterations");
+        assert_eq!(
+            result, 32,
+            "128K context cloud model should get 32 iterations"
+        );
     }
 
     #[test]
@@ -190,6 +218,54 @@ mod tests {
         // If user sets high value, cloud should honor it
         let result = effective_max_iterations(100, 128_000, false);
         assert_eq!(result, 100, "Cloud should honor user's high setting");
+    }
+
+    #[test]
+    fn test_build_core_handle_local_forces_local_provider_even_with_cloud_keys() {
+        let _guard = set_local_mode(true);
+
+        let mut cfg = Config::default();
+        cfg.agents.defaults.model = "anthropic/claude-opus-4-5".to_string();
+        cfg.providers.openrouter.api_key = "sk-or-cloud-key".to_string();
+        cfg.providers.openrouter.api_base = Some("https://openrouter.ai/api/v1".to_string());
+
+        let handle = build_core_handle(
+            &cfg,
+            "18080",
+            Some("Qwen3-8B-Q4_K_M.gguf"),
+            None,
+            None,
+            None,
+        );
+        let core = handle.swappable();
+
+        assert!(
+            core.is_local,
+            "local mode should force local provider wiring"
+        );
+        assert_eq!(core.model, "local:Qwen3-8B-Q4_K_M.gguf");
+        assert_eq!(
+            core.provider.get_api_base(),
+            Some("http://localhost:18080/v1"),
+            "main provider should point to local server in local mode"
+        );
+        assert_eq!(
+            core.memory_provider.get_api_base(),
+            Some("http://localhost:18080/v1"),
+            "memory provider should also stay local in local mode"
+        );
+    }
+
+    #[test]
+    fn test_make_eval_provider_local_uses_local_endpoint() {
+        let provider = make_eval_provider(true, 18081);
+        assert_eq!(provider.get_default_model(), "local-model");
+        assert_eq!(provider.get_api_base(), Some("http://localhost:18081/v1"));
+    }
+
+    #[test]
+    fn test_eval_model_name_local_is_port_scoped() {
+        assert_eq!(eval_model_name(true, 18082), "local:18082");
     }
 }
 
@@ -304,6 +380,7 @@ pub(crate) fn build_core_handle(
     local_model_name: Option<&str>,
     compaction_port: Option<&str>,
     delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
 ) -> SharedCoreHandle {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     let provider: Arc<dyn LLMProvider> = if is_local {
@@ -330,7 +407,8 @@ pub(crate) fn build_core_handle(
 
     // Auto-detect context size from local server; fall back to config/model default.
     let max_context_tokens = if is_local {
-        crate::server::query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
+        crate::server::query_local_context_size(local_port)
+            .unwrap_or(config.agents.defaults.max_context_tokens)
     } else {
         model_context_size(&model, config.agents.defaults.max_context_tokens)
     };
@@ -352,6 +430,14 @@ pub(crate) fn build_core_handle(
             "local-delegation",
             Some(&format!("http://localhost:{}/v1", p)),
             Some("local-delegation"),
+        ))
+    });
+
+    let sp: Option<Arc<dyn LLMProvider>> = specialist_port.map(|p| -> Arc<dyn LLMProvider> {
+        Arc::new(OpenAICompatProvider::new(
+            "local-specialist",
+            Some(&format!("http://localhost:{}/v1", p)),
+            Some("local-specialist"),
         ))
     });
 
@@ -379,6 +465,8 @@ pub(crate) fn build_core_handle(
         config.provenance.clone(),
         config.agents.defaults.max_tool_result_chars,
         dp,
+        sp,
+        config.trio.clone(),
     );
     let counters = Arc::new(RuntimeCounters::new(max_context_tokens));
     AgentHandle::new(core, counters)
@@ -394,6 +482,7 @@ pub(crate) fn rebuild_core(
     local_model_name: Option<&str>,
     compaction_port: Option<&str>,
     delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
 ) {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     let provider: Arc<dyn LLMProvider> = if is_local {
@@ -420,7 +509,8 @@ pub(crate) fn rebuild_core(
 
     // Auto-detect context size from local server; fall back to config/model default.
     let max_context_tokens = if is_local {
-        crate::server::query_local_context_size(local_port).unwrap_or(config.agents.defaults.max_context_tokens)
+        crate::server::query_local_context_size(local_port)
+            .unwrap_or(config.agents.defaults.max_context_tokens)
     } else {
         model_context_size(&model, config.agents.defaults.max_context_tokens)
     };
@@ -442,6 +532,13 @@ pub(crate) fn rebuild_core(
             "local-delegation",
             Some(&format!("http://localhost:{}/v1", p)),
             Some("local-delegation"),
+        ))
+    });
+    let sp: Option<Arc<dyn LLMProvider>> = specialist_port.map(|p| -> Arc<dyn LLMProvider> {
+        Arc::new(OpenAICompatProvider::new(
+            "local-specialist",
+            Some(&format!("http://localhost:{}/v1", p)),
+            Some("local-specialist"),
         ))
     });
 
@@ -469,14 +566,25 @@ pub(crate) fn rebuild_core(
         config.provenance.clone(),
         config.agents.defaults.max_tool_result_chars,
         dp,
+        sp,
+        config.trio.clone(),
     );
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
     // Update max context since the new model may have a different size.
-    handle.counters.last_context_max.store(max_context_tokens as u64, Ordering::Relaxed);
+    handle
+        .counters
+        .last_context_max
+        .store(max_context_tokens as u64, Ordering::Relaxed);
     // Reset delegation health — new core may have a fresh delegation server.
-    handle.counters.delegation_healthy.store(true, Ordering::Relaxed);
-    handle.counters.delegation_retry_counter.store(0, Ordering::Relaxed);
+    handle
+        .counters
+        .delegation_healthy
+        .store(true, Ordering::Relaxed);
+    handle
+        .counters
+        .delegation_retry_counter
+        .store(0, Ordering::Relaxed);
 }
 
 /// Create an agent loop with per-instance channels, using the shared core handle.
@@ -513,12 +621,16 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         eprintln!("Verbose mode enabled");
     }
 
-    println!("{} Starting nanobot gateway on port {}...", crate::LOGO, port);
+    println!(
+        "{} Starting nanobot gateway on port {}...",
+        crate::LOGO,
+        port
+    );
 
     let config = load_config(None);
     check_api_key(&config);
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -673,7 +785,7 @@ pub(crate) fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -737,7 +849,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -858,7 +970,7 @@ pub(crate) fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -1292,7 +1404,10 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         match load_oauth_provider(model) {
             Ok(provider) => return provider,
             Err(e) => {
-                info!("OAuth fallback failed ({}), continuing with key-based provider", e);
+                info!(
+                    "OAuth fallback failed ({}), continuing with key-based provider",
+                    e
+                );
             }
         }
     }
@@ -1475,7 +1590,8 @@ fn eval_model_name(local: bool, port: u16) -> String {
 /// closure that runner.rs expects.
 fn make_llm_caller(
     provider: Arc<dyn LLMProvider>,
-) -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>> {
+) -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>>
+{
     move |prompt: String| {
         let p = provider.clone();
         Box::pin(async move {
@@ -1509,8 +1625,13 @@ pub(crate) fn cmd_eval_hanoi(
 
     if calibrate {
         let model_name = eval_model_name(local, port);
-        println!("{} Hanoi Calibration: {} disks, {} samples (model: {})\n",
-            crate::LOGO, disks, samples, model_name);
+        println!(
+            "{} Hanoi Calibration: {} disks, {} samples (model: {})\n",
+            crate::LOGO,
+            disks,
+            samples,
+            model_name
+        );
 
         let total_steps = (1usize << disks as usize) - 1;
         println!("  Total optimal steps: {}", total_steps);
@@ -1531,8 +1652,12 @@ pub(crate) fn cmd_eval_hanoi(
 
         println!("  Results:");
         println!("  ─────────────────────────");
-        println!("    Accuracy:       {:.1}% ({}/{})", cal.accuracy * 100.0,
-            (cal.accuracy * cal.num_samples as f64).round() as usize, cal.num_samples);
+        println!(
+            "    Accuracy:       {:.1}% ({}/{})",
+            cal.accuracy * 100.0,
+            (cal.accuracy * cal.num_samples as f64).round() as usize,
+            cal.num_samples
+        );
         println!("    Red Flag Rate:  {:.1}%", cal.red_flag_rate * 100.0);
         println!("    Median Latency: {:.0}ms", cal.median_latency_ms);
 
@@ -1550,8 +1675,13 @@ pub(crate) fn cmd_eval_hanoi(
             Err(e) => eprintln!("\n  Failed to save: {}", e),
         }
     } else if solve {
-        println!("{} Hanoi Solve: {} disks, k={}{}\n", crate::LOGO, disks, k,
-            if catts { " (CATTS enabled)" } else { "" });
+        println!(
+            "{} Hanoi Solve: {} disks, k={}{}\n",
+            crate::LOGO,
+            disks,
+            k,
+            if catts { " (CATTS enabled)" } else { "" }
+        );
 
         let solution = hanoi::optimal_solution(disks);
         println!("  Optimal solution: {} steps", solution.len());
@@ -1563,15 +1693,29 @@ pub(crate) fn cmd_eval_hanoi(
     }
 }
 
-pub(crate) fn cmd_eval_haystack(facts: usize, length: usize, aggregate: bool, local: bool, port: u16) {
+pub(crate) fn cmd_eval_haystack(
+    facts: usize,
+    length: usize,
+    aggregate: bool,
+    local: bool,
+    port: u16,
+) {
     use crate::agent::eval::haystack;
     use crate::agent::eval::results;
     use crate::agent::eval::runner;
     use crate::agent::knowledge_store::KnowledgeStore;
 
-    println!("{} Aggregation Haystack: {} facts, {} chars{}\n",
-        crate::LOGO, facts, length,
-        if aggregate { " + aggregation" } else { " (retrieval only)" });
+    println!(
+        "{} Aggregation Haystack: {} facts, {} chars{}\n",
+        crate::LOGO,
+        facts,
+        length,
+        if aggregate {
+            " + aggregation"
+        } else {
+            " (retrieval only)"
+        }
+    );
 
     // Generate synthetic data
     let fact_list = haystack::generate_facts(facts, 42);
@@ -1589,16 +1733,19 @@ pub(crate) fn cmd_eval_haystack(facts: usize, length: usize, aggregate: bool, lo
         std::process::exit(1);
     });
 
-    let ingest_result = store.ingest("eval_haystack", None, &document, 4096, 256).unwrap_or_else(|e| {
-        eprintln!("Failed to ingest document: {}", e);
-        std::process::exit(1);
-    });
+    let ingest_result = store
+        .ingest("eval_haystack", None, &document, 4096, 256)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to ingest document: {}", e);
+            std::process::exit(1);
+        });
 
     println!("  Ingested: {} chunks\n", ingest_result.chunks_created);
 
     // Tier 1: Pure FTS5 retrieval benchmark
     let metrics = haystack::evaluate_retrieval(&fact_list, |query| {
-        store.search(query, 10)
+        store
+            .search(query, 10)
             .unwrap_or_default()
             .into_iter()
             .map(|h| h.snippet)
@@ -1610,7 +1757,10 @@ pub(crate) fn cmd_eval_haystack(facts: usize, length: usize, aggregate: bool, lo
     println!("    Precision: {:.3}", metrics.precision);
     println!("    Recall:    {:.3}", metrics.recall);
     println!("    MRR:       {:.3}", metrics.mrr);
-    println!("    Found:     {}/{}\n", metrics.facts_found, metrics.facts_total);
+    println!(
+        "    Found:     {}/{}\n",
+        metrics.facts_found, metrics.facts_total
+    );
 
     // Save tier 1 result
     let model_name = eval_model_name(local, port);
@@ -1638,7 +1788,10 @@ pub(crate) fn cmd_eval_haystack(facts: usize, length: usize, aggregate: bool, lo
         let tasks = haystack::generate_aggregation_tasks(&fact_list);
         println!("  Tier 2: Aggregation Tasks ({})", model_name);
         println!("  ─────────────────────────");
-        println!("  Running {} aggregation tasks against LLM...\n", tasks.len());
+        println!(
+            "  Running {} aggregation tasks against LLM...\n",
+            tasks.len()
+        );
 
         let provider = make_eval_provider(local, port);
         let llm_call = make_llm_caller(provider);
@@ -1648,17 +1801,34 @@ pub(crate) fn cmd_eval_haystack(facts: usize, length: usize, aggregate: bool, lo
 
         let correct = agg_results.iter().filter(|r| r.correct).count();
         let total = agg_results.len();
-        let accuracy = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
-        let mean_search = agg_results.iter().map(|r| r.search_calls as f64).sum::<f64>()
+        let accuracy = if total > 0 {
+            correct as f64 / total as f64
+        } else {
+            0.0
+        };
+        let mean_search = agg_results
+            .iter()
+            .map(|r| r.search_calls as f64)
+            .sum::<f64>()
             / total.max(1) as f64;
 
         for (i, res) in agg_results.iter().enumerate() {
             let status = if res.correct { "PASS" } else { "FAIL" };
             let prompt = haystack::build_aggregation_prompt(&res.task);
-            println!("    [{}] Task {}: {}", status, i + 1, prompt.lines().next().unwrap_or(""));
+            println!(
+                "    [{}] Task {}: {}",
+                status,
+                i + 1,
+                prompt.lines().next().unwrap_or("")
+            );
         }
 
-        println!("\n    Accuracy: {}/{} ({:.1}%)", correct, total, accuracy * 100.0);
+        println!(
+            "\n    Accuracy: {}/{} ({:.1}%)",
+            correct,
+            total,
+            accuracy * 100.0
+        );
 
         // Save tier 2 result
         let agg_eval_result = results::EvalResult {
@@ -1693,14 +1863,22 @@ pub(crate) fn cmd_eval_learn(family: String, tasks: usize, depth: usize, local: 
         "fact-retrieval" => learning::TaskFamily::FactRetrieval { num_facts: depth },
         "tool-chain" => learning::TaskFamily::ToolChain { num_steps: depth },
         _ => {
-            eprintln!("Unknown task family: '{}'. Use: arithmetic, fact-retrieval, tool-chain", family);
+            eprintln!(
+                "Unknown task family: '{}'. Use: arithmetic, fact-retrieval, tool-chain",
+                family
+            );
             std::process::exit(1);
         }
     };
 
     let model_name = eval_model_name(local, port);
-    println!("{} Learning Curve: {} tasks, family={:?} (model: {})\n",
-        crate::LOGO, tasks, task_family, model_name);
+    println!(
+        "{} Learning Curve: {} tasks, family={:?} (model: {})\n",
+        crate::LOGO,
+        tasks,
+        task_family,
+        model_name
+    );
 
     let curriculum = learning::generate_curriculum(&task_family, tasks, 42);
     println!("  Generated {} tasks", curriculum.len());
@@ -1716,22 +1894,41 @@ pub(crate) fn cmd_eval_learn(family: String, tasks: usize, depth: usize, local: 
     let curve = learning::compute_learning_curve(&task_family, &executions, 5.min(tasks));
     let correct = executions.iter().filter(|e| e.success).count();
     let total = executions.len();
-    let final_accuracy = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
+    let final_accuracy = if total > 0 {
+        correct as f64 / total as f64
+    } else {
+        0.0
+    };
 
     // Print per-task results (compact)
     for exec in &executions {
         let status = if exec.success { "PASS" } else { "FAIL" };
         let task = &curriculum[exec.task_index];
-        println!("    [{}] Task {} (d{}): got \"{}\" expected \"{}\" ({:.0}ms)",
-            status, exec.task_index, task.difficulty,
-            exec.agent_answer.lines().next().unwrap_or("").chars().take(40).collect::<String>(),
+        println!(
+            "    [{}] Task {} (d{}): got \"{}\" expected \"{}\" ({:.0}ms)",
+            status,
+            exec.task_index,
+            task.difficulty,
+            exec.agent_answer
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(40)
+                .collect::<String>(),
             task.expected_answer,
-            exec.duration_ms);
+            exec.duration_ms
+        );
     }
 
     println!("\n  Results:");
     println!("  ─────────────────────────");
-    println!("    Accuracy:         {}/{} ({:.1}%)", correct, total, final_accuracy * 100.0);
+    println!(
+        "    Accuracy:         {}/{} ({:.1}%)",
+        correct,
+        total,
+        final_accuracy * 100.0
+    );
     println!("    Forward Transfer: {:.3}", curve.forward_transfer);
     println!("    Surprise Rate:    {:.1}%", curve.surprise_rate * 100.0);
 
@@ -1759,9 +1956,9 @@ pub(crate) fn cmd_eval_learn(family: String, tasks: usize, depth: usize, local: 
 }
 
 pub(crate) fn cmd_eval_sprint(corpus_size: usize, questions: usize, local: bool, port: u16) {
-    use crate::agent::eval::sprint;
     use crate::agent::eval::results;
     use crate::agent::eval::runner;
+    use crate::agent::eval::sprint;
 
     let model_name = eval_model_name(local, port);
     let config = sprint::SprintConfig {
@@ -1770,8 +1967,13 @@ pub(crate) fn cmd_eval_sprint(corpus_size: usize, questions: usize, local: bool,
         ..Default::default()
     };
 
-    println!("{} Research Sprint: {} chars corpus, {} questions (model: {})\n",
-        crate::LOGO, corpus_size, questions, model_name);
+    println!(
+        "{} Research Sprint: {} chars corpus, {} questions (model: {})\n",
+        crate::LOGO,
+        corpus_size,
+        questions,
+        model_name
+    );
 
     let (domains, _document) = sprint::generate_corpus(&config);
     let all_facts = sprint::all_facts(&domains);
@@ -1792,16 +1994,27 @@ pub(crate) fn cmd_eval_sprint(corpus_size: usize, questions: usize, local: bool,
     for exec in &executions {
         let q = &question_list[exec.index];
         let status = if exec.correct { "PASS" } else { "FAIL" };
-        println!("    [{}] Q{} [{}]: got \"{}\"",
-            status, exec.index + 1, q.difficulty.label(),
-            exec.agent_answer.lines().next().unwrap_or("").chars().take(50).collect::<String>());
+        println!(
+            "    [{}] Q{} [{}]: got \"{}\"",
+            status,
+            exec.index + 1,
+            q.difficulty.label(),
+            exec.agent_answer
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(50)
+                .collect::<String>()
+        );
     }
 
     println!();
     print!("{}", sprint::format_scorecard(&scorecard));
 
     // Save result
-    let catts_trend: Vec<f64> = executions.iter()
+    let catts_trend: Vec<f64> = executions
+        .iter()
         .map(|e| if e.catts_accepted_pilot { 1.0 } else { 0.0 })
         .collect();
     let time_per_q: Vec<f64> = executions.iter().map(|e| e.duration_ms as f64).collect();

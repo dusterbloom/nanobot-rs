@@ -4,10 +4,10 @@
 //! recommendations based on P75 iterations, historical success rates, and
 //! task complexity patterns.
 
-use std::path::{Path, PathBuf};
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// A recorded execution measurement for calibration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +79,8 @@ impl BudgetCalibrator {
     /// Open or create the calibration database.
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
 
@@ -99,7 +100,8 @@ impl BudgetCalibrator {
 
             CREATE INDEX IF NOT EXISTS idx_records_task_type ON execution_records(task_type);
             CREATE INDEX IF NOT EXISTS idx_records_created ON execution_records(created_at DESC);
-        ")?;
+        ",
+        )?;
         Ok(Self { conn })
     }
 
@@ -133,34 +135,42 @@ impl BudgetCalibrator {
     pub fn task_stats(&self, task_type: &str) -> Result<Option<TaskTypeStats>> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM execution_records WHERE task_type = ?1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
-        if total == 0 { return Ok(None); }
+        if total == 0 {
+            return Ok(None);
+        }
 
         let successful: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM execution_records WHERE task_type = ?1 AND success = 1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
         let mean_iterations: f64 = self.conn.query_row(
             "SELECT AVG(iterations_used) FROM execution_records WHERE task_type = ?1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
         let mean_cost: f64 = self.conn.query_row(
             "SELECT AVG(cost_usd) FROM execution_records WHERE task_type = ?1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
         let mean_duration: f64 = self.conn.query_row(
             "SELECT AVG(duration_ms) FROM execution_records WHERE task_type = ?1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
         let mean_tools: f64 = self.conn.query_row(
             "SELECT AVG(tool_calls) FROM execution_records WHERE task_type = ?1",
-            params![task_type], |r| r.get(0)
+            params![task_type],
+            |r| r.get(0),
         )?;
 
         // P75 and P95 via window functions on sorted iterations
@@ -186,12 +196,17 @@ impl BudgetCalibrator {
         let mut stmt = self.conn.prepare(
             "SELECT iterations_used FROM execution_records WHERE task_type = ?1 ORDER BY iterations_used ASC"
         )?;
-        let values: Vec<u32> = stmt.query_map(params![task_type], |r| r.get(0))?
+        let values: Vec<u32> = stmt
+            .query_map(params![task_type], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        if values.is_empty() { return Ok(0.0); }
+        if values.is_empty() {
+            return Ok(0.0);
+        }
 
-        let idx = ((values.len() as f64 * percentile).ceil() as usize).saturating_sub(1).min(values.len() - 1);
+        let idx = ((values.len() as f64 * percentile).ceil() as usize)
+            .saturating_sub(1)
+            .min(values.len() - 1);
         Ok(values[idx] as f64)
     }
 
@@ -206,7 +221,11 @@ impl BudgetCalibrator {
                 let recommended_depth = if stats.mean_tool_calls > 3.0 { 2 } else { 1 };
 
                 // Multiplier: tighter for simple tasks, looser for complex
-                let recommended_multiplier = if stats.mean_iterations < 3.0 { 0.3 } else { 0.5 };
+                let recommended_multiplier = if stats.mean_iterations < 3.0 {
+                    0.3
+                } else {
+                    0.5
+                };
 
                 // Confidence based on sample size (logarithmic scale)
                 // log2(1) = 0, log2(2) = 1, log2(32) = 5, so we add 1 to give some confidence to single samples
@@ -241,10 +260,11 @@ impl BudgetCalibrator {
 
     /// List all known task types with their stats.
     pub fn all_task_types(&self) -> Result<Vec<TaskTypeStats>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT task_type FROM execution_records ORDER BY task_type"
-        )?;
-        let types: Vec<String> = stmt.query_map([], |r| r.get(0))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT task_type FROM execution_records ORDER BY task_type")?;
+        let types: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut result = Vec::new();
@@ -280,7 +300,9 @@ impl BudgetCalibrator {
 
     /// Get total record count.
     pub fn total_records(&self) -> Result<i64> {
-        self.conn.query_row("SELECT COUNT(*) FROM execution_records", [], |r| r.get(0)).map_err(Into::into)
+        self.conn
+            .query_row("SELECT COUNT(*) FROM execution_records", [], |r| r.get(0))
+            .map_err(Into::into)
     }
 }
 

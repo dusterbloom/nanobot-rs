@@ -135,8 +135,16 @@ pub struct TopicDomain {
 
 /// Domain names for the synthetic corpus.
 const DOMAINS: &[&str] = &[
-    "medicine", "engineering", "education", "finance", "agriculture",
-    "technology", "law", "arts", "science", "sports",
+    "medicine",
+    "engineering",
+    "education",
+    "finance",
+    "agriculture",
+    "technology",
+    "law",
+    "arts",
+    "science",
+    "sports",
 ];
 
 /// Generate a multi-domain corpus with facts distributed across domains.
@@ -216,7 +224,11 @@ pub fn generate_questions(
                 "Does {} live in the same city as {}?",
                 fact_a.name, fact_b.name
             ),
-            expected_answer: if same_city { "yes".to_string() } else { "no".to_string() },
+            expected_answer: if same_city {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
             difficulty: QuestionDifficulty::MultiHop,
             domains: vec![
                 domain_for_fact(domains, fact_a.person_id),
@@ -227,7 +239,9 @@ pub fn generate_questions(
 
     // Tier 3: Aggregation
     for i in 0..(per_tier + if remainder > 0 { 1 } else { 0 }) {
-        if questions.len() >= num_questions { break; }
+        if questions.len() >= num_questions {
+            break;
+        }
         let job_idx = (seed as usize + i) % haystack::JOBS.len();
         let job = haystack::JOBS[job_idx];
         let count = all.iter().filter(|f| f.job == job).count();
@@ -236,7 +250,11 @@ pub fn generate_questions(
             question: format!("How many people work as a {}?", job),
             expected_answer: count.to_string(),
             difficulty: QuestionDifficulty::Aggregation,
-            domains: DOMAINS.iter().take(domains.len()).map(|s| s.to_string()).collect(),
+            domains: DOMAINS
+                .iter()
+                .take(domains.len())
+                .map(|s| s.to_string())
+                .collect(),
         });
     }
 
@@ -294,7 +312,11 @@ pub fn compute_scorecard(
 ) -> SprintScorecard {
     let total = questions.len();
     let correct = executions.iter().filter(|e| e.correct).count();
-    let accuracy = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
+    let accuracy = if total > 0 {
+        correct as f64 / total as f64
+    } else {
+        0.0
+    };
 
     // Group by difficulty tier
     let mut time_by_tier: HashMap<String, Vec<f64>> = HashMap::new();
@@ -304,9 +326,18 @@ pub fn compute_scorecard(
     for exec in executions {
         if let Some(q) = questions.get(exec.index) {
             let tier = q.difficulty.label().to_string();
-            time_by_tier.entry(tier.clone()).or_default().push(exec.duration_ms as f64);
-            catts_by_tier.entry(tier.clone()).or_default().push(exec.catts_accepted_pilot);
-            iters_by_tier.entry(tier.clone()).or_default().push(exec.iterations_used as f64);
+            time_by_tier
+                .entry(tier.clone())
+                .or_default()
+                .push(exec.duration_ms as f64);
+            catts_by_tier
+                .entry(tier.clone())
+                .or_default()
+                .push(exec.catts_accepted_pilot);
+            iters_by_tier
+                .entry(tier.clone())
+                .or_default()
+                .push(exec.iterations_used as f64);
         }
     }
 
@@ -319,7 +350,14 @@ pub fn compute_scorecard(
         .iter()
         .map(|(k, v)| {
             let accepted = v.iter().filter(|&&b| b).count();
-            (k.clone(), if v.is_empty() { 0.0 } else { accepted as f64 / v.len() as f64 })
+            (
+                k.clone(),
+                if v.is_empty() {
+                    0.0
+                } else {
+                    accepted as f64 / v.len() as f64
+                },
+            )
         })
         .collect();
 
@@ -329,11 +367,19 @@ pub fn compute_scorecard(
         .collect();
 
     // Trend: compare first half vs second half timing
-    let speed_trend = compute_trend(&executions.iter().map(|e| e.duration_ms as f64).collect::<Vec<_>>());
+    let speed_trend = compute_trend(
+        &executions
+            .iter()
+            .map(|e| e.duration_ms as f64)
+            .collect::<Vec<_>>(),
+    );
 
     // Savings trend: CATTS acceptance rate over time
     let savings_trend = compute_trend(
-        &executions.iter().map(|e| if e.catts_accepted_pilot { 1.0 } else { 0.0 }).collect::<Vec<_>>(),
+        &executions
+            .iter()
+            .map(|e| if e.catts_accepted_pilot { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>(),
     );
 
     // Compound score: accuracy * speed_improvement * savings
@@ -343,7 +389,11 @@ pub fn compute_scorecard(
         executions.iter().filter(|e| e.catts_accepted_pilot).count() as f64
             / executions.len() as f64
     };
-    let speed_improvement = if speed_trend > 0.0 { 1.0 / speed_trend.max(0.01) } else { 1.0 };
+    let speed_improvement = if speed_trend > 0.0 {
+        1.0 / speed_trend.max(0.01)
+    } else {
+        1.0
+    };
     let compound_score = accuracy * speed_improvement.min(2.0) * (1.0 + overall_catts);
 
     SprintScorecard {
@@ -394,12 +444,15 @@ pub fn format_scorecard(sc: &SprintScorecard) -> String {
         }
     }
 
+    out.push_str(&format!("\nCompound Score: {:.3}\n", sc.compound_score));
     out.push_str(&format!(
-        "\nCompound Score: {:.3}\n",
-        sc.compound_score
+        "Speed trend:   {:.3} (< 1.0 = getting faster)\n",
+        sc.speed_trend
     ));
-    out.push_str(&format!("Speed trend:   {:.3} (< 1.0 = getting faster)\n", sc.speed_trend));
-    out.push_str(&format!("Savings trend: {:.3} (> 1.0 = more CATTS savings)\n", sc.savings_trend));
+    out.push_str(&format!(
+        "Savings trend: {:.3} (> 1.0 = more CATTS savings)\n",
+        sc.savings_trend
+    ));
     out.push_str(&"=".repeat(54));
     out.push('\n');
 

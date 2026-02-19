@@ -111,7 +111,8 @@ impl Budget {
             max_depth: self.max_depth,
             current_depth: self.current_depth + 1,
             budget_multiplier: self.budget_multiplier,
-            cost_limit: (self.cost_limit - self.cost_spent).max(0.0) * self.budget_multiplier as f64,
+            cost_limit: (self.cost_limit - self.cost_spent).max(0.0)
+                * self.budget_multiplier as f64,
             cost_spent: 0.0,
             prices: self.prices.clone(),
         })
@@ -123,7 +124,11 @@ impl Budget {
     }
 
     /// Record cost from an LLM response and return the cost of this call.
-    pub fn record_cost(&mut self, model: &str, usage: &std::collections::HashMap<String, i64>) -> f64 {
+    pub fn record_cost(
+        &mut self,
+        model: &str,
+        usage: &std::collections::HashMap<String, i64>,
+    ) -> f64 {
         let prices = match &self.prices {
             Some(p) => p,
             None => return 0.0,
@@ -173,8 +178,11 @@ fn build_analysis_state(store: &ContextStore) -> String {
     // Variable metadata
     let vars = store.variable_metadata();
     if !vars.is_empty() {
-        let var_lines: Vec<String> = vars.iter()
-            .map(|(name, len, preview)| format!("  {} ({} chars, preview: \"{}\")", name, len, preview))
+        let var_lines: Vec<String> = vars
+            .iter()
+            .map(|(name, len, preview)| {
+                format!("  {} ({} chars, preview: \"{}\")", name, len, preview)
+            })
             .collect();
         parts.push(format!("Variables:\n{}", var_lines.join("\n")));
     }
@@ -184,7 +192,8 @@ fn build_analysis_state(store: &ContextStore) -> String {
     if !mem.is_empty() {
         let mut sorted_keys: Vec<&String> = mem.keys().collect();
         sorted_keys.sort();
-        let mem_lines: Vec<String> = sorted_keys.iter()
+        let mem_lines: Vec<String> = sorted_keys
+            .iter()
             .map(|k| format!("  {}: {}", k, mem[*k]))
             .collect();
         parts.push(format!("Findings so far:\n{}", mem_lines.join("\n")));
@@ -220,13 +229,20 @@ async fn analyze_via_scratch_pad(
 
     for round in 0..max_rounds {
         // Check cancellation.
-        if config.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+        if config
+            .cancellation_token
+            .as_ref()
+            .map_or(false, |t| t.is_cancelled())
+        {
             return Some("Analysis cancelled.".to_string());
         }
 
         // Check cost budget.
         if cost_limit > 0.0 && cost_spent >= cost_limit {
-            debug!("Cost budget exhausted (${:.6} / ${:.6}) after {} rounds", cost_spent, cost_limit, round);
+            debug!(
+                "Cost budget exhausted (${:.6} / ${:.6}) after {} rounds",
+                cost_spent, cost_limit, round
+            );
             break;
         }
 
@@ -249,35 +265,51 @@ async fn analyze_via_scratch_pad(
         };
 
         // Single LLM call with full context budget.
-        let response = match config.provider.chat(
-            &messages,
-            tool_defs_opt,
-            Some(&config.model),
-            config.max_tokens,
-            0.3,
-            None,
-        ).await {
+        let response = match config
+            .provider
+            .chat(
+                &messages,
+                tool_defs_opt,
+                Some(&config.model),
+                config.max_tokens,
+                0.3,
+                None,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
-                warn!("Scratch pad analysis LLM call failed (round {}): {}", round, e);
+                warn!(
+                    "Scratch pad analysis LLM call failed (round {}): {}",
+                    round, e
+                );
                 break; // Fall through to fallback
             }
         };
 
         // Error response from provider — stop analyzing.
         if response.finish_reason == "error" {
-            warn!("Scratch pad analysis got error response (round {}) — falling back", round);
+            warn!(
+                "Scratch pad analysis got error response (round {}) — falling back",
+                round
+            );
             break;
         }
 
         // Track cost from this LLM call.
         if let Some(ref p) = prices {
             let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
-            let completion_tokens = response.usage.get("completion_tokens").copied().unwrap_or(0);
+            let completion_tokens = response
+                .usage
+                .get("completion_tokens")
+                .copied()
+                .unwrap_or(0);
             let call_cost = p.cost_of(&config.model, prompt_tokens, completion_tokens);
             cost_spent += call_cost;
-            debug!("Analysis round {} cost: ${:.6} (total: ${:.6} / limit: ${:.6})",
-                round, call_cost, cost_spent, cost_limit);
+            debug!(
+                "Analysis round {} cost: ${:.6} (total: ${:.6} / limit: ${:.6})",
+                round, call_cost, cost_spent, cost_limit
+            );
         }
 
         if response.has_tool_calls() {
@@ -298,8 +330,16 @@ async fn analyze_via_scratch_pad(
                 seen_calls.insert(call_key);
 
                 if tc.name == "ctx_summarize" {
-                    let variable = tc.arguments.get("variable").and_then(|v| v.as_str()).unwrap_or("");
-                    let instruction = tc.arguments.get("instruction").and_then(|v| v.as_str()).unwrap_or("Summarize");
+                    let variable = tc
+                        .arguments
+                        .get("variable")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let instruction = tc
+                        .arguments
+                        .get("instruction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Summarize");
                     let result = context_store::execute_ctx_summarize(
                         context_store,
                         variable,
@@ -308,18 +348,21 @@ async fn analyze_via_scratch_pad(
                         &config.model,
                         config.depth,
                         config.max_tokens,
-                    ).await;
+                    )
+                    .await;
                     // Store summary as new variable + save finding in memory.
                     let (var_name, _) = context_store.store(result.clone());
                     context_store.mem_store(&format!("summary_{}", var_name), result);
                 } else if context_store::is_micro_tool(&tc.name) {
-                    let result = context_store::execute_micro_tool(context_store, &tc.name, &tc.arguments);
+                    let result =
+                        context_store::execute_micro_tool(context_store, &tc.name, &tc.arguments);
                     // mem_store/mem_recall are already handled internally by execute_micro_tool.
                     // For inspection tools (slice/grep/length), the model will use
                     // mem_store in a subsequent call to persist findings.
                     debug!("Scratch pad micro-tool {}: {} chars", tc.name, result.len());
                 } else if worker_tools::is_worker_tool(&tc.name) {
-                    let result = worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
+                    let result =
+                        worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
                     let (_, _metadata) = context_store.store(result.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
@@ -335,7 +378,9 @@ async fn analyze_via_scratch_pad(
                             cancellation_token: token.child_token(),
                             tool_call_id: tc.id.clone(),
                         };
-                        tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                        tools
+                            .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
+                            .await
                     } else {
                         tools.execute(&tc.name, tc.arguments.clone()).await
                     };
@@ -360,18 +405,45 @@ async fn analyze_via_scratch_pad(
     // Phase 4: Graceful fallback — synthesize from accumulated memory findings.
     let keys = context_store.mem_keys();
     if !keys.is_empty() {
-        let findings: Vec<String> = keys.iter()
+        let findings: Vec<String> = keys
+            .iter()
             .filter_map(|k| {
                 let v = context_store.mem_recall(k);
-                if v.starts_with("Key '") { None } else { Some(format!("{}: {}", k, v)) }
+                if v.starts_with("Key '") {
+                    None
+                } else {
+                    Some(format!("{}: {}", k, v))
+                }
             })
             .collect();
         if !findings.is_empty() {
-            debug!("Scratch pad fallback: synthesizing from {} memory findings", findings.len());
+            debug!(
+                "Scratch pad fallback: synthesizing from {} memory findings",
+                findings.len()
+            );
             return Some(findings.join("\n"));
         }
     }
     None
+}
+
+/// Pick a bounded scratch-pad analysis round budget from config + model family.
+///
+/// Small local models should spend fewer rounds "thinking about tool outputs"
+/// and move on faster to actionable tool execution/results.
+fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
+    let mut rounds = config.max_iterations.clamp(1, 10) as usize;
+    let model = config.model.to_ascii_lowercase();
+
+    if model.contains("nanbeige") {
+        rounds = rounds.min(3);
+    } else if model.contains("functiongemma") {
+        rounds = rounds.min(2);
+    } else if model.contains("ministral-3") || model.contains("qwen3-1.7b") {
+        rounds = rounds.min(4);
+    }
+
+    rounds.max(1)
 }
 
 /// Run a delegated tool execution loop.
@@ -487,7 +559,11 @@ pub async fn run_tool_loop(
         iterations_used = iteration + 1;
 
         // Check cancellation before each iteration.
-        if config.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+        if config
+            .cancellation_token
+            .as_ref()
+            .map_or(false, |t| t.is_cancelled())
+        {
             return ToolRunResult {
                 tool_results: all_results,
                 summary: Some("Tool execution cancelled.".to_string()),
@@ -514,17 +590,7 @@ pub async fn run_tool_loop(
         // Build assistant message with tool_calls (using normalized IDs).
         let tc_json: Vec<Value> = pending_calls
             .iter()
-            .map(|tc| {
-                json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": serde_json::to_string(&tc.arguments)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    }
-                })
-            })
+            .map(|tc| tc.to_openai_json())
             .collect();
         ContextBuilder::add_assistant_message(&mut messages, None, Some(&tc_json));
 
@@ -536,9 +602,20 @@ pub async fn run_tool_loop(
         for tc in &pending_calls {
             if tc.name == "ctx_summarize" {
                 // Async micro-tool: runs a sub-loop with the provider.
-                let variable = tc.arguments.get("variable").and_then(|v| v.as_str()).unwrap_or("");
-                let instruction = tc.arguments.get("instruction").and_then(|v| v.as_str()).unwrap_or("Summarize");
-                debug!("ctx_summarize: var={}, instruction={}, depth={}", variable, instruction, config.depth);
+                let variable = tc
+                    .arguments
+                    .get("variable")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let instruction = tc
+                    .arguments
+                    .get("instruction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Summarize");
+                debug!(
+                    "ctx_summarize: var={}, instruction={}, depth={}",
+                    variable, instruction, config.depth
+                );
                 let result = context_store::execute_ctx_summarize(
                     &context_store,
                     variable,
@@ -547,7 +624,8 @@ pub async fn run_tool_loop(
                     &config.model,
                     config.depth,
                     config.max_tokens,
-                ).await;
+                )
+                .await;
                 // Store the summary as a new variable for subsequent micro-tool access.
                 let (_, summary_metadata) = context_store.store(result.clone());
                 let _ = summary_metadata; // metadata available if needed later
@@ -555,29 +633,47 @@ pub async fn run_tool_loop(
                 // NOT added to all_results — ctx_summarize is internal to delegation.
             } else if tc.name == DELEGATE_TOOL {
                 // Recursive delegation: spawn a child worker.
-                let task = tc.arguments.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let context = tc.arguments.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let task = tc
+                    .arguments
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let context = tc
+                    .arguments
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
                 let child_budget = match config.budget.as_ref().and_then(|b| b.child()) {
                     Some(b) => b,
                     None => {
                         let result = "Error: delegation depth limit reached.".to_string();
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
-                        let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        let original_id =
+                            id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
                     }
                 };
 
                 // Determine child tools — use requested subset or all allowed tools.
-                let child_tool_names: Vec<String> = tc.arguments
+                let child_tool_names: Vec<String> = tc
+                    .arguments
                     .get("tools")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_else(Vec::new);
 
-                debug!("Delegate: task='{}', depth={}, budget={}, tools={:?}",
-                    task, child_budget.current_depth, child_budget.max_iterations, child_tool_names);
+                debug!(
+                    "Delegate: task='{}', depth={}, budget={}, tools={:?}",
+                    task, child_budget.current_depth, child_budget.max_iterations, child_tool_names
+                );
 
                 // Build child config — inherits provider/model from parent.
                 let child_config = ToolRunnerConfig {
@@ -595,46 +691,79 @@ pub async fn run_tool_loop(
                 };
 
                 // Build child system prompt.
-                let child_system = format!("You are a worker agent. Complete this task:\n\n{}\n\n{}", task,
-                    if context.is_empty() { String::new() } else { format!("Context:\n{}", context) });
+                let child_system = format!(
+                    "You are a worker agent. Complete this task:\n\n{}\n\n{}",
+                    task,
+                    if context.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Context:\n{}", context)
+                    }
+                );
 
                 // Ask the child model what tools to use.
                 let child_msgs = vec![
                     json!({"role": "system", "content": child_system}),
-                    json!({"role": "user", "content": "Begin working on the task. Use the available tools to complete it."})
+                    json!({"role": "user", "content": "Begin working on the task. Use the available tools to complete it."}),
                 ];
 
                 // Get child tool definitions.
                 let mut child_tool_defs: Vec<Value> = if child_tool_names.is_empty() {
                     // No specific tools requested — give same tools as parent (minus delegate to prevent deep recursion issues).
-                    tool_defs.iter()
-                        .filter(|d| d.pointer("/function/name").and_then(|v| v.as_str()) != Some(DELEGATE_TOOL) || child_config.budget.as_ref().map_or(false, |b| b.can_delegate()))
+                    tool_defs
+                        .iter()
+                        .filter(|d| {
+                            d.pointer("/function/name").and_then(|v| v.as_str())
+                                != Some(DELEGATE_TOOL)
+                                || child_config
+                                    .budget
+                                    .as_ref()
+                                    .map_or(false, |b| b.can_delegate())
+                        })
                         .cloned()
                         .collect()
                 } else {
                     // Filter to only requested tools + always include micro-tools and worker tools.
-                    let child_allowed: std::collections::HashSet<&str> = child_tool_names.iter().map(|s| s.as_str()).collect();
-                    tool_defs.iter()
+                    let child_allowed: std::collections::HashSet<&str> =
+                        child_tool_names.iter().map(|s| s.as_str()).collect();
+                    tool_defs
+                        .iter()
                         .filter(|d| {
-                            let name = d.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
-                            child_allowed.contains(name) || context_store::is_micro_tool(name) || worker_tools::is_worker_tool(name)
+                            let name = d
+                                .pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            child_allowed.contains(name)
+                                || context_store::is_micro_tool(name)
+                                || worker_tools::is_worker_tool(name)
                         })
                         .cloned()
                         .collect()
                 };
 
                 // Always add micro-tool and worker tool defs if not already present.
-                let existing_names: std::collections::HashSet<String> = child_tool_defs.iter()
-                    .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                let existing_names: std::collections::HashSet<String> = child_tool_defs
+                    .iter()
+                    .filter_map(|d| {
+                        d.pointer("/function/name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .collect();
                 for def in context_store::micro_tool_definitions() {
-                    let name = def.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = def
+                        .pointer("/function/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if !existing_names.contains(name) {
                         child_tool_defs.push(def);
                     }
                 }
                 for def in worker_tools::worker_tool_definitions() {
-                    let name = def.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = def
+                        .pointer("/function/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if !existing_names.contains(name) {
                         child_tool_defs.push(def);
                     }
@@ -647,19 +776,24 @@ pub async fn run_tool_loop(
                 };
 
                 // Get the child's first response (with tool calls).
-                let child_response = match config.provider.chat(
-                    &child_msgs,
-                    child_tool_defs_opt,
-                    Some(&config.model),
-                    config.max_tokens,
-                    0.3,
-                    None,
-                ).await {
+                let child_response = match config
+                    .provider
+                    .chat(
+                        &child_msgs,
+                        child_tool_defs_opt,
+                        Some(&config.model),
+                        config.max_tokens,
+                        0.3,
+                        None,
+                    )
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         let result = format!("Delegate error: {}", e);
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
-                        let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
+                        let original_id =
+                            id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
                         all_results.push((original_id, tc.name.clone(), result));
                         continue;
                     }
@@ -672,17 +806,24 @@ pub async fn run_tool_loop(
                         &child_response.tool_calls,
                         tools,
                         &child_system,
-                    )).await;
+                    ))
+                    .await;
                     // Return the child's summary, or concatenated results if no summary.
                     child_result.summary.unwrap_or_else(|| {
-                        child_result.tool_results.iter()
-                            .map(|(_, name, data)| format!("[{}]: {}", name, &data[..data.len().min(500)]))
+                        child_result
+                            .tool_results
+                            .iter()
+                            .map(|(_, name, data)| {
+                                format!("[{}]: {}", name, &data[..data.len().min(500)])
+                            })
                             .collect::<Vec<_>>()
                             .join("\n")
                     })
                 } else {
                     // Child produced a text response — return it directly.
-                    child_response.content.unwrap_or_else(|| "No result from delegate.".to_string())
+                    child_response
+                        .content
+                        .unwrap_or_else(|| "No result from delegate.".to_string())
                 };
 
                 // Store delegate result like any other tool.
@@ -717,12 +858,16 @@ pub async fn run_tool_loop(
                 all_results.last().unwrap().2.hash(&mut hasher);
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
-                    warn!("Worker tool '{}' produced identical results — likely loop", tc.name);
+                    warn!(
+                        "Worker tool '{}' produced identical results — likely loop",
+                        tc.name
+                    );
                 }
             } else if context_store::is_micro_tool(&tc.name) {
                 // Sync micro-tool: execute against ContextStore (internal to delegation).
                 debug!("Micro-tool: {} (id: {})", tc.name, tc.id);
-                let result = context_store::execute_micro_tool(&mut context_store, &tc.name, &tc.arguments);
+                let result =
+                    context_store::execute_micro_tool(&mut context_store, &tc.name, &tc.arguments);
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                 // NOT added to all_results — micro-tools are internal.
             } else {
@@ -736,7 +881,9 @@ pub async fn run_tool_loop(
                         cancellation_token: token.child_token(),
                         tool_call_id: tc.id.clone(),
                     };
-                    tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                    tools
+                        .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
+                        .await
                 } else {
                     tools.execute(&tc.name, tc.arguments.clone()).await
                 };
@@ -759,7 +906,10 @@ pub async fn run_tool_loop(
                 result.data.hash(&mut hasher);
                 let result_hash = hasher.finish();
                 if !seen_results.insert(result_hash) {
-                    warn!("Tool '{}' produced identical results — likely loop", tc.name);
+                    warn!(
+                        "Tool '{}' produced identical results — likely loop",
+                        tc.name
+                    );
                 }
             }
         }
@@ -783,12 +933,14 @@ pub async fn run_tool_loop(
 
         if config.short_circuit_chars > 0 && iteration == 0 {
             let threshold = config.short_circuit_chars;
-            let all_short = all_results.iter().all(|(_, _, data)| data.len() < threshold);
+            let all_short = all_results
+                .iter()
+                .all(|(_, _, data)| data.len() < threshold);
             // exec/web_search/web_fetch results need interpretation even when short
             // (e.g. a 50-char error message should be analyzed, not passed raw).
-            let needs_interpretation = all_results.iter().any(|(_, name, _)| {
-                matches!(name.as_str(), "exec" | "web_search" | "web_fetch")
-            });
+            let needs_interpretation = all_results
+                .iter()
+                .any(|(_, name, _)| matches!(name.as_str(), "exec" | "web_search" | "web_fetch"));
             if all_short && !needs_interpretation {
                 debug!(
                     "All {} tool results are short (< {} chars) — skipping delegation LLM, returning raw results",
@@ -808,7 +960,11 @@ pub async fn run_tool_loop(
         // LLM call with the ContextStore's memory acting as persistent state.
         // This replaces the growing-message loop that caused context saturation.
         if iteration == 0 {
-            debug!("Handing off to scratch pad analysis (up to 10 rounds)");
+            let scratch_rounds = scratch_pad_round_budget(config);
+            debug!(
+                "Handing off to scratch pad analysis (up to {} rounds, model={})",
+                scratch_rounds, config.model
+            );
             let summary = analyze_via_scratch_pad(
                 config,
                 &mut context_store,
@@ -817,8 +973,9 @@ pub async fn run_tool_loop(
                 tools,
                 &task_context,
                 &mut all_results,
-                10, // max analysis rounds
-            ).await;
+                scratch_rounds,
+            )
+            .await;
             return ToolRunResult {
                 tool_results: all_results,
                 summary,
@@ -859,11 +1016,7 @@ pub fn format_results_for_context(
             // Legacy fallback: hard char truncation.
             if data.len() > max_result_chars {
                 let end = crate::utils::helpers::floor_char_boundary(data, max_result_chars);
-                format!(
-                    "{}… ({} chars total)",
-                    &data[..end],
-                    data.len()
-                )
+                format!("{}… ({} chars total)", &data[..end], data.len())
             } else {
                 data.clone()
             }
@@ -1067,18 +1220,15 @@ mod tests {
             budget: None,
         };
 
-        let result = run_tool_loop(
-            &config,
-            &make_tool_calls(&["test_tool"]),
-            &tools,
-            "test",
-        )
-        .await;
+        let result = run_tool_loop(&config, &make_tool_calls(&["test_tool"]), &tools, "test").await;
 
         // Scratch pad runs internally after iteration 0; iterations_used is always 1.
         assert_eq!(result.iterations_used, 1);
         // Scratch pad exhausts rounds on pure tool-call responses and falls back.
-        assert!(result.tool_results.len() > 1, "Should have initial + scratch pad results");
+        assert!(
+            result.tool_results.len() > 1,
+            "Should have initial + scratch pad results"
+        );
     }
 
     #[tokio::test]
@@ -1123,17 +1273,15 @@ mod tests {
         // Initial call uses "test" as query (from make_tool_calls).
         // First chain uses "same_args" (new, allowed).
         // Second chain uses "same_args" again (duplicate, blocked).
-        let result = run_tool_loop(
-            &config,
-            &make_tool_calls(&["test_tool"]),
-            &tools,
-            "test",
-        )
-        .await;
+        let result = run_tool_loop(&config, &make_tool_calls(&["test_tool"]), &tools, "test").await;
 
         // Scratch pad detects duplicates: first "same_args" call is new, subsequent skipped.
         assert_eq!(result.iterations_used, 1);
-        assert_eq!(result.tool_results.len(), 2, "Initial + 1 new call from scratch pad (duplicates skipped)");
+        assert_eq!(
+            result.tool_results.len(),
+            2,
+            "Initial + 1 new call from scratch pad (duplicates skipped)"
+        );
     }
 
     #[tokio::test]
@@ -1173,17 +1321,18 @@ mod tests {
         .await;
 
         assert_eq!(result.iterations_used, 1);
-        assert_eq!(
-            result.summary.as_deref(),
-            Some("Summary: found 3 files.")
-        );
+        assert_eq!(result.summary.as_deref(), Some("Summary: found 3 files."));
     }
 
     #[test]
     fn test_aggregate_results_formatting() {
         let result = ToolRunResult {
             tool_results: vec![
-                ("id1".into(), "read_file".into(), "file contents here".into()),
+                (
+                    "id1".into(),
+                    "read_file".into(),
+                    "file contents here".into(),
+                ),
                 ("id2".into(), "exec".into(), "command output".into()),
             ],
             summary: Some("Read a file and ran a command.".to_string()),
@@ -1210,15 +1359,12 @@ mod tests {
         let formatted = format_results_for_context(&result, 2000, None);
         assert!(formatted.contains("chars total"));
         assert!(formatted.len() < 3000);
-
     }
 
     #[test]
     fn test_slim_results_truncation() {
         let result = ToolRunResult {
-            tool_results: vec![
-                ("id1".into(), "read_file".into(), "x".repeat(500)),
-            ],
+            tool_results: vec![("id1".into(), "read_file".into(), "x".repeat(500))],
             summary: Some("Found a large file.".to_string()),
             iterations_used: 1,
             error: None,
@@ -1261,10 +1407,7 @@ mod tests {
             _temperature: f64,
             _thinking_budget: Option<u32>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-            self.captured_messages
-                .lock()
-                .await
-                .push(messages.to_vec());
+            self.captured_messages.lock().await.push(messages.to_vec());
             Ok(crate::providers::base::LLMResponse {
                 content: Some("Done.".to_string()),
                 tool_calls: vec![],
@@ -1310,14 +1453,22 @@ mod tests {
         .await;
 
         let captured = provider.captured_messages.lock().await;
-        assert!(!captured.is_empty(), "Should have made at least one LLM call");
+        assert!(
+            !captured.is_empty(),
+            "Should have made at least one LLM call"
+        );
 
         let messages = &captured[0];
 
         // Expected sequence: system, user, assistant(tool_calls), tool(result)
         // NO user continuation — Mistral handles tool→generate natively.
         // Scratch pad sends fresh [system, user] messages each round.
-        assert_eq!(messages.len(), 2, "Scratch pad should send fresh [system, user] messages, got {}", messages.len());
+        assert_eq!(
+            messages.len(),
+            2,
+            "Scratch pad should send fresh [system, user] messages, got {}",
+            messages.len()
+        );
         assert_eq!(messages[0]["role"].as_str(), Some("system"));
         assert_eq!(messages[1]["role"].as_str(), Some("user"));
     }
@@ -1415,7 +1566,11 @@ mod tests {
         let messages = &captured[0];
 
         // Scratch pad sends fresh [system, user] messages each round.
-        assert_eq!(messages.len(), 2, "Scratch pad should send fresh [system, user] messages");
+        assert_eq!(
+            messages.len(),
+            2,
+            "Scratch pad should send fresh [system, user] messages"
+        );
         assert_eq!(messages[0]["role"].as_str(), Some("system"));
         assert_eq!(messages[1]["role"].as_str(), Some("user"));
     }
@@ -1476,7 +1631,11 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].1, "test_tool");
         // Scratch pad LLM call fails, falls back to None (no memory findings).
-        assert!(result.summary.is_none(), "Provider error in scratch pad falls back to None: {:?}", result.summary);
+        assert!(
+            result.summary.is_none(),
+            "Provider error in scratch pad falls back to None: {:?}",
+            result.summary
+        );
         assert_eq!(result.iterations_used, 1);
     }
 
@@ -1578,8 +1737,7 @@ mod tests {
 
         // Result should use ORIGINAL ID (for main model correlation)
         assert_eq!(
-            result.tool_results[0].0,
-            "toolu_01XYZabc123def456ghi789",
+            result.tool_results[0].0, "toolu_01XYZabc123def456ghi789",
             "Results should preserve original tool call ID"
         );
 
@@ -1710,14 +1868,21 @@ mod tests {
         // Scratch pad receives variable metadata in the user message state.
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
-        let user_msg = messages.iter()
+        let user_msg = messages
+            .iter()
             .find(|m| m["role"].as_str() == Some("user"))
             .unwrap();
         let content = user_msg["content"].as_str().unwrap();
-        assert!(content.contains("output_0"),
-            "Scratch pad state should contain variable metadata, got: {}", content);
-        assert!(content.contains("500 chars"),
-            "State should contain char count, got: {}", content);
+        assert!(
+            content.contains("output_0"),
+            "Scratch pad state should contain variable metadata, got: {}",
+            content
+        );
+        assert!(
+            content.contains("500 chars"),
+            "State should contain char count, got: {}",
+            content
+        );
     }
 
     #[tokio::test]
@@ -1760,13 +1925,17 @@ mod tests {
         // Scratch pad receives variable metadata in user message state.
         let captured = provider.captured_messages.lock().await;
         let messages = &captured[0];
-        let user_msg = messages.iter()
+        let user_msg = messages
+            .iter()
             .find(|m| m["role"].as_str() == Some("user"))
             .unwrap();
         let content = user_msg["content"].as_str().unwrap();
         // Even small results are stored as variables in ContextStore.
-        assert!(content.contains("output_0"),
-            "Scratch pad state should contain variable info, got: {}", content);
+        assert!(
+            content.contains("output_0"),
+            "Scratch pad state should contain variable info, got: {}",
+            content
+        );
     }
 
     #[tokio::test]
@@ -1804,10 +1973,16 @@ mod tests {
         assert_eq!(result.tool_results.len(), 1);
         assert_eq!(result.tool_results[0].2, "tool result data");
         // No summary — LLM was skipped
-        assert!(result.summary.is_none(), "Short-circuit should skip LLM, summary should be None");
+        assert!(
+            result.summary.is_none(),
+            "Short-circuit should skip LLM, summary should be None"
+        );
         // No LLM calls made
         let captured = provider.captured_messages.lock().await;
-        assert!(captured.is_empty(), "No LLM calls should have been made for short results");
+        assert!(
+            captured.is_empty(),
+            "No LLM calls should have been made for short results"
+        );
     }
 
     #[tokio::test]
@@ -1848,8 +2023,11 @@ mod tests {
         .await;
 
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.summary.as_deref(), Some("Summarized."),
-            "With short_circuit_chars=0, LLM should still be called");
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Summarized."),
+            "With short_circuit_chars=0, LLM should still be called"
+        );
     }
 
     // -- Tool filtering tests (prompt injection defense) --
@@ -1923,10 +2101,17 @@ mod tests {
         .await;
 
         // Only test_tool should have executed (from initial calls)
-        assert_eq!(result.tool_results.len(), 1, "Only initial tool should execute");
+        assert_eq!(
+            result.tool_results.len(),
+            1,
+            "Only initial tool should execute"
+        );
         assert_eq!(result.tool_results[0].1, "test_tool");
         // dangerous_tool was blocked, all calls were filtered → loop detected
-        assert!(result.summary.is_some(), "Should have a summary after blocking");
+        assert!(
+            result.summary.is_some(),
+            "Should have a summary after blocking"
+        );
     }
 
     #[tokio::test]
@@ -1984,7 +2169,11 @@ mod tests {
         .await;
 
         // Both calls should execute (same tool, different args)
-        assert_eq!(result.tool_results.len(), 2, "Should have 2 results (initial + chain)");
+        assert_eq!(
+            result.tool_results.len(),
+            2,
+            "Should have 2 results (initial + chain)"
+        );
         assert_eq!(result.tool_results[0].1, "test_tool");
         assert_eq!(result.tool_results[1].1, "test_tool");
     }
@@ -1995,8 +2184,8 @@ mod tests {
         let provider = Arc::new(CapturingProvider::new());
 
         let mut tools = ToolRegistry::new();
-        tools.register(Box::new(CountingTool::new()));    // test_tool
-        tools.register(Box::new(DangerousTool));           // dangerous_tool
+        tools.register(Box::new(CountingTool::new())); // test_tool
+        tools.register(Box::new(DangerousTool)); // dangerous_tool
 
         let config = ToolRunnerConfig {
             provider: provider.clone(),
@@ -2028,7 +2217,10 @@ mod tests {
 
         // The run completed without dangerous_tool being available
         let captured = provider.captured_messages.lock().await;
-        assert!(!captured.is_empty(), "Should have made at least one LLM call");
+        assert!(
+            !captured.is_empty(),
+            "Should have made at least one LLM call"
+        );
     }
 
     // -- ContextStore integration tests --
@@ -2088,7 +2280,11 @@ mod tests {
         .await;
 
         // Only the real tool call should be in results
-        assert_eq!(result.tool_results.len(), 1, "Micro-tool results should not be in all_results");
+        assert_eq!(
+            result.tool_results.len(),
+            1,
+            "Micro-tool results should not be in all_results"
+        );
         assert_eq!(result.tool_results[0].1, "test_tool");
     }
 
@@ -2122,10 +2318,7 @@ mod tests {
                 _thinking_budget: Option<u32>,
             ) -> anyhow::Result<crate::providers::base::LLMResponse> {
                 if let Some(t) = tools {
-                    self.captured_tools
-                        .lock()
-                        .await
-                        .push(t.to_vec());
+                    self.captured_tools.lock().await.push(t.to_vec());
                 }
                 let n = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
@@ -2189,18 +2382,32 @@ mod tests {
 
         let captured = provider.captured_tools.lock().await;
         // All iterations now receive tools (no iteration 0 suppression).
-        assert_eq!(captured.len(), 2, "Both iterations should receive tool definitions");
+        assert_eq!(
+            captured.len(),
+            2,
+            "Both iterations should receive tool definitions"
+        );
 
         // Check the first iteration's tool defs (representative of all).
         let defs = &captured[0];
-        let tool_names: Vec<&str> = defs.iter()
+        let tool_names: Vec<&str> = defs
+            .iter()
             .filter_map(|d| d.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
 
-        assert!(tool_names.contains(&"test_tool"), "Should include the real tool");
-        assert!(tool_names.contains(&"ctx_slice"), "Should include ctx_slice");
+        assert!(
+            tool_names.contains(&"test_tool"),
+            "Should include the real tool"
+        );
+        assert!(
+            tool_names.contains(&"ctx_slice"),
+            "Should include ctx_slice"
+        );
         assert!(tool_names.contains(&"ctx_grep"), "Should include ctx_grep");
-        assert!(tool_names.contains(&"ctx_length"), "Should include ctx_length");
+        assert!(
+            tool_names.contains(&"ctx_length"),
+            "Should include ctx_length"
+        );
     }
 
     #[tokio::test]
@@ -2269,7 +2476,11 @@ mod tests {
             "Should return depth limit error, got: {}",
             result
         );
-        assert!(result.starts_with("Error:"), "Should be an error: {}", result);
+        assert!(
+            result.starts_with("Error:"),
+            "Should be an error: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -2295,7 +2506,11 @@ mod tests {
             "Should return not-found error, got: {}",
             result
         );
-        assert!(result.starts_with("Error:"), "Should be an error: {}", result);
+        assert!(
+            result.starts_with("Error:"),
+            "Should be an error: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -2450,7 +2665,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.tool_results.is_empty(), "No tools should execute when pre-cancelled");
+        assert!(
+            result.tool_results.is_empty(),
+            "No tools should execute when pre-cancelled"
+        );
         assert_eq!(result.iterations_used, 1);
         assert!(
             result.summary.as_deref().unwrap().contains("cancelled"),
@@ -2550,7 +2768,8 @@ mod tests {
         // Initial tool executes (1), scratch pad round 0 executes chained tool (1),
         // then cancellation is detected at the top of round 1.
         assert_eq!(
-            result.tool_results.len(), 2,
+            result.tool_results.len(),
+            2,
             "Initial + 1 from scratch pad before cancellation detected"
         );
         assert!(
@@ -2639,7 +2858,10 @@ mod tests {
         assert_eq!(result.tool_results[0].1, "test_tool");
         assert_eq!(result.tool_results[0].2, "tool result data");
         // Delegation model NOT called — no summary.
-        assert!(result.summary.is_none(), "verbatim mode must not produce a summary");
+        assert!(
+            result.summary.is_none(),
+            "verbatim mode must not produce a summary"
+        );
         // Only one iteration (initial execution, no delegation loop).
         assert_eq!(result.iterations_used, 1);
     }
@@ -2733,6 +2955,24 @@ mod tests {
     }
 
     #[test]
+    fn test_scratch_pad_round_budget_for_nanbeige() {
+        let config = ToolRunnerConfig {
+            provider: Arc::new(MockProvider::new(vec![])),
+            model: "local:nanbeige4.1-3b-q8_0.gguf".to_string(),
+            max_iterations: 10,
+            max_tokens: 1024,
+            needs_user_continuation: true,
+            max_tool_result_chars: 2000,
+            short_circuit_chars: 200,
+            depth: 0,
+            cancellation_token: None,
+            verbatim: false,
+            budget: None,
+        };
+        assert_eq!(scratch_pad_round_budget(&config), 3);
+    }
+
+    #[test]
     fn test_budget_zero_depth() {
         let budget = Budget::root(10, 0);
         assert!(!budget.can_delegate());
@@ -2743,7 +2983,9 @@ mod tests {
     fn test_budget_cost_tracking() {
         let mut prices = crate::agent::model_prices::ModelPrices::empty();
         // $1/MTok prompt, $2/MTok completion → per-token: 0.000001, 0.000002
-        prices.prices.insert("test/model".to_string(), (0.000001, 0.000002));
+        prices
+            .prices
+            .insert("test/model".to_string(), (0.000001, 0.000002));
         let prices = std::sync::Arc::new(prices);
 
         let mut budget = Budget::root_with_cost(10, 2, 0.01, prices);
@@ -2795,7 +3037,9 @@ mod tests {
     #[test]
     fn test_budget_child_inherits_remaining_cost() {
         let mut prices = crate::agent::model_prices::ModelPrices::empty();
-        prices.prices.insert("test/model".to_string(), (0.000001, 0.000002));
+        prices
+            .prices
+            .insert("test/model".to_string(), (0.000001, 0.000002));
         let prices = std::sync::Arc::new(prices);
 
         let mut budget = Budget::root_with_cost(10, 2, 0.10, prices);
@@ -2809,8 +3053,11 @@ mod tests {
 
         // Child gets (0.10 - 0.04) * 0.5 = 0.03
         let child = budget.child().unwrap();
-        assert!((child.cost_limit - 0.03).abs() < 1e-9,
-            "child cost_limit was {}", child.cost_limit);
+        assert!(
+            (child.cost_limit - 0.03).abs() < 1e-9,
+            "child cost_limit was {}",
+            child.cost_limit
+        );
         assert_eq!(child.cost_spent, 0.0);
         assert!(child.prices.is_some());
     }
@@ -2821,7 +3068,11 @@ mod tests {
     fn test_build_analysis_state_empty_store() {
         let store = context_store::ContextStore::new();
         let state = build_analysis_state(&store);
-        assert!(state.is_empty(), "Empty store should produce empty state, got: {}", state);
+        assert!(
+            state.is_empty(),
+            "Empty store should produce empty state, got: {}",
+            state
+        );
     }
 
     #[test]
@@ -2831,10 +3082,22 @@ mod tests {
         store.store("x".repeat(500));
 
         let state = build_analysis_state(&store);
-        assert!(state.contains("output_0"), "State should contain variable name");
-        assert!(state.contains("11 chars"), "State should contain char count for output_0");
-        assert!(state.contains("output_1"), "State should contain second variable");
-        assert!(state.contains("500 chars"), "State should contain char count for output_1");
+        assert!(
+            state.contains("output_0"),
+            "State should contain variable name"
+        );
+        assert!(
+            state.contains("11 chars"),
+            "State should contain char count for output_0"
+        );
+        assert!(
+            state.contains("output_1"),
+            "State should contain second variable"
+        );
+        assert!(
+            state.contains("500 chars"),
+            "State should contain char count for output_1"
+        );
     }
 
     #[test]
@@ -2844,10 +3107,22 @@ mod tests {
         store.mem_store("relevant_section", "Lines 142-168".to_string());
 
         let state = build_analysis_state(&store);
-        assert!(state.contains("Findings so far:"), "State should have findings section");
-        assert!(state.contains("file_type"), "State should contain memory key");
-        assert!(state.contains("HTML page"), "State should contain memory value");
-        assert!(state.contains("relevant_section"), "State should contain second key");
+        assert!(
+            state.contains("Findings so far:"),
+            "State should have findings section"
+        );
+        assert!(
+            state.contains("file_type"),
+            "State should contain memory key"
+        );
+        assert!(
+            state.contains("HTML page"),
+            "State should contain memory value"
+        );
+        assert!(
+            state.contains("relevant_section"),
+            "State should contain second key"
+        );
     }
 
     #[test]
@@ -2857,8 +3132,14 @@ mod tests {
         store.mem_store("finding", "important result".to_string());
 
         let state = build_analysis_state(&store);
-        assert!(state.contains("Variables:"), "Should have variables section");
-        assert!(state.contains("Findings so far:"), "Should have findings section");
+        assert!(
+            state.contains("Variables:"),
+            "Should have variables section"
+        );
+        assert!(
+            state.contains("Findings so far:"),
+            "Should have findings section"
+        );
         assert!(state.contains("output_0"), "Should contain variable");
         assert!(state.contains("important result"), "Should contain finding");
     }
@@ -2919,14 +3200,12 @@ mod tests {
                             usage: HashMap::new(),
                         })
                     }
-                    _ => {
-                        Ok(crate::providers::base::LLMResponse {
-                            content: Some("Unexpected call.".to_string()),
-                            tool_calls: vec![],
-                            finish_reason: "stop".to_string(),
-                            usage: HashMap::new(),
-                        })
-                    }
+                    _ => Ok(crate::providers::base::LLMResponse {
+                        content: Some("Unexpected call.".to_string()),
+                        tool_calls: vec![],
+                        finish_reason: "stop".to_string(),
+                        usage: HashMap::new(),
+                    }),
                 }
             }
 
@@ -2962,23 +3241,37 @@ mod tests {
             &make_tool_calls(&["test_tool"]),
             &tools,
             "test context",
-        ).await;
+        )
+        .await;
 
-        assert_eq!(result.summary.as_deref(), Some("Found 5 endpoints in the API."));
+        assert_eq!(
+            result.summary.as_deref(),
+            Some("Found 5 endpoints in the API.")
+        );
 
         // Verify round 1's user message contains the finding from round 0.
         let captured = provider.captured_messages.lock().await;
-        assert!(captured.len() >= 2, "Should have at least 2 LLM calls (round 0 + round 1)");
+        assert!(
+            captured.len() >= 2,
+            "Should have at least 2 LLM calls (round 0 + round 1)"
+        );
 
         let round1_messages = &captured[1];
-        let user_msg = round1_messages.iter()
+        let user_msg = round1_messages
+            .iter()
             .find(|m| m["role"].as_str() == Some("user"))
             .expect("Round 1 should have a user message");
         let content = user_msg["content"].as_str().unwrap();
-        assert!(content.contains("finding_1"),
-            "Round 1 state should contain memory key from round 0, got: {}", content);
-        assert!(content.contains("discovered 5 endpoints"),
-            "Round 1 state should contain memory value from round 0, got: {}", content);
+        assert!(
+            content.contains("finding_1"),
+            "Round 1 state should contain memory key from round 0, got: {}",
+            content
+        );
+        assert!(
+            content.contains("discovered 5 endpoints"),
+            "Round 1 state should contain memory value from round 0, got: {}",
+            content
+        );
     }
 
     // -- needs_user_continuation irrelevance for scratch pad --
@@ -3012,20 +3305,37 @@ mod tests {
             &make_tool_calls(&["test_tool"]),
             &tools,
             "test context",
-        ).await;
+        )
+        .await;
 
         let captured = provider.captured_messages.lock().await;
-        assert!(!captured.is_empty(), "Scratch pad should make at least 1 LLM call");
+        assert!(
+            !captured.is_empty(),
+            "Scratch pad should make at least 1 LLM call"
+        );
 
         // Every call to the scratch pad should have exactly 2 messages: system + user.
         // No extra user continuation injected.
         for (i, messages) in captured.iter().enumerate() {
-            assert_eq!(messages.len(), 2,
-                "Scratch pad round {} should have [system, user], got {} messages", i, messages.len());
-            assert_eq!(messages[0]["role"].as_str(), Some("system"),
-                "Round {} message 0 should be system", i);
-            assert_eq!(messages[1]["role"].as_str(), Some("user"),
-                "Round {} message 1 should be user", i);
+            assert_eq!(
+                messages.len(),
+                2,
+                "Scratch pad round {} should have [system, user], got {} messages",
+                i,
+                messages.len()
+            );
+            assert_eq!(
+                messages[0]["role"].as_str(),
+                Some("system"),
+                "Round {} message 0 should be system",
+                i
+            );
+            assert_eq!(
+                messages[1]["role"].as_str(),
+                Some("user"),
+                "Round {} message 1 should be user",
+                i
+            );
         }
     }
 }

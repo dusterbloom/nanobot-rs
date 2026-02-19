@@ -77,7 +77,6 @@ impl MemoryStore {
         files.sort_by(|a, b| b.cmp(a));
         files
     }
-
 }
 
 #[cfg(test)]
@@ -171,5 +170,4 @@ mod tests {
         assert_eq!(names[0], "2025-06-15.md");
         assert_eq!(names[1], "2025-01-01.md");
     }
-
 }

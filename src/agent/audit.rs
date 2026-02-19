@@ -63,7 +63,13 @@ impl AuditLog {
         // Sanitize session_key for use as filename
         let safe_key: String = session_key
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let file_path = audit_dir.join(format!("{}.jsonl", safe_key));
         let lock_path = audit_dir.join(format!("{}.lock", safe_key));
@@ -186,7 +192,8 @@ impl AuditLog {
             }
 
             // Recompute hash and verify.
-            let args_json = serde_json::to_string(&entry.arguments).unwrap_or_else(|_| "{}".to_string());
+            let args_json =
+                serde_json::to_string(&entry.arguments).unwrap_or_else(|_| "{}".to_string());
             let computed = Self::compute_hash(
                 &entry.prev_hash,
                 entry.seq,
@@ -213,7 +220,10 @@ impl AuditLog {
     /// Search entries for one whose result_data contains the given substring.
     pub fn find_matching_result(&self, substring: &str) -> Option<AuditEntry> {
         let entries = self.get_entries();
-        entries.into_iter().rev().find(|e| e.result_data.contains(substring))
+        entries
+            .into_iter()
+            .rev()
+            .find(|e| e.result_data.contains(substring))
     }
 
     // --- Private helpers ---
@@ -316,7 +326,13 @@ pub fn write_turn_summary(workspace: &Path, session_key: &str, summary: &TurnSum
     let _ = fs::create_dir_all(&audit_dir);
     let safe_key: String = session_key
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = audit_dir.join(format!("{}.turns.jsonl", safe_key));
     if let Ok(json) = serde_json::to_string(summary) {
@@ -428,8 +444,24 @@ mod tests {
     #[test]
     fn test_find_matching_result() {
         let (_tmp, log) = make_audit();
-        log.record("read_file", "c1", &json!({}), "hello world", true, 5, "inline");
-        log.record("exec", "c2", &json!({}), "total 42 files", true, 10, "inline");
+        log.record(
+            "read_file",
+            "c1",
+            &json!({}),
+            "hello world",
+            true,
+            5,
+            "inline",
+        );
+        log.record(
+            "exec",
+            "c2",
+            &json!({}),
+            "total 42 files",
+            true,
+            10,
+            "inline",
+        );
 
         let found = log.find_matching_result("42 files");
         assert!(found.is_some());
@@ -536,7 +568,11 @@ mod tests {
         write_turn_summary(tmp.path(), "test-session", &summary);
 
         // Read back and verify.
-        let path = tmp.path().join("memory").join("audit").join("test-session.turns.jsonl");
+        let path = tmp
+            .path()
+            .join("memory")
+            .join("audit")
+            .join("test-session.turns.jsonl");
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         let parsed: TurnSummary = serde_json::from_str(content.trim()).unwrap();

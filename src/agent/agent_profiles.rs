@@ -286,10 +286,7 @@ Do stuff."#;
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251001");
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-5-20250929");
         assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(
-            resolve_model_alias("Haiku"),
-            "claude-haiku-4-5-20251001"
-        ); // case insensitive
+        assert_eq!(resolve_model_alias("Haiku"), "claude-haiku-4-5-20251001"); // case insensitive
         assert_eq!(resolve_model_alias("local"), "local");
         assert_eq!(resolve_model_alias("custom-model-v2"), "custom-model-v2");
     }

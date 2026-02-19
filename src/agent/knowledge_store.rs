@@ -52,8 +52,7 @@ impl KnowledgeStore {
                 .context("Failed to create knowledge store directory")?;
         }
 
-        let conn = Connection::open(db_path)
-            .context("Failed to open knowledge database")?;
+        let conn = Connection::open(db_path).context("Failed to open knowledge database")?;
 
         // Enable WAL mode and mmap for performance
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -110,8 +109,7 @@ impl KnowledgeStore {
 
     /// Open the knowledge database at the default location (~/.nanobot/knowledge.db).
     pub fn open_default() -> Result<Self> {
-        let home = dirs::home_dir()
-            .context("Failed to determine home directory")?;
+        let home = dirs::home_dir().context("Failed to determine home directory")?;
         let db_path = home.join(".nanobot").join("knowledge.db");
         Self::open(&db_path)
     }
@@ -144,9 +142,9 @@ impl KnowledgeStore {
         let source_id = self.conn.last_insert_rowid();
 
         // Insert chunks
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO chunks (source_id, chunk_idx, content) VALUES (?1, ?2, ?3)"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO chunks (source_id, chunk_idx, content) VALUES (?1, ?2, ?3)")?;
 
         for (idx, chunk_text) in chunks.iter().enumerate() {
             stmt.execute(params![source_id, idx as i64, chunk_text])?;
@@ -229,9 +227,10 @@ impl KnowledgeStore {
         )?;
 
         let chunks = stmt
-            .query_map(params![source_name, start_idx as i64, end_idx as i64], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![source_name, start_idx as i64, end_idx as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(chunks)
@@ -275,10 +274,12 @@ impl KnowledgeStore {
 
         if let Some(id) = source_id {
             // Delete chunks (triggers will handle FTS cleanup)
-            self.conn.execute("DELETE FROM chunks WHERE source_id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM chunks WHERE source_id = ?1", params![id])?;
 
             // Delete source
-            self.conn.execute("DELETE FROM sources WHERE id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM sources WHERE id = ?1", params![id])?;
 
             Ok(true)
         } else {
@@ -288,21 +289,19 @@ impl KnowledgeStore {
 
     /// Get statistics about the knowledge store.
     pub fn stats(&self) -> Result<StoreStats> {
-        let total_sources: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM sources", [], |row| row.get(0))?;
+        let total_sources: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM sources", [], |row| row.get(0))?;
 
         let total_chunks: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
 
-        let total_chars: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(SUM(total_chars), 0) FROM sources",
-                [],
-                |row| row.get(0),
-            )?;
+        let total_chars: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(total_chars), 0) FROM sources",
+            [],
+            |row| row.get(0),
+        )?;
 
         Ok(StoreStats {
             total_sources,
@@ -345,10 +344,7 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
         if end < total_chars {
             // Look ahead for newline within a reasonable distance
             let search_limit = (end + 100).min(total_chars);
-            if let Some(newline_pos) = chars[end..search_limit]
-                .iter()
-                .position(|&c| c == '\n')
-            {
+            if let Some(newline_pos) = chars[end..search_limit].iter().position(|&c| c == '\n') {
                 end = end + newline_pos + 1; // Include the newline
             }
         }
@@ -390,7 +386,9 @@ mod tests {
         let store = KnowledgeStore::open(&db_path).unwrap();
 
         let text = "Hello, this is a test document.";
-        let result = store.ingest("test_doc", Some("/path/to/doc"), text, 4096, 256).unwrap();
+        let result = store
+            .ingest("test_doc", Some("/path/to/doc"), text, 4096, 256)
+            .unwrap();
 
         assert_eq!(result.chunks_created, 1);
         assert_eq!(result.total_chars, text.chars().count());
@@ -445,8 +443,24 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let store = KnowledgeStore::open(&db_path).unwrap();
 
-        store.ingest("doc1", None, "The quick brown fox jumps over the lazy dog.", 4096, 256).unwrap();
-        store.ingest("doc2", None, "A completely different topic about databases.", 4096, 256).unwrap();
+        store
+            .ingest(
+                "doc1",
+                None,
+                "The quick brown fox jumps over the lazy dog.",
+                4096,
+                256,
+            )
+            .unwrap();
+        store
+            .ingest(
+                "doc2",
+                None,
+                "A completely different topic about databases.",
+                4096,
+                256,
+            )
+            .unwrap();
 
         let results = store.search("fox", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -461,10 +475,20 @@ mod tests {
         let store = KnowledgeStore::open(&db_path).unwrap();
 
         // Doc with term appearing once
-        store.ingest("doc1", None, "The database system is important.", 4096, 256).unwrap();
+        store
+            .ingest("doc1", None, "The database system is important.", 4096, 256)
+            .unwrap();
 
         // Doc with term appearing multiple times
-        store.ingest("doc2", None, "Database, database, database everywhere! Database systems.", 4096, 256).unwrap();
+        store
+            .ingest(
+                "doc2",
+                None,
+                "Database, database, database everywhere! Database systems.",
+                4096,
+                256,
+            )
+            .unwrap();
 
         let results = store.search("database", 10).unwrap();
         assert_eq!(results.len(), 2);
@@ -512,9 +536,13 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let store = KnowledgeStore::open(&db_path).unwrap();
 
-        store.ingest("doc1", Some("/path/1"), "Content 1", 4096, 256).unwrap();
+        store
+            .ingest("doc1", Some("/path/1"), "Content 1", 4096, 256)
+            .unwrap();
         store.ingest("doc2", None, "Content 2", 4096, 256).unwrap();
-        store.ingest("doc3", Some("/path/3"), "Content 3", 4096, 256).unwrap();
+        store
+            .ingest("doc3", Some("/path/3"), "Content 3", 4096, 256)
+            .unwrap();
 
         let sources = store.list_sources().unwrap();
         assert_eq!(sources.len(), 3);
@@ -539,7 +567,9 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let store = KnowledgeStore::open(&db_path).unwrap();
 
-        store.ingest("doc1", None, "Content to be deleted", 4096, 256).unwrap();
+        store
+            .ingest("doc1", None, "Content to be deleted", 4096, 256)
+            .unwrap();
 
         let deleted = store.delete_source("doc1").unwrap();
         assert!(deleted);
@@ -569,7 +599,9 @@ mod tests {
         assert_eq!(stats.total_chars, 0);
 
         store.ingest("doc1", None, "Short", 4096, 256).unwrap();
-        store.ingest("doc2", None, "a".repeat(5000).as_str(), 1000, 100).unwrap();
+        store
+            .ingest("doc2", None, "a".repeat(5000).as_str(), 1000, 100)
+            .unwrap();
 
         let stats = store.stats().unwrap();
         assert_eq!(stats.total_sources, 2);
@@ -583,8 +615,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let store = KnowledgeStore::open(&db_path).unwrap();
 
-        store.ingest("doc", None, "Original content", 4096, 256).unwrap();
-        store.ingest("doc", None, "Replaced content", 4096, 256).unwrap();
+        store
+            .ingest("doc", None, "Original content", 4096, 256)
+            .unwrap();
+        store
+            .ingest("doc", None, "Replaced content", 4096, 256)
+            .unwrap();
 
         let sources = store.list_sources().unwrap();
         assert_eq!(sources.len(), 1);

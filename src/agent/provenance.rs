@@ -126,9 +126,7 @@ impl<'a> ClaimVerifier<'a> {
     fn extract_command_refs(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
         // Match: ran/executed + backtick content
-        let re = Regex::new(
-            r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`"
-        ).unwrap();
+        let re = Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap();
 
         for cap in re.captures_iter(text) {
             if let (Some(full), Some(cmd)) = (cap.get(0), cap.get(2)) {
@@ -213,8 +211,9 @@ impl<'a> ClaimVerifier<'a> {
 
         // Pattern 3: "When I run X" / "If I run X" (implied action)
         let re_when = Regex::new(
-            r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}"
-        ).unwrap();
+            r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}",
+        )
+        .unwrap();
 
         for cap in re_when.captures_iter(text) {
             if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
@@ -239,9 +238,9 @@ impl<'a> ClaimVerifier<'a> {
             "read" => Some("read_file"),
             "wrote" | "created" | "modified" | "updated" => Some("write_file"),
             "deleted" | "removed" => Some("exec"),
-            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify"
-            | "built" | "build" | "compiled" | "installed" | "install" | "copied"
-            | "copy" | "tested" | "test" | "try" | "look" | "see" => Some("exec"),
+            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify" | "built"
+            | "build" | "compiled" | "installed" | "install" | "copied" | "copy" | "tested"
+            | "test" | "try" | "look" | "see" => Some("exec"),
             "searched" => Some("web_search"),
             "fetched" => Some("web_fetch"),
             "edited" => Some("edit_file"),
@@ -252,8 +251,9 @@ impl<'a> ClaimVerifier<'a> {
     fn extract_numeric_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
         let re = Regex::new(
-            r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b"
-        ).unwrap();
+            r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b",
+        )
+        .unwrap();
 
         for cap in re.captures_iter(text) {
             if let (Some(full), Some(num)) = (cap.get(0), cap.get(1)) {
@@ -303,15 +303,17 @@ impl<'a> ClaimVerifier<'a> {
     fn extract_timestamp_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
         // Match time patterns: "17:45", "from 17:36", "at 3:30 PM"
-        let re = Regex::new(
-            r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b"
-        ).unwrap();
+        let re = Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap();
 
         for cap in re.captures_iter(text) {
             if let Some(full) = cap.get(0) {
                 let time_str = full.as_str();
                 // Check if any audit entry result contains this timestamp.
-                let status = if self.entries.iter().any(|e| e.result_data.contains(time_str)) {
+                let status = if self
+                    .entries
+                    .iter()
+                    .any(|e| e.result_data.contains(time_str))
+                {
                     ClaimStatus::Derived
                 } else if self.entries.is_empty() {
                     ClaimStatus::Recalled
@@ -461,11 +463,13 @@ impl<'a> ClaimVerifier<'a> {
         // Broad check: does any tool name relate to the action?
         let related_tools: Vec<&str> = match action {
             "read" => vec!["read_file", "read"],
-            "wrote" | "created" | "modified" | "updated" => vec!["write_file", "write", "edit_file"],
+            "wrote" | "created" | "modified" | "updated" => {
+                vec!["write_file", "write", "edit_file"]
+            }
             "deleted" | "removed" => vec!["exec"],
-            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify"
-            | "built" | "build" | "compiled" | "installed" | "install" | "copied"
-            | "copy" | "tested" | "test" | "try" | "look" | "see" => vec!["exec"],
+            "executed" | "ran" | "run" | "checked" | "check" | "verified" | "verify" | "built"
+            | "build" | "compiled" | "installed" | "install" | "copied" | "copy" | "tested"
+            | "test" | "try" | "look" | "see" => vec!["exec"],
             "searched" => vec!["web_search", "search"],
             "fetched" => vec!["web_fetch", "fetch"],
             "edited" => vec!["edit_file", "edit"],
@@ -574,8 +578,8 @@ pub fn detect_phantom_claims(response: &str, tools_called: &[String]) -> Option<
         "let me verify",
         "let me look",
         // Fake tool output indicators
-        "```\n$",         // fake shell prompt in code block
-        "exit code:",     // fake exec output
+        "```\n$",     // fake shell prompt in code block
+        "exit code:", // fake exec output
         "successfully edited",
         "successfully created",
         "successfully wrote",
@@ -624,7 +628,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_entry(tool_name: &str, tool_call_id: &str, args: serde_json::Value, result: &str, ok: bool) -> AuditEntry {
+    fn make_entry(
+        tool_name: &str,
+        tool_call_id: &str,
+        args: serde_json::Value,
+        result: &str,
+        ok: bool,
+    ) -> AuditEntry {
         AuditEntry {
             seq: 0,
             timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -642,13 +652,21 @@ mod tests {
 
     #[test]
     fn test_observed_file_ref() {
-        let entries = vec![
-            make_entry("read_file", "c1", json!({"path": "/home/user/code.rs"}), "fn main() {}", true),
-        ];
+        let entries = vec![make_entry(
+            "read_file",
+            "c1",
+            json!({"path": "/home/user/code.rs"}),
+            "fn main() {}",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
-        let claims = verifier.verify("I read `/home/user/code.rs` and it contains a main function.");
+        let claims =
+            verifier.verify("I read `/home/user/code.rs` and it contains a main function.");
         assert!(!claims.is_empty());
-        let file_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "file_ref").collect();
+        let file_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "file_ref")
+            .collect();
         assert!(!file_claims.is_empty());
         assert_eq!(file_claims[0].status, ClaimStatus::Observed);
     }
@@ -658,7 +676,10 @@ mod tests {
         let entries: Vec<AuditEntry> = vec![];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I read `/tmp/secret.txt` and found passwords.");
-        let file_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "file_ref").collect();
+        let file_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "file_ref")
+            .collect();
         if !file_claims.is_empty() {
             // No tool calls = phantom action, should be Claimed (fabrication).
             assert_eq!(file_claims[0].status, ClaimStatus::Claimed);
@@ -667,36 +688,51 @@ mod tests {
 
     #[test]
     fn test_command_ref_observed() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "cargo test"}), "test result: ok. 42 passed", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "cargo test"}),
+            "test result: ok. 42 passed",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I ran `cargo test` and all tests passed.");
-        let cmd_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "command_ref").collect();
+        let cmd_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "command_ref")
+            .collect();
         assert!(!cmd_claims.is_empty());
         assert_eq!(cmd_claims[0].status, ClaimStatus::Observed);
     }
 
     #[test]
     fn test_action_claim_observed() {
-        let entries = vec![
-            make_entry("write_file", "c1", json!({"path": "/tmp/out.txt"}), "ok", true),
-        ];
+        let entries = vec![make_entry(
+            "write_file",
+            "c1",
+            json!({"path": "/tmp/out.txt"}),
+            "ok",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I wrote the output to a file.");
-        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
         assert!(!action_claims.is_empty());
         assert_eq!(action_claims[0].status, ClaimStatus::Observed);
     }
 
     #[test]
     fn test_action_claim_no_matching_tool() {
-        let entries = vec![
-            make_entry("read_file", "c1", json!({}), "data", true),
-        ];
+        let entries = vec![make_entry("read_file", "c1", json!({}), "data", true)];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I deleted the temporary files.");
-        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
         assert!(!action_claims.is_empty());
         // "deleted" maps to "exec" tool, but we only have read_file
         assert_eq!(action_claims[0].status, ClaimStatus::Claimed);
@@ -704,21 +740,26 @@ mod tests {
 
     #[test]
     fn test_numeric_claim_derived() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({}), "total 42 files found", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({}),
+            "total 42 files found",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("There are 42 files in the directory.");
-        let num_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "numeric").collect();
+        let num_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "numeric")
+            .collect();
         assert!(!num_claims.is_empty());
         assert_eq!(num_claims[0].status, ClaimStatus::Derived);
     }
 
     #[test]
     fn test_has_unverified() {
-        let entries = vec![
-            make_entry("read_file", "c1", json!({}), "data", true),
-        ];
+        let entries = vec![make_entry("read_file", "c1", json!({}), "data", true)];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I deleted the old backups.");
         assert!(verifier.has_unverified(&claims));
@@ -726,9 +767,7 @@ mod tests {
 
     #[test]
     fn test_unverified_summary() {
-        let entries = vec![
-            make_entry("read_file", "c1", json!({}), "data", true),
-        ];
+        let entries = vec![make_entry("read_file", "c1", json!({}), "data", true)];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("I deleted the old backups.");
         let summary = verifier.unverified_summary(&claims);
@@ -761,7 +800,10 @@ mod tests {
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Let me check the time. It's 5:35 PM.");
         // Should detect "Let me check" as a phantom action (Claimed).
-        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
         assert!(!action_claims.is_empty());
         assert_eq!(action_claims[0].status, ClaimStatus::Claimed);
     }
@@ -771,7 +813,10 @@ mod tests {
         let entries: Vec<AuditEntry> = vec![];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Let me run date to get the current time.");
-        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
         assert!(!action_claims.is_empty());
         assert_eq!(action_claims[0].status, ClaimStatus::Claimed);
     }
@@ -779,12 +824,19 @@ mod tests {
     #[test]
     fn test_let_me_check_with_actual_tool_call() {
         // Agent says "Let me check" AND actually called exec.
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "date"}), "Fri Feb 13 17:35:00 CET 2026", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "date"}),
+            "Fri Feb 13 17:35:00 CET 2026",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Let me check the time. It's 17:35.");
-        let action_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "action_claim").collect();
+        let action_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim")
+            .collect();
         assert!(!action_claims.is_empty());
         // Tool WAS called → Observed, not Claimed.
         assert_eq!(action_claims[0].status, ClaimStatus::Observed);
@@ -794,36 +846,57 @@ mod tests {
 
     #[test]
     fn test_outcome_claim_success_matches_ok_tool() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "cargo build"}), "Compiling...\nFinished", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "cargo build"}),
+            "Compiling...\nFinished",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Build succeeded. Now let me copy the binary.");
-        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        let outcome_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "outcome")
+            .collect();
         assert!(!outcome_claims.is_empty());
         assert_eq!(outcome_claims[0].status, ClaimStatus::Derived);
     }
 
     #[test]
     fn test_outcome_claim_success_contradicts_failed_tool() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "cargo build"}), "error[E0308]: mismatched types", false),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "cargo build"}),
+            "error[E0308]: mismatched types",
+            false,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Build succeeded. Now let me install.");
-        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        let outcome_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "outcome")
+            .collect();
         assert!(!outcome_claims.is_empty());
         assert_eq!(outcome_claims[0].status, ClaimStatus::Claimed);
     }
 
     #[test]
     fn test_outcome_claim_failure_matches_failed_tool() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "cargo build"}), "error: aborting due to previous error", false),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "cargo build"}),
+            "error: aborting due to previous error",
+            false,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("Build failed. Let me fix the error.");
-        let outcome_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "outcome").collect();
+        let outcome_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "outcome")
+            .collect();
         assert!(!outcome_claims.is_empty());
         assert_eq!(outcome_claims[0].status, ClaimStatus::Derived);
     }
@@ -832,24 +905,38 @@ mod tests {
 
     #[test]
     fn test_timestamp_claim_from_tool_output() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "stat file"}), "Modify: 2026-02-13 17:36:00", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "stat file"}),
+            "Modify: 2026-02-13 17:36:00",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("The binary is from 17:36.");
-        let ts_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "timestamp").collect();
+        let ts_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "timestamp")
+            .collect();
         assert!(!ts_claims.is_empty());
         assert_eq!(ts_claims[0].status, ClaimStatus::Derived);
     }
 
     #[test]
     fn test_timestamp_claim_fabricated() {
-        let entries = vec![
-            make_entry("exec", "c1", json!({"command": "stat file"}), "Modify: 2026-02-13 17:36:00", true),
-        ];
+        let entries = vec![make_entry(
+            "exec",
+            "c1",
+            json!({"command": "stat file"}),
+            "Modify: 2026-02-13 17:36:00",
+            true,
+        )];
         let verifier = ClaimVerifier::new(&entries);
         let claims = verifier.verify("The binary is from 17:45.");
-        let ts_claims: Vec<_> = claims.iter().filter(|c| c.claim_type == "timestamp").collect();
+        let ts_claims: Vec<_> = claims
+            .iter()
+            .filter(|c| c.claim_type == "timestamp")
+            .collect();
         assert!(!ts_claims.is_empty());
         // 17:45 is NOT in any tool output → fabricated
         assert_eq!(ts_claims[0].status, ClaimStatus::Claimed);
@@ -859,9 +946,13 @@ mod tests {
 
     #[test]
     fn test_verify_turn_claims_no_fabrication() {
-        let entries = vec![
-            make_entry("write_file", "c1", json!({"path": "/tmp/out.txt"}), "ok", true),
-        ];
+        let entries = vec![make_entry(
+            "write_file",
+            "c1",
+            json!({"path": "/tmp/out.txt"}),
+            "ok",
+            true,
+        )];
         let (claims, has_fab) = verify_turn_claims("I wrote the output to a file.", &entries);
         assert!(!claims.is_empty());
         assert!(!has_fab);
@@ -869,9 +960,7 @@ mod tests {
 
     #[test]
     fn test_verify_turn_claims_with_fabrication() {
-        let entries = vec![
-            make_entry("read_file", "c1", json!({}), "data", true),
-        ];
+        let entries = vec![make_entry("read_file", "c1", json!({}), "data", true)];
         let (claims, has_fab) = verify_turn_claims("I deleted the old backups.", &entries);
         assert!(has_fab);
     }
@@ -949,17 +1038,23 @@ mod tests {
         );
         assert!(result.is_some(), "should detect phantom claims");
         let detection = result.unwrap();
-        assert!(detection.matched_patterns.iter().any(|p| p.contains("I read the file")));
-        assert!(detection.matched_patterns.iter().any(|p| p.contains("the output shows")));
+        assert!(detection
+            .matched_patterns
+            .iter()
+            .any(|p| p.contains("I read the file")));
+        assert!(detection
+            .matched_patterns
+            .iter()
+            .any(|p| p.contains("the output shows")));
     }
 
     #[test]
     fn test_phantom_detection_no_tools_no_claims() {
-        let result = detect_phantom_claims(
-            "Here is a general explanation of Rust ownership.",
-            &[],
+        let result = detect_phantom_claims("Here is a general explanation of Rust ownership.", &[]);
+        assert!(
+            result.is_none(),
+            "should not detect phantom when no tool language used"
         );
-        assert!(result.is_none(), "should not detect phantom when no tool language used");
     }
 
     #[test]
@@ -968,15 +1063,15 @@ mod tests {
             "I read the file and it contains configuration data.",
             &["read_file".to_string()],
         );
-        assert!(result.is_none(), "should not flag when tools were actually called");
+        assert!(
+            result.is_none(),
+            "should not flag when tools were actually called"
+        );
     }
 
     #[test]
     fn test_phantom_detection_case_insensitive() {
-        let result = detect_phantom_claims(
-            "I EXECUTED the command successfully.",
-            &[],
-        );
+        let result = detect_phantom_claims("I EXECUTED the command successfully.", &[]);
         assert!(result.is_some(), "should be case-insensitive");
     }
 
@@ -986,9 +1081,15 @@ mod tests {
             "Let me check the file and show you the contents.\n\nThe file contains: foo bar baz",
             &[],
         );
-        assert!(result.is_some(), "should detect 'let me check' phantom pattern");
+        assert!(
+            result.is_some(),
+            "should detect 'let me check' phantom pattern"
+        );
         let detection = result.unwrap();
-        assert!(detection.matched_patterns.iter().any(|p| p.contains("let me check")));
+        assert!(detection
+            .matched_patterns
+            .iter()
+            .any(|p| p.contains("let me check")));
     }
 
     #[test]

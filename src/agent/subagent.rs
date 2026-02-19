@@ -7,16 +7,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use chrono::Utc;
 
 use crate::agent::agent_profiles::{self, AgentProfile};
 use crate::agent::context::ContextBuilder;
 use crate::agent::thread_repair;
+use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::{
     EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
     WriteFileTool,
@@ -32,6 +33,15 @@ const MAX_SUBAGENT_ITERATIONS: u32 = 15;
 /// Maximum spawn depth to prevent infinite recursion.
 const MAX_SPAWN_DEPTH: u32 = 3;
 
+/// Conservative fallback context window for local subagent calls when /props
+/// is unavailable.
+const LOCAL_SUBAGENT_FALLBACK_CONTEXT: usize = 8192;
+/// Lower bound to avoid creating unusably tiny budgets.
+const LOCAL_SUBAGENT_MIN_CONTEXT: usize = 2048;
+/// Keep local subagent outputs short on constrained hardware.
+const LOCAL_SUBAGENT_MAX_RESPONSE_TOKENS: u32 = 1024;
+const LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS: u32 = 256;
+
 /// Configuration passed to `_run_subagent`, derived from profile + overrides.
 #[derive(Debug, Clone)]
 struct SubagentConfig {
@@ -40,6 +50,7 @@ struct SubagentConfig {
     tools_filter: Option<Vec<String>>,
     read_only: bool,
     max_iterations: u32,
+    max_tool_result_chars: usize,
 }
 
 /// Truncate text for display: max `max_lines` lines or `max_chars` characters.
@@ -68,6 +79,45 @@ fn truncate_for_display(data: &str, max_lines: usize, max_chars: usize) -> Strin
         lines += 1;
     }
     out
+}
+
+/// Extract localhost port from an API base URL.
+fn extract_local_port_from_api_base(api_base: &str) -> Option<u16> {
+    let parsed = reqwest::Url::parse(api_base).ok()?;
+    let host = parsed.host_str()?;
+    if host != "localhost" && host != "127.0.0.1" {
+        return None;
+    }
+    parsed.port_or_known_default()
+}
+
+/// Resolve per-request local context limit with headroom.
+fn resolve_local_context_limit(provider: &dyn LLMProvider) -> usize {
+    if let Some(base) = provider.get_api_base() {
+        if let Some(port) = extract_local_port_from_api_base(base) {
+            if let Some(ctx) = crate::server::query_local_context_size(&port.to_string()) {
+                return ctx.max(LOCAL_SUBAGENT_MIN_CONTEXT);
+            }
+        }
+    }
+    LOCAL_SUBAGENT_FALLBACK_CONTEXT
+}
+
+/// Compute a conservative local response budget from the detected context size.
+fn local_response_token_limit(ctx_limit: usize) -> u32 {
+    let adaptive = (ctx_limit / 6).clamp(
+        LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS as usize,
+        LOCAL_SUBAGENT_MAX_RESPONSE_TOKENS as usize,
+    );
+    adaptive as u32
+}
+
+/// Detect provider-side context overflow errors in a robust way.
+fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("exceed_context_size_error")
+        || msg.contains("exceeds the available context size")
+        || msg.contains("context size")
 }
 
 /// Info about a running subagent task (cheaply cloneable).
@@ -104,7 +154,20 @@ pub struct SubagentManager {
     /// Current spawn depth (0 = root). Children get depth + 1.
     /// Spawns are rejected when depth >= MAX_SPAWN_DEPTH.
     depth: u32,
-    running_tasks: Arc<Mutex<HashMap<String, (SubagentInfo, tokio::task::JoinHandle<()>, broadcast::Sender<String>)>>>,
+    running_tasks: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    SubagentInfo,
+                    tokio::task::JoinHandle<()>,
+                    broadcast::Sender<String>,
+                ),
+            >,
+        >,
+    >,
+    /// Max chars per tool result (passed from config).
+    max_tool_result_chars: usize,
     /// Priority signal sender for the aha channel (proprioception Phase 6).
     aha_tx: Option<UnboundedSender<crate::agent::system_state::AhaSignal>>,
 }
@@ -120,6 +183,7 @@ impl SubagentManager {
         exec_timeout: u64,
         restrict_to_workspace: bool,
         is_local: bool,
+        max_tool_result_chars: usize,
     ) -> Self {
         // Rotate event log if >100MB before anything else.
         Self::rotate_event_log(&workspace);
@@ -144,6 +208,7 @@ impl SubagentManager {
             exec_timeout,
             restrict_to_workspace,
             is_local,
+            max_tool_result_chars,
             profiles,
             providers_config: None,
             display_tx: None,
@@ -154,7 +219,10 @@ impl SubagentManager {
     }
 
     /// Set the aha channel sender for priority signals (proprioception).
-    pub fn with_aha_tx(mut self, tx: UnboundedSender<crate::agent::system_state::AhaSignal>) -> Self {
+    pub fn with_aha_tx(
+        mut self,
+        tx: UnboundedSender<crate::agent::system_state::AhaSignal>,
+    ) -> Self {
         self.aha_tx = Some(tx);
         self
     }
@@ -278,12 +346,14 @@ impl SubagentManager {
             tools_filter: profile.as_ref().and_then(|p| p.tools.clone()),
             read_only: profile.as_ref().map(|p| p.read_only).unwrap_or(false),
             max_iterations: effective_iterations,
+            max_tool_result_chars: self.max_tool_result_chars,
         };
 
         let effective_model_for_display = config.model.clone();
 
         // Resolve provider for model prefix (groq/, gemini/, openai/, etc.)
-        let (provider, resolved_model, targets_local) = self.resolve_provider_for_model(&config.model);
+        let (provider, resolved_model, targets_local) =
+            self.resolve_provider_for_model(&config.model);
         let routed_to_cloud = resolved_model != config.model;
         if routed_to_cloud {
             info!(
@@ -313,7 +383,11 @@ impl SubagentManager {
         // Provider-routed subagents: check if the resolved API base is localhost.
         // A groq/ prefix pointing to localhost:8083 is still a local llama-server
         // and needs strict alternation repair.
-        let is_local = if routed_to_cloud { targets_local } else { self.is_local };
+        let is_local = if routed_to_cloud {
+            targets_local
+        } else {
+            self.is_local
+        };
         let display_tx = self.display_tx.clone();
         let running_tasks = self.running_tasks.clone();
         let tid = task_id.clone();
@@ -377,7 +451,11 @@ impl SubagentManager {
             // In CLI mode, send directly to the terminal since the bus
             // isn't consumed by process_direct().
             if let Some(ref dtx) = display_tx {
-                let status_color = if status == "completed" { "\x1b[32m" } else { "\x1b[31m" };
+                let status_color = if status == "completed" {
+                    "\x1b[32m"
+                } else {
+                    "\x1b[31m"
+                };
                 // Strip markdown formatting for terminal display
                 let clean_result = result_text
                     .replace("**", "")
@@ -394,7 +472,10 @@ impl SubagentManager {
                 );
                 // Indent each line under a dim gutter
                 for line in truncated.lines() {
-                    block.push_str(&format!("  \x1b[2m\u{2502}\x1b[0m \x1b[37m{}\x1b[0m\n", line));
+                    block.push_str(&format!(
+                        "  \x1b[2m\u{2502}\x1b[0m \x1b[37m{}\x1b[0m\n",
+                        line
+                    ));
                 }
                 block.push_str("  \x1b[2m\u{2514}\u{2500}\x1b[0m\n");
                 let _ = dtx.send(block);
@@ -496,8 +577,8 @@ impl SubagentManager {
             }
             Ok(Err(e)) => format!("Subagent result channel error: {}", e),
             Err(_) => format!(
-                "Timed out waiting for subagent '{}' after {}s. \
-                 It is still running — use 'spawn list' to check status \
+                "Subagent '{}' is still running after {}s. \
+                 Use 'spawn list' to check status, 'spawn check' to fetch completed output, \
                  or 'spawn cancel' to abort.",
                 task_id,
                 timeout.as_secs()
@@ -528,8 +609,13 @@ impl SubagentManager {
             .or_else(|| self.default_subagent_model.clone())
             .unwrap_or_else(|| self.model.clone());
 
-        let (provider, resolved_model, targets_local) = self.resolve_provider_for_model(&effective_model);
-        let is_local = if resolved_model != effective_model { targets_local } else { self.is_local };
+        let (provider, resolved_model, targets_local) =
+            self.resolve_provider_for_model(&effective_model);
+        let is_local = if resolved_model != effective_model {
+            targets_local
+        } else {
+            self.is_local
+        };
 
         info!(
             "Starting agent loop: max_rounds={}, model={}, stop={:?}",
@@ -542,6 +628,7 @@ impl SubagentManager {
             tools_filter,
             read_only: false,
             max_iterations: MAX_SUBAGENT_ITERATIONS,
+            max_tool_result_chars: self.max_tool_result_chars,
         };
 
         let mut round_summaries: Vec<String> = Vec::new();
@@ -618,13 +705,20 @@ impl SubagentManager {
             round_summaries.push(format!("Round {}: {}", round + 1, round_text));
 
             if done {
-                info!("Agent loop stop condition met at round {}/{}", round + 1, max_rounds);
+                info!(
+                    "Agent loop stop condition met at round {}/{}",
+                    round + 1,
+                    max_rounds
+                );
                 break;
             }
         }
 
         // Build final output.
-        let mut output = format!("Agent loop completed ({} rounds):\n\n", round_summaries.len());
+        let mut output = format!(
+            "Agent loop completed ({} rounds):\n\n",
+            round_summaries.len()
+        );
         for summary in &round_summaries {
             output.push_str(summary);
             output.push_str("\n\n---\n\n");
@@ -654,9 +748,11 @@ impl SubagentManager {
                     "Subagent using {} provider (base={}, local={}) for model {}",
                     prefix, base, targets_local, rest
                 );
-                let provider: Arc<dyn LLMProvider> = Arc::new(
-                    OpenAICompatProvider::new(&api_key, Some(&base), Some(&rest)),
-                );
+                let provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+                    &api_key,
+                    Some(&base),
+                    Some(&rest),
+                ));
                 return (provider, rest, targets_local);
             }
         }
@@ -681,7 +777,12 @@ impl SubagentManager {
     ) -> anyhow::Result<String> {
         debug!(
             "Subagent {} starting (model={}, max_iter={}, read_only={}, tools_filter={:?}): {}",
-            task_id, config.model, config.max_iterations, config.read_only, config.tools_filter, label
+            task_id,
+            config.model,
+            config.max_iterations,
+            config.read_only,
+            config.tools_filter,
+            label
         );
 
         // Build a tool registry. Start with all tools, then filter.
@@ -722,7 +823,7 @@ impl SubagentManager {
                 None,
                 None,
                 restrict_to_workspace,
-                30000,
+                config.max_tool_result_chars,
             )));
         }
         if should_include("web_search") {
@@ -732,7 +833,7 @@ impl SubagentManager {
             )));
         }
         if should_include("web_fetch") {
-            tools.register(Box::new(WebFetchTool::new(50_000)));
+            tools.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
         }
 
         // Build the subagent system prompt.
@@ -758,6 +859,15 @@ impl SubagentManager {
             json!({"role": "user", "content": task}),
         ];
 
+        let local_ctx_limit = if is_local {
+            Some(resolve_local_context_limit(provider))
+        } else {
+            None
+        };
+        let max_response_tokens = local_ctx_limit
+            .map(local_response_token_limit)
+            .unwrap_or(4096);
+
         let tool_defs = tools.get_definitions();
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
@@ -775,9 +885,76 @@ impl SubagentManager {
                 config.max_iterations
             );
 
-            let response = provider
-                .chat(&messages, tool_defs_opt, Some(&config.model), 4096, 0.7, None)
-                .await?;
+            if let Some(ctx_limit) = local_ctx_limit {
+                let tool_def_tokens = tool_defs_opt
+                    .map(TokenBudget::estimate_tool_def_tokens)
+                    .unwrap_or(0);
+                let budget = TokenBudget::new(ctx_limit, max_response_tokens as usize);
+                let available = budget.available_budget(tool_def_tokens);
+                let before = TokenBudget::estimate_tokens(&messages);
+                if before > available {
+                    let trimmed = budget.trim_to_fit(&messages, tool_def_tokens);
+                    let after = TokenBudget::estimate_tokens(&trimmed);
+                    warn!(
+                        "Subagent {} context guard trimmed prompt ({} -> {} tokens, limit={}, reserve={}, tool_defs={})",
+                        task_id,
+                        before,
+                        after,
+                        ctx_limit,
+                        max_response_tokens,
+                        tool_def_tokens,
+                    );
+                    messages = trimmed;
+                }
+            }
+
+            let response = match provider
+                .chat(
+                    &messages,
+                    tool_defs_opt,
+                    Some(&config.model),
+                    max_response_tokens,
+                    0.7,
+                    None,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) if local_ctx_limit.is_some() && is_context_overflow_error(&e) => {
+                    let ctx_limit = local_ctx_limit.unwrap_or(LOCAL_SUBAGENT_FALLBACK_CONTEXT);
+                    let retry_ctx = ((ctx_limit as f64) * 0.85).round() as usize;
+                    let retry_ctx = retry_ctx.max(LOCAL_SUBAGENT_MIN_CONTEXT);
+                    let retry_max_tokens =
+                        (max_response_tokens / 2).max(LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS);
+                    let tool_def_tokens = tool_defs_opt
+                        .map(TokenBudget::estimate_tool_def_tokens)
+                        .unwrap_or(0);
+                    let retry_budget = TokenBudget::new(retry_ctx, retry_max_tokens as usize);
+                    let before_retry = TokenBudget::estimate_tokens(&messages);
+                    messages = retry_budget.trim_to_fit(&messages, tool_def_tokens);
+                    let after_retry = TokenBudget::estimate_tokens(&messages);
+                    warn!(
+                        "Subagent {} hit context overflow; retrying once after hard trim ({} -> {} tokens, retry_limit={}, retry_reserve={}): {}",
+                        task_id,
+                        before_retry,
+                        after_retry,
+                        retry_ctx,
+                        retry_max_tokens,
+                        e,
+                    );
+                    provider
+                        .chat(
+                            &messages,
+                            tool_defs_opt,
+                            Some(&config.model),
+                            retry_max_tokens,
+                            0.7,
+                            None,
+                        )
+                        .await?
+                }
+                Err(e) => return Err(e),
+            };
 
             // Check for LLM provider errors (finish_reason == "error").
             if response.finish_reason == "error" {
@@ -791,17 +968,7 @@ impl SubagentManager {
                 let tc_json: Vec<Value> = response
                     .tool_calls
                     .iter()
-                    .map(|tc| {
-                        json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": serde_json::to_string(&tc.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            }
-                        })
-                    })
+                    .map(|tc| tc.to_openai_json())
                     .collect();
 
                 ContextBuilder::add_assistant_message(
@@ -823,6 +990,7 @@ impl SubagentManager {
                 // already ends with a user message. No extra continuation needed.
                 if is_local {
                     thread_repair::repair_for_strict_alternation(&mut messages);
+                    thread_repair::strip_imitatable_patterns(&mut messages);
                 }
             } else {
                 // No tool calls -- the subagent is done.
@@ -1009,7 +1177,10 @@ pub fn format_status_block(running: &[SubagentInfo], recent_completed: &[String]
     if !running.is_empty() {
         for info in running {
             let elapsed = info.started_at.elapsed().as_secs();
-            out.push_str(&format!("- RUNNING: {} (id:{}, {}s)\n", info.label, info.task_id, elapsed));
+            out.push_str(&format!(
+                "- RUNNING: {} (id:{}, {}s)\n",
+                info.label, info.task_id, elapsed
+            ));
         }
     }
     for entry in recent_completed.iter().take(3) {
@@ -1021,8 +1192,39 @@ pub fn format_status_block(running: &[SubagentInfo], recent_completed: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::providers::base::{LLMResponse, ToolCallRequest};
+    use async_trait::async_trait;
+
+    #[test]
+    fn test_extract_local_port_from_api_base() {
+        assert_eq!(
+            extract_local_port_from_api_base("http://localhost:8080/v1"),
+            Some(8080)
+        );
+        assert_eq!(
+            extract_local_port_from_api_base("http://127.0.0.1:18080/v1"),
+            Some(18080)
+        );
+        assert_eq!(
+            extract_local_port_from_api_base("https://api.openai.com/v1"),
+            None
+        );
+        assert_eq!(extract_local_port_from_api_base("not-a-url"), None);
+    }
+
+    #[test]
+    fn test_is_context_overflow_error_detects_known_strings() {
+        let e1 =
+            anyhow::Error::msg("HTTP 400: {\"error\":{\"type\":\"exceed_context_size_error\"}}");
+        let e2 = anyhow::anyhow!(
+            "request (12197 tokens) exceeds the available context size (8192 tokens)"
+        );
+        let e3 = anyhow::anyhow!("network timeout");
+
+        assert!(is_context_overflow_error(&e1));
+        assert!(is_context_overflow_error(&e2));
+        assert!(!is_context_overflow_error(&e3));
+    }
 
     /// Mock provider that captures messages and returns a tool call on first
     /// call, then a text-only response on second call.
@@ -1093,6 +1295,7 @@ mod tests {
             tools_filter: None,
             read_only: false,
             max_iterations: MAX_SUBAGENT_ITERATIONS,
+            max_tool_result_chars: 30000,
         }
     }
 
@@ -1166,7 +1369,9 @@ mod tests {
                     usage: HashMap::new(),
                 })
             }
-            fn get_default_model(&self) -> &str { "immediate" }
+            fn get_default_model(&self) -> &str {
+                "immediate"
+            }
         }
 
         let workspace = tempfile::tempdir().unwrap().into_path();
@@ -1198,6 +1403,7 @@ mod tests {
             tools_filter: None, // all tools allowed
             read_only: true,    // but read_only
             max_iterations: 5,
+            max_tool_result_chars: 30000,
         };
 
         // The should_include logic is inline in _run_subagent, but we can
@@ -1225,12 +1431,10 @@ mod tests {
         let config = SubagentConfig {
             model: "test".to_string(),
             system_prompt: None,
-            tools_filter: Some(vec![
-                "read_file".to_string(),
-                "list_dir".to_string(),
-            ]),
+            tools_filter: Some(vec!["read_file".to_string(), "list_dir".to_string()]),
             read_only: false,
             max_iterations: 5,
+            max_tool_result_chars: 30000,
         };
 
         let should_include = |name: &str| -> bool {
@@ -1257,7 +1461,10 @@ mod tests {
     #[test]
     fn test_status_block_empty_when_nothing() {
         let result = format_status_block(&[], &[]);
-        assert!(result.is_empty(), "Should return empty when nothing to report");
+        assert!(
+            result.is_empty(),
+            "Should return empty when nothing to report"
+        );
     }
 
     #[test]
@@ -1275,9 +1482,8 @@ mod tests {
 
     #[test]
     fn test_status_block_shows_recent_completed() {
-        let completed = vec![
-            "  • fetch-docs (id: def456) — completed [2026-02-17T12:00:00Z]".into(),
-        ];
+        let completed =
+            vec!["  • fetch-docs (id: def456) — completed [2026-02-17T12:00:00Z]".into()];
         let result = format_status_block(&[], &completed);
         assert!(result.contains("## Background Status"));
         assert!(result.contains("fetch-docs"));

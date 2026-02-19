@@ -68,7 +68,10 @@ impl Tool for ReadSkillTool {
                     .map(|s| s.name)
                     .collect();
                 if available.is_empty() {
-                    format!("Error: Skill '{}' not found. No skills are installed.", name)
+                    format!(
+                        "Error: Skill '{}' not found. No skills are installed.",
+                        name
+                    )
                 } else {
                     format!(
                         "Error: Skill '{}' not found. Available skills: {}",

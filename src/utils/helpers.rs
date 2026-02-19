@@ -1,6 +1,7 @@
 //! Utility functions for nanobot.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -13,6 +14,28 @@ pub fn ensure_dir(path: impl AsRef<Path>) -> PathBuf {
         let _ = fs::create_dir_all(&path);
     }
     path
+}
+
+/// Move a file, falling back to copy+remove when rename cannot cross devices.
+pub fn move_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent);
+    }
+
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device_error(&e) => {
+            fs::copy(src, dst)?;
+            fs::remove_file(src)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn is_cross_device_error(err: &io::Error) -> bool {
+    // EXDEV on Unix-like systems (Linux/macOS).
+    err.raw_os_error() == Some(18)
 }
 
 /// Get the nanobot data directory (~/.nanobot).
@@ -159,6 +182,19 @@ mod tests {
     fn test_safe_filename() {
         assert_eq!(safe_filename("hello:world"), "hello_world");
         assert_eq!(safe_filename("a<b>c"), "a_b_c");
+    }
+
+    #[test]
+    fn test_move_file_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        let dst = dir.path().join("nested").join("b.txt");
+        fs::write(&src, "hello").unwrap();
+
+        move_file(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert!(dst.exists());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Contains `ReplContext`, `normalize_alias()`, `dispatch()`, and all
 //! `cmd_xxx()` command handlers.
 
-use std::io::{self, BufRead, IsTerminal, Write as _};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,10 +14,10 @@ use rustyline::ExternalPrinter as _;
 use tokio::sync::mpsc;
 
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
-use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::provenance::{ClaimVerifier, ClaimStatus};
+use crate::agent::audit::AuditLog;
+use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
 use crate::cli;
-use crate::config::loader::{get_data_dir, load_config, save_config};
+use crate::config::loader::{load_config, save_config};
 use crate::config::schema::{Config, EmailConfig};
 use crate::cron::service::CronService;
 use crate::server;
@@ -47,6 +47,10 @@ pub(crate) struct ReplContext {
     pub rl: rustyline::DefaultEditor,
     /// Health watchdog task handle — aborted on mode switch, restarted on `/local`.
     pub watchdog_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Sender for auto-restart requests (passed to watchdog).
+    pub restart_tx: mpsc::UnboundedSender<crate::server::RestartRequest>,
+    /// Receiver for auto-restart requests from the health watchdog.
+    pub restart_rx: mpsc::UnboundedReceiver<crate::server::RestartRequest>,
     #[cfg(feature = "voice")]
     pub voice_session: Option<crate::voice::VoiceSession>,
 }
@@ -72,7 +76,7 @@ impl ReplContext {
     /// (Re)start the health watchdog for all active local servers.
     ///
     /// Aborts any previous watchdog task, collects current server ports, and
-    /// spawns a fresh watchdog. Called on REPL init and on `/local` toggle-on.
+    /// spawns a fresh watchdog with auto-repair. Called on REPL init and on `/local` toggle-on.
     pub fn restart_watchdog(&mut self) {
         if let Some(handle) = self.watchdog_handle.take() {
             handle.abort();
@@ -85,9 +89,11 @@ impl ReplContext {
         if let Some(ref dp) = self.srv.delegation_port {
             ports.push(("delegation".to_string(), dp.clone()));
         }
-        self.watchdog_handle = Some(
-            crate::server::start_health_watchdog(ports, self.display_tx.clone()),
-        );
+        self.watchdog_handle = Some(crate::server::start_health_watchdog_with_autorepair(
+            ports,
+            self.display_tx.clone(),
+            self.restart_tx.clone(),
+        ));
     }
 
     /// Stop the health watchdog (e.g. when switching to cloud mode).
@@ -95,6 +101,81 @@ impl ReplContext {
         if let Some(handle) = self.watchdog_handle.take() {
             handle.abort();
         }
+    }
+
+    /// Check for and handle any pending auto-restart requests from the watchdog.
+    ///
+    /// Returns true if a restart was performed.
+    pub async fn handle_restart_requests(&mut self) -> bool {
+        let mut restarted = false;
+        while let Ok(req) = self.restart_rx.try_recv() {
+            if req.role == "main" {
+                let _ = self.display_tx.send(format!(
+                    "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting main server...\n"
+                ));
+                self.cmd_restart().await;
+                
+                // Wait for server to be ready
+                for i in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if server::check_chat_health(&self.srv.local_port).await {
+                        let _ = self.display_tx.send(format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Main server \x1b[32mready\x1b[0m\n"
+                        ));
+                        break;
+                    }
+                    if i == 9 {
+                        let _ = self.display_tx.send(format!(
+                            "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Main server failed to start\n"
+                        ));
+                    }
+                }
+                restarted = true;
+            } else if req.role == "delegation" {
+                let _ = self.display_tx.send(format!(
+                    "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting delegation server...\n"
+                ));
+                server::stop_delegation_server(
+                    &mut self.srv.delegation_process,
+                    &mut self.srv.delegation_port,
+                );
+                server::start_delegation_if_available(
+                    &mut self.srv.delegation_process,
+                    &mut self.srv.delegation_port,
+                ).await;
+                if self.srv.delegation_port.is_some() {
+                    self.core_handle
+                        .counters
+                        .delegation_healthy
+                        .store(true, Ordering::Relaxed);
+                    let _ = self.display_tx.send(format!(
+                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Delegation server \x1b[32mready\x1b[0m\n"
+                    ));
+                }
+                restarted = true;
+            } else if req.role == "compaction" {
+                let _ = self.display_tx.send(format!(
+                    "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting compaction server...\n"
+                ));
+                server::stop_compaction_server(
+                    &mut self.srv.compaction_process,
+                    &mut self.srv.compaction_port,
+                );
+                let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
+                server::start_compaction_if_available(
+                    &mut self.srv.compaction_process,
+                    &mut self.srv.compaction_port,
+                    ctx_size,
+                ).await;
+                if self.srv.compaction_port.is_some() {
+                    let _ = self.display_tx.send(format!(
+                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Compaction server \x1b[32mready\x1b[0m\n"
+                    ));
+                }
+                restarted = true;
+            }
+        }
+        restarted
     }
 
     /// Drain pending display messages from background channels/subagents.
@@ -165,7 +246,9 @@ impl ReplContext {
     pub async fn print_status_bar(&mut self) {
         let sa_count = self.agent_loop.subagent_manager().get_running_count().await;
         self.active_channels.retain(|ch| !ch.handle.is_finished());
-        let ch_names: Vec<&str> = self.active_channels.iter()
+        let ch_names: Vec<&str> = self
+            .active_channels
+            .iter()
             .map(|c| super::short_channel_name(&c.name))
             .collect();
         tui::print_status_bar(&self.core_handle, &ch_names, sa_count);
@@ -194,12 +277,12 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
     match cmd {
         "/l" => "/local",
         "/m" => "/model",
-        "/t" => "/think",
+        "/t" | "/thinking" => "/think",
         "/nt" => "/nothink",
         "/v" => "/voice",
         "/wa" => "/whatsapp",
         "/tg" => "/telegram",
-        "/p" => "/provenance",
+        "/p" | "/prov" => "/provenance",
         "/h" | "/?" => "/help",
         "/a" => "/agents",
         "/s" => "/status",
@@ -216,36 +299,83 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
 impl ReplContext {
     /// Dispatch a slash command. Returns `true` if the input was a recognized command.
     pub async fn dispatch(&mut self, input: &str) -> bool {
-        let (cmd, arg) = input.split_once(' ')
+        let (cmd, arg) = input
+            .split_once(' ')
             .map(|(c, a)| (c, a.trim()))
             .unwrap_or((input, ""));
         let cmd = normalize_alias(cmd);
         match cmd {
-            "/help" => { super::print_help(); }
-            "/think" => { self.cmd_think(arg); }
-            "/nothink" => { self.cmd_nothink(); }
-            "/status" => { self.cmd_status().await; }
-            "/context" => { self.cmd_context(); }
-            "/memory" => { self.cmd_memory(); }
-            "/agents" => { self.cmd_agents().await; }
-            "/audit" => { self.cmd_audit(); }
-            "/verify" => { self.cmd_verify().await; }
-            "/kill" => { self.cmd_kill(arg).await; }
-            "/stop" => { self.cmd_stop().await; }
+            "/help" => {
+                super::print_help();
+            }
+            "/think" => {
+                self.cmd_think(arg);
+            }
+            "/nothink" => {
+                self.cmd_nothink();
+            }
+            "/status" => {
+                self.cmd_status().await;
+            }
+            "/context" => {
+                self.cmd_context();
+            }
+            "/memory" => {
+                self.cmd_memory();
+            }
+            "/agents" => {
+                self.cmd_agents().await;
+            }
+            "/audit" => {
+                self.cmd_audit();
+            }
+            "/verify" => {
+                self.cmd_verify().await;
+            }
+            "/kill" => {
+                self.cmd_kill(arg).await;
+            }
+            "/stop" => {
+                self.cmd_stop().await;
+            }
 
-            "/replay" => { self.cmd_replay(arg).await; }
-            "/long" => { self.cmd_long(arg); }
-            "/provenance" => { self.cmd_provenance(); }
-            "/restart" => { self.cmd_restart().await; }
-            "/ctx" => { self.cmd_ctx(arg).await; }
-            "/model" => { self.cmd_model().await; }
-            "/local" => { self.cmd_local().await; }
-            "/whatsapp" => { self.cmd_whatsapp(); }
-            "/telegram" => { self.cmd_telegram(); }
-            "/email" => { self.cmd_email(); }
+            "/replay" => {
+                self.cmd_replay(arg).await;
+            }
+            "/long" => {
+                self.cmd_long(arg);
+            }
+            "/provenance" => {
+                self.cmd_provenance();
+            }
+            "/restart" => {
+                self.cmd_restart().await;
+            }
+            "/ctx" => {
+                self.cmd_ctx(arg).await;
+            }
+            "/model" => {
+                self.cmd_model().await;
+            }
+            "/local" => {
+                self.cmd_local().await;
+            }
+            "/whatsapp" => {
+                self.cmd_whatsapp();
+            }
+            "/telegram" => {
+                self.cmd_telegram();
+            }
+            "/email" => {
+                self.cmd_email();
+            }
             #[cfg(feature = "voice")]
-            "/voice" => { self.cmd_voice().await; }
-            _ => { return false; }
+            "/voice" => {
+                self.cmd_voice().await;
+            }
+            _ => {
+                return false;
+            }
         }
         true
     }
@@ -263,13 +393,36 @@ impl ReplContext {
         let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
         let model_name = &core.model;
         let mode_label = if is_local { "local" } else { "cloud" };
+        let lane_label = if is_local {
+            if self.config.trio.enabled {
+                "trio"
+            } else {
+                "legacy"
+            }
+        } else {
+            "cloud"
+        };
 
         println!();
-        println!("  {}MODE{}      {} ({})", tui::BOLD, tui::RESET, mode_label, model_name);
+        println!(
+            "  {}MODE{}      {} ({}, {})",
+            tui::BOLD,
+            tui::RESET,
+            mode_label,
+            lane_label,
+            model_name
+        );
 
         let thinking = counters.thinking_budget.load(Ordering::Relaxed);
         if thinking > 0 {
-            println!("  {}THINKING{}  {}\u{1f9e0}{} enabled (budget: {} tokens)", tui::BOLD, tui::RESET, tui::GREY, tui::RESET, thinking);
+            println!(
+                "  {}THINKING{}  {}\u{1f9e0}{} enabled (budget: {} tokens)",
+                tui::BOLD,
+                tui::RESET,
+                tui::GREY,
+                tui::RESET,
+                thinking
+            );
         }
 
         let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
@@ -282,9 +435,14 @@ impl ReplContext {
         };
         println!(
             "  {}CONTEXT{}   {:>6} / {:>6} tokens ({}{}{}%{})",
-            tui::BOLD, tui::RESET,
-            tui::format_thousands(used), tui::format_thousands(max),
-            ctx_color, tui::BOLD, pct, tui::RESET
+            tui::BOLD,
+            tui::RESET,
+            tui::format_thousands(used),
+            tui::format_thousands(max),
+            ctx_color,
+            tui::BOLD,
+            pct,
+            tui::RESET
         );
 
         let obs_count = {
@@ -293,29 +451,50 @@ impl ReplContext {
         };
         println!(
             "  {}MEMORY{}    {} ({} observations)",
-            tui::BOLD, tui::RESET,
-            if core.memory_enabled { "enabled" } else { "disabled" },
+            tui::BOLD,
+            tui::RESET,
+            if core.memory_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             obs_count
         );
 
         let agent_count = self.agent_loop.subagent_manager().get_running_count().await;
-        println!("  {}AGENTS{}    {} running", tui::BOLD, tui::RESET, agent_count);
+        println!(
+            "  {}AGENTS{}    {} running",
+            tui::BOLD,
+            tui::RESET,
+            agent_count
+        );
 
         self.active_channels.retain(|ch| !ch.handle.is_finished());
         if !self.active_channels.is_empty() {
-            let ch_names: Vec<&str> = self.active_channels.iter()
+            let ch_names: Vec<&str> = self
+                .active_channels
+                .iter()
                 .map(|c| super::short_channel_name(&c.name))
                 .collect();
-            println!("  {}CHANNELS{}  {}", tui::BOLD, tui::RESET, ch_names.join(" "));
+            println!(
+                "  {}CHANNELS{}  {}",
+                tui::BOLD,
+                tui::RESET,
+                ch_names.join(" ")
+            );
         }
 
         let turn = counters.learning_turn_counter.load(Ordering::Relaxed);
         println!("  {}TURN{}      {}", tui::BOLD, tui::RESET, turn);
 
         // Token telemetry.
-        let est_prompt = counters.last_estimated_prompt_tokens.load(Ordering::Relaxed);
+        let est_prompt = counters
+            .last_estimated_prompt_tokens
+            .load(Ordering::Relaxed);
         let act_prompt = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
-        let act_completion = counters.last_actual_completion_tokens.load(Ordering::Relaxed);
+        let act_completion = counters
+            .last_actual_completion_tokens
+            .load(Ordering::Relaxed);
         if act_prompt > 0 || est_prompt > 0 {
             let drift = if act_prompt > 0 && est_prompt > 0 {
                 let diff = (act_prompt as f64 - est_prompt as f64) / act_prompt as f64 * 100.0;
@@ -325,7 +504,8 @@ impl ReplContext {
             };
             println!(
                 "  {}TOKENS{}    est:{} actual:{}+{}{}",
-                tui::BOLD, tui::RESET,
+                tui::BOLD,
+                tui::RESET,
                 tui::format_thousands(est_prompt as usize),
                 tui::format_thousands(act_prompt as usize),
                 tui::format_thousands(act_completion as usize),
@@ -335,7 +515,12 @@ impl ReplContext {
 
         let long_remaining = counters.long_mode_turns.load(Ordering::Relaxed);
         if long_remaining > 0 {
-            println!("  {}LONG{}      {} turns remaining", tui::BOLD, tui::RESET, long_remaining);
+            println!(
+                "  {}LONG{}      {} turns remaining",
+                tui::BOLD,
+                tui::RESET,
+                long_remaining
+            );
         }
 
         // Server health display (local mode or when delegation server is active).
@@ -343,9 +528,11 @@ impl ReplContext {
             let mut servers: Vec<String> = Vec::new();
 
             if is_local {
-                let main_health = crate::server::check_health(
-                    &format!("http://localhost:{}/v1", self.srv.local_port)
-                ).await;
+                let main_health = crate::server::check_health(&format!(
+                    "http://localhost:{}/v1",
+                    self.srv.local_port
+                ))
+                .await;
                 let (color, label) = if main_health {
                     (tui::GREEN, "healthy")
                 } else {
@@ -353,14 +540,17 @@ impl ReplContext {
                 };
                 servers.push(format!(
                     "main:{} ({}{}{}{})",
-                    self.srv.local_port, color, tui::BOLD, label, tui::RESET
+                    self.srv.local_port,
+                    color,
+                    tui::BOLD,
+                    label,
+                    tui::RESET
                 ));
             }
 
             if let Some(ref cp) = self.srv.compaction_port {
-                let health = crate::server::check_health(
-                    &format!("http://localhost:{}/v1", cp)
-                ).await;
+                let health =
+                    crate::server::check_health(&format!("http://localhost:{}/v1", cp)).await;
                 let (color, label) = if health {
                     (tui::GREEN, "healthy")
                 } else {
@@ -368,27 +558,61 @@ impl ReplContext {
                 };
                 servers.push(format!(
                     "compact:{} ({}{}{}{})",
-                    cp, color, tui::BOLD, label, tui::RESET
+                    cp,
+                    color,
+                    tui::BOLD,
+                    label,
+                    tui::RESET
                 ));
             }
 
             if let Some(ref dp) = self.srv.delegation_port {
-                let deleg_healthy = counters.delegation_healthy.load(Ordering::Relaxed);
-                let (color, label) = if deleg_healthy {
+                let health =
+                    crate::server::check_health(&format!("http://localhost:{}/v1", dp)).await;
+                let (color, label) = if health {
+                    (tui::GREEN, "healthy")
+                } else {
+                    (tui::RED, "DOWN")
+                };
+                let lane_name = if self.config.trio.enabled {
+                    "router"
+                } else {
+                    "deleg"
+                };
+                servers.push(format!(
+                    "{}:{} ({}{}{}{})",
+                    lane_name,
+                    dp,
+                    color,
+                    tui::BOLD,
+                    label,
+                    tui::RESET
+                ));
+            }
+
+            if let Some(ref sp) = self.srv.specialist_port {
+                let health =
+                    crate::server::check_health(&format!("http://localhost:{}/v1", sp)).await;
+                let (color, label) = if health {
                     (tui::GREEN, "healthy")
                 } else {
                     (tui::RED, "DOWN")
                 };
                 servers.push(format!(
-                    "deleg:{} ({}{}{}{})",
-                    dp, color, tui::BOLD, label, tui::RESET
+                    "specialist:{} ({}{}{}{})",
+                    sp,
+                    color,
+                    tui::BOLD,
+                    label,
+                    tui::RESET
                 ));
             }
 
             if !servers.is_empty() {
                 println!(
                     "  {}SERVERS{}   {}",
-                    tui::BOLD, tui::RESET,
+                    tui::BOLD,
+                    tui::RESET,
                     servers.join("  ")
                 );
             }
@@ -406,11 +630,22 @@ impl ReplContext {
         let msg_count = counters.last_message_count.load(Ordering::Relaxed) as usize;
         let wm_tokens = counters.last_working_memory_tokens.load(Ordering::Relaxed) as usize;
         let turn = counters.learning_turn_counter.load(Ordering::Relaxed);
-        let pct = if max > 0 { (used as f64 / max as f64) * 100.0 } else { 0.0 };
+        let pct = if max > 0 {
+            (used as f64 / max as f64) * 100.0
+        } else {
+            0.0
+        };
 
         // Estimate system prompt size from an empty message build.
         let system_prompt = core.context.build_messages(
-            &[], "", None, None, Some("cli"), Some("repl"), false, None,
+            &[],
+            "",
+            None,
+            None,
+            Some("cli"),
+            Some("repl"),
+            false,
+            None,
         );
         let system_tokens = if let Some(sys) = system_prompt.first() {
             crate::agent::token_budget::TokenBudget::estimate_message_tokens_pub(sys)
@@ -428,29 +663,82 @@ impl ReplContext {
         let bootstrap_budget = core.context.bootstrap_budget;
         let ltm_budget = core.context.long_term_memory_budget;
 
-        println!("  {}System prompt:    {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(system_tokens), tui::RESET);
-        println!("  {}  identity:       {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(identity_tokens), tui::RESET);
-        println!("  {}  bootstrap cap:  {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(bootstrap_budget), tui::RESET);
-        println!("  {}  memory cap:     {} {:>6}{}", tui::DIM, tui::RESET, tui::format_thousands(ltm_budget), tui::RESET);
-        println!("  {}History:          {} {:>6} messages{}", tui::DIM, tui::RESET, msg_count, tui::RESET);
-        println!("  {}Working memory:   {} {:>6} tokens{}", tui::DIM, tui::RESET, tui::format_thousands(wm_tokens), tui::RESET);
-        println!("  {}Turn:             {} {:>6}{}", tui::DIM, tui::RESET, turn, tui::RESET);
+        println!(
+            "  {}System prompt:    {} {:>6} tokens{}",
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(system_tokens),
+            tui::RESET
+        );
+        println!(
+            "  {}  identity:       {} {:>6}{}",
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(identity_tokens),
+            tui::RESET
+        );
+        println!(
+            "  {}  bootstrap cap:  {} {:>6}{}",
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(bootstrap_budget),
+            tui::RESET
+        );
+        println!(
+            "  {}  memory cap:     {} {:>6}{}",
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(ltm_budget),
+            tui::RESET
+        );
+        println!(
+            "  {}History:          {} {:>6} messages{}",
+            tui::DIM,
+            tui::RESET,
+            msg_count,
+            tui::RESET
+        );
+        println!(
+            "  {}Working memory:   {} {:>6} tokens{}",
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(wm_tokens),
+            tui::RESET
+        );
+        println!(
+            "  {}Turn:             {} {:>6}{}",
+            tui::DIM,
+            tui::RESET,
+            turn,
+            tui::RESET
+        );
 
         // Token accuracy comparison.
         let counters = &self.core_handle.counters;
-        let est = counters.last_estimated_prompt_tokens.load(Ordering::Relaxed);
+        let est = counters
+            .last_estimated_prompt_tokens
+            .load(Ordering::Relaxed);
         let act = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
         if act > 0 && est > 0 {
             let drift_pct = (act as f64 - est as f64) / act as f64 * 100.0;
-            println!("  {}Estimation drift: {} {:>+5.1}%{}", tui::DIM, tui::RESET, drift_pct, tui::RESET);
+            println!(
+                "  {}Estimation drift: {} {:>+5.1}%{}",
+                tui::DIM,
+                tui::RESET,
+                drift_pct,
+                tui::RESET
+            );
         }
 
         println!("  {}─────────────────────────────{}", tui::DIM, tui::RESET);
         println!(
             "  {}Total:            {} {:>6} / {} tokens ({:.1}%){}",
-            tui::DIM, tui::RESET,
-            tui::format_thousands(used), tui::format_thousands(max),
-            pct, tui::RESET
+            tui::DIM,
+            tui::RESET,
+            tui::format_thousands(used),
+            tui::format_thousands(max),
+            pct,
+            tui::RESET
         );
         println!();
     }
@@ -461,16 +749,28 @@ impl ReplContext {
         if !core.memory_enabled {
             println!("\n  Memory system is disabled.\n");
         } else {
-            let wm = core.working_memory.get_context(&self.session_id, usize::MAX);
+            let wm = core
+                .working_memory
+                .get_context(&self.session_id, usize::MAX);
             if wm.is_empty() {
                 println!("\n  No working memory for this session.\n");
             } else {
-                println!("\n  {}Working Memory (session: {}){}\n", tui::BOLD, self.session_id, tui::RESET);
+                println!(
+                    "\n  {}Working Memory (session: {}){}\n",
+                    tui::BOLD,
+                    self.session_id,
+                    tui::RESET
+                );
                 for line in wm.lines() {
                     println!("  {}{}{}", tui::DIM, line, tui::RESET);
                 }
                 let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&wm);
-                println!("\n  {}({} tokens){}\n", tui::DIM, tui::format_thousands(tokens), tui::RESET);
+                println!(
+                    "\n  {}({} tokens){}\n",
+                    tui::DIM,
+                    tui::format_thousands(tokens),
+                    tui::RESET
+                );
             }
             // Also show learning context if available.
             let learning = core.learning.get_learning_context();
@@ -518,7 +818,10 @@ impl ReplContext {
                 println!("\n  No audit entries for this session.\n");
             } else {
                 println!("\n  Audit log ({} entries):\n", entries.len());
-                println!("  {:<4} {:<14} {:<12} {:<6} {:<8} {}", "SEQ", "TOOL", "EXECUTOR", "OK", "MS", "RESULT (preview)");
+                println!(
+                    "  {:<4} {:<14} {:<12} {:<6} {:<8} {}",
+                    "SEQ", "TOOL", "EXECUTOR", "OK", "MS", "RESULT (preview)"
+                );
                 for e in &entries {
                     let preview: String = e.result_data.chars().take(40).collect();
                     let preview = preview.replace('\n', " ");
@@ -533,7 +836,10 @@ impl ReplContext {
                     );
                 }
                 match audit.verify_chain() {
-                    Ok(n) => println!("\n  \x1b[32m\u{2713}\x1b[0m Hash chain valid ({} entries)", n),
+                    Ok(n) => println!(
+                        "\n  \x1b[32m\u{2713}\x1b[0m Hash chain valid ({} entries)",
+                        n
+                    ),
                     Err(e) => println!("\n  \x1b[31m\u{2717}\x1b[0m Hash chain BROKEN: {}", e),
                 }
                 println!();
@@ -554,7 +860,9 @@ impl ReplContext {
             } else {
                 // Get last assistant response from session history.
                 let history = core.sessions.get_history(&self.session_id, 10, 0).await;
-                let last_response = history.iter().rev()
+                let last_response = history
+                    .iter()
+                    .rev()
                     .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                     .and_then(|m| m.get("content").and_then(|c| c.as_str()));
                 match last_response {
@@ -568,12 +876,15 @@ impl ReplContext {
                             for c in &claims {
                                 let (marker, color) = match c.status {
                                     ClaimStatus::Observed => ("\u{2713}", "\x1b[32m"),
-                                    ClaimStatus::Derived  => ("~", "\x1b[34m"),
-                                    ClaimStatus::Claimed  => ("\u{26a0}", "\x1b[33m"),
+                                    ClaimStatus::Derived => ("~", "\x1b[34m"),
+                                    ClaimStatus::Claimed => ("\u{26a0}", "\x1b[33m"),
                                     ClaimStatus::Recalled => ("\u{25c7}", "\x1b[2m"),
                                 };
                                 let preview: String = c.text.chars().take(60).collect();
-                                println!("  {}{}\x1b[0m [{}] {}", color, marker, c.claim_type, preview);
+                                println!(
+                                    "  {}{}\x1b[0m [{}] {}",
+                                    color, marker, c.claim_type, preview
+                                );
                             }
                             let summary = verifier.unverified_summary(&claims);
                             if !summary.is_empty() {
@@ -599,9 +910,30 @@ impl ReplContext {
     fn cmd_think(&self, arg: &str) {
         let counters = &self.core_handle.counters;
         let core = self.core_handle.swappable();
+        let default_budget = (core.max_tokens / 2).clamp(1024, 32000);
 
         if !arg.is_empty() {
-            // Parse explicit budget
+            let mode = arg.to_ascii_lowercase();
+            match mode.as_str() {
+                "on" | "enable" | "enabled" | "true" => {
+                    counters
+                        .thinking_budget
+                        .store(default_budget, Ordering::Relaxed);
+                    println!(
+                        "\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
+                        default_budget
+                    );
+                    return;
+                }
+                "off" | "disable" | "disabled" | "false" => {
+                    counters.thinking_budget.store(0, Ordering::Relaxed);
+                    println!("\n  Thinking \x1b[33mdisabled\x1b[0m\n");
+                    return;
+                }
+                _ => {}
+            }
+
+            // Parse explicit numeric budget
             match arg.parse::<u32>() {
                 Ok(budget) if budget == 0 => {
                     counters.thinking_budget.store(0, Ordering::Relaxed);
@@ -613,7 +945,9 @@ impl ReplContext {
                     println!("\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", clamped);
                 }
                 Err(_) => {
-                    println!("\n  Usage: /think [budget]\n  Examples: /think, /think 16000, /think 0\n");
+                    println!(
+                        "\n  Usage: /think [on|off|budget]\n  Examples: /think, /thinking off, /think 16000, /think 0\n"
+                    );
                 }
             }
         } else {
@@ -623,9 +957,9 @@ impl ReplContext {
                 counters.thinking_budget.store(0, Ordering::Relaxed);
                 println!("\n  Thinking \x1b[33mdisabled\x1b[0m\n");
             } else {
-                // Default budget: half of max_tokens, clamped to [1024, 32000]
-                let default_budget = (core.max_tokens / 2).clamp(1024, 32000);
-                counters.thinking_budget.store(default_budget, Ordering::Relaxed);
+                counters
+                    .thinking_budget
+                    .store(default_budget, Ordering::Relaxed);
                 println!("\n  \x1b[90m\u{1f9e0}\x1b[0m Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
             }
         }
@@ -638,11 +972,17 @@ impl ReplContext {
         let was_suppressed = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
         if was_suppressed {
             // Toggle off — re-enable thinking display (but thinking budget stays 0)
-            counters.suppress_thinking_in_tts.store(false, Ordering::Relaxed);
-            println!("\n  Thinking display \x1b[32mrestored\x1b[0m (use /think to re-enable thinking)\n");
+            counters
+                .suppress_thinking_in_tts
+                .store(false, Ordering::Relaxed);
+            println!(
+                "\n  Thinking display \x1b[32mrestored\x1b[0m (use /think to re-enable thinking)\n"
+            );
         } else {
             counters.thinking_budget.store(0, Ordering::Relaxed);
-            counters.suppress_thinking_in_tts.store(true, Ordering::Relaxed);
+            counters
+                .suppress_thinking_in_tts
+                .store(true, Ordering::Relaxed);
             println!("\n  Thinking \x1b[33msuppressed\x1b[0m — no thinking tokens sent to output or TTS\n");
         }
     }
@@ -654,20 +994,30 @@ impl ReplContext {
         if !arg.is_empty() {
             match arg.parse::<u32>() {
                 Ok(0) => {
-                    counters.long_mode_turns.store(0, std::sync::atomic::Ordering::Relaxed);
+                    counters
+                        .long_mode_turns
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     println!("\n  Long mode \x1b[33mdisabled\x1b[0m — back to adaptive.\n");
                 }
                 Ok(n) => {
                     let clamped = n.min(20);
-                    counters.long_mode_turns.store(clamped, std::sync::atomic::Ordering::Relaxed);
-                    println!("\n  Long mode \x1b[32menabled\x1b[0m for {} turn{} (max_tokens=8192).\n", clamped, if clamped > 1 { "s" } else { "" });
+                    counters
+                        .long_mode_turns
+                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    println!(
+                        "\n  Long mode \x1b[32menabled\x1b[0m for {} turn{} (max_tokens=8192).\n",
+                        clamped,
+                        if clamped > 1 { "s" } else { "" }
+                    );
                 }
                 Err(_) => {
                     println!("\n  Usage: /long [turns]  (default: 3, 0 to disable)\n");
                 }
             }
         } else {
-            counters.long_mode_turns.store(3, std::sync::atomic::Ordering::Relaxed);
+            counters
+                .long_mode_turns
+                .store(3, std::sync::atomic::Ordering::Relaxed);
             println!("\n  Long mode \x1b[32menabled\x1b[0m for 3 turns (max_tokens=8192).\n");
         }
     }
@@ -690,7 +1040,11 @@ impl ReplContext {
         if self.active_channels.is_empty() {
             println!("\n  No channels running.\n");
         } else {
-            let names: Vec<String> = self.active_channels.iter().map(|c| c.name.clone()).collect();
+            let names: Vec<String> = self
+                .active_channels
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
             println!("\n  Stopping: {}", names.join(", "));
             for ch in &self.active_channels {
                 ch.stop.store(true, Ordering::Relaxed);
@@ -713,21 +1067,43 @@ impl ReplContext {
             println!("\n  No messages in session history.\n");
         } else if arg == "full" {
             // Show full content of all messages.
-            println!("\n  {}Session replay ({} messages):{}\n", tui::BOLD, history.len(), tui::RESET);
+            println!(
+                "\n  {}Session replay ({} messages):{}\n",
+                tui::BOLD,
+                history.len(),
+                tui::RESET
+            );
             for (i, msg) in history.iter().enumerate() {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let has_tc = msg.get("tool_calls").is_some();
                 let tc_id = msg.get("tool_call_id").and_then(|v| v.as_str());
-                println!("  {}[{}]{} {} {}", tui::DIM, i, tui::RESET, role,
-                    if has_tc { "[+tool_calls]" } else if tc_id.is_some() { &format!("[tc:{}]", tc_id.unwrap()) } else { "" });
+                println!(
+                    "  {}[{}]{} {} {}",
+                    tui::DIM,
+                    i,
+                    tui::RESET,
+                    role,
+                    if has_tc {
+                        "[+tool_calls]"
+                    } else if tc_id.is_some() {
+                        &format!("[tc:{}]", tc_id.unwrap())
+                    } else {
+                        ""
+                    }
+                );
                 if !content.is_empty() {
                     let preview: String = content.chars().take(200).collect();
                     for line in preview.lines() {
                         println!("    {}{}{}", tui::DIM, line, tui::RESET);
                     }
                     if content.len() > 200 {
-                        println!("    {}...({} total chars){}", tui::DIM, content.len(), tui::RESET);
+                        println!(
+                            "    {}...({} total chars){}",
+                            tui::DIM,
+                            content.len(),
+                            tui::RESET
+                        );
                     }
                 }
             }
@@ -735,7 +1111,11 @@ impl ReplContext {
         } else if let Ok(idx) = arg.parse::<usize>() {
             // Show specific message.
             if idx >= history.len() {
-                println!("\n  Message {} out of range (0..{}).\n", idx, history.len() - 1);
+                println!(
+                    "\n  Message {} out of range (0..{}).\n",
+                    idx,
+                    history.len() - 1
+                );
             } else {
                 let msg = &history[idx];
                 println!("\n  {}Message [{}]:{}\n", tui::BOLD, idx, tui::RESET);
@@ -747,25 +1127,43 @@ impl ReplContext {
             }
         } else {
             // Summary mode (default).
-            println!("\n  {}Session replay ({} messages):{}\n", tui::BOLD, history.len(), tui::RESET);
+            println!(
+                "\n  {}Session replay ({} messages):{}\n",
+                tui::BOLD,
+                history.len(),
+                tui::RESET
+            );
             for (i, msg) in history.iter().enumerate() {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(content);
                 let has_tc = msg.get("tool_calls").is_some();
                 let name = msg.get("name").and_then(|n| n.as_str());
-                let extra = if has_tc { " [+tool_calls]" }
-                    else if let Some(n) = name { &format!(" [{}]", n) }
-                    else { "" };
+                let extra = if has_tc {
+                    " [+tool_calls]"
+                } else if let Some(n) = name {
+                    &format!(" [{}]", n)
+                } else {
+                    ""
+                };
                 let preview: String = content.chars().take(60).collect();
                 let preview = preview.replace('\n', " ");
                 println!(
                     "  {}[{:>3}]{} {:<10} ({:>5} tok){} {}",
-                    tui::DIM, i, tui::RESET,
-                    role, tokens, extra, preview
+                    tui::DIM,
+                    i,
+                    tui::RESET,
+                    role,
+                    tokens,
+                    extra,
+                    preview
                 );
             }
-            println!("\n  {}Usage: /replay full | /replay <N>{}\n", tui::DIM, tui::RESET);
+            println!(
+                "\n  {}Usage: /replay full | /replay <N>{}\n",
+                tui::DIM,
+                tui::RESET
+            );
         }
     }
 }
@@ -791,57 +1189,147 @@ impl ReplContext {
             self.current_model_path.file_name().and_then(|n| n.to_str()),
             self.srv.compaction_port.as_deref(),
             self.srv.delegation_port.as_deref(),
+            self.srv.specialist_port.as_deref(),
         );
         self.agent_loop = cli::create_agent_loop(
-            self.core_handle.clone(), &toggled_config, Some(self.cron_service.clone()), self.email_config.clone(), Some(self.display_tx.clone()),
+            self.core_handle.clone(),
+            &toggled_config,
+            Some(self.cron_service.clone()),
+            self.email_config.clone(),
+            Some(self.display_tx.clone()),
         );
         if !was_enabled {
-            println!("\n  Provenance \x1b[32menabled\x1b[0m (tool calls visible, audit logging on)\n");
+            println!(
+                "\n  Provenance \x1b[32menabled\x1b[0m (tool calls visible, audit logging on)\n"
+            );
         } else {
             println!("\n  Provenance \x1b[33mdisabled\x1b[0m\n");
         }
     }
 
-    /// /restart — restart delegation server.
-    async fn cmd_restart(&mut self) {
-        let core = self.core_handle.swappable();
-        if !core.tool_delegation_config.enabled {
-            println!("  Tool delegation is not enabled.");
-            return;
-        }
+    /// /restart — restart local servers (or delegation server in cloud mode).
+    pub async fn cmd_restart(&mut self) {
+        let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
+        if is_local {
+            self.srv.kill_current();
+            let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
+            let fallback_model = dirs::home_dir()
+                .map(|h| h.join("models").join(server::DEFAULT_LOCAL_MODEL))
+                .filter(|p| p.exists() && *p != self.current_model_path);
+            let fallback = fallback_model
+                .as_ref()
+                .map(|p| (p.as_path(), server::compute_optimal_context_size(p)));
 
-        // Stop existing delegation server if any.
-        server::stop_delegation_server(
-            &mut self.srv.delegation_process,
-            &mut self.srv.delegation_port,
-        );
-
-        // Try to start a fresh one.
-        server::start_delegation_if_available(
-            &mut self.srv.delegation_process,
-            &mut self.srv.delegation_port,
-        ).await;
-
-        if self.srv.delegation_port.is_some() {
-            // Reset health flag and rebuild core with new provider.
-            self.core_handle.counters.delegation_healthy.store(true, Ordering::Relaxed);
-            self.core_handle.counters.delegation_retry_counter.store(0, Ordering::Relaxed);
-            cli::rebuild_core(
-                &self.core_handle, &self.config, &self.srv.local_port,
-                self.current_model_path.file_name().and_then(|n| n.to_str()),
-                self.srv.compaction_port.as_deref(),
-                self.srv.delegation_port.as_deref(),
+            println!(
+                "  {}{}Restarting{} local server stack (ctx: {}K)...",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                ctx_size / 1024
             );
-            self.rebuild_agent_loop();
+
+            match super::start_with_fallback(
+                &mut self.srv,
+                &self.current_model_path,
+                ctx_size,
+                fallback,
+            )
+            .await
+            {
+                super::StartOutcome::Started | super::StartOutcome::Fallback => {
+                    if self.config.trio.enabled {
+                        // Trio lane: router + specialist only (no compaction/delegation stack).
+                        server::stop_compaction_server(
+                            &mut self.srv.compaction_process,
+                            &mut self.srv.compaction_port,
+                        );
+                        self.srv.start_trio_servers(&self.config).await;
+                    } else if self.config.tool_delegation.enabled
+                        && self.config.tool_delegation.auto_local
+                        && self.config.tool_delegation.provider.is_none()
+                    {
+                        server::start_compaction_if_available(
+                            &mut self.srv.compaction_process,
+                            &mut self.srv.compaction_port,
+                            ctx_size,
+                        )
+                        .await;
+                        server::start_delegation_if_available(
+                            &mut self.srv.delegation_process,
+                            &mut self.srv.delegation_port,
+                        )
+                        .await;
+                    } else {
+                        server::start_compaction_if_available(
+                            &mut self.srv.compaction_process,
+                            &mut self.srv.compaction_port,
+                            ctx_size,
+                        )
+                        .await;
+                    }
+                    self.apply_and_rebuild();
+                    self.restart_watchdog();
+                    tui::print_mode_banner(&self.srv.local_port);
+                }
+                super::StartOutcome::CloudFallback => {
+                    self.stop_watchdog();
+                    self.apply_and_rebuild();
+                }
+            }
         } else {
-            println!("  No suitable delegation model found in ~/models/");
+            let core = self.core_handle.swappable();
+            if !core.tool_delegation_config.enabled {
+                println!("  Tool delegation is not enabled.");
+                return;
+            }
+
+            // Stop existing delegation server if any.
+            server::stop_delegation_server(
+                &mut self.srv.delegation_process,
+                &mut self.srv.delegation_port,
+            );
+
+            // Try to start a fresh one.
+            server::start_delegation_if_available(
+                &mut self.srv.delegation_process,
+                &mut self.srv.delegation_port,
+            )
+            .await;
+
+            if self.srv.delegation_port.is_some() {
+                // Reset health flag and rebuild core with new provider.
+                self.core_handle
+                    .counters
+                    .delegation_healthy
+                    .store(true, Ordering::Relaxed);
+                self.core_handle
+                    .counters
+                    .delegation_retry_counter
+                    .store(0, Ordering::Relaxed);
+                cli::rebuild_core(
+                    &self.core_handle,
+                    &self.config,
+                    &self.srv.local_port,
+                    self.current_model_path.file_name().and_then(|n| n.to_str()),
+                    self.srv.compaction_port.as_deref(),
+                    self.srv.delegation_port.as_deref(),
+                    self.srv.specialist_port.as_deref(),
+                );
+                self.rebuild_agent_loop();
+            } else {
+                println!("  No suitable delegation model found in ~/models/");
+            }
         }
     }
 
     /// /ctx [size] — change context size.
     async fn cmd_ctx(&mut self, arg: &str) {
         if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
-            println!("\n  {}Not in local mode — use /local first{}\n", tui::DIM, tui::RESET);
+            println!(
+                "\n  {}Not in local mode — use /local first{}\n",
+                tui::DIM,
+                tui::RESET
+            );
             return;
         }
 
@@ -863,8 +1351,21 @@ impl ReplContext {
         // Restart server with new context size
         self.srv.kill_current();
         let fallback_ctx = server::compute_optimal_context_size(&self.current_model_path);
-        println!("  {}{}Restarting{} llama.cpp (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, new_ctx / 1024);
-        match super::start_with_fallback(&mut self.srv, &self.current_model_path, new_ctx, Some((&self.current_model_path, fallback_ctx))).await {
+        println!(
+            "  {}{}Restarting{} llama.cpp (ctx: {}K)...",
+            tui::BOLD,
+            tui::YELLOW,
+            tui::RESET,
+            new_ctx / 1024
+        );
+        match super::start_with_fallback(
+            &mut self.srv,
+            &self.current_model_path,
+            new_ctx,
+            Some((&self.current_model_path, fallback_ctx)),
+        )
+        .await
+        {
             super::StartOutcome::Started | super::StartOutcome::Fallback => {
                 self.apply_and_rebuild();
                 tui::print_mode_banner(&self.srv.local_port);
@@ -889,13 +1390,19 @@ impl ReplContext {
             let size_mb = std::fs::metadata(path)
                 .map(|m| m.len() / 1_048_576)
                 .unwrap_or(0);
-            let marker = if *path == self.current_model_path { " (active)" } else { "" };
+            let marker = if *path == self.current_model_path {
+                " (active)"
+            } else {
+                ""
+            };
             println!("  [{}] {} ({} MB){}", i + 1, name, size_mb, marker);
         }
         let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", models.len());
         let choice = match self.rl.readline(&model_prompt) {
             Ok(line) => line,
-            Err(_) => { return; }
+            Err(_) => {
+                return;
+            }
         };
         let choice = choice.trim();
         if choice.is_empty() {
@@ -923,9 +1430,22 @@ impl ReplContext {
         if crate::LOCAL_MODE.load(Ordering::SeqCst) {
             self.srv.kill_current();
             let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-            println!("  {}{}Starting{} llama.cpp (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, ctx_size / 1024);
+            println!(
+                "  {}{}Starting{} llama.cpp (ctx: {}K)...",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                ctx_size / 1024
+            );
             let fallback_ctx = server::compute_optimal_context_size(&previous_model_path);
-            match super::start_with_fallback(&mut self.srv, &self.current_model_path, ctx_size, Some((&previous_model_path, fallback_ctx))).await {
+            match super::start_with_fallback(
+                &mut self.srv,
+                &self.current_model_path,
+                ctx_size,
+                Some((&previous_model_path, fallback_ctx)),
+            )
+            .await
+            {
                 super::StartOutcome::Started => {
                     self.apply_and_rebuild();
                     tui::print_mode_banner(&self.srv.local_port);
@@ -949,44 +1469,88 @@ impl ReplContext {
         let currently_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
 
         if !currently_local {
-            // Toggle ON: check if a llama.cpp server is already running
-            let mut found_port: Option<u16> = None;
-            for port in 8080..=8089 {
-                let url = format!("http://localhost:{}/health", port);
-                if let Ok(resp) = reqwest::blocking::get(&url) {
-                    if resp.status().is_success() {
-                        let props_url = format!("http://localhost:{}/props", port);
-                        let n_parallel = reqwest::blocking::get(&props_url)
-                            .ok()
-                            .and_then(|r| r.json::<serde_json::Value>().ok())
-                            .and_then(|json| {
-                                json.get("default_generation_settings")
-                                    .and_then(|s| s.get("n_parallel"))
-                                    .and_then(|n| n.as_u64())
-                                    .or_else(|| {
-                                        json.get("n_parallel").and_then(|n| n.as_u64())
-                                    })
-                            })
-                            .unwrap_or(1);
-                        if n_parallel <= 1 {
-                            found_port = Some(port);
-                            break;
-                        }
+            // Toggle ON with deterministic port pinning.
+            // Only reuse/start on the configured local port to avoid accidental
+            // attachment to unrelated local-agent servers.
+            let preferred_port = self.srv.local_port.parse::<u16>().unwrap_or(8080);
+            self.srv.local_port = preferred_port.to_string();
+            let mut reuse_preferred = false;
+
+            let url = format!("http://localhost:{}/health", preferred_port);
+            if let Ok(resp) = reqwest::blocking::get(&url) {
+                if resp.status().is_success() {
+                    let props_url = format!("http://localhost:{}/props", preferred_port);
+                    let n_parallel = reqwest::blocking::get(&props_url)
+                        .ok()
+                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|json| {
+                            json.get("default_generation_settings")
+                                .and_then(|s| s.get("n_parallel"))
+                                .and_then(|n| n.as_u64())
+                                .or_else(|| json.get("n_parallel").and_then(|n| n.as_u64()))
+                        })
+                        .unwrap_or(1);
+                    if n_parallel <= 1 {
+                        reuse_preferred = true;
+                    } else {
+                        println!(
+                            "\n  {}{}Port {} is healthy but n_parallel={} (shared). Starting dedicated server on pinned port instead.{}",
+                            tui::BOLD,
+                            tui::YELLOW,
+                            preferred_port,
+                            n_parallel,
+                            tui::RESET
+                        );
                     }
                 }
             }
 
-            if let Some(port) = found_port {
+            if reuse_preferred {
                 // Reuse existing server
-                println!("\n  {}{}Reusing{} llama.cpp server on port {}", tui::BOLD, tui::YELLOW, tui::RESET, port);
-                self.srv.local_port = port.to_string();
+                println!(
+                    "\n  {}{}Reusing{} llama.cpp server on pinned port {}",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET,
+                    preferred_port
+                );
                 crate::LOCAL_MODE.store(true, Ordering::SeqCst);
                 let main_ctx = server::compute_optimal_context_size(&self.current_model_path);
-                server::start_compaction_if_available(&mut self.srv.compaction_process, &mut self.srv.compaction_port, main_ctx).await;
-                if self.config.tool_delegation.enabled && self.config.tool_delegation.auto_local && self.config.tool_delegation.provider.is_none() {
-                    server::start_delegation_if_available(&mut self.srv.delegation_process, &mut self.srv.delegation_port).await;
+                if self.config.trio.enabled {
+                    // Trio lane: ensure legacy auxiliaries are down.
+                    server::stop_compaction_server(
+                        &mut self.srv.compaction_process,
+                        &mut self.srv.compaction_port,
+                    );
+                    self.srv.start_trio_servers(&self.config).await;
+                } else {
+                    server::start_compaction_if_available(
+                        &mut self.srv.compaction_process,
+                        &mut self.srv.compaction_port,
+                        main_ctx,
+                    )
+                    .await;
                 }
-                cli::rebuild_core(&self.core_handle, &self.config, &self.srv.local_port, self.current_model_path.file_name().and_then(|n| n.to_str()), self.srv.compaction_port.as_deref(), self.srv.delegation_port.as_deref());
+                if !self.config.trio.enabled
+                    && self.config.tool_delegation.enabled
+                    && self.config.tool_delegation.auto_local
+                    && self.config.tool_delegation.provider.is_none()
+                {
+                    server::start_delegation_if_available(
+                        &mut self.srv.delegation_process,
+                        &mut self.srv.delegation_port,
+                    )
+                    .await;
+                }
+                cli::rebuild_core(
+                    &self.core_handle,
+                    &self.config,
+                    &self.srv.local_port,
+                    self.current_model_path.file_name().and_then(|n| n.to_str()),
+                    self.srv.compaction_port.as_deref(),
+                    self.srv.delegation_port.as_deref(),
+                    self.srv.specialist_port.as_deref(),
+                );
                 self.rebuild_agent_loop();
                 self.restart_watchdog();
                 tui::print_mode_banner(&self.srv.local_port);
@@ -994,14 +1558,45 @@ impl ReplContext {
                 // Kill any orphaned servers from previous runs
                 self.srv.kill_current();
                 let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-                println!("\n  {}{}Starting{} llama.cpp server (ctx: {}K)...", tui::BOLD, tui::YELLOW, tui::RESET, ctx_size / 1024);
+                println!(
+                    "\n  {}{}Starting{} llama.cpp server on pinned port {} (ctx: {}K)...",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET,
+                    self.srv.local_port,
+                    ctx_size / 1024
+                );
 
-                match super::try_start_server(&mut self.srv, &self.current_model_path, ctx_size).await {
+                match super::try_start_server(&mut self.srv, &self.current_model_path, ctx_size)
+                    .await
+                {
                     Ok(_) => {
                         crate::LOCAL_MODE.store(true, Ordering::SeqCst);
-                        server::start_compaction_if_available(&mut self.srv.compaction_process, &mut self.srv.compaction_port, ctx_size).await;
-                        if self.config.tool_delegation.enabled && self.config.tool_delegation.auto_local && self.config.tool_delegation.provider.is_none() {
-                            server::start_delegation_if_available(&mut self.srv.delegation_process, &mut self.srv.delegation_port).await;
+                        if self.config.trio.enabled {
+                            // Trio lane: ensure legacy auxiliaries are down.
+                            server::stop_compaction_server(
+                                &mut self.srv.compaction_process,
+                                &mut self.srv.compaction_port,
+                            );
+                            self.srv.start_trio_servers(&self.config).await;
+                        } else {
+                            server::start_compaction_if_available(
+                                &mut self.srv.compaction_process,
+                                &mut self.srv.compaction_port,
+                                ctx_size,
+                            )
+                            .await;
+                        }
+                        if !self.config.trio.enabled
+                            && self.config.tool_delegation.enabled
+                            && self.config.tool_delegation.auto_local
+                            && self.config.tool_delegation.provider.is_none()
+                        {
+                            server::start_delegation_if_available(
+                                &mut self.srv.delegation_process,
+                                &mut self.srv.delegation_port,
+                            )
+                            .await;
                         }
                         self.apply_and_rebuild();
                         self.restart_watchdog();
@@ -1009,6 +1604,12 @@ impl ReplContext {
                     }
                     Err(e) => {
                         println!("  {}{}Failed: {}{}", tui::BOLD, tui::YELLOW, e, tui::RESET);
+                        println!(
+                            "  {}Pinned local port is {} (set NANOBOT_LOCAL_PORT to change).{}",
+                            tui::DIM,
+                            self.srv.local_port,
+                            tui::RESET
+                        );
                         println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
                     }
                 }
@@ -1020,12 +1621,27 @@ impl ReplContext {
                 child.wait().ok();
             }
             self.srv.llama_process = None;
-            server::stop_compaction_server(&mut self.srv.compaction_process, &mut self.srv.compaction_port);
+            server::stop_compaction_server(
+                &mut self.srv.compaction_process,
+                &mut self.srv.compaction_port,
+            );
+            if self.config.trio.enabled {
+                // Trio lane shutdown: stop router/specialist too.
+                server::stop_delegation_server(
+                    &mut self.srv.delegation_process,
+                    &mut self.srv.delegation_port,
+                );
+                server::stop_custom_server(
+                    &mut self.srv.specialist_process,
+                    &mut self.srv.specialist_port,
+                );
+            }
             self.stop_watchdog();
             crate::LOCAL_MODE.store(false, Ordering::SeqCst);
 
             // Re-spawn delegation if it wasn't already running
             if self.srv.delegation_port.is_none()
+                && !self.config.trio.enabled
                 && self.config.tool_delegation.enabled
                 && self.config.tool_delegation.auto_local
                 && self.config.tool_delegation.provider.is_none()
@@ -1033,7 +1649,8 @@ impl ReplContext {
                 server::start_delegation_if_available(
                     &mut self.srv.delegation_process,
                     &mut self.srv.delegation_port,
-                ).await;
+                )
+                .await;
             }
 
             self.apply_and_rebuild();
@@ -1069,7 +1686,9 @@ impl ReplContext {
             cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
         });
         self.active_channels.push(super::ActiveChannel {
-            name: "whatsapp".to_string(), stop, handle,
+            name: "whatsapp".to_string(),
+            stop,
+            handle,
         });
         println!("  WhatsApp running in background. Continue chatting.\n");
     }
@@ -1094,7 +1713,9 @@ impl ReplContext {
             let tok_prompt = "  Enter bot token: ";
             let t = match self.rl.readline(tok_prompt) {
                 Ok(line) => line.trim().to_string(),
-                Err(_) => { return; }
+                Err(_) => {
+                    return;
+                }
             };
             if t.is_empty() {
                 println!("  Cancelled.\n");
@@ -1133,7 +1754,9 @@ impl ReplContext {
             cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
         });
         self.active_channels.push(super::ActiveChannel {
-            name: "telegram".to_string(), stop, handle,
+            name: "telegram".to_string(),
+            stop,
+            handle,
         });
         println!("  Telegram running in background. Continue chatting.\n");
     }
@@ -1149,7 +1772,10 @@ impl ReplContext {
         let mut gw_config = load_config(None);
         cli::check_api_key(&gw_config);
         let email_cfg = &gw_config.channels.email;
-        if email_cfg.imap_host.is_empty() || email_cfg.username.is_empty() || email_cfg.password.is_empty() {
+        if email_cfg.imap_host.is_empty()
+            || email_cfg.username.is_empty()
+            || email_cfg.password.is_empty()
+        {
             println!("  Email not configured. Run `nanobot email` first or add settings to config.json.\n");
             return;
         }
@@ -1167,7 +1793,9 @@ impl ReplContext {
             cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
         });
         self.active_channels.push(super::ActiveChannel {
-            name: "email".to_string(), stop, handle,
+            name: "email".to_string(),
+            stop,
+            handle,
         });
         println!("  Email running in background. Continue chatting.\n");
     }
@@ -1181,15 +1809,23 @@ impl ReplContext {
             }
             self.voice_session = None;
             // Restore thinking display when voice mode turns off.
-            self.core_handle.counters.suppress_thinking_in_tts.store(false, Ordering::Relaxed);
+            self.core_handle
+                .counters
+                .suppress_thinking_in_tts
+                .store(false, Ordering::Relaxed);
             println!("\nVoice mode OFF\n");
         } else {
             match crate::voice::VoiceSession::with_lang(self.lang.as_deref()).await {
                 Ok(vs) => {
                     self.voice_session = Some(vs);
                     // Auto-suppress thinking tokens from TTS.
-                    self.core_handle.counters.suppress_thinking_in_tts.store(true, Ordering::Relaxed);
-                    println!("\nVoice mode ON. Ctrl+Space or Enter to speak/interrupt, type for text.\n");
+                    self.core_handle
+                        .counters
+                        .suppress_thinking_in_tts
+                        .store(true, Ordering::Relaxed);
+                    println!(
+                        "\nVoice mode ON. Ctrl+Space or Enter to speak/interrupt, type for text.\n"
+                    );
                 }
                 Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
             }
@@ -1205,9 +1841,13 @@ impl ReplContext {
     /// Whether voice mode is currently active.
     pub fn voice_on(&self) -> bool {
         #[cfg(feature = "voice")]
-        { self.voice_session.is_some() }
+        {
+            self.voice_session.is_some()
+        }
         #[cfg(not(feature = "voice"))]
-        { false }
+        {
+            false
+        }
     }
 }
 
@@ -1224,6 +1864,7 @@ mod tests {
         assert_eq!(normalize_alias("/l"), "/local");
         assert_eq!(normalize_alias("/m"), "/model");
         assert_eq!(normalize_alias("/t"), "/think");
+        assert_eq!(normalize_alias("/thinking"), "/think");
         assert_eq!(normalize_alias("/nt"), "/nothink");
         assert_eq!(normalize_alias("/v"), "/voice");
         assert_eq!(normalize_alias("/wa"), "/whatsapp");
@@ -1250,7 +1891,8 @@ mod tests {
     fn test_command_arg_parsing() {
         // Verify split_once behavior used in dispatch
         let input = "/ctx 32K";
-        let (cmd, arg) = input.split_once(' ')
+        let (cmd, arg) = input
+            .split_once(' ')
             .map(|(c, a)| (c, a.trim()))
             .unwrap_or((input, ""));
         assert_eq!(cmd, "/ctx");
@@ -1258,7 +1900,8 @@ mod tests {
 
         // No arg
         let input2 = "/status";
-        let (cmd2, arg2) = input2.split_once(' ')
+        let (cmd2, arg2) = input2
+            .split_once(' ')
             .map(|(c, a)| (c, a.trim()))
             .unwrap_or((input2, ""));
         assert_eq!(cmd2, "/status");

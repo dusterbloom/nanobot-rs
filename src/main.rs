@@ -286,7 +286,7 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         // Restore terminal before printing panic message
         tui::force_exit_raw_mode();
-        print!("\x1b[r");  // reset scroll region
+        print!("\x1b[r"); // reset scroll region
         print!("\x1b[?25h"); // show cursor
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
@@ -328,14 +328,10 @@ fn main() {
                 .init();
         } else {
             // Fallback: just write to stderr if we can't open the log file.
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     match cli.command {
@@ -366,7 +362,12 @@ fn main() {
             CronAction::Remove { job_id } => cli::cmd_cron_remove(job_id),
             CronAction::Enable { job_id, disable } => cli::cmd_cron_enable(job_id, disable),
         },
-        Commands::Ingest { files, name, chunk_size, overlap } => cli::cmd_ingest(files, name, chunk_size, overlap),
+        Commands::Ingest {
+            files,
+            name,
+            chunk_size,
+            overlap,
+        } => cli::cmd_ingest(files, name, chunk_size, overlap),
         Commands::Search { query, limit } => cli::cmd_search(query, limit),
         Commands::WhatsApp => cli::cmd_whatsapp(),
         Commands::Telegram { token } => cli::cmd_telegram(token),
@@ -377,18 +378,36 @@ fn main() {
             password,
         } => cli::cmd_email(imap_host, smtp_host, username, password),
         Commands::Eval { action } => match action {
-            EvalAction::Hanoi { disks, calibrate, samples, solve, catts, k, local, port } => {
-                cli::cmd_eval_hanoi(disks, calibrate, samples, solve, catts, k, local, port)
-            }
-            EvalAction::Haystack { facts, length, aggregate, local, port } => {
-                cli::cmd_eval_haystack(facts, length, aggregate, local, port)
-            }
-            EvalAction::Learn { family, tasks, depth, local, port } => {
-                cli::cmd_eval_learn(family, tasks, depth, local, port)
-            }
-            EvalAction::Sprint { corpus_size, questions, local, port } => {
-                cli::cmd_eval_sprint(corpus_size, questions, local, port)
-            }
+            EvalAction::Hanoi {
+                disks,
+                calibrate,
+                samples,
+                solve,
+                catts,
+                k,
+                local,
+                port,
+            } => cli::cmd_eval_hanoi(disks, calibrate, samples, solve, catts, k, local, port),
+            EvalAction::Haystack {
+                facts,
+                length,
+                aggregate,
+                local,
+                port,
+            } => cli::cmd_eval_haystack(facts, length, aggregate, local, port),
+            EvalAction::Learn {
+                family,
+                tasks,
+                depth,
+                local,
+                port,
+            } => cli::cmd_eval_learn(family, tasks, depth, local, port),
+            EvalAction::Sprint {
+                corpus_size,
+                questions,
+                local,
+                port,
+            } => cli::cmd_eval_sprint(corpus_size, questions, local, port),
             EvalAction::Report => cli::cmd_eval_report(),
         },
     }
@@ -412,7 +431,10 @@ mod tests {
                 assert_eq!(input, "bench.json");
                 assert!(!json);
             }
-            other => panic!("unexpected parsed command: {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "unexpected parsed command: {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 

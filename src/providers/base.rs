@@ -14,6 +14,21 @@ pub struct ToolCallRequest {
     pub arguments: HashMap<String, serde_json::Value>,
 }
 
+impl ToolCallRequest {
+    /// Convert to OpenAI function-call JSON format.
+    pub fn to_openai_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": serde_json::to_string(&self.arguments)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            }
+        })
+    }
+}
+
 /// Response from an LLM provider.
 #[derive(Debug, Clone)]
 pub struct LLMResponse {
@@ -83,7 +98,16 @@ pub trait LLMProvider: Send + Sync {
         temperature: f64,
         thinking_budget: Option<u32>,
     ) -> Result<StreamHandle> {
-        let response = self.chat(messages, tools, model, max_tokens, temperature, thinking_budget).await?;
+        let response = self
+            .chat(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                thinking_budget,
+            )
+            .await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Some(ref content) = response.content {
             let _ = tx.send(StreamChunk::TextDelta(content.clone()));

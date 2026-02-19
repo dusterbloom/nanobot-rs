@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use crate::agent::step_voter::{vote, VoteResult, VoterConfig, VoterResponse};
 use serde::{Deserialize, Serialize};
-use crate::agent::step_voter::{VoterConfig, VoterResponse, VoteResult, vote};
+use std::collections::HashMap;
 
 /// Configuration for confidence-gated voting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +80,9 @@ impl GateDecision {
 /// Normalized to [0, 1] by dividing by log2(num_candidates).
 pub fn vote_entropy(vote_counts: &HashMap<String, usize>) -> f64 {
     let total: usize = vote_counts.values().sum();
-    if total == 0 { return 0.0; }
+    if total == 0 {
+        return 0.0;
+    }
 
     let total_f = total as f64;
     let mut entropy = 0.0;
@@ -94,9 +96,15 @@ pub fn vote_entropy(vote_counts: &HashMap<String, usize>) -> f64 {
 
     // Normalize by max possible entropy (uniform distribution)
     let num_candidates = vote_counts.len();
-    if num_candidates <= 1 { return 0.0; }
+    if num_candidates <= 1 {
+        return 0.0;
+    }
     let max_entropy = (num_candidates as f64).log2();
-    if max_entropy > 0.0 { entropy / max_entropy } else { 0.0 }
+    if max_entropy > 0.0 {
+        entropy / max_entropy
+    } else {
+        0.0
+    }
 }
 
 /// Compute the margin between the top-1 and top-2 vote counts.
@@ -104,7 +112,9 @@ pub fn vote_entropy(vote_counts: &HashMap<String, usize>) -> f64 {
 /// Returns 1.0 if only one candidate, 0.0 if tied.
 pub fn top_margin(vote_counts: &HashMap<String, usize>) -> f64 {
     let total: usize = vote_counts.values().sum();
-    if total == 0 { return 0.0; }
+    if total == 0 {
+        return 0.0;
+    }
 
     let mut counts: Vec<usize> = vote_counts.values().copied().collect();
     counts.sort_unstable_by(|a, b| b.cmp(a));
@@ -125,10 +135,13 @@ pub fn gated_vote(
     config: &ConfidenceGateConfig,
 ) -> GateDecision {
     // Step 1: Vote on pilot responses
-    let pilot_result = vote(pilot_responses, &VoterConfig {
-        num_voters: config.pilot_voters,
-        ..config.full_config.clone()
-    });
+    let pilot_result = vote(
+        pilot_responses,
+        &VoterConfig {
+            num_voters: config.pilot_voters,
+            ..config.full_config.clone()
+        },
+    );
 
     // Step 2: Compute confidence metrics
     let entropy = vote_entropy(&pilot_result.vote_counts);
@@ -193,13 +206,17 @@ impl GateStats {
     /// Compute savings ratio: actual_voters / theoretical_voters.
     /// Lower is better. 1.0 = no savings. 0.5 = 2x savings.
     pub fn savings_ratio(&self) -> f64 {
-        if self.theoretical_full_voters == 0 { return 1.0; }
+        if self.theoretical_full_voters == 0 {
+            return 1.0;
+        }
         self.total_voters_used as f64 / self.theoretical_full_voters as f64
     }
 
     /// Acceptance rate: fraction of decisions accepted at pilot stage.
     pub fn acceptance_rate(&self) -> f64 {
-        if self.total_decisions == 0 { return 0.0; }
+        if self.total_decisions == 0 {
+            return 0.0;
+        }
         self.pilot_accepted as f64 / self.total_decisions as f64
     }
 }
@@ -281,14 +298,8 @@ mod tests {
         let config = ConfidenceGateConfig::default();
 
         // Two unanimous pilot votes
-        let pilot = vec![
-            make_response("42"),
-            make_response("42"),
-        ];
-        let extra = vec![
-            make_response("42"),
-            make_response("42"),
-        ];
+        let pilot = vec![make_response("42"), make_response("42")];
+        let extra = vec![make_response("42"), make_response("42")];
 
         let decision = gated_vote(&pilot, &extra, &config);
 
@@ -296,7 +307,10 @@ mod tests {
         assert_eq!(decision.result().winner, Some("42".to_string()));
         assert_eq!(decision.total_voters_used(), 2);
 
-        if let GateDecision::AcceptPilot { entropy, margin, .. } = decision {
+        if let GateDecision::AcceptPilot {
+            entropy, margin, ..
+        } = decision
+        {
             assert_eq!(entropy, 0.0);
             assert_eq!(margin, 1.0);
         } else {
@@ -309,14 +323,8 @@ mod tests {
         let config = ConfidenceGateConfig::default();
 
         // Split pilot vote (1:1)
-        let pilot = vec![
-            make_response("42"),
-            make_response("43"),
-        ];
-        let extra = vec![
-            make_response("42"),
-            make_response("42"),
-        ];
+        let pilot = vec![make_response("42"), make_response("43")];
+        let extra = vec![make_response("42"), make_response("42")];
 
         let decision = gated_vote(&pilot, &extra, &config);
 
@@ -342,9 +350,7 @@ mod tests {
             make_response("42"),
             make_response("43"),
         ];
-        let extra = vec![
-            make_response("42"),
-        ];
+        let extra = vec![make_response("42")];
 
         let decision = gated_vote(&pilot, &extra, &config);
 
@@ -371,7 +377,11 @@ mod tests {
 
         // Simulate one escalated decision
         let pilot2 = vec![make_response("42"), make_response("43")];
-        let extra2 = vec![make_response("42"), make_response("42"), make_response("42")];
+        let extra2 = vec![
+            make_response("42"),
+            make_response("42"),
+            make_response("42"),
+        ];
         let decision2 = gated_vote(&pilot2, &extra2, &config);
         stats.record(&decision2, 5);
 

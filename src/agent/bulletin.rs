@@ -69,7 +69,10 @@ impl BulletinCache {
 /// Build the bulletin prompt from current memory state.
 ///
 /// Pure function — no I/O, no LLM. Testable with synthetic data.
-pub fn build_bulletin_prompt(long_term_memory: &str, active_sessions: &[(String, String)]) -> String {
+pub fn build_bulletin_prompt(
+    long_term_memory: &str,
+    active_sessions: &[(String, String)],
+) -> String {
     let sessions_text = if active_sessions.is_empty() {
         "No active sessions.".to_string()
     } else {
@@ -147,13 +150,15 @@ pub async fn refresh_bulletin(
 /// Load persisted bulletin from disk (warm start after restart).
 pub fn load_persisted_bulletin(workspace: &Path) -> Option<String> {
     let path = workspace.join("BULLETIN.md");
-    std::fs::read_to_string(&path).ok().filter(|s| !s.trim().is_empty())
+    std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::base::{LLMResponse, LLMProvider};
+    use crate::providers::base::{LLMProvider, LLMResponse};
     use async_trait::async_trait;
     use serde_json::Value;
     use tempfile::TempDir;
@@ -243,7 +248,10 @@ mod tests {
     fn test_load_persisted_content() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("BULLETIN.md"), "Briefing text").unwrap();
-        assert_eq!(load_persisted_bulletin(tmp.path()).unwrap(), "Briefing text");
+        assert_eq!(
+            load_persisted_bulletin(tmp.path()).unwrap(),
+            "Briefing text"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -271,7 +279,9 @@ mod tests {
             })
         }
 
-        fn get_default_model(&self) -> &str { "mock" }
+        fn get_default_model(&self) -> &str {
+            "mock"
+        }
     }
 
     #[tokio::test]
@@ -283,7 +293,9 @@ mod tests {
         std::fs::write(mem_path.join("MEMORY.md"), "User likes Rust").unwrap();
 
         let provider = MockBulletinProvider;
-        let result = generate_bulletin(&provider, "test-model", tmp.path()).await.unwrap();
+        let result = generate_bulletin(&provider, "test-model", tmp.path())
+            .await
+            .unwrap();
         assert!(result.contains("nanobot"));
     }
 
@@ -298,7 +310,9 @@ mod tests {
         let handle = cache.handle();
 
         let provider = MockBulletinProvider;
-        refresh_bulletin(&provider, "test", tmp.path(), &handle).await.unwrap();
+        refresh_bulletin(&provider, "test", tmp.path(), &handle)
+            .await
+            .unwrap();
 
         // Cache updated
         assert!(!cache.read().is_empty());

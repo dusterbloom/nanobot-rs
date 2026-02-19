@@ -158,8 +158,14 @@ impl HeartbeatService {
         let maintenance_commands = self.maintenance_commands.clone();
 
         let handle = tokio::spawn(async move {
-            Self::run_loop(running, interval_s, workspace, on_heartbeat, maintenance_commands)
-                .await;
+            Self::run_loop(
+                running,
+                interval_s,
+                workspace,
+                on_heartbeat,
+                maintenance_commands,
+            )
+            .await;
         });
 
         let mut guard = self.task_handle.lock().await;

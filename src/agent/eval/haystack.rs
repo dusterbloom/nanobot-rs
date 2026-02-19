@@ -33,11 +33,25 @@ impl Default for HaystackConfig {
 /// Types of aggregation tasks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AggregationTask {
-    Count { job: String, expected: usize },
-    Distribution { expected_top_job: String },
-    Filter { city: String, expected_names: Vec<String> },
-    CrossRef { person_id: usize, expected_names: Vec<String> },
-    Temporal { position: TemporalPosition, expected_name: String },
+    Count {
+        job: String,
+        expected: usize,
+    },
+    Distribution {
+        expected_top_job: String,
+    },
+    Filter {
+        city: String,
+        expected_names: Vec<String>,
+    },
+    CrossRef {
+        person_id: usize,
+        expected_names: Vec<String>,
+    },
+    Temporal {
+        position: TemporalPosition,
+        expected_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,7 +80,15 @@ pub struct AggregationResult {
 }
 
 pub const JOBS: &[&str] = &[
-    "engineer", "teacher", "doctor", "artist", "chef", "scientist", "lawyer", "writer", "nurse",
+    "engineer",
+    "teacher",
+    "doctor",
+    "artist",
+    "chef",
+    "scientist",
+    "lawyer",
+    "writer",
+    "nurse",
     "pilot",
 ];
 
@@ -347,7 +369,10 @@ pub fn evaluate_retrieval(
         let mut found_rank: Option<usize> = None;
 
         for (idx, result) in results.iter().enumerate() {
-            if result.contains(&fact.name) && result.contains(&fact.job) && result.contains(&fact.city) {
+            if result.contains(&fact.name)
+                && result.contains(&fact.job)
+                && result.contains(&fact.city)
+            {
                 found_rank = Some(idx + 1);
                 break;
             }

@@ -666,7 +666,14 @@ mod tests {
 
     #[test]
     fn test_allow_patterns_block_unmatched() {
-        let tool = ExecTool::new(10, None, None, Some(vec![r"^echo\b".to_string()]), false, 30000);
+        let tool = ExecTool::new(
+            10,
+            None,
+            None,
+            Some(vec![r"^echo\b".to_string()]),
+            false,
+            30000,
+        );
         let cwd = ".".to_string();
 
         // "echo" matches, so it should be allowed.
@@ -903,7 +910,10 @@ mod tests {
     fn test_guard_allows_rm_single_file() {
         // rm without -r or -f flags on a single file is allowed
         let result = guard_unrestricted("rm temp.txt");
-        assert!(result.is_none(), "rm without dangerous flags should be allowed");
+        assert!(
+            result.is_none(),
+            "rm without dangerous flags should be allowed"
+        );
     }
 
     #[tokio::test]
@@ -1151,9 +1161,7 @@ mod tests {
         // Produce output then wait so ticker fires with output available
         params.insert(
             "command".to_string(),
-            serde_json::Value::String(
-                "echo preview_line && sleep 2".to_string(),
-            ),
+            serde_json::Value::String("echo preview_line && sleep 2".to_string()),
         );
 
         let _result = tool.execute_with_context(params, &ctx).await;

@@ -19,13 +19,16 @@ use tracing::{debug, error, info, warn};
 use crate::agent::context::ContextBuilder;
 use crate::agent::thread_repair;
 use crate::agent::tools::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::providers::base::LLMProvider;
 
 /// Default max iterations per tool-equipped step.
 const DEFAULT_STEP_MAX_ITERATIONS: u32 = 5;
+
+/// Default max chars for tool results in pipeline steps.
+const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
 /// A single step in a pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,14 +133,9 @@ pub async fn run_pipeline(
 
         let (answer, voters_used) = if step.tools.is_some() {
             // Tool-equipped step: run a mini agent loop.
-            let ans = execute_step_with_tools(
-                provider,
-                &config.model,
-                step,
-                &context_so_far,
-                workspace,
-            )
-            .await;
+            let ans =
+                execute_step_with_tools(provider, &config.model, step, &context_so_far, workspace)
+                    .await;
             (ans, 1) // No voting for tool-equipped steps.
         } else if config.ahead_by_k > 0 {
             // Plain step with voting.
@@ -157,9 +155,10 @@ pub async fn run_pipeline(
             (ans, 1)
         };
 
-        let correct = step.expected.as_ref().map(|exp| {
-            exp.trim().to_lowercase() == answer.trim().to_lowercase()
-        });
+        let correct = step
+            .expected
+            .as_ref()
+            .map(|exp| exp.trim().to_lowercase() == answer.trim().to_lowercase());
 
         // The context for chaining is the full answer.
         let step_context = answer.clone();
@@ -177,7 +176,10 @@ pub async fn run_pipeline(
         append_pipeline_event(workspace, &config.pipeline_id, &step_result);
 
         // Accumulate context for subsequent steps.
-        context_so_far.push_str(&format!("## Step {} output\n{}\n\n", step.index, step_context));
+        context_so_far.push_str(&format!(
+            "## Step {} output\n{}\n\n",
+            step.index, step_context
+        ));
 
         results.push(step_result);
     }
@@ -220,9 +222,7 @@ async fn execute_step_with_tools(
 
     // Build a tool registry with only the requested tools.
     let mut tools = ToolRegistry::new();
-    let should_include = |name: &str| -> bool {
-        tool_names.iter().any(|t| t == name)
-    };
+    let should_include = |name: &str| -> bool { tool_names.iter().any(|t| t == name) };
 
     if should_include("read_file") {
         tools.register(Box::new(ReadFileTool));
@@ -243,14 +243,14 @@ async fn execute_step_with_tools(
             None,
             None,
             false, // restrict_to_workspace
-            30000, // max_result_chars
+            DEFAULT_MAX_TOOL_RESULT_CHARS,
         )));
     }
     if should_include("web_search") {
         tools.register(Box::new(WebSearchTool::new(None, 5)));
     }
     if should_include("web_fetch") {
-        tools.register(Box::new(WebFetchTool::new(50_000)));
+        tools.register(Box::new(WebFetchTool::new(DEFAULT_MAX_TOOL_RESULT_CHARS)));
     }
 
     let tool_defs = tools.get_definitions();
@@ -290,6 +290,7 @@ async fn execute_step_with_tools(
         // Repair tool messages before each LLM call.
         if is_local && iteration > 0 {
             thread_repair::repair_for_strict_alternation(&mut messages);
+            thread_repair::strip_imitatable_patterns(&mut messages);
         }
 
         let response = match provider
@@ -314,17 +315,7 @@ async fn execute_step_with_tools(
             let tc_json: Vec<Value> = response
                 .tool_calls
                 .iter()
-                .map(|tc| {
-                    json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": serde_json::to_string(&tc.arguments)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        }
-                    })
-                })
+                .map(|tc| tc.to_openai_json())
                 .collect();
 
             ContextBuilder::add_assistant_message(
@@ -388,7 +379,10 @@ async fn vote_on_step(
             .unwrap_or(0);
 
         if max_count >= second_max + ahead_by_k {
-            debug!("Vote converged after {} voters: '{}'", voters_used, normalized);
+            debug!(
+                "Vote converged after {} voters: '{}'",
+                voters_used, normalized
+            );
             return (answer, voters_used);
         }
     }
@@ -399,14 +393,20 @@ async fn vote_on_step(
         .max_by_key(|(_, count)| *count)
         .map(|(answer, _)| answer)
         .unwrap_or_default();
-    warn!("Vote did not converge after {} voters, using plurality: '{}'", max_voters, best);
+    warn!(
+        "Vote did not converge after {} voters, using plurality: '{}'",
+        max_voters, best
+    );
     (best, voters_used)
 }
 
 /// Single LLM call for pipeline steps.
 async fn call_llm(provider: &dyn LLMProvider, model: &str, prompt: &str) -> String {
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-    match provider.chat(&messages, None, Some(model), 512, 0.3, None).await {
+    match provider
+        .chat(&messages, None, Some(model), 512, 0.3, None)
+        .await
+    {
         Ok(resp) => resp.content.unwrap_or_default(),
         Err(e) => {
             error!("Pipeline LLM call failed: {}", e);
@@ -435,7 +435,9 @@ fn append_pipeline_event(workspace: &Path, pipeline_id: &str, result: &StepResul
         .append(true)
         .open(&event_path)
     {
-        Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+        Ok(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+        }
         Err(e) => warn!("Failed to append pipeline event: {}", e),
     }
 }
@@ -451,9 +453,7 @@ fn load_completed_steps(workspace: &Path, pipeline_id: &str) -> Vec<StepResult> 
     let mut results: Vec<StepResult> = Vec::new();
     for line in content.lines() {
         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-            if ev["kind"] == "pipeline_step"
-                && ev["pipeline_id"].as_str() == Some(pipeline_id)
-            {
+            if ev["kind"] == "pipeline_step" && ev["pipeline_id"].as_str() == Some(pipeline_id) {
                 results.push(StepResult {
                     index: ev["step_index"].as_u64().unwrap_or(0) as usize,
                     answer: ev["answer"].as_str().unwrap_or("").to_string(),
@@ -479,9 +479,9 @@ fn load_completed_steps(workspace: &Path, pipeline_id: &str) -> Vec<StepResult> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use async_trait::async_trait;
     use crate::providers::base::LLMResponse;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
 
     struct MockPipelineProvider {
         answers: Vec<String>,
@@ -508,8 +508,12 @@ mod tests {
             _temperature: f64,
             _thinking_budget: Option<u32>,
         ) -> anyhow::Result<LLMResponse> {
-            let idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let answer = self.answers.get(idx % self.answers.len())
+            let idx = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self
+                .answers
+                .get(idx % self.answers.len())
                 .cloned()
                 .unwrap_or_else(|| "default".to_string());
             Ok(LLMResponse {
@@ -519,7 +523,9 @@ mod tests {
                 usage: HashMap::new(),
             })
         }
-        fn get_default_model(&self) -> &str { "mock" }
+        fn get_default_model(&self) -> &str {
+            "mock"
+        }
     }
 
     #[tokio::test]
@@ -529,9 +535,27 @@ mod tests {
         let config = PipelineConfig {
             pipeline_id: "test-1".to_string(),
             steps: vec![
-                PipelineStep { index: 0, prompt: "Q1".into(), expected: Some("42".into()), tools: None, max_iterations: None },
-                PipelineStep { index: 1, prompt: "Q2".into(), expected: None, tools: None, max_iterations: None },
-                PipelineStep { index: 2, prompt: "Q3".into(), expected: Some("done".into()), tools: None, max_iterations: None },
+                PipelineStep {
+                    index: 0,
+                    prompt: "Q1".into(),
+                    expected: Some("42".into()),
+                    tools: None,
+                    max_iterations: None,
+                },
+                PipelineStep {
+                    index: 1,
+                    prompt: "Q2".into(),
+                    expected: None,
+                    tools: None,
+                    max_iterations: None,
+                },
+                PipelineStep {
+                    index: 2,
+                    prompt: "Q3".into(),
+                    expected: Some("done".into()),
+                    tools: None,
+                    max_iterations: None,
+                },
             ],
             ahead_by_k: 0,
             max_voters: 1,
@@ -564,17 +588,26 @@ mod tests {
             "voters_used": 1,
             "duration_ms": 100,
         });
-        std::fs::write(
-            dir.path().join("events.jsonl"),
-            format!("{}\n", event),
-        ).unwrap();
+        std::fs::write(dir.path().join("events.jsonl"), format!("{}\n", event)).unwrap();
 
         let provider = MockPipelineProvider::new(vec!["second"]);
         let config = PipelineConfig {
             pipeline_id: "resume-test".to_string(),
             steps: vec![
-                PipelineStep { index: 0, prompt: "Q1".into(), expected: None, tools: None, max_iterations: None },
-                PipelineStep { index: 1, prompt: "Q2".into(), expected: None, tools: None, max_iterations: None },
+                PipelineStep {
+                    index: 0,
+                    prompt: "Q1".into(),
+                    expected: None,
+                    tools: None,
+                    max_iterations: None,
+                },
+                PipelineStep {
+                    index: 1,
+                    prompt: "Q2".into(),
+                    expected: None,
+                    tools: None,
+                    max_iterations: None,
+                },
             ],
             ahead_by_k: 0,
             max_voters: 1,
@@ -606,8 +639,20 @@ mod tests {
         let config = PipelineConfig {
             pipeline_id: "chain-test".to_string(),
             steps: vec![
-                PipelineStep { index: 0, prompt: "Do step 1".into(), expected: None, tools: None, max_iterations: None },
-                PipelineStep { index: 1, prompt: "Do step 2".into(), expected: None, tools: None, max_iterations: None },
+                PipelineStep {
+                    index: 0,
+                    prompt: "Do step 1".into(),
+                    expected: None,
+                    tools: None,
+                    max_iterations: None,
+                },
+                PipelineStep {
+                    index: 1,
+                    prompt: "Do step 2".into(),
+                    expected: None,
+                    tools: None,
+                    max_iterations: None,
+                },
             ],
             ahead_by_k: 0,
             max_voters: 1,

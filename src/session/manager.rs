@@ -92,11 +92,7 @@ impl Session {
             let mut turns_seen = 0;
             let mut turn_start = safe_start;
             for i in (safe_start..self.messages.len()).rev() {
-                if self.messages[i]
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    == Some("user")
-                {
+                if self.messages[i].get("role").and_then(|r| r.as_str()) == Some("user") {
                     turns_seen += 1;
                     if turns_seen > max_turns {
                         break;
@@ -143,6 +139,23 @@ impl Session {
 // SessionManager
 // ---------------------------------------------------------------------------
 
+const ROTATION_SIZE_BYTES: usize = 1_000_000; // 1 MB
+const ROTATION_CARRY_MESSAGES: usize = 10;
+
+pub fn should_rotate(session: &Session) -> bool {
+    let age_hours = (Local::now() - session.updated_at).num_hours();
+    if age_hours >= 24 {
+        return true;
+    }
+    
+    let size: usize = session.messages.iter().map(|m| m.to_string().len()).sum();
+    if size > ROTATION_SIZE_BYTES {
+        return true;
+    }
+    
+    false
+}
+
 /// Manages conversation sessions.
 ///
 /// Sessions are stored as JSONL files in `~/.nanobot/sessions`.
@@ -171,7 +184,12 @@ impl SessionManager {
     ///
     /// `max_turns` limits how many user turns (conversation rounds) to load.
     /// Set to 0 to disable turn-based limiting.
-    pub async fn get_history(&self, key: &str, max_messages: usize, max_turns: usize) -> Vec<Value> {
+    pub async fn get_history(
+        &self,
+        key: &str,
+        max_messages: usize,
+        max_turns: usize,
+    ) -> Vec<Value> {
         let mut cache = self.cache.lock().await;
         let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
         session.get_history(max_messages, max_turns)
@@ -292,31 +310,54 @@ impl SessionManager {
 
     // -----------------------------------------------------------------------
     // Private/internal helpers
-    // -----------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
     /// Get or create a session within an already-locked cache.
     ///
-    /// Handles daily rotation: if the cached session was created on a
-    /// different day, saves it and starts a fresh session for today.
+    /// Handles rotation:
+    /// 1. Daily rotation: if session was created on a different day
+    /// 2. Size rotation: if session exceeds 1MB
+    /// When rotating, carries over last N messages to new session.
     fn get_or_create_inner<'a>(
         cache: &'a mut HashMap<String, Session>,
         key: &str,
         sessions_dir: &Path,
     ) -> &'a mut Session {
         let today = Local::now().format("%Y-%m-%d").to_string();
+        let mut carry_messages: Option<Vec<Value>> = None;
 
         if let Some(existing) = cache.get(key) {
             let session_date = existing.created_at.format("%Y-%m-%d").to_string();
-            if session_date != today {
-                // Day rolled over: save the old session, then evict from cache.
+            let size: usize = existing.messages.iter().map(|m| m.to_string().len()).sum();
+            
+            if session_date != today || size > ROTATION_SIZE_BYTES {
                 Self::save_session(existing, sessions_dir);
+                
+                let carried: Vec<Value> = existing.messages
+                    .iter()
+                    .rev()
+                    .take(ROTATION_CARRY_MESSAGES)
+                    .rev()
+                    .cloned()
+                    .collect();
+                
+                if !carried.is_empty() && session_date == today {
+                    carry_messages = Some(carried);
+                }
+                
                 cache.remove(key);
             }
         }
 
         if !cache.contains_key(key) {
-            let session =
+            let mut session =
                 Self::load_from_disk(key, sessions_dir).unwrap_or_else(|| Session::new(key));
+            
+            if let Some(carried) = carry_messages {
+                session.messages = carried;
+                session.created_at = Local::now();
+            }
+            
             cache.insert(key.to_string(), session);
         }
         cache.get_mut(key).expect("session must exist in cache")
@@ -539,12 +580,21 @@ mod tests {
 
         // Verify tool_calls preserved on assistant message.
         let assistant_msg = &history[1];
-        assert!(assistant_msg.get("tool_calls").is_some(), "tool_calls should be preserved");
+        assert!(
+            assistant_msg.get("tool_calls").is_some(),
+            "tool_calls should be preserved"
+        );
 
         // Verify tool_call_id preserved on tool result message.
         let tool_msg = &history[2];
-        assert_eq!(tool_msg.get("tool_call_id").and_then(|v| v.as_str()), Some("tc_1"));
-        assert_eq!(tool_msg.get("name").and_then(|v| v.as_str()), Some("read_file"));
+        assert_eq!(
+            tool_msg.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_1")
+        );
+        assert_eq!(
+            tool_msg.get("name").and_then(|v| v.as_str()),
+            Some("read_file")
+        );
     }
 
     #[tokio::test]
@@ -566,21 +616,33 @@ mod tests {
     fn test_get_history_skips_orphaned_tool_results_at_boundary() {
         let mut session = Session::new("test");
         // Build: user → assistant+tool_calls → tool result → assistant → user → assistant
-        session.messages.push(json!({"role": "user", "content": "q1"}));
+        session
+            .messages
+            .push(json!({"role": "user", "content": "q1"}));
         session.messages.push(json!({
             "role": "assistant", "content": "",
             "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
         }));
-        session.messages.push(json!({"role": "tool", "tool_call_id": "tc_1", "name": "exec", "content": "ok"}));
-        session.messages.push(json!({"role": "assistant", "content": "Done"}));
-        session.messages.push(json!({"role": "user", "content": "q2"}));
-        session.messages.push(json!({"role": "assistant", "content": "answer"}));
+        session
+            .messages
+            .push(json!({"role": "tool", "tool_call_id": "tc_1", "name": "exec", "content": "ok"}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": "Done"}));
+        session
+            .messages
+            .push(json!({"role": "user", "content": "q2"}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": "answer"}));
 
         // Window of 4: naive start=2 → messages[2] is the tool result (orphan).
         // Protocol-safe windowing should skip it.
         let history = session.get_history(4, 0);
         assert!(
-            history.iter().all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool")),
+            history
+                .iter()
+                .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool")),
             "Orphaned tool results at window boundary should be skipped"
         );
         // Should have: assistant("Done"), user("q2"), assistant("answer") = 3 msgs
@@ -595,14 +657,22 @@ mod tests {
             "role": "assistant", "content": "",
             "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]
         }));
-        session.messages.push(json!({"role": "tool", "tool_call_id": "tc_1", "name": "read", "content": "data"}));
-        session.messages.push(json!({"role": "user", "content": "thanks"}));
-        session.messages.push(json!({"role": "assistant", "content": "you're welcome"}));
+        session.messages.push(
+            json!({"role": "tool", "tool_call_id": "tc_1", "name": "read", "content": "data"}),
+        );
+        session
+            .messages
+            .push(json!({"role": "user", "content": "thanks"}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": "you're welcome"}));
 
         // All 4 messages fit — tool result is NOT orphaned because its assistant is in the window.
         let history = session.get_history(100, 0);
         assert_eq!(history.len(), 4);
-        let has_tool = history.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
+        let has_tool = history
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
         assert!(has_tool, "Complete tool group should be preserved");
     }
 
@@ -643,5 +713,44 @@ mod tests {
             history_one[0].get("content").and_then(|v| v.as_str()),
             Some("question 5")
         );
+    }
+
+    #[test]
+    fn test_should_rotate_by_size() {
+        let mut session = Session::new("test:large");
+        // Create a session larger than 1MB
+        let large_content = "x".repeat(100_000);
+        for _ in 0..12 {
+            session.add_message("user", &large_content);
+        }
+        
+        assert!(should_rotate(&session), "Should rotate when size > 1MB");
+    }
+
+    #[test]
+    fn test_should_not_rotate_small_session() {
+        let session = Session::new("test:small");
+        // Fresh session with no messages should not rotate
+        assert!(!should_rotate(&session), "Should not rotate small session");
+    }
+
+    #[tokio::test]
+    async fn test_rotation_carries_recent_messages() {
+        let tmp = std::env::temp_dir().join("nanobot_test_rotation_carry");
+        let mgr = SessionManager::new(&tmp);
+        let key = format!("test:rotate_{}", uuid::Uuid::new_v4());
+        
+        // Add many messages to exceed 1MB
+        let large_content = "x".repeat(100_000);
+        for i in 0..12 {
+            mgr.add_message_and_save(&key, "user", &format!("{}: {}", i, large_content)).await;
+        }
+        
+        // Get history - should trigger rotation
+        let history = mgr.get_history(&key, 100, 0).await;
+        
+        // Should have carried over last 10 messages
+        assert!(history.len() <= 10, "After rotation should have at most {} messages, got {}", 
+                ROTATION_CARRY_MESSAGES, history.len());
     }
 }

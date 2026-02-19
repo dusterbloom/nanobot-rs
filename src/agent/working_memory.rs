@@ -12,11 +12,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::agent::token_budget::TokenBudget;
-use crate::utils::helpers::ensure_dir;
+use crate::utils::helpers::{ensure_dir, move_file};
 
 /// Status of a working session.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,10 +82,7 @@ impl WorkingMemoryStore {
         hasher.update(session_key.as_bytes());
         let result = hasher.finalize();
         // Manual hex encode of first 4 bytes (= 8 hex chars).
-        result[..4]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        result[..4].iter().map(|b| format!("{:02x}", b)).collect()
     }
 
     /// Path for a session file.
@@ -120,8 +117,12 @@ impl WorkingMemoryStore {
         let frontmatter = format!(
             "---\nsession_key: \"{}\"\ncreated: \"{}\"\nupdated: \"{}\"\nstatus: {}\n---\n",
             session.session_key,
-            session.created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            session.updated.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            session
+                .created
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            session
+                .updated
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             session.status,
         );
         let full = if session.content.is_empty() {
@@ -130,7 +131,10 @@ impl WorkingMemoryStore {
             format!("{}\n{}", frontmatter, session.content)
         };
         if let Err(e) = fs::write(&session.path, &full) {
-            warn!("Failed to save working session {}: {}", session.session_key, e);
+            warn!(
+                "Failed to save working session {}: {}",
+                session.session_key, e
+            );
         }
     }
 
@@ -207,7 +211,7 @@ impl WorkingMemoryStore {
         ensure_dir(&self.archived_dir);
         if let Some(filename) = path.file_name() {
             let dest = self.archived_dir.join(filename);
-            fs::rename(&path, &dest)?;
+            move_file(&path, &dest)?;
         }
         Ok(())
     }
@@ -394,7 +398,10 @@ mod tests {
     fn test_get_context_truncated() {
         let (_tmp, store) = make_store();
         // Use multi-line content so line-boundary truncation kicks in.
-        let content = (0..500).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..500)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         store.update_from_compaction("cli:default", &content);
         let ctx = store.get_context("cli:default", 50);
         // Should be silently truncated — no marker visible to the model.
@@ -493,19 +500,29 @@ mod tests {
 
         // Only the latest snapshot survives (overwrite, not append).
         let ctx = wm.get_context("cli:session1", 10000);
-        assert!(!ctx.contains("ownership model"), "older snapshots should be overwritten");
+        assert!(
+            !ctx.contains("ownership model"),
+            "older snapshots should be overwritten"
+        );
         assert!(ctx.contains("async next"), "latest snapshot should survive");
 
         // Verify the session file exists on disk.
         let hash = WorkingMemoryStore::session_hash("cli:session1");
-        let session_file = tmp.path().join("memory").join("sessions").join(format!("SESSION_{}.md", hash));
+        let session_file = tmp
+            .path()
+            .join("memory")
+            .join("sessions")
+            .join(format!("SESSION_{}.md", hash));
         assert!(session_file.exists(), "Session file should exist on disk");
 
         // Verify per-channel CONTEXT-cli.md was written (channel extracted from session key).
         let context_file = tmp.path().join("CONTEXT-cli.md");
         assert!(context_file.exists(), "CONTEXT-cli.md should exist");
         let context_content = std::fs::read_to_string(&context_file).unwrap();
-        assert!(context_content.contains("async next"), "CONTEXT-cli.md should have latest snapshot");
+        assert!(
+            context_content.contains("async next"),
+            "CONTEXT-cli.md should have latest snapshot"
+        );
     }
 
     #[test]
@@ -554,7 +571,8 @@ mod tests {
         std::fs::write(
             obs_dir.join("20260101T000000Z_test.md"),
             "---\ntimestamp: 2026-01-01T00:00:00Z\nsession: test\n---\n\nOld observation data.",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Also write long-term memory to verify it IS loaded.
         let mem_dir = tmp.path().join("memory");
@@ -564,14 +582,26 @@ mod tests {
         let prompt = cb.build_system_prompt(None, None);
 
         // Observations should NOT be in the prompt.
-        assert!(!prompt.contains("Old observation data"), "Observations must not be in system prompt");
+        assert!(
+            !prompt.contains("Old observation data"),
+            "Observations must not be in system prompt"
+        );
         assert!(!prompt.contains("Observations from Past Conversations"));
 
         // Long-term memory SHOULD be in the prompt.
-        assert!(prompt.contains("User likes Rust"), "Long-term memory should be in system prompt");
+        assert!(
+            prompt.contains("User likes Rust"),
+            "Long-term memory should be in system prompt"
+        );
 
         // Identity should mention layered memory system.
-        assert!(prompt.contains("Working Memory"), "Identity should mention working memory");
-        assert!(prompt.contains("recall"), "Identity should mention recall tool");
+        assert!(
+            prompt.contains("Working Memory"),
+            "Identity should mention working memory"
+        );
+        assert!(
+            prompt.contains("recall"),
+            "Identity should mention recall tool"
+        );
     }
 }

@@ -53,10 +53,17 @@ pub fn render_turn(text: &str, role: TurnRole) -> String {
             // Dark grey background per line (raw text, no markdown pipeline —
             // render_response resets would kill the bg color).
             // First line gets a ● marker: green for text, purple for voice.
-            let marker_color = if role == TurnRole::VoiceUser { "\x1b[35m" } else { "\x1b[32m" };
+            let marker_color = if role == TurnRole::VoiceUser {
+                "\x1b[35m"
+            } else {
+                "\x1b[32m"
+            };
             for (i, line) in text.lines().enumerate() {
                 if i == 0 {
-                    output.push_str(&format!("\x1b[48;5;236m {}●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n", marker_color, line));
+                    output.push_str(&format!(
+                        "\x1b[48;5;236m {}●\x1b[0m\x1b[48;5;236m {} \x1b[0m\n",
+                        marker_color, line
+                    ));
                 } else {
                     output.push_str(&format!("\x1b[48;5;236m   {} \x1b[0m\n", line));
                 }
@@ -105,7 +112,8 @@ pub fn render_turn_with_provenance(
 
     // If there are claimed items in strict mode, append a summary.
     if strict {
-        let claimed: Vec<&(usize, usize, u8, String)> = claims.iter().filter(|c| c.2 == 2).collect();
+        let claimed: Vec<&(usize, usize, u8, String)> =
+            claims.iter().filter(|c| c.2 == 2).collect();
         if !claimed.is_empty() {
             output.push_str(&format!(
                 "\n\x1b[33m\x1b[1m⚠ {} unverified claim(s):\x1b[0m\n",
@@ -148,15 +156,13 @@ pub fn render_turn_with_provenance(
 ///
 /// Use this when the response was already rendered incrementally and we only
 /// need to append claim verification summary.
-pub fn render_provenance_footer(
-    claims: &[(usize, usize, u8, String)],
-    strict: bool,
-) -> String {
+pub fn render_provenance_footer(claims: &[(usize, usize, u8, String)], strict: bool) -> String {
     let mut output = String::new();
 
     // If there are claimed items in strict mode, append a summary.
     if strict {
-        let claimed: Vec<&(usize, usize, u8, String)> = claims.iter().filter(|c| c.2 == 2).collect();
+        let claimed: Vec<&(usize, usize, u8, String)> =
+            claims.iter().filter(|c| c.2 == 2).collect();
         if !claimed.is_empty() {
             output.push_str(&format!(
                 "\n\x1b[33m\x1b[1m⚠ {} unverified claim(s):\x1b[0m\n",
@@ -301,7 +307,10 @@ pub(crate) fn render_code_block(code: &str, lang: &str) -> String {
     }
 
     // Footer: ──────────────────
-    output.push_str(&format!("\x1b[38;5;240m{}\x1b[0m\n", "─".repeat(rule_width)));
+    output.push_str(&format!(
+        "\x1b[38;5;240m{}\x1b[0m\n",
+        "─".repeat(rule_width)
+    ));
 
     output
 }
@@ -409,7 +418,10 @@ mod tests {
     fn test_render_turn_assistant_has_marker() {
         let output = render_turn("Hello world", TurnRole::Assistant);
         let plain = strip_ansi(&output);
-        assert!(plain.contains('И'), "assistant turn must start with И marker");
+        assert!(
+            plain.contains('И'),
+            "assistant turn must start with И marker"
+        );
         assert!(plain.contains("Hello world"));
     }
 
@@ -418,7 +430,9 @@ mod tests {
         let output = render_turn("Some response", TurnRole::Assistant);
         let plain = strip_ansi(&output);
         let marker_pos = plain.find('И').expect("И must be present");
-        let content_pos = plain.find("Some response").expect("content must be present");
+        let content_pos = plain
+            .find("Some response")
+            .expect("content must be present");
         assert!(marker_pos < content_pos, "И must appear before content");
     }
 
@@ -434,7 +448,10 @@ mod tests {
         let output = render_turn("Hello **bold** text", TurnRole::User);
         let plain = strip_ansi(&output);
         // User text is raw (grey box), not markdown-rendered.
-        assert!(plain.contains("**bold**"), "user text should be raw, not markdown-processed");
+        assert!(
+            plain.contains("**bold**"),
+            "user text should be raw, not markdown-processed"
+        );
     }
 
     #[test]
@@ -442,7 +459,10 @@ mod tests {
         let output = render_turn("Look:\n\n```rust\nlet x = 1;\n```", TurnRole::User);
         let plain = strip_ansi(&output);
         assert!(plain.contains("let x = 1;"));
-        assert!(plain.contains("```rust"), "code fences should be preserved raw");
+        assert!(
+            plain.contains("```rust"),
+            "code fences should be preserved raw"
+        );
     }
 
     #[test]
@@ -479,10 +499,15 @@ mod tests {
     #[test]
     fn test_render_turn_with_provenance_with_claims() {
         let claims = vec![
-            (0, 5, 0u8, "read file".to_string()),  // Observed
-            (10, 20, 2u8, "deleted stuff".to_string()),  // Claimed
+            (0, 5, 0u8, "read file".to_string()),       // Observed
+            (10, 20, 2u8, "deleted stuff".to_string()), // Claimed
         ];
-        let output = render_turn_with_provenance("Hello world with claims", TurnRole::Assistant, &claims, false);
+        let output = render_turn_with_provenance(
+            "Hello world with claims",
+            TurnRole::Assistant,
+            &claims,
+            false,
+        );
         let plain = strip_ansi(&output);
         assert!(plain.contains("provenance:"));
     }
@@ -490,7 +515,7 @@ mod tests {
     #[test]
     fn test_render_turn_with_provenance_strict_mode() {
         let claims = vec![
-            (0, 5, 2u8, "I deleted the files".to_string()),  // Claimed
+            (0, 5, 2u8, "I deleted the files".to_string()), // Claimed
         ];
         let output = render_turn_with_provenance("Test", TurnRole::Assistant, &claims, true);
         let plain = strip_ansi(&output);

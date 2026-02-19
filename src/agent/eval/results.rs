@@ -331,9 +331,10 @@ pub fn summarize(result: &EvalResult) -> ResultSummary {
                 completion,
             )
         }
-        BenchmarkData::HaystackRetrieval { mrr, recall, .. } => {
-            (format!("MRR {:.3}, Recall {:.1}%", mrr, recall * 100.0), *mrr)
-        }
+        BenchmarkData::HaystackRetrieval { mrr, recall, .. } => (
+            format!("MRR {:.3}, Recall {:.1}%", mrr, recall * 100.0),
+            *mrr,
+        ),
         BenchmarkData::HaystackAggregation { accuracy, .. } => {
             (format!("{:.1}% accuracy", accuracy * 100.0), *accuracy)
         }

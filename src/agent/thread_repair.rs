@@ -6,8 +6,27 @@
 
 use std::collections::HashSet;
 
+use regex::Regex;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tracing::{debug, warn};
+
+static STRIP_TOOL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[Called\s+\w+\([^]]*\)\]\s*").expect("Invalid strip tool pattern regex")
+});
+
+/// Pattern to strip XML-style tool calls like <read_file>{"path":"..."}</read_file>
+/// Note: Uses non-backreference approach since Rust regex doesn't support \1
+static STRIP_XML_TOOL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<(read_file|write_file|exec|spawn|web_fetch|list_dir|edit_file)[^>]*>.*?</(read_file|write_file|exec|spawn|web_fetch|list_dir|edit_file)>\s*")
+        .expect("Invalid XML tool pattern regex")
+});
+
+/// Pattern to strip tool intent phrases that the model shouldn't learn
+static STRIP_INTENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(let me (check|read|look|execute|run|fetch)|i'll (check|read|look|execute|run|fetch)|i will (check|read|look|execute|run|fetch))\s*")
+        .expect("Invalid intent pattern regex")
+});
 
 /// Repair protocol violations in a message array.
 ///
@@ -274,13 +293,18 @@ fn ensure_not_ending_with_assistant(messages: &mut Vec<Value>) {
     if let Some(last) = messages.last() {
         let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "assistant" {
-            let content_preview: String = last.get("content")
+            let content_preview: String = last
+                .get("content")
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .chars()
                 .take(80)
                 .collect();
-            let has_tool_calls = last.get("tool_calls").and_then(|tc| tc.as_array()).map(|a| a.len()).unwrap_or(0);
+            let has_tool_calls = last
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             warn!(
                 "Messages end with assistant role — appending user continuation to prevent prefill error \
                  (msg_count={}, content=\"{}\", tool_calls={})",
@@ -312,7 +336,27 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
         return;
     }
 
-    // Pass 1: Convert assistant tool_calls to text descriptions.
+    // Pass 0: Local templates typically allow at most one leading system message.
+    // Convert any mid-thread system messages into user notes.
+    for (idx, msg) in messages.iter_mut().enumerate() {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "system" || idx == 0 {
+            continue;
+        }
+        let content = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        *msg = json!({
+            "role": "user",
+            "content": format!("[System notice] {}", content)
+        });
+    }
+
+    // Pass 1: Convert assistant tool_calls to a compact, non-imitatable summary.
+    // Uses "(used tools: name1, name2)" format that won't be stripped by
+    // strip_imitatable_patterns(), preserving tool context for local models.
     for msg in messages.iter_mut() {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role != "assistant" {
@@ -323,19 +367,19 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
             _ => continue,
         };
 
-        // Build text description of tool calls.
-        let mut call_descriptions: Vec<String> = Vec::new();
+        // Collect unique tool names in call order.
+        let mut tool_names: Vec<String> = Vec::new();
         for tc in &tool_calls {
             let name = tc
                 .pointer("/function/name")
                 .and_then(|n| n.as_str())
-                .unwrap_or("unknown");
-            let args = tc
-                .pointer("/function/arguments")
-                .and_then(|a| a.as_str())
-                .unwrap_or("{}");
-            call_descriptions.push(format!("[Called {}({})]", name, args));
+                .unwrap_or("unknown")
+                .to_string();
+            if !tool_names.contains(&name) {
+                tool_names.push(name);
+            }
         }
+        let summary = format!("(used tools: {})", tool_names.join(", "));
 
         // Preserve existing content text if any.
         let existing = msg
@@ -345,9 +389,9 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
             .to_string();
 
         let new_content = if existing.is_empty() {
-            call_descriptions.join("\n")
+            summary
         } else {
-            format!("{}\n{}", existing, call_descriptions.join("\n"))
+            format!("{}\n{}", existing, summary)
         };
 
         // Replace message: keep role, set content, remove tool_calls.
@@ -367,10 +411,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
             .get("tool_call_id")
             .and_then(|id| id.as_str())
             .unwrap_or("?");
-        let tool_name = msg
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("tool");
+        let tool_name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
         let content = msg
             .get("content")
             .and_then(|c| c.as_str())
@@ -392,8 +433,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
 fn merge_consecutive_assistant_messages(messages: &mut Vec<Value>) {
     let mut i = 0;
     while i + 1 < messages.len() {
-        let is_assistant =
-            messages[i].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let is_assistant = messages[i].get("role").and_then(|r| r.as_str()) == Some("assistant");
         let next_is_assistant =
             messages[i + 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
 
@@ -414,6 +454,47 @@ fn merge_consecutive_assistant_messages(messages: &mut Vec<Value>) {
             messages.remove(i + 1);
         } else {
             i += 1;
+        }
+    }
+}
+
+/// Strip `[Called tool(...)]` patterns from assistant message content.
+///
+/// This prevents models from learning to output text descriptions of tool calls
+/// instead of actual tool calls. The patterns are added by `repair_for_strict_alternation`
+/// for local models that can't handle native tool_calls, but we must remove them
+/// before the next LLM call to avoid teaching the model this anti-pattern.
+///
+/// Also strips:
+/// - XML-style tool calls: <read_file>...</read_file>
+/// - Tool intent phrases: "Let me check", "I'll read"
+pub fn strip_imitatable_patterns(messages: &mut Vec<Value>) {
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+            let mut cleaned = content.to_string();
+            let original_len = cleaned.len();
+
+            // Strip [Called tool(...)] patterns
+            cleaned = STRIP_TOOL_PATTERN.replace_all(&cleaned, "").to_string();
+
+            // Strip XML-style tool calls
+            cleaned = STRIP_XML_TOOL_PATTERN.replace_all(&cleaned, "").to_string();
+
+            // Strip tool intent phrases (only if no actual tools were called)
+            cleaned = STRIP_INTENT_PATTERN.replace_all(&cleaned, "").to_string();
+
+            let cleaned = cleaned.trim().to_string();
+            if cleaned.len() != original_len {
+                debug!(
+                    "Stripped imitatable tool patterns from assistant message ({} -> {} chars)",
+                    original_len,
+                    cleaned.len()
+                );
+                msg["content"] = Value::String(cleaned);
+            }
         }
     }
 }
@@ -637,7 +718,10 @@ mod tests {
         // Should have exactly 1 tool result (the synthetic one, AFTER the assistant).
         assert_eq!(tool_msgs.len(), 1);
         assert!(
-            tool_msgs[0]["content"].as_str().unwrap().contains("interrupted"),
+            tool_msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("interrupted"),
             "Should be a synthetic result"
         );
     }
@@ -714,7 +798,11 @@ mod tests {
             .iter()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
             .collect();
-        assert_eq!(tool_msgs.len(), 1, "Duplicate tool result should be removed");
+        assert_eq!(
+            tool_msgs.len(),
+            1,
+            "Duplicate tool result should be removed"
+        );
         assert_eq!(
             tool_msgs[0]["content"].as_str().unwrap(),
             "first result",
@@ -796,7 +884,9 @@ mod tests {
 
         // No tool messages should remain.
         assert!(
-            !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            !messages
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
             "No tool messages should remain after strict alternation repair"
         );
         // No tool_calls keys should remain.
@@ -840,12 +930,19 @@ mod tests {
         repair_for_strict_alternation(&mut messages);
 
         // The assistant message should contain both original content and tool call description.
-        let assistant = messages.iter()
+        let assistant = messages
+            .iter()
             .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
             .expect("Should have an assistant message");
         let content = assistant["content"].as_str().unwrap();
-        assert!(content.contains("Let me check that file."), "Should preserve original content");
-        assert!(content.contains("[Called read_file"), "Should describe tool call");
+        assert!(
+            content.contains("Let me check that file."),
+            "Should preserve original content"
+        );
+        assert!(
+            content.contains("(used tools: read_file)"),
+            "Should describe tool call"
+        );
     }
 
     #[test]
@@ -879,15 +976,26 @@ mod tests {
         repair_for_strict_alternation(&mut messages);
 
         // The two tool messages should be merged into one user message.
-        let user_msgs: Vec<&Value> = messages.iter()
+        let user_msgs: Vec<&Value> = messages
+            .iter()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
             .collect();
         // Original user + merged tool results = 2 user messages.
-        assert_eq!(user_msgs.len(), 2, "Should have 2 user messages (original + merged tool results)");
+        assert_eq!(
+            user_msgs.len(),
+            2,
+            "Should have 2 user messages (original + merged tool results)"
+        );
         // The merged message should contain both results.
         let merged = user_msgs[1]["content"].as_str().unwrap();
-        assert!(merged.contains("contents of a"), "Should contain first result");
-        assert!(merged.contains("contents of b"), "Should contain second result");
+        assert!(
+            merged.contains("contents of a"),
+            "Should contain first result"
+        );
+        assert!(
+            merged.contains("contents of b"),
+            "Should contain second result"
+        );
     }
 
     #[test]
@@ -902,7 +1010,10 @@ mod tests {
 
         repair_for_strict_alternation(&mut messages);
 
-        assert_eq!(messages, original, "Should not modify messages without tool roles");
+        assert_eq!(
+            messages, original,
+            "Should not modify messages without tool roles"
+        );
     }
 
     #[test]
@@ -929,14 +1040,19 @@ mod tests {
         repair_for_strict_alternation(&mut messages);
 
         // Verify strict alternation: after system, must alternate user/assistant.
-        let roles: Vec<&str> = messages.iter()
+        let roles: Vec<&str> = messages
+            .iter()
             .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or(""))
             .collect();
         assert_eq!(roles[0], "system");
         for i in 1..roles.len() - 1 {
             if roles[i] == "user" {
-                assert!(roles[i + 1] == "assistant" || roles[i + 1] == "user",
-                    "After user at {}, got {} (expected assistant or user for merge)", i, roles[i + 1]);
+                assert!(
+                    roles[i + 1] == "assistant" || roles[i + 1] == "user",
+                    "After user at {}, got {} (expected assistant or user for merge)",
+                    i,
+                    roles[i + 1]
+                );
             }
         }
         // No tool messages.
@@ -948,5 +1064,212 @@ mod tests {
         let mut messages: Vec<Value> = vec![];
         repair_for_strict_alternation(&mut messages);
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_strict_alternation_converts_mid_system_to_user_note() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "Top-level system prompt"}),
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "assistant", "content": "Hi"}),
+            json!({"role": "system", "content": "Legacy warning injected mid-thread"}),
+            json!({"role": "assistant", "content": "Continuing"}),
+        ];
+
+        repair_for_strict_alternation(&mut messages);
+
+        // Leading system prompt is allowed.
+        assert_eq!(messages[0]["role"], "system");
+        // Any system after index 0 should be removed/converted.
+        assert!(!messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .any(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("system")));
+        // Converted message should be represented as user note.
+        assert!(
+            messages.iter().any(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && m.get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .contains("[System notice]")
+            }),
+            "Expected converted system notice as user message"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for strip_imitatable_patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_strip_removes_called_patterns() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "I'll read the file.\n[Called read_file({\"path\":\"/foo\"})]\nHere's what I found."}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(!content.contains("[Called"), "Should strip [Called pattern");
+        assert!(
+            content.contains("Here's what I found"),
+            "Should preserve other text"
+        );
+    }
+
+    #[test]
+    fn test_strip_removes_called_patterns_no_intent() {
+        // This test verifies [Called ...] stripping without intent phrases
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "Processing.\n[Called read_file({\"path\":\"/foo\"})]\nDone."}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(!content.contains("[Called"), "Should strip [Called pattern");
+        assert!(content.contains("Processing"), "Should preserve other text");
+        assert!(content.contains("Done"), "Should preserve other text");
+    }
+
+    #[test]
+    fn test_strip_multiple_patterns() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "[Called spawn({\"task\":\"a\"})]\n[Called spawn({\"task\":\"b\"})]\nDone"}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("[Called"),
+            "Should strip all [Called patterns"
+        );
+        assert!(content.contains("Done"), "Should preserve trailing text");
+    }
+
+    #[test]
+    fn test_strip_only_assistant_messages() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "[Called fake({})]"}),
+            json!({"role": "assistant", "content": "[Called real({})]"}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        assert!(
+            messages[0]["content"].as_str().unwrap().contains("[Called"),
+            "Should NOT strip from user messages"
+        );
+        assert!(
+            !messages[1]["content"].as_str().unwrap().contains("[Called"),
+            "Should strip from assistant messages"
+        );
+    }
+
+    #[test]
+    fn test_strip_preserves_empty_assistant() {
+        let mut messages = vec![json!({"role": "assistant", "content": ""})];
+
+        strip_imitatable_patterns(&mut messages);
+
+        assert_eq!(messages[0]["content"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn test_strip_pattern_variations() {
+        let test_cases = [
+            "[Called read_file({})]",
+            "[Called spawn({\"task\":\"test\"})]",
+            "[called exec({\"cmd\":\"ls\"})]", // lowercase variant
+            "[Called web_fetch({\"url\":\"https://example.com\"})]",
+        ];
+
+        for pattern in test_cases {
+            let mut messages = vec![json!({"role": "assistant", "content": pattern.to_string()})];
+
+            strip_imitatable_patterns(&mut messages);
+
+            assert!(
+                !messages[0]["content"].as_str().unwrap().contains("[Called"),
+                "Should strip pattern: {}",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_xml_tool_patterns() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "I'll do it.\n<read_file>{\"path\":\"Cargo.toml\"}</read_file>\nDone"}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("<read_file"),
+            "Should strip XML tool pattern"
+        );
+        assert!(content.contains("Done"), "Should preserve trailing text");
+    }
+
+    #[test]
+    fn test_strip_multiple_xml_patterns() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": "<read_file>{\"path\":\"a\"}</read_file>\n<exec>{\"cmd\":\"ls\"}</exec>\nComplete"}),
+        ];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("<read_file"),
+            "Should strip read_file XML"
+        );
+        assert!(!content.contains("<exec"), "Should strip exec XML");
+        assert!(
+            content.contains("Complete"),
+            "Should preserve trailing text"
+        );
+    }
+
+    #[test]
+    fn test_strip_intent_phrases() {
+        let test_cases = [
+            "Let me check that file.",
+            "I'll read the configuration.",
+            "I will execute the command.",
+            "Let me fetch the data.",
+        ];
+
+        for intent in test_cases {
+            let mut messages = vec![json!({"role": "assistant", "content": intent.to_string()})];
+
+            strip_imitatable_patterns(&mut messages);
+
+            let content = messages[0]["content"].as_str().unwrap();
+            assert!(
+                !content.to_lowercase().contains("let me"),
+                "Should strip intent phrase: {}",
+                intent
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_intent_preserves_other_text() {
+        let mut messages =
+            vec![json!({"role": "assistant", "content": "The file contains important data."})];
+
+        strip_imitatable_patterns(&mut messages);
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("important"),
+            "Should preserve non-intent text"
+        );
     }
 }

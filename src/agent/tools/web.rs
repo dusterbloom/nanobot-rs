@@ -99,13 +99,13 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     /// Create a new web search tool.
     ///
-    /// If `api_key` is empty/None, the `BRAVE_API_KEY` environment variable is
-    /// checked.
+    /// If `api_key` is `None`, the `BRAVE_API_KEY` environment variable is
+    /// checked. Passing `Some("")` explicitly disables env fallback.
     pub fn new(api_key: Option<String>, max_results: u32) -> Self {
-        let resolved_key = api_key
-            .filter(|k| !k.is_empty())
-            .or_else(|| std::env::var("BRAVE_API_KEY").ok())
-            .unwrap_or_default();
+        let resolved_key = match api_key {
+            Some(key) => key,
+            None => std::env::var("BRAVE_API_KEY").unwrap_or_default(),
+        };
 
         Self {
             api_key: resolved_key,
@@ -394,7 +394,7 @@ impl Tool for WebFetchTool {
 /// and boilerplate.  Falls back to the old `scraper`-based extraction on
 /// parse errors or when `dom_smoothie` returns empty content.
 fn extract_html_content(html: &str, mode: &str) -> String {
-    use dom_smoothie::{Readability, Config, TextMode};
+    use dom_smoothie::{Config, Readability, TextMode};
 
     let text_mode = if mode == "markdown" {
         TextMode::Markdown

@@ -24,25 +24,37 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
+use crate::agent::pipeline;
+use crate::agent::policy;
 use crate::agent::reflector::Reflector;
-use crate::agent::working_memory::WorkingMemoryStore;
+use crate::agent::role_policy;
+use crate::agent::router_fallback;
 use crate::agent::subagent::SubagentManager;
+use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
 use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
-use crate::agent::tools::{
-    CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool, ListDirTool, MessageTool,
-    CancelCallback, CheckCallback, ListCallback, LoopCallback, PipelineCallback, ReadFileTool, ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry, WaitCallback,
-    WebFetchTool, WebSearchTool, WriteFileTool,
-};
-use crate::agent::pipeline;
-use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::agent::tool_guard::ToolGuard;
+use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
-use crate::agent::system_state::{self, AhaSignal, AhaPriority, SystemState};
-use crate::config::schema::{EmailConfig, MemoryConfig, ProprioceptionConfig, ProvenanceConfig, ToolDelegationConfig};
+use crate::agent::tools::{
+    CancelCallback, CheckCallback, CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool,
+    ListCallback, ListDirTool, LoopCallback, MessageTool, PipelineCallback, ReadFileTool,
+    ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
+    WaitCallback, WebFetchTool, WebSearchTool, WriteFileTool,
+};
+use crate::agent::working_memory::WorkingMemoryStore;
+use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::config::schema::{
+    EmailConfig, MemoryConfig, ProprioceptionConfig, ProvenanceConfig, ToolDelegationConfig,
+    TrioConfig,
+};
 use crate::cron::service::CronService;
-use crate::providers::base::{LLMProvider, StreamChunk};
+use crate::providers::base::{LLMProvider, StreamChunk, ToolCallRequest};
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::session::manager::SessionManager;
+
+use crate::agent::context_hygiene;
+use crate::agent::validation;
 
 // ---------------------------------------------------------------------------
 // Shared core (identical across all agents, swappable on /local toggle)
@@ -74,8 +86,16 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    pub main_no_think: bool,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_runner_model: Option<String>,
+    pub router_provider: Option<Arc<dyn LLMProvider>>,
+    pub router_model: Option<String>,
+    pub router_no_think: bool,
+    pub router_temperature: f64,
+    pub router_top_p: f64,
+    pub specialist_provider: Option<Arc<dyn LLMProvider>>,
+    pub specialist_model: Option<String>,
     pub tool_delegation_config: ToolDelegationConfig,
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
@@ -174,6 +194,320 @@ impl AgentHandle {
 // Backward-compatibility alias during migration.
 pub type SharedCoreHandle = AgentHandle;
 
+/// Local chat templates often reject mid-conversation `system` messages.
+/// In local mode, provenance reminders must be emitted as `user` role.
+fn provenance_warning_role(is_local: bool) -> &'static str {
+    if is_local {
+        "user"
+    } else {
+        "system"
+    }
+}
+
+fn is_small_local_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("nanbeige")
+        || m.contains("functiongemma")
+        || m.contains("ministral-3")
+        || m.contains("qwen3-1.7b")
+        || m.contains("3b")
+        || m.contains("1.7b")
+}
+
+/// Extract the first top-level JSON object from raw text.
+///
+/// This tolerates wrappers like markdown fences while still requiring the
+/// final parsed payload to satisfy strict schema validation.
+fn extract_json_object(raw: &str) -> Option<String> {
+    let mut start = None;
+    let mut depth: i32 = 0;
+    for (idx, ch) in raw.char_indices() {
+        if ch == '{' {
+            if start.is_none() {
+                start = Some(idx);
+            }
+            depth += 1;
+        } else if ch == '}' && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(s) = start {
+                    return Some(raw[s..=idx].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse FunctionGemma-style function-call output into a router decision.
+///
+/// Example accepted fragment:
+/// `call: tool,read_file,{"path":"README.md","confidence":0.9}`
+fn parse_functiongemma_router_decision(raw: &str) -> Option<role_policy::RouterDecision> {
+    fn normalize_action(raw_action: &str, target: &str, args: &Value) -> String {
+        let a = raw_action.to_lowercase();
+        let t = target.to_lowercase();
+        if matches!(a.as_str(), "tool" | "subagent" | "specialist" | "ask_user") {
+            return a;
+        }
+        if t.contains("clarify") || args.get("question").is_some() {
+            return "ask_user".to_string();
+        }
+        if t.contains("summar") || t.contains("specialist") {
+            return "specialist".to_string();
+        }
+        if t.contains("agent") || a.contains("subagent") {
+            return "subagent".to_string();
+        }
+        "tool".to_string()
+    }
+
+    fn extract_quoted(raw: &str, key: &str) -> Option<String> {
+        let pat = format!("\"{}\":\"", key);
+        let start = raw.find(&pat)? + pat.len();
+        let tail = &raw[start..];
+        let end = tail.find('"')?;
+        Some(tail[..end].to_string())
+    }
+
+    let mut tail = if let Some(call_start) = raw.find("call:") {
+        raw[call_start + "call:".len()..].to_string()
+    } else {
+        raw.to_string()
+    }
+    .replace("<start_function_call>", "")
+        .replace("<end_function_call>", "")
+        .replace("<escape>", "")
+        .replace('\n', " ");
+
+    let end = tail.find("<end_function_call>").unwrap_or(tail.len());
+    tail = tail[..end].trim().to_string();
+
+    // Canonical FunctionGemma shape: `tool,target,{"k":"v"}`
+    if tail.contains(',') && !tail.contains("\"action\"") {
+        let mut parts = tail.splitn(3, ',');
+        let raw_action = parts.next()?.trim();
+        let target = parts.next()?.trim().to_string();
+        let args_raw = parts.next().unwrap_or("{}").trim();
+        let args = serde_json::from_str::<Value>(args_raw).unwrap_or_else(|_| json!({}));
+        let confidence = args
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.7);
+        let decision = role_policy::RouterDecision {
+            action: normalize_action(raw_action, &target, &args),
+            target,
+            args,
+            confidence,
+        };
+        if role_policy::parse_router_decision_strict(&serde_json::to_string(&decision).ok()?)
+            .is_ok()
+        {
+            return Some(decision);
+        }
+    }
+
+    // Malformed JSON-ish output: recover fields leniently.
+    let target = extract_quoted(&tail, "target")
+        .or_else(|| extract_quoted(raw, "target"))
+        .unwrap_or_else(|| "clarify".to_string());
+    let raw_action = extract_quoted(&tail, "action")
+        .or_else(|| extract_quoted(&tail, "call"))
+        .or_else(|| extract_quoted(raw, "action"))
+        .or_else(|| extract_quoted(raw, "call"))
+        .unwrap_or_else(|| "tool".to_string());
+    let args = extract_json_object(&tail)
+        .and_then(|obj| serde_json::from_str::<Value>(&obj).ok())
+        .and_then(|v| v.get("args").cloned())
+        .or_else(|| {
+            extract_json_object(raw)
+                .and_then(|obj| serde_json::from_str::<Value>(&obj).ok())
+                .and_then(|v| v.get("args").cloned())
+        })
+        .unwrap_or_else(|| json!({}));
+    let confidence = extract_json_object(&tail)
+        .and_then(|obj| serde_json::from_str::<Value>(&obj).ok())
+        .and_then(|v| v.get("confidence").and_then(|c| c.as_f64()))
+        .or_else(|| {
+            extract_json_object(raw)
+                .and_then(|obj| serde_json::from_str::<Value>(&obj).ok())
+                .and_then(|v| v.get("confidence").and_then(|c| c.as_f64()))
+        })
+        .unwrap_or(0.5);
+    let decision = role_policy::RouterDecision {
+        action: normalize_action(&raw_action, &target, &args),
+        target,
+        args,
+        confidence,
+    };
+    if role_policy::parse_router_decision_strict(&serde_json::to_string(&decision).ok()?).is_ok() {
+        Some(decision)
+    } else {
+        None
+    }
+}
+
+async fn request_strict_router_decision(
+    provider: &dyn LLMProvider,
+    model: &str,
+    router_pack: &str,
+    no_think: bool,
+    temperature: f64,
+) -> Result<role_policy::RouterDecision, String> {
+    fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
+        let action = {
+            let pat = "action=";
+            let start = pack.find(pat)? + pat.len();
+            let tail = &pack[start..];
+            let end = tail
+                .find(|c: char| c.is_whitespace() || c == ',')
+                .unwrap_or(tail.len());
+            tail[..end].trim().to_string()
+        };
+        let target = {
+            let pat = "target=";
+            let start = pack.find(pat)? + pat.len();
+            let tail = &pack[start..];
+            let end = tail
+                .find(|c: char| c.is_whitespace() || c == ',')
+                .unwrap_or(tail.len());
+            tail[..end].trim().to_string()
+        };
+        let args = if let Some(args_pos) = pack.find("args=") {
+            let tail = &pack[args_pos + "args=".len()..];
+            extract_json_object(tail)
+                .and_then(|obj| serde_json::from_str::<Value>(&obj).ok())
+                .unwrap_or_else(|| json!({}))
+        } else {
+            json!({})
+        };
+        let decision = role_policy::RouterDecision {
+            action,
+            target,
+            args,
+            confidence: 0.9,
+        };
+        if role_policy::parse_router_decision_strict(&serde_json::to_string(&decision).ok()?)
+            .is_ok()
+        {
+            Some(decision)
+        } else {
+            None
+        }
+    }
+
+    // Build user content with optional /no_think prefix for Nemotron-Orchestrator-8B
+    let user_content = if no_think {
+        format!(" /no_think\n{}", router_pack)
+    } else {
+        router_pack.to_string()
+    };
+
+    let route_tool = json!({
+        "type": "function",
+        "function": {
+            "name": "route_decision",
+            "description": "Return one routing decision.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["tool","subagent","specialist","ask_user"]},
+                    "target": {"type": "string"},
+                    "args": {"type": "object"},
+                    "confidence": {"type": "number"}
+                },
+                "required": ["action","target","args","confidence"]
+            }
+        }
+    });
+    let tool_defs = vec![route_tool];
+    let tool_messages = vec![
+        json!({
+            "role": "system",
+            "content": "ROLE=ROUTER\nCall route_decision exactly once. Do not emit prose."
+        }),
+        json!({
+            "role": "user",
+            "content": user_content.clone()
+        }),
+    ];
+    if let Ok(tool_resp) = provider
+        .chat(&tool_messages, Some(&tool_defs), Some(model), 128, temperature, None)
+        .await
+    {
+        if let Some(tc) = tool_resp.tool_calls.first() {
+            if tc.name == "route_decision" {
+                let args_obj = tc
+                    .arguments
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<serde_json::Map<String, Value>>();
+                let val = Value::Object(args_obj);
+                if let Ok(decision) = serde_json::from_value::<role_policy::RouterDecision>(val) {
+                    if role_policy::parse_router_decision_strict(
+                        &serde_json::to_string(&decision).unwrap_or_default(),
+                    )
+                    .is_ok()
+                    {
+                        return Ok(decision);
+                    }
+                }
+            }
+        }
+    }
+
+    let router_messages = vec![
+        json!({
+            "role": "system",
+            "content": "ROLE=ROUTER\nOutput EXACTLY one minified JSON object.\nSchema:{\"action\":\"tool|subagent|specialist|ask_user\",\"target\":\"string\",\"args\":{},\"confidence\":0..1}\nRules: no markdown, no prose, no extra keys."
+        }),
+        json!({
+            "role": "user",
+            "content": user_content
+        }),
+    ];
+
+    let router_resp = provider
+        .chat(&router_messages, None, Some(model), 256, temperature, None)
+        .await
+        .map_err(|e| format!("strict router call failed: {}", e))?;
+    let raw = router_resp.content.unwrap_or_default();
+    let parsed = role_policy::parse_router_decision_strict(&raw)
+        .or_else(|_| {
+            extract_json_object(&raw)
+                .ok_or_else(|| "no JSON object found".to_string())
+                .and_then(|obj| role_policy::parse_router_decision_strict(&obj))
+        })
+        .or_else(|_| {
+            parse_functiongemma_router_decision(&raw)
+                .ok_or_else(|| "no JSON or FunctionGemma call format found".to_string())
+        })
+        .map_err(|e| e.to_string());
+    match parsed {
+        Ok(mut decision) => {
+            let suspicious = raw.contains('|')
+                || decision.target.contains("\"target\"")
+                || decision.target.len() > 96;
+            if suspicious {
+                if let Some(from_pack) = parse_router_directive_pack(router_pack) {
+                    decision = from_pack;
+                }
+            }
+            Ok(decision)
+        }
+        Err(e) => {
+            if let Some(from_pack) = parse_router_directive_pack(router_pack) {
+                return Ok(from_pack);
+            }
+            Err(format!(
+                "strict router parse failed: {}. raw={}",
+                e,
+                raw.chars().take(220).collect::<String>()
+            ))
+        }
+    }
+}
+
 /// Build a `SwappableCore` from the given parameters.
 ///
 /// When `is_local` is true, the compactor and memory operations use a dedicated
@@ -197,7 +531,10 @@ pub fn build_swappable_core(
     provenance: ProvenanceConfig,
     max_tool_result_chars: usize,
     delegation_provider: Option<Arc<dyn LLMProvider>>,
+    specialist_provider: Option<Arc<dyn LLMProvider>>,
+    trio_config: TrioConfig,
 ) -> SwappableCore {
+    let router_provider = delegation_provider.clone();
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
     } else {
@@ -260,8 +597,15 @@ pub fn build_swappable_core(
     };
 
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
-    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone(), max_context_tokens)
-        .with_thresholds(memory_config.compaction_threshold_percent, memory_config.compaction_threshold_tokens);
+    let compactor = ContextCompactor::new(
+        memory_provider.clone(),
+        memory_model.clone(),
+        max_context_tokens,
+    )
+    .with_thresholds(
+        memory_config.compaction_threshold_percent,
+        memory_config.compaction_threshold_tokens,
+    );
     let learning = LearningStore::new(&workspace);
     let working_memory = WorkingMemoryStore::new(&workspace);
 
@@ -273,7 +617,10 @@ pub fn build_swappable_core(
         } else if let Some(ref tr_cfg) = tool_delegation.provider {
             Arc::new(OpenAICompatProvider::new(
                 &tr_cfg.api_key,
-                tr_cfg.api_base.as_deref().or(Some("http://localhost:8080/v1")),
+                tr_cfg
+                    .api_base
+                    .as_deref()
+                    .or(Some("http://localhost:8080/v1")),
                 None,
             ))
         } else {
@@ -295,6 +642,13 @@ pub fn build_swappable_core(
     } else {
         (None, None)
     };
+
+    let specialist_model = specialist_provider
+        .as_ref()
+        .map(|provider| provider.get_default_model().to_string());
+    let router_model = router_provider
+        .as_ref()
+        .map(|provider| provider.get_default_model().to_string());
 
     SwappableCore {
         provider,
@@ -324,8 +678,16 @@ pub fn build_swappable_core(
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        main_no_think: trio_config.main_no_think,
         tool_runner_provider,
         tool_runner_model,
+        router_provider,
+        router_model,
+        router_no_think: trio_config.router_no_think,
+        router_temperature: trio_config.router_temperature,
+        router_top_p: trio_config.router_top_p,
+        specialist_provider,
+        specialist_model,
         tool_delegation_config: tool_delegation,
         provenance_config: provenance,
         max_tool_result_chars,
@@ -402,6 +764,8 @@ struct AgentLoopShared {
     aha_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<AhaSignal>>>,
     /// Sender for priority signals (given to subagent manager).
     aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
+    /// Sticky per-session policy flags (e.g. local_only).
+    session_policies: Arc<Mutex<HashMap<String, policy::SessionPolicy>>>,
 }
 
 impl AgentLoopShared {
@@ -410,7 +774,12 @@ impl AgentLoopShared {
     ///
     /// Takes a snapshot of `SwappableCore` so the registry is consistent for the
     /// entire message processing.
-    async fn build_tools(&self, core: &SwappableCore, channel: &str, chat_id: &str) -> ToolRegistry {
+    async fn build_tools(
+        &self,
+        core: &SwappableCore,
+        channel: &str,
+        chat_id: &str,
+    ) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
 
         // File system tools (stateless).
@@ -431,7 +800,7 @@ impl AgentLoopShared {
 
         // Web (stateless config).
         tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
-        tools.register(Box::new(WebFetchTool::new(50_000)));
+        tools.register(Box::new(WebFetchTool::new(core.max_tool_result_chars)));
 
         // Memory recall (stateless config).
         tools.register(Box::new(RecallTool::new(&core.workspace)));
@@ -453,10 +822,22 @@ impl AgentLoopShared {
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, agent, model, ch, cid, working_dir| {
-            let mgr = subagents_ref.clone();
-            Box::pin(async move { mgr.spawn(task, label, agent, model, ch, cid, working_dir).await })
-        });
+        let session_policies_ref = self.session_policies.clone();
+        let spawn_cb: SpawnCallback =
+            Arc::new(move |task, label, agent, model, ch, cid, working_dir| {
+                let mgr = subagents_ref.clone();
+                let policies = session_policies_ref.clone();
+                Box::pin(async move {
+                    let key = format!("{}:{}", ch, cid);
+                    let policy = {
+                        let map = policies.lock().await;
+                        map.get(&key).cloned().unwrap_or_default()
+                    };
+                    let effective_model = policy::enforce_subagent_model(&policy, model);
+                    mgr.spawn(task, label, agent, effective_model, ch, cid, working_dir)
+                        .await
+                })
+            });
         let subagents_ref2 = self.subagents.clone();
         let list_workspace = core.workspace.clone();
         let list_cb: ListCallback = Arc::new(move || {
@@ -524,83 +905,108 @@ impl AgentLoopShared {
         });
         // Pipeline callback: parse steps JSON, build PipelineConfig, run pipeline.
         // Uses the delegation provider/model (cheap) for pipeline LLM calls.
-        let pipeline_provider = core.tool_runner_provider.clone()
+        let pipeline_provider = core
+            .tool_runner_provider
+            .clone()
             .unwrap_or_else(|| core.provider.clone());
-        let pipeline_model = core.tool_runner_model.clone()
+        let pipeline_model = core
+            .tool_runner_model
+            .clone()
             .unwrap_or_else(|| core.model.clone());
         let pipeline_workspace = core.workspace.clone();
-        let pipeline_cb: PipelineCallback = Arc::new(move |steps_json: String, ahead_by_k: usize| {
-            let provider = pipeline_provider.clone();
-            let model = pipeline_model.clone();
-            let workspace = pipeline_workspace.clone();
-            Box::pin(async move {
-                // Parse steps from JSON.
-                let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
-                    Ok(s) => s,
-                    Err(e) => return format!("Error parsing pipeline steps: {}", e),
-                };
-                let pipeline_steps: Vec<pipeline::PipelineStep> = steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| pipeline::PipelineStep {
-                        index: i,
-                        prompt: s["prompt"].as_str().unwrap_or("").to_string(),
-                        expected: s["expected"].as_str().map(|s| s.to_string()),
-                        tools: s["tools"].as_array().map(|arr| {
-                            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
-                        }),
-                        max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
-                    })
-                    .collect();
-                if pipeline_steps.is_empty() {
-                    return "Error: no valid pipeline steps provided.".to_string();
-                }
-                let config = pipeline::PipelineConfig {
-                    pipeline_id: format!("pipe-{}", chrono::Utc::now().timestamp_millis() % 100_000_000),
-                    steps: pipeline_steps,
-                    ahead_by_k,
-                    max_voters: if ahead_by_k > 0 { ahead_by_k * 2 + 1 } else { 1 },
-                    model: model.clone(),
-                };
-                let result = pipeline::run_pipeline(&config, provider.as_ref(), &workspace).await;
-                // Format result for the agent.
-                let mut output = format!(
-                    "Pipeline '{}' completed: {}/{} steps\n",
-                    result.pipeline_id, result.steps_completed, result.steps_total
-                );
-                for sr in &result.results {
-                    let correct_str = match sr.correct {
-                        Some(true) => " ✓",
-                        Some(false) => " ✗",
-                        None => "",
+        let pipeline_cb: PipelineCallback =
+            Arc::new(move |steps_json: String, ahead_by_k: usize| {
+                let provider = pipeline_provider.clone();
+                let model = pipeline_model.clone();
+                let workspace = pipeline_workspace.clone();
+                Box::pin(async move {
+                    // Parse steps from JSON.
+                    let steps: Vec<serde_json::Value> = match serde_json::from_str(&steps_json) {
+                        Ok(s) => s,
+                        Err(e) => return format!("Error parsing pipeline steps: {}", e),
                     };
-                    output.push_str(&format!(
-                        "  Step {}: {}{} ({}ms, {} voters)\n",
-                        sr.index,
-                        sr.answer.chars().take(200).collect::<String>(),
-                        correct_str,
-                        sr.duration_ms,
-                        sr.voters_used
-                    ));
-                }
-                output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
-                output
-            })
-        });
+                    let pipeline_steps: Vec<pipeline::PipelineStep> = steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| pipeline::PipelineStep {
+                            index: i,
+                            prompt: s["prompt"].as_str().unwrap_or("").to_string(),
+                            expected: s["expected"].as_str().map(|s| s.to_string()),
+                            tools: s["tools"].as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            }),
+                            max_iterations: s["max_iterations"].as_u64().map(|n| n as u32),
+                        })
+                        .collect();
+                    if pipeline_steps.is_empty() {
+                        return "Error: no valid pipeline steps provided.".to_string();
+                    }
+                    let config = pipeline::PipelineConfig {
+                        pipeline_id: format!(
+                            "pipe-{}",
+                            chrono::Utc::now().timestamp_millis() % 100_000_000
+                        ),
+                        steps: pipeline_steps,
+                        ahead_by_k,
+                        max_voters: if ahead_by_k > 0 {
+                            ahead_by_k * 2 + 1
+                        } else {
+                            1
+                        },
+                        model: model.clone(),
+                    };
+                    let result =
+                        pipeline::run_pipeline(&config, provider.as_ref(), &workspace).await;
+                    // Format result for the agent.
+                    let mut output = format!(
+                        "Pipeline '{}' completed: {}/{} steps\n",
+                        result.pipeline_id, result.steps_completed, result.steps_total
+                    );
+                    for sr in &result.results {
+                        let correct_str = match sr.correct {
+                            Some(true) => " ✓",
+                            Some(false) => " ✗",
+                            None => "",
+                        };
+                        output.push_str(&format!(
+                            "  Step {}: {}{} ({}ms, {} voters)\n",
+                            sr.index,
+                            sr.answer.chars().take(200).collect::<String>(),
+                            correct_str,
+                            sr.duration_ms,
+                            sr.voters_used
+                        ));
+                    }
+                    output.push_str(&format!("Total time: {}ms", result.total_duration_ms));
+                    output
+                })
+            });
 
         // Loop callback: run an autonomous refinement loop via SubagentManager.
         let subagents_ref5 = self.subagents.clone();
-        let loop_cb: LoopCallback = Arc::new(move |task: String,
-                                                     max_rounds: u32,
-                                                     tools_filter: Option<Vec<String>>,
-                                                     stop_condition: Option<String>,
-                                                     model: Option<String>,
-                                                     working_dir: Option<String>| {
-            let mgr = subagents_ref5.clone();
-            Box::pin(async move {
-                mgr.run_loop(task, max_rounds, tools_filter, stop_condition, model, working_dir).await
-            })
-        });
+        let loop_cb: LoopCallback = Arc::new(
+            move |task: String,
+                  max_rounds: u32,
+                  tools_filter: Option<Vec<String>>,
+                  stop_condition: Option<String>,
+                  model: Option<String>,
+                  working_dir: Option<String>| {
+                let mgr = subagents_ref5.clone();
+                Box::pin(async move {
+                    mgr.run_loop(
+                        task,
+                        max_rounds,
+                        tools_filter,
+                        stop_condition,
+                        model,
+                        working_dir,
+                    )
+                    .await
+                })
+            },
+        );
 
         let spawn_tool = Arc::new(SpawnTool::new());
         // Set callbacks and context before registering so they're ready for use.
@@ -651,7 +1057,10 @@ impl AgentLoopShared {
         // Snapshot core — instant Arc clone under brief read lock.
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
-        let turn_count = counters.learning_turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let turn_count = counters
+            .learning_turn_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         if turn_count % 50 == 0 {
             core.learning.prune();
         }
@@ -662,6 +1071,18 @@ impl AgentLoopShared {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id));
+
+        let session_policy = {
+            let mut map = self.session_policies.lock().await;
+            let entry = map.entry(session_key.clone()).or_default();
+            if core.tool_delegation_config.strict_local_only {
+                entry.local_only = true;
+            }
+            policy::update_from_user_text(entry, &msg.content);
+            entry.clone()
+        };
+        let strict_local_only =
+            core.tool_delegation_config.strict_local_only || session_policy.local_only;
 
         debug!(
             "Processing message{} from {} on {}: {}",
@@ -682,11 +1103,14 @@ impl AgentLoopShared {
         let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
         // Get session history. Track count so we know where new messages start.
-        let history = core.sessions.get_history(
+        let history = core
+            .sessions
+            .get_history(
                 &session_key,
                 history_limit(core.token_budget.max_context()),
                 core.max_history_turns,
-            ).await;
+            )
+            .await;
         // Track where new (unsaved) messages start. Updated after compaction
         // swaps to avoid re-persisting already-saved messages.
         let mut new_start = 1 + history.len();
@@ -714,9 +1138,14 @@ impl AgentLoopShared {
             .get("detected_language")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let user_content = if core.main_no_think {
+            format!(" /no_think\n{}", msg.content)
+        } else {
+            msg.content.clone()
+        };
         let mut messages = core.context.build_messages(
             &history,
-            &msg.content,
+            &user_content,
             None,
             if media_paths.is_empty() {
                 None
@@ -731,7 +1160,9 @@ impl AgentLoopShared {
 
         // Inject per-session working memory into the system message.
         if core.memory_enabled {
-            let mut wm = core.working_memory.get_context(&session_key, core.working_memory_budget);
+            let mut wm = core
+                .working_memory
+                .get_context(&session_key, core.working_memory_budget);
             // Append learning context (tool patterns) if available.
             let learning_ctx = core.learning.get_learning_context();
             if !learning_ctx.is_empty() {
@@ -739,7 +1170,11 @@ impl AgentLoopShared {
                 wm.push_str(&learning_ctx);
             }
             if !wm.is_empty() {
-                if let Some(system_content) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+                if let Some(system_content) = messages
+                    .first()
+                    .and_then(|m| m["content"].as_str())
+                    .map(|s| s.to_string())
+                {
                     let enriched = format!(
                         "{}\n\n---\n\n# Working Memory (Current Session)\n\n{}",
                         system_content, wm
@@ -753,10 +1188,15 @@ impl AgentLoopShared {
         // is naturally aware of running/completed subagents without explicit tool calls.
         {
             let running = self.subagents.list_running().await;
-            let recent = crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
+            let recent =
+                crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
             let status = crate::agent::subagent::format_status_block(&running, &recent);
             if !status.is_empty() {
-                if let Some(sys) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
+                if let Some(sys) = messages
+                    .first()
+                    .and_then(|m| m["content"].as_str())
+                    .map(|s| s.to_string())
+                {
                     messages[0]["content"] = Value::String(format!("{}{}", sys, status));
                 }
             }
@@ -766,10 +1206,13 @@ impl AgentLoopShared {
         {
             let bulletin = self.bulletin_cache.load_full();
             if !bulletin.is_empty() {
-                if let Some(sys) = messages.first().and_then(|m| m["content"].as_str()).map(|s| s.to_string()) {
-                    messages[0]["content"] = Value::String(format!(
-                        "{}\n\n## Memory Briefing\n\n{}", sys, &*bulletin
-                    ));
+                if let Some(sys) = messages
+                    .first()
+                    .and_then(|m| m["content"].as_str())
+                    .map(|s| s.to_string())
+                {
+                    messages[0]["content"] =
+                        Value::String(format!("{}\n\n## Memory Briefing\n\n{}", sys, &*bulletin));
                 }
             }
         }
@@ -794,7 +1237,9 @@ impl AgentLoopShared {
         let compaction_in_flight = Arc::new(AtomicBool::new(false));
 
         // Context gate: budget-aware content sizing for this turn.
-        let cache_dir = crate::utils::helpers::get_data_path().join("cache").join("tool_outputs");
+        let cache_dir = crate::utils::helpers::get_data_path()
+            .join("cache")
+            .join("tool_outputs");
         let mut content_gate = crate::agent::context_gate::ContentGate::new(
             core.token_budget.max_context(),
             0.20,
@@ -806,13 +1251,24 @@ impl AgentLoopShared {
 
         // Response boundary: after exec/write_file, force a text response.
         let mut force_response = false;
+        let mut router_preflight_done = false;
+        let mut tool_guard = ToolGuard::new(core.tool_delegation_config.max_same_tool_call_per_turn);
 
         // Track turns since last compaction for proprioception.
         let mut turns_since_compaction: u32 = 0;
 
         // Agent loop: call LLM, handle tool calls, repeat.
+        let mut forced_finalize_attempted = false;
         for iteration in 0..core.max_iterations {
-            debug!("Agent iteration{} {}/{}", if streaming { " (streaming)" } else { "" }, iteration + 1, core.max_iterations);
+            debug!(
+                "Agent iteration{} {}/{}",
+                if streaming { " (streaming)" } else { "" },
+                iteration + 1,
+                core.max_iterations
+            );
+
+            // --- Context Hygiene: clean up conversation history ---
+            context_hygiene::hygiene_pipeline(&mut messages);
 
             // --- Proprioception: update SystemState ---
             if self.proprioception_config.enabled {
@@ -832,7 +1288,7 @@ impl AgentLoopShared {
                     messages.len() as u64,
                     turns_since_compaction,
                     counters.delegation_healthy.load(Ordering::Relaxed),
-                    0, // recent_tool_failures — not tracked yet
+                    0,    // recent_tool_failures — not tracked yet
                     true, // last_tool_ok
                     active_subs,
                     0, // pending_aha_signals filled below
@@ -921,7 +1377,10 @@ impl AgentLoopShared {
                 // trigger a "does not support assistant message prefill" error.
                 let remaining = core.max_iterations.saturating_sub(iteration as u32 + 1);
                 let budget_note = if remaining <= 5 {
-                    format!(" [Budget: {}/{} iterations remaining — wrap up soon]", remaining, core.max_iterations)
+                    format!(
+                        " [Budget: {}/{} iterations remaining — wrap up soon]",
+                        remaining, core.max_iterations
+                    )
                 } else {
                     String::new()
                 };
@@ -937,11 +1396,17 @@ impl AgentLoopShared {
 
             // Filter tool definitions to relevant tools (phase-scoped when proprioception is active).
             let current_phase = self.system_state.load_full().task_phase;
-            let mut tool_defs = if self.proprioception_config.enabled && self.proprioception_config.dynamic_tool_scoping {
+            let mut tool_defs = if self.proprioception_config.enabled
+                && self.proprioception_config.dynamic_tool_scoping
+            {
                 tools.get_scoped_definitions(&current_phase, &messages, &used_tools)
             } else {
                 tools.get_relevant_definitions(&messages, &used_tools)
             };
+            if core.tool_delegation_config.strict_no_tools_main {
+                // Hard separation: main model is conversation/orchestration only.
+                tool_defs.clear();
+            }
             if boundary_active {
                 tool_defs.retain(|def| {
                     let name = def
@@ -958,14 +1423,20 @@ impl AgentLoopShared {
             };
 
             // Trim messages to fit context budget.
-            let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+            let tool_def_tokens =
+                TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
             messages = core.token_budget.trim_to_fit_with_age(
-                &messages, tool_def_tokens, turn_count, core.max_message_age_turns,
+                &messages,
+                tool_def_tokens,
+                turn_count,
+                core.max_message_age_turns,
             );
 
             // Spawn background compaction when threshold exceeded.
             if !compaction_in_flight.load(Ordering::Relaxed)
-                && core.compactor.needs_compaction(&messages, &core.token_budget, tool_def_tokens)
+                && core
+                    .compactor
+                    .needs_compaction(&messages, &core.token_budget, tool_def_tokens)
             {
                 let slot = compaction_slot.clone();
                 let in_flight = compaction_in_flight.clone();
@@ -979,21 +1450,34 @@ impl AgentLoopShared {
                 let bg_proprio = self.proprioception_config.clone();
                 tokio::spawn(async move {
                     let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                        bg_core.compactor.compact_gradient(
-                            &bg_messages, &bg_core.token_budget, 0,
-                            bg_proprio.raw_window, bg_proprio.light_window,
-                        ).await
+                        bg_core
+                            .compactor
+                            .compact_gradient(
+                                &bg_messages,
+                                &bg_core.token_budget,
+                                0,
+                                bg_proprio.raw_window,
+                                bg_proprio.light_window,
+                            )
+                            .await
                     } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                        let reader = crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                        bg_core.compactor.compact_for_reader(
-                            &bg_messages, &bg_core.token_budget, 0, &reader
-                        ).await
+                        let reader =
+                            crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                        bg_core
+                            .compactor
+                            .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
+                            .await
                     } else {
-                        bg_core.compactor.compact(&bg_messages, &bg_core.token_budget, 0).await
+                        bg_core
+                            .compactor
+                            .compact(&bg_messages, &bg_core.token_budget, 0)
+                            .await
                     };
                     if bg_core.memory_enabled {
                         if let Some(ref summary) = result.observation {
-                            bg_core.working_memory.update_from_compaction(&bg_session_key, summary);
+                            bg_core
+                                .working_memory
+                                .update_from_compaction(&bg_session_key, summary);
                         }
                     }
                     if result.messages.len() < bg_messages.len() {
@@ -1010,6 +1494,9 @@ impl AgentLoopShared {
             // Convert tool messages to user messages and tool_calls to text.
             if core.is_local {
                 thread_repair::repair_for_strict_alternation(&mut messages);
+                // Strip the "[Called tool(...)]" patterns we just added so the model
+                // doesn't learn to output text descriptions instead of actual tool calls.
+                thread_repair::strip_imitatable_patterns(&mut messages);
             }
 
             // Pre-flight context size check: emergency trim if we're about to
@@ -1028,6 +1515,188 @@ impl AgentLoopShared {
                 thread_repair::repair_messages(&mut messages);
                 if core.is_local {
                     thread_repair::repair_for_strict_alternation(&mut messages);
+                    thread_repair::strip_imitatable_patterns(&mut messages);
+                }
+            }
+
+            // Router-first preflight for strict trio mode.
+            if core.tool_delegation_config.strict_no_tools_main
+                && core.tool_delegation_config.strict_router_schema
+                && !router_preflight_done
+            {
+                router_preflight_done = true;
+                let (router_provider, router_model) =
+                    match (core.router_provider.as_ref(), core.router_model.as_deref()) {
+                        (Some(p), Some(m)) => (p.clone(), m.to_string()),
+                        _ => {
+                            final_content = "Router lane is required by policy but not configured. Start trio router server and retry.".to_string();
+                            break;
+                        }
+                    };
+                let tool_list = tools.tool_names();
+                let task_state = format!("Strict preflight. User message: {}", msg.content);
+                let router_pack = if core.tool_delegation_config.role_scoped_context_packs {
+                    role_policy::build_context_pack(
+                        role_policy::Role::Router,
+                        &msg.content,
+                        "(live turn; summary omitted)",
+                        &task_state,
+                        &tool_list,
+                        2000,
+                    )
+                } else {
+                    task_state
+                };
+
+                let decision = match request_strict_router_decision(
+                    router_provider.as_ref(),
+                    &router_model,
+                    &router_pack,
+                    core.router_no_think,
+                    core.router_temperature,
+                )
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        final_content = format!("Router policy failed: {}.", e);
+                        break;
+                    }
+                };
+
+                match decision.action.as_str() {
+                    "ask_user" => {
+                        final_content = decision
+                            .args
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "I need clarification to continue.".to_string());
+                        break;
+                    }
+                    "specialist" => {
+                        let (specialist_provider, specialist_model) = match (
+                            core.specialist_provider.as_ref(),
+                            core.specialist_model.as_deref(),
+                        ) {
+                            (Some(p), Some(m)) => (p.clone(), m.to_string()),
+                            _ => {
+                                final_content = "Specialist lane requested by router but no specialist server is configured.".to_string();
+                                break;
+                            }
+                        };
+                        let specialist_state = format!(
+                            "Target: {}\nRouter args: {}\nUser intent: {}",
+                            decision.target, decision.args, msg.content
+                        );
+                        let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs
+                        {
+                            role_policy::build_context_pack(
+                                role_policy::Role::Specialist,
+                                &msg.content,
+                                "(live turn; summary omitted)",
+                                &specialist_state,
+                                &tool_list,
+                                3000,
+                            )
+                        } else {
+                            specialist_state
+                        };
+                        let specialist_messages = vec![
+                            json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise actionable output only. No markdown unless requested."}),
+                            json!({"role":"user","content": specialist_pack}),
+                        ];
+                        match specialist_provider
+                            .chat(
+                                &specialist_messages,
+                                None,
+                                Some(&specialist_model),
+                                core.tool_delegation_config.max_tokens,
+                                0.3,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(sp_resp) => {
+                                let text = sp_resp
+                                    .content
+                                    .unwrap_or_else(|| "Specialist returned no content.".to_string());
+                                messages.push(json!({
+                                    "role":"user",
+                                    "content": format!("[specialist:{}] {}", decision.target, text),
+                                }));
+                                continue;
+                            }
+                            Err(e) => {
+                                final_content = format!("Specialist lane failed: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    "subagent" => {
+                        let mut params: HashMap<String, Value> = HashMap::new();
+                        params.insert("action".to_string(), json!("spawn"));
+                        if let Some(task) = decision.args.get("task").and_then(|v| v.as_str()) {
+                            params.insert("task".to_string(), json!(task));
+                        } else {
+                            params.insert("task".to_string(), json!(msg.content.clone()));
+                        }
+                        if !decision.target.trim().is_empty() {
+                            params.insert("agent".to_string(), json!(decision.target));
+                        }
+                        if strict_local_only {
+                            params.insert("model".to_string(), json!("local"));
+                        }
+                        if let Err(e) = policy::validate_spawn_args(&params) {
+                            final_content = e;
+                            break;
+                        }
+                        if let Err(e) = tool_guard.allow("spawn", &params) {
+                            warn!("{}", e);
+                            messages.push(json!({
+                                "role":"user",
+                                "content": format!("[tool-guard] {}", e),
+                            }));
+                            continue;
+                        }
+                        let spawn_result = tools.execute("spawn", params).await;
+                        messages.push(json!({
+                            "role":"user",
+                            "content": format!("[router:subagent] {}", spawn_result.data),
+                        }));
+                        continue;
+                    }
+                    "tool" => {
+                        if decision.target.trim().is_empty() {
+                            final_content = "Router selected tool action but target is empty.".to_string();
+                            break;
+                        }
+                        let params_map = decision
+                            .args
+                            .as_object()
+                            .map(|m| {
+                                m.iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect::<HashMap<String, Value>>()
+                            })
+                            .unwrap_or_default();
+                        if let Err(e) = tool_guard.allow(&decision.target, &params_map) {
+                            warn!("{}", e);
+                            messages.push(json!({
+                                "role":"user",
+                                "content": format!("[tool-guard] {}", e),
+                            }));
+                            continue;
+                        }
+                        let tr = tools.execute(&decision.target, params_map).await;
+                        messages.push(json!({
+                            "role":"user",
+                            "content": format!("[router:tool:{}] {}", decision.target, tr.data),
+                        }));
+                        used_tools.insert(decision.target);
+                        continue;
+                    }
+                    _ => {}
                 }
             }
 
@@ -1041,7 +1710,8 @@ impl AgentLoopShared {
                     base.max(8192)
                 } else {
                     // Detect long-form triggers in the user message.
-                    let user_text = messages.last()
+                    let user_text = messages
+                        .last()
                         .and_then(|m| m.get("content"))
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
@@ -1055,7 +1725,10 @@ impl AgentLoopShared {
                         || lower.starts_with("write ")
                         || user_text.len() > 500;
                     // Count recent tool calls: if tool-heavy, use smaller budget.
-                    let recent_tool_calls = messages.iter().rev().take(6)
+                    let recent_tool_calls = messages
+                        .iter()
+                        .rev()
+                        .take(6)
                         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
                         .count();
                     if is_long_form {
@@ -1072,12 +1745,18 @@ impl AgentLoopShared {
             let thinking_budget = {
                 let stored = counters.thinking_budget.load(Ordering::Relaxed);
                 if stored > 0 {
-                    Some(stored)
+                    // Small local models can burn the whole completion budget in reasoning.
+                    // Hard-cap explicit thinking to keep them action-oriented.
+                    if core.is_local && is_small_local_model(&core.model) {
+                        Some(stored.min(256))
+                    } else {
+                        Some(stored)
+                    }
                 } else {
                     None
                 }
             };
-            let response = if let Some(ref delta_tx) = text_delta_tx {
+            let mut response = if let Some(ref delta_tx) = text_delta_tx {
                 // Streaming path: forward text deltas as they arrive.
                 let mut stream = match core
                     .provider
@@ -1154,7 +1833,10 @@ impl AgentLoopShared {
                     Some(r) => r,
                     None => {
                         // Stream ended without Done — either cancelled or genuine error.
-                        if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                        if cancellation_token
+                            .as_ref()
+                            .map_or(false, |t| t.is_cancelled())
+                        {
                             // Cancelled mid-stream — exit cleanly.
                             break;
                         }
@@ -1186,6 +1868,81 @@ impl AgentLoopShared {
                 }
             };
 
+            // --- Response Validation: detect hallucinated tool calls ---
+            let content_str = response.content.as_deref().unwrap_or("");
+            let tool_calls_as_maps: Vec<HashMap<String, Value>> = response
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let mut map = HashMap::new();
+                    map.insert("id".to_string(), Value::String(tc.id.clone()));
+                    map.insert("name".to_string(), Value::String(tc.name.clone()));
+                    map.insert(
+                        "arguments".to_string(),
+                        Value::Object(tc.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                    );
+                    map
+                })
+                .collect();
+
+            if let Err(validation_err) = validation::validate_response(content_str, &tool_calls_as_maps) {
+                warn!("Response validation failed: {:?}", validation_err);
+                if !response.has_tool_calls() {
+                    let hint = validation::generate_retry_prompt(&validation_err, 1);
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": content_str
+                    }));
+                    messages.push(json!({
+                        "role": "user",
+                        "content": hint
+                    }));
+                    debug!("Injected validation retry hint");
+                    continue;
+                }
+            }
+
+            // Rescue pass: if local model consumed completion on reasoning and produced no
+            // visible answer, force one concise no-thinking completion once.
+            let empty_visible = response
+                .content
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            if core.is_local
+                && !response.has_tool_calls()
+                && empty_visible
+                && response.finish_reason == "length"
+                && !forced_finalize_attempted
+            {
+                forced_finalize_attempted = true;
+                let rescue_tokens = effective_max_tokens.min(384).max(128);
+                let mut rescue_messages = messages.clone();
+                rescue_messages.push(json!({
+                    "role": "user",
+                    "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
+                }));
+                match core
+                    .provider
+                    .chat(
+                        &rescue_messages,
+                        None,
+                        Some(&core.model),
+                        rescue_tokens,
+                        0.2,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        response = r;
+                    }
+                    Err(e) => {
+                        warn!("Finalize rescue call failed: {}", e);
+                    }
+                }
+            }
+
             // Check for LLM provider errors before processing the response.
             // openai_compat.rs wraps errors as Ok(LLMResponse { finish_reason: "error", ... })
             // so they slip through as normal responses unless explicitly caught.
@@ -1212,22 +1969,312 @@ impl AgentLoopShared {
             {
                 let estimated_prompt = TokenBudget::estimate_tokens(&messages);
                 let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
-                let actual_completion = response.usage.get("completion_tokens").copied().unwrap_or(-1);
+                let actual_completion = response
+                    .usage
+                    .get("completion_tokens")
+                    .copied()
+                    .unwrap_or(-1);
                 info!(
                     "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}, max_tokens={}",
                     estimated_prompt, actual_prompt, actual_completion, effective_max_tokens
                 );
                 // Store actual tokens for /status display.
                 if actual_prompt > 0 {
-                    counters.last_actual_prompt_tokens.store(actual_prompt as u64, Ordering::Relaxed);
+                    counters
+                        .last_actual_prompt_tokens
+                        .store(actual_prompt as u64, Ordering::Relaxed);
                 }
                 if actual_completion > 0 {
-                    counters.last_actual_completion_tokens.store(actual_completion as u64, Ordering::Relaxed);
+                    counters
+                        .last_actual_completion_tokens
+                        .store(actual_completion as u64, Ordering::Relaxed);
                 }
-                counters.last_estimated_prompt_tokens.store(estimated_prompt as u64, Ordering::Relaxed);
+                counters
+                    .last_estimated_prompt_tokens
+                    .store(estimated_prompt as u64, Ordering::Relaxed);
             }
 
             if response.has_tool_calls() {
+                let mut routed_tool_calls = response.tool_calls.clone();
+                let mut router_decision: Option<role_policy::RouterDecision> = None;
+                let mut router_decision_valid = false;
+                let mut selected_plan: Option<toolplan::ToolPlan> = None;
+                let available_tools = tools.tool_names();
+
+                if core.tool_delegation_config.strict_router_schema {
+                    let task_state = format!(
+                        "Main content: {}\nCandidate tool calls: {}",
+                        response.content.as_deref().unwrap_or("(empty)"),
+                        routed_tool_calls
+                            .iter()
+                            .map(|tc| tc.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let router_pack = if core.tool_delegation_config.role_scoped_context_packs {
+                        role_policy::build_context_pack(
+                            role_policy::Role::Router,
+                            &msg.content,
+                            "(live turn; summary omitted)",
+                            &task_state,
+                            &available_tools,
+                            2000,
+                        )
+                    } else {
+                        task_state
+                    };
+
+                    if let (Some(router_provider), Some(router_model)) =
+                        (core.router_provider.as_ref(), core.router_model.as_deref())
+                    {
+                        match request_strict_router_decision(
+                            router_provider.as_ref(),
+                            router_model,
+                            &router_pack,
+                            core.router_no_think,
+                            core.router_temperature,
+                        )
+                        .await
+                        {
+                            Ok(decision) => {
+                                router_decision_valid = true;
+                                router_decision = Some(decision);
+                            }
+                            Err(e) => {
+                                warn!("{}", e);
+                            }
+                        }
+                    } else {
+                        warn!("strict router enabled but router lane is not configured");
+                    }
+                }
+
+                if let Some(decision) = router_decision.clone() {
+                    match toolplan::from_router_decision(decision) {
+                        Ok(plan) => {
+                            selected_plan = Some(plan);
+                        }
+                        Err(e) => {
+                            warn!("router decision normalization failed: {}", e);
+                            if core.tool_delegation_config.strict_toolplan_validation
+                                && core.tool_delegation_config.deterministic_router_fallback
+                            {
+                                selected_plan = Some(router_fallback::route(
+                                    &msg.content,
+                                    &available_tools,
+                                    &session_policy,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if role_policy::should_block_main_tool_calls(
+                    core.tool_delegation_config.strict_no_tools_main,
+                    true,
+                ) && !router_decision_valid
+                {
+                    if core.tool_delegation_config.deterministic_router_fallback {
+                        warn!(
+                            "strict router invalid; using deterministic fallback plan (model={})",
+                            core.model
+                        );
+                        selected_plan = Some(router_fallback::route(
+                            &msg.content,
+                            &available_tools,
+                            &session_policy,
+                        ));
+                    } else {
+                        warn!(
+                            "Policy blocked main-model tool calls (strictNoToolsMain=true, model={})",
+                            core.model
+                        );
+                        final_content = "I can orchestrate the task, but direct tool calls from the main model are disabled by policy and strict router did not return a valid decision.".to_string();
+                        break;
+                    }
+                }
+
+                if let Some(plan) = selected_plan {
+                    if core.tool_delegation_config.strict_toolplan_validation {
+                        if let Err(e) = plan.validate() {
+                            if core.tool_delegation_config.deterministic_router_fallback {
+                                warn!(
+                                    "tool plan validation failed ({}), using deterministic fallback",
+                                    e
+                                );
+                            } else {
+                                final_content = format!("Router produced invalid tool plan: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    match plan.action {
+                        ToolPlanAction::AskUser => {
+                            final_content = plan
+                                .args
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| {
+                                    response
+                                        .content
+                                        .clone()
+                                        .unwrap_or_else(|| "I need clarification to continue.".to_string())
+                                });
+                            break;
+                        }
+                        ToolPlanAction::Specialist => {
+                            let (specialist_provider, specialist_model) = match (
+                                core.specialist_provider.as_ref(),
+                                core.specialist_model.as_deref(),
+                            ) {
+                                (Some(p), Some(m)) => (p.clone(), m.to_string()),
+                                _ => {
+                                    final_content = "Specialist lane requested by router but no specialist server is configured.".to_string();
+                                    break;
+                                }
+                            };
+                            let specialist_state = format!(
+                                "Target: {}\nMain content: {}\nRouter args: {}",
+                                plan.target,
+                                response.content.as_deref().unwrap_or("(empty)"),
+                                plan.args
+                            );
+                            let specialist_pack =
+                                if core.tool_delegation_config.role_scoped_context_packs {
+                                    role_policy::build_context_pack(
+                                        role_policy::Role::Specialist,
+                                        &msg.content,
+                                        "(live turn; summary omitted)",
+                                        &specialist_state,
+                                        &tools.tool_names(),
+                                        3000,
+                                    )
+                                } else {
+                                    specialist_state
+                                };
+                            let specialist_messages = vec![
+                                json!({"role":"system","content":"You are a focused specialist. Provide direct, actionable output only."}),
+                                json!({"role":"user","content": specialist_pack}),
+                            ];
+                            match specialist_provider
+                                .chat(
+                                    &specialist_messages,
+                                    None,
+                                    Some(&specialist_model),
+                                    core.tool_delegation_config.max_tokens,
+                                    0.3,
+                                    None,
+                                )
+                                .await
+                            {
+                                Ok(sp_resp) => {
+                                    let text = sp_resp
+                                        .content
+                                        .unwrap_or_else(|| "Specialist returned no content.".to_string());
+                                    messages.push(json!({
+                                        "role":"user",
+                                        "content": format!("[specialist:{}] {}", plan.target, text),
+                                    }));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    final_content =
+                                        format!("Specialist lane failed: {}. Try /restart.", e);
+                                    break;
+                                }
+                            }
+                        }
+                        ToolPlanAction::Subagent => {
+                            let mut params: HashMap<String, Value> = HashMap::new();
+                            params.insert("action".to_string(), json!("spawn"));
+                            if let Some(task) = plan.args.get("task").and_then(|v| v.as_str())
+                            {
+                                params.insert("task".to_string(), json!(task));
+                            } else {
+                                params.insert("task".to_string(), json!(msg.content.clone()));
+                            }
+                            if !plan.target.trim().is_empty() {
+                                params.insert("agent".to_string(), json!(plan.target));
+                            }
+                            if strict_local_only {
+                                params.insert("model".to_string(), json!("local"));
+                            }
+                            if let Err(e) = policy::validate_spawn_args(&params) {
+                                final_content = e;
+                                break;
+                            }
+                            if let Err(e) = tool_guard.allow("spawn", &params) {
+                                warn!("{}", e);
+                                messages.push(json!({
+                                    "role":"user",
+                                    "content": format!("[tool-guard] {}", e),
+                                }));
+                                continue;
+                            }
+                            let spawn_result = tools.execute("spawn", params).await;
+                            messages.push(json!({
+                                "role":"user",
+                                "content": format!("[router:subagent] {}", spawn_result.data),
+                            }));
+                            continue;
+                        }
+                        ToolPlanAction::Tool => {
+                            if !plan.target.is_empty() {
+                                let filtered: Vec<_> = routed_tool_calls
+                                    .iter()
+                                    .filter(|tc| tc.name == plan.target)
+                                    .cloned()
+                                    .collect();
+                                if !filtered.is_empty() {
+                                    routed_tool_calls = filtered;
+                                } else {
+                                    let args = plan
+                                        .args
+                                        .as_object()
+                                        .map(|m| {
+                                            m.iter()
+                                                .map(|(k, v)| (k.clone(), v.clone()))
+                                                .collect::<HashMap<String, Value>>()
+                                        })
+                                        .unwrap_or_default();
+                                    routed_tool_calls = vec![ToolCallRequest {
+                                        id: format!("planned-{}-{}", turn_count, plan.target),
+                                        name: plan.target,
+                                        arguments: args,
+                                    }];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut blocked_calls = 0usize;
+                routed_tool_calls.retain(|tc| match tool_guard.allow(&tc.name, &tc.arguments) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        blocked_calls += 1;
+                        warn!("{}", e);
+                        false
+                    }
+                });
+                if blocked_calls > 0 {
+                    messages.push(json!({
+                        "role":"user",
+                        "content": format!(
+                            "[tool-guard] blocked {} duplicate tool call(s). Continue without re-running identical calls.",
+                            blocked_calls
+                        ),
+                    }));
+                }
+                if routed_tool_calls.is_empty() {
+                    if let Some(text) = response.content.as_ref().filter(|s| !s.trim().is_empty()) {
+                        final_content = text.clone();
+                        break;
+                    }
+                    continue;
+                }
+
                 // Context pressure check: if high, log a warning. The correct
                 // response is compaction, NOT spawning the main model as its
                 // own tool runner (which doubles cost for no benefit).
@@ -1251,16 +2298,20 @@ impl AgentLoopShared {
                 // Periodically re-probe: every 10 inline calls, try delegation
                 // once in case the server recovered (e.g. user restarted it).
                 if !delegation_alive && core.tool_delegation_config.enabled {
-                    let retries = counters.delegation_retry_counter.fetch_add(1, Ordering::Relaxed);
+                    let retries = counters
+                        .delegation_retry_counter
+                        .fetch_add(1, Ordering::Relaxed);
                     if retries > 0 && retries % 10 == 0 {
-                        info!("Re-probing delegation provider (attempt {} since failure)", retries);
+                        info!(
+                            "Re-probing delegation provider (attempt {} since failure)",
+                            retries
+                        );
                         delegation_alive = true; // try this one time
                     } else {
                         debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
                     }
                 }
-                let should_delegate = core.tool_delegation_config.enabled
-                    && delegation_alive;
+                let should_delegate = core.tool_delegation_config.enabled && delegation_alive;
                 // Resolve provider+model from explicit config.
                 let delegation_provider = core.tool_runner_provider.clone();
                 let delegation_model = core.tool_runner_model.clone();
@@ -1271,19 +2322,20 @@ impl AgentLoopShared {
                     {
                         debug!(
                             "Delegating {} tool calls to tool runner (model: {})",
-                            response.tool_calls.len(),
+                            routed_tool_calls.len(),
                             tr_model
                         );
 
                         // Local delegation providers (llama-server) require
                         // user-last messages for tool→generate flow.
                         // Check delegation provider's locality, not the main model's.
-                        let needs_user_cont = core.is_local
-                            || delegation_provider.is_some();
+                        let needs_user_cont = core.is_local || delegation_provider.is_some();
 
                         // Detect [VERBATIM] marker: the main model is asking for
                         // raw tool output instead of a delegation summary.
-                        let verbatim = response.content.as_ref()
+                        let verbatim = response
+                            .content
+                            .as_ref()
                             .map(|c| c.contains("[VERBATIM]"))
                             .unwrap_or(false);
 
@@ -1291,8 +2343,7 @@ impl AgentLoopShared {
                         // Cap tool results to ~750 tokens (~3000 chars) so the system
                         // prompt, tool call messages, and response all fit comfortably.
                         // Use the main model's limit only if it's already smaller.
-                        let delegation_result_limit = core.max_tool_result_chars
-                            .min(3000);
+                        let delegation_result_limit = core.max_tool_result_chars.min(3000);
 
                         let runner_config = ToolRunnerConfig {
                             provider: tr_provider.clone(),
@@ -1308,7 +2359,8 @@ impl AgentLoopShared {
                             budget: {
                                 let cost_budget = core.tool_delegation_config.cost_budget;
                                 if cost_budget > 0.0 {
-                                    let prices = crate::agent::model_prices::ModelPrices::load().await;
+                                    let prices =
+                                        crate::agent::model_prices::ModelPrices::load().await;
                                     Some(Budget::root_with_cost(
                                         core.tool_delegation_config.max_iterations,
                                         2,
@@ -1326,7 +2378,7 @@ impl AgentLoopShared {
 
                         // Emit tool call start events for delegated calls.
                         if let Some(ref tx) = tool_event_tx {
-                            for tc in &response.tool_calls {
+                            for tc in &routed_tool_calls {
                                 let preview: String = serde_json::to_string(&tc.arguments)
                                     .unwrap_or_default()
                                     .chars()
@@ -1345,46 +2397,66 @@ impl AgentLoopShared {
                         // instructions — it naturally contains intent, constraints,
                         // and expected format. Fall back to the user message if
                         // the main model didn't produce text.
-                        let tool_names: Vec<&str> = response.tool_calls
+                        let tool_names: Vec<&str> = routed_tool_calls
                             .iter()
                             .map(|tc| tc.name.as_str())
                             .collect();
-                        let instructions = response.content.as_deref()
+                        let instructions = response
+                            .content
+                            .as_deref()
                             .filter(|c| !c.trim().is_empty())
                             .map(|c| c.chars().take(400).collect::<String>())
-                            .unwrap_or_else(|| {
-                                msg.content.chars().take(300).collect::<String>()
-                            });
-                        let task_desc = format!(
-                            "Instructions: {}\nTools to execute: {}",
-                            instructions,
-                            tool_names.join(", ")
-                        );
+                            .unwrap_or_else(|| msg.content.chars().take(300).collect::<String>());
+                        let task_desc = if core.tool_delegation_config.role_scoped_context_packs {
+                            let task_state = format!(
+                                "Tool lane execution\nPlanned tools: {}",
+                                tool_names.join(", ")
+                            );
+                            role_policy::build_context_pack(
+                                role_policy::Role::Main,
+                                &instructions,
+                                "(live turn; summary omitted)",
+                                &task_state,
+                                &tools.tool_names(),
+                                2500,
+                            )
+                        } else {
+                            format!(
+                                "Instructions: {}\nTools to execute: {}",
+                                instructions,
+                                tool_names.join(", ")
+                            )
+                        };
 
                         let delegation_start = std::time::Instant::now();
                         let run_result = tool_runner::run_tool_loop(
                             &runner_config,
-                            &response.tool_calls,
+                            &routed_tool_calls,
                             &tools,
                             &task_desc,
                         )
                         .await;
                         let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
-                        // Only mark unhealthy on actual errors or timeout —
-                        // "no summary" alone is a quality issue, not a health issue.
-                        let is_hard_failure = run_result.error.is_some()
-                            || delegation_elapsed_ms > 30_000;
+                        // Only mark unhealthy on actual provider/tool-runner errors.
+                        // Slow-but-successful runs are quality/perf issues, not
+                        // liveness failures. Marking unhealthy on latency alone
+                        // causes false negatives in long-running delegated tasks.
+                        let is_hard_failure = run_result.error.is_some();
                         if is_hard_failure && !run_result.tool_results.is_empty() {
-                            let reason = if let Some(ref err) = run_result.error {
-                                format!("delegation model errored: {}", err)
-                            } else {
-                                "delegation model timed out (>30s)".to_string()
-                            };
-                            let results_preview: String = run_result.tool_results
+                            let reason = format!(
+                                "delegation model errored: {}",
+                                run_result.error.as_deref().unwrap_or("unknown error")
+                            );
+                            let results_preview: String = run_result
+                                .tool_results
                                 .first()
                                 .map(|(_, name, data)| {
-                                    format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
+                                    format!(
+                                        "[{}]: {}",
+                                        name,
+                                        data.chars().take(200).collect::<String>()
+                                    )
                                 })
                                 .unwrap_or_default();
                             warn!(
@@ -1397,7 +2469,14 @@ impl AgentLoopShared {
                                 results_preview,
                             );
                             counters.delegation_healthy.store(false, Ordering::Relaxed);
-                        } else if run_result.summary.is_none() && !run_result.tool_results.is_empty() {
+                        } else if delegation_elapsed_ms > 30_000 {
+                            debug!(
+                                "Delegation run was slow ({} ms) but succeeded — keeping provider healthy",
+                                delegation_elapsed_ms,
+                            );
+                        } else if run_result.summary.is_none()
+                            && !run_result.tool_results.is_empty()
+                        {
                             debug!(
                                 "Delegation returned no summary (model={}, iters={}), using results inline",
                                 tr_model, run_result.iterations_used,
@@ -1406,7 +2485,9 @@ impl AgentLoopShared {
                             // Re-probe succeeded — server recovered!
                             info!("Delegation provider recovered — re-enabling delegation");
                             counters.delegation_healthy.store(true, Ordering::Relaxed);
-                            counters.delegation_retry_counter.store(0, Ordering::Relaxed);
+                            counters
+                                .delegation_retry_counter
+                                .store(0, Ordering::Relaxed);
                         }
 
                         debug!(
@@ -1416,20 +2497,9 @@ impl AgentLoopShared {
                         );
 
                         // Build the assistant message with original tool_calls.
-                        let tc_json: Vec<Value> = response
-                            .tool_calls
+                        let tc_json: Vec<Value> = routed_tool_calls
                             .iter()
-                            .map(|tc| {
-                                json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": serde_json::to_string(&tc.arguments)
-                                            .unwrap_or_else(|_| "{}".to_string()),
-                                    }
-                                })
-                            })
+                            .map(|tc| tc.to_openai_json())
                             .collect();
                         ContextBuilder::add_assistant_message(
                             &mut messages,
@@ -1441,7 +2511,7 @@ impl AgentLoopShared {
                         // ContentGate handles budget-aware sizing.
                         let preview_max = core.tool_delegation_config.max_result_preview_chars;
 
-                        for tc in &response.tool_calls {
+                        for tc in &routed_tool_calls {
                             // Find the matching result from the runner.
                             let full_data = run_result
                                 .tool_results
@@ -1472,8 +2542,7 @@ impl AgentLoopShared {
 
                         // Inject the runner's summary so the main LLM knows what
                         // the tools found without needing full output.
-                        let has_extra =
-                            run_result.tool_results.len() > response.tool_calls.len();
+                        let has_extra = run_result.tool_results.len() > routed_tool_calls.len();
                         if run_result.summary.is_some() || has_extra {
                             let summary_text = if has_extra {
                                 let extra = tool_runner::format_results_for_context(
@@ -1483,15 +2552,11 @@ impl AgentLoopShared {
                                 );
                                 format!(
                                     "[Tool runner executed {} additional calls]\n{}",
-                                    run_result.tool_results.len()
-                                        - response.tool_calls.len(),
+                                    run_result.tool_results.len() - routed_tool_calls.len(),
                                     extra
                                 )
                             } else {
-                                run_result
-                                    .summary
-                                    .clone()
-                                    .unwrap_or_default()
+                                run_result.summary.clone().unwrap_or_default()
                             };
                             if !summary_text.is_empty() {
                                 // Inject as user role, not assistant. This is
@@ -1576,20 +2641,9 @@ impl AgentLoopShared {
                 }
 
                 // Inline path (default, unchanged): execute tools directly.
-                let tc_json: Vec<Value> = response
-                    .tool_calls
+                let tc_json: Vec<Value> = routed_tool_calls
                     .iter()
-                    .map(|tc| {
-                        json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": serde_json::to_string(&tc.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            }
-                        })
-                    })
+                    .map(|tc| tc.to_openai_json())
                     .collect();
 
                 ContextBuilder::add_assistant_message(
@@ -1599,7 +2653,7 @@ impl AgentLoopShared {
                 );
 
                 // Execute each tool call.
-                for tc in &response.tool_calls {
+                for tc in &routed_tool_calls {
                     debug!("Executing tool: {} (id: {})", tc.name, tc.id);
 
                     // Emit tool call start event.
@@ -1646,12 +2700,15 @@ impl AgentLoopShared {
                         use crate::agent::tools::base::ToolExecutionContext;
                         let ctx = ToolExecutionContext {
                             event_tx: tx.clone(),
-                            cancellation_token: cancellation_token.as_ref()
+                            cancellation_token: cancellation_token
+                                .as_ref()
                                 .map(|t| t.child_token())
                                 .unwrap_or_else(tokio_util::sync::CancellationToken::new),
                             tool_call_id: tc.id.clone(),
                         };
-                        tools.execute_with_context(&tc.name, tc.arguments.clone(), &ctx).await
+                        tools
+                            .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
+                            .await
                     } else {
                         tools.execute(&tc.name, tc.arguments.clone()).await
                     };
@@ -1671,7 +2728,12 @@ impl AgentLoopShared {
                     // Gate tool result through context budget.
                     let data = content_gate.admit_simple(&result.data).into_text();
                     if core.provenance_config.enabled {
-                        ContextBuilder::add_tool_result_immutable(&mut messages, &tc.id, &tc.name, &data);
+                        ContextBuilder::add_tool_result_immutable(
+                            &mut messages,
+                            &tc.id,
+                            &tc.name,
+                            &data,
+                        );
                     } else {
                         ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &data);
                     }
@@ -1754,23 +2816,33 @@ impl AgentLoopShared {
                 }
 
                 // Check cancellation between tool call iterations.
-                if cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                if cancellation_token
+                    .as_ref()
+                    .map_or(false, |t| t.is_cancelled())
+                {
                     break;
                 }
             } else {
                 // No tool calls -- the agent is done.
                 final_content = response.content.unwrap_or_default();
+                if final_content.trim().is_empty() {
+                    final_content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
+                        .to_string();
+                }
                 break;
             }
         }
 
         // Store context stats for status bar.
         let final_tokens = TokenBudget::estimate_tokens(&messages) as u64;
-        counters.last_context_used
+        counters
+            .last_context_used
             .store(final_tokens, Ordering::Relaxed);
-        counters.last_context_max
+        counters
+            .last_context_max
             .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
-        counters.last_message_count
+        counters
+            .last_message_count
             .store(messages.len() as u64, Ordering::Relaxed);
         // Store working memory token count.
         let wm_tokens = if core.memory_enabled {
@@ -1779,7 +2851,9 @@ impl AgentLoopShared {
         } else {
             0
         };
-        counters.last_working_memory_tokens.store(wm_tokens, Ordering::Relaxed);
+        counters
+            .last_working_memory_tokens
+            .store(wm_tokens, Ordering::Relaxed);
         // Store tools called this turn.
         {
             let tools_list: Vec<String> = used_tools.iter().cloned().collect();
@@ -1820,13 +2894,15 @@ impl AgentLoopShared {
                         crate::agent::provenance::redact_fabrications(&final_content, &claims);
                     final_content = redacted;
                     if redaction_count > 0 {
+                        let warning_role = provenance_warning_role(core.is_local);
+                        let warning_content = format!(
+                            "NOTICE: {} claim(s) in the previous response could not be \
+                             verified against tool outputs and were removed.",
+                            redaction_count
+                        );
                         messages.push(json!({
-                            "role": "system",
-                            "content": format!(
-                                "NOTICE: {} claim(s) in the previous response could not be \
-                                 verified against tool outputs and were removed.",
-                                redaction_count
-                            )
+                            "role": warning_role,
+                            "content": warning_content
                         }));
                     }
                 }
@@ -1836,7 +2912,9 @@ impl AgentLoopShared {
         // Phantom tool call detection: check if LLM claims tool results without calling tools.
         if !final_content.is_empty() && core.provenance_config.enabled {
             let tools_list: Vec<String> = used_tools.iter().cloned().collect();
-            if let Some(detection) = crate::agent::provenance::detect_phantom_claims(&final_content, &tools_list) {
+            if let Some(detection) =
+                crate::agent::provenance::detect_phantom_claims(&final_content, &tools_list)
+            {
                 warn!(
                     "Phantom tool claims detected ({} patterns): {:?}",
                     detection.matched_patterns.len(),
@@ -1846,13 +2924,15 @@ impl AgentLoopShared {
                 // Hard block: annotate the response so the user sees the warning.
                 if core.provenance_config.strict_mode {
                     final_content = crate::agent::provenance::annotate_phantom_response(
-                        &final_content, &detection,
+                        &final_content,
+                        &detection,
                     );
                 }
 
                 // Inject system reminder for the next turn.
+                let warning_role = provenance_warning_role(core.is_local);
                 messages.push(json!({
-                    "role": "system",
+                    "role": warning_role,
                     "content": detection.system_warning
                 }));
             }
@@ -1877,7 +2957,9 @@ impl AgentLoopShared {
             fallback
         };
         if !new_messages.is_empty() {
-            core.sessions.add_messages_raw(&session_key, &new_messages).await;
+            core.sessions
+                .add_messages_raw(&session_key, &new_messages)
+                .await;
         }
 
         // Auto-complete stale working memory sessions (runs on every message, cheap).
@@ -1965,6 +3047,7 @@ impl AgentLoop {
             core.exec_timeout,
             core.restrict_to_workspace,
             core.is_local,
+            core.max_tool_result_chars,
         );
         if let Some(pc) = providers_config {
             subagent_mgr = subagent_mgr.with_providers_config(pc);
@@ -1989,7 +3072,9 @@ impl AgentLoop {
         let bulletin_cache = {
             let core = core_handle.swappable();
             let cache = crate::agent::bulletin::BulletinCache::new();
-            if let Some(persisted) = crate::agent::bulletin::load_persisted_bulletin(&core.workspace) {
+            if let Some(persisted) =
+                crate::agent::bulletin::load_persisted_bulletin(&core.workspace)
+            {
                 cache.update(persisted);
             }
             cache.handle()
@@ -2010,6 +3095,7 @@ impl AgentLoop {
             proprioception_config,
             aha_rx: Arc::new(Mutex::new(aha_rx)),
             aha_tx,
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
         });
 
         Self {
@@ -2040,17 +3126,26 @@ impl AgentLoop {
             while running.load(Ordering::Relaxed) {
                 debug!("Bulletin: refreshing...");
                 if let Err(e) = crate::agent::bulletin::refresh_bulletin(
-                    provider.as_ref(), &model, &workspace, &cache,
-                ).await {
+                    provider.as_ref(),
+                    &model,
+                    &workspace,
+                    &cache,
+                )
+                .await
+                {
                     warn!("Bulletin refresh failed: {}", e);
                 }
                 // Sleep until next refresh.
                 tokio::time::sleep(Duration::from_secs(
                     crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S,
-                )).await;
+                ))
+                .await;
             }
         });
-        info!("Bulletin refresh task spawned (every {}min)", crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S / 60);
+        info!(
+            "Bulletin refresh task spawned (every {}min)",
+            crate::agent::bulletin::DEFAULT_BULLETIN_INTERVAL_S / 60
+        );
     }
 
     /// Spawn a background reflection task if observations exceed threshold.
@@ -2128,7 +3223,10 @@ impl AgentLoop {
                             let other_key = other.session_key();
                             let other_lock = {
                                 let mut locks = session_locks.lock().await;
-                                locks.entry(other_key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+                                locks
+                                    .entry(other_key)
+                                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                                    .clone()
                             };
                             let other_shared = self.shared.clone();
                             let other_outbound_tx = self.shared.bus_outbound_tx.clone();
@@ -2137,7 +3235,10 @@ impl AgentLoop {
                             tokio::spawn(async move {
                                 if let Ok(permit) = other_sem.acquire_owned().await {
                                     let _guard = other_lock.lock().await;
-                                    if let Some(resp) = other_shared.process_message(&other, None, None, None, None).await {
+                                    if let Some(resp) = other_shared
+                                        .process_message(&other, None, None, None, None)
+                                        .await
+                                    {
                                         let _ = other_outbound_tx.send(resp);
                                     }
                                     drop(permit);
@@ -2222,7 +3323,8 @@ impl AgentLoop {
                     // Notify REPL about outbound response.
                     if let Some(ref dtx) = display_tx {
                         let preview = if outbound.content.len() > 120 {
-                            let end = crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
+                            let end =
+                                crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
                             format!("{}...", &outbound.content[..end])
                         } else {
                             outbound.content.clone()
@@ -2290,7 +3392,11 @@ impl AgentLoop {
                 .insert("detected_language".to_string(), json!(lang));
         }
 
-        match self.shared.process_message(&msg, None, None, None, None).await {
+        match self
+            .shared
+            .process_message(&msg, None, None, None, None)
+            .await
+        {
             Some(response) => response.content,
             None => String::new(),
         }
@@ -2324,7 +3430,13 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, Some(text_delta_tx), tool_event_tx, cancellation_token, priority_rx)
+            .process_message(
+                &msg,
+                Some(text_delta_tx),
+                tool_event_tx,
+                cancellation_token,
+                priority_rx,
+            )
             .await
         {
             Some(response) => response.content,
@@ -2406,6 +3518,7 @@ impl crate::agent::tools::Tool for CronToolProxy {
 mod tests {
     use super::*;
     use crate::config::schema::ProviderConfig;
+    use crate::providers::openai_compat::OpenAICompatProvider;
     use async_trait::async_trait;
 
     /// Minimal mock LLM provider for wiring tests.
@@ -2415,7 +3528,9 @@ mod tests {
 
     impl MockLLM {
         fn named(name: &str) -> Arc<dyn LLMProvider> {
-            Arc::new(Self { name: name.to_string() })
+            Arc::new(Self {
+                name: name.to_string(),
+            })
         }
     }
 
@@ -2432,6 +3547,44 @@ mod tests {
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             Ok(crate::providers::base::LLMResponse {
                 content: Some("mock".to_string()),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct StaticResponseLLM {
+        name: String,
+        body: String,
+    }
+
+    impl StaticResponseLLM {
+        fn new(name: &str, body: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                body: body.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for StaticResponseLLM {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(self.body.clone()),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -2476,7 +3629,202 @@ mod tests {
             ProvenanceConfig::default(),
             2000,
             delegation_provider,
+            None,
+            TrioConfig::default(),
         )
+    }
+
+    #[test]
+    fn test_provenance_warning_role_local_safe() {
+        assert_eq!(provenance_warning_role(true), "user");
+        assert_eq!(provenance_warning_role(false), "system");
+    }
+
+    #[test]
+    fn test_extract_json_object_from_markdown_fence() {
+        let raw = "```json\n{\"action\":\"tool\",\"target\":\"exec\",\"args\":{},\"confidence\":0.9}\n```";
+        let obj = extract_json_object(raw).expect("json object");
+        assert!(obj.starts_with('{'));
+        assert!(obj.ends_with('}'));
+        assert!(obj.contains("\"action\":\"tool\""));
+    }
+
+    #[test]
+    fn test_extract_json_object_none_when_missing() {
+        assert!(extract_json_object("no json here").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_request_strict_router_decision_action_matrix() {
+        let cases = vec![
+            (
+                r#"{"action":"tool","target":"read_file","args":{"path":"README.md"},"confidence":0.9}"#,
+                "tool",
+            ),
+            (
+                r#"{"action":"subagent","target":"builder","args":{"task":"x"},"confidence":0.8}"#,
+                "subagent",
+            ),
+            (
+                r#"{"action":"specialist","target":"summarizer","args":{"style":"tight"},"confidence":0.7}"#,
+                "specialist",
+            ),
+            (
+                r#"{"action":"ask_user","target":"clarify","args":{"question":"Need path?"},"confidence":0.6}"#,
+                "ask_user",
+            ),
+        ];
+
+        for (raw, expected_action) in cases {
+            let llm = StaticResponseLLM::new("router", raw);
+            let decision = request_strict_router_decision(
+                &llm,
+                "router",
+                "route this action with strict schema",
+                false,
+                0.6,
+            )
+            .await
+            .expect("valid strict router decision");
+            assert_eq!(decision.action, expected_action);
+        }
+    }
+
+    /// Real-provider trio probe.
+    ///
+    /// Runs against live OpenAI-compatible endpoints (typically llama.cpp):
+    /// - main: `NANOBOT_REAL_MAIN_BASE` (default: http://127.0.0.1:8080/v1)
+    /// - router: `NANOBOT_REAL_ROUTER_BASE` (default: http://127.0.0.1:8094/v1)
+    /// - specialist: `NANOBOT_REAL_SPECIALIST_BASE` (default: http://127.0.0.1:8095/v1)
+    ///
+    /// Optional model overrides:
+    /// - `NANOBOT_REAL_MAIN_MODEL`
+    /// - `NANOBOT_REAL_ROUTER_MODEL`
+    /// - `NANOBOT_REAL_SPECIALIST_MODEL`
+    #[tokio::test]
+    #[ignore = "requires running local providers on main/router/specialist ports"]
+    async fn test_real_providers_trio_probe() {
+        let main_base = std::env::var("NANOBOT_REAL_MAIN_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string());
+        let router_base = std::env::var("NANOBOT_REAL_ROUTER_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:8094/v1".to_string());
+        let specialist_base = std::env::var("NANOBOT_REAL_SPECIALIST_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:8095/v1".to_string());
+        let main_model = std::env::var("NANOBOT_REAL_MAIN_MODEL")
+            .unwrap_or_else(|_| "local-model".to_string());
+        let router_model = std::env::var("NANOBOT_REAL_ROUTER_MODEL")
+            .unwrap_or_else(|_| "local-delegation".to_string());
+        let specialist_model = std::env::var("NANOBOT_REAL_SPECIALIST_MODEL")
+            .unwrap_or_else(|_| "local-specialist".to_string());
+
+        let main = OpenAICompatProvider::new("local", Some(&main_base), Some(&main_model));
+        let router = OpenAICompatProvider::new("local", Some(&router_base), Some(&router_model));
+        let specialist =
+            OpenAICompatProvider::new("local", Some(&specialist_base), Some(&specialist_model));
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // Router: force each action in a constrained prompt and verify strict parsing.
+        let router_cases = vec![
+            ("tool", "Return action=tool target=read_file args={\"path\":\"README.md\"}."),
+            (
+                "subagent",
+                "Return action=subagent target=builder args={\"task\":\"diagnose issue\"}.",
+            ),
+            (
+                "specialist",
+                "Return action=specialist target=summarizer args={\"objective\":\"compress\"}.",
+            ),
+            (
+                "ask_user",
+                "Return action=ask_user target=clarify args={\"question\":\"Which file?\"}.",
+            ),
+        ];
+        for (expected_action, directive) in router_cases {
+            let pack = format!("{}\nFollow schema strictly.", directive);
+            match request_strict_router_decision(&router, &router_model, &pack, false, 0.6).await {
+                Ok(d) => {
+                    if d.action != expected_action {
+                        failures.push(format!(
+                            "router action mismatch: expected={}, got={} target={}",
+                            expected_action, d.action, d.target
+                        ));
+                    }
+                }
+                Err(e) => failures.push(format!("router {} failed: {}", expected_action, e)),
+            }
+        }
+
+        // Specialist must produce non-empty response (with warmup retries).
+        let specialist_messages = vec![
+            json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise output."}),
+            json!({"role":"user","content":"Summarize: tool call failed because server was down and port conflicted."}),
+        ];
+        let mut specialist_ok = false;
+        for _ in 0..10 {
+            match specialist
+                .chat(
+                    &specialist_messages,
+                    None,
+                    Some(&specialist_model),
+                    256,
+                    0.2,
+                    None,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let text = resp.content.unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        specialist_ok = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.to_lowercase().contains("loading model")
+                        || msg.to_lowercase().contains("503")
+                    {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    failures.push(format!("specialist call failed: {}", msg));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if !specialist_ok {
+            failures.push("specialist did not become ready / returned empty output".to_string());
+        }
+
+        // Main provider smoke: should answer plain text with no tools when none offered.
+        let main_messages = vec![json!({"role":"user","content":"Reply with exactly: main-ok"})];
+        match main
+            .chat(&main_messages, None, Some(&main_model), 64, 0.0, None)
+            .await
+        {
+            Ok(resp) => {
+                if resp.has_tool_calls() {
+                    failures.push("main returned tool calls unexpectedly".to_string());
+                }
+                let text = resp.content.unwrap_or_default();
+                if !text.to_lowercase().contains("main-ok") {
+                    failures.push(format!("main output mismatch: {}", text));
+                }
+            }
+            Err(e) => failures.push(format!("main call failed: {}", e)),
+        }
+
+        if !failures.is_empty() {
+            panic!(
+                "real trio probe failed (main={}, router={}, specialist={}):\n{}",
+                main_base,
+                router_base,
+                specialist_base,
+                failures.join("\n")
+            );
+        }
     }
 
     // -- Delegation provider wiring tests --
@@ -2593,6 +3941,8 @@ mod tests {
             ProvenanceConfig::default(),
             2000,
             None,
+            None,
+            TrioConfig::default(),
         );
         assert_eq!(
             core.tool_runner_model.as_deref(),
@@ -2645,12 +3995,17 @@ mod tests {
             ProvenanceConfig::default(),
             2000,
             Some(dp),
+            None,
+            TrioConfig::default(),
         );
 
         assert!(core.is_local);
         assert!(core.tool_runner_provider.is_some());
         assert_eq!(
-            core.tool_runner_provider.as_ref().unwrap().get_default_model(),
+            core.tool_runner_provider
+                .as_ref()
+                .unwrap()
+                .get_default_model(),
             "local-delegation",
             "Local mode should still use the delegation provider"
         );
@@ -2687,6 +4042,8 @@ mod tests {
             ProvenanceConfig::default(),
             2000,
             Some(delegation),
+            None,
+            TrioConfig::default(),
         );
 
         // Compaction provider goes to memory_provider, delegation to tool_runner
@@ -2696,7 +4053,10 @@ mod tests {
             "Memory should use compaction provider"
         );
         assert_eq!(
-            core.tool_runner_provider.as_ref().unwrap().get_default_model(),
+            core.tool_runner_provider
+                .as_ref()
+                .unwrap()
+                .get_default_model(),
             "delegation",
             "Tool runner should use delegation provider"
         );
