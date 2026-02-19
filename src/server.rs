@@ -1354,10 +1354,11 @@ pub(crate) fn start_health_watchdog_with_autorepair(
     ports: Vec<(String, String)>, // (role, port)
     alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
     restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
+    inference_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
 
@@ -1371,6 +1372,12 @@ pub(crate) fn start_health_watchdog_with_autorepair(
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            // Skip health checks while LLM inference is in flight — the server
+            // blocks /health during large prompt processing, causing false positives.
+            if inference_active.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
 
             for (role, port) in &ports {
                 // Use deep health check for main server, simple check for others
@@ -1390,13 +1397,13 @@ pub(crate) fn start_health_watchdog_with_autorepair(
                     *consecutive_failures.get_mut(role).unwrap() += 1;
                     let failures = consecutive_failures[role];
 
-                    if failures == 1 && prev {
+                    if failures < 3 && prev {
                         let msg = format!(
-                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt 1/2)\n",
-                            role, port
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt {}/3)\n",
+                            role, port, failures
                         );
                         let _ = alert_tx.send(msg);
-                    } else if failures >= 2 {
+                    } else if failures >= 3 {
                         let msg = format!(
                             "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m auto-restarting...\n",
                             role

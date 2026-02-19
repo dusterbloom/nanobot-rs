@@ -139,6 +139,12 @@ pub struct RuntimeCounters {
     /// When true, ThinkingDelta tokens are NOT sent to delta_tx (suppressed
     /// from TTS). Auto-set when voice mode is active; toggled by `/nothink`.
     pub suppress_thinking_in_tts: AtomicBool,
+    /// Set to true while an LLM call is in flight. The health watchdog reads
+    /// this to skip health checks during inference (avoiding false "unhealthy"
+    /// restarts when the server is busy processing a large prompt).
+    /// Wrapped in Arc so the watchdog can hold a cheap clone without needing
+    /// the full RuntimeCounters.
+    pub inference_active: Arc<AtomicBool>,
 }
 
 impl RuntimeCounters {
@@ -158,6 +164,7 @@ impl RuntimeCounters {
             last_actual_completion_tokens: AtomicU64::new(0),
             last_estimated_prompt_tokens: AtomicU64::new(0),
             suppress_thinking_in_tts: AtomicBool::new(false),
+            inference_active: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1739,7 +1746,19 @@ impl AgentLoopShared {
                             break;
                         }
                     };
-                let tool_list = ctx.tools.tool_names();
+                let tool_list = if ctx.core.is_local {
+                    ctx.tools
+                        .get_local_definitions(&ctx.messages, &ctx.used_tools)
+                        .iter()
+                        .filter_map(|d| {
+                            d.pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
+                        .collect()
+                } else {
+                    ctx.tools.tool_names()
+                };
                 let task_state = format!("Strict preflight. User message: {}", ctx.user_content);
                 let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
                     role_policy::build_context_pack(
@@ -1894,6 +1913,9 @@ impl AgentLoopShared {
                     None
                 }
             };
+            // Signal watchdog: LLM inference is active — skip health checks.
+            counters.inference_active.store(true, Ordering::Relaxed);
+
             let mut response = if let Some(ref delta_tx) = ctx.text_delta_tx {
                 // Streaming path: forward text deltas as they arrive.
                 let mut stream = match ctx.core
@@ -1910,6 +1932,7 @@ impl AgentLoopShared {
                 {
                     Ok(s) => s,
                     Err(e) => {
+                        counters.inference_active.store(false, Ordering::Relaxed);
                         error!("LLM streaming call failed: {}", e);
                         ctx.final_content = format!("I encountered an error: {}", e);
                         break;
@@ -1970,6 +1993,7 @@ impl AgentLoopShared {
                 match streamed_response {
                     Some(r) => r,
                     None => {
+                        counters.inference_active.store(false, Ordering::Relaxed);
                         // Stream ended without Done — either cancelled or genuine error.
                         if ctx.cancellation_token
                             .as_ref()
@@ -1999,12 +2023,16 @@ impl AgentLoopShared {
                 {
                     Ok(r) => r,
                     Err(e) => {
+                        counters.inference_active.store(false, Ordering::Relaxed);
                         error!("LLM call failed: {}", e);
                         ctx.final_content = format!("I encountered an error: {}", e);
                         break;
                     }
                 }
             };
+
+            // Inference complete — allow watchdog health checks again.
+            counters.inference_active.store(false, Ordering::Relaxed);
 
             // --- Response Validation: detect hallucinated tool calls ---
             let content_str = response.content.as_deref().unwrap_or("");
@@ -2060,6 +2088,7 @@ impl AgentLoopShared {
                     "role": "user",
                     "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
                 }));
+                counters.inference_active.store(true, Ordering::Relaxed);
                 match ctx.core
                     .provider
                     .chat(
@@ -2079,6 +2108,7 @@ impl AgentLoopShared {
                         warn!("Finalize rescue call failed: {}", e);
                     }
                 }
+                counters.inference_active.store(false, Ordering::Relaxed);
             }
 
             // Check for LLM provider errors before processing the response.
