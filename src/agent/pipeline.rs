@@ -16,12 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::agent::context::ContextBuilder;
 use crate::agent::thread_repair;
-use crate::agent::tools::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
-    WriteFileTool,
-};
+use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::providers::base::LLMProvider;
 
 /// Default max iterations per tool-equipped step.
@@ -221,37 +217,11 @@ async fn execute_step_with_tools(
     let tool_names = step.tools.as_deref().unwrap_or(&[]);
 
     // Build a tool registry with only the requested tools.
-    let mut tools = ToolRegistry::new();
-    let should_include = |name: &str| -> bool { tool_names.iter().any(|t| t == name) };
-
-    if should_include("read_file") {
-        tools.register(Box::new(ReadFileTool));
-    }
-    if should_include("write_file") {
-        tools.register(Box::new(WriteFileTool));
-    }
-    if should_include("edit_file") {
-        tools.register(Box::new(EditFileTool));
-    }
-    if should_include("list_dir") {
-        tools.register(Box::new(ListDirTool));
-    }
-    if should_include("exec") {
-        tools.register(Box::new(ExecTool::new(
-            30, // timeout
-            Some(workspace.to_string_lossy().to_string()),
-            None,
-            None,
-            false, // restrict_to_workspace
-            DEFAULT_MAX_TOOL_RESULT_CHARS,
-        )));
-    }
-    if should_include("web_search") {
-        tools.register(Box::new(WebSearchTool::new(None, 5)));
-    }
-    if should_include("web_fetch") {
-        tools.register(Box::new(WebFetchTool::new(DEFAULT_MAX_TOOL_RESULT_CHARS)));
-    }
+    let tool_config = ToolConfig {
+        tools_filter: Some(tool_names.iter().map(|s| s.to_string()).collect()),
+        ..ToolConfig::new(workspace)
+    };
+    let tools = ToolRegistry::with_standard_tools(&tool_config);
 
     let tool_defs = tools.get_definitions();
     let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
@@ -287,10 +257,9 @@ async fn execute_step_with_tools(
         );
 
         // Local models with Jinja templates require strict user/assistant alternation.
-        // Repair tool messages before each LLM call.
+        // Repair tool messages before each LLM call (skip iteration 0 — freshly built).
         if is_local && iteration > 0 {
-            thread_repair::repair_for_strict_alternation(&mut messages);
-            thread_repair::strip_imitatable_patterns(&mut messages);
+            thread_repair::repair_for_local(&mut messages);
         }
 
         let response = match provider
@@ -310,26 +279,10 @@ async fn execute_step_with_tools(
             return format!("Error: {}", err);
         }
 
-        if response.has_tool_calls() {
-            // Build assistant message with tool calls.
-            let tc_json: Vec<Value> = response
-                .tool_calls
-                .iter()
-                .map(|tc| tc.to_openai_json())
-                .collect();
-
-            ContextBuilder::add_assistant_message(
-                &mut messages,
-                response.content.as_deref(),
-                Some(&tc_json),
-            );
-
-            // Execute each tool call.
-            for tc in &response.tool_calls {
-                debug!("Pipeline step {} calling tool: {}", step.index, tc.name);
-                let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-                ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
-            }
+        if crate::agent::tool_runner::process_tool_response(
+            &response, &mut messages, &tools, is_local,
+        ).await {
+            // Tool calls processed — continue loop.
         } else {
             // No tool calls — step is done.
             final_content = response.content.unwrap_or_default();

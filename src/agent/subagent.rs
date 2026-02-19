@@ -15,13 +15,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::agent::agent_profiles::{self, AgentProfile};
-use crate::agent::context::ContextBuilder;
-use crate::agent::thread_repair;
 use crate::agent::token_budget::TokenBudget;
-use crate::agent::tools::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ToolRegistry, WebFetchTool, WebSearchTool,
-    WriteFileTool,
-};
+use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::bus::events::InboundMessage;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::base::LLMProvider;
@@ -785,56 +780,18 @@ impl SubagentManager {
             label
         );
 
-        // Build a tool registry. Start with all tools, then filter.
-        let mut tools = ToolRegistry::new();
-
-        // Determine which tools to register based on profile config.
-        let should_include = |name: &str| -> bool {
-            // If read_only, exclude write tools regardless of filter.
-            if config.read_only && matches!(name, "write_file" | "edit_file") {
-                return false;
-            }
-            // If there's a tools filter, only include listed tools.
-            if let Some(ref filter) = config.tools_filter {
-                return filter.iter().any(|t| t == name);
-            }
-            true
+        // Build a tool registry using unified ToolConfig.
+        let tool_config = ToolConfig {
+            workspace: workspace.to_path_buf(),
+            exec_timeout,
+            restrict_to_workspace,
+            max_tool_result_chars: config.max_tool_result_chars,
+            brave_api_key: brave_api_key.map(|s| s.to_string()),
+            read_only: config.read_only,
+            tools_filter: config.tools_filter.clone(),
+            exec_working_dir: exec_working_dir.map(|s| s.to_string()),
         };
-
-        if should_include("read_file") {
-            tools.register(Box::new(ReadFileTool));
-        }
-        if should_include("write_file") {
-            tools.register(Box::new(WriteFileTool));
-        }
-        if should_include("edit_file") {
-            tools.register(Box::new(EditFileTool));
-        }
-        if should_include("list_dir") {
-            tools.register(Box::new(ListDirTool));
-        }
-        if should_include("exec") {
-            let exec_cwd = exec_working_dir
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| workspace.to_string_lossy().to_string());
-            tools.register(Box::new(ExecTool::new(
-                exec_timeout,
-                Some(exec_cwd),
-                None,
-                None,
-                restrict_to_workspace,
-                config.max_tool_result_chars,
-            )));
-        }
-        if should_include("web_search") {
-            tools.register(Box::new(WebSearchTool::new(
-                brave_api_key.map(|s| s.to_string()),
-                5,
-            )));
-        }
-        if should_include("web_fetch") {
-            tools.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
-        }
+        let tools = ToolRegistry::with_standard_tools(&tool_config);
 
         // Build the subagent system prompt.
         let system_prompt = if let Some(ref profile_prompt) = config.system_prompt {
@@ -963,37 +920,12 @@ impl SubagentManager {
                 return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
             }
 
-            if response.has_tool_calls() {
-                // Build tool_calls JSON for the assistant message.
-                let tc_json: Vec<Value> = response
-                    .tool_calls
-                    .iter()
-                    .map(|tc| tc.to_openai_json())
-                    .collect();
-
-                ContextBuilder::add_assistant_message(
-                    &mut messages,
-                    response.content.as_deref(),
-                    Some(&tc_json),
-                );
-
-                // Execute each tool call.
-                for tc in &response.tool_calls {
-                    debug!("Subagent {} calling tool: {}", task_id, tc.name);
-                    let result = tools.execute(&tc.name, tc.arguments.clone()).await;
-                    ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result.data);
-                }
-
-                // Local models with strict Jinja templates require strict user/assistant alternation.
-                // Tool results use "role": "tool" which breaks this. Repair converts
-                // tool→user and merges consecutive same-role messages, so the thread
-                // already ends with a user message. No extra continuation needed.
-                if is_local {
-                    thread_repair::repair_for_strict_alternation(&mut messages);
-                    thread_repair::strip_imitatable_patterns(&mut messages);
-                }
+            if crate::agent::tool_runner::process_tool_response(
+                &response, &mut messages, &tools, is_local,
+            ).await {
+                // Tool calls processed — continue loop.
             } else {
-                // No tool calls -- the subagent is done.
+                // No tool calls — the subagent is done.
                 final_content = response.content.unwrap_or_default();
                 break;
             }

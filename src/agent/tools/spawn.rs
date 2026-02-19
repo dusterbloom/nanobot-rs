@@ -148,6 +148,48 @@ impl Default for SpawnTool {
     }
 }
 
+/// Lightweight spawn tool for local models with limited context.
+///
+/// Same callbacks and execution logic as SpawnTool, but with a minimal
+/// schema (~200 tokens vs ~1,100). Drops pipeline/loop actions that
+/// require cloud-level reasoning.
+pub struct SpawnToolLite(pub Arc<SpawnTool>);
+
+#[async_trait]
+impl Tool for SpawnToolLite {
+    fn name(&self) -> &str {
+        "spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Run a background task, list tasks, check results, wait, or cancel."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["spawn", "list", "check", "wait", "cancel"]
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Task description (for spawn)"
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID (for check/wait/cancel)"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
+        self.0.execute(params).await
+    }
+}
+
 #[async_trait]
 impl Tool for SpawnTool {
     fn name(&self) -> &str {

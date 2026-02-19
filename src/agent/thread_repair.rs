@@ -458,6 +458,21 @@ fn merge_consecutive_assistant_messages(messages: &mut Vec<Value>) {
     }
 }
 
+/// Full repair pipeline for local models.
+///
+/// Combines all three repair steps that local models need before each LLM call:
+/// 1. `repair_messages` — remove orphaned tool results, dedup
+/// 2. `repair_for_strict_alternation` — convert tool→user, flatten tool_calls
+/// 3. `strip_imitatable_patterns` — remove patterns the model might imitate
+///
+/// This replaces the inconsistent triple-call pattern scattered across
+/// agent_loop.rs, subagent.rs, and pipeline.rs.
+pub fn repair_for_local(messages: &mut Vec<Value>) {
+    repair_messages(messages);
+    repair_for_strict_alternation(messages);
+    strip_imitatable_patterns(messages);
+}
+
 /// Strip `[Called tool(...)]` patterns from assistant message content.
 ///
 /// This prevents models from learning to output text descriptions of tool calls
@@ -1271,5 +1286,39 @@ mod tests {
             content.contains("important"),
             "Should preserve non-intent text"
         );
+    }
+
+    // ----- repair_for_local -----
+
+    #[test]
+    fn test_repair_for_local_combines_all_steps() {
+        // Tool result before its assistant (orphan) + tool messages that need alternation.
+        let mut messages = vec![
+            json!({"role": "system", "content": "System"}),
+            json!({"role": "user", "content": "Do something"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc_1", "name": "exec", "content": "ok"}),
+        ];
+
+        repair_for_local(&mut messages);
+
+        // After repair: no tool-role messages remain (converted to user).
+        assert!(
+            !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            "tool messages should be converted"
+        );
+        // No [Called patterns remain.
+        for m in &messages {
+            if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
+                assert!(!c.contains("[Called"), "no [Called patterns should survive");
+            }
+        }
+        // Should end with user (for local model protocol).
+        let last_role = messages.last().unwrap()["role"].as_str().unwrap();
+        assert_eq!(last_role, "user", "should end with user message");
     }
 }

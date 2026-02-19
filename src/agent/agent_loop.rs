@@ -36,11 +36,11 @@ use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
+use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::agent::tools::{
-    CancelCallback, CheckCallback, CheckInboxTool, CronScheduleTool, EditFileTool, ExecTool,
-    ListCallback, ListDirTool, LoopCallback, MessageTool, PipelineCallback, ReadFileTool,
-    ReadSkillTool, RecallTool, SendCallback, SendEmailTool, SpawnCallback, SpawnTool, ToolRegistry,
-    WaitCallback, WebFetchTool, WebSearchTool, WriteFileTool,
+    CancelCallback, CheckCallback, CheckInboxTool, CronScheduleTool, ListCallback, LoopCallback,
+    MessageTool, PipelineCallback, SendCallback, SendEmailTool, SpawnCallback, SpawnTool,
+    SpawnToolLite, WaitCallback,
 };
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -508,6 +508,108 @@ async fn request_strict_router_decision(
     }
 }
 
+/// Dispatch a router decision to the specialist lane.
+///
+/// Shared by both preflight and post-tool router paths. Returns:
+/// - `Ok(Some(text))` to inject as a user message and continue
+/// - `Ok(None)` to break with an error (set in `final_content`)
+/// - `Err(msg)` on fatal error (break with msg)
+async fn dispatch_specialist(
+    core: &SwappableCore,
+    target: &str,
+    router_args: &Value,
+    user_content: &str,
+    context_summary: &str,
+    tool_list: &[String],
+) -> Result<String, String> {
+    let (specialist_provider, specialist_model) = match (
+        core.specialist_provider.as_ref(),
+        core.specialist_model.as_deref(),
+    ) {
+        (Some(p), Some(m)) => (p.clone(), m.to_string()),
+        _ => {
+            return Err(
+                "Specialist lane requested by router but no specialist server is configured."
+                    .to_string(),
+            );
+        }
+    };
+    let specialist_state = format!(
+        "Target: {}\nRouter args: {}\nUser intent: {}",
+        target, router_args, context_summary
+    );
+    let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
+        role_policy::build_context_pack(
+            role_policy::Role::Specialist,
+            user_content,
+            "(live turn; summary omitted)",
+            &specialist_state,
+            tool_list,
+            3000,
+        )
+    } else {
+        specialist_state
+    };
+    let specialist_messages = vec![
+        json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise actionable output only. No markdown unless requested."}),
+        json!({"role":"user","content": specialist_pack}),
+    ];
+    match specialist_provider
+        .chat(
+            &specialist_messages,
+            None,
+            Some(&specialist_model),
+            core.tool_delegation_config.max_tokens,
+            0.3,
+            None,
+        )
+        .await
+    {
+        Ok(sp_resp) => {
+            let text = sp_resp
+                .content
+                .unwrap_or_else(|| "Specialist returned no content.".to_string());
+            Ok(format!("[specialist:{}] {}", target, text))
+        }
+        Err(e) => Err(format!("Specialist lane failed: {}", e)),
+    }
+}
+
+/// Dispatch a router decision to spawn a subagent.
+///
+/// Returns the formatted result string to inject as a user message.
+async fn dispatch_subagent(
+    tools: &ToolRegistry,
+    target: &str,
+    router_args: &Value,
+    user_content: &str,
+    strict_local_only: bool,
+    tool_guard: &mut crate::agent::tool_guard::ToolGuard,
+) -> Result<String, String> {
+    let mut params: HashMap<String, Value> = HashMap::new();
+    params.insert("action".to_string(), json!("spawn"));
+    if let Some(task) = router_args.get("task").and_then(|v| v.as_str()) {
+        params.insert("task".to_string(), json!(task));
+    } else {
+        params.insert("task".to_string(), json!(user_content));
+    }
+    if !target.trim().is_empty() {
+        params.insert("agent".to_string(), json!(target));
+    }
+    if strict_local_only {
+        params.insert("model".to_string(), json!("local"));
+    }
+    if let Err(e) = policy::validate_spawn_args(&params) {
+        return Err(e);
+    }
+    if let Err(e) = tool_guard.allow("spawn", &params) {
+        warn!("{}", e);
+        return Ok(format!("[tool-guard] {}", e));
+    }
+    let spawn_result = tools.execute("spawn", params).await;
+    Ok(format!("[router:subagent] {}", spawn_result.data))
+}
+
 /// Build a `SwappableCore` from the given parameters.
 ///
 /// When `is_local` is true, the compactor and memory operations use a dedicated
@@ -780,33 +882,16 @@ impl AgentLoopShared {
         channel: &str,
         chat_id: &str,
     ) -> ToolRegistry {
-        let mut tools = ToolRegistry::new();
-
-        // File system tools (stateless).
-        tools.register(Box::new(ReadFileTool));
-        tools.register(Box::new(WriteFileTool));
-        tools.register(Box::new(EditFileTool));
-        tools.register(Box::new(ListDirTool));
-
-        // Shell (stateless config).
-        tools.register(Box::new(ExecTool::new(
-            core.exec_timeout,
-            Some(core.workspace.to_string_lossy().to_string()),
-            None,
-            None,
-            core.restrict_to_workspace,
-            core.max_tool_result_chars,
-        )));
-
-        // Web (stateless config).
-        tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
-        tools.register(Box::new(WebFetchTool::new(core.max_tool_result_chars)));
-
-        // Memory recall (stateless config).
-        tools.register(Box::new(RecallTool::new(&core.workspace)));
-
-        // Skill reader — on-demand skill loading (RLM lazy mode).
-        tools.register(Box::new(ReadSkillTool::new(&core.workspace)));
+        // Standard stateless tools via unified ToolConfig.
+        let tool_config = ToolConfig {
+            workspace: core.workspace.clone(),
+            exec_timeout: core.exec_timeout,
+            restrict_to_workspace: core.restrict_to_workspace,
+            max_tool_result_chars: core.max_tool_result_chars,
+            brave_api_key: core.brave_api_key.clone(),
+            ..ToolConfig::new(&core.workspace)
+        };
+        let mut tools = ToolRegistry::with_standard_tools(&tool_config);
 
         // Message tool - context baked in.
         let outbound_tx_clone = self.bus_outbound_tx.clone();
@@ -1018,7 +1103,13 @@ impl AgentLoopShared {
         spawn_tool.set_pipeline_callback(pipeline_cb).await;
         spawn_tool.set_loop_callback(loop_cb).await;
         spawn_tool.set_context(channel, chat_id).await;
-        tools.register(Box::new(SpawnToolProxy(spawn_tool)));
+        // Local models get the lite schema (~200 tokens) instead of the full
+        // schema (~1,100 tokens) which would consume 55% of a 4K context.
+        if core.is_local {
+            tools.register(Box::new(SpawnToolLite(spawn_tool)));
+        } else {
+            tools.register(Box::new(SpawnToolProxy(spawn_tool)));
+        }
 
         // Cron tool (optional) - context baked in.
         if let Some(ref svc) = self.cron_service {
@@ -1487,16 +1578,11 @@ impl AgentLoopShared {
                 });
             }
 
-            // Repair any protocol violations before calling the LLM.
-            thread_repair::repair_messages(&mut messages);
-
-            // Local models via --jinja may require strict user/assistant alternation.
-            // Convert tool messages to user messages and tool_calls to text.
+            // Repair protocol violations before calling the LLM.
             if core.is_local {
-                thread_repair::repair_for_strict_alternation(&mut messages);
-                // Strip the "[Called tool(...)]" patterns we just added so the model
-                // doesn't learn to output text descriptions instead of actual tool calls.
-                thread_repair::strip_imitatable_patterns(&mut messages);
+                thread_repair::repair_for_local(&mut messages);
+            } else {
+                thread_repair::repair_messages(&mut messages);
             }
 
             // Pre-flight context size check: emergency trim if we're about to
@@ -1512,10 +1598,10 @@ impl AgentLoopShared {
                 // tool_def_tokens=0 is conservative (trims more aggressively).
                 messages = core.token_budget.trim_to_fit(&messages, 0);
                 // Re-run repair after trim in case truncation broke protocol.
-                thread_repair::repair_messages(&mut messages);
                 if core.is_local {
-                    thread_repair::repair_for_strict_alternation(&mut messages);
-                    thread_repair::strip_imitatable_patterns(&mut messages);
+                    thread_repair::repair_for_local(&mut messages);
+                } else {
+                    thread_repair::repair_messages(&mut messages);
                 }
             }
 
@@ -1575,96 +1661,28 @@ impl AgentLoopShared {
                         break;
                     }
                     "specialist" => {
-                        let (specialist_provider, specialist_model) = match (
-                            core.specialist_provider.as_ref(),
-                            core.specialist_model.as_deref(),
-                        ) {
-                            (Some(p), Some(m)) => (p.clone(), m.to_string()),
-                            _ => {
-                                final_content = "Specialist lane requested by router but no specialist server is configured.".to_string();
-                                break;
-                            }
-                        };
-                        let specialist_state = format!(
-                            "Target: {}\nRouter args: {}\nUser intent: {}",
-                            decision.target, decision.args, msg.content
-                        );
-                        let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs
-                        {
-                            role_policy::build_context_pack(
-                                role_policy::Role::Specialist,
-                                &msg.content,
-                                "(live turn; summary omitted)",
-                                &specialist_state,
-                                &tool_list,
-                                3000,
-                            )
-                        } else {
-                            specialist_state
-                        };
-                        let specialist_messages = vec![
-                            json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise actionable output only. No markdown unless requested."}),
-                            json!({"role":"user","content": specialist_pack}),
-                        ];
-                        match specialist_provider
-                            .chat(
-                                &specialist_messages,
-                                None,
-                                Some(&specialist_model),
-                                core.tool_delegation_config.max_tokens,
-                                0.3,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(sp_resp) => {
-                                let text = sp_resp
-                                    .content
-                                    .unwrap_or_else(|| "Specialist returned no content.".to_string());
-                                messages.push(json!({
-                                    "role":"user",
-                                    "content": format!("[specialist:{}] {}", decision.target, text),
-                                }));
+                        match dispatch_specialist(
+                            &core, &decision.target, &decision.args,
+                            &msg.content, &msg.content, &tool_list,
+                        ).await {
+                            Ok(text) => {
+                                messages.push(json!({"role":"user","content": text}));
                                 continue;
                             }
-                            Err(e) => {
-                                final_content = format!("Specialist lane failed: {}", e);
-                                break;
-                            }
+                            Err(e) => { final_content = e; break; }
                         }
                     }
                     "subagent" => {
-                        let mut params: HashMap<String, Value> = HashMap::new();
-                        params.insert("action".to_string(), json!("spawn"));
-                        if let Some(task) = decision.args.get("task").and_then(|v| v.as_str()) {
-                            params.insert("task".to_string(), json!(task));
-                        } else {
-                            params.insert("task".to_string(), json!(msg.content.clone()));
+                        match dispatch_subagent(
+                            &tools, &decision.target, &decision.args,
+                            &msg.content, strict_local_only, &mut tool_guard,
+                        ).await {
+                            Ok(text) => {
+                                messages.push(json!({"role":"user","content": text}));
+                                continue;
+                            }
+                            Err(e) => { final_content = e; break; }
                         }
-                        if !decision.target.trim().is_empty() {
-                            params.insert("agent".to_string(), json!(decision.target));
-                        }
-                        if strict_local_only {
-                            params.insert("model".to_string(), json!("local"));
-                        }
-                        if let Err(e) = policy::validate_spawn_args(&params) {
-                            final_content = e;
-                            break;
-                        }
-                        if let Err(e) = tool_guard.allow("spawn", &params) {
-                            warn!("{}", e);
-                            messages.push(json!({
-                                "role":"user",
-                                "content": format!("[tool-guard] {}", e),
-                            }));
-                            continue;
-                        }
-                        let spawn_result = tools.execute("spawn", params).await;
-                        messages.push(json!({
-                            "role":"user",
-                            "content": format!("[router:subagent] {}", spawn_result.data),
-                        }));
-                        continue;
                     }
                     "tool" => {
                         if decision.target.trim().is_empty() {
@@ -2124,100 +2142,29 @@ impl AgentLoopShared {
                             break;
                         }
                         ToolPlanAction::Specialist => {
-                            let (specialist_provider, specialist_model) = match (
-                                core.specialist_provider.as_ref(),
-                                core.specialist_model.as_deref(),
-                            ) {
-                                (Some(p), Some(m)) => (p.clone(), m.to_string()),
-                                _ => {
-                                    final_content = "Specialist lane requested by router but no specialist server is configured.".to_string();
-                                    break;
-                                }
-                            };
-                            let specialist_state = format!(
-                                "Target: {}\nMain content: {}\nRouter args: {}",
-                                plan.target,
-                                response.content.as_deref().unwrap_or("(empty)"),
-                                plan.args
-                            );
-                            let specialist_pack =
-                                if core.tool_delegation_config.role_scoped_context_packs {
-                                    role_policy::build_context_pack(
-                                        role_policy::Role::Specialist,
-                                        &msg.content,
-                                        "(live turn; summary omitted)",
-                                        &specialist_state,
-                                        &tools.tool_names(),
-                                        3000,
-                                    )
-                                } else {
-                                    specialist_state
-                                };
-                            let specialist_messages = vec![
-                                json!({"role":"system","content":"You are a focused specialist. Provide direct, actionable output only."}),
-                                json!({"role":"user","content": specialist_pack}),
-                            ];
-                            match specialist_provider
-                                .chat(
-                                    &specialist_messages,
-                                    None,
-                                    Some(&specialist_model),
-                                    core.tool_delegation_config.max_tokens,
-                                    0.3,
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(sp_resp) => {
-                                    let text = sp_resp
-                                        .content
-                                        .unwrap_or_else(|| "Specialist returned no content.".to_string());
-                                    messages.push(json!({
-                                        "role":"user",
-                                        "content": format!("[specialist:{}] {}", plan.target, text),
-                                    }));
+                            let context_summary = response.content.as_deref().unwrap_or("(empty)");
+                            match dispatch_specialist(
+                                &core, &plan.target, &plan.args,
+                                &msg.content, context_summary, &tools.tool_names(),
+                            ).await {
+                                Ok(text) => {
+                                    messages.push(json!({"role":"user","content": text}));
                                     continue;
                                 }
-                                Err(e) => {
-                                    final_content =
-                                        format!("Specialist lane failed: {}. Try /restart.", e);
-                                    break;
-                                }
+                                Err(e) => { final_content = e; break; }
                             }
                         }
                         ToolPlanAction::Subagent => {
-                            let mut params: HashMap<String, Value> = HashMap::new();
-                            params.insert("action".to_string(), json!("spawn"));
-                            if let Some(task) = plan.args.get("task").and_then(|v| v.as_str())
-                            {
-                                params.insert("task".to_string(), json!(task));
-                            } else {
-                                params.insert("task".to_string(), json!(msg.content.clone()));
+                            match dispatch_subagent(
+                                &tools, &plan.target, &plan.args,
+                                &msg.content, strict_local_only, &mut tool_guard,
+                            ).await {
+                                Ok(text) => {
+                                    messages.push(json!({"role":"user","content": text}));
+                                    continue;
+                                }
+                                Err(e) => { final_content = e; break; }
                             }
-                            if !plan.target.trim().is_empty() {
-                                params.insert("agent".to_string(), json!(plan.target));
-                            }
-                            if strict_local_only {
-                                params.insert("model".to_string(), json!("local"));
-                            }
-                            if let Err(e) = policy::validate_spawn_args(&params) {
-                                final_content = e;
-                                break;
-                            }
-                            if let Err(e) = tool_guard.allow("spawn", &params) {
-                                warn!("{}", e);
-                                messages.push(json!({
-                                    "role":"user",
-                                    "content": format!("[tool-guard] {}", e),
-                                }));
-                                continue;
-                            }
-                            let spawn_result = tools.execute("spawn", params).await;
-                            messages.push(json!({
-                                "role":"user",
-                                "content": format!("[router:subagent] {}", spawn_result.data),
-                            }));
-                            continue;
                         }
                         ToolPlanAction::Tool => {
                             if !plan.target.is_empty() {

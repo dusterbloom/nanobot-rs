@@ -1,11 +1,50 @@
 //! Tool registry for dynamic tool management.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
+use super::{
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
+};
 use crate::agent::system_state::TaskPhase;
+
+/// Configuration for building a standard tool registry.
+///
+/// Consolidates the divergent parameters across agent_loop, subagent, and pipeline
+/// into a single source of truth.
+pub struct ToolConfig {
+    pub workspace: PathBuf,
+    pub exec_timeout: u64,
+    pub restrict_to_workspace: bool,
+    pub max_tool_result_chars: usize,
+    pub brave_api_key: Option<String>,
+    /// When true, exclude write_file and edit_file.
+    pub read_only: bool,
+    /// If set, only register tools in this list. Empty = register all.
+    pub tools_filter: Option<Vec<String>>,
+    /// Optional override for exec working directory.
+    pub exec_working_dir: Option<String>,
+}
+
+impl ToolConfig {
+    /// Sensible defaults for a given workspace.
+    pub fn new(workspace: &Path) -> Self {
+        Self {
+            workspace: workspace.to_path_buf(),
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            max_tool_result_chars: 30_000,
+            brave_api_key: None,
+            read_only: false,
+            tools_filter: None,
+            exec_working_dir: None,
+        }
+    }
+}
 
 /// Registry for agent tools.
 ///
@@ -128,6 +167,76 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+        }
+    }
+
+    /// Create a registry pre-populated with standard stateless tools.
+    ///
+    /// This is the single place that maps ToolConfig → registered tools.
+    /// Agent loop, subagent, and pipeline all call this instead of
+    /// duplicating tool registration.
+    pub fn with_standard_tools(config: &ToolConfig) -> Self {
+        let mut registry = Self::new();
+        registry.register_standard_tools(config);
+        registry
+    }
+
+    /// Register the standard stateless tools based on config.
+    ///
+    /// Handles filtering (read_only, tools_filter) and wires all params
+    /// from ToolConfig. Callers can add stateful tools (MessageTool, SpawnTool)
+    /// after this.
+    pub fn register_standard_tools(&mut self, config: &ToolConfig) {
+        let should_include = |name: &str| -> bool {
+            if config.read_only && matches!(name, "write_file" | "edit_file") {
+                return false;
+            }
+            if let Some(ref filter) = config.tools_filter {
+                return filter.iter().any(|t| t == name);
+            }
+            true
+        };
+
+        if should_include("read_file") {
+            self.register(Box::new(ReadFileTool));
+        }
+        if should_include("write_file") {
+            self.register(Box::new(WriteFileTool));
+        }
+        if should_include("edit_file") {
+            self.register(Box::new(EditFileTool));
+        }
+        if should_include("list_dir") {
+            self.register(Box::new(ListDirTool));
+        }
+        if should_include("exec") {
+            let exec_cwd = config
+                .exec_working_dir
+                .clone()
+                .unwrap_or_else(|| config.workspace.to_string_lossy().to_string());
+            self.register(Box::new(ExecTool::new(
+                config.exec_timeout,
+                Some(exec_cwd),
+                None,
+                None,
+                config.restrict_to_workspace,
+                config.max_tool_result_chars,
+            )));
+        }
+        if should_include("web_search") {
+            self.register(Box::new(WebSearchTool::new(
+                config.brave_api_key.clone(),
+                5,
+            )));
+        }
+        if should_include("web_fetch") {
+            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
+        }
+        if should_include("recall") {
+            self.register(Box::new(RecallTool::new(&config.workspace)));
+        }
+        if should_include("read_skill") {
+            self.register(Box::new(ReadSkillTool::new(&config.workspace)));
         }
     }
 

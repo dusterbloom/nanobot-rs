@@ -446,6 +446,41 @@ fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
     rounds.max(1)
 }
 
+/// Process tool calls from an LLM response: build assistant message,
+/// execute each tool, add results to messages, and optionally repair for local.
+///
+/// This is the common core shared by agent_loop, subagent, and pipeline.
+/// Returns `true` if tool calls were processed, `false` if none were present.
+pub async fn process_tool_response(
+    response: &crate::providers::base::LLMResponse,
+    messages: &mut Vec<Value>,
+    tools: &ToolRegistry,
+    is_local: bool,
+) -> bool {
+    if !response.has_tool_calls() {
+        return false;
+    }
+
+    let tc_json: Vec<Value> = response
+        .tool_calls
+        .iter()
+        .map(|tc| tc.to_openai_json())
+        .collect();
+
+    ContextBuilder::add_assistant_message(messages, response.content.as_deref(), Some(&tc_json));
+
+    for tc in &response.tool_calls {
+        let result = tools.execute(&tc.name, tc.arguments.clone()).await;
+        ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, &result.data);
+    }
+
+    if is_local {
+        crate::agent::thread_repair::repair_for_local(messages);
+    }
+
+    true
+}
+
 /// Run a delegated tool execution loop.
 ///
 /// Executes `initial_tool_calls` using the `tools` registry, then asks the
