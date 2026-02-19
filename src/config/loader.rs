@@ -33,7 +33,10 @@ pub fn load_config(config_path: Option<&Path>) -> Config {
     if path.exists() {
         match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<Config>(&contents) {
-                Ok(cfg) => return cfg,
+                Ok(mut cfg) => {
+                    cfg.tool_delegation.apply_mode();
+                    return cfg;
+                }
                 Err(e) => {
                     warn!(
                         "Failed to parse config from {}: {}. Using default configuration.",

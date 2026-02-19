@@ -338,6 +338,14 @@ impl ToolRegistry {
         "spawn",
     ];
 
+    /// Minimal tool set for local models — saves context tokens.
+    const LOCAL_CORE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "write_file",
+        "list_dir",
+        "exec",
+    ];
+
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
         (
@@ -419,6 +427,51 @@ impl ToolRegistry {
         // If we end up with all tools anyway, just return everything.
         if relevant.len() >= self.tools.len() {
             return self.get_definitions();
+        }
+
+        self.tools
+            .iter()
+            .filter(|(name, _)| relevant.contains(name.as_str()))
+            .map(|(_, tool)| tool.to_schema())
+            .collect()
+    }
+
+    /// Get tool definitions for local models — smaller core set with keyword
+    /// expansion to conserve context tokens.
+    pub fn get_local_definitions(
+        &self,
+        messages: &[serde_json::Value],
+        used_tools: &HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut relevant: HashSet<String> = HashSet::new();
+
+        // Minimal core for local models.
+        for name in Self::LOCAL_CORE_TOOLS {
+            if self.tools.contains_key(*name) {
+                relevant.insert(name.to_string());
+            }
+        }
+
+        // Include tools the model has already used (it expects them).
+        for name in used_tools {
+            if self.tools.contains_key(name) {
+                relevant.insert(name.clone());
+            }
+        }
+
+        // Keyword triggers still apply, but only last 3 messages (tighter).
+        let recent_text = Self::extract_recent_text(messages, 3);
+        let lower_text = recent_text.to_lowercase();
+
+        for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
+            if self.tools.contains_key(*tool_name) {
+                for kw in *keywords {
+                    if lower_text.contains(kw) {
+                        relevant.insert(tool_name.to_string());
+                        break;
+                    }
+                }
+            }
         }
 
         self.tools
@@ -1081,5 +1134,84 @@ mod tests {
         assert!(names.contains("read_file"));
         assert!(names.contains("edit_file"));
         assert!(names.contains("web_fetch")); // used tool, added back
+    }
+
+    #[test]
+    fn test_local_defs_minimal_core() {
+        let mut registry = ToolRegistry::new();
+        for name in &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "spawn",
+            "web_search",
+            "web_fetch",
+            "message",
+        ] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "fix the bug"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // Local core: read_file, write_file, list_dir, exec
+        assert!(names.contains("read_file"));
+        assert!(names.contains("list_dir"));
+        assert!(names.contains("exec"));
+        // Excluded from local core:
+        assert!(!names.contains("edit_file"));
+        assert!(!names.contains("spawn"));
+        assert!(!names.contains("web_search"));
+        assert!(!names.contains("message"));
+    }
+
+    #[test]
+    fn test_local_defs_keyword_expansion() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "list_dir", "exec", "web_search"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        // "search" triggers web_search
+        let messages = vec![serde_json::json!({"role": "user", "content": "search for rust docs"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(names.contains("web_search")); // keyword-triggered
+        assert!(names.contains("read_file"));  // local core
+    }
+
+    #[test]
+    fn test_local_defs_used_tools_preserved() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "list_dir", "exec", "spawn", "message"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "continue"})];
+        let mut used = HashSet::new();
+        used.insert("spawn".to_string());
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(names.contains("spawn")); // used tool preserved
+        assert!(!names.contains("message")); // not used, not in local core
     }
 }

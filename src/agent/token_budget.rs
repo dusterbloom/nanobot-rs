@@ -10,11 +10,20 @@ use serde_json::Value;
 use tiktoken_rs::CoreBPE;
 
 /// Manages the token budget for LLM context windows.
+///
+/// Unified budget system: handles both context-window trimming (for message
+/// arrays) and per-turn consumption tracking (for the content gate).
 pub struct TokenBudget {
     /// Total context window size in tokens (e.g. 128K for Claude, 16K for local).
     max_context: usize,
     /// Tokens reserved for the LLM's response (max_tokens from config).
     reserve_response: usize,
+    /// Tokens currently consumed this turn (system prompt + messages + tool results).
+    /// Used by ContentGate for admission decisions. Reset each turn.
+    used_tokens: usize,
+    /// Fraction of context reserved for output generation (0.0–1.0).
+    /// When set, `available()` uses this instead of `reserve_response`.
+    output_reserve: Option<f64>,
 }
 
 impl TokenBudget {
@@ -26,12 +35,51 @@ impl TokenBudget {
         Self {
             max_context,
             reserve_response: max_response,
+            used_tokens: 0,
+            output_reserve: None,
+        }
+    }
+
+    /// Create a budget with a fractional output reserve (used by ContentGate).
+    ///
+    /// `output_reserve` is the fraction reserved for generation (0.0–1.0).
+    pub fn with_output_reserve(max_context: usize, output_reserve: f32) -> Self {
+        Self {
+            max_context,
+            reserve_response: 0,
+            used_tokens: 0,
+            output_reserve: Some((output_reserve as f64).clamp(0.0, 0.95)),
         }
     }
 
     /// Return the maximum context window size in tokens.
     pub fn max_context(&self) -> usize {
         self.max_context
+    }
+
+    /// Tokens available for new content (accounting for reserve and usage).
+    pub fn available(&self) -> usize {
+        let ceiling = if let Some(reserve) = self.output_reserve {
+            ((self.max_context as f64) * (1.0 - reserve)).round() as usize
+        } else {
+            self.max_context.saturating_sub(self.reserve_response)
+        };
+        ceiling.saturating_sub(self.used_tokens)
+    }
+
+    /// Record tokens consumed this turn.
+    pub fn consume(&mut self, tokens: usize) {
+        self.used_tokens = self.used_tokens.saturating_add(tokens);
+    }
+
+    /// Reset consumption tracking (e.g. after compaction or new turn).
+    pub fn reset_used(&mut self, used: usize) {
+        self.used_tokens = used;
+    }
+
+    /// Current tokens consumed this turn.
+    pub fn used(&self) -> usize {
+        self.used_tokens
     }
 
     /// Estimate token count for a string using BPE (cl100k_base).

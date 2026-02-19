@@ -610,32 +610,58 @@ async fn dispatch_subagent(
     Ok(format!("[router:subagent] {}", spawn_result.data))
 }
 
-/// Build a `SwappableCore` from the given parameters.
+/// Named-field input for [`build_swappable_core`].
 ///
-/// When `is_local` is true, the compactor and memory operations use a dedicated
-/// `compaction_provider` if supplied (e.g. a CPU-only Qwen3-0.6B server), or
-/// fall back to the main (local) provider.
-pub fn build_swappable_core(
-    provider: Arc<dyn LLMProvider>,
-    workspace: PathBuf,
-    model: String,
-    max_iterations: u32,
-    max_tokens: u32,
-    temperature: f64,
-    max_context_tokens: usize,
-    brave_api_key: Option<String>,
-    exec_timeout: u64,
-    restrict_to_workspace: bool,
-    memory_config: MemoryConfig,
-    is_local: bool,
-    compaction_provider: Option<Arc<dyn LLMProvider>>,
-    tool_delegation: ToolDelegationConfig,
-    provenance: ProvenanceConfig,
-    max_tool_result_chars: usize,
-    delegation_provider: Option<Arc<dyn LLMProvider>>,
-    specialist_provider: Option<Arc<dyn LLMProvider>>,
-    trio_config: TrioConfig,
-) -> SwappableCore {
+/// Replaces 18 positional parameters with a single struct so callers
+/// are immune to parameter-ordering bugs.
+pub struct SwappableCoreConfig {
+    pub provider: Arc<dyn LLMProvider>,
+    pub workspace: PathBuf,
+    pub model: String,
+    pub max_iterations: u32,
+    pub max_tokens: u32,
+    pub temperature: f64,
+    pub max_context_tokens: usize,
+    pub brave_api_key: Option<String>,
+    pub exec_timeout: u64,
+    pub restrict_to_workspace: bool,
+    pub memory_config: MemoryConfig,
+    pub is_local: bool,
+    pub compaction_provider: Option<Arc<dyn LLMProvider>>,
+    pub tool_delegation: ToolDelegationConfig,
+    pub provenance: ProvenanceConfig,
+    pub max_tool_result_chars: usize,
+    pub delegation_provider: Option<Arc<dyn LLMProvider>>,
+    pub specialist_provider: Option<Arc<dyn LLMProvider>>,
+    pub trio_config: TrioConfig,
+}
+
+/// Build a `SwappableCore` from the given config.
+///
+/// Called once at startup and again for every `/local` or `/model` toggle.
+/// Resolves provider selection, memory config, tool delegation, and router setup.
+pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
+    let SwappableCoreConfig {
+        provider,
+        workspace,
+        model,
+        max_iterations,
+        max_tokens,
+        temperature,
+        max_context_tokens,
+        brave_api_key,
+        exec_timeout,
+        restrict_to_workspace,
+        memory_config,
+        is_local,
+        compaction_provider,
+        tool_delegation,
+        provenance,
+        max_tool_result_chars,
+        delegation_provider,
+        specialist_provider,
+        trio_config,
+    } = cfg;
     let router_provider = delegation_provider.clone();
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
@@ -868,6 +894,55 @@ struct AgentLoopShared {
     aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
     /// Sticky per-session policy flags (e.g. local_only).
     session_policies: Arc<Mutex<HashMap<String, policy::SessionPolicy>>>,
+}
+
+/// Per-message state that flows through the three processing phases.
+///
+/// Owns all per-turn mutable state that previously lived as local variables
+/// inside `process_message`. No lifetimes needed — values are cloned from the
+/// inbound message where required.
+struct TurnContext {
+    // --- Config (set during prepare, immutable after) ---
+    core: Arc<SwappableCore>,
+    session_key: String,
+    session_policy: policy::SessionPolicy,
+    strict_local_only: bool,
+    turn_count: u64,
+    streaming: bool,
+    audit: Option<AuditLog>,
+    tools: ToolRegistry,
+    user_content: String,
+    channel: String,
+    chat_id: String,
+    is_voice_message: bool,
+    detected_language: Option<String>,
+
+    // --- Channels (moved into context) ---
+    text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
+    // --- Conversation state ---
+    messages: Vec<Value>,
+    new_start: usize,
+
+    // --- Tracking ---
+    used_tools: std::collections::HashSet<String>,
+    final_content: String,
+    turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
+
+    // --- Budget/compaction ---
+    compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
+    compaction_in_flight: Arc<AtomicBool>,
+    content_gate: crate::agent::context_gate::ContentGate,
+
+    // --- Flow control ---
+    force_response: bool,
+    router_preflight_done: bool,
+    tool_guard: ToolGuard,
+    turns_since_compaction: u32,
+    forced_finalize_attempted: bool,
 }
 
 impl AgentLoopShared {
@@ -1141,8 +1216,26 @@ impl AgentLoopShared {
         text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
-        mut priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Option<OutboundMessage> {
+        let mut ctx = self.prepare_context(msg, text_delta_tx, tool_event_tx, cancellation_token, priority_rx).await;
+        self.run_agent_loop(&mut ctx).await;
+        self.finalize_response(ctx).await
+    }
+
+    /// Phase 1: Build the [`TurnContext`] from the inbound message.
+    ///
+    /// Snapshots the swappable core, extracts session info, builds tools,
+    /// loads history, constructs the message array, and initialises all
+    /// per-turn tracking state.
+    async fn prepare_context(
+        &self,
+        msg: &InboundMessage,
+        text_delta_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) -> TurnContext {
         let streaming = text_delta_tx.is_some();
 
         // Snapshot core — instant Arc clone under brief read lock.
@@ -1204,7 +1297,7 @@ impl AgentLoopShared {
             .await;
         // Track where new (unsaved) messages start. Updated after compaction
         // swaps to avoid re-persisting already-saved messages.
-        let mut new_start = 1 + history.len();
+        let new_start = 1 + history.len();
 
         // Extract media paths.
         let media_paths: Vec<String> = msg
@@ -1314,14 +1407,6 @@ impl AgentLoopShared {
             last["_turn"] = json!(turn_count);
         }
 
-        // Track which tools have been used for smart tool selection.
-        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let mut final_content = String::new();
-
-        // Collect tool call details for turn audit summary.
-        let mut turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry> = Vec::new();
-
         // Background compaction state.
         let compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>> =
             Arc::new(tokio::sync::Mutex::new(None));
@@ -1340,26 +1425,59 @@ impl AgentLoopShared {
         let initial_tokens = TokenBudget::estimate_tokens(&messages);
         content_gate.budget.consume(initial_tokens);
 
-        // Response boundary: after exec/write_file, force a text response.
-        let mut force_response = false;
-        let mut router_preflight_done = false;
-        let mut tool_guard = ToolGuard::new(core.tool_delegation_config.max_same_tool_call_per_turn);
+        let tool_guard = ToolGuard::new(core.tool_delegation_config.max_same_tool_call_per_turn);
 
-        // Track turns since last compaction for proprioception.
-        let mut turns_since_compaction: u32 = 0;
+        TurnContext {
+            core,
+            session_key,
+            session_policy,
+            strict_local_only,
+            turn_count,
+            streaming,
+            audit,
+            tools,
+            user_content,
+            channel: msg.channel.clone(),
+            chat_id: msg.chat_id.clone(),
+            is_voice_message,
+            detected_language,
+            text_delta_tx,
+            tool_event_tx,
+            cancellation_token,
+            priority_rx,
+            messages,
+            new_start,
+            used_tools: std::collections::HashSet::new(),
+            final_content: String::new(),
+            turn_tool_entries: Vec::new(),
+            compaction_slot,
+            compaction_in_flight,
+            content_gate,
+            force_response: false,
+            router_preflight_done: false,
+            tool_guard,
+            turns_since_compaction: 0,
+            forced_finalize_attempted: false,
+        }
+    }
 
-        // Agent loop: call LLM, handle tool calls, repeat.
-        let mut forced_finalize_attempted = false;
-        for iteration in 0..core.max_iterations {
+    /// Phase 2: Run the main agent loop (LLM calls + tool execution).
+    ///
+    /// Iterates up to `max_iterations`, calling the LLM, handling tool calls
+    /// or router decisions, and accumulating results in `ctx`.
+    async fn run_agent_loop(&self, ctx: &mut TurnContext) {
+        let counters = &self.core_handle.counters;
+
+        for iteration in 0..ctx.core.max_iterations {
             debug!(
                 "Agent iteration{} {}/{}",
-                if streaming { " (streaming)" } else { "" },
+                if ctx.streaming { " (streaming)" } else { "" },
                 iteration + 1,
-                core.max_iterations
+                ctx.core.max_iterations
             );
 
             // --- Context Hygiene: clean up conversation history ---
-            context_hygiene::hygiene_pipeline(&mut messages);
+            context_hygiene::hygiene_pipeline(&mut ctx.messages);
 
             // --- Proprioception: update SystemState ---
             if self.proprioception_config.enabled {
@@ -1375,9 +1493,9 @@ impl AgentLoopShared {
                     phase,
                     counters.last_context_used.load(Ordering::Relaxed),
                     counters.last_context_max.load(Ordering::Relaxed),
-                    turn_count,
-                    messages.len() as u64,
-                    turns_since_compaction,
+                    ctx.turn_count,
+                    ctx.messages.len() as u64,
+                    ctx.turns_since_compaction,
                     counters.delegation_healthy.load(Ordering::Relaxed),
                     0,    // recent_tool_failures — not tracked yet
                     true, // last_tool_ok
@@ -1393,7 +1511,7 @@ impl AgentLoopShared {
                     while let Ok(signal) = rx.try_recv() {
                         match signal.priority {
                             AhaPriority::Critical => {
-                                messages.push(json!({
+                                ctx.messages.push(json!({
                                     "role": "user",
                                     "content": format!(
                                         "[ALERT from subagent {}] {}",
@@ -1402,7 +1520,7 @@ impl AgentLoopShared {
                                 }));
                             }
                             AhaPriority::High => {
-                                messages.push(json!({
+                                ctx.messages.push(json!({
                                     "role": "user",
                                     "content": format!(
                                         "[Signal from subagent {}] {}",
@@ -1431,70 +1549,73 @@ impl AgentLoopShared {
                     state.context_pressure,
                 ) {
                     let grounding = system_state::format_grounding(&state);
-                    messages.push(json!({
+                    ctx.messages.push(json!({
                         "role": "user",
                         "content": grounding
                     }));
                 }
             }
 
-            turns_since_compaction += 1;
+            ctx.turns_since_compaction += 1;
 
             // Check if background compaction finished — swap in compacted messages.
-            if let Ok(mut guard) = compaction_slot.try_lock() {
+            if let Ok(mut guard) = ctx.compaction_slot.try_lock() {
                 if let Some(pending) = guard.take() {
                     debug!(
                         "Compaction swap: {} msgs -> {} compacted + {} new",
                         pending.watermark,
                         pending.result.messages.len(),
-                        messages.len().saturating_sub(pending.watermark)
+                        ctx.messages.len().saturating_sub(pending.watermark)
                     );
-                    apply_compaction_result(&mut messages, pending);
+                    apply_compaction_result(&mut ctx.messages, pending);
                     // After compaction, all messages in the array are "new" from
                     // the perspective of persistence (the session file was rebuilt).
-                    new_start = messages.len();
-                    turns_since_compaction = 0;
+                    ctx.new_start = ctx.messages.len();
+                    ctx.turns_since_compaction = 0;
                 }
             }
 
             // Response boundary: suppress exec/write_file tools to force text output.
-            let boundary_active = force_response
-                && core.provenance_config.enabled
-                && core.provenance_config.response_boundary;
+            let boundary_active = ctx.force_response
+                && ctx.core.provenance_config.enabled
+                && ctx.core.provenance_config.response_boundary;
             if boundary_active {
                 // Use "user" role, not "system". The Anthropic OpenAI-compat
                 // endpoint strips mid-conversation system messages, which would
                 // leave the conversation ending with an assistant message and
                 // trigger a "does not support assistant message prefill" error.
-                let remaining = core.max_iterations.saturating_sub(iteration as u32 + 1);
+                let remaining = ctx.core.max_iterations.saturating_sub(iteration as u32 + 1);
                 let budget_note = if remaining <= 5 {
                     format!(
                         " [Budget: {}/{} iterations remaining — wrap up soon]",
-                        remaining, core.max_iterations
+                        remaining, ctx.core.max_iterations
                     )
                 } else {
                     String::new()
                 };
-                messages.push(json!({
+                ctx.messages.push(json!({
                     "role": "user",
                     "content": format!(
                         "[system] You just executed a tool that modifies files or runs commands. \
                          Report the result to the user before making additional tool calls.{budget_note}"
                     )
                 }));
-                force_response = false;
+                ctx.force_response = false;
             }
 
-            // Filter tool definitions to relevant tools (phase-scoped when proprioception is active).
+            // Filter tool definitions to relevant tools.
+            // Local models get a minimal set to conserve context tokens.
             let current_phase = self.system_state.load_full().task_phase;
-            let mut tool_defs = if self.proprioception_config.enabled
+            let mut tool_defs = if ctx.core.is_local {
+                ctx.tools.get_local_definitions(&ctx.messages, &ctx.used_tools)
+            } else if self.proprioception_config.enabled
                 && self.proprioception_config.dynamic_tool_scoping
             {
-                tools.get_scoped_definitions(&current_phase, &messages, &used_tools)
+                ctx.tools.get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
             } else {
-                tools.get_relevant_definitions(&messages, &used_tools)
+                ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
             };
-            if core.tool_delegation_config.strict_no_tools_main {
+            if ctx.core.tool_delegation_config.strict_no_tools_main {
                 // Hard separation: main model is conversation/orchestration only.
                 tool_defs.clear();
             }
@@ -1516,26 +1637,25 @@ impl AgentLoopShared {
             // Trim messages to fit context budget.
             let tool_def_tokens =
                 TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-            messages = core.token_budget.trim_to_fit_with_age(
-                &messages,
+            ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
+                &ctx.messages,
                 tool_def_tokens,
-                turn_count,
-                core.max_message_age_turns,
+                ctx.turn_count,
+                ctx.core.max_message_age_turns,
             );
 
             // Spawn background compaction when threshold exceeded.
-            if !compaction_in_flight.load(Ordering::Relaxed)
-                && core
+            if !ctx.compaction_in_flight.load(Ordering::Relaxed)
+                && ctx.core
                     .compactor
-                    .needs_compaction(&messages, &core.token_budget, tool_def_tokens)
+                    .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
             {
-                let slot = compaction_slot.clone();
-                let in_flight = compaction_in_flight.clone();
-                let bg_messages = messages.clone();
-                let bg_core = core.clone();
-                let bg_session_key = session_key.clone();
-                let bg_channel = msg.channel.clone();
-                let watermark = messages.len();
+                let slot = ctx.compaction_slot.clone();
+                let in_flight = ctx.compaction_in_flight.clone();
+                let bg_messages = ctx.messages.clone();
+                let bg_core = ctx.core.clone();
+                let bg_session_key = ctx.session_key.clone();
+                let watermark = ctx.messages.len();
                 in_flight.store(true, Ordering::SeqCst);
 
                 let bg_proprio = self.proprioception_config.clone();
@@ -1579,52 +1699,52 @@ impl AgentLoopShared {
             }
 
             // Repair protocol violations before calling the LLM.
-            if core.is_local {
-                thread_repair::repair_for_local(&mut messages);
+            if ctx.core.is_local {
+                thread_repair::repair_for_local(&mut ctx.messages);
             } else {
-                thread_repair::repair_messages(&mut messages);
+                thread_repair::repair_messages(&mut ctx.messages);
             }
 
             // Pre-flight context size check: emergency trim if we're about to
             // exceed the model's context window. The 95% threshold leaves room
             // for the response tokens.
-            let estimated = TokenBudget::estimate_tokens(&messages);
-            let max_ctx = core.token_budget.max_context();
+            let estimated = TokenBudget::estimate_tokens(&ctx.messages);
+            let max_ctx = ctx.core.token_budget.max_context();
             if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
                 warn!(
                     "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
                     estimated, max_ctx
                 );
                 // tool_def_tokens=0 is conservative (trims more aggressively).
-                messages = core.token_budget.trim_to_fit(&messages, 0);
+                ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
                 // Re-run repair after trim in case truncation broke protocol.
-                if core.is_local {
-                    thread_repair::repair_for_local(&mut messages);
+                if ctx.core.is_local {
+                    thread_repair::repair_for_local(&mut ctx.messages);
                 } else {
-                    thread_repair::repair_messages(&mut messages);
+                    thread_repair::repair_messages(&mut ctx.messages);
                 }
             }
 
             // Router-first preflight for strict trio mode.
-            if core.tool_delegation_config.strict_no_tools_main
-                && core.tool_delegation_config.strict_router_schema
-                && !router_preflight_done
+            if ctx.core.tool_delegation_config.strict_no_tools_main
+                && ctx.core.tool_delegation_config.strict_router_schema
+                && !ctx.router_preflight_done
             {
-                router_preflight_done = true;
+                ctx.router_preflight_done = true;
                 let (router_provider, router_model) =
-                    match (core.router_provider.as_ref(), core.router_model.as_deref()) {
+                    match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {
                         (Some(p), Some(m)) => (p.clone(), m.to_string()),
                         _ => {
-                            final_content = "Router lane is required by policy but not configured. Start trio router server and retry.".to_string();
+                            ctx.final_content = "Router lane is required by policy but not configured. Start trio router server and retry.".to_string();
                             break;
                         }
                     };
-                let tool_list = tools.tool_names();
-                let task_state = format!("Strict preflight. User message: {}", msg.content);
-                let router_pack = if core.tool_delegation_config.role_scoped_context_packs {
+                let tool_list = ctx.tools.tool_names();
+                let task_state = format!("Strict preflight. User message: {}", ctx.user_content);
+                let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
                     role_policy::build_context_pack(
                         role_policy::Role::Router,
-                        &msg.content,
+                        &ctx.user_content,
                         "(live turn; summary omitted)",
                         &task_state,
                         &tool_list,
@@ -1638,21 +1758,21 @@ impl AgentLoopShared {
                     router_provider.as_ref(),
                     &router_model,
                     &router_pack,
-                    core.router_no_think,
-                    core.router_temperature,
+                    ctx.core.router_no_think,
+                    ctx.core.router_temperature,
                 )
                 .await
                 {
                     Ok(d) => d,
                     Err(e) => {
-                        final_content = format!("Router policy failed: {}.", e);
+                        ctx.final_content = format!("Router policy failed: {}.", e);
                         break;
                     }
                 };
 
                 match decision.action.as_str() {
                     "ask_user" => {
-                        final_content = decision
+                        ctx.final_content = decision
                             .args
                             .get("question")
                             .and_then(|v| v.as_str())
@@ -1662,31 +1782,31 @@ impl AgentLoopShared {
                     }
                     "specialist" => {
                         match dispatch_specialist(
-                            &core, &decision.target, &decision.args,
-                            &msg.content, &msg.content, &tool_list,
+                            &ctx.core, &decision.target, &decision.args,
+                            &ctx.user_content, &ctx.user_content, &tool_list,
                         ).await {
                             Ok(text) => {
-                                messages.push(json!({"role":"user","content": text}));
+                                ctx.messages.push(json!({"role":"user","content": text}));
                                 continue;
                             }
-                            Err(e) => { final_content = e; break; }
+                            Err(e) => { ctx.final_content = e; break; }
                         }
                     }
                     "subagent" => {
                         match dispatch_subagent(
-                            &tools, &decision.target, &decision.args,
-                            &msg.content, strict_local_only, &mut tool_guard,
+                            &ctx.tools, &decision.target, &decision.args,
+                            &ctx.user_content, ctx.strict_local_only, &mut ctx.tool_guard,
                         ).await {
                             Ok(text) => {
-                                messages.push(json!({"role":"user","content": text}));
+                                ctx.messages.push(json!({"role":"user","content": text}));
                                 continue;
                             }
-                            Err(e) => { final_content = e; break; }
+                            Err(e) => { ctx.final_content = e; break; }
                         }
                     }
                     "tool" => {
                         if decision.target.trim().is_empty() {
-                            final_content = "Router selected tool action but target is empty.".to_string();
+                            ctx.final_content = "Router selected tool action but target is empty.".to_string();
                             break;
                         }
                         let params_map = decision
@@ -1698,20 +1818,20 @@ impl AgentLoopShared {
                                     .collect::<HashMap<String, Value>>()
                             })
                             .unwrap_or_default();
-                        if let Err(e) = tool_guard.allow(&decision.target, &params_map) {
+                        if let Err(e) = ctx.tool_guard.allow(&decision.target, &params_map) {
                             warn!("{}", e);
-                            messages.push(json!({
+                            ctx.messages.push(json!({
                                 "role":"user",
                                 "content": format!("[tool-guard] {}", e),
                             }));
                             continue;
                         }
-                        let tr = tools.execute(&decision.target, params_map).await;
-                        messages.push(json!({
+                        let tr = ctx.tools.execute(&decision.target, params_map).await;
+                        ctx.messages.push(json!({
                             "role":"user",
                             "content": format!("[router:tool:{}] {}", decision.target, tr.data),
                         }));
-                        used_tools.insert(decision.target);
+                        ctx.used_tools.insert(decision.target);
                         continue;
                     }
                     _ => {}
@@ -1720,7 +1840,7 @@ impl AgentLoopShared {
 
             // Adaptive max_tokens: size the response budget to the task.
             let effective_max_tokens = {
-                let base = core.max_tokens;
+                let base = ctx.core.max_tokens;
                 // Check for /long override (temporary boost).
                 let long_override = counters.long_mode_turns.load(Ordering::Relaxed);
                 if long_override > 0 {
@@ -1728,7 +1848,7 @@ impl AgentLoopShared {
                     base.max(8192)
                 } else {
                     // Detect long-form triggers in the user message.
-                    let user_text = messages
+                    let user_text = ctx.messages
                         .last()
                         .and_then(|m| m.get("content"))
                         .and_then(|c| c.as_str())
@@ -1743,7 +1863,7 @@ impl AgentLoopShared {
                         || lower.starts_with("write ")
                         || user_text.len() > 500;
                     // Count recent tool calls: if tool-heavy, use smaller budget.
-                    let recent_tool_calls = messages
+                    let recent_tool_calls = ctx.messages
                         .iter()
                         .rev()
                         .take(6)
@@ -1765,7 +1885,7 @@ impl AgentLoopShared {
                 if stored > 0 {
                     // Small local models can burn the whole completion budget in reasoning.
                     // Hard-cap explicit thinking to keep them action-oriented.
-                    if core.is_local && is_small_local_model(&core.model) {
+                    if ctx.core.is_local && is_small_local_model(&ctx.core.model) {
                         Some(stored.min(256))
                     } else {
                         Some(stored)
@@ -1774,16 +1894,16 @@ impl AgentLoopShared {
                     None
                 }
             };
-            let mut response = if let Some(ref delta_tx) = text_delta_tx {
+            let mut response = if let Some(ref delta_tx) = ctx.text_delta_tx {
                 // Streaming path: forward text deltas as they arrive.
-                let mut stream = match core
+                let mut stream = match ctx.core
                     .provider
                     .chat_stream(
-                        &messages,
+                        &ctx.messages,
                         tool_defs_opt,
-                        Some(&core.model),
+                        Some(&ctx.core.model),
                         effective_max_tokens,
-                        core.temperature,
+                        ctx.core.temperature,
                         thinking_budget,
                     )
                     .await
@@ -1791,7 +1911,7 @@ impl AgentLoopShared {
                     Ok(s) => s,
                     Err(e) => {
                         error!("LLM streaming call failed: {}", e);
-                        final_content = format!("I encountered an error: {}", e);
+                        ctx.final_content = format!("I encountered an error: {}", e);
                         break;
                     }
                 };
@@ -1803,7 +1923,7 @@ impl AgentLoopShared {
                     tokio::select! {
                         biased;
                         _ = async {
-                            if let Some(ref token) = cancellation_token {
+                            if let Some(ref token) = ctx.cancellation_token {
                                 token.cancelled().await;
                             } else {
                                 std::future::pending::<()>().await;
@@ -1823,7 +1943,7 @@ impl AgentLoopShared {
                                     // Render thinking tokens as dimmed text
                                     if !in_thinking {
                                         in_thinking = true;
-                                        let _ = delta_tx.send("\x1b[90m🧠 \x1b[2m".to_string());
+                                        let _ = delta_tx.send("\x1b[90m\u{1f9e0} \x1b[2m".to_string());
                                     }
                                     let _ = delta_tx.send(delta);
                                 }
@@ -1851,7 +1971,7 @@ impl AgentLoopShared {
                     Some(r) => r,
                     None => {
                         // Stream ended without Done — either cancelled or genuine error.
-                        if cancellation_token
+                        if ctx.cancellation_token
                             .as_ref()
                             .map_or(false, |t| t.is_cancelled())
                         {
@@ -1859,20 +1979,20 @@ impl AgentLoopShared {
                             break;
                         }
                         error!("LLM stream ended without Done");
-                        final_content = "I encountered a streaming error.".to_string();
+                        ctx.final_content = "I encountered a streaming error.".to_string();
                         break;
                     }
                 }
             } else {
                 // Blocking path: single request/response.
-                match core
+                match ctx.core
                     .provider
                     .chat(
-                        &messages,
+                        &ctx.messages,
                         tool_defs_opt,
-                        Some(&core.model),
+                        Some(&ctx.core.model),
                         effective_max_tokens,
-                        core.temperature,
+                        ctx.core.temperature,
                         thinking_budget,
                     )
                     .await
@@ -1880,7 +2000,7 @@ impl AgentLoopShared {
                     Ok(r) => r,
                     Err(e) => {
                         error!("LLM call failed: {}", e);
-                        final_content = format!("I encountered an error: {}", e);
+                        ctx.final_content = format!("I encountered an error: {}", e);
                         break;
                     }
                 }
@@ -1907,11 +2027,11 @@ impl AgentLoopShared {
                 warn!("Response validation failed: {:?}", validation_err);
                 if !response.has_tool_calls() {
                     let hint = validation::generate_retry_prompt(&validation_err, 1);
-                    messages.push(json!({
+                    ctx.messages.push(json!({
                         "role": "assistant",
                         "content": content_str
                     }));
-                    messages.push(json!({
+                    ctx.messages.push(json!({
                         "role": "user",
                         "content": hint
                     }));
@@ -1927,25 +2047,25 @@ impl AgentLoopShared {
                 .as_ref()
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true);
-            if core.is_local
+            if ctx.core.is_local
                 && !response.has_tool_calls()
                 && empty_visible
                 && response.finish_reason == "length"
-                && !forced_finalize_attempted
+                && !ctx.forced_finalize_attempted
             {
-                forced_finalize_attempted = true;
+                ctx.forced_finalize_attempted = true;
                 let rescue_tokens = effective_max_tokens.min(384).max(128);
-                let mut rescue_messages = messages.clone();
+                let mut rescue_messages = ctx.messages.clone();
                 rescue_messages.push(json!({
                     "role": "user",
                     "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
                 }));
-                match core
+                match ctx.core
                     .provider
                     .chat(
                         &rescue_messages,
                         None,
-                        Some(&core.model),
+                        Some(&ctx.core.model),
                         rescue_tokens,
                         0.2,
                         None,
@@ -1969,23 +2089,23 @@ impl AgentLoopShared {
                 error!("LLM provider error: {}", err_msg);
 
                 // In local mode, check if the server is still alive.
-                if core.is_local {
-                    if let Some(base) = core.provider.get_api_base() {
+                if ctx.core.is_local {
+                    if let Some(base) = ctx.core.provider.get_api_base() {
                         if !crate::server::check_health(base).await {
                             error!("Local LLM server is down!");
-                            final_content = "[LLM Error] Local server crashed. Use /restart or /local to recover.".into();
+                            ctx.final_content = "[LLM Error] Local server crashed. Use /restart or /local to recover.".into();
                             break;
                         }
                     }
                 }
 
-                final_content = format!("[LLM Error] {}", err_msg);
+                ctx.final_content = format!("[LLM Error] {}", err_msg);
                 break;
             }
 
             // Token telemetry: log actual vs estimated usage.
             {
-                let estimated_prompt = TokenBudget::estimate_tokens(&messages);
+                let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
                 let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
                 let actual_completion = response
                     .usage
@@ -2017,9 +2137,9 @@ impl AgentLoopShared {
                 let mut router_decision: Option<role_policy::RouterDecision> = None;
                 let mut router_decision_valid = false;
                 let mut selected_plan: Option<toolplan::ToolPlan> = None;
-                let available_tools = tools.tool_names();
+                let available_tools = ctx.tools.tool_names();
 
-                if core.tool_delegation_config.strict_router_schema {
+                if ctx.core.tool_delegation_config.strict_router_schema {
                     let task_state = format!(
                         "Main content: {}\nCandidate tool calls: {}",
                         response.content.as_deref().unwrap_or("(empty)"),
@@ -2029,10 +2149,10 @@ impl AgentLoopShared {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    let router_pack = if core.tool_delegation_config.role_scoped_context_packs {
+                    let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
                         role_policy::build_context_pack(
                             role_policy::Role::Router,
-                            &msg.content,
+                            &ctx.user_content,
                             "(live turn; summary omitted)",
                             &task_state,
                             &available_tools,
@@ -2043,14 +2163,14 @@ impl AgentLoopShared {
                     };
 
                     if let (Some(router_provider), Some(router_model)) =
-                        (core.router_provider.as_ref(), core.router_model.as_deref())
+                        (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref())
                     {
                         match request_strict_router_decision(
                             router_provider.as_ref(),
                             router_model,
                             &router_pack,
-                            core.router_no_think,
-                            core.router_temperature,
+                            ctx.core.router_no_think,
+                            ctx.core.router_temperature,
                         )
                         .await
                         {
@@ -2074,13 +2194,13 @@ impl AgentLoopShared {
                         }
                         Err(e) => {
                             warn!("router decision normalization failed: {}", e);
-                            if core.tool_delegation_config.strict_toolplan_validation
-                                && core.tool_delegation_config.deterministic_router_fallback
+                            if ctx.core.tool_delegation_config.strict_toolplan_validation
+                                && ctx.core.tool_delegation_config.deterministic_router_fallback
                             {
                                 selected_plan = Some(router_fallback::route(
-                                    &msg.content,
+                                    &ctx.user_content,
                                     &available_tools,
-                                    &session_policy,
+                                    &ctx.session_policy,
                                 ));
                             }
                         }
@@ -2088,47 +2208,47 @@ impl AgentLoopShared {
                 }
 
                 if role_policy::should_block_main_tool_calls(
-                    core.tool_delegation_config.strict_no_tools_main,
+                    ctx.core.tool_delegation_config.strict_no_tools_main,
                     true,
                 ) && !router_decision_valid
                 {
-                    if core.tool_delegation_config.deterministic_router_fallback {
+                    if ctx.core.tool_delegation_config.deterministic_router_fallback {
                         warn!(
                             "strict router invalid; using deterministic fallback plan (model={})",
-                            core.model
+                            ctx.core.model
                         );
                         selected_plan = Some(router_fallback::route(
-                            &msg.content,
+                            &ctx.user_content,
                             &available_tools,
-                            &session_policy,
+                            &ctx.session_policy,
                         ));
                     } else {
                         warn!(
                             "Policy blocked main-model tool calls (strictNoToolsMain=true, model={})",
-                            core.model
+                            ctx.core.model
                         );
-                        final_content = "I can orchestrate the task, but direct tool calls from the main model are disabled by policy and strict router did not return a valid decision.".to_string();
+                        ctx.final_content = "I can orchestrate the task, but direct tool calls from the main model are disabled by policy and strict router did not return a valid decision.".to_string();
                         break;
                     }
                 }
 
                 if let Some(plan) = selected_plan {
-                    if core.tool_delegation_config.strict_toolplan_validation {
+                    if ctx.core.tool_delegation_config.strict_toolplan_validation {
                         if let Err(e) = plan.validate() {
-                            if core.tool_delegation_config.deterministic_router_fallback {
+                            if ctx.core.tool_delegation_config.deterministic_router_fallback {
                                 warn!(
                                     "tool plan validation failed ({}), using deterministic fallback",
                                     e
                                 );
                             } else {
-                                final_content = format!("Router produced invalid tool plan: {}", e);
+                                ctx.final_content = format!("Router produced invalid tool plan: {}", e);
                                 break;
                             }
                         }
                     }
                     match plan.action {
                         ToolPlanAction::AskUser => {
-                            final_content = plan
+                            ctx.final_content = plan
                                 .args
                                 .get("question")
                                 .and_then(|v| v.as_str())
@@ -2144,26 +2264,26 @@ impl AgentLoopShared {
                         ToolPlanAction::Specialist => {
                             let context_summary = response.content.as_deref().unwrap_or("(empty)");
                             match dispatch_specialist(
-                                &core, &plan.target, &plan.args,
-                                &msg.content, context_summary, &tools.tool_names(),
+                                &ctx.core, &plan.target, &plan.args,
+                                &ctx.user_content, context_summary, &ctx.tools.tool_names(),
                             ).await {
                                 Ok(text) => {
-                                    messages.push(json!({"role":"user","content": text}));
+                                    ctx.messages.push(json!({"role":"user","content": text}));
                                     continue;
                                 }
-                                Err(e) => { final_content = e; break; }
+                                Err(e) => { ctx.final_content = e; break; }
                             }
                         }
                         ToolPlanAction::Subagent => {
                             match dispatch_subagent(
-                                &tools, &plan.target, &plan.args,
-                                &msg.content, strict_local_only, &mut tool_guard,
+                                &ctx.tools, &plan.target, &plan.args,
+                                &ctx.user_content, ctx.strict_local_only, &mut ctx.tool_guard,
                             ).await {
                                 Ok(text) => {
-                                    messages.push(json!({"role":"user","content": text}));
+                                    ctx.messages.push(json!({"role":"user","content": text}));
                                     continue;
                                 }
-                                Err(e) => { final_content = e; break; }
+                                Err(e) => { ctx.final_content = e; break; }
                             }
                         }
                         ToolPlanAction::Tool => {
@@ -2186,7 +2306,7 @@ impl AgentLoopShared {
                                         })
                                         .unwrap_or_default();
                                     routed_tool_calls = vec![ToolCallRequest {
-                                        id: format!("planned-{}-{}", turn_count, plan.target),
+                                        id: format!("planned-{}-{}", ctx.turn_count, plan.target),
                                         name: plan.target,
                                         arguments: args,
                                     }];
@@ -2197,7 +2317,7 @@ impl AgentLoopShared {
                 }
 
                 let mut blocked_calls = 0usize;
-                routed_tool_calls.retain(|tc| match tool_guard.allow(&tc.name, &tc.arguments) {
+                routed_tool_calls.retain(|tc| match ctx.tool_guard.allow(&tc.name, &tc.arguments) {
                     Ok(()) => true,
                     Err(e) => {
                         blocked_calls += 1;
@@ -2206,7 +2326,7 @@ impl AgentLoopShared {
                     }
                 });
                 if blocked_calls > 0 {
-                    messages.push(json!({
+                    ctx.messages.push(json!({
                         "role":"user",
                         "content": format!(
                             "[tool-guard] blocked {} duplicate tool call(s). Continue without re-running identical calls.",
@@ -2216,7 +2336,7 @@ impl AgentLoopShared {
                 }
                 if routed_tool_calls.is_empty() {
                     if let Some(text) = response.content.as_ref().filter(|s| !s.trim().is_empty()) {
-                        final_content = text.clone();
+                        ctx.final_content = text.clone();
                         break;
                     }
                     continue;
@@ -2225,14 +2345,14 @@ impl AgentLoopShared {
                 // Context pressure check: if high, log a warning. The correct
                 // response is compaction, NOT spawning the main model as its
                 // own tool runner (which doubles cost for no benefit).
-                let context_tokens = TokenBudget::estimate_tokens(&messages);
-                let max_tokens = core.token_budget.max_context();
+                let context_tokens = TokenBudget::estimate_tokens(&ctx.messages);
+                let max_tokens = ctx.core.token_budget.max_context();
                 let pressure = if max_tokens > 0 {
                     context_tokens as f64 / max_tokens as f64
                 } else {
                     0.0
                 };
-                if pressure > 0.7 && !core.tool_delegation_config.enabled {
+                if pressure > 0.7 && !ctx.core.tool_delegation_config.enabled {
                     debug!(
                         "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
                         pressure * 100.0,
@@ -2244,7 +2364,7 @@ impl AgentLoopShared {
                 let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
                 // Periodically re-probe: every 10 inline calls, try delegation
                 // once in case the server recovered (e.g. user restarted it).
-                if !delegation_alive && core.tool_delegation_config.enabled {
+                if !delegation_alive && ctx.core.tool_delegation_config.enabled {
                     let retries = counters
                         .delegation_retry_counter
                         .fetch_add(1, Ordering::Relaxed);
@@ -2258,10 +2378,10 @@ impl AgentLoopShared {
                         debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
                     }
                 }
-                let should_delegate = core.tool_delegation_config.enabled && delegation_alive;
+                let should_delegate = ctx.core.tool_delegation_config.enabled && delegation_alive;
                 // Resolve provider+model from explicit config.
-                let delegation_provider = core.tool_runner_provider.clone();
-                let delegation_model = core.tool_runner_model.clone();
+                let delegation_provider = ctx.core.tool_runner_provider.clone();
+                let delegation_model = ctx.core.tool_runner_model.clone();
 
                 if should_delegate {
                     if let (Some(ref tr_provider), Some(ref tr_model)) =
@@ -2276,7 +2396,7 @@ impl AgentLoopShared {
                         // Local delegation providers (llama-server) require
                         // user-last messages for tool→generate flow.
                         // Check delegation provider's locality, not the main model's.
-                        let needs_user_cont = core.is_local || delegation_provider.is_some();
+                        let needs_user_cont = ctx.core.is_local || delegation_provider.is_some();
 
                         // Detect [VERBATIM] marker: the main model is asking for
                         // raw tool output instead of a delegation summary.
@@ -2290,33 +2410,33 @@ impl AgentLoopShared {
                         // Cap tool results to ~750 tokens (~3000 chars) so the system
                         // prompt, tool call messages, and response all fit comfortably.
                         // Use the main model's limit only if it's already smaller.
-                        let delegation_result_limit = core.max_tool_result_chars.min(3000);
+                        let delegation_result_limit = ctx.core.max_tool_result_chars.min(3000);
 
                         let runner_config = ToolRunnerConfig {
                             provider: tr_provider.clone(),
                             model: tr_model.clone(),
-                            max_iterations: core.tool_delegation_config.max_iterations,
-                            max_tokens: core.tool_delegation_config.max_tokens,
+                            max_iterations: ctx.core.tool_delegation_config.max_iterations,
+                            max_tokens: ctx.core.tool_delegation_config.max_tokens,
                             needs_user_continuation: needs_user_cont,
                             max_tool_result_chars: delegation_result_limit,
                             short_circuit_chars: 200,
                             depth: 0,
-                            cancellation_token: cancellation_token.clone(),
+                            cancellation_token: ctx.cancellation_token.clone(),
                             verbatim,
                             budget: {
-                                let cost_budget = core.tool_delegation_config.cost_budget;
+                                let cost_budget = ctx.core.tool_delegation_config.cost_budget;
                                 if cost_budget > 0.0 {
                                     let prices =
                                         crate::agent::model_prices::ModelPrices::load().await;
                                     Some(Budget::root_with_cost(
-                                        core.tool_delegation_config.max_iterations,
+                                        ctx.core.tool_delegation_config.max_iterations,
                                         2,
                                         cost_budget,
                                         std::sync::Arc::new(prices),
                                     ))
                                 } else {
                                     Some(Budget::root(
-                                        core.tool_delegation_config.max_iterations,
+                                        ctx.core.tool_delegation_config.max_iterations,
                                         2,
                                     ))
                                 }
@@ -2324,7 +2444,7 @@ impl AgentLoopShared {
                         };
 
                         // Emit tool call start events for delegated calls.
-                        if let Some(ref tx) = tool_event_tx {
+                        if let Some(ref tx) = ctx.tool_event_tx {
                             for tc in &routed_tool_calls {
                                 let preview: String = serde_json::to_string(&tc.arguments)
                                     .unwrap_or_default()
@@ -2353,8 +2473,8 @@ impl AgentLoopShared {
                             .as_deref()
                             .filter(|c| !c.trim().is_empty())
                             .map(|c| c.chars().take(400).collect::<String>())
-                            .unwrap_or_else(|| msg.content.chars().take(300).collect::<String>());
-                        let task_desc = if core.tool_delegation_config.role_scoped_context_packs {
+                            .unwrap_or_else(|| ctx.user_content.chars().take(300).collect::<String>());
+                        let task_desc = if ctx.core.tool_delegation_config.role_scoped_context_packs {
                             let task_state = format!(
                                 "Tool lane execution\nPlanned tools: {}",
                                 tool_names.join(", ")
@@ -2364,7 +2484,7 @@ impl AgentLoopShared {
                                 &instructions,
                                 "(live turn; summary omitted)",
                                 &task_state,
-                                &tools.tool_names(),
+                                &ctx.tools.tool_names(),
                                 2500,
                             )
                         } else {
@@ -2379,7 +2499,7 @@ impl AgentLoopShared {
                         let run_result = tool_runner::run_tool_loop(
                             &runner_config,
                             &routed_tool_calls,
-                            &tools,
+                            &ctx.tools,
                             &task_desc,
                         )
                         .await;
@@ -2449,14 +2569,14 @@ impl AgentLoopShared {
                             .map(|tc| tc.to_openai_json())
                             .collect();
                         ContextBuilder::add_assistant_message(
-                            &mut messages,
+                            &mut ctx.messages,
                             response.content.as_deref(),
                             Some(&tc_json),
                         );
 
                         // Add tool results from the runner to the main context.
                         // ContentGate handles budget-aware sizing.
-                        let preview_max = core.tool_delegation_config.max_result_preview_chars;
+                        let preview_max = ctx.core.tool_delegation_config.max_result_preview_chars;
 
                         for tc in &routed_tool_calls {
                             // Find the matching result from the runner.
@@ -2467,24 +2587,24 @@ impl AgentLoopShared {
                                 .map(|(_, _, data)| data.as_str())
                                 .unwrap_or("(no result)");
 
-                            let injected = content_gate.admit_simple(full_data).into_text();
+                            let injected = ctx.content_gate.admit_simple(full_data).into_text();
 
-                            if core.provenance_config.enabled {
+                            if ctx.core.provenance_config.enabled {
                                 ContextBuilder::add_tool_result_immutable(
-                                    &mut messages,
+                                    &mut ctx.messages,
                                     &tc.id,
                                     &tc.name,
                                     &injected,
                                 );
                             } else {
                                 ContextBuilder::add_tool_result(
-                                    &mut messages,
+                                    &mut ctx.messages,
                                     &tc.id,
                                     &tc.name,
                                     &injected,
                                 );
                             }
-                            used_tools.insert(tc.name.clone());
+                            ctx.used_tools.insert(tc.name.clone());
                         }
 
                         // Inject the runner's summary so the main LLM knows what
@@ -2517,7 +2637,7 @@ impl AgentLoopShared {
                                 } else {
                                     "[tool runner summary]"
                                 };
-                                messages.push(json!({
+                                ctx.messages.push(json!({
                                     "role": "user",
                                     "content": format!("{} {}", prefix, summary_text)
                                 }));
@@ -2533,7 +2653,7 @@ impl AgentLoopShared {
                             let per_tool_ms = delegation_elapsed_ms / n_results;
 
                             // Emit tool call end event.
-                            if let Some(ref tx) = tool_event_tx {
+                            if let Some(ref tx) = ctx.tool_event_tx {
                                 let _ = tx.send(ToolEvent::CallEnd {
                                     tool_name: tool_name.clone(),
                                     tool_call_id: tool_call_id.clone(),
@@ -2544,7 +2664,7 @@ impl AgentLoopShared {
                             }
 
                             // Record in audit log.
-                            if let Some(ref audit) = audit {
+                            if let Some(ref audit) = ctx.audit {
                                 let _ = audit.record(
                                     tool_name,
                                     tool_call_id,
@@ -2556,7 +2676,7 @@ impl AgentLoopShared {
                                 );
                             }
 
-                            core.learning.record_extended(
+                            ctx.core.learning.record_extended(
                                 tool_name,
                                 ok,
                                 &data.chars().take(100).collect::<String>(),
@@ -2565,13 +2685,13 @@ impl AgentLoopShared {
                                 Some(tr_model),
                                 None,
                             );
-                            used_tools.insert(tool_name.clone());
+                            ctx.used_tools.insert(tool_name.clone());
                         }
 
                         // Set response boundary flag if any delegated tool was exec/write_file.
                         for (_, tool_name, _) in &run_result.tool_results {
                             if tool_name == "exec" || tool_name == "write_file" {
-                                force_response = true;
+                                ctx.force_response = true;
                                 break;
                             }
                         }
@@ -2594,7 +2714,7 @@ impl AgentLoopShared {
                     .collect();
 
                 ContextBuilder::add_assistant_message(
-                    &mut messages,
+                    &mut ctx.messages,
                     response.content.as_deref(),
                     Some(&tc_json),
                 );
@@ -2604,7 +2724,7 @@ impl AgentLoopShared {
                     debug!("Executing tool: {} (id: {})", tc.name, tc.id);
 
                     // Emit tool call start event.
-                    if let Some(ref tx) = tool_event_tx {
+                    if let Some(ref tx) = ctx.tool_event_tx {
                         let preview: String = serde_json::to_string(&tc.arguments)
                             .unwrap_or_default()
                             .chars()
@@ -2621,7 +2741,7 @@ impl AgentLoopShared {
 
                     // Spawn heartbeat that emits Progress every 2s for tools that
                     // don't emit their own (everything except exec).
-                    let heartbeat = if let Some(ref tx) = tool_event_tx {
+                    let heartbeat = if let Some(ref tx) = ctx.tool_event_tx {
                         let hb_tx = tx.clone();
                         let hb_name = tc.name.clone();
                         let hb_id = tc.id.clone();
@@ -2643,21 +2763,21 @@ impl AgentLoopShared {
                         None
                     };
 
-                    let result = if let Some(ref tx) = tool_event_tx {
+                    let result = if let Some(ref tx) = ctx.tool_event_tx {
                         use crate::agent::tools::base::ToolExecutionContext;
-                        let ctx = ToolExecutionContext {
+                        let exec_ctx = ToolExecutionContext {
                             event_tx: tx.clone(),
-                            cancellation_token: cancellation_token
+                            cancellation_token: ctx.cancellation_token
                                 .as_ref()
                                 .map(|t| t.child_token())
                                 .unwrap_or_else(tokio_util::sync::CancellationToken::new),
                             tool_call_id: tc.id.clone(),
                         };
-                        tools
-                            .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
+                        ctx.tools
+                            .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
                             .await
                     } else {
-                        tools.execute(&tc.name, tc.arguments.clone()).await
+                        ctx.tools.execute(&tc.name, tc.arguments.clone()).await
                     };
 
                     // Stop heartbeat when tool finishes.
@@ -2673,20 +2793,20 @@ impl AgentLoopShared {
                         duration_ms
                     );
                     // Gate tool result through context budget.
-                    let data = content_gate.admit_simple(&result.data).into_text();
-                    if core.provenance_config.enabled {
+                    let data = ctx.content_gate.admit_simple(&result.data).into_text();
+                    if ctx.core.provenance_config.enabled {
                         ContextBuilder::add_tool_result_immutable(
-                            &mut messages,
+                            &mut ctx.messages,
                             &tc.id,
                             &tc.name,
                             &data,
                         );
                     } else {
-                        ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &data);
+                        ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &data);
                     }
 
                     // Emit tool call end event.
-                    if let Some(ref tx) = tool_event_tx {
+                    if let Some(ref tx) = ctx.tool_event_tx {
                         let _ = tx.send(ToolEvent::CallEnd {
                             tool_name: tc.name.clone(),
                             tool_call_id: tc.id.clone(),
@@ -2697,7 +2817,7 @@ impl AgentLoopShared {
                     }
 
                     // Record in audit log.
-                    if let Some(ref audit) = audit {
+                    if let Some(ref audit) = ctx.audit {
                         let args_value = serde_json::to_value(&tc.arguments).unwrap_or(json!({}));
                         let _ = audit.record(
                             &tc.name,
@@ -2711,10 +2831,10 @@ impl AgentLoopShared {
                     }
 
                     // Track used tools.
-                    used_tools.insert(tc.name.clone());
+                    ctx.used_tools.insert(tc.name.clone());
 
                     // Collect for turn audit summary.
-                    turn_tool_entries.push(crate::agent::audit::TurnToolEntry {
+                    ctx.turn_tool_entries.push(crate::agent::audit::TurnToolEntry {
                         name: tc.name.clone(),
                         id: tc.id.clone(),
                         ok: result.ok,
@@ -2732,7 +2852,7 @@ impl AgentLoopShared {
                         .chars()
                         .take(100)
                         .collect();
-                    core.learning.record(
+                    ctx.core.learning.record(
                         &tc.name,
                         result.ok,
                         &context_str,
@@ -2741,7 +2861,7 @@ impl AgentLoopShared {
 
                     // Set response boundary flag for exec/write_file.
                     if tc.name == "exec" || tc.name == "write_file" {
-                        force_response = true;
+                        ctx.force_response = true;
                     }
                 }
 
@@ -2752,18 +2872,18 @@ impl AgentLoopShared {
                 // consecutive user messages.
 
                 // Check for priority user messages injected mid-task.
-                if let Some(ref mut rx) = priority_rx {
-                    if let Ok(msg) = rx.try_recv() {
-                        messages.push(json!({
+                if let Some(ref mut rx) = ctx.priority_rx {
+                    if let Ok(priority_msg) = rx.try_recv() {
+                        ctx.messages.push(json!({
                             "role": "user",
-                            "content": format!("[PRIORITY USER MESSAGE]: {}", msg)
+                            "content": format!("[PRIORITY USER MESSAGE]: {}", priority_msg)
                         }));
                         // Continue to next LLM call — let the model see and adjust.
                     }
                 }
 
                 // Check cancellation between tool call iterations.
-                if cancellation_token
+                if ctx.cancellation_token
                     .as_ref()
                     .map_or(false, |t| t.is_cancelled())
                 {
@@ -2771,29 +2891,38 @@ impl AgentLoopShared {
                 }
             } else {
                 // No tool calls -- the agent is done.
-                final_content = response.content.unwrap_or_default();
-                if final_content.trim().is_empty() {
-                    final_content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
+                ctx.final_content = response.content.unwrap_or_default();
+                if ctx.final_content.trim().is_empty() {
+                    ctx.final_content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
                         .to_string();
                 }
                 break;
             }
         }
+    }
+
+    /// Phase 3: Finalize the response — persist session, build outbound message.
+    ///
+    /// Consumes the `TurnContext` (by value) since this is the terminal phase.
+    /// Stores context stats, writes audit summaries, verifies claims, and
+    /// constructs the `OutboundMessage`.
+    async fn finalize_response(&self, mut ctx: TurnContext) -> Option<OutboundMessage> {
+        let counters = &self.core_handle.counters;
 
         // Store context stats for status bar.
-        let final_tokens = TokenBudget::estimate_tokens(&messages) as u64;
+        let final_tokens = TokenBudget::estimate_tokens(&ctx.messages) as u64;
         counters
             .last_context_used
             .store(final_tokens, Ordering::Relaxed);
         counters
             .last_context_max
-            .store(core.token_budget.max_context() as u64, Ordering::Relaxed);
+            .store(ctx.core.token_budget.max_context() as u64, Ordering::Relaxed);
         counters
             .last_message_count
-            .store(messages.len() as u64, Ordering::Relaxed);
+            .store(ctx.messages.len() as u64, Ordering::Relaxed);
         // Store working memory token count.
-        let wm_tokens = if core.memory_enabled {
-            let wm_text = core.working_memory.get_context(&session_key, usize::MAX);
+        let wm_tokens = if ctx.core.memory_enabled {
+            let wm_text = ctx.core.working_memory.get_context(&ctx.session_key, usize::MAX);
             TokenBudget::estimate_str_tokens(&wm_text) as u64
         } else {
             0
@@ -2803,51 +2932,51 @@ impl AgentLoopShared {
             .store(wm_tokens, Ordering::Relaxed);
         // Store tools called this turn.
         {
-            let tools_list: Vec<String> = used_tools.iter().cloned().collect();
+            let tools_list: Vec<String> = ctx.used_tools.iter().cloned().collect();
             if let Ok(mut guard) = counters.last_tools_called.lock() {
                 *guard = tools_list;
             }
         }
 
         // Write per-turn audit summary.
-        if core.provenance_config.enabled && core.provenance_config.audit_log {
+        if ctx.core.provenance_config.enabled && ctx.core.provenance_config.audit_log {
             let summary = crate::agent::audit::TurnSummary {
-                turn: turn_count,
+                turn: ctx.turn_count,
                 timestamp: Utc::now().to_rfc3339(),
                 context_tokens: final_tokens as usize,
-                message_count: messages.len(),
-                tools_called: turn_tool_entries,
+                message_count: ctx.messages.len(),
+                tools_called: ctx.turn_tool_entries,
                 working_memory_tokens: wm_tokens as usize,
             };
-            crate::agent::audit::write_turn_summary(&core.workspace, &session_key, &summary);
+            crate::agent::audit::write_turn_summary(&ctx.core.workspace, &ctx.session_key, &summary);
         }
 
-        if final_content.is_empty() && messages.len() > 2 {
-            final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+        if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
+            ctx.final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
         }
 
         // Phase 3+4: Claim verification and context hygiene.
-        if !final_content.is_empty()
-            && core.provenance_config.enabled
-            && core.provenance_config.verify_claims
+        if !ctx.final_content.is_empty()
+            && ctx.core.provenance_config.enabled
+            && ctx.core.provenance_config.verify_claims
         {
-            if let Some(ref audit) = audit {
+            if let Some(ref audit) = ctx.audit {
                 let entries = audit.get_entries();
                 let (claims, has_fabrication) =
-                    crate::agent::provenance::verify_turn_claims(&final_content, &entries);
+                    crate::agent::provenance::verify_turn_claims(&ctx.final_content, &entries);
 
-                if has_fabrication && core.provenance_config.strict_mode {
+                if has_fabrication && ctx.core.provenance_config.strict_mode {
                     let (redacted, redaction_count) =
-                        crate::agent::provenance::redact_fabrications(&final_content, &claims);
-                    final_content = redacted;
+                        crate::agent::provenance::redact_fabrications(&ctx.final_content, &claims);
+                    ctx.final_content = redacted;
                     if redaction_count > 0 {
-                        let warning_role = provenance_warning_role(core.is_local);
+                        let warning_role = provenance_warning_role(ctx.core.is_local);
                         let warning_content = format!(
                             "NOTICE: {} claim(s) in the previous response could not be \
                              verified against tool outputs and were removed.",
                             redaction_count
                         );
-                        messages.push(json!({
+                        ctx.messages.push(json!({
                             "role": warning_role,
                             "content": warning_content
                         }));
@@ -2857,10 +2986,10 @@ impl AgentLoopShared {
         }
 
         // Phantom tool call detection: check if LLM claims tool results without calling tools.
-        if !final_content.is_empty() && core.provenance_config.enabled {
-            let tools_list: Vec<String> = used_tools.iter().cloned().collect();
+        if !ctx.final_content.is_empty() && ctx.core.provenance_config.enabled {
+            let tools_list: Vec<String> = ctx.used_tools.iter().cloned().collect();
             if let Some(detection) =
-                crate::agent::provenance::detect_phantom_claims(&final_content, &tools_list)
+                crate::agent::provenance::detect_phantom_claims(&ctx.final_content, &tools_list)
             {
                 warn!(
                     "Phantom tool claims detected ({} patterns): {:?}",
@@ -2869,16 +2998,16 @@ impl AgentLoopShared {
                 );
 
                 // Hard block: annotate the response so the user sees the warning.
-                if core.provenance_config.strict_mode {
-                    final_content = crate::agent::provenance::annotate_phantom_response(
-                        &final_content,
+                if ctx.core.provenance_config.strict_mode {
+                    ctx.final_content = crate::agent::provenance::annotate_phantom_response(
+                        &ctx.final_content,
                         &detection,
                     );
                 }
 
                 // Inject system reminder for the next turn.
-                let warning_role = provenance_warning_role(core.is_local);
-                messages.push(json!({
+                let warning_role = provenance_warning_role(ctx.core.is_local);
+                ctx.messages.push(json!({
                     "role": warning_role,
                     "content": detection.system_warning
                 }));
@@ -2887,61 +3016,56 @@ impl AgentLoopShared {
 
         // Ensure the final text response is in the messages array for persistence.
         // Without this, text-only responses (no tool calls) would be lost.
-        if !final_content.is_empty() {
-            messages.push(json!({"role": "assistant", "content": final_content.clone()}));
+        if !ctx.final_content.is_empty() {
+            ctx.messages.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
         }
 
         // Update session history — persist full message array including tool calls.
         // Skip system prompt (index 0) and pre-existing history.
-        let new_messages: Vec<Value> = if new_start < messages.len() {
-            messages[new_start..].to_vec()
+        let new_messages: Vec<Value> = if ctx.new_start < ctx.messages.len() {
+            ctx.messages[ctx.new_start..].to_vec()
         } else {
             // Fallback: save at least user + assistant text.
-            let mut fallback = vec![json!({"role": "user", "content": msg.content.clone()})];
-            if !final_content.is_empty() {
-                fallback.push(json!({"role": "assistant", "content": final_content.clone()}));
+            let mut fallback = vec![json!({"role": "user", "content": ctx.user_content.clone()})];
+            if !ctx.final_content.is_empty() {
+                fallback.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
             }
             fallback
         };
         if !new_messages.is_empty() {
-            core.sessions
-                .add_messages_raw(&session_key, &new_messages)
+            ctx.core.sessions
+                .add_messages_raw(&ctx.session_key, &new_messages)
                 .await;
         }
 
         // Auto-complete stale working memory sessions (runs on every message, cheap).
-        if core.memory_enabled {
-            for session in core.working_memory.list_active() {
-                if session.session_key != session_key {
+        if ctx.core.memory_enabled {
+            for session in ctx.core.working_memory.list_active() {
+                if session.session_key != ctx.session_key {
                     let age = Utc::now() - session.updated;
-                    if age.num_seconds() > core.session_complete_after_secs as i64 {
-                        core.working_memory.complete(&session.session_key);
+                    if age.num_seconds() > ctx.core.session_complete_after_secs as i64 {
+                        ctx.core.working_memory.complete(&session.session_key);
                         debug!("Auto-completed stale session: {}", session.session_key);
                     }
                 }
             }
         }
 
-        if final_content.is_empty() {
+        if ctx.final_content.is_empty() {
             None
         } else {
-            let mut outbound = OutboundMessage::new(&msg.channel, &msg.chat_id, &final_content);
+            let mut outbound = OutboundMessage::new(&ctx.channel, &ctx.chat_id, &ctx.final_content);
             // Propagate voice_message metadata so channels know to reply with voice.
-            if msg
-                .metadata
-                .get("voice_message")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            if ctx.is_voice_message {
                 outbound
                     .metadata
                     .insert("voice_message".to_string(), json!(true));
             }
             // Propagate detected_language for TTS voice selection.
-            if let Some(lang) = msg.metadata.get("detected_language") {
+            if let Some(ref lang) = ctx.detected_language {
                 outbound
                     .metadata
-                    .insert("detected_language".to_string(), lang.clone());
+                    .insert("detected_language".to_string(), json!(lang));
             }
             Some(outbound)
         }
@@ -3558,27 +3682,27 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        build_swappable_core(
-            main,
+        build_swappable_core(SwappableCoreConfig {
+            provider: main,
             workspace,
-            "main-model".to_string(),
-            10,
-            4096,
-            0.7,
-            16384,
-            None,
-            30,
-            false,
-            MemoryConfig::default(),
-            false,
-            None,
-            td,
-            ProvenanceConfig::default(),
-            2000,
+            model: "main-model".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: false,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
             delegation_provider,
-            None,
-            TrioConfig::default(),
-        )
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+        })
     }
 
     #[test]
@@ -3870,27 +3994,27 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_swappable_core(
-            main,
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
             workspace,
-            "main-model".to_string(),
-            10,
-            4096,
-            0.7,
-            16384,
-            None,
-            30,
-            false,
-            MemoryConfig::default(),
-            false,
-            None,
-            td,
-            ProvenanceConfig::default(),
-            2000,
-            None,
-            None,
-            TrioConfig::default(),
-        );
+            model: "main-model".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: false,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+        });
         assert_eq!(
             core.tool_runner_model.as_deref(),
             Some("main-model"),
@@ -3924,27 +4048,27 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_swappable_core(
-            main,
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
             workspace,
-            "local-model".to_string(),
-            10,
-            4096,
-            0.7,
-            16384,
-            None,
-            30,
-            false,
-            MemoryConfig::default(),
-            true, // is_local = true
-            None,
-            td,
-            ProvenanceConfig::default(),
-            2000,
-            Some(dp),
-            None,
-            TrioConfig::default(),
-        );
+            model: "local-model".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(dp),
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+        });
 
         assert!(core.is_local);
         assert!(core.tool_runner_provider.is_some());
@@ -3971,27 +4095,27 @@ mod tests {
             auto_local: true,
             ..Default::default()
         };
-        let core = build_swappable_core(
-            main,
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
             workspace,
-            "main-model".to_string(),
-            10,
-            4096,
-            0.7,
-            16384,
-            None,
-            30,
-            false,
-            MemoryConfig::default(),
-            true,
-            Some(compaction),
-            td,
-            ProvenanceConfig::default(),
-            2000,
-            Some(delegation),
-            None,
-            TrioConfig::default(),
-        );
+            model: "main-model".to_string(),
+            max_iterations: 10,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16384,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: Some(compaction),
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(delegation),
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+        });
 
         // Compaction provider goes to memory_provider, delegation to tool_runner
         assert_eq!(

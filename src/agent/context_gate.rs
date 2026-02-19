@@ -27,66 +27,6 @@ pub struct CacheRef {
 }
 
 // ---------------------------------------------------------------------------
-// ContextBudget
-// ---------------------------------------------------------------------------
-
-/// Pure token accounting — no I/O, no side effects.
-///
-/// Tracks how many tokens have been consumed and answers "does this fit?"
-pub struct ContextBudget {
-    /// Model's max context window in tokens.
-    max_tokens: usize,
-    /// Tokens currently consumed (system prompt + messages + tool results).
-    used_tokens: usize,
-    /// Fraction reserved for model output generation (default 0.20).
-    output_reserve: f64,
-}
-
-impl ContextBudget {
-    /// Create a new budget from the model's context window.
-    ///
-    /// `output_reserve` is the fraction reserved for generation (0.0–1.0).
-    pub fn new(max_tokens: usize, output_reserve: f32) -> Self {
-        Self {
-            max_tokens,
-            used_tokens: 0,
-            output_reserve: (output_reserve as f64).clamp(0.0, 0.95),
-        }
-    }
-
-    /// Tokens available for new content.
-    pub fn available(&self) -> usize {
-        let ceiling = ((self.max_tokens as f64) * (1.0 - self.output_reserve)).round() as usize;
-        ceiling.saturating_sub(self.used_tokens)
-    }
-
-    /// Record tokens consumed.
-    pub fn consume(&mut self, tokens: usize) {
-        self.used_tokens = self.used_tokens.saturating_add(tokens);
-    }
-
-    /// Reset after compaction or new turn.
-    pub fn reset(&mut self, used: usize) {
-        self.used_tokens = used;
-    }
-
-    /// Current usage.
-    pub fn used(&self) -> usize {
-        self.used_tokens
-    }
-
-    /// Maximum context window.
-    pub fn max_tokens(&self) -> usize {
-        self.max_tokens
-    }
-
-    /// Estimate tokens for a string (delegates to TokenBudget's BPE).
-    pub fn estimate_tokens(text: &str) -> usize {
-        TokenBudget::estimate_str_tokens(text)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // OutputCache
 // ---------------------------------------------------------------------------
 
@@ -197,14 +137,14 @@ impl GateResult {
 /// Decides: pass raw (fits) or produce a briefing (doesn't fit).
 /// The briefing is a structural summary; full content is cached for drill-down.
 pub struct ContentGate {
-    pub budget: ContextBudget,
+    pub budget: TokenBudget,
     pub cache: OutputCache,
 }
 
 impl ContentGate {
     pub fn new(max_tokens: usize, output_reserve: f32, cache_dir: PathBuf) -> Self {
         Self {
-            budget: ContextBudget::new(max_tokens, output_reserve),
+            budget: TokenBudget::with_output_reserve(max_tokens, output_reserve),
             cache: OutputCache::new(cache_dir),
         }
     }
@@ -221,7 +161,7 @@ impl ContentGate {
     where
         F: FnOnce(&str, usize) -> String,
     {
-        let tokens = ContextBudget::estimate_tokens(content);
+        let tokens = TokenBudget::estimate_str_tokens(content);
         let available = self.budget.available();
 
         if tokens <= available {
@@ -233,7 +173,7 @@ impl ContentGate {
         let cache_ref = self.cache.store(content);
         let target_tokens = available / 2; // briefing should use ~half remaining budget
         let summary = briefing_fn(content, target_tokens);
-        let summary_tokens = ContextBudget::estimate_tokens(&summary);
+        let summary_tokens = TokenBudget::estimate_str_tokens(&summary);
         self.budget.consume(summary_tokens);
 
         GateResult::Briefing {
@@ -262,7 +202,7 @@ impl ContentGate {
         content: &str,
         compactor: &ContextCompactor,
     ) -> GateResult {
-        let tokens = ContextBudget::estimate_tokens(content);
+        let tokens = TokenBudget::estimate_str_tokens(content);
         let available = self.budget.available();
 
         if tokens <= available {
@@ -285,7 +225,7 @@ impl ContentGate {
             }
         };
 
-        let summary_tokens = ContextBudget::estimate_tokens(&summary);
+        let summary_tokens = TokenBudget::estimate_str_tokens(&summary);
         self.budget.consume(summary_tokens);
 
         GateResult::Briefing {
@@ -378,18 +318,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // -- ContextBudget tests --
+    // -- TokenBudget (with_output_reserve) tests --
 
     #[test]
     fn test_budget_available_basic() {
-        let budget = ContextBudget::new(10_000, 0.20);
+        let budget = TokenBudget::with_output_reserve(10_000, 0.20);
         // ceiling = 10_000 * 0.80 = 8_000
         assert_eq!(budget.available(), 8_000);
     }
 
     #[test]
     fn test_budget_consume_and_available() {
-        let mut budget = ContextBudget::new(10_000, 0.20);
+        let mut budget = TokenBudget::with_output_reserve(10_000, 0.20);
         budget.consume(3_000);
         assert_eq!(budget.available(), 5_000);
         assert_eq!(budget.used(), 3_000);
@@ -397,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_budget_saturating_consume() {
-        let mut budget = ContextBudget::new(1_000, 0.20);
+        let mut budget = TokenBudget::with_output_reserve(1_000, 0.20);
         budget.consume(900);
         // available = 800 - 900 = 0 (saturating)
         assert_eq!(budget.available(), 0);
@@ -405,22 +345,22 @@ mod tests {
 
     #[test]
     fn test_budget_reset() {
-        let mut budget = ContextBudget::new(10_000, 0.20);
+        let mut budget = TokenBudget::with_output_reserve(10_000, 0.20);
         budget.consume(5_000);
-        budget.reset(1_000);
+        budget.reset_used(1_000);
         assert_eq!(budget.used(), 1_000);
         assert_eq!(budget.available(), 7_000);
     }
 
     #[test]
     fn test_budget_clamp_output_reserve() {
-        let budget = ContextBudget::new(10_000, 1.5); // clamped to 0.95
+        let budget = TokenBudget::with_output_reserve(10_000, 1.5); // clamped to 0.95
         assert_eq!(budget.available(), 500); // 10_000 * 0.05
     }
 
     #[test]
     fn test_estimate_tokens_delegates_to_bpe() {
-        let tokens = ContextBudget::estimate_tokens("hello world");
+        let tokens = TokenBudget::estimate_str_tokens("hello world");
         assert!(tokens > 0 && tokens < 10);
     }
 

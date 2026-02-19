@@ -754,6 +754,24 @@ fn default_td_max_tokens() -> u32 {
     1024
 }
 
+/// High-level delegation mode that sets sensible defaults for the strict flags.
+///
+/// Use this instead of configuring individual `strict_*` booleans:
+/// - **Inline**: Main model calls tools directly (no delegation).
+/// - **Delegated**: Tools delegated to a cheaper tool runner model.
+/// - **Trio**: Strict separation — main=conversation, router=dispatch, specialist=execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DelegationMode {
+    /// Main model calls tools directly (delegation disabled).
+    Inline,
+    /// Tools delegated to tool runner model (default).
+    #[default]
+    Delegated,
+    /// Strict trio: main=orchestrator, router=dispatch, specialist=tools.
+    Trio,
+}
+
 /// Configuration for delegating tool execution loops to a cheaper model.
 ///
 /// When enabled, tool calls from the main LLM are handed off to a lightweight
@@ -762,6 +780,11 @@ fn default_td_max_tokens() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDelegationConfig {
+    /// High-level mode (overrides strict_* flags when set).
+    /// Defaults to `Delegated`. Set to `trio` for strict separation or
+    /// `inline` to disable delegation entirely.
+    #[serde(default)]
+    pub mode: DelegationMode,
     /// Enable tool delegation (default: true).
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -855,6 +878,7 @@ fn default_td_max_same_tool_call() -> u32 {
 impl Default for ToolDelegationConfig {
     fn default() -> Self {
         Self {
+            mode: DelegationMode::default(),
             enabled: true,
             model: String::new(),
             provider: None,
@@ -872,6 +896,34 @@ impl Default for ToolDelegationConfig {
             strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: default_td_max_same_tool_call(),
+        }
+    }
+}
+
+impl ToolDelegationConfig {
+    /// Apply the high-level `mode` to the individual strict flags.
+    ///
+    /// Call after deserialization to ensure the mode takes effect.
+    /// Individual flag overrides in the JSON are clobbered by mode.
+    pub fn apply_mode(&mut self) {
+        match self.mode {
+            DelegationMode::Inline => {
+                self.enabled = false;
+                self.strict_no_tools_main = false;
+                self.strict_router_schema = false;
+                self.role_scoped_context_packs = false;
+            }
+            DelegationMode::Delegated => {
+                self.enabled = true;
+                self.strict_no_tools_main = false;
+                self.strict_router_schema = false;
+            }
+            DelegationMode::Trio => {
+                self.enabled = true;
+                self.strict_no_tools_main = true;
+                self.strict_router_schema = true;
+                self.role_scoped_context_packs = true;
+            }
         }
     }
 }
@@ -1309,6 +1361,7 @@ mod tests {
             strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: 1,
+            mode: DelegationMode::Trio,
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();

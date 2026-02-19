@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::agent_loop::{
     build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle,
+    SwappableCoreConfig,
 };
 use crate::agent::tuning::{score_feasible_profiles, select_optimal_from_input, OptimizationInput};
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -447,27 +448,27 @@ pub(crate) fn build_core_handle(
         is_local,
     );
 
-    let core = build_swappable_core(
+    let core = build_swappable_core(SwappableCoreConfig {
         provider,
-        config.workspace_path(),
+        workspace: config.workspace_path(),
         model,
-        max_iters,
-        config.agents.defaults.max_tokens,
-        config.agents.defaults.temperature,
+        max_iterations: max_iters,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
         max_context_tokens,
-        brave_key,
-        config.tools.exec_.timeout,
-        config.tools.exec_.restrict_to_workspace,
-        config.memory.clone(),
+        brave_api_key: brave_key,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
         is_local,
-        cp,
-        config.tool_delegation.clone(),
-        config.provenance.clone(),
-        config.agents.defaults.max_tool_result_chars,
-        dp,
-        sp,
-        config.trio.clone(),
-    );
+        compaction_provider: cp,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: dp,
+        specialist_provider: sp,
+        trio_config: config.trio.clone(),
+    });
     let counters = Arc::new(RuntimeCounters::new(max_context_tokens));
     AgentHandle::new(core, counters)
 }
@@ -548,27 +549,27 @@ pub(crate) fn rebuild_core(
         is_local,
     );
 
-    let new_core = build_swappable_core(
+    let new_core = build_swappable_core(SwappableCoreConfig {
         provider,
-        config.workspace_path(),
+        workspace: config.workspace_path(),
         model,
-        max_iters,
-        config.agents.defaults.max_tokens,
-        config.agents.defaults.temperature,
+        max_iterations: max_iters,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
         max_context_tokens,
-        brave_key,
-        config.tools.exec_.timeout,
-        config.tools.exec_.restrict_to_workspace,
-        config.memory.clone(),
+        brave_api_key: brave_key,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
         is_local,
-        cp,
-        config.tool_delegation.clone(),
-        config.provenance.clone(),
-        config.agents.defaults.max_tool_result_chars,
-        dp,
-        sp,
-        config.trio.clone(),
-    );
+        compaction_provider: cp,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: dp,
+        specialist_provider: sp,
+        trio_config: config.trio.clone(),
+    });
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
     // Update max context since the new model may have a different size.
