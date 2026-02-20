@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
 use super::jit_gate::{is_jit_loading_error, JitGate};
@@ -478,6 +478,7 @@ fn extract_reasoning_delta(delta: &serde_json::Value) -> Option<&str> {
 
 #[async_trait]
 impl LLMProvider for OpenAICompatProvider {
+    #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
     async fn chat(
         &self,
         messages: &[serde_json::Value],
@@ -507,6 +508,7 @@ impl LLMProvider for OpenAICompatProvider {
             "chat: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
+        let call_start = std::time::Instant::now();
 
         // For Nemotron-family models with reasoning off and no tools: try the native
         // LMS API which can disable reasoning at the template level. Skip for all
@@ -528,6 +530,18 @@ impl LLMProvider for OpenAICompatProvider {
             )
             .await
             {
+                let elapsed_ms = call_start.elapsed().as_millis() as u64;
+                let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
+                let completion_tokens = response.usage.get("completion_tokens").copied().unwrap_or(0);
+                info!(
+                    elapsed_ms = elapsed_ms,
+                    model = %model,
+                    tokens_prompt = prompt_tokens,
+                    tokens_completion = completion_tokens,
+                    api_base = %self.api_base,
+                    path = "native_lms",
+                    "llm_call_complete"
+                );
                 return Ok(response);
             }
             // Native API failed — fall through to regular path.
@@ -625,11 +639,15 @@ impl LLMProvider for OpenAICompatProvider {
                     continue;
                 }
 
-                warn!(
-                    "LLM API returned status {} (base={}): {}",
-                    status, self.api_base, response_text
-                );
                 let status_code = status.as_u16();
+                let body_snippet: String = response_text.chars().take(500).collect();
+                warn!(
+                    model = %model,
+                    api_base = %self.api_base,
+                    status = status_code,
+                    body = %body_snippet,
+                    "llm_api_error"
+                );
                 return Err(match status_code {
                     429 => {
                         // Try to extract retry-after from the response text.
@@ -664,13 +682,35 @@ impl LLMProvider for OpenAICompatProvider {
                 }
             };
 
-            return parse_response(&data);
+            let result = parse_response(&data);
+            let elapsed_ms = call_start.elapsed().as_millis() as u64;
+            if let Ok(ref resp) = result {
+                let prompt_tokens = resp.usage.get("prompt_tokens").copied().unwrap_or(0);
+                let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
+                info!(
+                    elapsed_ms = elapsed_ms,
+                    model = %model,
+                    tokens_prompt = prompt_tokens,
+                    tokens_completion = completion_tokens,
+                    api_base = %self.api_base,
+                    "llm_call_complete"
+                );
+            } else {
+                warn!(
+                    elapsed_ms = elapsed_ms,
+                    model = %model,
+                    api_base = %self.api_base,
+                    "llm_call_failed"
+                );
+            }
+            return result;
         }
 
         // Should never reach here, but just in case:
         Err(crate::errors::ProviderError::HttpError("JIT retry loop exhausted".into()).into())
     }
 
+    #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
     async fn chat_stream(
         &self,
         messages: &[serde_json::Value],
@@ -697,6 +737,7 @@ impl LLMProvider for OpenAICompatProvider {
             "chat_stream: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
+        let call_start = std::time::Instant::now();
 
         // For Nemotron-family models with reasoning off and no tools: try native LMS API.
         let has_tools = tools.map_or(false, |t| !t.is_empty());
@@ -777,13 +818,15 @@ impl LLMProvider for OpenAICompatProvider {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            warn!(
-                "LLM streaming API returned status {} (base={}): {}",
-                status, self.api_base, error_text
-            );
             // Drop permit explicitly on error (it would drop anyway, but be clear).
             drop(jit_permit);
             let status_code = status.as_u16();
+            warn!(
+                model = %model,
+                api_base = %self.api_base,
+                status = status_code,
+                "llm_stream_api_error"
+            );
             return Err(match status_code {
                 429 => crate::errors::ProviderError::RateLimited {
                     status: status_code,
@@ -804,6 +847,14 @@ impl LLMProvider for OpenAICompatProvider {
             }
             .into());
         }
+
+        let ttfb_ms = call_start.elapsed().as_millis() as u64;
+        info!(
+            ttfb_ms = ttfb_ms,
+            model = %model,
+            api_base = %self.api_base,
+            "llm_stream_started"
+        );
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -980,7 +1031,13 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
                 if let Some(s) = arguments_raw.as_str() {
                     match serde_json::from_str(s) {
                         Ok(map) => map,
-                        Err(_) => {
+                        Err(e) => {
+                            warn!(
+                                tool = %name,
+                                error = %e,
+                                raw_args = %s,
+                                "malformed_tool_call_json"
+                            );
                             let mut m = HashMap::new();
                             m.insert("raw".to_string(), serde_json::Value::String(s.to_string()));
                             m
@@ -1106,7 +1163,13 @@ async fn parse_sse_stream(
                     let arguments: HashMap<String, serde_json::Value> =
                         match serde_json::from_str(&args_str) {
                             Ok(map) => map,
-                            Err(_) => {
+                            Err(e) => {
+                                warn!(
+                                    tool = %name,
+                                    error = %e,
+                                    raw_args = %args_str,
+                                    "malformed_tool_call_json"
+                                );
                                 let mut m = HashMap::new();
                                 m.insert("raw".to_string(), serde_json::Value::String(args_str));
                                 m
@@ -1220,7 +1283,13 @@ async fn parse_sse_stream(
         let _ = tx.send(StreamChunk::TextDelta(tail_content));
     }
 
-    // Stream ended without [DONE] — fallback to reasoning if content is empty.
+    // Stream ended without [DONE] — SLM may have crashed or dropped connection.
+    warn!(
+        content_len = full_content.len(),
+        reasoning_len = full_reasoning.len(),
+        tool_calls = tool_calls_acc.len(),
+        "sse_stream_ended_without_done"
+    );
     let content = if !full_content.is_empty() {
         if !full_reasoning.is_empty() {
             debug!(
@@ -1246,7 +1315,13 @@ async fn parse_sse_stream(
         let (id, name, args_str) = tool_calls_acc.remove(&idx).unwrap();
         let arguments: HashMap<String, serde_json::Value> = match serde_json::from_str(&args_str) {
             Ok(map) => map,
-            Err(_) => {
+            Err(e) => {
+                warn!(
+                    tool = %name,
+                    error = %e,
+                    raw_args = %args_str,
+                    "malformed_tool_call_json"
+                );
                 let mut m = HashMap::new();
                 m.insert("raw".to_string(), serde_json::Value::String(args_str));
                 m
@@ -1851,5 +1926,246 @@ mod tests {
         assert!(!needs_native_lms_api("ministral-3-8b-instruct-2512"));
         assert!(!needs_native_lms_api("local-model"));
         assert!(!needs_native_lms_api("nanbeige4.1-3b"));
+    }
+
+    // ── B6: SLM Observability tests ──────────────────────────────────
+    //
+    // These tests exercise the failure paths that were previously silent.
+    // They verify the data transformation is correct (malformed JSON → {"raw": ...})
+    // AND that the code doesn't panic on degenerate SLM outputs.
+
+    #[test]
+    fn test_parse_response_malformed_tool_args_multiple_tools() {
+        // SLMs often produce a mix: one tool with valid JSON, another with garbage.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"/tmp/test\"}"
+                            }
+                        },
+                        {
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {
+                                "name": "web_fetch",
+                                "arguments": "the content is <html>..."
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed despite malformed args");
+        assert_eq!(resp.tool_calls.len(), 2);
+
+        // First tool: valid JSON → parsed normally.
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(
+            resp.tool_calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/test")
+        );
+
+        // Second tool: malformed → wrapped in {"raw": ...}.
+        assert_eq!(resp.tool_calls[1].name, "web_fetch");
+        assert_eq!(
+            resp.tool_calls[1].arguments.get("raw").and_then(|v| v.as_str()),
+            Some("the content is <html>...")
+        );
+        // Must NOT have the parsed keys from the first tool.
+        assert!(resp.tool_calls[1].arguments.get("path").is_none());
+    }
+
+    #[test]
+    fn test_parse_response_empty_arguments_string() {
+        // SLMs sometimes emit arguments: "" (empty string) instead of "{}".
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {
+                            "name": "wait",
+                            "arguments": ""
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "wait");
+        // Empty string is invalid JSON → wrapped in {"raw": ""}.
+        assert_eq!(
+            resp.tool_calls[0].arguments.get("raw").and_then(|v| v.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn test_parse_response_function_call_tag_as_arguments() {
+        // Nemotron-family SLMs wrap tool calls in <start_function_call> tags.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_tag",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "<start_function_call>{\"command\": \"ls\"}<end_function_call>"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.tool_calls.len(), 1);
+        // Tagged output is not valid JSON → wrapped in raw.
+        assert!(resp.tool_calls[0].arguments.contains_key("raw"));
+    }
+
+    /// Helper: create a fake byte stream from SSE lines.
+    fn sse_bytes(lines: &[&str]) -> Vec<Result<bytes::Bytes, reqwest::Error>> {
+        lines
+            .iter()
+            .map(|l| Ok(bytes::Bytes::from(format!("{}\n", l))))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_no_done_produces_response() {
+        // Simulate an SLM that streams content then drops the connection
+        // without sending [DONE]. The parse_sse_stream should still
+        // produce a Done chunk with whatever was accumulated.
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"index\":0}]}",
+            // No "data: [DONE]" — connection dropped.
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        // Collect all chunks.
+        let mut deltas = Vec::new();
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::TextDelta(d) => deltas.push(d),
+                StreamChunk::Done(resp) => done_response = Some(resp),
+                _ => {}
+            }
+        }
+
+        // Must have received content deltas.
+        assert!(!deltas.is_empty(), "should have received text deltas");
+        let full: String = deltas.join("");
+        assert!(full.contains("Hello"), "content should contain 'Hello'");
+
+        // Must have received a Done with assembled content.
+        let resp = done_response.expect("should have received Done chunk despite no [DONE]");
+        assert_eq!(resp.content.as_deref(), Some("Hello world"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_malformed_tool_args_in_done() {
+        // SLM streams a tool call with malformed arguments, then sends [DONE].
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"not json at all\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done chunk");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "shell");
+        // Accumulated argument string "not json at all" is not valid JSON → {"raw": ...}.
+        assert!(
+            resp.tool_calls[0].arguments.contains_key("raw"),
+            "malformed tool args should be wrapped in 'raw' key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_no_done_with_tool_calls() {
+        // SLM streams a tool call then drops without [DONE].
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/tmp/test\\\"\"}}]},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"index\":0}]}",
+            // No [DONE]
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done despite no [DONE]");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        // The accumulated args should be valid JSON: {"path":"/tmp/test"}
+        assert_eq!(
+            resp.tool_calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/test")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_completely_empty() {
+        // SLM returns zero content — connection established then immediately dropped.
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![];
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should produce Done even for empty stream");
+        assert!(resp.content.is_none(), "empty stream should have no content");
+        assert!(resp.tool_calls.is_empty(), "empty stream should have no tool calls");
     }
 }

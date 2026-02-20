@@ -9,6 +9,19 @@
 
 ### 🔴 Blocking — do first
 
+- [ ] **B6: SLM Observability** — Flying blind with trio. 8 silent failure paths identified (2026-02-20 audit). Zero new deps — uses existing `tracing` crate. Changes:
+  1. `warn!` on malformed tool-call JSON (openai_compat.rs:1028, 1154, 1300) — currently silently wrapped in `{"raw":…}`
+  2. Log HTTP error response body (openai_compat.rs:642, anthropic.rs:442) — currently body discarded, only status code logged
+  3. `warn!` on SSE stream ending without `[DONE]` (openai_compat.rs:1270) — SLM crashes mid-response invisible
+  4. `warn!` on empty LLM response fallback (agent_loop.rs:1214) — silent hardcoded string injection
+  5. `warn!` on Anthropic SSE parse errors (anthropic.rs:700) — `Err(_) => continue` with zero logging
+  6. Add `#[instrument]` spans to `chat()`/`chat_stream()` in both providers
+  7. Add `.with_span_events(FmtSpan::CLOSE)` to JSON subscriber in main.rs — free latency tracking
+  8. Remove dead `error_detail()` code (base.rs:47-62) — `finish_reason == "error"` never fires
+  9. Fix duplicate `llm_stream_started` event in anthropic.rs:610-624
+  10. Promote `llm_call_failed` from `info!` to `warn!` (openai_compat.rs:696, anthropic.rs:485)
+  _Ref: session audit 2026-02-20, logs at ~/.nanobot/nanobot.log_
+- [ ] **B7: Provider retry with `backon`** — Three hand-rolled retry loops (JIT gate, specialist warm-up, audit persistence) with no jitter. `ProviderError::RateLimited { retry_after_ms }` created but never read. `chat_stream` has zero retry. Add `backon = "1.6"` (MIT, near-zero deps, used by `uv`). Shared `is_retryable_provider_error()` predicate. Replace all 3 loops + add retry to streaming path. _Ref: session audit 2026-02-20_
 - [ ] **B3: Update default local trio** — New defaults: 1) Main: `gemma-3n-e4b-it`, 2) Orchestrator: `nvidia_orchestrator-8b`, 3) Specialist: `ministral-3-8b-instruct-2512`. Update `agents.json`, `DEFAULT_LOCAL_MODEL`, config schema defaults, and `TrioConfig`. _Ref: experiments/tool-calling/_
 - [ ] **B3.1: Smarter deterministic fallback** — `router_fallback.rs` only has 2 patterns (URL→web_fetch, "latest news"→spawn). Fails on "research report + URLs" which should spawn a researcher. Add pattern: research/report/summarize + URLs → `Subagent(researcher)`. _Ref: `src/agent/router_fallback.rs`_
 - [ ] **B4: Multi-model config schema** — Add `local.main`, `local.rlm`, `local.memory` to config. Each slot: `{ model, path, gpu, context_size, temperature }`. Server manager spawns up to 3 llama-server instances. _Ref: `docs/plans/local-model-matrix.md`_

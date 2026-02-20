@@ -375,6 +375,7 @@ fn main() {
             .with_env_filter(env_filter)
             .with_writer(file_appender)
             .json()
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
             .with_ansi(false)
             .init();
     } else {

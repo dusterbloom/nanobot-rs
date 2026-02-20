@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
 
@@ -346,6 +346,7 @@ fn parse_anthropic_response(data: &Value) -> Result<LLMResponse> {
 
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
+    #[instrument(skip(self, messages, tools), fields(provider = "anthropic"))]
     async fn chat(
         &self,
         messages: &[Value],
@@ -409,6 +410,7 @@ impl LLMProvider for AnthropicProvider {
             anthropic_messages.len()
         );
 
+        let call_start = std::time::Instant::now();
         let mut req = self
             .client
             .post(&url)
@@ -428,7 +430,7 @@ impl LLMProvider for AnthropicProvider {
         let response = match req.json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Anthropic API request failed: {}", e);
+                warn!(model = %model, provider = "anthropic", "Anthropic API request failed: {}", e);
                 return Err(crate::errors::ProviderError::HttpError(e.to_string()).into());
             }
         };
@@ -437,8 +439,15 @@ impl LLMProvider for AnthropicProvider {
         let response_text = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            warn!("Anthropic API returned {} : {}", status, response_text);
             let status_code = status.as_u16();
+            let body_snippet: String = response_text.chars().take(500).collect();
+            warn!(
+                model = %model,
+                provider = "anthropic",
+                status = status_code,
+                body = %body_snippet,
+                "llm_api_error"
+            );
             return Err(match status_code {
                 429 => crate::errors::ProviderError::RateLimited {
                     status: status_code,
@@ -463,9 +472,31 @@ impl LLMProvider for AnthropicProvider {
         let data: Value = serde_json::from_str(&response_text)
             .context("Failed to parse Anthropic API response")?;
 
-        parse_anthropic_response(&data)
+        let result = parse_anthropic_response(&data);
+        let elapsed_ms = call_start.elapsed().as_millis() as u64;
+        if let Ok(ref resp) = result {
+            let prompt_tokens = resp.usage.get("prompt_tokens").copied().unwrap_or(0);
+            let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
+            info!(
+                elapsed_ms = elapsed_ms,
+                model = %model,
+                tokens_prompt = prompt_tokens,
+                tokens_completion = completion_tokens,
+                provider = "anthropic",
+                "llm_call_complete"
+            );
+        } else {
+            warn!(
+                elapsed_ms = elapsed_ms,
+                model = %model,
+                provider = "anthropic",
+                "llm_call_failed"
+            );
+        }
+        result
     }
 
+    #[instrument(skip(self, messages, tools), fields(provider = "anthropic"))]
     async fn chat_stream(
         &self,
         messages: &[Value],
@@ -530,6 +561,7 @@ impl LLMProvider for AnthropicProvider {
             anthropic_messages.len()
         );
 
+        let call_start = std::time::Instant::now();
         let mut req = self
             .client
             .post(&url)
@@ -551,11 +583,15 @@ impl LLMProvider for AnthropicProvider {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            warn!(
-                "Anthropic streaming API returned {}: {}",
-                status, error_text
-            );
             let status_code = status.as_u16();
+            let body_snippet: String = error_text.chars().take(500).collect();
+            warn!(
+                model = %model,
+                provider = "anthropic",
+                status = status_code,
+                body = %body_snippet,
+                "llm_stream_api_error"
+            );
             return Err(match status_code {
                 429 => crate::errors::ProviderError::RateLimited {
                     status: status_code,
@@ -576,6 +612,14 @@ impl LLMProvider for AnthropicProvider {
             }
             .into());
         }
+
+        let ttfb_ms = call_start.elapsed().as_millis() as u64;
+        info!(
+            ttfb_ms = ttfb_ms,
+            model = %model,
+            provider = "anthropic",
+            "llm_stream_started"
+        );
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let byte_stream = response.bytes_stream();
@@ -653,7 +697,14 @@ async fn parse_anthropic_sse(
             let data_str = &line[6..];
             let data: Value = match serde_json::from_str(data_str) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        raw_data = %data_str.chars().take(200).collect::<String>(),
+                        "anthropic_sse_parse_error"
+                    );
+                    continue;
+                }
             };
 
             let event_type = data["type"].as_str().unwrap_or("");
@@ -1046,5 +1097,74 @@ mod tests {
         assert_eq!(msgs[1]["role"], "assistant");
         assert_eq!(msgs[2]["role"], "user"); // tool result
         assert_eq!(msgs[3]["role"], "user"); // follow-up
+    }
+
+    // ── B6: SLM Observability tests ──────────────────────────────────
+
+    /// Helper: create SSE byte chunks from lines.
+    fn sse_bytes(lines: &[&str]) -> Vec<Result<bytes::Bytes, reqwest::Error>> {
+        lines
+            .iter()
+            .map(|l| Ok(bytes::Bytes::from(format!("{}\n", l))))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_sse_malformed_json_skipped() {
+        // Simulate SSE with a malformed JSON line followed by valid content.
+        // The malformed line should be skipped (with debug log), valid content preserved.
+        let chunks = sse_bytes(&[
+            "event: message_start",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}",
+            "event: content_block_start",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "event: content_block_delta",
+            "data: NOT VALID JSON AT ALL",
+            "event: content_block_delta",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+            "event: message_stop",
+            "data: {\"type\":\"message_stop\"}",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_anthropic_sse(stream, tx).await;
+
+        let mut deltas = Vec::new();
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::TextDelta(d) => deltas.push(d),
+                StreamChunk::Done(resp) => done_response = Some(resp),
+                _ => {}
+            }
+        }
+
+        // Despite the malformed line, we should still get the valid content.
+        let resp = done_response.expect("should have received Done");
+        assert_eq!(resp.content.as_deref(), Some("Hello"));
+        assert_eq!(*resp.usage.get("prompt_tokens").unwrap_or(&0), 10);
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_sse_empty_stream() {
+        // Connection established then immediately closed — zero SSE events.
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![];
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_anthropic_sse(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should produce Done even for empty stream");
+        assert!(resp.content.is_none(), "empty stream should have no content");
+        assert!(resp.tool_calls.is_empty());
     }
 }
