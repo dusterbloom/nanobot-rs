@@ -835,6 +835,7 @@ pub(crate) async fn route_tool_calls(
     }
 
     // Tool guard filtering.
+    let original_count = routed_tool_calls.len();
     let mut blocked_calls = 0usize;
     routed_tool_calls.retain(|tc| match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
         Ok(()) => true,
@@ -854,11 +855,29 @@ pub(crate) async fn route_tool_calls(
         }));
     }
     if routed_tool_calls.is_empty() {
+        // Track consecutive rounds where ALL tool calls were blocked.
+        if blocked_calls > 0 && blocked_calls == original_count {
+            ctx.flow.consecutive_all_blocked += 1;
+            // Circuit breaker: after 3 consecutive all-blocked rounds, force a
+            // text response. The LLM is stuck in a loop requesting the same tools.
+            if ctx.flow.consecutive_all_blocked >= 3 {
+                warn!(
+                    rounds = ctx.flow.consecutive_all_blocked,
+                    "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
+                );
+                return RouteResult::Break(
+                    "I've been trying to use the same tools repeatedly. Let me answer with what I have so far."
+                        .to_string(),
+                );
+            }
+        }
         if let Some(text) = response_content.filter(|s| !s.trim().is_empty()) {
             return RouteResult::Break(text.to_string());
         }
         return RouteResult::Continue;
     }
 
+    // Reset the consecutive blocked counter when tool calls succeed.
+    ctx.flow.consecutive_all_blocked = 0;
     RouteResult::Execute(routed_tool_calls)
 }

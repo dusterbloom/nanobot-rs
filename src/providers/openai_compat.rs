@@ -783,6 +783,7 @@ impl LLMProvider for OpenAICompatProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
         apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
 

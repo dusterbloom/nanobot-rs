@@ -138,6 +138,11 @@ pub(crate) struct FlowControl {
     pub(crate) iterations_since_compaction: u32,
     pub(crate) forced_finalize_attempted: bool,
     pub(crate) content_was_streamed: bool,
+    /// Consecutive rounds where ALL tool calls were blocked by the guard.
+    /// When this reaches the threshold, the loop forces a text response.
+    pub(crate) consecutive_all_blocked: u32,
+    /// When the LLM call started — set in step_call_llm, read in step_process_response.
+    pub(crate) llm_call_start: Option<std::time::Instant>,
 }
 
 /// Shared handles for background compaction coordination.
@@ -454,6 +459,8 @@ impl AgentLoopShared {
                 iterations_since_compaction: 0,
                 forced_finalize_attempted: false,
                 content_was_streamed: false,
+                consecutive_all_blocked: 0,
+                llm_call_start: None,
             },
         }
     }
@@ -895,6 +902,7 @@ impl AgentLoopShared {
         };
         // Signal watchdog: LLM inference is active — skip health checks.
         counters.inference_active.store(true, Ordering::Relaxed);
+        ctx.flow.llm_call_start = Some(std::time::Instant::now());
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas as they arrive.
@@ -1192,7 +1200,7 @@ impl AgentLoopShared {
                 role: "main".into(),
                 model: ctx.core.model.clone(),
                 provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
-                elapsed_ms: 0, // timing is in provider layer
+                elapsed_ms: ctx.flow.llm_call_start.map_or(0, |t| t.elapsed().as_millis() as u64),
                 prompt_tokens: actual_prompt.max(0) as u64,
                 completion_tokens: actual_completion.max(0) as u64,
                 status: "ok".into(),
