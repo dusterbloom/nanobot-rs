@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Main agent loop that consumes inbound messages and produces responses.
 //!
 //! Ported from Python `agent/loop.py`.
@@ -93,6 +94,7 @@ pub struct SwappableCore {
     pub router_model: Option<String>,
     pub router_no_think: bool,
     pub router_temperature: f64,
+    #[allow(dead_code)]
     pub router_top_p: f64,
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub specialist_model: Option<String>,
@@ -246,11 +248,11 @@ fn extract_json_object(raw: &str) -> Option<String> {
     None
 }
 
-/// Parse FunctionGemma-style function-call output into a router decision.
+/// Lenient parser for non-standard router output (comma-separated, malformed JSON, etc.).
 ///
 /// Example accepted fragment:
 /// `call: tool,read_file,{"path":"README.md","confidence":0.9}`
-fn parse_functiongemma_router_decision(raw: &str) -> Option<role_policy::RouterDecision> {
+fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::RouterDecision> {
     fn normalize_action(raw_action: &str, target: &str, args: &Value) -> String {
         let a = raw_action.to_lowercase();
         let t = target.to_lowercase();
@@ -290,7 +292,7 @@ fn parse_functiongemma_router_decision(raw: &str) -> Option<role_policy::RouterD
     let end = tail.find("<end_function_call>").unwrap_or(tail.len());
     tail = tail[..end].trim().to_string();
 
-    // Canonical FunctionGemma shape: `tool,target,{"k":"v"}`
+    // Comma-separated shape (FunctionGemma, etc.): `tool,target,{"k":"v"}`
     if tail.contains(',') && !tail.contains("\"action\"") {
         let mut parts = tail.splitn(3, ',');
         let raw_action = parts.next()?.trim();
@@ -502,8 +504,8 @@ async fn request_strict_router_decision(
                 .and_then(|obj| role_policy::parse_router_decision_strict(&obj))
         })
         .or_else(|_| {
-            parse_functiongemma_router_decision(&raw)
-                .ok_or_else(|| "no JSON or FunctionGemma call format found".to_string())
+            parse_lenient_router_decision(&raw)
+                .ok_or_else(|| "no JSON or lenient call format found".to_string())
         })
         .map_err(|e| e.to_string());
     match parsed {
@@ -901,6 +903,7 @@ struct AgentLoopShared {
     core_handle: SharedCoreHandle,
     subagents: Arc<SubagentManager>,
     bus_outbound_tx: UnboundedSender<OutboundMessage>,
+    #[allow(dead_code)]
     bus_inbound_tx: UnboundedSender<InboundMessage>,
     cron_service: Option<Arc<CronService>>,
     email_config: Option<EmailConfig>,
@@ -2249,7 +2252,7 @@ impl AgentLoopShared {
                             }
                         }
                     } else {
-                        warn!("strict router enabled but router lane is not configured");
+                        debug!("strict router enabled but router lane is not configured");
                     }
                 }
 
@@ -3384,7 +3387,7 @@ impl AgentLoop {
                             };
                             let other_shared = self.shared.clone();
                             let other_outbound_tx = self.shared.bus_outbound_tx.clone();
-                            let other_display_tx = self.shared.repl_display_tx.clone();
+                            let _other_display_tx = self.shared.repl_display_tx.clone();
                             let other_sem = semaphore.clone();
                             tokio::spawn(async move {
                                 if let Ok(permit) = other_sem.acquire_owned().await {
