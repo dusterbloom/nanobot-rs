@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! REPL loop and interactive command dispatch for `nanobot agent`.
 //!
 //! Contains the main agent REPL, slash-command handlers, voice recording
@@ -7,31 +8,27 @@ mod commands;
 mod incremental;
 
 use std::io::{self, IsTerminal, Write as _};
-use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
+use crate::agent::agent_loop::SharedCoreHandle;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
 use crate::cli;
-use crate::config::loader::{get_data_dir, load_config, save_config};
+use crate::config::loader::{get_data_dir, load_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::heartbeat::service::{
     HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
 };
-use crate::providers::base::LLMProvider;
-use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::server;
 use crate::syntax;
 use crate::tui;
-use crate::utils::helpers::get_workspace_path;
 
 // ============================================================================
 // Streaming TTS type (feature-gated)
@@ -260,7 +257,7 @@ pub(crate) fn spawn_input_watcher(
     enter_interrupted: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     use termimad::crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use termimad::crossterm::terminal;
+    
 
     std::thread::spawn(move || {
         let owned = tui::enter_raw_mode();

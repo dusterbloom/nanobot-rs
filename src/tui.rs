@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! TUI-related functions: ANSI constants, status bars, banners, and voice helpers.
 
 use std::io::{self, BufWriter, Write};
