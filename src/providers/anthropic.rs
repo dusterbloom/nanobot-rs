@@ -429,12 +429,7 @@ impl LLMProvider for AnthropicProvider {
             Ok(r) => r,
             Err(e) => {
                 warn!("Anthropic API request failed: {}", e);
-                return Ok(LLMResponse {
-                    content: Some(format!("Error calling Anthropic API: {}", e)),
-                    tool_calls: Vec::new(),
-                    finish_reason: "error".to_string(),
-                    usage: HashMap::new(),
-                });
+                return Err(crate::errors::ProviderError::HttpError(e.to_string()).into());
             }
         };
 
@@ -443,15 +438,26 @@ impl LLMProvider for AnthropicProvider {
 
         if !status.is_success() {
             warn!("Anthropic API returned {} : {}", status, response_text);
-            return Ok(LLMResponse {
-                content: Some(format!(
-                    "Error calling Anthropic API (HTTP {}): {}",
-                    status, response_text
+            let status_code = status.as_u16();
+            return Err(match status_code {
+                429 => crate::errors::ProviderError::RateLimited {
+                    status: status_code,
+                    retry_after_ms: 1000,
+                },
+                401 | 403 => crate::errors::ProviderError::AuthError {
+                    status: status_code,
+                    message: response_text,
+                },
+                500..=599 => crate::errors::ProviderError::ServerError {
+                    status: status_code,
+                    message: response_text,
+                },
+                _ => crate::errors::ProviderError::HttpError(format!(
+                    "HTTP {}: {}",
+                    status_code, response_text
                 )),
-                tool_calls: Vec::new(),
-                finish_reason: "error".to_string(),
-                usage: HashMap::new(),
-            });
+            }
+            .into());
         }
 
         let data: Value = serde_json::from_str(&response_text)
@@ -549,17 +555,26 @@ impl LLMProvider for AnthropicProvider {
                 "Anthropic streaming API returned {}: {}",
                 status, error_text
             );
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let _ = tx.send(StreamChunk::Done(LLMResponse {
-                content: Some(format!(
-                    "Error calling Anthropic API (HTTP {}): {}",
-                    status, error_text
+            let status_code = status.as_u16();
+            return Err(match status_code {
+                429 => crate::errors::ProviderError::RateLimited {
+                    status: status_code,
+                    retry_after_ms: 1000,
+                },
+                401 | 403 => crate::errors::ProviderError::AuthError {
+                    status: status_code,
+                    message: error_text,
+                },
+                500..=599 => crate::errors::ProviderError::ServerError {
+                    status: status_code,
+                    message: error_text,
+                },
+                _ => crate::errors::ProviderError::HttpError(format!(
+                    "HTTP {}: {}",
+                    status_code, error_text
                 )),
-                tool_calls: Vec::new(),
-                finish_reason: "error".to_string(),
-                usage: HashMap::new(),
-            }));
-            return Ok(StreamHandle { rx });
+            }
+            .into());
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

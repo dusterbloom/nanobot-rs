@@ -127,6 +127,22 @@ struct ThinkSplitState {
     carry: String,
 }
 
+/// Try to extract a retry-after duration from an error response body.
+fn parse_retry_after_ms(response_text: &str) -> u64 {
+    // Try JSON: {"error": {"retry_after": 1.5}} or {"retry_after": 2}
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(response_text) {
+        if let Some(secs) = v
+            .pointer("/error/retry_after")
+            .or_else(|| v.get("retry_after"))
+            .and_then(|v| v.as_f64())
+        {
+            return (secs * 1000.0) as u64;
+        }
+    }
+    // Default: 1 second
+    1000
+}
+
 pub(crate) fn is_local_api_base(api_base: &str) -> bool {
     let lower = api_base.to_ascii_lowercase();
     lower.contains("localhost")
@@ -582,12 +598,7 @@ impl LLMProvider for OpenAICompatProvider {
                             .await;
                         continue;
                     }
-                    return Ok(LLMResponse {
-                        content: Some(err_msg),
-                        tool_calls: Vec::new(),
-                        finish_reason: "error".to_string(),
-                        usage: HashMap::new(),
-                    });
+                    return Err(crate::errors::ProviderError::HttpError(err_msg).into());
                 }
             };
 
@@ -595,12 +606,9 @@ impl LLMProvider for OpenAICompatProvider {
             let response_text = match response.text().await {
                 Ok(t) => t,
                 Err(e) => {
-                    return Ok(LLMResponse {
-                        content: Some(format!("Error reading LLM response: {}", e)),
-                        tool_calls: Vec::new(),
-                        finish_reason: "error".to_string(),
-                        usage: HashMap::new(),
-                    });
+                    return Err(
+                        crate::errors::ProviderError::ResponseReadError(e.to_string()).into(),
+                    );
                 }
             };
 
@@ -621,26 +629,38 @@ impl LLMProvider for OpenAICompatProvider {
                     "LLM API returned status {} (base={}): {}",
                     status, self.api_base, response_text
                 );
-                return Ok(LLMResponse {
-                    content: Some(format!(
-                        "Error calling LLM (HTTP {}): {}",
-                        status, response_text
+                let status_code = status.as_u16();
+                return Err(match status_code {
+                    429 => {
+                        // Try to extract retry-after from the response text.
+                        let retry_ms = parse_retry_after_ms(&response_text);
+                        crate::errors::ProviderError::RateLimited {
+                            status: status_code,
+                            retry_after_ms: retry_ms,
+                        }
+                    }
+                    401 | 403 => crate::errors::ProviderError::AuthError {
+                        status: status_code,
+                        message: response_text,
+                    },
+                    500..=599 => crate::errors::ProviderError::ServerError {
+                        status: status_code,
+                        message: response_text,
+                    },
+                    _ => crate::errors::ProviderError::HttpError(format!(
+                        "HTTP {}: {}",
+                        status_code, response_text
                     )),
-                    tool_calls: Vec::new(),
-                    finish_reason: "error".to_string(),
-                    usage: HashMap::new(),
-                });
+                }
+                .into());
             }
 
             let data: serde_json::Value = match serde_json::from_str(&response_text) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Ok(LLMResponse {
-                        content: Some(format!("Error parsing LLM response JSON: {}", e)),
-                        tool_calls: Vec::new(),
-                        finish_reason: "error".to_string(),
-                        usage: HashMap::new(),
-                    });
+                    return Err(
+                        crate::errors::ProviderError::JsonParseError(e.to_string()).into(),
+                    );
                 }
             };
 
@@ -648,12 +668,7 @@ impl LLMProvider for OpenAICompatProvider {
         }
 
         // Should never reach here, but just in case:
-        Ok(LLMResponse {
-            content: Some("Error: JIT retry loop exhausted".to_string()),
-            tool_calls: Vec::new(),
-            finish_reason: "error".to_string(),
-            usage: HashMap::new(),
-        })
+        Err(crate::errors::ProviderError::HttpError("JIT retry loop exhausted".into()).into())
     }
 
     async fn chat_stream(
@@ -768,17 +783,26 @@ impl LLMProvider for OpenAICompatProvider {
             );
             // Drop permit explicitly on error (it would drop anyway, but be clear).
             drop(jit_permit);
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let _ = tx.send(StreamChunk::Done(LLMResponse {
-                content: Some(format!(
-                    "Error calling LLM (HTTP {}): {}",
-                    status, error_text
+            let status_code = status.as_u16();
+            return Err(match status_code {
+                429 => crate::errors::ProviderError::RateLimited {
+                    status: status_code,
+                    retry_after_ms: parse_retry_after_ms(&error_text),
+                },
+                401 | 403 => crate::errors::ProviderError::AuthError {
+                    status: status_code,
+                    message: error_text,
+                },
+                500..=599 => crate::errors::ProviderError::ServerError {
+                    status: status_code,
+                    message: error_text,
+                },
+                _ => crate::errors::ProviderError::HttpError(format!(
+                    "HTTP {}: {}",
+                    status_code, error_text
                 )),
-                tool_calls: Vec::new(),
-                finish_reason: "error".to_string(),
-                usage: HashMap::new(),
-            }));
-            return Ok(StreamHandle { rx });
+            }
+            .into());
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -857,12 +881,10 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or_default();
 
     if choices.is_empty() {
-        return Ok(LLMResponse {
-            content: Some("Error: No choices in LLM response".to_string()),
-            tool_calls: Vec::new(),
-            finish_reason: "error".to_string(),
-            usage: HashMap::new(),
-        });
+        return Err(
+            crate::errors::ProviderError::JsonParseError("No choices in LLM response".into())
+                .into(),
+        );
     }
 
     let choice = &choices[0];
@@ -1371,13 +1393,10 @@ mod tests {
             "choices": []
         });
 
-        let resp = parse_response(&data).expect("parse should succeed");
-        assert_eq!(
-            resp.content.as_deref(),
-            Some("Error: No choices in LLM response")
-        );
-        assert_eq!(resp.finish_reason, "error");
-        assert!(resp.tool_calls.is_empty());
+        let err = parse_response(&data).unwrap_err();
+        let provider_err = err.downcast_ref::<crate::errors::ProviderError>();
+        assert!(provider_err.is_some(), "Should be a ProviderError");
+        assert!(err.to_string().contains("No choices"));
     }
 
     #[test]
@@ -1387,12 +1406,8 @@ mod tests {
             "error": "something went wrong"
         });
 
-        let resp = parse_response(&data).expect("parse should succeed");
-        assert_eq!(
-            resp.content.as_deref(),
-            Some("Error: No choices in LLM response")
-        );
-        assert_eq!(resp.finish_reason, "error");
+        let err = parse_response(&data).unwrap_err();
+        assert!(err.to_string().contains("No choices"));
     }
 
     #[test]

@@ -287,15 +287,6 @@ async fn analyze_via_scratch_pad(
             }
         };
 
-        // Error response from provider — stop analyzing.
-        if response.is_error() {
-            warn!(
-                "Scratch pad analysis got error response (round {}) — falling back",
-                round
-            );
-            break;
-        }
-
         // Track cost from this LLM call.
         if let Some(ref p) = prices {
             let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
@@ -343,6 +334,16 @@ async fn analyze_via_scratch_pad(
                 let call_key = normalize_call_key(&tc.name, &tc.arguments);
                 if seen_calls.contains(&call_key) {
                     debug!("Scratch pad: duplicate call {} — skipping", call_key);
+                    // Tell the model this call was already executed so it stops
+                    // regenerating identical requests (saves tokens on local models).
+                    let dedup_msg = format!(
+                        "DUPLICATE: This exact {} call was already executed. Use the existing result from memory.",
+                        tc.name
+                    );
+                    context_store.mem_store(
+                        &format!("dedup_{}", tc.name),
+                        dedup_msg,
+                    );
                     continue;
                 }
                 seen_calls.insert(call_key);

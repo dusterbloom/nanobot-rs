@@ -15,19 +15,12 @@ use serde_json::Value;
 // ValidationError
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
+    #[error("HallucinatedToolCall")]
     HallucinatedToolCall,
+    #[error("ClaimedButNotExecuted")]
     ClaimedButNotExecuted,
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValidationError::HallucinatedToolCall => write!(f, "HallucinatedToolCall"),
-            ValidationError::ClaimedButNotExecuted => write!(f, "ClaimedButNotExecuted"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ mod channels;
 mod cli;
 mod config;
 mod cron;
+mod errors;
 mod heartbeat;
 mod lms;
 mod providers;
@@ -303,7 +304,7 @@ fn main() {
     // and other spammy crates don't flood the log file.
     let noisy_crate_filters = ",html5ever=error,ort=off,pocket_tts=off,hyper=warn,reqwest=warn,rustyline=warn";
     let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(filter) => {
+        Ok(_) => {
             // RUST_LOG is set — append our mandatory suppressions
             let combined = format!("{}{}", std::env::var("RUST_LOG").unwrap_or_default(), noisy_crate_filters);
             tracing_subscriber::EnvFilter::new(combined)

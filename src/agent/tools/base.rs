@@ -8,11 +8,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::audit::ToolEvent;
 
 /// Structured outcome for a tool invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
     pub ok: bool,
     pub data: String,
     pub error: Option<String>,
+    /// Structured error classification when available.
+    pub error_kind: Option<crate::errors::ToolErrorKind>,
 }
 
 impl ToolExecutionResult {
@@ -21,14 +23,17 @@ impl ToolExecutionResult {
             ok: true,
             data,
             error: None,
+            error_kind: None,
         }
     }
 
     pub fn failure(message: String) -> Self {
+        let error_kind = crate::errors::classify_tool_error(&message);
         Self {
             ok: false,
             data: format!("Error: {}", message),
             error: Some(message),
+            error_kind,
         }
     }
 }
@@ -75,10 +80,12 @@ pub trait Tool: Send + Sync {
     ) -> ToolExecutionResult {
         let out = self.execute(params).await;
         if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            let error_kind = crate::errors::classify_tool_error(&err);
             ToolExecutionResult {
                 ok: false,
                 data: out,
                 error: Some(err),
+                error_kind,
             }
         } else {
             ToolExecutionResult::success(out)
@@ -111,10 +118,12 @@ pub trait Tool: Send + Sync {
     ) -> ToolExecutionResult {
         let out = self.execute_with_context(params, ctx).await;
         if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            let error_kind = crate::errors::classify_tool_error(&err);
             ToolExecutionResult {
                 ok: false,
                 data: out,
                 error: Some(err),
+                error_kind,
             }
         } else {
             ToolExecutionResult::success(out)
