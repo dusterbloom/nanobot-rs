@@ -1,0 +1,4 @@
+interface:
+  display_name: "SLM Agentic Reliability"
+  short_description: "Failure-first local SLM reliability on constrained hardware"
+  default_prompt: "Use $slm-agentic-reliability to audit today's local-model failures, classify root causes, and produce a hardening plan for RTX 3090 or Apple M4 32GB."
