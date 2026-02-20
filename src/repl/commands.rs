@@ -1114,11 +1114,16 @@ impl ReplContext {
         // Toggle by rebuilding core with modified config.
         let mut toggled_config = self.config.clone();
         toggled_config.provenance.enabled = !was_enabled;
+        let model_name = if !self.config.agents.defaults.lms_main_model.is_empty() {
+            Some(self.config.agents.defaults.lms_main_model.as_str())
+        } else {
+            self.current_model_path.file_name().and_then(|n| n.to_str())
+        };
         cli::rebuild_core(
             &self.core_handle,
             &toggled_config,
             &self.srv.local_port,
-            self.current_model_path.file_name().and_then(|n| n.to_str()),
+            model_name,
             None,
             None,
             None,
@@ -1294,6 +1299,11 @@ impl ReplContext {
 
     /// /model — select local model from ~/models/.
     async fn cmd_model(&mut self) {
+        if !self.core_handle.swappable().is_local {
+            println!("\n  /model is only available in local mode. Use /local to switch.\n");
+            return;
+        }
+
         // LMS-managed: list from LM Studio's downloaded models via HTTP API
         if self.srv.lms_managed {
             let lms_port = self.config.agents.defaults.lms_port;
@@ -1348,6 +1358,17 @@ impl ReplContext {
 
             let selected = llm_models[idx].clone();
             println!("\nSelected: {}", selected);
+
+            // Unload the previous main model to free VRAM
+            let prev_model = &self.config.agents.defaults.lms_main_model;
+            if !prev_model.is_empty() && prev_model != &selected {
+                print!("  Unloading {}... ", prev_model);
+                io::stdout().flush().ok();
+                match crate::lms::unload_model(lms_port, prev_model).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
+                }
+            }
 
             // Load the model in LMS with context length
             let ctx = Some(self.config.agents.defaults.local_max_context_tokens);

@@ -763,11 +763,18 @@ pub(crate) fn apply_server_change(
     config: &Config,
     is_local: bool,
 ) {
+    // Prefer lms_main_model which preserves namespace prefixes like "qwen/qwen3-vl-8b".
+    // PathBuf::file_name() strips parent components, breaking namespaced model identifiers.
+    let model_name = if !config.agents.defaults.lms_main_model.is_empty() {
+        Some(config.agents.defaults.lms_main_model.as_str())
+    } else {
+        model_path.file_name().and_then(|n| n.to_str())
+    };
     cli::rebuild_core(
         core_handle,
         config,
         &state.local_port,
-        model_path.file_name().and_then(|n| n.to_str()),
+        model_name,
         None,
         None,
         None,
