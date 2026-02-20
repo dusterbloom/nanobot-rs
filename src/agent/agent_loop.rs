@@ -713,29 +713,71 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     context.agent_profiles = agent_profiles::profiles_summary(&profiles);
     let sessions = SessionManager::new(&workspace);
 
-    // When local, use dedicated compaction provider if available, else main provider.
-    let memory_model = if memory_config.model.is_empty() {
-        model.clone()
-    } else {
-        memory_config.model.clone()
-    };
-    let memory_provider: Arc<dyn LLMProvider> = if is_local {
-        if let Some(cp) = compaction_provider {
+    // Resolve memory provider + model.
+    //
+    // Priority:
+    //   1. Explicit `memory.model` / `memory.provider` from config.json
+    //   2. Cloud default: "haiku" (cheap, fast summarisation)
+    //   3. Local default: specialist provider from trio (if available),
+    //      then dedicated compaction provider, then main provider.
+    let (memory_provider, memory_model): (Arc<dyn LLMProvider>, String) = if is_local {
+        // --- Local mode ---
+        let mem_model = if !memory_config.model.is_empty() {
+            memory_config.model.clone()
+        } else if let Some(ref sp) = specialist_provider {
+            // Trio specialist is ideal for summarisation tasks.
+            sp.get_default_model().to_string()
+        } else {
+            model.clone()
+        };
+        let mem_provider: Arc<dyn LLMProvider> = if let Some(ref mem_provider_cfg) =
+            memory_config.provider
+        {
+            Arc::new(OpenAICompatProvider::new(
+                &mem_provider_cfg.api_key,
+                mem_provider_cfg
+                    .api_base
+                    .as_deref()
+                    .or(Some("http://localhost:8080/v1")),
+                None,
+            ))
+        } else if let Some(ref sp) = specialist_provider {
+            // Reuse trio specialist provider when no explicit memory provider.
+            sp.clone()
+        } else if let Some(cp) = compaction_provider {
             cp
         } else {
             provider.clone()
-        }
-    } else if let Some(ref mem_provider_cfg) = memory_config.provider {
-        Arc::new(OpenAICompatProvider::new(
-            &mem_provider_cfg.api_key,
-            mem_provider_cfg
-                .api_base
-                .as_deref()
-                .or(Some("http://localhost:8080/v1")),
-            None,
-        ))
+        };
+        (mem_provider, mem_model)
     } else {
-        provider.clone()
+        // --- Cloud mode ---
+        let mem_model = if !memory_config.model.is_empty() {
+            memory_config.model.clone()
+        } else if provider.get_api_base().is_none()
+            || provider
+                .get_api_base()
+                .map_or(false, |b| b.contains("openrouter"))
+        {
+            // Anthropic native or OpenRouter — use haiku for cheap memory ops.
+            "haiku".to_string()
+        } else {
+            model.clone()
+        };
+        let mem_provider: Arc<dyn LLMProvider> =
+            if let Some(ref mem_provider_cfg) = memory_config.provider {
+                Arc::new(OpenAICompatProvider::new(
+                    &mem_provider_cfg.api_key,
+                    mem_provider_cfg
+                        .api_base
+                        .as_deref()
+                        .or(Some("http://localhost:8080/v1")),
+                    None,
+                ))
+            } else {
+                provider.clone()
+            };
+        (mem_provider, mem_model)
     };
 
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);

@@ -647,8 +647,9 @@ pub struct MemoryConfig {
     pub enabled: bool,
 
     /// Model to use for memory operations (observation + reflection).
-    /// If empty, falls back to the main agent model.
-    /// Recommended: a small, fast model like "google/gemini-2.5-flash".
+    /// If empty: Anthropic/OpenRouter defaults to "haiku", other cloud providers
+    /// fall back to the main model, local defaults to trio specialist if available.
+    /// Override with any model name, e.g. "gemini/gemini-2.5-flash".
     #[serde(default)]
     pub model: String,
 

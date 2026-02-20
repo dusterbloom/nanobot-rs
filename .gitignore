@@ -5,3 +5,5 @@ bridge/whatsapp/node_modules/
 *.swo
 *~
 .DS_Store
+.claude/
+.sisyphus/
