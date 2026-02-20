@@ -17,6 +17,7 @@ pub mod knowledge_store;
 pub mod learning;
 pub mod lora_bridge;
 pub mod memory;
+pub mod metrics;
 pub mod model_prices;
 pub mod observer;
 pub mod pipeline;

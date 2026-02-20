@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::TurnContext;
@@ -157,6 +157,7 @@ pub(crate) async fn request_strict_router_decision(
     no_think: bool,
     temperature: f64,
 ) -> Result<role_policy::RouterDecision, String> {
+    info!(role = "router", model = %model, "router_decision_start");
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
         let action = {
             let pat = "action=";
@@ -312,6 +313,12 @@ pub(crate) async fn request_strict_router_decision(
                     decision = from_pack;
                 }
             }
+            debug!(
+                action = %decision.action,
+                target = %decision.target,
+                confidence = decision.confidence,
+                "router_decision_parsed"
+            );
             Ok(decision)
         }
         Err(e) => {
@@ -340,6 +347,7 @@ pub(crate) async fn dispatch_specialist(
     context_summary: &str,
     tool_list: &[String],
 ) -> Result<String, String> {
+    info!(role = "specialist", target = %target, "dispatch_specialist_start");
     let (specialist_provider, specialist_model) = match (
         core.specialist_provider.as_ref(),
         core.specialist_model.as_deref(),
@@ -507,11 +515,12 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
         }
     };
 
-    debug!(
-        "Router decision: action={}, target={}, args={}",
-        decision.action,
-        decision.target,
-        serde_json::to_string(&decision.args).unwrap_or_default()
+    info!(
+        role = "router",
+        model = %router_model,
+        action = %decision.action,
+        target = %decision.target,
+        "router_decision"
     );
 
     match decision.action.as_str() {

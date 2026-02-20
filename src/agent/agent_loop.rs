@@ -85,6 +85,7 @@ pub(crate) struct AgentLoopShared {
 pub(crate) struct TurnContext {
     // --- Config (set during prepare, immutable after) ---
     pub(crate) core: Arc<SwappableCore>,
+    pub(crate) request_id: String,
     pub(crate) session_key: String,
     pub(crate) session_policy: policy::SessionPolicy,
     pub(crate) strict_local_only: bool,
@@ -205,6 +206,17 @@ impl AgentLoopShared {
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Option<OutboundMessage> {
+        let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let core = self.core_handle.swappable();
+        info!(
+            request_id = %request_id,
+            role = "main",
+            model = %core.model,
+            channel = %msg.channel,
+            "request_start"
+        );
+        drop(core);
+
         let mut ctx = self.prepare_context(msg, text_delta_tx, tool_event_tx, cancellation_token, priority_rx).await;
         self.run_agent_loop(&mut ctx).await;
         self.finalize_response(ctx).await
@@ -397,8 +409,18 @@ impl AgentLoopShared {
 
         let tool_guard = ToolGuard::new(core.tool_delegation_config.max_same_tool_call_per_turn);
 
+        let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        info!(
+            request_id = %request_id,
+            model = %core.model,
+            session = %session_key,
+            turn = turn_count,
+            "request_started"
+        );
+
         TurnContext {
             core,
+            request_id,
             session_key,
             session_policy,
             strict_local_only,
@@ -762,8 +784,10 @@ impl AgentLoopShared {
         let max_ctx = ctx.core.token_budget.max_context();
         if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
             warn!(
-                "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
-                estimated, max_ctx
+                estimated_tokens = estimated,
+                max_context = max_ctx,
+                model = %ctx.core.model,
+                "context_overflow_emergency_trim"
             );
             // tool_def_tokens=0 is conservative (trims more aggressively).
             ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
@@ -889,7 +913,7 @@ impl AgentLoopShared {
                 Ok(s) => s,
                 Err(e) => {
                     counters.inference_active.store(false, Ordering::Relaxed);
-                    error!("LLM streaming call failed: {}", e);
+                    error!(model = %ctx.core.model, error = %e, "llm_stream_call_failed");
                     return StepResult::Done(IterationOutcome::Error(
                         format!("I encountered an error: {}", e),
                     ));
@@ -983,7 +1007,7 @@ impl AgentLoopShared {
                 Ok(r) => r,
                 Err(e) => {
                     counters.inference_active.store(false, Ordering::Relaxed);
-                    error!("LLM call failed: {}", e);
+                    error!(model = %ctx.core.model, error = %e, "llm_call_failed");
                     return StepResult::Done(IterationOutcome::Error(
                         format!("I encountered an error: {}", e),
                     ));
@@ -1028,7 +1052,11 @@ impl AgentLoopShared {
             .collect();
 
         if let Err(validation_err) = validation::validate_response(content_str, &tool_calls_as_maps) {
-            warn!("Response validation failed: {:?}", validation_err);
+            warn!(
+                model = %ctx.core.model,
+                validation = %format!("{:?}", validation_err),
+                "response_validation_failed"
+            );
             if !response.has_tool_calls() {
                 let hint = validation::generate_retry_prompt(&validation_err, 1);
                 ctx.messages.push(json!({
@@ -1108,7 +1136,7 @@ impl AgentLoopShared {
 
         // Check for LLM provider errors before processing the response.
         if let Some(err_msg) = response.error_detail() {
-            error!("LLM provider error: {}", err_msg);
+            error!(model = %ctx.core.model, error = %err_msg, "llm_provider_error");
 
             // In local mode, check if the server is still alive.
             if ctx.core.is_local {
@@ -1156,6 +1184,25 @@ impl AgentLoopShared {
             counters
                 .last_estimated_prompt_tokens
                 .store(estimated_prompt as u64, Ordering::Relaxed);
+
+            // Emit per-call metrics to ~/.nanobot/metrics.jsonl.
+            crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
+                timestamp: chrono::Local::now().to_rfc3339(),
+                request_id: ctx.request_id.clone(),
+                role: "main".into(),
+                model: ctx.core.model.clone(),
+                provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
+                elapsed_ms: 0, // timing is in provider layer
+                prompt_tokens: actual_prompt.max(0) as u64,
+                completion_tokens: actual_completion.max(0) as u64,
+                status: "ok".into(),
+                error_detail: None,
+                anti_drift_score: None,
+                anti_drift_signals: None,
+                tool_calls_requested: response.tool_calls.len() as u32,
+                tool_calls_executed: 0, // updated after execution
+                validation_result: None,
+            });
         }
 
         // Branch: tool calls → Executing, no tool calls → finished.
@@ -1165,6 +1212,10 @@ impl AgentLoopShared {
         } else {
             let mut content = response.content.unwrap_or_default();
             if content.trim().is_empty() {
+                warn!(
+                    finish_reason = %response.finish_reason,
+                    "empty_llm_response: SLM returned no content and no tool calls, injecting fallback"
+                );
                 content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
                     .to_string();
             }
@@ -1387,8 +1438,9 @@ impl AgentLoopShared {
                 crate::agent::provenance::detect_phantom_claims(&ctx.final_content, &tools_list)
             {
                 warn!(
-                    "Phantom tool claims detected ({} patterns): {:?}",
-                    detection.matched_patterns.len(),
+                    model = %ctx.core.model,
+                    patterns = detection.matched_patterns.len(),
+                    "phantom_tool_claims_detected: {:?}",
                     detection.matched_patterns
                 );
 

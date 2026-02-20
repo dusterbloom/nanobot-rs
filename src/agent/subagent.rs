@@ -298,6 +298,13 @@ impl SubagentManager {
         }
 
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
+        info!(
+            role = "subagent",
+            task_id = %task_id,
+            depth = self.depth,
+            agent = ?agent_name,
+            "subagent_spawn"
+        );
 
         // Resolve agent profile if specified.
         let profile = agent_name.as_ref().and_then(|name| {
@@ -368,20 +375,24 @@ impl SubagentManager {
         let routed_to_cloud = resolved_model != config.model;
         if routed_to_cloud {
             info!(
-                "Spawning subagent {} (agent={:?}, model={} → provider-routed as {}) for: {}",
-                task_id,
-                agent_name.as_deref().unwrap_or("default"),
-                effective_model_for_display,
-                resolved_model,
+                role = "subagent",
+                task_id = %task_id,
+                agent = agent_name.as_deref().unwrap_or("default"),
+                model = %effective_model_for_display,
+                resolved_model = %resolved_model,
+                depth = self.depth,
+                "subagent_spawn_routed: {}",
                 display_label
             );
             config.model = resolved_model;
         } else {
             info!(
-                "Spawning subagent {} (agent={:?}, model={}) for: {}",
-                task_id,
-                agent_name.as_deref().unwrap_or("default"),
-                effective_model_for_display,
+                role = "subagent",
+                task_id = %task_id,
+                agent = agent_name.as_deref().unwrap_or("default"),
+                model = %effective_model_for_display,
+                depth = self.depth,
+                "subagent_spawn: {}",
                 display_label
             );
         }

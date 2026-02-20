@@ -31,7 +31,8 @@ futures-util = "0.3"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::context::ContextBuilder;
 use crate::agent::context_store::{self, ContextStore};
@@ -536,6 +536,12 @@ pub async fn run_tool_loop(
     tools: &ToolRegistry,
     system_context: &str,
 ) -> ToolRunResult {
+    info!(
+        role = "delegation",
+        model = %config.model,
+        tools = initial_tool_calls.len(),
+        "tool_delegation_start"
+    );
     let mut all_results: Vec<(String, String, String)> = Vec::new();
     let mut iterations_used: u32 = 0;
     let mut id_counter: usize = 0;
