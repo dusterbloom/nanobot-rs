@@ -1,0 +1,31 @@
+{
+  "agents": {
+    "main": {
+      "name": "Gemma-Main",
+      "description": "Main chat/reasoning agent using Google Gemma 3n E4B - fast and efficient",
+      "model": "gemma-3n-e4b-it-Q4_K_M.gguf",
+      "port": 8080,
+      "context_length": 8192,
+      "temperature": 0.7,
+      "gpu_layers": 99
+    },
+    "fast": {
+      "name": "Orchestrator-Router",
+      "description": "Routing and orchestration using NVIDIA Orchestrator 8B - 10/10 routing accuracy",
+      "model": "nvidia_orchestrator-8b-Q4_K_M.gguf",
+      "port": 8081,
+      "context_length": 4096,
+      "temperature": 0.2,
+      "gpu_layers": 99
+    },
+    "specialist": {
+      "name": "Ministral-Specialist",
+      "description": "Tool-calling specialist using Ministral 3 8B - strong instruction following",
+      "model": "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
+      "port": 8082,
+      "context_length": 8192,
+      "temperature": 0.3,
+      "gpu_layers": 99
+    }
+  }
+}

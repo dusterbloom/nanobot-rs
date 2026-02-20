@@ -408,6 +408,7 @@ impl Tool for ExecTool {
                 .arg("-c")
                 .arg(command)
                 .current_dir(&cwd)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()

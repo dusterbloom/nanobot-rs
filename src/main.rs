@@ -298,9 +298,20 @@ fn main() {
     let is_interactive_repl = matches!(&cli.command, Commands::Agent { message: None, .. })
         && std::io::stdout().is_terminal();
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("warn,ort=off,pocket_tts=off,html5ever=error")
-    });
+    // Always suppress noisy crates regardless of RUST_LOG setting.
+    // When RUST_LOG is set (e.g. "debug"), append mandatory filters so html5ever
+    // and other spammy crates don't flood the log file.
+    let noisy_crate_filters = ",html5ever=error,ort=off,pocket_tts=off,hyper=warn,reqwest=warn,rustyline=warn";
+    let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => {
+            // RUST_LOG is set — append our mandatory suppressions
+            let combined = format!("{}{}", std::env::var("RUST_LOG").unwrap_or_default(), noisy_crate_filters);
+            tracing_subscriber::EnvFilter::new(combined)
+        }
+        Err(_) => {
+            tracing_subscriber::EnvFilter::new(format!("warn{}", noisy_crate_filters))
+        }
+    };
 
     if is_interactive_repl {
         // Redirect tracing to a log file to prevent WARN logs from interleaving

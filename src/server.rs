@@ -15,7 +15,7 @@ use tracing::debug;
 // Constants
 // ============================================================================
 
-pub(crate) const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
+pub(crate) const DEFAULT_LOCAL_MODEL: &str = "gemma-3n-e4b-it-Q4_K_M.gguf";
 
 // ============================================================================
 // GGUF Metadata

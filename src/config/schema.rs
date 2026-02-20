@@ -211,7 +211,7 @@ pub struct AgentDefaults {
     /// Max characters for inline tool results before truncation (default: 30000).
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
-    /// LM Studio model identifier for the main model (e.g. "nanbeige4.1-3b").
+    /// LM Studio model identifier for the main model (e.g. "gemma-3n-e4b-it").
     /// When empty, derived from local_model via strip_gguf_suffix.
     #[serde(default)]
     pub lms_main_model: String,
@@ -557,17 +557,17 @@ pub struct ModelEndpoint {
 }
 
 /// Configuration for the SLM trio (router + specialist helpers).
-/// Uses Nemotron-Orchestrator-8B as router with /no_think mode for direct JSON output.
+/// Default trio: gemma-3n-e4b-it (main) + nvidia_orchestrator-8b (router) + ministral-3-8b (specialist).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrioConfig {
     /// Enable the trio workflow (defaults to false).
     #[serde(default)]
     pub enabled: bool,
-    /// Use /no_think mode for main model (Nemotron-Nano) to output directly to content.
+    /// Use /no_think mode for main model (gemma-3n) to output directly to content.
     #[serde(default = "default_trio_main_no_think")]
     pub main_no_think: bool,
-    /// Local GGUF filename for the router (Nemotron-Orchestrator-8B). Stored in ~/models/.
+    /// Local GGUF filename for the router (nvidia_orchestrator-8b). Stored in ~/models/.
     #[serde(default)]
     pub router_model: String,
     /// TCP port for the router server (default: 8094).

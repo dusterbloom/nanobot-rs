@@ -1,6 +1,6 @@
 # nanobot Architecture Map
 
-> Complete reference for LLM onboarding. Last updated: 2026-02-20
+> Complete reference for LLM onboarding. Last verified: 2026-02-20
 
 ## System Overview
 
@@ -61,17 +61,22 @@ AgentHandle (cloneable)
 └── counters: Arc<RuntimeCounters>          -- Persists across swaps
 ```
 
-**SwappableCore** contains:
+**SwappableCore** contains (39 fields total, key ones shown):
 - `provider: Arc<dyn LLMProvider>` - Main LLM
 - `memory_provider: Arc<dyn LLMProvider>` - For compaction/reflection
 - `router_provider: Option<Arc<dyn LLMProvider>>` - For trio routing
 - `specialist_provider: Option<Arc<dyn LLMProvider>>` - For trio execution
+- `tool_runner_provider: Option<Arc<dyn LLMProvider>>` - For delegated tool execution
 - `context: ContextBuilder` - System prompt assembly
 - `sessions: SessionManager` - Conversation persistence
 - `token_budget: TokenBudget` - Context window management
 - `compactor: ContextCompactor` - Background context compression
 - `learning: LearningStore` - Experience database
 - `working_memory: WorkingMemoryStore` - Per-session state
+- Plus: `workspace`, `model`, `max_iterations`, `max_tokens`, `temperature`, `is_local`, `brave_api_key`, `exec_timeout`, `restrict_to_workspace`, `memory_enabled`, delegation/provenance configs, and per-provider model overrides
+
+**RuntimeCounters** (survives core swaps, 15 atomic fields):
+- `delegation_healthy`, `thinking_budget`, `long_mode_turns`, `inference_active`, etc.
 
 **Processing Phases:**
 
@@ -98,24 +103,28 @@ AgentHandle (cloneable)
 ```
 LLMProvider (trait)
 ├── chat()         - Single completion
-├── chat_stream()  - Streaming completion
+├── chat_stream()  - Streaming completion (default: buffered fallback to chat())
 ├── get_default_model()
-└── get_api_base() - For health checks
+└── get_api_base() - For health checks (default: None)
 
 OpenAICompatProvider (main implementation)
 ├── api_key, api_base, default_model
 ├── jit_gate: Option<Arc<JitGate>>  - Serializes requests to LM Studio
 └── supports_cache_control()        - Anthropic prompt caching
+
+AnthropicProvider (native Anthropic Messages API)
+├── Used exclusively for OAuth/Claude Max flows
+└── Speaks native Anthropic API, not OpenAI-compat
 ```
 
 **Provider Selection Priority:**
 ```
-OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM
+OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > ZhipuCoding > Groq > vLLM
 ```
 
 **Multi-Provider Routing:**
 - Model names with prefixes (`groq/llama-3.3-70b`) resolve to specific providers
-- `PROVIDER_PREFIXES` constant maps prefixes to API bases
+- `PROVIDER_PREFIXES` constant maps 9 prefixes to API bases: `groq/`, `gemini/`, `openai/`, `anthropic/`, `deepseek/`, `huggingface/`, `zhipu-coding/`, `zhipu/`, `openrouter/`
 - Subagents can use different providers than main agent
 
 ### 4. Tool System (`src/agent/tools/`)
@@ -127,8 +136,9 @@ trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> serde_json::Value;
     fn execute(&self, params: HashMap<String, Value>) -> String;
-    fn execute_with_result(&self, params) -> ToolExecutionResult;
-    fn execute_with_context(&self, params, ctx) -> String;
+    fn execute_with_result(&self, params) -> ToolExecutionResult;          // default impl
+    fn execute_with_context(&self, params, ctx) -> String;                 // default impl
+    fn execute_with_result_and_context(&self, params, ctx) -> ToolExecutionResult; // default impl
 }
 ```
 
@@ -146,6 +156,8 @@ trait Tool: Send + Sync {
 - `message` - Channel messaging
 - `recall` - Memory search
 - `read_skill` - Lazy skill loading
+- `cron` - Scheduled job management
+- `check_inbox`, `send_email` - Email tools
 
 ### 5. Context Builder (`src/agent/context.rs`)
 
@@ -155,22 +167,27 @@ trait Tool: Send + Sync {
 # nanobot (identity)
 ## Context (time, workspace, model)
 ## Verification Protocol (if provenance enabled)
-## AGENTS.md / SOUL.md / USER.md (bootstrap files)
-## Session Context (CONTEXT-{channel}.md)
+## AGENTS.md / SOUL.md / USER.md / TOOLS.md / IDENTITY.md (bootstrap files)
+## Session Context (CONTEXT-{channel}.md, fallback to CONTEXT.md)
 # Memory
-## Long-term Memory (MEMORY.md, tail-truncated)
+## Long-term Memory (MEMORY.md only, tail-truncated)
+## (daily notes and learnings are NOT in the system prompt)
 # Skills (XML summary, lazy loading)
-# Active Skills (eager-loaded)
+# Active Skills (eager-loaded, always:true)
 # Subagent Profiles
-## Current Session (channel, chat_id)
-## Voice Mode (if applicable)
+# Requested Skills (on-demand)
 ```
 
-**Budget Management:**
+**Budget Management (two modes):**
+
+Local (`set_lite_mode`): bootstrap 2%, memory 1%, skills 2%, profiles 1%, cap 30%
+Cloud (`scale_budgets`): bootstrap 2%, memory 1%, skills 4%, profiles 2%, cap 40%
+
 - `bootstrap_budget` - Max tokens for instruction files
 - `long_term_memory_budget` - Max tokens for MEMORY.md
 - `skills_budget` - Max tokens for skills section
-- `system_prompt_cap` - Hard limit (0 = disabled for cloud)
+- `profiles_budget` - Max tokens for subagent profiles
+- `system_prompt_cap` - Hard limit (0 = disabled for cloud defaults)
 - Automatic scaling for large context windows (1M tokens)
 
 ### 6. Session Management (`src/session/manager.rs`)
@@ -185,9 +202,8 @@ trait Tool: Send + Sync {
 ```
 
 **Rotation Policy:**
-- Daily rotation: `{session_key}_{YYYY-MM-DD}.jsonl`
-- Size rotation: When >1MB
-- Carries last 10 messages to new session
+- Daily rotation: `{session_key}_{YYYY-MM-DD}.jsonl` (cross-day starts fresh)
+- Size rotation: When >1MB (same-day only, carries last 10 messages)
 
 ### 7. Channel System (`src/channels/`)
 
@@ -198,7 +214,8 @@ trait Channel: Send + Sync {
     async fn start(&mut self) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
     async fn send(&self, msg: &OutboundMessage) -> Result<()>;
-    fn is_allowed(&self, sender_id: &str, allow_list: &[String]) -> bool;
+    fn is_allowed(&self, sender_id: &str, allow_list: &[String]) -> bool; // default impl
+    fn is_running(&self) -> bool;
 }
 ```
 
@@ -210,8 +227,8 @@ trait Channel: Send + Sync {
 
 **Supported Channels:**
 - Telegram - Bot API via long polling
-- WhatsApp - Via bridge WebSocket
-- Feishu/Lark - WebSocket long connection
+- WhatsApp - Via Node.js bridge WebSocket
+- Feishu/Lark - HTTP API, **send-only** (no receive; Lark SDK WebSocket has no Rust equivalent)
 - Email - IMAP polling + SMTP sending
 
 ### 8. Memory System
@@ -222,12 +239,14 @@ trait Channel: Send + Sync {
 - Atomic writes (temp + rename)
 
 **WorkingMemoryStore (`working_memory.rs`):**
-- Per-session state in SQLite
+- Per-session state in flat Markdown files (`SESSION_{hash}.md` with YAML frontmatter)
+- Stored at `{workspace}/memory/sessions/`
 - Auto-completes after inactivity
 - Injected into system prompt
 
 **LearningStore (`learning.rs`):**
-- Experience database (SQLite)
+- Experience database in JSONL (`{workspace}/memory/learnings.jsonl`)
+- Append-only with file-level locking
 - Used for reflection and improvement
 
 ### 9. Skills System (`src/agent/skills.rs`)
@@ -482,7 +501,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- 1248 tests in codebase
+- ~1253 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 
@@ -495,7 +514,7 @@ Applied to live conversation
 
 ## Critical Flaws
 
-### 1. **Monolithic agent_loop.rs (1700+ lines)**
+### 1. **Monolithic agent_loop.rs (4200+ lines)**
 **Problem:** Single file handles routing, streaming, tool execution, compaction, provenance, and trio mode. Hard to navigate and test in isolation.
 
 **Recommendation:**
@@ -505,7 +524,7 @@ Applied to live conversation
 - Keep `agent_loop.rs` as thin coordinator
 
 ### 2. **Implicit State Machine in TurnContext**
-**Problem:** `TurnContext` has 30+ fields tracking turn state. Flow control via boolean flags (`force_response`, `router_preflight_done`, `forced_finalize_attempted`). Easy to get into invalid states.
+**Problem:** `TurnContext` has 27 fields tracking turn state, including 6 boolean flow-control flags (`force_response`, `router_preflight_done`, `forced_finalize_attempted`, `content_was_streamed`, `compaction_in_flight`, `new_start`). Easy to get into invalid states.
 
 **Recommendation:**
 - Model turn lifecycle as explicit state machine:

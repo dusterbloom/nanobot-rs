@@ -9,10 +9,9 @@
 
 ### 🔴 Blocking — do first
 
-- [ ] **B1: 132 compiler warnings** — `cargo fix` pass to clear `unused_imports`, `dead_code`, `unused_variables`. Real errors invisible under noise.
-- [ ] **B2: 2 test failures** — `test_web_search_no_api_key` (assumes no BRAVE_API_KEY), `test_normalize_alias_all_aliases` (stale `/prov` alias). Quick fixes.
-- [ ] **B3: Wire Nanbeige4.1-3B as RLM model** — Update `DELEGATION_MODEL_PREFERENCES` (top of list), update `DEFAULT_LOCAL_MODEL`. Test tool calling with nanobot's `<tool_call>` format. _Ref: `docs/plans/local-model-matrix.md`_
+- [ ] **B3: Update default local trio** — New defaults: 1) Main: `gemma-3n-e4b-it`, 2) Orchestrator: `nvidia_orchestrator-8b`, 3) Specialist: `ministral-3-8b-instruct-2512`. Update `agents.json`, `DEFAULT_LOCAL_MODEL`, config schema defaults, and `TrioConfig`. _Ref: experiments/tool-calling/_
 - [ ] **B4: Multi-model config schema** — Add `local.main`, `local.rlm`, `local.memory` to config. Each slot: `{ model, path, gpu, context_size, temperature }`. Server manager spawns up to 3 llama-server instances. _Ref: `docs/plans/local-model-matrix.md`_
+- [ ] **B5: RLM model evaluation** — Systematic experiments to find best RLM model per VRAM tier. Critical for "3 impossible things". See experiment plan below.
 
 ### 🟡 Important — do soon
 
@@ -46,7 +45,7 @@
 
 ## Phase 2: Million-Step Processes (later)
 
-- [ ] **P2.0: Calibration run** — Measure Nanbeige4.1-3B per-step `p` on 1K-10K steps
+- [ ] **P2.0: Calibration run** — Measure per-step `p` on 1K-10K steps using winning RLM model from E3
 - [ ] **P2.1: MAKER voting** — `first_to_ahead_by_k`, red-flagging, output token cap
 - [ ] **P2.2: MAD decomposition** — Atomic step definitions per domain
 - [ ] **P2.3: Process tree** — Persistent execution tree, checkpoint/resume
@@ -63,6 +62,72 @@
 - [ ] **P3.2: Skill crystallization** — Auto-create skills from repeated successes
 - [ ] **P3.3: Budget calibration** — Per-task-type stats in SQLite
 - [ ] **P3.4: LoRA distillation** — Export traces → Zero pipeline → hot-swap LoRA
+
+---
+
+## Experiment Plan: Local Trio Evaluation
+
+> Reduce assumptions one at a time. No coding until we know what works.
+
+### New Default Trio (RTX 3090, 24GB VRAM)
+
+| Role | Model | Size | Why |
+|------|-------|------|-----|
+| **Main** | gemma-3n-e4b-it | ~4B effective | Fast, good chat, small footprint |
+| **Orchestrator** | nvidia_orchestrator-8b | 8B | 10/10 routing accuracy (proven in experiments/) |
+| **Specialist** | ministral-3-8b-instruct-2512 | 8B | Strong tool-calling, instruction following |
+
+### What We Know
+- Nemotron Orchestrator: 10/10 routing (vs NanBeige 6/10). Purpose-built. **Proven.**
+- NanBeige 3B: Good with `<think>\n</think>\n\n` prefill, but weak as router.
+- Main + Orchestrator work well together in practice.
+- Sequential self-routing would add latency vs parallel separation. Keep roles split.
+
+### Experiments Needed (one assumption at a time)
+
+#### E1: Role Evaluation Matrix
+Test each candidate model in each role independently.
+
+| Model | As Main | As Orchestrator | As Specialist | As RLM |
+|-------|---------|-----------------|---------------|--------|
+| gemma-3n-e4b-it | ? | ? | ? | ? |
+| nvidia_orchestrator-8b | ✅ 10/10 routing | ✅ proven | ? | ? |
+| ministral-3-8b-instruct-2512 | ? | ? | ? | ? |
+| nanbeige4.1-3b | ? | 6/10 | ? | ? |
+
+Test bench per role:
+- **Main**: 10 conversation tasks (chat quality, coherence, narration compliance)
+- **Orchestrator**: 10 routing cases (existing test suite from experiments/)
+- **Specialist**: 10 tool-calling tasks (file ops, exec, multi-step)
+- **RLM**: 5 delegation loops (multi-step file edit, research, build cycle)
+
+#### E2: VRAM Profile Testing
+Critical for "3 impossible things" — must work across hardware tiers.
+
+| Tier | VRAM | Trio Budget | Candidate Combos |
+|------|------|-------------|------------------|
+| Potato | 4-6 GB | ~4B total | 1 model does all? |
+| Sweet | 8-12 GB | ~12B total | 2 small models |
+| Power | 16-24 GB | ~24B total | Full trio (current target) |
+| Beast | 48+ GB | Unlimited | Bigger specialists |
+
+#### E3: RLM Model Shootout
+The key unknown. Test candidates on delegation loop benchmarks:
+- Multi-step file edit (read → plan → edit → verify)
+- Web research synthesis (search → fetch → summarize)
+- Build cycle (edit → compile → fix errors → retry)
+
+Metrics: completion rate, token cost, latency, error recovery.
+
+#### E4: Integration Test
+Once E1-E3 identify winners, run full nanobot session with the new trio.
+Compare against current setup on real tasks.
+
+### Experiment Order
+1. **E1** first — know what each model can do in each role
+2. **E3** next — find the RLM (biggest unknown)
+3. **E2** then — scale findings across VRAM tiers
+4. **E4** last — validate the winning combo end-to-end
 
 ---
 
@@ -83,6 +148,10 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 ## Done ✅
 
+- ~~B1: 132 compiler warnings~~ → 0 warnings (2026-02-20)
+- ~~B2: 2 test failures~~ → 1248 pass, 0 fail (2026-02-20)
+- ~~Fix: Subprocess stdin steal~~ — `.stdin(Stdio::null())` on all 4 spawn sites in shell.rs + worker_tools.rs (2026-02-20)
+- ~~Fix: Esc-mashing freezes REPL~~ — drain_stdin() after cancel (2026-02-20, commit 57ec883)
 - ~~Fix stale comment in `ensure_compaction_model`~~ (2026-02-17)
 - ~~Raise tool result truncation threshold~~ (2026-02-17)
 - ~~Document multi-session CONTEXT.md race~~ (2026-02-17)

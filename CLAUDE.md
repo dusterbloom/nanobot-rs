@@ -53,9 +53,9 @@ The `AgentLoop` (`src/agent/agent_loop.rs`) is the core: it receives messages vi
 
 ### Config & Provider Selection
 
-`Config::get_api_key()` and `Config::get_api_base()` use the same priority order to select the active provider: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM. The first non-empty API key wins.
+`Config::get_api_key()` and `Config::get_api_base()` use the same priority order to select the active provider: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > ZhipuCoding > Groq > vLLM. The first non-empty API key wins.
 
-All providers are accessed through `OpenAICompatProvider` which sends requests to the provider-specific base URL. Config JSON uses camelCase keys (`#[serde(rename_all = "camelCase")]`).
+Most providers are accessed through `OpenAICompatProvider` which sends requests to the provider-specific base URL. `AnthropicProvider` speaks the native Anthropic Messages API for OAuth/Claude Max flows. Config JSON uses camelCase keys (`#[serde(rename_all = "camelCase")]`).
 
 ### Tool System
 
@@ -63,7 +63,7 @@ Tools implement the `Tool` trait (`agent/tools/base.rs`): `name()`, `description
 
 ### Context & Memory
 
-`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (daily notes + `MEMORY.md`), and skills. The workspace defaults to `~/.nanobot/workspace/`.
+`ContextBuilder` assembles the system prompt from: identity text, bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `IDENTITY.md` in workspace), memory (`MEMORY.md` only — daily notes and learnings are excluded from the system prompt), and skills. The workspace defaults to `~/.nanobot/workspace/`.
 
 ### Skills
 
