@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared proprioception: SystemState, TaskPhase, and ensemble coordination types.
 //!
 //! Every model in the ensemble can sense the system's current state through

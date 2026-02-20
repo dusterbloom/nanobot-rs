@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Memory system for persistent agent memory.
 //!
 //! Supports daily notes (`memory/YYYY-MM-DD.md`) and long-term memory (`MEMORY.md`).

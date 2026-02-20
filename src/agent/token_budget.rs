@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Token budget management for context window overflow prevention.
 //!
 //! Uses tiktoken-rs (cl100k_base BPE) for accurate token counting,

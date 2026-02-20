@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Local LLM utilities: health checks, GGUF parser, model listing, context sizing.
 //!
 //! Server lifecycle (spawning, process management) is handled by LM Studio via

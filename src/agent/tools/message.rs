@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Message tool for sending messages to users.
 
 use std::collections::HashMap;

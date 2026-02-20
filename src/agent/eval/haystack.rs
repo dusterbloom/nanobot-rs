@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -365,7 +366,7 @@ pub fn evaluate_retrieval(
         }
 
         // Check if the fact sentence appears in results
-        let fact_sentence = fact_to_sentence(fact);
+        let _fact_sentence = fact_to_sentence(fact);
         let mut found_rank: Option<usize> = None;
 
         for (idx, result) in results.iter().enumerate() {

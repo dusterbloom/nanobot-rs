@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Memory bulletin — periodic briefing synthesized by the compaction model.
 //!
 //! Every N minutes (default 60), when the system is idle, the bulletin service
@@ -5,13 +6,13 @@
 //! word briefing. The result is cached in an `ArcSwap<String>` for zero-cost
 //! reads on every turn — injected into the system prompt alongside memory.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::agent::memory::MemoryStore;
 use crate::agent::working_memory::WorkingMemoryStore;

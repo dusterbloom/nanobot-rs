@@ -126,7 +126,7 @@ pub fn generate_arithmetic_task(index: usize, depth: usize, seed: u64) -> Curric
 
     steps.push(format!("A store has {} {}", initial_value, subject));
 
-    for i in 0..depth {
+    for _i in 0..depth {
         let operation = rng.next_range(0, 3);
         let operand = rng.next_range(5, 25);
 
@@ -177,7 +177,7 @@ pub fn generate_fact_retrieval_task(index: usize, num_facts: usize, seed: u64) -
     let attribute_types = ["age", "height_cm", "score"];
 
     let attr_type = attribute_types[rng.next_range(0, attribute_types.len() as i32) as usize];
-    let (attr_name, value_range, question_superlative, comparative) = match attr_type {
+    let (attr_name, value_range, question_superlative, _comparative) = match attr_type {
         "age" => ("age", (20, 60), "oldest", "older"),
         "height_cm" => ("height", (150, 200), "tallest", "taller"),
         _ => ("score", (60, 100), "highest score", "higher score"),

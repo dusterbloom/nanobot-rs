@@ -603,6 +603,7 @@ async fn parse_anthropic_sse(
     // For tool_use blocks: (id, name, accumulated_json_str)
     let mut tool_blocks: HashMap<u64, (String, String, String)> = HashMap::new();
     let mut current_block_index: u64 = 0;
+    #[allow(unused_assignments)]
     let mut current_block_type = String::new();
 
     let mut stream = Box::pin(byte_stream);

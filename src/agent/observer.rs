@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Observation store for cross-session memory.
 //!
 //! Observations are LLM-generated summaries of conversations, created during

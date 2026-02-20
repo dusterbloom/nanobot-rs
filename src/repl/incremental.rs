@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Incremental line renderer for streaming LLM responses.
 //!
 //! Replaces the old progress-line display with live formatted text.

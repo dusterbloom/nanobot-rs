@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! LM Studio integration via CLI (server management) and HTTP API (model operations).
 //!
 //! The `lms` CLI is used only for server start/stop/status because those commands

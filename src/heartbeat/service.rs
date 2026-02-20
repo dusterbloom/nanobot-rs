@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Heartbeat service -- periodic maintenance + agent wake-up.
 //!
 //! Two layers run on each tick:
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Default heartbeat interval: 5 minutes.
 pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 5 * 60;

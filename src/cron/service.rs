@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Cron service for managing scheduled jobs.
 
 use std::path::PathBuf;

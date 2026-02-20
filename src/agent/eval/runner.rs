@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! LLM integration for evaluation benchmarks.
 //!
 //! This module connects the pure benchmark logic to actual LLM calls

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Command dispatch and handlers for the REPL.
 //!
 //! Contains `ReplContext`, `normalize_alias()`, `dispatch()`, and all

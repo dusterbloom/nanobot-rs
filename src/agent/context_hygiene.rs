@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context hygiene pipeline for cleaning up conversation history.
 //!
 //! Vendored and adapted from stakpak-agent-core:

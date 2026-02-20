@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Circuit breaker for LLM provider health tracking.
 //!
 //! Tracks consecutive failures per provider:model key and marks providers

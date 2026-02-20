@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Channel manager for coordinating chat channels.
 //!
 //! Initialises enabled channels, starts them, and dispatches outbound messages

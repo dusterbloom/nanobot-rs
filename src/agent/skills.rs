@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Skills loader for agent capabilities.
 //!
 //! Skills are markdown files (`SKILL.md`) that teach the agent how to use

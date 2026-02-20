@@ -29,7 +29,6 @@ use crate::providers::jit_gate::JitGate;
 use crate::providers::oauth::OAuthTokenManager;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
-use anyhow::Context as _;
 
 #[cfg(test)]
 mod tests {

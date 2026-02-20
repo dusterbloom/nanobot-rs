@@ -266,7 +266,7 @@ pub fn generate_questions(
 
         // Count scientists in this domain
         let job = "scientist";
-        let count_in_domain = domain.facts.iter().filter(|f| f.job == job).count();
+        let _count_in_domain = domain.facts.iter().filter(|f| f.job == job).count();
         let city_idx = (seed as usize + i * 7) % haystack::CITIES.len();
         let city = haystack::CITIES[city_idx];
         let in_city = domain

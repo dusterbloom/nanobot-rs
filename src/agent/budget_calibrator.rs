@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Budget calibration using historical execution data.
 //!
 //! Tracks per-task-type performance stats in SQLite and provides budget

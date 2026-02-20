@@ -1,5 +1,6 @@
 /// Copy src to dst, but skip if they are hardlinked (same inode) to avoid
 /// truncating the source when sherpa-rs-sys creates hardlinks from cache to target.
+#[cfg(feature = "voice")]
 fn safe_copy(src: &std::path::Path, dst: &std::path::Path) {
     use std::os::unix::fs::MetadataExt;
     if let (Ok(sm), Ok(dm)) = (src.metadata(), dst.metadata()) {
@@ -81,7 +82,9 @@ fn main() {
 }
 
 /// Recursively copy a directory tree.
+#[allow(dead_code)]
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+#[cfg(feature = "voice")]
     let _ = std::fs::create_dir_all(dst);
     if let Ok(entries) = std::fs::read_dir(src) {
         for entry in entries.flatten() {
@@ -97,6 +100,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 /// Simple recursive directory walker (no extra deps).
+#[allow(dead_code)]
 fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut results = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {

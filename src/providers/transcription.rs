@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Voice transcription provider using Groq's Whisper API.
 
 use std::path::Path;

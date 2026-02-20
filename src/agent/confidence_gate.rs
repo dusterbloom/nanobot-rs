@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::agent::step_voter::{vote, VoteResult, VoterConfig, VoterResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

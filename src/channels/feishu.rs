@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Feishu/Lark channel implementation.
 //!
 //! This is a simplified stub: receiving messages via WebSocket long connection

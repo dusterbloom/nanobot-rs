@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Base trait for chat channels.
 
 use anyhow::Result;

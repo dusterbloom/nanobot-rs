@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Unified text rendering pipeline for LLM responses.
 //!
 //! Combines termimad prose formatting (headers, bold, lists, links) with

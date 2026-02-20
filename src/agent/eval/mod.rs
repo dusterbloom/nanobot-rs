@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Evaluation benchmarks for the "Three Impossible Things" plan.
 //!
 //! Four benchmarks testing context retrieval, multi-step verification,

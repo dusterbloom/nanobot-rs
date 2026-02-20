@@ -27,10 +27,7 @@ Fully functional voice assistant with local LLM support: low-latency TTS, interr
   - [x] /local auto-spawn: llama.cpp server with --ctx-size 16384
 - Now: Idle — voice_pipeline.rs extracted (250 lines), main.rs voice refactored
 - Remaining:
-  - [ ] Investigate Supertonic word-dropping (upstream diffusion issue, no fix yet)
-  - [ ] Consider multi-sample generation (generate N, pick best) for quality vs latency tradeoff
   - [ ] Voice activity detection (VAD) for hands-free recording start/stop
-  - [ ] Streaming LLM response + TTS (start speaking before full LLM response)
 
 ## Open Questions
 - UNCONFIRMED: Can supertonic's diffusion steps parameter reduce word dropping? (issue #39 suggests picking 1st sample instead of 4th helps)

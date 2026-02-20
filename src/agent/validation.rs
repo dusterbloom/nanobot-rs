@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Response validation to detect hallucinated tool calls and context drift.
 //!
 //! When local SLMs get confused or context becomes polluted, they may:

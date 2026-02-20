@@ -372,7 +372,7 @@ pub async fn execute_ctx_summarize(
 
     // Create a mini ContextStore with just this variable's content.
     let mut sub_store = ContextStore::new();
-    let (var_name, metadata) = sub_store.store(content);
+    let (_var_name, metadata) = sub_store.store(content);
 
     // Build messages for the sub-loop.
     let system_msg = json!({

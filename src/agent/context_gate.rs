@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context Gate: intelligent content management for LLM agents.
 //!
 //! Instead of uniform char-limit truncation, the gate makes context-aware

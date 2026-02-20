@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context builder for assembling agent prompts.
 //!
 //! Assembles bootstrap files, memory, skills, and conversation history into

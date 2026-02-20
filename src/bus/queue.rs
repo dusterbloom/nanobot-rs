@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Async message queue for decoupled channel-agent communication.
 //!
 //! Uses `tokio::sync::mpsc::unbounded_channel` for inbound/outbound queues and

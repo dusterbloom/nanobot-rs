@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Tool registry for dynamic tool management.
 
 use std::collections::{HashMap, HashSet};

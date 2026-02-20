@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Session management for conversation history.
 //!
 //! Sessions are stored as JSONL files. The first line is a metadata header
