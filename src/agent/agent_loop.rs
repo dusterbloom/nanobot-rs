@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::audit::{AuditLog, ToolEvent};
+use crate::agent::anti_drift;
 use crate::agent::context_hygiene;
 use crate::agent::policy;
 use crate::agent::reflector::Reflector;
@@ -508,6 +509,11 @@ impl AgentLoopShared {
 
         // --- Context Hygiene: clean up conversation history ---
         context_hygiene::hygiene_pipeline(&mut ctx.messages);
+
+        // --- Anti-Drift: quality-based cleanup for local models ---
+        if ctx.core.is_local && ctx.core.anti_drift.enabled {
+            anti_drift::pre_completion_pipeline(&mut ctx.messages, iteration, &ctx.core.anti_drift);
+        }
 
         // --- Proprioception: update SystemState ---
         if self.proprioception_config.enabled {
@@ -1038,6 +1044,16 @@ impl AgentLoopShared {
             }
         }
 
+        // --- Strip thinking tags leaked by small models (Qwen3, etc.) ---
+        if ctx.core.is_local {
+            if let Some(ref mut content) = response.content {
+                let cleaned = crate::agent::compaction::strip_thinking_tags(content);
+                if cleaned.len() != content.len() {
+                    *content = cleaned;
+                }
+            }
+        }
+
         // Rescue pass: if local model consumed completion on reasoning and produced no
         // visible answer, force one concise no-thinking completion once.
         let empty_visible = response
@@ -1081,6 +1097,13 @@ impl AgentLoopShared {
                 }
             }
             counters.inference_active.store(false, Ordering::Relaxed);
+        }
+
+        // --- Anti-Drift post-completion: collapse babble ---
+        if ctx.core.is_local && ctx.core.anti_drift.enabled && !response.has_tool_calls() {
+            if let Some(ref mut content) = response.content {
+                anti_drift::post_completion_pipeline(content, &ctx.messages, &ctx.core.anti_drift);
+            }
         }
 
         // Check for LLM provider errors before processing the response.

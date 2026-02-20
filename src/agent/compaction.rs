@@ -913,7 +913,7 @@ impl ContextCompactor {
 ///
 /// Small models (Qwen3-0.6B, 1.7B) sometimes leak chain-of-thought tags
 /// into their output. This prevents garbage from leaking into summaries.
-fn strip_thinking_tags(text: &str) -> String {
+pub fn strip_thinking_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
     while let Some(start) = remaining.find("<thinking>") {

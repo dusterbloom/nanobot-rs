@@ -1,6 +1,7 @@
 pub mod agent_core;
 pub mod agent_loop;
 pub mod agent_profiles;
+pub mod anti_drift;
 pub mod audit;
 pub mod budget_calibrator;
 pub mod bulletin;

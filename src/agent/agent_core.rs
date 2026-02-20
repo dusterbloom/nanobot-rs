@@ -16,7 +16,7 @@ use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
-use crate::config::schema::{MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
+use crate::config::schema::{AntiDriftConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
 use crate::session::manager::SessionManager;
 
@@ -50,6 +50,7 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    pub anti_drift: AntiDriftConfig,
     pub main_no_think: bool,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_runner_model: Option<String>,
@@ -396,6 +397,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        anti_drift: trio_config.anti_drift.clone(),
         main_no_think: trio_config.main_no_think,
         tool_runner_provider,
         tool_runner_model,

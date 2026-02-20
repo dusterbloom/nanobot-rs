@@ -606,6 +606,62 @@ pub struct TrioConfig {
     /// VRAM budget cap in GB (default: 16). Context sizes auto-computed to fit.
     #[serde(default = "default_vram_cap_gb")]
     pub vram_cap_gb: f64,
+    /// Anti-drift hooks for SLM context quality stabilization.
+    #[serde(default)]
+    pub anti_drift: AntiDriftConfig,
+}
+
+/// Anti-drift configuration for SLM context stabilization.
+///
+/// Pre/post completion hooks that score turn quality, evict pollution,
+/// collapse repetition, re-inject format anchors, and strip thinking artifacts.
+/// Zero extra LLM calls — all heuristic-based.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiDriftConfig {
+    /// Enable anti-drift hooks (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Inject a format anchor every N iterations (default: 3).
+    #[serde(default = "default_anchor_interval")]
+    pub anchor_interval: u32,
+    /// Pollution score threshold to evict a turn (default: 0.6, requires 2+ signals).
+    #[serde(default = "default_pollution_threshold")]
+    pub pollution_threshold: f32,
+    /// Max word count before babble collapse fires (default: 200).
+    #[serde(default = "default_babble_max_tokens")]
+    pub babble_max_tokens: usize,
+    /// Minimum consecutive identical fingerprints to trigger collapse (default: 3).
+    #[serde(default = "default_repetition_min_count")]
+    pub repetition_min_count: usize,
+}
+
+fn default_anchor_interval() -> u32 {
+    3
+}
+
+fn default_pollution_threshold() -> f32 {
+    0.6
+}
+
+fn default_babble_max_tokens() -> usize {
+    200
+}
+
+fn default_repetition_min_count() -> usize {
+    3
+}
+
+impl Default for AntiDriftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            anchor_interval: default_anchor_interval(),
+            pollution_threshold: default_pollution_threshold(),
+            babble_max_tokens: default_babble_max_tokens(),
+            repetition_min_count: default_repetition_min_count(),
+        }
+    }
 }
 
 impl Default for TrioConfig {
@@ -626,6 +682,7 @@ impl Default for TrioConfig {
             router_endpoint: None,
             specialist_endpoint: None,
             vram_cap_gb: default_vram_cap_gb(),
+            anti_drift: AntiDriftConfig::default(),
         }
     }
 }
