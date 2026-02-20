@@ -629,6 +629,9 @@ async fn stream_and_render_inner(
     watcher.join().ok();
     // Defensive: ensure raw mode is off even if watcher thread panicked.
     tui::force_exit_raw_mode();
+    // Flush any leftover keystrokes (e.g. rapid Esc presses) so they don't
+    // leak into rustyline as partial ANSI escape sequences, which would hang.
+    tui::drain_stdin();
 
     let cancelled = cancel_token.is_cancelled();
     let (_tool_lines, _tool_event_lines) = print_task.await.unwrap_or((0, Vec::new()));

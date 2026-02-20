@@ -630,8 +630,7 @@ pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Flush any buffered terminal input (e.g. extra Enter keypresses during recording).
-#[cfg(feature = "voice")]
+/// Flush any buffered terminal input (e.g. extra Esc/Enter keypresses during streaming).
 pub(crate) fn drain_stdin() {
     #[cfg(unix)]
     {
