@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context compaction via LLM-powered summarization.
 //!
 //! Two-stage design:
@@ -418,7 +419,7 @@ impl ContextCompactor {
         &self,
         messages: &[Value],
         available_budget: usize,
-        budget: &TokenBudget,
+        _budget: &TokenBudget,
     ) -> Result<(Vec<Value>, String)> {
         if messages.is_empty() {
             return Ok((messages.to_vec(), String::new()));
@@ -698,11 +699,8 @@ impl ContextCompactor {
             )
             .await?;
 
-        if response.finish_reason == "error" {
-            anyhow::bail!(
-                "Briefing generation failed: {}",
-                response.content.as_deref().unwrap_or("unknown error")
-            );
+        if let Some(detail) = response.error_detail() {
+            anyhow::bail!("Briefing generation failed: {}", detail);
         }
 
         let text = response
@@ -767,7 +765,7 @@ impl ContextCompactor {
         &self,
         messages: &[Value],
         available_budget: usize,
-        budget: &TokenBudget,
+        _budget: &TokenBudget,
         prompt: &str,
     ) -> Result<(Vec<Value>, String)> {
         if messages.is_empty() {
@@ -892,11 +890,7 @@ impl ContextCompactor {
             )
             .await?;
 
-        if response.finish_reason == "error" {
-            let detail = response
-                .content
-                .as_deref()
-                .unwrap_or("unknown summarization error");
+        if let Some(detail) = response.error_detail() {
             anyhow::bail!("Summarization provider error: {}", detail);
         }
 

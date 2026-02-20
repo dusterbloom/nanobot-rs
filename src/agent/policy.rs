@@ -40,7 +40,7 @@ pub fn update_from_user_text(policy: &mut SessionPolicy, text: &str) -> bool {
 /// Whether the model string denotes a local model.
 pub fn is_local_model(model: &str) -> bool {
     let m = model.trim().to_lowercase();
-    m == "local" || m.starts_with("local:")
+    m == "local" || m.starts_with("local:") || m.starts_with("local/")
 }
 
 /// Enforce local-only policy for spawned subagent model overrides.

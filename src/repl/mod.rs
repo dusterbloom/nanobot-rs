@@ -1188,6 +1188,7 @@ pub(crate) fn cmd_agent(
 
                 // === GET INPUT ===
                 let input_text: String;
+                #[allow(unused_mut)]
                 let mut do_record = false;
 
                 #[cfg(feature = "voice")]
@@ -1345,6 +1346,7 @@ pub(crate) fn cmd_agent(
 
                 // Process message (streaming)
                 let channel = if voice_on { "voice" } else { "cli" };
+                #[allow(unused_variables)]
                 let response = stream_and_render(
                     &mut ctx.agent_loop,
                     input,

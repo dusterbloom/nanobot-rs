@@ -288,7 +288,7 @@ async fn analyze_via_scratch_pad(
         };
 
         // Error response from provider — stop analyzing.
-        if response.finish_reason == "error" {
+        if response.is_error() {
             warn!(
                 "Scratch pad analysis got error response (round {}) — falling back",
                 round

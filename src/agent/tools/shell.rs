@@ -374,7 +374,7 @@ impl Tool for ExecTool {
         let max_len = self.max_output_chars;
         if output.len() > max_len {
             let overflow = output.len() - max_len;
-            output.truncate(max_len);
+            output.truncate(crate::utils::helpers::floor_char_boundary(&output, max_len));
             output.push_str(&format!("\n... (truncated, {} more chars)", overflow));
         }
 
@@ -514,7 +514,7 @@ impl Tool for ExecTool {
         let max_len = self.max_output_chars;
         if output.len() > max_len {
             let overflow = output.len() - max_len;
-            output.truncate(max_len);
+            output.truncate(crate::utils::helpers::floor_char_boundary(&output, max_len));
             output.push_str(&format!("\n... (truncated, {} more chars)", overflow));
         }
 

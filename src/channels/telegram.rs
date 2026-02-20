@@ -10,8 +10,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
@@ -522,6 +523,27 @@ impl TelegramChannel {
 // Markdown -> Telegram HTML conversion
 // ---------------------------------------------------------------------------
 
+static RE_CODEBLOCK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"```[\w]*\n?([\s\S]*?)```").unwrap());
+static RE_INLINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
+static RE_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap());
+static RE_BLOCKQUOTE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^>\s*(.*)$").unwrap());
+static RE_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static RE_BOLD_STAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_BOLD_UNDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
+static RE_ITALIC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|[^a-zA-Z0-9])_([^_]+)_($|[^a-zA-Z0-9])").unwrap());
+static RE_STRIKE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
+static RE_BULLET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^[-*]\s+").unwrap());
+
 /// Convert markdown to Telegram-safe HTML.
 ///
 /// This is a port of the Python `_markdown_to_telegram_html` function.
@@ -532,8 +554,7 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
 
     // 1. Extract and protect code blocks.
     let mut code_blocks: Vec<String> = Vec::new();
-    let re_codeblock = Regex::new(r"```[\w]*\n?([\s\S]*?)```").unwrap();
-    let text = re_codeblock
+    let text = RE_CODEBLOCK
         .replace_all(text, |caps: &regex::Captures| {
             let idx = code_blocks.len();
             code_blocks.push(caps[1].to_string());
@@ -543,8 +564,7 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
 
     // 2. Extract and protect inline code.
     let mut inline_codes: Vec<String> = Vec::new();
-    let re_inline = Regex::new(r"`([^`]+)`").unwrap();
-    let text = re_inline
+    let text = RE_INLINE
         .replace_all(&text, |caps: &regex::Captures| {
             let idx = inline_codes.len();
             inline_codes.push(caps[1].to_string());
@@ -553,12 +573,10 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
         .to_string();
 
     // 3. Headers -> plain text.
-    let re_header = Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap();
-    let text = re_header.replace_all(&text, "$1").to_string();
+    let text = RE_HEADER.replace_all(&text, "$1").to_string();
 
     // 4. Blockquotes -> plain text.
-    let re_blockquote = Regex::new(r"(?m)^>\s*(.*)$").unwrap();
-    let text = re_blockquote.replace_all(&text, "$1").to_string();
+    let text = RE_BLOCKQUOTE.replace_all(&text, "$1").to_string();
 
     // 5. Escape HTML special characters.
     let text = text
@@ -567,30 +585,22 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
         .replace('>', "&gt;");
 
     // 6. Links [text](url).
-    let re_link = Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
-    let text = re_link
+    let text = RE_LINK
         .replace_all(&text, r#"<a href="$2">$1</a>"#)
         .to_string();
 
     // 7. Bold **text** or __text__.
-    let re_bold_star = Regex::new(r"\*\*(.+?)\*\*").unwrap();
-    let text = re_bold_star.replace_all(&text, "<b>$1</b>").to_string();
-    let re_bold_under = Regex::new(r"__(.+?)__").unwrap();
-    let text = re_bold_under.replace_all(&text, "<b>$1</b>").to_string();
+    let text = RE_BOLD_STAR.replace_all(&text, "<b>$1</b>").to_string();
+    let text = RE_BOLD_UNDER.replace_all(&text, "<b>$1</b>").to_string();
 
     // 8. Italic _text_ (avoid matching inside words).
-    // The regex crate does not support look-around, so we capture the
-    // preceding and following non-alphanumeric characters and restore them.
-    let re_italic = Regex::new(r"(^|[^a-zA-Z0-9])_([^_]+)_($|[^a-zA-Z0-9])").unwrap();
-    let text = re_italic.replace_all(&text, "$1<i>$2</i>$3").to_string();
+    let text = RE_ITALIC.replace_all(&text, "$1<i>$2</i>$3").to_string();
 
     // 9. Strikethrough ~~text~~.
-    let re_strike = Regex::new(r"~~(.+?)~~").unwrap();
-    let text = re_strike.replace_all(&text, "<s>$1</s>").to_string();
+    let text = RE_STRIKE.replace_all(&text, "<s>$1</s>").to_string();
 
     // 10. Bullet lists.
-    let re_bullet = Regex::new(r"(?m)^[-*]\s+").unwrap();
-    let mut text = re_bullet.replace_all(&text, "\u{2022} ").to_string();
+    let mut text = RE_BULLET.replace_all(&text, "\u{2022} ").to_string();
 
     // 11. Restore inline code.
     for (i, code) in inline_codes.iter().enumerate() {

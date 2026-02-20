@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Pipeline runner: Rust-level orchestration for multi-step pipelines.
 //!
 //! The key insight: the pipeline loop is Rust, not LLM. A 3B model doing
@@ -7,9 +8,7 @@
 //! Supports MAKER-style first-to-ahead-by-k voting, crash resume from
 //! the event log, tool-equipped steps, and context chaining between steps.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -246,7 +245,7 @@ async fn execute_step_with_tools(
     let mut final_content = String::new();
 
     // Detect local models for strict alternation repair.
-    let is_local = model.starts_with("local:") || model.starts_with("local/");
+    let is_local = crate::agent::policy::is_local_model(model);
 
     for iteration in 0..max_iter {
         debug!(
@@ -273,8 +272,7 @@ async fn execute_step_with_tools(
             }
         };
 
-        if response.finish_reason == "error" {
-            let err = response.content.as_deref().unwrap_or("Unknown error");
+        if let Some(err) = response.error_detail() {
             error!("Pipeline step {} LLM error: {}", step.index, err);
             return format!("Error: {}", err);
         }
@@ -370,8 +368,6 @@ async fn call_llm(provider: &dyn LLMProvider, model: &str, prompt: &str) -> Stri
 
 /// Append a pipeline step result to the event log.
 fn append_pipeline_event(workspace: &Path, pipeline_id: &str, result: &StepResult) {
-    use std::io::Write;
-    let event_path = workspace.join("events.jsonl");
     let event = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "kind": "pipeline_step",
@@ -382,17 +378,7 @@ fn append_pipeline_event(workspace: &Path, pipeline_id: &str, result: &StepResul
         "voters_used": result.voters_used,
         "duration_ms": result.duration_ms,
     });
-    let line = format!("{}\n", event);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&event_path)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(line.as_bytes());
-        }
-        Err(e) => warn!("Failed to append pipeline event: {}", e),
-    }
+    crate::utils::helpers::append_jsonl_event(workspace, &event);
 }
 
 /// Load completed step results for a pipeline from the event log (for resume).

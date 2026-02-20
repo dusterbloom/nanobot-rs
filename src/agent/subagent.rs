@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Subagent manager for background task execution.
 //!
 //! Spawns independent agent loops that can read/write files, execute commands,
@@ -757,7 +758,7 @@ impl SubagentManager {
         if let Some(ref pc) = self.providers_config {
             if let Some((api_key, base, rest)) = pc.resolve_model_prefix(model) {
                 let prefix = model.split('/').next().unwrap_or("unknown");
-                let targets_local = base.contains("localhost") || base.contains("127.0.0.1");
+                let targets_local = crate::providers::openai_compat::is_local_api_base(&base);
                 info!(
                     "Subagent using {} provider (base={}, local={}) for model {}",
                     prefix, base, targets_local, rest
@@ -933,9 +934,7 @@ impl SubagentManager {
                 Err(e) => return Err(e),
             };
 
-            // Check for LLM provider errors (finish_reason == "error").
-            if response.finish_reason == "error" {
-                let err_msg = response.content.as_deref().unwrap_or("Unknown LLM error");
+            if let Some(err_msg) = response.error_detail() {
                 error!("Subagent {} LLM provider error: {}", task_id, err_msg);
                 return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
             }
@@ -971,8 +970,6 @@ impl SubagentManager {
         result: &str,
         status: &str,
     ) {
-        use std::io::Write;
-        let event_path = workspace.join("events.jsonl");
         let event = serde_json::json!({
             "ts": Utc::now().to_rfc3339(),
             "kind": "subagent_result",
@@ -982,19 +979,7 @@ impl SubagentManager {
             "status": status,
             "result": result,
         });
-        let line = format!("{}\n", event);
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&event_path)
-        {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(line.as_bytes()) {
-                    warn!("Failed to append event: {}", e);
-                }
-            }
-            Err(e) => warn!("Failed to open events.jsonl: {}", e),
-        }
+        crate::utils::helpers::append_jsonl_event(workspace, &event);
     }
 
     /// Rotate event log if it exceeds 100 MB. Called once from `new()`.

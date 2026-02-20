@@ -3,7 +3,9 @@
 
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "voice")]
+use std::sync::Arc;
 
 use unicode_width::UnicodeWidthStr;
 

@@ -43,6 +43,23 @@ impl LLMResponse {
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
+
+    /// Returns `true` if this response represents an LLM provider error.
+    ///
+    /// `openai_compat.rs` wraps errors as `Ok(LLMResponse { finish_reason: "error", .. })`
+    /// so they slip through as normal responses unless explicitly checked.
+    pub fn is_error(&self) -> bool {
+        self.finish_reason == "error"
+    }
+
+    /// Returns the error detail if this response is an error, else `None`.
+    pub fn error_detail(&self) -> Option<&str> {
+        if self.is_error() {
+            Some(self.content.as_deref().unwrap_or("Unknown LLM error"))
+        } else {
+            None
+        }
+    }
 }
 
 /// A chunk from an SSE streaming response.

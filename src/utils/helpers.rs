@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Utility functions for nanobot.
 
 use std::fs;
@@ -161,6 +162,25 @@ fn expand_tilde(path: &str) -> PathBuf {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
     } else {
         PathBuf::from(path)
+    }
+}
+
+/// Append a JSON event as a single line to `events.jsonl` in the given workspace.
+pub fn append_jsonl_event(workspace: &Path, event: &serde_json::Value) {
+    use std::io::Write;
+    let event_path = workspace.join("events.jsonl");
+    let line = format!("{}\n", event);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&event_path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!("Failed to append event: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to open events.jsonl: {}", e),
     }
 }
 

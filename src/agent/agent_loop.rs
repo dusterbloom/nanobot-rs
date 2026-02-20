@@ -191,12 +191,12 @@ impl AgentHandle {
 
     /// Snapshot the current swappable core (cheap Arc clone under brief read lock).
     pub fn swappable(&self) -> Arc<SwappableCore> {
-        self.core.read().unwrap().clone()
+        self.core.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Replace the swappable core (write lock). Counters are untouched.
     pub fn swap_core(&self, new_core: SwappableCore) {
-        *self.core.write().unwrap() = Arc::new(new_core);
+        *self.core.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_core);
     }
 }
 
@@ -714,39 +714,28 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     let sessions = SessionManager::new(&workspace);
 
     // When local, use dedicated compaction provider if available, else main provider.
-    let (memory_provider, memory_model): (Arc<dyn LLMProvider>, String) = if is_local {
-        let m = if memory_config.model.is_empty() {
-            model.clone()
-        } else {
-            memory_config.model.clone()
-        };
+    let memory_model = if memory_config.model.is_empty() {
+        model.clone()
+    } else {
+        memory_config.model.clone()
+    };
+    let memory_provider: Arc<dyn LLMProvider> = if is_local {
         if let Some(cp) = compaction_provider {
-            (cp, m)
+            cp
         } else {
-            (provider.clone(), m)
+            provider.clone()
         }
     } else if let Some(ref mem_provider_cfg) = memory_config.provider {
-        let p: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+        Arc::new(OpenAICompatProvider::new(
             &mem_provider_cfg.api_key,
             mem_provider_cfg
                 .api_base
                 .as_deref()
                 .or(Some("http://localhost:8080/v1")),
             None,
-        ));
-        let m = if memory_config.model.is_empty() {
-            model.clone()
-        } else {
-            memory_config.model.clone()
-        };
-        (p, m)
+        ))
     } else {
-        let m = if memory_config.model.is_empty() {
-            model.clone()
-        } else {
-            memory_config.model.clone()
-        };
-        (provider.clone(), m)
+        provider.clone()
     };
 
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
@@ -894,6 +883,17 @@ fn apply_compaction_result(messages: &mut Vec<Value>, pending: PendingCompaction
     *messages = swapped;
 }
 
+/// Append a suffix to the first (system) message's content.
+fn append_to_system_prompt(messages: &mut [Value], suffix: &str) {
+    if let Some(sys) = messages
+        .first()
+        .and_then(|m| m["content"].as_str())
+        .map(|s| s.to_string())
+    {
+        messages[0]["content"] = Value::String(format!("{}{}", sys, suffix));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
 // ---------------------------------------------------------------------------
@@ -1005,7 +1005,7 @@ impl AgentLoopShared {
             })
         });
         let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
-        tools.register(Box::new(MessageToolProxy(message_tool)));
+        tools.register(Box::new(ArcToolProxy(message_tool)));
 
         // Spawn tool - context baked in.
         let subagents_ref = self.subagents.clone();
@@ -1210,14 +1210,14 @@ impl AgentLoopShared {
         if core.is_local {
             tools.register(Box::new(SpawnToolLite(spawn_tool)));
         } else {
-            tools.register(Box::new(SpawnToolProxy(spawn_tool)));
+            tools.register(Box::new(ArcToolProxy(spawn_tool)));
         }
 
         // Cron tool (optional) - context baked in.
         if let Some(ref svc) = self.cron_service {
             let ct = Arc::new(CronScheduleTool::new(svc.clone()));
             ct.set_context(channel, chat_id).await;
-            tools.register(Box::new(CronToolProxy(ct)));
+            tools.register(Box::new(ArcToolProxy(ct)));
         }
 
         // Email tools (optional) - available when email is configured.
@@ -1381,17 +1381,10 @@ impl AgentLoopShared {
                 wm.push_str(&learning_ctx);
             }
             if !wm.is_empty() {
-                if let Some(system_content) = messages
-                    .first()
-                    .and_then(|m| m["content"].as_str())
-                    .map(|s| s.to_string())
-                {
-                    let enriched = format!(
-                        "{}\n\n---\n\n# Working Memory (Current Session)\n\n{}",
-                        system_content, wm
-                    );
-                    messages[0]["content"] = Value::String(enriched);
-                }
+                append_to_system_prompt(
+                    &mut messages,
+                    &format!("\n\n---\n\n# Working Memory (Current Session)\n\n{}", wm),
+                );
             }
         }
 
@@ -1403,13 +1396,7 @@ impl AgentLoopShared {
                 crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
             let status = crate::agent::subagent::format_status_block(&running, &recent);
             if !status.is_empty() {
-                if let Some(sys) = messages
-                    .first()
-                    .and_then(|m| m["content"].as_str())
-                    .map(|s| s.to_string())
-                {
-                    messages[0]["content"] = Value::String(format!("{}{}", sys, status));
-                }
+                append_to_system_prompt(&mut messages, &status);
             }
         }
 
@@ -1417,14 +1404,10 @@ impl AgentLoopShared {
         {
             let bulletin = self.bulletin_cache.load_full();
             if !bulletin.is_empty() {
-                if let Some(sys) = messages
-                    .first()
-                    .and_then(|m| m["content"].as_str())
-                    .map(|s| s.to_string())
-                {
-                    messages[0]["content"] =
-                        Value::String(format!("{}\n\n## Memory Briefing\n\n{}", sys, &*bulletin));
-                }
+                append_to_system_prompt(
+                    &mut messages,
+                    &format!("\n\n## Memory Briefing\n\n{}", &*bulletin),
+                );
             }
         }
 
@@ -1899,9 +1882,12 @@ impl AgentLoopShared {
             let effective_max_tokens = {
                 let base = ctx.core.max_tokens;
                 // Check for /long override (temporary boost).
-                let long_override = counters.long_mode_turns.load(Ordering::Relaxed);
-                if long_override > 0 {
-                    counters.long_mode_turns.fetch_sub(1, Ordering::Relaxed);
+                let had_long = counters.long_mode_turns
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        if v > 0 { Some(v - 1) } else { None }
+                    })
+                    .is_ok();
+                if had_long {
                     base.max(8192)
                 } else {
                     // Detect long-form triggers in the user message.
@@ -2151,10 +2137,7 @@ impl AgentLoopShared {
             }
 
             // Check for LLM provider errors before processing the response.
-            // openai_compat.rs wraps errors as Ok(LLMResponse { finish_reason: "error", ... })
-            // so they slip through as normal responses unless explicitly caught.
-            if response.finish_reason == "error" {
-                let err_msg = response.content.as_deref().unwrap_or("Unknown LLM error");
+            if let Some(err_msg) = response.error_detail() {
                 error!("LLM provider error: {}", err_msg);
 
                 // In local mode, check if the server is still alive.
@@ -3610,49 +3593,11 @@ impl AgentLoop {
 // requires owned `Box<dyn Tool>`), we create thin proxy wrappers that
 // implement `Tool` by delegating to the inner `Arc`.
 
-/// Proxy that wraps `Arc<MessageTool>` to satisfy `Tool`.
-struct MessageToolProxy(Arc<MessageTool>);
+/// Generic proxy that wraps `Arc<T: Tool>` so it can be registered as `Box<dyn Tool>`.
+struct ArcToolProxy<T: crate::agent::tools::Tool>(Arc<T>);
 
 #[async_trait::async_trait]
-impl crate::agent::tools::Tool for MessageToolProxy {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-    fn description(&self) -> &str {
-        self.0.description()
-    }
-    fn parameters(&self) -> Value {
-        self.0.parameters()
-    }
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        self.0.execute(params).await
-    }
-}
-
-/// Proxy that wraps `Arc<SpawnTool>` to satisfy `Tool`.
-struct SpawnToolProxy(Arc<SpawnTool>);
-
-#[async_trait::async_trait]
-impl crate::agent::tools::Tool for SpawnToolProxy {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-    fn description(&self) -> &str {
-        self.0.description()
-    }
-    fn parameters(&self) -> Value {
-        self.0.parameters()
-    }
-    async fn execute(&self, params: HashMap<String, Value>) -> String {
-        self.0.execute(params).await
-    }
-}
-
-/// Proxy that wraps `Arc<CronScheduleTool>` to satisfy `Tool`.
-struct CronToolProxy(Arc<CronScheduleTool>);
-
-#[async_trait::async_trait]
-impl crate::agent::tools::Tool for CronToolProxy {
+impl<T: crate::agent::tools::Tool> crate::agent::tools::Tool for ArcToolProxy<T> {
     fn name(&self) -> &str {
         self.0.name()
     }

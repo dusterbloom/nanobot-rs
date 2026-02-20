@@ -127,7 +127,7 @@ struct ThinkSplitState {
     carry: String,
 }
 
-fn is_local_api_base(api_base: &str) -> bool {
+pub(crate) fn is_local_api_base(api_base: &str) -> bool {
     let lower = api_base.to_ascii_lowercase();
     lower.contains("localhost")
         || lower.contains("127.0.0.1")

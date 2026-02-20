@@ -57,7 +57,7 @@ pub fn repair_messages(messages: &mut Vec<Value>) {
     fix_orphaned_tool_calls(messages);
 
     // Pass 3: Merge consecutive user messages.
-    merge_consecutive_user_messages(messages);
+    merge_consecutive_role(messages, "user");
 
     // Pass 4: Ensure first non-system message is user role.
     ensure_user_first(messages);
@@ -231,15 +231,14 @@ fn fix_orphaned_tool_results(messages: &mut Vec<Value>) {
     }
 }
 
-/// Merge consecutive user messages into a single message.
-fn merge_consecutive_user_messages(messages: &mut Vec<Value>) {
+/// Merge consecutive messages with the given role into a single message.
+fn merge_consecutive_role(messages: &mut Vec<Value>, role: &str) {
     let mut i = 0;
     while i + 1 < messages.len() {
-        let is_user = messages[i].get("role").and_then(|r| r.as_str()) == Some("user");
-        let next_is_user = messages[i + 1].get("role").and_then(|r| r.as_str()) == Some("user");
+        let is_role = messages[i].get("role").and_then(|r| r.as_str()) == Some(role);
+        let next_is_role = messages[i + 1].get("role").and_then(|r| r.as_str()) == Some(role);
 
-        if is_user && next_is_user {
-            // Merge content from messages[i+1] into messages[i].
+        if is_role && next_is_role {
             let next_content = messages[i + 1]
                 .get("content")
                 .and_then(|c| c.as_str())
@@ -254,7 +253,7 @@ fn merge_consecutive_user_messages(messages: &mut Vec<Value>) {
             messages[i]["content"] =
                 Value::String(format!("{}\n\n{}", current_content, next_content));
             messages.remove(i + 1);
-            // Don't increment i — check if the next message is also user.
+            // Don't increment i — check if the next message is also same role.
         } else {
             i += 1;
         }
@@ -425,38 +424,10 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
     }
 
     // Pass 3: Merge consecutive same-role messages.
-    merge_consecutive_user_messages(messages);
-    merge_consecutive_assistant_messages(messages);
+    merge_consecutive_role(messages, "user");
+    merge_consecutive_role(messages, "assistant");
 }
 
-/// Merge consecutive assistant messages into a single message.
-fn merge_consecutive_assistant_messages(messages: &mut Vec<Value>) {
-    let mut i = 0;
-    while i + 1 < messages.len() {
-        let is_assistant = messages[i].get("role").and_then(|r| r.as_str()) == Some("assistant");
-        let next_is_assistant =
-            messages[i + 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
-
-        if is_assistant && next_is_assistant {
-            let next_content = messages[i + 1]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let current_content = messages[i]
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            messages[i]["content"] =
-                Value::String(format!("{}\n\n{}", current_content, next_content));
-            messages.remove(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-}
 
 /// Full repair pipeline for local models.
 ///

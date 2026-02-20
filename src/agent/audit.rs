@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Immutable audit log for tool call provenance.
 //!
 //! Records every tool invocation with arguments, results, timing, and a
@@ -109,7 +110,7 @@ impl AuditLog {
         };
 
         let prev_hash = {
-            let guard = self.last_hash.lock().unwrap();
+            let guard = self.last_hash.lock().unwrap_or_else(|e| e.into_inner());
             guard.clone()
         };
 
@@ -159,7 +160,7 @@ impl AuditLog {
         }
 
         // Update last_hash.
-        *self.last_hash.lock().unwrap() = hash;
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
     }
 
     /// Load all entries from the audit log.
