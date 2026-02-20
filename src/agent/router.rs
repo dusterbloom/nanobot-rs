@@ -450,12 +450,12 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
     if !(ctx.core.is_local
         && ctx.core.tool_delegation_config.strict_no_tools_main
         && ctx.core.tool_delegation_config.strict_router_schema
-        && !ctx.router_preflight_done)
+        && !ctx.flow.router_preflight_done)
     {
         return PreflightResult::Passthrough;
     }
 
-    ctx.router_preflight_done = true;
+    ctx.flow.router_preflight_done = true;
     let (router_provider, router_model) =
         match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {
             (Some(p), Some(m)) => (p.clone(), m.to_string()),
@@ -549,7 +549,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
                 &decision.args,
                 &ctx.user_content,
                 ctx.strict_local_only,
-                &mut ctx.tool_guard,
+                &mut ctx.flow.tool_guard,
             )
             .await
             {
@@ -576,7 +576,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
                         .collect::<HashMap<String, Value>>()
                 })
                 .unwrap_or_default();
-            if let Err(e) = ctx.tool_guard.allow(&decision.target, &params_map) {
+            if let Err(e) = ctx.flow.tool_guard.allow(&decision.target, &params_map) {
                 warn!("{}", e);
                 ctx.messages.push(json!({
                     "role":"user",
@@ -783,7 +783,7 @@ pub(crate) async fn route_tool_calls(
                     &plan.args,
                     &ctx.user_content,
                     ctx.strict_local_only,
-                    &mut ctx.tool_guard,
+                    &mut ctx.flow.tool_guard,
                 )
                 .await
                 {
@@ -827,7 +827,7 @@ pub(crate) async fn route_tool_calls(
 
     // Tool guard filtering.
     let mut blocked_calls = 0usize;
-    routed_tool_calls.retain(|tc| match ctx.tool_guard.allow(&tc.name, &tc.arguments) {
+    routed_tool_calls.retain(|tc| match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
         Ok(()) => true,
         Err(e) => {
             blocked_calls += 1;

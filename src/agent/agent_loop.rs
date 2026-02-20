@@ -113,17 +113,35 @@ pub(crate) struct TurnContext {
     pub(crate) turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
 
     // --- Budget/compaction ---
-    pub(crate) compaction_slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
-    pub(crate) compaction_in_flight: Arc<AtomicBool>,
+    pub(crate) compaction: CompactionHandle,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
 
     // --- Flow control ---
+    pub(crate) flow: FlowControl,
+}
+
+/// Per-turn flow control flags.
+///
+/// These are orthogonal booleans (not a linear state machine):
+/// - `force_response`: set by exec/write_file tools, cleared after boundary injection
+/// - `router_preflight_done`: one-shot, set after router runs
+/// - `forced_finalize_attempted`: one-shot, set after rescue pass for empty responses
+/// - `content_was_streamed`: one-shot, set when TextDelta chunks are sent
+/// - `iterations_since_compaction`: counter, reset when compaction swaps in
+/// - `tool_guard`: per-turn tool call policy enforcement
+pub(crate) struct FlowControl {
     pub(crate) force_response: bool,
     pub(crate) router_preflight_done: bool,
     pub(crate) tool_guard: ToolGuard,
-    pub(crate) turns_since_compaction: u32,
+    pub(crate) iterations_since_compaction: u32,
     pub(crate) forced_finalize_attempted: bool,
     pub(crate) content_was_streamed: bool,
+}
+
+/// Shared handles for background compaction coordination.
+pub(crate) struct CompactionHandle {
+    pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
+    pub(crate) in_flight: Arc<AtomicBool>,
 }
 
 impl AgentLoopShared {
@@ -359,15 +377,19 @@ impl AgentLoopShared {
             used_tools: std::collections::HashSet::new(),
             final_content: String::new(),
             turn_tool_entries: Vec::new(),
-            compaction_slot,
-            compaction_in_flight,
+            compaction: CompactionHandle {
+                slot: compaction_slot,
+                in_flight: compaction_in_flight,
+            },
             content_gate,
-            force_response: false,
-            router_preflight_done: false,
-            tool_guard,
-            turns_since_compaction: 0,
-            forced_finalize_attempted: false,
-            content_was_streamed: false,
+            flow: FlowControl {
+                force_response: false,
+                router_preflight_done: false,
+                tool_guard,
+                iterations_since_compaction: 0,
+                forced_finalize_attempted: false,
+                content_was_streamed: false,
+            },
         }
     }
 
@@ -405,7 +427,7 @@ impl AgentLoopShared {
                     counters.last_context_max.load(Ordering::Relaxed),
                     ctx.turn_count,
                     ctx.messages.len() as u64,
-                    ctx.turns_since_compaction,
+                    ctx.flow.iterations_since_compaction,
                     counters.delegation_healthy.load(Ordering::Relaxed),
                     0,    // recent_tool_failures — not tracked yet
                     true, // last_tool_ok
@@ -466,10 +488,10 @@ impl AgentLoopShared {
                 }
             }
 
-            ctx.turns_since_compaction += 1;
+            ctx.flow.iterations_since_compaction += 1;
 
             // Check if background compaction finished — swap in compacted messages.
-            if let Ok(mut guard) = ctx.compaction_slot.try_lock() {
+            if let Ok(mut guard) = ctx.compaction.slot.try_lock() {
                 if let Some(pending) = guard.take() {
                     debug!(
                         "Compaction swap: {} msgs -> {} compacted + {} new",
@@ -481,12 +503,12 @@ impl AgentLoopShared {
                     // After compaction, all messages in the array are "new" from
                     // the perspective of persistence (the session file was rebuilt).
                     ctx.new_start = ctx.messages.len();
-                    ctx.turns_since_compaction = 0;
+                    ctx.flow.iterations_since_compaction = 0;
                 }
             }
 
             // Response boundary: suppress exec/write_file tools to force text output.
-            let boundary_active = ctx.force_response
+            let boundary_active = ctx.flow.force_response
                 && ctx.core.provenance_config.enabled
                 && ctx.core.provenance_config.response_boundary;
             if boundary_active {
@@ -510,7 +532,7 @@ impl AgentLoopShared {
                          Report the result to the user before making additional tool calls.{budget_note}"
                     )
                 }));
-                ctx.force_response = false;
+                ctx.flow.force_response = false;
             }
 
             // Filter tool definitions to relevant tools.
@@ -556,13 +578,13 @@ impl AgentLoopShared {
             );
 
             // Spawn background compaction when threshold exceeded.
-            if !ctx.compaction_in_flight.load(Ordering::Relaxed)
+            if !ctx.compaction.in_flight.load(Ordering::Relaxed)
                 && ctx.core
                     .compactor
                     .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
             {
-                let slot = ctx.compaction_slot.clone();
-                let in_flight = ctx.compaction_in_flight.clone();
+                let slot = ctx.compaction.slot.clone();
+                let in_flight = ctx.compaction.in_flight.clone();
                 let bg_messages = ctx.messages.clone();
                 let bg_core = ctx.core.clone();
                 let bg_session_key = ctx.session_key.clone();
@@ -767,7 +789,7 @@ impl AgentLoopShared {
                                         in_thinking = false;
                                         let _ = delta_tx.send("\x1b[0m\n\n".to_string());
                                     }
-                                    ctx.content_was_streamed = true;
+                                    ctx.flow.content_was_streamed = true;
                                     let _ = delta_tx.send(delta);
                                 }
                                 Some(StreamChunk::Done(resp)) => {
@@ -872,9 +894,9 @@ impl AgentLoopShared {
                 && !response.has_tool_calls()
                 && empty_visible
                 && response.finish_reason == "length"
-                && !ctx.forced_finalize_attempted
+                && !ctx.flow.forced_finalize_attempted
             {
-                ctx.forced_finalize_attempted = true;
+                ctx.flow.forced_finalize_attempted = true;
                 let rescue_tokens = effective_max_tokens.min(384).max(128);
                 let mut rescue_messages = ctx.messages.clone();
                 rescue_messages.push(json!({
@@ -1074,7 +1096,7 @@ impl AgentLoopShared {
         // now so the REPL's incremental renderer actually displays something.
         // Skip if content was already streamed via TextDelta chunks to avoid
         // duplication.
-        if !ctx.final_content.is_empty() && !ctx.content_was_streamed {
+        if !ctx.final_content.is_empty() && !ctx.flow.content_was_streamed {
             if let Some(ref tx) = ctx.text_delta_tx {
                 let _ = tx.send(ctx.final_content.clone());
             }

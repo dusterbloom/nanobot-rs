@@ -322,7 +322,7 @@ pub(crate) async fn execute_tools_delegated(
     // Set response boundary flag if any delegated tool was exec/write_file.
     for (_, tool_name, _) in &run_result.tool_results {
         if tool_name == "exec" || tool_name == "write_file" {
-            ctx.force_response = true;
+            ctx.flow.force_response = true;
             break;
         }
     }
@@ -491,7 +491,7 @@ pub(crate) async fn execute_tools_inline(
 
         // Set response boundary flag for exec/write_file.
         if tc.name == "exec" || tc.name == "write_file" {
-            ctx.force_response = true;
+            ctx.flow.force_response = true;
         }
     }
 }
