@@ -1,0 +1,37 @@
+Model ID,Type,Input ($/1M),Output ($/1M),Cached Input,Context (K),Release Date,Status,Notes
+GLM-5,Text,$1.00,$3.20,$0.20,204.8,Feb 11 2026,Latest Flagship,Newest model - highest performance
+GLM-5-Code,Text,$1.20,$5.00,$0.30,204.8,Feb 2026,New Specialized,Coding-optimized variant
+GLM-4.7,Text,$0.40,$1.50,$0.20,202.7,Jan 2026,High-Performance,Best performance/price ratio
+GLM-4.7-Flash,Text,FREE,FREE,FREE,202.7,Jan 2026,Completely Free,✅ No cost
+GLM-4.7-FlashX,Text,$0.07,$0.40,$0.01,202.7,Jan 2026,Ultra-Cheap,Fastest & cheapest paid option
+GLM-4.7-Thinking,Text,$0.40,$1.50,$0.20,202.7,Jan 2026,Extended Reasoning,Same price as base
+GLM-4.6,Text,$0.35,$1.50,$0.175,202.7,Sep 2025,Advanced,Proven performance
+GLM-4.6-Thinking,Text,$0.35,$1.50,$0.175,202.7,Sep 2025,Extended Reasoning,Same price as base
+GLM-4.5,Text,$0.35,$1.55,$0.175,131.0,Jul 2025,Stable,Reliable flagship
+GLM-4.5-Thinking,Text,$0.35,$1.55,$0.175,131.0,Jul 2025,Extended Reasoning,Same price as base
+GLM-4.5-Flash,Text,FREE,FREE,FREE,131.0,Jul 2025,Completely Free,✅ No cost
+GLM-4.5-Air,Text,$0.13,$0.85,$0.025,131.0,Jul 2025,Compact/Efficient,Cost-effective
+GLM-4.5-X,Text,$2.20,$8.90,$0.45,131.0,Jul 2025,Extended (Deprecated),Legacy - use GLM-4.7 instead
+GLM-4.5-AirX,Text,$1.10,$4.50,$0.22,131.0,Jul 2025,Extended Air (Deprecated),Legacy - use GLM-4.7 instead
+GLM-4-32B-0414-128K,Text,$0.10,$0.10,—,128.0,Apr 2024,Legacy,Older model - use GLM-4.5-Air instead
+GLM-4.6V,Vision,$0.30,$0.90,$0.05,131.0,Sep 2025,Advanced Vision,Best quality vision
+GLM-4.6V-Flash,Vision,FREE,FREE,FREE,131.0,Jan 2026,Completely Free,✅ No cost vision
+GLM-4.6V-FlashX,Vision,$0.04,$0.40,$0.004,131.0,Jan 2026,Ultra-Fast Vision,Fastest vision model
+GLM-4.6V-Thinking,Vision,$0.30,$0.90,—,131.0,Sep 2025,Extended Reasoning,Same price as base
+GLM-4.5V,Vision,$0.60,$1.80,$0.11,65.5,Jul 2025,Standard Vision,Reliable vision
+GLM-4.5V-Thinking,Vision,$0.60,$1.80,$0.11,65.5,Jul 2025,Extended Reasoning,Same price as base
+GLM-OCR,Vision,$0.03,$0.03,—,—,—,Text Recognition,OCR/document reading
+CogView-4,Image Generation,$0.01 per image,—,—,—,—,Advanced,Latest image generation
+GLM-Image,Image Generation,$0.015 per image,—,—,—,—,Standard,Standard image generation
+CogVideoX-3,Video Generation,$0.20 per video,—,—,—,—,Standard,Video generation
+ViduQ1-Text,Video Generation,$0.40 per video,—,—,—,—,Text-to-Video,Text input to video
+ViduQ1-Image,Video Generation,$0.40 per video,—,—,—,—,Image-to-Video,Image input to video
+ViduQ1-Start-End,Video Generation,$0.40 per video,—,—,—,—,Start/End Frames,Frame-based generation
+Vidu2-Image,Video Generation,$0.20 per video,—,—,—,—,Image-to-Video v2,Improved image-to-video
+Vidu2-Start-End,Video Generation,$0.20 per video,—,—,—,—,Start/End Frames v2,Improved frame-based
+Vidu2-Reference,Video Generation,$0.40 per video,—,—,—,—,Reference-based,Reference image generation
+GLM-ASR-2512,Audio,$0.03 per MTok,—,—,—,—,Speech-to-Text,≈$0.0024/minute
+Web Search,Tool,$0.01 per use,—,—,—,—,Built-in Tool,Search capability
+GLM Slide/Poster Agent,Agent,$0.70 per MTok,—,—,—,—,Beta,Presentation generation
+General-Purpose Translation,Agent,$3.00 per MTok,—,—,—,—,Standard,Translation service
+Special Effects Video,Agent,$0.20 per video,—,—,—,—,Template-based,Video effects
