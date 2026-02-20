@@ -1,6 +1,6 @@
 # nanobot Architecture Map
 
-> Complete reference for LLM onboarding. Last verified: 2026-02-20
+> Complete reference for LLM onboarding. Last verified: 2026-02-21
 
 ## System Overview
 
@@ -36,20 +36,28 @@
 
 ## Core Components
 
-### 1. Entry Points (`src/main.rs`, `src/cli.rs`)
+### 1. Entry Points (`src/main.rs`, `src/cli.rs`, `src/sessions_cmd.rs`)
 
 **main.rs** - CLI parsing and command routing:
 - `Commands` enum defines all CLI commands
-- Routes to handler functions in `cli.rs`
+- Routes to handler functions in `cli.rs` and `sessions_cmd.rs`
 - Panic hook restores terminal state
 - Global `LOCAL_MODE` atomic flag for cloud/local switching
 
-**cli.rs** - Command implementations:
+**cli.rs** - Agent/config command implementations:
 - `cmd_onboard()` - Initialize config and workspace
 - `cmd_gateway()` - Start multi-channel gateway
 - `build_core_handle()` - Create swappable core with provider
 - `rebuild_core()` - Hot-swap provider on `/local` toggle
 - `create_agent_loop()` - Wire agent loop with channels
+
+**sessions_cmd.rs** - Session management CLI:
+- `cmd_sessions_list()` - List sessions with date, size, message count
+- `cmd_sessions_export()` - Export session as markdown or JSONL
+- `cmd_sessions_nuke()` - Wipe all sessions, logs, and metrics
+- `cmd_sessions_purge()` - Remove files older than a duration
+- `cmd_sessions_archive()` - Show disk usage summary
+- `make_session_key()` - Generate session key from optional name
 
 ### 2. Agent Loop (`src/agent/agent_loop.rs`)
 
@@ -126,6 +134,32 @@ OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > ZhipuCoding > Groq
 - Model names with prefixes (`groq/llama-3.3-70b`) resolve to specific providers
 - `PROVIDER_PREFIXES` constant maps 9 prefixes to API bases: `groq/`, `gemini/`, `openai/`, `anthropic/`, `deepseek/`, `huggingface/`, `zhipu-coding/`, `zhipu/`, `openrouter/`
 - Subagents can use different providers than main agent
+
+**Error Classification (`src/errors.rs`):**
+```rust
+ProviderError {
+    HttpError(String),       // Network/transport failures
+    ResponseReadError,       // Body read failures
+    JsonParseError,          // Malformed JSON
+    RateLimited { status, retry_after_ms },  // 429 with server hint
+    AuthError { status, message },           // 401/403
+    ServerError { status, message },         // 5xx
+    Cancelled,
+}
+```
+`is_retryable()` classifies: `RateLimited` and `ServerError` always retry; `HttpError` retries on connection errors and JIT loading strings (but NOT "model not found" — prevents 3x retry on config typos).
+
+**Retry System (`src/providers/retry.rs`):**
+- Uses `backon` crate for exponential backoff with jitter
+- `provider_backoff()`: 1s → 2s → 4s, max 30s, 3 retries (cloud APIs)
+- `jit_backoff()`: 2s → 4s → 8s, 3 retries (local JIT servers)
+- `adjust_for_rate_limit()`: respects `Retry-After` from 429 responses — `max(backoff, server_hint)`
+- Applied to both `chat()` and `chat_stream()` via `.retry(backoff).when(|e| e.is_retryable())`
+
+**JIT Gate Timing:**
+- JIT permit acquisition wait measured separately as `jit_wait_ms`
+- API call `elapsed_ms` starts *after* permit acquired
+- Both fields logged in `llm_call_complete` / `llm_stream_started` events
 
 ### 4. Tool System (`src/agent/tools/`)
 
@@ -361,6 +395,32 @@ Config {
 - `pipeline` - Run multi-step voting pipeline
 - `loop` - Autonomous refinement loop
 
+### 13. Observability
+
+**Structured Tracing (both providers):**
+- `#[instrument]` spans on all 4 chat methods (`chat`/`chat_stream` x2 providers)
+- `skip(self, messages, tools)` prevents logging full message arrays
+- Structured fields: `model`, `api_base`, `status`, `elapsed_ms`, `jit_wait_ms`
+- `body_snippet` (500 chars) on error responses prevents log explosion
+- SSE parse errors logged at `warn!` level (not `debug!`) in both providers
+
+**Per-Request Metrics (`src/agent/metrics.rs`):**
+```
+~/.nanobot/metrics.jsonl  (one JSON object per LLM call)
+```
+- Fields: `timestamp`, `request_id`, `role`, `model`, `provider_base`, `elapsed_ms`, `prompt_tokens`, `completion_tokens`, `status`, `tool_calls_requested/executed`
+- Optional fields: `error_detail`, `anti_drift_score`, `anti_drift_signals`, `validation_result`
+- 10MB size-based rotation: current file renamed to `.jsonl.1`, fresh file started
+- Best-effort writes — failures never crash the agent loop
+
+**Log Rotation:**
+- `tracing-appender` daily rotation to `~/.nanobot/logs/`
+- `nanobot sessions purge --older-than 7d` cleans old logs and metrics
+
+**Request ID Tracking:**
+- UUID per agent turn, propagated through pipeline
+- Correlates: router decision → LLM call → tool execution → metrics
+
 ## Data Flow
 
 ### Single Message Processing
@@ -476,9 +536,12 @@ Applied to live conversation
 ```
 ~/.nanobot/
 ├── config.json           # Main configuration
-├── nanobot.log           # REPL logs
+├── metrics.jsonl          # Per-request LLM call metrics (10MB rotation)
+├── metrics.jsonl.1        # Previous metrics backup
+├── logs/                  # Daily rotated structured logs
+│   └── nanobot.2026-02-21.log
 ├── sessions/             # Conversation history
-│   └── cli_default_2026-02-20.jsonl
+│   └── cli_default_2026-02-21.jsonl
 └── workspace/
     ├── AGENTS.md         # Agent instructions
     ├── SOUL.md           # Personality
@@ -501,7 +564,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1253 tests in codebase (run `cargo test -- --list` for current count)
+- ~1340 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 
@@ -534,20 +597,14 @@ Applied to live conversation
 - Use enum-based states with state-specific data
 - Impossible to have invalid state combinations
 
-### 3. **Error Handling Inconsistency**
+### 3. **Error Handling Inconsistency** *(partially addressed)*
 **Problem:** Mix of `anyhow::Result`, `String` errors, `ToolExecutionResult`, and `LLMResponse` with `finish_reason: "error"`. Hard to track error origins.
 
-**Recommendation:**
-- Define domain error types:
-  ```rust
-  enum AgentError {
-      Provider(ProviderError),
-      Tool(ToolError),
-      Session(SessionError),
-      Context(ContextError),
-  }
-  ```
-- Use `thiserror` for structured errors
+**Progress:** `ProviderError` (6 variants) and `ToolErrorKind` (5 variants) defined in `src/errors.rs` with `thiserror`. Provider errors have `is_retryable()` classification. Tool errors have `classify_tool_error()` from string matching.
+
+**Remaining:**
+- Define top-level `AgentError` enum wrapping all domain errors
+- Eliminate `String` errors from tool execution path
 - Never wrap errors in success types
 
 ### 4. **Global Mutable State (LOCAL_MODE)**
@@ -630,20 +687,17 @@ self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
 - Consider compression instead of truncation
 - Allow tool to signal importance of output
 
-### 12. **No Rate Limiting on Provider Calls**
-**Problem:** Can exceed API rate limits during tool loops. No backoff or retry logic at agent level.
+### 12. ~~**No Rate Limiting on Provider Calls**~~ *(addressed)*
+~~**Problem:** Can exceed API rate limits during tool loops. No backoff or retry logic at agent level.~~
 
-**Recommendation:**
-- Add `RateLimiter` to provider wrapper
-- Implement exponential backoff
-- Respect `Retry-After` headers
+**Resolved:** `backon` crate provides exponential backoff with jitter on both `chat()` and `chat_stream()`. `adjust_for_rate_limit()` respects `Retry-After` headers from 429 responses. See Provider System § Retry System above.
 
 ## Minor Improvements
 
-### 13. **Logging Verbosity**
-- Add structured logging with spans
-- Include session_id, turn_number in all logs
-- Add timing metrics for performance analysis
+### 13. **Logging Verbosity** *(substantially addressed)*
+- ~~Add structured logging with spans~~ Done: `#[instrument]` on all chat methods, structured fields
+- ~~Include session_id, turn_number in all logs~~ Partially: `request_id` tracked per turn
+- ~~Add timing metrics for performance analysis~~ Done: `metrics.jsonl` with `elapsed_ms`, `jit_wait_ms`, token counts
 
 ### 14. **Configuration Validation**
 - Add schema validation on load
@@ -665,16 +719,16 @@ self.bootstrap_budget = (max_context_tokens / 50).clamp(300, 2_000); // 2%
 1. **High Impact, Medium Effort:**
    - Extract `ToolExecutionEngine` from agent_loop.rs
    - Create `ProviderRegistry` to centralize provider logic
-   - Define domain error types
+   - ~~Define domain error types~~ Done: `ProviderError`, `ToolErrorKind` (top-level `AgentError` remains)
 
 2. **High Impact, High Effort:**
    - Model turn lifecycle as state machine
    - Eliminate global LOCAL_MODE
 
 3. **Medium Impact, Low Effort:**
-   - Add rate limiting to providers
+   - ~~Add rate limiting to providers~~ Done: `backon` retry with backoff
    - Improve tool result truncation signaling
-   - Add structured logging
+   - ~~Add structured logging~~ Done: `#[instrument]` spans + `metrics.jsonl`
 
 4. **Ongoing:**
    - Increase test coverage
