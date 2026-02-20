@@ -327,12 +327,22 @@ async fn try_native_lms_chat(
 }
 
 /// For local thinking-capable models with thinking disabled: prefill the
-/// assistant response so the model skips `<think>` blocks and responds
-/// directly. Only applied when no tools are requested (tool-calling
-/// models need to start fresh to emit tool_calls).
+/// assistant response with a pre-closed `<think>` block so the model
+/// skips reasoning and responds (or tool-calls) directly.
 ///
-/// Uses a single newline — neutral enough not to bias the response style
-/// while still preventing the model from starting a `<think>` block.
+/// Works universally — with and without tools. The pre-closed block
+/// satisfies the template's expected `<think>` structure while placing
+/// the continuation point at the response/tool-call position.
+///
+/// Tested against NanBeige4.1-3B (see experiments/tool-calling/nanbeige-prefill-tests.md):
+/// - `"\n"` does NOT prevent thinking (indistinguishable from template format)
+/// - `"Sure, "` works for chat but breaks tool calling
+/// - `"<tool_call>"` skips thinking but breaks tool selection on ambiguous prompts
+/// - `"<think>\n</think>\n\n"` works for all cases: chat, tool selection, and
+///   correctly declines tools when not needed. 9/10 stress test pass rate.
+///
+/// Skipped when thinking is explicitly enabled (`/think` / `/t`) so the
+/// user can toggle reasoning on demand.
 fn apply_local_thinking_prefill(
     body: &mut serde_json::Value,
     api_base: &str,
@@ -341,17 +351,10 @@ fn apply_local_thinking_prefill(
     if !is_local_api_base(api_base) || thinking_budget.is_some() {
         return;
     }
-    let has_tools = body
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map_or(false, |a| !a.is_empty());
-    if has_tools {
-        return;
-    }
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         messages.push(serde_json::json!({
             "role": "assistant",
-            "content": "\n"
+            "content": "<think>\n</think>\n\n"
         }));
     }
 }
@@ -1711,11 +1714,11 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[1]["content"], "\n");
+        assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
     }
 
     #[test]
-    fn test_thinking_prefill_skipped_when_tools_present() {
+    fn test_thinking_prefill_added_when_tools_present() {
         let mut body = serde_json::json!({
             "model": "ministral-3-3b",
             "messages": [
@@ -1725,7 +1728,8 @@ mod tests {
         });
         apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1, "prefill should NOT be added when tools are present");
+        assert_eq!(msgs.len(), 2, "pre-closed think prefill works with tools too");
+        assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
     }
 
     #[test]
