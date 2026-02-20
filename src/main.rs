@@ -134,6 +134,11 @@ enum Commands {
         #[arg(short, long)]
         password: Option<String>,
     },
+    /// Manage sessions and log files.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
     /// Run evaluation benchmarks.
     Eval {
         #[command(subcommand)]
@@ -226,6 +231,51 @@ enum EvalAction {
 }
 
 #[derive(Subcommand)]
+enum SessionsAction {
+    /// List all sessions with date, size, and message count.
+    List,
+    /// Resume an existing session's REPL.
+    Resume {
+        /// Session key to resume (from `sessions list`).
+        key: String,
+        /// Use local LLM instead of cloud API.
+        #[arg(short, long)]
+        local: bool,
+    },
+    /// Start a fresh named session.
+    New {
+        /// Optional human-readable label (default: cli:<uuid8>).
+        #[arg(long)]
+        name: Option<String>,
+        /// Use local LLM instead of cloud API.
+        #[arg(short, long)]
+        local: bool,
+    },
+    /// Export a session to stdout (markdown or JSONL).
+    Export {
+        /// Session key to export.
+        key: String,
+        /// Output format: "md" (default) or "jsonl".
+        #[arg(long, default_value = "md")]
+        format: String,
+    },
+    /// Purge session and log files older than the given duration.
+    Purge {
+        /// Age threshold (e.g. "7d", "24h", "30d").
+        #[arg(long)]
+        older_than: String,
+    },
+    /// Gzip session files older than 24 hours.
+    Archive,
+    /// Wipe all sessions, logs, and metrics.
+    Nuke {
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ChannelsAction {
     /// Show channel status.
     Status,
@@ -311,30 +361,31 @@ fn main() {
     };
 
     if is_interactive_repl {
-        // Redirect tracing to a log file to prevent WARN logs from interleaving
-        // with streaming output on stderr. Logs are still available in the file.
-        let log_path = dirs::home_dir()
+        // Redirect tracing to a daily-rotated log file to prevent WARN logs from
+        // interleaving with streaming output on stderr.  Rolling appender produces
+        // files like `nanobot.log.2026-02-20` and keeps the current day open.
+        let log_dir = dirs::home_dir()
             .unwrap_or_default()
             .join(".nanobot")
-            .join("nanobot.log");
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .ok();
-        if let Some(file) = log_file {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_writer(std::sync::Mutex::new(file))
-                .with_ansi(false)
-                .init();
-        } else {
-            // Fallback: just write to stderr if we can't open the log file.
-            tracing_subscriber::fmt().with_env_filter(env_filter).init();
-        }
+            .join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "nanobot.log");
+
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(file_appender)
+            .json()
+            .with_ansi(false)
+            .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        command = %format!("{:?}", std::mem::discriminant(&cli.command)),
+        "nanobot started"
+    );
 
     match cli.command {
         Commands::Onboard => cli::cmd_onboard(),
@@ -411,6 +462,18 @@ fn main() {
                 port,
             } => cli::cmd_eval_sprint(corpus_size, questions, local, port),
             EvalAction::Report => cli::cmd_eval_report(),
+        },
+        Commands::Sessions { action } => match action {
+            SessionsAction::List => cli::cmd_sessions_list(),
+            SessionsAction::Resume { key, local } => repl::cmd_agent(None, key, local, None),
+            SessionsAction::New { name, local } => {
+                let key = cli::make_session_key(name.as_deref());
+                repl::cmd_agent(None, key, local, None)
+            }
+            SessionsAction::Export { key, format } => cli::cmd_sessions_export(&key, &format),
+            SessionsAction::Purge { older_than } => cli::cmd_sessions_purge(&older_than),
+            SessionsAction::Archive => cli::cmd_sessions_archive(),
+            SessionsAction::Nuke { force } => cli::cmd_sessions_nuke(force),
         },
     }
 }
@@ -515,5 +578,66 @@ mod tests {
         let output = cli::run_tune_from_path(&path, true).expect("expected JSON output");
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["profile"]["id"].as_str(), Some("balanced"));
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_resume() {
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "resume", "cli:test"]).unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::Resume { key, local } => {
+                    assert_eq!(key, "cli:test");
+                    assert!(!local);
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_new_with_name() {
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "new", "--name", "lab"]).unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::New { name, local } => {
+                    assert_eq!(name, Some("lab".to_string()));
+                    assert!(!local);
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_export() {
+        let cli =
+            Cli::try_parse_from(["nanobot", "sessions", "export", "cli:x", "--format", "jsonl"])
+                .unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::Export { key, format } => {
+                    assert_eq!(key, "cli:x");
+                    assert_eq!(format, "jsonl");
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_sessions_nuke() {
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "nuke", "--force"]).unwrap();
+        match cli.command {
+            Commands::Sessions { action } => match action {
+                SessionsAction::Nuke { force } => {
+                    assert!(force);
+                }
+                other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
     }
 }
