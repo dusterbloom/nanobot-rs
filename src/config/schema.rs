@@ -188,6 +188,16 @@ pub struct AgentDefaults {
     /// Empty = use hardcoded DEFAULT_LOCAL_MODEL fallback.
     #[serde(default)]
     pub local_model: String,
+    /// Custom API base for local inference (e.g. "http://192.168.1.22:1234/v1").
+    /// When set, local mode uses this instead of LM Studio on localhost.
+    /// All trio roles (main, router, specialist) share this endpoint; model
+    /// differentiation happens via the `model` field in each API request (JIT loading).
+    #[serde(default)]
+    pub local_api_base: String,
+    /// Context window size for local models (default: 32768).
+    /// Separate from maxContextTokens so cloud (512K) and local (32K) coexist.
+    #[serde(default = "default_local_max_context_tokens")]
+    pub local_max_context_tokens: usize,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
@@ -201,6 +211,21 @@ pub struct AgentDefaults {
     /// Max characters for inline tool results before truncation (default: 30000).
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
+    /// LM Studio model identifier for the main model (e.g. "nanbeige4.1-3b").
+    /// When empty, derived from local_model via strip_gguf_suffix.
+    #[serde(default)]
+    pub lms_main_model: String,
+    /// Port for the LM Studio server when managed by lms CLI (default: 1234).
+    #[serde(default = "default_lms_port")]
+    pub lms_port: u16,
+    /// Inference engine preference: "auto" | "lms".
+    /// Currently only LM Studio ("lms") is supported.
+    #[serde(default = "default_inference_engine")]
+    pub inference_engine: String,
+    /// Runtime flag: skip JitGate when models are pre-loaded by lms.
+    /// Not serialized to config.json.
+    #[serde(skip)]
+    pub skip_jit_gate: bool,
 }
 
 fn default_workspace() -> String {
@@ -209,6 +234,10 @@ fn default_workspace() -> String {
 
 fn default_model() -> String {
     "anthropic/claude-opus-4-5".to_string()
+}
+
+fn default_local_max_context_tokens() -> usize {
+    32768
 }
 
 fn default_max_tokens() -> u32 {
@@ -235,18 +264,32 @@ fn default_max_tool_result_chars() -> usize {
     10_000
 }
 
+fn default_lms_port() -> u16 {
+    1234
+}
+
+fn default_inference_engine() -> String {
+    "auto".to_string()
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
             workspace: default_workspace(),
             model: default_model(),
             local_model: String::new(),
+            local_api_base: String::new(),
+            local_max_context_tokens: default_local_max_context_tokens(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             max_tool_iterations: default_max_tool_iterations(),
             max_context_tokens: default_max_context_tokens(),
             max_concurrent_chats: default_max_concurrent_chats(),
             max_tool_result_chars: default_max_tool_result_chars(),
+            lms_main_model: String::new(),
+            lms_port: default_lms_port(),
+            inference_engine: default_inference_engine(),
+            skip_jit_gate: false,
         }
     }
 }
@@ -469,7 +512,7 @@ fn default_trio_router_ctx_tokens() -> usize {
 }
 
 fn default_trio_router_temperature() -> f64 {
-    0.6
+    0.2
 }
 
 fn default_trio_router_top_p() -> f64 {
@@ -494,6 +537,23 @@ fn default_trio_specialist_ctx_tokens() -> usize {
 
 fn default_trio_specialist_temperature() -> f64 {
     0.7
+}
+
+fn default_vram_cap_gb() -> f64 {
+    16.0
+}
+
+/// A URL + model pair identifying a specific model on a specific server.
+///
+/// Used for trio roles (router, specialist) so that both single-server (LM Studio)
+/// and multi-server (llama.cpp) setups are expressed the same way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEndpoint {
+    /// Full API base URL, e.g. "http://localhost:1234/v1".
+    pub url: String,
+    /// Model identifier sent in the API request, e.g. "nvidia_orchestrator-8b".
+    pub model: String,
 }
 
 /// Configuration for the SLM trio (router + specialist helpers).
@@ -537,6 +597,15 @@ pub struct TrioConfig {
     /// Temperature for the specialist LLM (default: 0.7).
     #[serde(default = "default_trio_specialist_temperature")]
     pub specialist_temperature: f64,
+    /// Explicit endpoint for the router role (takes priority over router_port + router_model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_endpoint: Option<ModelEndpoint>,
+    /// Explicit endpoint for the specialist role (takes priority over specialist_port + specialist_model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialist_endpoint: Option<ModelEndpoint>,
+    /// VRAM budget cap in GB (default: 16). Context sizes auto-computed to fit.
+    #[serde(default = "default_vram_cap_gb")]
+    pub vram_cap_gb: f64,
 }
 
 impl Default for TrioConfig {
@@ -554,6 +623,9 @@ impl Default for TrioConfig {
             specialist_port: default_trio_specialist_port(),
             specialist_ctx_tokens: default_trio_specialist_ctx_tokens(),
             specialist_temperature: default_trio_specialist_temperature(),
+            router_endpoint: None,
+            specialist_endpoint: None,
+            vram_cap_gb: default_vram_cap_gb(),
         }
     }
 }
@@ -582,7 +654,7 @@ pub struct MemoryConfig {
 
     /// Optional separate provider for memory operations.
     /// If not set, reuses the main agent's provider.
-    /// Allows pointing memory at a local llama.cpp or cheap cloud API.
+    /// Allows pointing memory at a local LM Studio or cheap cloud API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
 
@@ -1520,5 +1592,163 @@ mod tests {
             !td2.auto_local,
             "Roundtrip should preserve auto_local=false"
         );
+    }
+
+    #[test]
+    fn test_local_api_base_deserialization() {
+        let json = r#"{"agents": {"defaults": {"localApiBase": "http://192.168.1.22:1234/v1"}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.agents.defaults.local_api_base, "http://192.168.1.22:1234/v1");
+        assert!(!cfg.agents.defaults.local_api_base.is_empty());
+    }
+
+    #[test]
+    fn test_local_api_base_empty_by_default() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.agents.defaults.local_api_base.is_empty());
+    }
+
+    #[test]
+    fn test_local_max_context_tokens_default() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.agents.defaults.local_max_context_tokens, 32768);
+    }
+
+    // -- ModelEndpoint + TrioConfig endpoint tests --
+
+    #[test]
+    fn test_model_endpoint_deserialization() {
+        let json = r#"{"url": "http://localhost:1234/v1", "model": "nvidia_orchestrator-8b"}"#;
+        let ep: ModelEndpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(ep.url, "http://localhost:1234/v1");
+        assert_eq!(ep.model, "nvidia_orchestrator-8b");
+    }
+
+    #[test]
+    fn test_trio_config_endpoints_absent_by_default() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.trio.router_endpoint.is_none());
+        assert!(cfg.trio.specialist_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_trio_config_router_endpoint_lmstudio() {
+        // Single LM Studio server: both roles share same URL, different models.
+        let json = r#"{
+            "trio": {
+                "enabled": true,
+                "routerEndpoint": {
+                    "url": "http://localhost:1234/v1",
+                    "model": "nvidia_orchestrator-8b"
+                },
+                "specialistEndpoint": {
+                    "url": "http://localhost:1234/v1",
+                    "model": "ministral-3-8b-instruct-2512"
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.trio.enabled);
+        let re = cfg.trio.router_endpoint.as_ref().unwrap();
+        assert_eq!(re.url, "http://localhost:1234/v1");
+        assert_eq!(re.model, "nvidia_orchestrator-8b");
+        let se = cfg.trio.specialist_endpoint.as_ref().unwrap();
+        assert_eq!(se.url, "http://localhost:1234/v1");
+        assert_eq!(se.model, "ministral-3-8b-instruct-2512");
+    }
+
+    #[test]
+    fn test_trio_config_endpoint_separate_servers() {
+        // llama.cpp: separate servers on different ports.
+        let json = r#"{
+            "trio": {
+                "routerEndpoint": {
+                    "url": "http://localhost:8094/v1",
+                    "model": "orchestrator"
+                },
+                "specialistEndpoint": {
+                    "url": "http://localhost:8095/v1",
+                    "model": "specialist"
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let re = cfg.trio.router_endpoint.as_ref().unwrap();
+        assert_eq!(re.url, "http://localhost:8094/v1");
+        let se = cfg.trio.specialist_endpoint.as_ref().unwrap();
+        assert_eq!(se.url, "http://localhost:8095/v1");
+    }
+
+    #[test]
+    fn test_trio_config_backwards_compat_port_model() {
+        // Old-style config with routerPort + routerModel still works.
+        let json = r#"{
+            "trio": {
+                "enabled": true,
+                "routerModel": "nemotron-orchestrator",
+                "routerPort": 8094
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.trio.enabled);
+        assert_eq!(cfg.trio.router_model, "nemotron-orchestrator");
+        assert_eq!(cfg.trio.router_port, 8094);
+        assert!(cfg.trio.router_endpoint.is_none(), "endpoint should be absent when not set");
+    }
+
+    #[test]
+    fn test_trio_config_endpoint_roundtrip() {
+        let trio = TrioConfig {
+            enabled: true,
+            router_endpoint: Some(ModelEndpoint {
+                url: "http://localhost:1234/v1".to_string(),
+                model: "router-model".to_string(),
+            }),
+            specialist_endpoint: Some(ModelEndpoint {
+                url: "http://localhost:1234/v1".to_string(),
+                model: "specialist-model".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&trio).unwrap();
+        let trio2: TrioConfig = serde_json::from_str(&json).unwrap();
+        assert!(trio2.router_endpoint.is_some());
+        assert_eq!(trio2.router_endpoint.unwrap().model, "router-model");
+        assert!(trio2.specialist_endpoint.is_some());
+        assert_eq!(trio2.specialist_endpoint.unwrap().model, "specialist-model");
+    }
+
+    #[test]
+    fn test_trio_vram_cap_gb_default() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!((cfg.trio.vram_cap_gb - 16.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_trio_vram_cap_gb_roundtrip() {
+        let mut trio = TrioConfig::default();
+        trio.vram_cap_gb = 12.0;
+        let json = serde_json::to_string(&trio).unwrap();
+        let trio2: TrioConfig = serde_json::from_str(&json).unwrap();
+        assert!((trio2.vram_cap_gb - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_trio_vram_cap_gb_from_json() {
+        let json = r#"{"trio": {"vramCapGb": 8.5}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!((cfg.trio.vram_cap_gb - 8.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_trio_config_endpoint_not_serialized_when_none() {
+        let trio = TrioConfig::default();
+        let json = serde_json::to_string(&trio).unwrap();
+        assert!(!json.contains("routerEndpoint"), "None endpoints should be skipped");
+        assert!(!json.contains("specialistEndpoint"), "None endpoints should be skipped");
     }
 }

@@ -472,8 +472,8 @@ pub(crate) fn print_mode_banner(local_port: &str) {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     println!();
     if is_local {
-        println!("  {BOLD}{YELLOW}LOCAL MODE{RESET} {DIM}llama.cpp on port {local_port}{RESET}");
         let props_url = format!("http://localhost:{}/props", local_port);
+        println!("  {BOLD}{YELLOW}LOCAL MODE{RESET} {DIM}LM Studio on port {local_port}{RESET}");
         if let Ok(resp) = reqwest::blocking::get(&props_url) {
             if let Ok(json) = resp.json::<serde_json::Value>() {
                 if let Some(model) = json
@@ -533,7 +533,13 @@ pub(crate) fn print_startup_splash(local_port: &str) {
 
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     if is_local {
-        println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}llama.cpp :{local_port}{RESET}");
+        let config = load_config(None);
+        let base = &config.agents.defaults.local_api_base;
+        if !base.is_empty() {
+            println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}{base}{RESET}");
+        } else {
+            println!("  {BOLD}{YELLOW}LOCAL{RESET} {DIM}LM Studio :{local_port}{RESET}");
+        }
     } else {
         let config = load_config(None);
         println!(

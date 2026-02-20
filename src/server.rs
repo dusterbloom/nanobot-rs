@@ -1,14 +1,12 @@
-//! Local LLM server management: llama-server spawn/health, GGUF parser, context sizing.
+//! Local LLM utilities: health checks, GGUF parser, model listing, context sizing.
 //!
-//! Handles spawning and managing llama.cpp server processes (main model + compaction),
-//! parsing GGUF model metadata for auto-sizing context windows, and detecting available
-//! system memory (VRAM/RAM).
+//! Server lifecycle (spawning, process management) is handled by LM Studio via
+//! the `lms` module. This module provides shared utilities used across the codebase.
 
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::process::Command;
 
 use tracing::debug;
 
@@ -17,10 +15,6 @@ use tracing::debug;
 // ============================================================================
 
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
-
-const COMPACTION_MODEL_URL: &str =
-    "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf";
-const COMPACTION_MODEL_FILENAME: &str = "Qwen3-1.7B-Q4_K_M.gguf";
 
 // ============================================================================
 // GGUF Metadata
@@ -35,7 +29,7 @@ pub(crate) struct GgufModelInfo {
 }
 
 // ============================================================================
-// Function Implementations
+// Port & Model Utilities
 // ============================================================================
 
 /// Find an available TCP port starting from `start`.
@@ -104,440 +98,9 @@ pub(crate) fn resolve_local_model_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Ensure the dedicated compaction model is available locally.
-///
-/// Downloads Qwen3-1.7B Q4_K_M (~1.1GB) to `~/.nanobot/models/` if not already
-/// present. Returns `None` on failure (graceful degradation — compaction just
-/// gets skipped and the system falls back to `trim_to_fit`).
-pub(crate) fn ensure_compaction_model() -> Option<PathBuf> {
-    let models_dir = dirs::home_dir()?.join(".nanobot").join("models");
-    std::fs::create_dir_all(&models_dir).ok()?;
-
-    let model_path = models_dir.join(COMPACTION_MODEL_FILENAME);
-    if model_path.exists() {
-        return Some(model_path);
-    }
-
-    println!(
-        "  {}{}Downloading{} compaction model (Qwen3-1.7B, ~1.1GB)...",
-        crate::tui::BOLD,
-        crate::tui::YELLOW,
-        crate::tui::RESET
-    );
-
-    let tmp_path = models_dir.join(format!("{}.downloading", COMPACTION_MODEL_FILENAME));
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut resp = reqwest::blocking::get(COMPACTION_MODEL_URL)?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()).into());
-        }
-        let mut file = std::fs::File::create(&tmp_path)?;
-        resp.copy_to(&mut file)?;
-        std::fs::rename(&tmp_path, &model_path)?;
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            println!(
-                "  {}{}Done{} — saved to {}",
-                crate::tui::BOLD,
-                crate::tui::GREEN,
-                crate::tui::RESET,
-                model_path.display()
-            );
-            Some(model_path)
-        }
-        Err(e) => {
-            println!(
-                "  {}{}Download failed:{} {} (compaction will use trim_to_fit fallback)",
-                crate::tui::BOLD,
-                crate::tui::YELLOW,
-                crate::tui::RESET,
-                e
-            );
-            // Clean up partial download
-            let _ = std::fs::remove_file(&tmp_path);
-            None
-        }
-    }
-}
-
-/// Start the dedicated compaction server if the model is available.
-///
-/// Downloads the model on first run, spawns a GPU-accelerated llama-server on
-/// port 8090+ with context matching the main model, and stores the process
-/// handle and port. Gracefully degrades if anything fails.
-pub(crate) async fn start_compaction_if_available(
-    compaction_process: &mut Option<Child>,
-    compaction_port: &mut Option<String>,
-    main_ctx_size: usize,
-) {
-    // Already running?
-    if compaction_process.is_some() {
-        return;
-    }
-
-    let model_path = match ensure_compaction_model() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let port = find_available_port(8090);
-    println!(
-        "  {}{}Starting{} compaction server on port {} (ctx: {}K, GPU)...",
-        crate::tui::BOLD,
-        crate::tui::YELLOW,
-        crate::tui::RESET,
-        port,
-        main_ctx_size / 1024,
-    );
-
-    let (reserve, cap) = role_gpu_policy("compaction");
-    let gpu_layers = compute_gpu_layers_with_policy(&model_path, main_ctx_size, reserve, cap);
-    match spawn_server_with_adaptive_layers(
-        port,
-        &model_path,
-        main_ctx_size,
-        "compaction",
-        15,
-        gpu_layers,
-    )
-    .await
-    {
-        Ok((child, used_layers)) => {
-            record_server_pid("compaction", child.id());
-            *compaction_process = Some(child);
-            *compaction_port = Some(port.to_string());
-            let gpu_label = if used_layers == 0 { "CPU fallback" } else { "GPU" };
-            println!(
-                "  {}{}Compaction server ready{} (Qwen3-1.7B on {})",
-                crate::tui::BOLD,
-                crate::tui::GREEN,
-                crate::tui::RESET,
-                gpu_label
-            );
-        }
-        Err(e) => {
-            println!(
-                "  {}{}Compaction server failed:{} {} (using trim_to_fit fallback)",
-                crate::tui::BOLD,
-                crate::tui::YELLOW,
-                crate::tui::RESET,
-                e
-            );
-            *compaction_process = None;
-        }
-    }
-}
-
-/// Stop the compaction server and clear state.
-pub(crate) fn stop_compaction_server(
-    compaction_process: &mut Option<Child>,
-    compaction_port: &mut Option<String>,
-) {
-    if let Some(ref mut child) = compaction_process {
-        let pid = child.id();
-        child.kill().ok();
-        child.wait().ok();
-        unrecord_server_pid(pid);
-    }
-    *compaction_process = None;
-    *compaction_port = None;
-}
-
 // ============================================================================
-// Delegation server (auto-spawned for tool delegation in local mode)
+// GGUF Parser
 // ============================================================================
-
-/// Model preferences for the auto-spawned delegation server, in priority order.
-/// The first model found in `~/models/` wins.
-const DELEGATION_MODEL_PREFERENCES: &[&str] = &[
-    "Ministral-3",
-    "nanbeige",
-    "Qwen3-0.6B",
-    "Ministral-8B",
-    "Nemotron-Nano-9B",
-];
-
-/// Find a suitable delegation model from `~/models/` using the preference list.
-///
-/// Scans `list_local_models()` and returns the first match against
-/// `DELEGATION_MODEL_PREFERENCES` (case-insensitive substring match).
-pub(crate) fn find_delegation_model() -> Option<PathBuf> {
-    pick_preferred_model(&list_local_models(), DELEGATION_MODEL_PREFERENCES)
-}
-
-/// Pure priority-matching: given a list of model paths and an ordered preference
-/// list, return the first model that matches the highest-priority preference
-/// (case-insensitive substring match on filename).
-fn pick_preferred_model(models: &[PathBuf], preferences: &[&str]) -> Option<PathBuf> {
-    for pref in preferences {
-        let pref_lower = pref.to_lowercase();
-        if let Some(m) = models.iter().find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_lowercase().contains(&pref_lower))
-                .unwrap_or(false)
-        }) {
-            return Some(m.clone());
-        }
-    }
-    None
-}
-
-/// Start the dedicated delegation server if a suitable model is available.
-///
-/// Spawns a GPU-accelerated llama-server on port 8091+ with a small context
-/// window (4096 tokens — tool work is short). Uses 10 GPU layers to avoid
-/// competing with the main model for VRAM.
-pub(crate) async fn start_delegation_if_available(
-    delegation_process: &mut Option<Child>,
-    delegation_port: &mut Option<String>,
-) {
-    // Already running?
-    if delegation_process.is_some() {
-        return;
-    }
-
-    let model_path = match find_delegation_model() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let model_name = model_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("delegation-model");
-    let port = find_available_port(8091);
-    let ctx_size = 8192; // Small models handle 8K fine; 4K caused ctx overflow
-
-    // Compute GPU layers based on available VRAM (after main model is loaded).
-    let (reserve, cap) = role_gpu_policy("delegation");
-    let gpu_layers = compute_gpu_layers_with_policy(&model_path, ctx_size, reserve, cap);
-    let gpu_label = if gpu_layers >= 99 {
-        "full GPU".to_string()
-    } else if gpu_layers == 0 {
-        "CPU".to_string()
-    } else {
-        format!("{} GPU layers", gpu_layers)
-    };
-
-    println!(
-        "  {}{}Starting{} delegation server ({}, port {}, ctx: {}K, {})...",
-        crate::tui::BOLD,
-        crate::tui::YELLOW,
-        crate::tui::RESET,
-        model_name,
-        port,
-        ctx_size / 1024,
-        gpu_label,
-    );
-
-    match spawn_server_with_adaptive_layers(
-        port,
-        &model_path,
-        ctx_size,
-        "delegation",
-        30,
-        gpu_layers,
-    )
-    .await
-    {
-        Ok((child, used_layers)) => {
-            record_server_pid("delegation", child.id());
-            *delegation_process = Some(child);
-            *delegation_port = Some(port.to_string());
-            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
-            println!(
-                "  {}{}Delegation server ready{} ({} on {})",
-                crate::tui::BOLD,
-                crate::tui::GREEN,
-                crate::tui::RESET,
-                model_name,
-                run_mode,
-            );
-        }
-        Err(e) => {
-            println!(
-                "  {}{}Delegation server failed:{} {} (tool delegation will use main model)",
-                crate::tui::BOLD,
-                crate::tui::YELLOW,
-                crate::tui::RESET,
-                e,
-            );
-            *delegation_process = None;
-        }
-    }
-}
-
-/// Stop the delegation server and clear state.
-pub(crate) fn stop_delegation_server(
-    delegation_process: &mut Option<Child>,
-    delegation_port: &mut Option<String>,
-) {
-    if let Some(ref mut child) = delegation_process {
-        let pid = child.id();
-        child.kill().ok();
-        child.wait().ok();
-        unrecord_server_pid(pid);
-    }
-    *delegation_process = None;
-    *delegation_port = None;
-}
-
-/// Start a custom llama.cpp server (router/specialist) using a known port.
-pub(crate) async fn start_custom_server(
-    process: &mut Option<Child>,
-    port_slot: &mut Option<String>,
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-    role: &str,
-) {
-    if process.is_some() {
-        return;
-    }
-
-    let model_name = model_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(role);
-
-    println!(
-        "  {}{}Starting{} {} server (port {}, ctx: {}K)...",
-        crate::tui::BOLD,
-        crate::tui::YELLOW,
-        crate::tui::RESET,
-        model_name,
-        port,
-        ctx_size / 1024,
-    );
-
-    let (reserve, cap) = role_gpu_policy(role);
-    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
-    match spawn_server_with_adaptive_layers(port, model_path, ctx_size, role, 30, gpu_layers).await
-    {
-        Ok((child, used_layers)) => {
-            record_server_pid(role, child.id());
-            *process = Some(child);
-            *port_slot = Some(port.to_string());
-            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
-            println!(
-                "  {}{}{} server ready{} ({})",
-                crate::tui::BOLD,
-                crate::tui::GREEN,
-                model_name,
-                crate::tui::RESET,
-                run_mode
-            );
-        }
-        Err(e) => {
-            println!(
-                "  {}{}{} server failed:{} {}{}",
-                crate::tui::BOLD,
-                crate::tui::YELLOW,
-                model_name,
-                crate::tui::RESET,
-                e,
-                crate::tui::RESET,
-            );
-            *process = None;
-            *port_slot = None;
-        }
-    }
-}
-
-/// Stop a custom server and clear its port record.
-pub(crate) fn stop_custom_server(process: &mut Option<Child>, port_slot: &mut Option<String>) {
-    if let Some(ref mut child) = process {
-        let pid = child.id();
-        child.kill().ok();
-        child.wait().ok();
-        unrecord_server_pid(pid);
-    }
-    *process = None;
-    *port_slot = None;
-}
-
-/// Path to the PID file for tracking spawned llama-server processes.
-fn pid_file_path() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".nanobot").join(".server-pids"))
-}
-
-/// Record a server PID in the tracking file (format: `role:pid` per line).
-pub(crate) fn record_server_pid(role: &str, pid: u32) {
-    if let Some(path) = pid_file_path() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{}:{}", role, pid);
-        }
-    }
-}
-
-/// Remove a specific PID from the tracking file.
-pub(crate) fn unrecord_server_pid(pid: u32) {
-    if let Some(path) = pid_file_path() {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            let remaining: Vec<&str> = contents
-                .lines()
-                .filter(|line| {
-                    line.split(':').nth(1).and_then(|p| p.parse::<u32>().ok()) != Some(pid)
-                })
-                .collect();
-            if remaining.is_empty() {
-                std::fs::remove_file(&path).ok();
-            } else {
-                std::fs::write(&path, remaining.join("\n") + "\n").ok();
-            }
-        }
-    }
-}
-
-/// Kill llama-server processes tracked from previous nanobot runs.
-///
-/// Only kills PIDs recorded in `~/.nanobot/.server-pids`, not system-wide.
-/// Replaces the former `pkill -f llama-server` approach.
-pub(crate) fn kill_tracked_servers() {
-    let path = match pid_file_path() {
-        Some(p) => p,
-        None => return,
-    };
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return, // No PID file — nothing to kill
-    };
-
-    for line in contents.lines() {
-        if let Some(pid_str) = line.split(':').nth(1) {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                // Send SIGKILL to the specific PID (safe: only our tracked PIDs)
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
-
-    // Clean up the file
-    std::fs::remove_file(&path).ok();
-    // Brief pause to let ports be released
-    std::thread::sleep(std::time::Duration::from_millis(300));
-}
-
-/// Kill any orphaned llama-server processes from previous runs.
-///
-/// Uses PID-based tracking. Falls back to the tracking file only.
-pub(crate) fn kill_stale_llama_servers() {
-    kill_tracked_servers();
-}
 
 /// Parse architecture-specific metadata from a GGUF file header.
 pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
@@ -670,10 +233,13 @@ pub(crate) fn parse_gguf_metadata(path: &Path) -> Option<GgufModelInfo> {
     })
 }
 
+// ============================================================================
+// Memory & Context Sizing
+// ============================================================================
+
 /// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
 /// Returns (vram_bytes, ram_bytes).
 pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
-    // Try VRAM via nvidia-smi
     let vram = Command::new("nvidia-smi")
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output()
@@ -687,7 +253,6 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
         })
         .map(|mib| mib * 1024 * 1024);
 
-    // RAM via /proc/meminfo
     let ram = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|contents| {
@@ -705,35 +270,24 @@ pub(crate) fn detect_available_memory() -> (Option<u64>, u64) {
 }
 
 /// Practical context cap based on model file size (proxy for parameter count).
-///
-/// Small models become unresponsive with very large contexts — attention is O(n²)
-/// and they lack the capacity to utilize long contexts effectively.
 pub(crate) fn practical_context_cap(model_file_size_bytes: u64) -> usize {
     let gb = model_file_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if gb < 2.0 {
         8192
-    }
-    // tiny (~1-3B heavy quant)
-    else if gb < 4.0 {
+    } else if gb < 4.0 {
         16384
-    }
-    // small (~3-7B)
-    else if gb < 8.0 {
+    } else if gb < 8.0 {
         32768
-    }
-    // medium (~7-14B)
-    else if gb < 16.0 {
+    } else if gb < 16.0 {
         65536
-    }
-    // large (~14-30B)
-    else {
+    } else {
         usize::MAX
-    } // xlarge (30B+) — no cap
+    }
 }
 
-/// Compute optimal --ctx-size for a GGUF model given available system resources.
+/// Compute optimal context size for a GGUF model given available system resources.
 pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
-    const OVERHEAD: u64 = 512 * 1024 * 1024; // 512 MB
+    const OVERHEAD: u64 = 512 * 1024 * 1024;
     const FALLBACK_CTX: usize = 16384;
 
     let model_file_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
@@ -741,7 +295,6 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
     let gguf = match parse_gguf_metadata(model_path) {
         Some(info) => info,
         None => {
-            // GGUF parse failed — use practical cap based on file size, or fallback
             let cap = practical_context_cap(model_file_size).min(FALLBACK_CTX);
             debug!(
                 "GGUF parse failed for {}, using {}K context (file size: {:.1}GB)",
@@ -754,18 +307,15 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
     };
 
     let head_dim = gguf.embedding_dim / gguf.n_heads;
-    // KV cache per token (FP16): 2 (K+V) × layers × kv_heads × head_dim × 2 bytes
     let kv_per_token = 2u64 * gguf.n_layers as u64 * gguf.n_kv_heads as u64 * head_dim as u64 * 2;
 
     let (vram, ram) = detect_available_memory();
 
     let available_for_kv = if let Some(vram_bytes) = vram {
-        // GPU mode: VRAM must hold model weights + KV cache
         vram_bytes
             .saturating_sub(model_file_size)
             .saturating_sub(OVERHEAD)
     } else {
-        // CPU mode: weights are mmap'd, RAM mainly for KV cache
         ram.saturating_sub(OVERHEAD)
     };
 
@@ -777,12 +327,10 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
 
     let max_ctx_from_memory = (available_for_kv / kv_per_token) as usize;
     let cap = practical_context_cap(model_file_size);
-    // Clamp: at least 4096, at most min(memory allows, GGUF native, practical cap)
     let ctx = max_ctx_from_memory
         .max(4096)
         .min(gguf.context_length as usize)
         .min(cap);
-    // Round down to nearest 1024
     let ctx = (ctx / 1024) * 1024;
 
     let mem_source = if vram.is_some() { "VRAM" } else { "RAM" };
@@ -797,443 +345,328 @@ pub(crate) fn compute_optimal_context_size(model_path: &Path) -> usize {
     ctx
 }
 
-/// Spawn a llama-server for context compaction (summarization).
-///
-/// Uses GPU acceleration and matches the main model's context size so
-/// large conversations can be summarized in a single LLM call.
-/// Estimate VRAM needed to fully offload a GGUF model (weights + small KV cache).
-///
-/// Returns bytes needed for full GPU offload. Uses file size as a proxy for
-/// weight memory (GGUF file ≈ quantized weights + small overhead).
-pub(crate) fn estimate_model_vram(model_path: &Path, ctx_size: usize) -> u64 {
-    let file_size = std::fs::metadata(model_path)
-        .map(|m| m.len())
-        .unwrap_or(5 * 1024 * 1024 * 1024); // 5GB fallback
+// ============================================================================
+// VRAM Budget Types
+// ============================================================================
 
-    // Parse GGUF for KV cache estimation if possible.
-    let kv_bytes = match parse_gguf_metadata(model_path) {
-        Some(meta) => {
-            let head_dim = meta.embedding_dim / meta.n_heads.max(1);
-            let kv_per_token = 2 * meta.n_layers * meta.n_kv_heads * head_dim * 2;
-            (kv_per_token as u64 * ctx_size as u64)
+/// Hardware-relevant metadata for a single model (extracted once, reused for budget computation).
+#[derive(Debug, Clone)]
+pub(crate) struct ModelProfile {
+    pub name: String,
+    /// Model file size in bytes (determines base VRAM for weights).
+    pub file_size_bytes: u64,
+    /// KV cache cost per token in bytes.
+    /// Computed from GGUF: 2 * n_layers * n_kv_heads * head_dim * 2.
+    pub kv_bytes_per_token: u64,
+    /// Maximum context length the model architecture supports.
+    pub max_context_length: usize,
+    /// Practical context cap from file-size heuristic.
+    pub practical_cap: usize,
+}
+
+/// Input to the VRAM budget solver. All fields are plain data -- no I/O.
+#[derive(Debug, Clone)]
+pub(crate) struct VramBudgetInput {
+    /// Available VRAM in bytes (or RAM if no GPU).
+    pub available_memory: u64,
+    /// Hard cap on total VRAM usage (default: 16GB from config).
+    pub vram_cap: u64,
+    /// Per-server overhead in bytes (default: 512MB).
+    pub overhead_per_model: u64,
+    /// Main model profile (always present in local mode).
+    pub main: ModelProfile,
+    /// Router model profile (None if trio disabled or no router set).
+    pub router: Option<ModelProfile>,
+    /// Specialist model profile (None if trio disabled or no specialist set).
+    pub specialist: Option<ModelProfile>,
+}
+
+/// Per-model breakdown in a VRAM budget result.
+#[derive(Debug, Clone)]
+pub(crate) struct VramModelBreakdown {
+    pub role: String,
+    pub name: String,
+    pub weights_bytes: u64,
+    pub kv_cache_bytes: u64,
+    pub context_tokens: usize,
+    pub overhead_bytes: u64,
+}
+
+/// Computed context sizes and VRAM usage for each role.
+#[derive(Debug, Clone)]
+pub(crate) struct VramBudgetResult {
+    pub main_ctx: usize,
+    pub router_ctx: usize,
+    pub specialist_ctx: usize,
+    pub total_vram_bytes: u64,
+    pub effective_limit_bytes: u64,
+    pub fits: bool,
+    pub breakdown: Vec<VramModelBreakdown>,
+}
+
+// ============================================================================
+// VRAM Budget Pure Functions
+// ============================================================================
+
+/// Build a ModelProfile from GGUF metadata and file size. Pure function.
+pub(crate) fn build_model_profile(
+    name: &str,
+    file_size_bytes: u64,
+    gguf: Option<&GgufModelInfo>,
+) -> ModelProfile {
+    let (kv_bytes_per_token, max_context_length) = match gguf {
+        Some(info) => {
+            let head_dim = if info.n_heads > 0 {
+                info.embedding_dim / info.n_heads
+            } else {
+                128 // fallback
+            };
+            let kv = 2u64
+                * info.n_layers as u64
+                * info.n_kv_heads as u64
+                * head_dim as u64
+                * 2; // fp16
+            (kv, info.context_length as usize)
+        }
+        None => (0, 32768),
+    };
+    ModelProfile {
+        name: name.to_string(),
+        file_size_bytes,
+        kv_bytes_per_token,
+        max_context_length,
+        practical_cap: practical_context_cap(file_size_bytes),
+    }
+}
+
+/// Estimate file size from model name (e.g. "qwen3-1.7b" -> ~1.1GB Q4_K_M).
+pub(crate) fn estimate_file_size_from_name(name: &str) -> u64 {
+    let lower = name.to_lowercase();
+    // Extract param count from common patterns: "1.7b", "3b", "8b", "9b", "14b", "70b"
+    let param_billions: Option<f64> = {
+        let mut result = None;
+        // Try patterns like "-1.7b", "-3b", "_8b", etc.
+        for separator in &["-", "_", " "] {
+            for part in lower.split(separator) {
+                if let Some(num_str) = part.strip_suffix('b') {
+                    if let Ok(n) = num_str.parse::<f64>() {
+                        if n > 0.1 && n < 1000.0 {
+                            result = Some(n);
+                            break;
+                        }
+                    }
+                }
+            }
+            if result.is_some() {
+                break;
+            }
+        }
+        result
+    };
+
+    match param_billions {
+        Some(params) => {
+            // Q4_K_M is roughly 0.6 bytes per param
+            (params * 0.6 * 1e9) as u64
         }
         None => {
-            // Rough estimate: ~2MB per 1K context for 8B model
-            (ctx_size as u64 / 1024) * 2 * 1024 * 1024
+            // Conservative fallback: assume ~3B model
+            2_000_000_000
         }
-    };
-
-    file_size + kv_bytes + 256 * 1024 * 1024 // weights + KV + 256MB overhead
+    }
 }
 
-/// Compute how many GPU layers a model can use given available VRAM.
+/// Compute optimal context sizes for all models to fit within VRAM budget.
 ///
-/// If the model fits entirely, returns 99 (full offload). Otherwise,
-/// proportionally allocates layers based on how much VRAM is free.
-pub(crate) fn compute_gpu_layers_for_model(model_path: &Path, ctx_size: usize) -> u32 {
-    compute_gpu_layers_with_policy(model_path, ctx_size, 0, None)
-}
+/// Priority order: main gets the largest share, specialist next, router least.
+/// Each role has a minimum context (main: 4096, specialist: 4096, router: 2048).
+pub(crate) fn compute_vram_budget(input: &VramBudgetInput) -> VramBudgetResult {
+    const MIN_MAIN_CTX: usize = 4096;
+    const MIN_ROUTER_CTX: usize = 2048;
+    const MIN_SPECIALIST_CTX: usize = 4096;
 
-/// Compute GPU layers with explicit reserve/cap policy.
-///
-/// - `reserve_vram_bytes`: VRAM to keep free for stability.
-/// - `max_layers_cap`: hard ceiling for auxiliary lanes.
-pub(crate) fn compute_gpu_layers_with_policy(
-    model_path: &Path,
-    ctx_size: usize,
-    reserve_vram_bytes: u64,
-    max_layers_cap: Option<u32>,
-) -> u32 {
-    let (vram, _ram) = detect_available_memory();
-    let Some(free_vram) = vram else {
-        return 0; // No GPU detected
-    };
-    let usable_vram = free_vram.saturating_sub(reserve_vram_bytes);
+    let effective_limit = input.available_memory.min(input.vram_cap);
 
-    let needed = estimate_model_vram(model_path, ctx_size);
+    // Count models and compute fixed costs (weights + overhead)
+    let mut model_count: u64 = 1; // main always
+    let mut fixed_cost: u64 = input.main.file_size_bytes + input.overhead_per_model;
 
-    let mut layers = if usable_vram >= needed {
-        99 // Full offload — plenty of room
-    } else if usable_vram < 512 * 1024 * 1024 {
-        0 // Less than 512MB free — CPU only
+    if let Some(ref router) = input.router {
+        model_count += 1;
+        fixed_cost += router.file_size_bytes + input.overhead_per_model;
+    }
+    if let Some(ref specialist) = input.specialist {
+        model_count += 1;
+        fixed_cost += specialist.file_size_bytes + input.overhead_per_model;
+    }
+    let _ = model_count; // used for breakdown
+
+    // If fixed costs alone exceed limit, we can't fit even with minimum contexts
+    if fixed_cost >= effective_limit {
+        let main_ctx = MIN_MAIN_CTX;
+        let router_ctx = if input.router.is_some() { MIN_ROUTER_CTX } else { 0 };
+        let specialist_ctx = if input.specialist.is_some() { MIN_SPECIALIST_CTX } else { 0 };
+
+        let main_kv = main_ctx as u64 * input.main.kv_bytes_per_token;
+        let router_kv = input.router.as_ref().map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
+        let spec_kv = input.specialist.as_ref().map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
+        let total = fixed_cost + main_kv + router_kv + spec_kv;
+
+        let breakdown = build_breakdown(input, main_ctx, router_ctx, specialist_ctx);
+
+        return VramBudgetResult {
+            main_ctx,
+            router_ctx,
+            specialist_ctx,
+            total_vram_bytes: total,
+            effective_limit_bytes: effective_limit,
+            fits: false,
+            breakdown,
+        };
+    }
+
+    let remaining = effective_limit - fixed_cost;
+
+    // Weighted proportional allocation: main=4, specialist=2, router=1
+    let main_weight: u64 = 4;
+    let router_weight: u64 = if input.router.is_some() { 1 } else { 0 };
+    let specialist_weight: u64 = if input.specialist.is_some() { 2 } else { 0 };
+    let total_weight = main_weight + router_weight + specialist_weight;
+
+    // Allocate remaining bytes proportionally
+    let main_kv_budget = remaining * main_weight / total_weight;
+    let router_kv_budget = if input.router.is_some() {
+        remaining * router_weight / total_weight
     } else {
-        // Proportional: if we have 60% of needed VRAM, use ~60% of layers.
-        // Parse layer count from GGUF, fall back to 32 (typical for 8B models).
-        let total_layers = parse_gguf_metadata(model_path)
-            .map(|m| m.n_layers)
-            .unwrap_or(32) as u64;
-        let proportion = usable_vram as f64 / needed as f64;
-        let layers = (total_layers as f64 * proportion).floor() as u32;
-        layers.max(1) // At least 1 layer on GPU
+        0
+    };
+    let specialist_kv_budget = if input.specialist.is_some() {
+        remaining * specialist_weight / total_weight
+    } else {
+        0
     };
 
-    if let Some(cap) = max_layers_cap {
-        if layers == 99 {
-            layers = cap.max(1);
-        } else {
-            layers = layers.min(cap.max(1));
-        }
-    }
-
-    layers
-}
-
-/// Role-aware defaults to reduce VRAM contention between lanes.
-fn role_gpu_policy(role: &str) -> (u64, Option<u32>) {
-    const MAIN_RESERVE: u64 = 1024 * 1024 * 1024; // 1GB headroom
-    const AUX_RESERVE: u64 = 2 * 1024 * 1024 * 1024; // 2GB headroom
-    match role {
-        "main" => (MAIN_RESERVE, None),
-        "compaction" => (AUX_RESERVE, Some(8)),
-        "delegation" => (AUX_RESERVE, Some(12)),
-        "trio-router" => (AUX_RESERVE, Some(6)),
-        "trio-specialist" => (AUX_RESERVE, Some(10)),
-        _ => (AUX_RESERVE, Some(12)),
-    }
-}
-
-/// Configuration for spawning a llama-server process.
-pub(crate) struct SpawnConfig<'a> {
-    pub port: u16,
-    pub model_path: &'a Path,
-    pub ctx_size: usize,
-    pub gpu_layers: u32,
-    pub role: &'a str, // "main", "compaction", "delegation" — for error messages
-}
-
-/// Spawn a llama-server with the given configuration.
-///
-/// Single implementation replacing the former per-role spawn functions.
-pub(crate) fn spawn_server(config: &SpawnConfig) -> Result<Child, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let server_path = home.join("llama.cpp/build/bin/llama-server");
-
-    if !server_path.exists() {
-        return Err(format!(
-            "llama-server not found at {}",
-            server_path.display()
-        ));
-    }
-    if !config.model_path.exists() {
-        return Err(format!(
-            "{} model not found at {}",
-            capitalize(config.role),
-            config.model_path.display()
-        ));
-    }
-
-    // Compute optimal thread count (leave 2 for system)
-    let num_threads = std::thread::available_parallelism()
-        .map(|p| p.get().saturating_sub(2))
-        .unwrap_or(4)
-        .max(1);
-    
-    // Batch size: smaller for stability with large contexts
-    let batch_size = if config.ctx_size > 32000 { 256 } else { 512 };
-
-    Command::new(&server_path)
-        .arg("--model")
-        .arg(config.model_path)
-        .arg("--port")
-        .arg(config.port.to_string())
-        .arg("--ctx-size")
-        .arg(config.ctx_size.to_string())
-        .arg("--parallel")
-        .arg("1")
-        .arg("--n-gpu-layers")
-        .arg(config.gpu_layers.to_string())
-        .arg("--threads")
-        .arg(num_threads.to_string())
-        .arg("--batch-size")
-        .arg(batch_size.to_string())
-        .arg("--ubatch-size")
-        .arg("128")
-        .arg("--flash-attn")
-        .arg("on")
-        .arg("--jinja")
-        .arg("--no-prefill-assistant")
-        // Memory-mapped for stability (don't load full model to RAM)
-        .arg("--mlock")
-        // Graceful handling of long contexts
-        .arg("--cache-reuse")
-        .arg("256")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {} server: {}", config.role, e))
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
-/// Convenience wrapper: spawn the main model server (full GPU offload).
-pub(crate) fn spawn_llama_server(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-) -> Result<Child, String> {
-    let (reserve, cap) = role_gpu_policy("main");
-    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
-    spawn_server(&SpawnConfig {
-        port,
-        model_path,
-        ctx_size,
-        gpu_layers,
-        role: "main",
-    })
-}
-
-/// Start main server with adaptive GPU-layer retries for VRAM stability.
-pub(crate) async fn spawn_main_server_adaptive(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-) -> Result<(Child, u32), String> {
-    let (reserve, cap) = role_gpu_policy("main");
-    let gpu_layers = compute_gpu_layers_with_policy(model_path, ctx_size, reserve, cap);
-    spawn_server_with_adaptive_layers(port, model_path, ctx_size, "main", 120, gpu_layers).await
-}
-
-fn gpu_layer_retry_plan(initial_layers: u32) -> Vec<u32> {
-    let mut plan = Vec::new();
-    let mut push_unique = |layers: u32| {
-        if !plan.contains(&layers) {
-            plan.push(layers);
-        }
-    };
-
-    push_unique(initial_layers);
-    if initial_layers > 16 {
-        push_unique(initial_layers / 2);
-    }
-    if initial_layers > 8 {
-        push_unique(8);
-    }
-    if initial_layers > 4 {
-        push_unique(4);
-    }
-    push_unique(0);
-    plan
-}
-
-async fn spawn_server_with_adaptive_layers(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-    role: &str,
-    timeout_secs: u64,
-    initial_layers: u32,
-) -> Result<(Child, u32), String> {
-    let plan = gpu_layer_retry_plan(initial_layers);
-    let mut last_err: Option<String> = None;
-
-    for (idx, layers) in plan.iter().enumerate() {
-        if idx > 0 {
-            println!(
-                "  {}{}Retrying {} with {} GPU layers...{}",
-                crate::tui::BOLD,
-                crate::tui::YELLOW,
-                role,
-                layers,
-                crate::tui::RESET
-            );
-        }
-
-        match spawn_server(&SpawnConfig {
-            port,
-            model_path,
-            ctx_size,
-            gpu_layers: *layers,
-            role,
-        }) {
-            Ok(child) => {
-                let mut process = Some(child);
-                if wait_for_server_ready(port, timeout_secs, &mut process).await {
-                    if let Some(ready_child) = process.take() {
-                        return Ok((ready_child, *layers));
-                    }
-                    last_err = Some(format!(
-                        "Internal error: {} server became ready but process handle was missing",
-                        role
-                    ));
-                } else {
-                    if let Some(mut failed_child) = process.take() {
-                        failed_child.kill().ok();
-                        failed_child.wait().ok();
-                    }
-                    last_err = Some(format!(
-                        "{} failed health checks with {} GPU layers",
-                        role, layers
-                    ));
-                }
-            }
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| format!("{} failed to start", role)))
-}
-
-/// Convenience wrapper: spawn the compaction server.
-pub(crate) fn spawn_compaction_server(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-    gpu_layers: u32,
-) -> Result<Child, String> {
-    spawn_server(&SpawnConfig {
-        port,
-        model_path,
-        ctx_size,
-        gpu_layers,
-        role: "compaction",
-    })
-}
-
-/// Convenience wrapper: spawn the delegation server (configurable GPU layers).
-pub(crate) fn spawn_delegation_server(
-    port: u16,
-    model_path: &Path,
-    ctx_size: usize,
-    gpu_layers: u32,
-) -> Result<Child, String> {
-    spawn_server(&SpawnConfig {
-        port,
-        model_path,
-        ctx_size,
-        gpu_layers,
-        role: "delegation",
-    })
-}
-
-/// Wait for a llama-server to be healthy (responds to /health).
-///
-/// Polls the server's health endpoint for up to `timeout_secs`, displaying
-/// a progress bar. If the server process exits unexpectedly, returns `false`.
-pub(crate) async fn wait_for_server_ready(
-    port: u16,
-    timeout_secs: u64,
-    llama_process: &mut Option<Child>,
-) -> bool {
-    use std::io::Write;
-
-    // Drain stderr in a background thread so the pipe buffer doesn't block the server.
-    let stderr_lines: Arc<std::sync::Mutex<Vec<String>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    if let Some(ref mut child) = llama_process {
-        if let Some(stderr) = child.stderr.take() {
-            let lines = stderr_lines.clone();
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                let reader = std::io::BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        lines.lock().unwrap().push(l);
-                    }
-                }
-            });
-        }
-    }
-
-    let client = reqwest::Client::new();
-    let url = format!("http://localhost:{}/health", port);
-    let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_secs(timeout_secs);
-    let bar_width = 24usize;
-
-    print!("{}", crate::tui::HIDE_CURSOR);
-    std::io::stdout().flush().ok();
-
-    while std::time::Instant::now() < deadline {
-        // Check if server process crashed
-        if let Some(ref mut child) = llama_process {
-            if let Ok(Some(_)) = child.try_wait() {
-                // Clear the bar line, show error
-                print!(
-                    "\r{}{}{}  ",
-                    crate::tui::SHOW_CURSOR,
-                    crate::tui::RESET,
-                    " ".repeat(bar_width + 30)
-                );
-                print!(
-                    "\r  {}Server exited unexpectedly{}\n",
-                    crate::tui::YELLOW,
-                    crate::tui::RESET
-                );
-                // Show last few stderr lines as hint
-                let lines = stderr_lines.lock().unwrap();
-                if let Some(last) = lines.last() {
-                    println!("  {}{}{}", crate::tui::DIM, last, crate::tui::RESET);
-                }
-                std::io::stdout().flush().ok();
-                return false;
-            }
-        }
-
-        // Draw progress bar
-        let elapsed = start.elapsed().as_secs_f64();
-        let frac = (elapsed / timeout_secs as f64).min(1.0);
-        let filled = (frac * bar_width as f64) as usize;
-        let empty = bar_width - filled;
-        print!(
-            "\r  {}Loading model [{}{}{}{}{}] {:.0}s{}",
-            crate::tui::DIM,
-            crate::tui::RESET,
-            crate::tui::CYAN,
-            "\u{2588}".repeat(filled), // █
-            "\u{2591}".repeat(empty),  // ░
-            crate::tui::DIM,
-            elapsed,
-            crate::tui::RESET,
-        );
-        std::io::stdout().flush().ok();
-
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                // Fill bar to 100% briefly
-                print!(
-                    "\r  {}Loading model [{}{}{}] done{}",
-                    crate::tui::DIM,
-                    crate::tui::RESET,
-                    crate::tui::CYAN,
-                    "\u{2588}".repeat(bar_width),
-                    crate::tui::RESET,
-                );
-                std::io::stdout().flush().ok();
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                print!(
-                    "\r{}{}\r",
-                    crate::tui::SHOW_CURSOR,
-                    " ".repeat(bar_width + 30)
-                );
-                std::io::stdout().flush().ok();
-                return true;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    print!(
-        "\r{}{}\r",
-        crate::tui::SHOW_CURSOR,
-        " ".repeat(bar_width + 30)
+    // Convert bytes to tokens, clamp, and round
+    let main_ctx = bytes_to_ctx(
+        main_kv_budget,
+        input.main.kv_bytes_per_token,
+        MIN_MAIN_CTX,
+        input.main.practical_cap.min(input.main.max_context_length),
     );
-    std::io::stdout().flush().ok();
-    false
+
+    let router_ctx = if let Some(ref router) = input.router {
+        bytes_to_ctx(
+            router_kv_budget,
+            router.kv_bytes_per_token,
+            MIN_ROUTER_CTX,
+            router.practical_cap.min(router.max_context_length),
+        )
+    } else {
+        0
+    };
+
+    let specialist_ctx = if let Some(ref specialist) = input.specialist {
+        bytes_to_ctx(
+            specialist_kv_budget,
+            specialist.kv_bytes_per_token,
+            MIN_SPECIALIST_CTX,
+            specialist.practical_cap.min(specialist.max_context_length),
+        )
+    } else {
+        0
+    };
+
+    // Compute actual total
+    let main_kv = main_ctx as u64 * input.main.kv_bytes_per_token;
+    let router_kv = input.router.as_ref().map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
+    let spec_kv = input.specialist.as_ref().map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
+    let total = fixed_cost + main_kv + router_kv + spec_kv;
+
+    let breakdown = build_breakdown(input, main_ctx, router_ctx, specialist_ctx);
+
+    VramBudgetResult {
+        main_ctx,
+        router_ctx,
+        specialist_ctx,
+        total_vram_bytes: total,
+        effective_limit_bytes: effective_limit,
+        fits: total <= effective_limit,
+        breakdown,
+    }
 }
 
-/// Quick health check: is the local llama-server at the given base URL alive?
+/// Convert a byte budget to context tokens, clamped and rounded down to 1K.
+fn bytes_to_ctx(budget_bytes: u64, kv_per_token: u64, min_ctx: usize, max_ctx: usize) -> usize {
+    if kv_per_token == 0 {
+        return min_ctx;
+    }
+    let raw = (budget_bytes / kv_per_token) as usize;
+    let clamped = raw.max(min_ctx).min(max_ctx);
+    // Round down to nearest 1024
+    (clamped / 1024) * 1024
+}
+
+fn build_breakdown(
+    input: &VramBudgetInput,
+    main_ctx: usize,
+    router_ctx: usize,
+    specialist_ctx: usize,
+) -> Vec<VramModelBreakdown> {
+    let mut breakdown = vec![VramModelBreakdown {
+        role: "main".to_string(),
+        name: input.main.name.clone(),
+        weights_bytes: input.main.file_size_bytes,
+        kv_cache_bytes: main_ctx as u64 * input.main.kv_bytes_per_token,
+        context_tokens: main_ctx,
+        overhead_bytes: input.overhead_per_model,
+    }];
+
+    if let Some(ref router) = input.router {
+        breakdown.push(VramModelBreakdown {
+            role: "router".to_string(),
+            name: router.name.clone(),
+            weights_bytes: router.file_size_bytes,
+            kv_cache_bytes: router_ctx as u64 * router.kv_bytes_per_token,
+            context_tokens: router_ctx,
+            overhead_bytes: input.overhead_per_model,
+        });
+    }
+
+    if let Some(ref specialist) = input.specialist {
+        breakdown.push(VramModelBreakdown {
+            role: "specialist".to_string(),
+            name: specialist.name.clone(),
+            weights_bytes: specialist.file_size_bytes,
+            kv_cache_bytes: specialist_ctx as u64 * specialist.kv_bytes_per_token,
+            context_tokens: specialist_ctx,
+            overhead_bytes: input.overhead_per_model,
+        });
+    }
+
+    breakdown
+}
+
+/// Resolve a ModelProfile by reading GGUF metadata from disk.
+pub(crate) fn resolve_model_profile_from_path(name: &str, path: &Path) -> ModelProfile {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let gguf = parse_gguf_metadata(path);
+    build_model_profile(name, file_size, gguf.as_ref())
+}
+
+/// Estimate a ModelProfile from an LMS model identifier.
+pub(crate) fn estimate_model_profile_from_name(name: &str) -> ModelProfile {
+    let estimated_size = estimate_file_size_from_name(name);
+    build_model_profile(name, estimated_size, None)
+}
+
+// ============================================================================
+// Health Checks
+// ============================================================================
+
+/// Quick health check: is the local server at the given base URL alive?
 ///
-/// Sends a GET to `/health` with a 2-second timeout. Returns `true` if the
-/// server responds with 200, `false` otherwise.
+/// Sends a GET to `/health` with a 2-second timeout.
 pub(crate) async fn check_health(api_base: &str) -> bool {
-    // api_base is typically "http://localhost:PORT/v1" — strip to get the root.
     let base = api_base
         .trim_end_matches('/')
         .trim_end_matches("/v1")
@@ -1249,23 +682,20 @@ pub(crate) async fn check_health(api_base: &str) -> bool {
     }
 }
 
-/// Deep health check: verify server can actually handle a chat completion.
-///
-/// Sends a minimal chat request and checks for a valid response.
-/// This catches cases where /health returns 200 but the model isn't loaded.
+/// Deep health check: verify server can handle a chat completion.
 pub(crate) async fn check_chat_health(port: &str) -> bool {
     let url = format!("http://localhost:{}/v1/chat/completions", port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
-    
+
     let body = serde_json::json!({
-        "model": "local",
+        "model": "default",
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 1
     });
-    
+
     match client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -1277,7 +707,6 @@ pub(crate) async fn check_chat_health(port: &str) -> bool {
             if !resp.status().is_success() {
                 return false;
             }
-            // Verify response has expected structure
             if let Ok(text) = resp.text().await {
                 text.contains("\"choices\"") || text.contains("\"content\"")
             } else {
@@ -1288,160 +717,13 @@ pub(crate) async fn check_chat_health(port: &str) -> bool {
     }
 }
 
-/// Background health watchdog for local llama-server processes.
+// ============================================================================
+// Context Size Query
+// ============================================================================
+
+/// Query the local server for its actual context size (`n_ctx`).
 ///
-/// Pings `/health` every 30 seconds on all active server ports. When a server
-/// goes down, sends a one-line warning to `alert_tx` (displayed in the REPL
-/// before the next prompt).
-pub(crate) fn start_health_watchdog(
-    ports: Vec<(String, String)>, // (role, port)
-    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-
-        // Track which servers were healthy on last check.
-        let mut was_healthy: HashMap<String, bool> =
-            ports.iter().map(|(role, _)| (role.clone(), true)).collect();
-
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-            for (role, port) in &ports {
-                let url = format!("http://localhost:{}/health", port);
-                let healthy = match client.get(&url).send().await {
-                    Ok(resp) => resp.status().is_success(),
-                    Err(_) => false,
-                };
-
-                let prev = was_healthy.get(role).copied().unwrap_or(true);
-                if !healthy && prev {
-                    // Server just went down — alert once.
-                    let msg = format!(
-                        "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[31mDOWN\x1b[0m — use /restart or /local to recover\n",
-                        role, port
-                    );
-                    let _ = alert_tx.send(msg);
-                } else if healthy && !prev {
-                    // Server recovered.
-                    let msg = format!(
-                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server (port {})\x1b[0m \x1b[32mrecovered\x1b[0m\n",
-                        role, port
-                    );
-                    let _ = alert_tx.send(msg);
-                }
-
-                was_healthy.insert(role.clone(), healthy);
-            }
-        }
-    })
-}
-
-/// Request to restart a specific server role.
-#[derive(Debug, Clone)]
-pub struct RestartRequest {
-    pub role: String,
-}
-
-/// Background health watchdog with auto-repair for local llama-server processes.
-///
-/// Pings `/health` every 30 seconds on all active server ports. When a server
-/// fails 2 consecutive health checks, sends a restart request through `restart_tx`.
-pub(crate) fn start_health_watchdog_with_autorepair(
-    ports: Vec<(String, String)>, // (role, port)
-    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
-    inference_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-
-        // Track which servers were healthy on last check.
-        let mut was_healthy: HashMap<String, bool> =
-            ports.iter().map(|(role, _)| (role.clone(), true)).collect();
-
-        // Track consecutive failures per role.
-        let mut consecutive_failures: HashMap<String, u32> =
-            ports.iter().map(|(role, _)| (role.clone(), 0)).collect();
-
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-            // Skip health checks while LLM inference is in flight — the server
-            // blocks /health during large prompt processing, causing false positives.
-            if inference_active.load(std::sync::atomic::Ordering::Relaxed) {
-                continue;
-            }
-
-            for (role, port) in &ports {
-                // Use deep health check for main server, simple check for others
-                let healthy = if role == "main" {
-                    check_chat_health(port).await
-                } else {
-                    let url = format!("http://localhost:{}/health", port);
-                    match client.get(&url).send().await {
-                        Ok(resp) => resp.status().is_success(),
-                        Err(_) => false,
-                    }
-                };
-
-                let prev = was_healthy.get(role).copied().unwrap_or(true);
-
-                if !healthy {
-                    *consecutive_failures.get_mut(role).unwrap() += 1;
-                    let failures = consecutive_failures[role];
-
-                    if failures < 3 && prev {
-                        let msg = format!(
-                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt {}/3)\n",
-                            role, port, failures
-                        );
-                        let _ = alert_tx.send(msg);
-                    } else if failures >= 3 {
-                        let msg = format!(
-                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m auto-restarting...\n",
-                            role
-                        );
-                        let _ = alert_tx.send(msg);
-                        let _ = restart_tx.send(RestartRequest { role: role.clone() });
-                        consecutive_failures.insert(role.clone(), 0);
-                    }
-                } else {
-                    let was_failed = consecutive_failures[role] > 0;
-                    consecutive_failures.insert(role.clone(), 0);
-
-                    if !prev {
-                        let msg = format!(
-                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mrecovered\x1b[0m\n",
-                            role
-                        );
-                        let _ = alert_tx.send(msg);
-                    } else if was_failed {
-                        let msg = format!(
-                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mhealthy\x1b[0m\n",
-                            role
-                        );
-                        let _ = alert_tx.send(msg);
-                    }
-                }
-
-                was_healthy.insert(role.clone(), healthy);
-            }
-        }
-    })
-}
-
-/// Query the local llama.cpp server for its actual context size (`n_ctx`).
-///
-/// Returns the server's context window with 5% headroom subtracted (to account
-/// for token-estimation drift). Falls back to `None` if the server is
-/// unreachable or the response is unexpected.
+/// Returns the server's context window with 5% headroom subtracted.
 pub(crate) fn query_local_context_size(port: &str) -> Option<usize> {
     let url = format!("http://localhost:{}/props", port);
     let props = tokio::task::block_in_place(|| {
@@ -1506,7 +788,103 @@ pub(crate) async fn query_local_context_size_async(port: &str) -> Option<usize> 
 }
 
 // ============================================================================
-// Tests (RED — these should FAIL until we move the implementations)
+// Health Watchdog
+// ============================================================================
+
+/// Request to restart a specific server role.
+#[derive(Debug, Clone)]
+pub struct RestartRequest {
+    pub role: String,
+}
+
+/// Background health watchdog with auto-repair for local server processes.
+///
+/// Pings `/health` every 30 seconds on all active server ports. When a server
+/// fails 3 consecutive health checks, sends a restart request through `restart_tx`.
+pub(crate) fn start_health_watchdog_with_autorepair(
+    ports: Vec<(String, String)>, // (role, port)
+    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
+    inference_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+
+        let mut was_healthy: HashMap<String, bool> =
+            ports.iter().map(|(role, _)| (role.clone(), true)).collect();
+
+        let mut consecutive_failures: HashMap<String, u32> =
+            ports.iter().map(|(role, _)| (role.clone(), 0)).collect();
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            if inference_active.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
+            for (role, port) in &ports {
+                let healthy = if role == "main" {
+                    check_chat_health(port).await
+                } else {
+                    let url = format!("http://localhost:{}/health", port);
+                    match client.get(&url).send().await {
+                        Ok(resp) => resp.status().is_success(),
+                        Err(_) => false,
+                    }
+                };
+
+                let prev = was_healthy.get(role).copied().unwrap_or(true);
+
+                if !healthy {
+                    *consecutive_failures.get_mut(role).unwrap() += 1;
+                    let failures = consecutive_failures[role];
+
+                    if failures < 3 && prev {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt {}/3)\n",
+                            role, port, failures
+                        );
+                        let _ = alert_tx.send(msg);
+                    } else if failures >= 3 {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m auto-restarting...\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                        let _ = restart_tx.send(RestartRequest { role: role.clone() });
+                        consecutive_failures.insert(role.clone(), 0);
+                    }
+                } else {
+                    let was_failed = consecutive_failures[role] > 0;
+                    consecutive_failures.insert(role.clone(), 0);
+
+                    if !prev {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mrecovered\x1b[0m\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                    } else if was_failed {
+                        let msg = format!(
+                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m \x1b[32mhealthy\x1b[0m\n",
+                            role
+                        );
+                        let _ = alert_tx.send(msg);
+                    }
+                }
+
+                was_healthy.insert(role.clone(), healthy);
+            }
+        }
+    })
+}
+
+// ============================================================================
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -1522,37 +900,31 @@ mod tests {
 
     #[test]
     fn test_practical_context_cap_tiny_model() {
-        // < 2 GB → 8192
         assert_eq!(practical_context_cap(1_500_000_000), 8192);
     }
 
     #[test]
     fn test_practical_context_cap_small_model() {
-        // 2-4 GB → 16384
         assert_eq!(practical_context_cap(3_000_000_000), 16384);
     }
 
     #[test]
     fn test_practical_context_cap_medium_model() {
-        // 4-8 GB → 32768
         assert_eq!(practical_context_cap(6_000_000_000), 32768);
     }
 
     #[test]
     fn test_practical_context_cap_large_model() {
-        // 8-16 GB → 65536
         assert_eq!(practical_context_cap(12_000_000_000), 65536);
     }
 
     #[test]
     fn test_practical_context_cap_xlarge_model() {
-        // > 16 GB → usize::MAX (no cap)
         assert_eq!(practical_context_cap(20_000_000_000), usize::MAX);
     }
 
     #[test]
     fn test_practical_context_cap_boundary_2gb() {
-        // Exactly at 2 GB boundary
         let two_gb = 2 * 1024 * 1024 * 1024u64;
         assert_eq!(practical_context_cap(two_gb), 16384);
         assert_eq!(practical_context_cap(two_gb - 1), 8192);
@@ -1563,37 +935,53 @@ mod tests {
     #[test]
     fn test_find_available_port_returns_valid_port() {
         if !can_bind_localhost() {
-            eprintln!(
-                "skipping test_find_available_port_returns_valid_port: localhost bind unavailable"
-            );
             return;
         }
         let port = find_available_port(19000);
         assert!(port >= 19000);
         assert!(port <= 19099);
-        // Should be bindable
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
 
     #[test]
     fn test_find_available_port_skips_occupied() {
         if !can_bind_localhost() {
-            eprintln!(
-                "skipping test_find_available_port_skips_occupied: localhost bind unavailable"
-            );
             return;
         }
-        // Bind a port, then ask for one starting at the same number
         let listener = TcpListener::bind(("127.0.0.1", 19200)).unwrap();
         let port = find_available_port(19200);
-        // Should get the next one since 19200 is occupied
         assert!(port > 19200);
         drop(listener);
     }
 
-    // -- parse_gguf_metadata tests (synthetic GGUF) --
+    #[test]
+    fn test_find_port_within_range() {
+        let start = 40000;
+        let port = find_available_port(start);
+        assert!(port >= start);
+        assert!(port < start + 100);
+    }
 
-    /// Build a minimal GGUF v3 file header with the metadata fields we care about.
+    #[test]
+    fn test_find_port_skips_consecutive_occupied() {
+        let base: u16 = 48500;
+        let l1 = TcpListener::bind(("127.0.0.1", base));
+        let l2 = TcpListener::bind(("127.0.0.1", base + 1));
+
+        if let (Ok(_l1), Ok(_l2)) = (l1, l2) {
+            let found = find_available_port(base);
+            assert!(found >= base + 2);
+        }
+    }
+
+    #[test]
+    fn test_find_port_high_start_no_overflow() {
+        let port = find_available_port(65500);
+        assert!(port >= 65500);
+    }
+
+    // -- parse_gguf_metadata tests --
+
     fn build_synthetic_gguf(
         arch: &str,
         n_layers: u32,
@@ -1604,55 +992,39 @@ mod tests {
     ) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        // Magic
         buf.extend_from_slice(b"GGUF");
-        // Version 3
         buf.extend_from_slice(&3u32.to_le_bytes());
-        // tensor_count = 0
         buf.extend_from_slice(&0u64.to_le_bytes());
-        // kv_count = 6 (arch + 5 fields)
         buf.extend_from_slice(&6u64.to_le_bytes());
 
-        // Helper: write a string-typed KV pair
         fn write_string_kv(buf: &mut Vec<u8>, key: &str, value: &str) {
-            // key length + key bytes
             buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
             buf.extend_from_slice(key.as_bytes());
-            // value type = 8 (string)
             buf.extend_from_slice(&8u32.to_le_bytes());
-            // value: length + bytes
             buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
             buf.extend_from_slice(value.as_bytes());
         }
 
-        // Helper: write a u32-typed KV pair
         fn write_u32_kv(buf: &mut Vec<u8>, key: &str, value: u32) {
             buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
             buf.extend_from_slice(key.as_bytes());
-            // value type = 4 (u32)
             buf.extend_from_slice(&4u32.to_le_bytes());
             buf.extend_from_slice(&value.to_le_bytes());
         }
 
-        // 1. general.architecture = arch
         write_string_kv(&mut buf, "general.architecture", arch);
-        // 2. {arch}.block_count
         write_u32_kv(&mut buf, &format!("{}.block_count", arch), n_layers);
-        // 3. {arch}.attention.head_count_kv
         write_u32_kv(
             &mut buf,
             &format!("{}.attention.head_count_kv", arch),
             n_kv_heads,
         );
-        // 4. {arch}.attention.head_count
         write_u32_kv(&mut buf, &format!("{}.attention.head_count", arch), n_heads);
-        // 5. {arch}.embedding_length
         write_u32_kv(
             &mut buf,
             &format!("{}.embedding_length", arch),
             embedding_dim,
         );
-        // 6. {arch}.context_length
         write_u32_kv(
             &mut buf,
             &format!("{}.context_length", arch),
@@ -1665,7 +1037,6 @@ mod tests {
     #[test]
     fn test_parse_gguf_metadata_synthetic() {
         let data = build_synthetic_gguf("llama", 32, 8, 32, 4096, 131072);
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.gguf");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -1685,7 +1056,6 @@ mod tests {
         let path = dir.path().join("bad.gguf");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"NOT_GGUF_DATA").unwrap();
-
         assert!(parse_gguf_metadata(&path).is_none());
     }
 
@@ -1696,9 +1066,7 @@ mod tests {
 
     #[test]
     fn test_parse_gguf_small_model() {
-        // Qwen3-0.6B style: small model with fewer layers
         let data = build_synthetic_gguf("qwen2", 28, 4, 16, 1024, 32768);
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("qwen.gguf");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -1715,9 +1083,7 @@ mod tests {
 
     #[test]
     fn test_list_local_models_returns_sorted() {
-        // This is a filesystem test — it may return empty if ~/models/ doesn't exist
         let models = list_local_models();
-        // If any models exist, they should be sorted and all .gguf
         for (i, model) in models.iter().enumerate() {
             assert_eq!(model.extension().and_then(|e| e.to_str()), Some("gguf"));
             if i > 0 {
@@ -1730,502 +1096,251 @@ mod tests {
 
     #[test]
     fn test_query_local_context_size_no_server() {
-        // No server running on this port, should return None gracefully
         assert!(query_local_context_size("59999").is_none());
     }
 
-    // -- find_available_port (additional) --
-
-    #[test]
-    fn test_find_port_within_range() {
-        let start = 40000;
-        let port = find_available_port(start);
-        assert!(port >= start, "Port {} < start {}", port, start);
-        assert!(port < start + 100, "Port {} >= start + 100", port);
-    }
-
-    #[test]
-    fn test_find_port_skips_consecutive_occupied() {
-        let base: u16 = 48500;
-        let l1 = TcpListener::bind(("127.0.0.1", base));
-        let l2 = TcpListener::bind(("127.0.0.1", base + 1));
-
-        if let (Ok(_l1), Ok(_l2)) = (l1, l2) {
-            let found = find_available_port(base);
-            assert!(
-                found >= base + 2,
-                "Should skip both occupied ports, got {}",
-                found
-            );
-        }
-    }
-
-    #[test]
-    fn test_find_port_high_start_no_overflow() {
-        let port = find_available_port(65500);
-        assert!(port >= 65500);
-    }
-
-    // -- spawn_llama_server --
-
-    #[test]
-    fn test_spawn_server_errors_when_binary_missing() {
-        let home = dirs::home_dir().unwrap();
-        let server_path = home.join("llama.cpp/build/bin/llama-server");
-
-        if !server_path.exists() {
-            let fake_model = home.join("models/nonexistent.gguf");
-            let result = spawn_llama_server(19876, &fake_model, 8192);
-            assert!(result.is_err());
-            assert!(
-                result.unwrap_err().contains("llama-server not found"),
-                "Should report missing binary"
-            );
-        }
-    }
-
-    #[test]
-    fn test_spawn_server_errors_when_model_missing() {
-        let home = dirs::home_dir().unwrap();
-        let server_path = home.join("llama.cpp/build/bin/llama-server");
-        let model_path = home.join("models/nonexistent-test-model.gguf");
-
-        if server_path.exists() {
-            let result = spawn_llama_server(19877, &model_path, 8192);
-            assert!(result.is_err());
-            assert!(
-                result.unwrap_err().contains("model not found"),
-                "Should report missing model"
-            );
-        }
-    }
-
-    #[test]
-    fn test_gpu_layer_retry_plan_includes_cpu_fallback() {
-        let plan = gpu_layer_retry_plan(24);
-        assert_eq!(plan.first().copied(), Some(24));
-        assert_eq!(plan.last().copied(), Some(0));
-    }
-
-    #[test]
-    fn test_gpu_layer_retry_plan_for_cpu_only_is_single_step() {
-        let plan = gpu_layer_retry_plan(0);
-        assert_eq!(plan, vec![0]);
-    }
-
-    // -- wait_for_server_ready --
-
-    #[tokio::test]
-    async fn test_wait_timeout_when_no_server() {
-        let mut proc = None;
-        let result = wait_for_server_ready(19999, 1, &mut proc).await;
-        assert!(!result, "Should return false when no server running");
-    }
-
-    #[tokio::test]
-    async fn test_wait_zero_timeout_returns_false() {
-        let mut proc = None;
-        let result = wait_for_server_ready(19998, 0, &mut proc).await;
-        assert!(!result, "Should return false immediately with zero timeout");
-    }
-
-    #[tokio::test]
-    async fn test_wait_finds_healthy_server() {
-        if !can_bind_localhost() {
-            eprintln!("skipping test_wait_finds_healthy_server: localhost bind unavailable");
-            return;
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let resp =
-                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
-                    stream.write_all(resp.as_bytes()).await.ok();
-                }
-            }
-        });
-
-        let mut proc = None;
-        let result = wait_for_server_ready(port, 5, &mut proc).await;
-        assert!(result, "Should detect the healthy server");
-    }
-
-    #[tokio::test]
-    async fn test_wait_retries_on_503_then_succeeds() {
-        if !can_bind_localhost() {
-            eprintln!(
-                "skipping test_wait_retries_on_503_then_succeeds: localhost bind unavailable"
-            );
-            return;
-        }
-        use std::sync::atomic::AtomicUsize;
-
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let count_clone = request_count.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf).await;
-
-                    let n = count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let resp = if n < 2 {
-                        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 7\r\n\r\nloading"
-                    } else {
-                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok"
-                    };
-                    stream.write_all(resp.as_bytes()).await.ok();
-                }
-            }
-        });
-
-        let mut proc = None;
-        let result = wait_for_server_ready(port, 10, &mut proc).await;
-        assert!(result, "Should succeed after retries");
-        assert!(
-            request_count.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-            "Should have retried at least 3 times"
-        );
-    }
-
-    // -- Integration: real GGUF model parsing --
-
-    #[test]
-    fn test_parse_real_gguf_if_available() {
-        let models = list_local_models();
-        if models.is_empty() {
-            eprintln!("Skipping: no GGUF models found in ~/models/");
-            return;
-        }
-
-        for model_path in &models {
-            let name = model_path.file_name().unwrap().to_string_lossy();
-            match parse_gguf_metadata(model_path) {
-                Some(info) => {
-                    // Sanity checks — all real models should have sane values
-                    assert!(info.n_layers > 0, "{}: n_layers should be > 0", name);
-                    assert!(
-                        info.n_layers <= 256,
-                        "{}: n_layers {} seems too high",
-                        name,
-                        info.n_layers
-                    );
-                    assert!(info.n_heads > 0, "{}: n_heads should be > 0", name);
-                    assert!(info.n_kv_heads > 0, "{}: n_kv_heads should be > 0", name);
-                    assert!(
-                        info.n_kv_heads <= info.n_heads,
-                        "{}: n_kv_heads {} > n_heads {}",
-                        name,
-                        info.n_kv_heads,
-                        info.n_heads
-                    );
-                    assert!(
-                        info.embedding_dim >= 64,
-                        "{}: embedding_dim {} too small",
-                        name,
-                        info.embedding_dim
-                    );
-                    assert!(
-                        info.context_length >= 512,
-                        "{}: context_length {} too small",
-                        name,
-                        info.context_length
-                    );
-                    eprintln!(
-                        "  OK: {} — layers={}, heads={}/{}, embed={}, ctx={}",
-                        name,
-                        info.n_layers,
-                        info.n_heads,
-                        info.n_kv_heads,
-                        info.embedding_dim,
-                        info.context_length
-                    );
-                }
-                None => {
-                    eprintln!("  SKIP: {} — could not parse GGUF header", name);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_compute_optimal_context_real_models() {
-        let models = list_local_models();
-        if models.is_empty() {
-            eprintln!("Skipping: no GGUF models found in ~/models/");
-            return;
-        }
-
-        for model_path in &models {
-            let name = model_path.file_name().unwrap().to_string_lossy();
-            let ctx = compute_optimal_context_size(model_path);
-            // Context should be at least 4096 and a multiple of 1024
-            assert!(ctx >= 4096, "{}: ctx {} < 4096", name, ctx);
-            assert_eq!(ctx % 1024, 0, "{}: ctx {} not aligned to 1024", name, ctx);
-            let file_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-            eprintln!(
-                "  OK: {} ({:.1}GB) → {}K context",
-                name,
-                file_size as f64 / 1e9,
-                ctx / 1024
-            );
-        }
-    }
+    // -- detect_available_memory --
 
     #[test]
     fn test_detect_available_memory_sane() {
         let (vram, ram) = detect_available_memory();
-        // RAM should be at least 1 GB on any modern system
         assert!(ram >= 1_000_000_000, "RAM {} seems too low", ram);
         if let Some(v) = vram {
-            // If VRAM detected, should be at least 256 MB
             assert!(v >= 256 * 1024 * 1024, "VRAM {} seems too low", v);
-            eprintln!(
-                "  VRAM: {:.1} GB, RAM: {:.1} GB",
-                v as f64 / 1e9,
-                ram as f64 / 1e9
-            );
-        } else {
-            eprintln!("  No GPU detected. RAM: {:.1} GB", ram as f64 / 1e9);
         }
     }
 
-    // -- find_delegation_model / pick_preferred_model tests --
+    // -- VRAM budget tests --
 
-    #[test]
-    fn test_find_delegation_model_preference_constants() {
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[0], "Ministral-3");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[1], "nanbeige");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[2], "Qwen3-0.6B");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[3], "Ministral-8B");
-        assert_eq!(DELEGATION_MODEL_PREFERENCES[4], "Nemotron-Nano-9B");
-    }
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
 
-    #[test]
-    fn test_pick_preferred_model_empty_list() {
-        let models: Vec<PathBuf> = vec![];
-        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
-    }
-
-    #[test]
-    fn test_pick_preferred_model_no_match() {
-        let models = vec![
-            PathBuf::from("/models/llama-70B.gguf"),
-            PathBuf::from("/models/qwen-7B.gguf"),
-        ];
-        assert!(pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES).is_none());
-    }
-
-    #[test]
-    fn test_pick_preferred_model_single_match() {
-        let models = vec![
-            PathBuf::from("/models/llama-70B.gguf"),
-            PathBuf::from("/models/Nemotron-Nano-9B-Q4.gguf"),
-        ];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert_eq!(
-            result.as_deref(),
-            Some(Path::new("/models/Nemotron-Nano-9B-Q4.gguf"))
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_priority_ordering() {
-        // Both Ministral-3 and Nemotron present — Ministral-3 wins (higher priority)
-        let models = vec![
-            PathBuf::from("/models/Nemotron-Nano-9B-v2-Q4_K_M.gguf"),
-            PathBuf::from("/models/Ministral-3-Instruct-Q4_K_M.gguf"),
-        ];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(
-            result
-                .as_ref()
-                .unwrap()
-                .to_string_lossy()
-                .contains("Ministral-3"),
-            "Ministral-3 should beat Nemotron, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_all_three_present() {
-        let models = vec![
-            PathBuf::from("/models/Nemotron-Nano-9B.gguf"),
-            PathBuf::from("/models/Ministral-3-Q4.gguf"),
-            PathBuf::from("/models/Ministral-8B-Q4.gguf"),
-        ];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(
-            result
-                .as_ref()
-                .unwrap()
-                .to_string_lossy()
-                .contains("Ministral-3"),
-            "Ministral-3 is highest priority, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_case_insensitive() {
-        let models = vec![PathBuf::from("/models/MINISTRAL-8B-INSTRUCT.gguf")];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(result.is_some(), "Should match case-insensitively");
-    }
-
-    #[test]
-    fn test_pick_preferred_model_mixed_case() {
-        let models = vec![PathBuf::from("/models/ministral-8b-instruct-Q4_K_M.gguf")];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(
-            result.is_some(),
-            "Should match lowercase filename against mixed-case preference"
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_substring_match() {
-        // "Ministral-3" should match "Ministral-3B-Instruct-Q4.gguf" via substring
-        let models = vec![PathBuf::from("/models/Ministral-3B-Instruct-Q4.gguf")];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(result.is_some(), "Substring match should work");
-    }
-
-    #[test]
-    fn test_pick_preferred_model_nanbeige_match() {
-        let models = vec![PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf")];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(
-            result.is_some(),
-            "nanbeige should match nanbeige4.1-3b-q8_0.gguf"
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_nanbeige_vs_qwen() {
-        // Nanbeige has higher priority than Qwen3-0.6B
-        let models = vec![
-            PathBuf::from("/models/Qwen3-0.6B-Q4.gguf"),
-            PathBuf::from("/models/nanbeige4.1-3b-q8_0.gguf"),
-        ];
-        let result = pick_preferred_model(&models, DELEGATION_MODEL_PREFERENCES);
-        assert!(
-            result
-                .as_ref()
-                .unwrap()
-                .to_string_lossy()
-                .contains("nanbeige"),
-            "nanbeige should beat Qwen3-0.6B, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_pick_preferred_model_empty_preferences() {
-        let models = vec![PathBuf::from("/models/anything.gguf")];
-        let prefs: &[&str] = &[];
-        assert!(pick_preferred_model(&models, prefs).is_none());
-    }
-
-    #[test]
-    fn test_find_delegation_model_uses_real_filesystem() {
-        // Integration test: delegates to pick_preferred_model with real ~/models/
-        let result = find_delegation_model();
-        if let Some(ref path) = result {
-            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
-            let matches_any = DELEGATION_MODEL_PREFERENCES
-                .iter()
-                .any(|pref| name.contains(&pref.to_lowercase()));
-            assert!(
-                matches_any,
-                "Real match '{}' should be in preferences",
-                name
-            );
-            eprintln!("  Found delegation model: {}", path.display());
-        } else {
-            eprintln!("  No delegation model in ~/models/ (OK in CI)");
+    fn make_profile(name: &str, file_size: u64, kv_per_token: u64) -> ModelProfile {
+        ModelProfile {
+            name: name.to_string(),
+            file_size_bytes: file_size,
+            kv_bytes_per_token: kv_per_token,
+            max_context_length: 131072,
+            practical_cap: practical_context_cap(file_size),
         }
     }
 
-    // -- stop_delegation_server tests --
+    // -- build_model_profile tests --
 
     #[test]
-    fn test_stop_delegation_server_clears_state() {
-        let mut process: Option<Child> = None;
-        let mut port: Option<String> = Some("8091".to_string());
-
-        stop_delegation_server(&mut process, &mut port);
-
-        assert!(process.is_none());
-        assert!(port.is_none());
+    fn test_build_model_profile_from_gguf() {
+        let gguf = GgufModelInfo {
+            n_layers: 32,
+            n_kv_heads: 8,
+            n_heads: 32,
+            embedding_dim: 4096,
+            context_length: 131072,
+        };
+        let profile = build_model_profile("test-8b", 5 * GB, Some(&gguf));
+        // head_dim = 4096/32 = 128, kv = 2 * 32 * 8 * 128 * 2 = 131072
+        assert_eq!(profile.kv_bytes_per_token, 131072);
+        assert_eq!(profile.max_context_length, 131072);
+        assert_eq!(profile.practical_cap, 32768); // 5GB -> <8GB bracket
     }
 
     #[test]
-    fn test_stop_delegation_server_noop_when_empty() {
-        let mut process: Option<Child> = None;
-        let mut port: Option<String> = None;
+    fn test_build_model_profile_no_gguf() {
+        let profile = build_model_profile("unknown", 2 * GB, None);
+        assert_eq!(profile.kv_bytes_per_token, 0);
+        assert_eq!(profile.max_context_length, 32768);
+    }
 
-        // Should not panic when nothing to stop
-        stop_delegation_server(&mut process, &mut port);
+    // -- estimate_file_size_from_name tests --
 
-        assert!(process.is_none());
-        assert!(port.is_none());
+    #[test]
+    fn test_estimate_file_size_1_7b() {
+        let size = estimate_file_size_from_name("qwen3-1.7b");
+        assert!(
+            size > 900 * MB && size < 1500 * MB,
+            "Expected ~1.1GB for 1.7B Q4, got {}",
+            size
+        );
     }
 
     #[test]
-    fn test_stop_delegation_server_kills_real_process() {
-        // Spawn a harmless process, then stop it
-        let child = Command::new("sleep")
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        if let Ok(child) = child {
-            let pid = child.id();
-            let mut process = Some(child);
-            let mut port = Some("8091".to_string());
-
-            stop_delegation_server(&mut process, &mut port);
-
-            assert!(process.is_none());
-            assert!(port.is_none());
-
-            // Verify the process is actually dead
-            let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
-            // kill -0 should fail (process doesn't exist)
-            if let Ok(s) = status {
-                assert!(!s.success(), "Process {} should be dead after stop", pid);
-            }
-        }
+    fn test_estimate_file_size_8b() {
+        let size = estimate_file_size_from_name("nvidia_orchestrator-8b");
+        assert!(
+            size > 4 * GB && size < 6 * GB,
+            "Expected ~4.8GB for 8B Q4, got {}",
+            size
+        );
     }
 
-    // -- Delegation vs compaction server symmetry --
+    #[test]
+    fn test_estimate_file_size_3b() {
+        let size = estimate_file_size_from_name("ministral-3b-instruct");
+        assert!(
+            size > 1500 * MB && size < 2500 * MB,
+            "Expected ~1.8GB for 3B Q4, got {}",
+            size
+        );
+    }
 
     #[test]
-    fn test_stop_delegation_mirrors_stop_compaction() {
-        // Both stop functions should behave identically for state cleanup
-        let mut d_process: Option<Child> = None;
-        let mut d_port: Option<String> = Some("8091".to_string());
-        let mut c_process: Option<Child> = None;
-        let mut c_port: Option<String> = Some("8090".to_string());
+    fn test_estimate_file_size_unknown() {
+        let size = estimate_file_size_from_name("mystery-model");
+        assert!(size > 0, "Should return conservative fallback");
+    }
 
-        stop_delegation_server(&mut d_process, &mut d_port);
-        stop_compaction_server(&mut c_process, &mut c_port);
+    // -- compute_vram_budget tests --
 
-        assert_eq!(d_process.is_none(), c_process.is_none());
-        assert_eq!(d_port.is_none(), c_port.is_none());
+    #[test]
+    fn test_budget_single_model_fits_easily() {
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("test-8b", 5 * GB, 131072),
+            router: None,
+            specialist: None,
+        };
+        let result = compute_vram_budget(&input);
+        assert!(result.fits);
+        assert!(result.main_ctx >= 4096);
+        assert!(result.main_ctx <= 32768); // capped by practical_cap (5GB -> 32K)
+        assert_eq!(result.router_ctx, 0);
+        assert_eq!(result.specialist_ctx, 0);
+    }
+
+    #[test]
+    fn test_budget_trio_fits_in_16gb() {
+        // Typical trio: 9B main (5.5GB) + 8B router (4.9GB) + 3B specialist (1.9GB)
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main-9b", 5_500 * MB, 131072),
+            router: Some(make_profile("router-8b", 4_900 * MB, 131072)),
+            specialist: Some(make_profile("specialist-3b", 1_900 * MB, 32768)),
+        };
+        let result = compute_vram_budget(&input);
+        assert!(result.fits, "Trio should fit in 16GB");
+        assert!(result.main_ctx >= 4096);
+        assert!(result.router_ctx >= 2048);
+        assert!(result.specialist_ctx >= 4096);
+        // Main should get the biggest share
+        assert!(
+            result.main_ctx >= result.router_ctx,
+            "main_ctx {} should >= router_ctx {}",
+            result.main_ctx,
+            result.router_ctx
+        );
+    }
+
+    #[test]
+    fn test_budget_trio_does_not_fit() {
+        // 8GB VRAM with three large models -> doesn't fit
+        let input = VramBudgetInput {
+            available_memory: 8 * GB,
+            vram_cap: 8 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main-8b", 4_900 * MB, 131072),
+            router: Some(make_profile("router-8b", 4_900 * MB, 131072)),
+            specialist: Some(make_profile("spec-8b", 4_900 * MB, 131072)),
+        };
+        let result = compute_vram_budget(&input);
+        assert!(!result.fits, "Three 5GB models can't fit in 8GB");
+    }
+
+    #[test]
+    fn test_budget_respects_vram_cap() {
+        let input = VramBudgetInput {
+            available_memory: 24 * GB,
+            vram_cap: 12 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main", 5 * GB, 131072),
+            router: None,
+            specialist: None,
+        };
+        let result = compute_vram_budget(&input);
+        assert_eq!(result.effective_limit_bytes, 12 * GB);
+    }
+
+    #[test]
+    fn test_budget_priority_order() {
+        // With constrained budget, main should get more than specialist, specialist more than router
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main", 5 * GB, 131072),
+            router: Some(make_profile("router", 5 * GB, 131072)),
+            specialist: Some(make_profile("spec", 5 * GB, 131072)),
+        };
+        let result = compute_vram_budget(&input);
+        // main_weight=4, spec_weight=2, router_weight=1
+        assert!(
+            result.main_ctx >= result.specialist_ctx,
+            "main {} should >= specialist {}",
+            result.main_ctx,
+            result.specialist_ctx
+        );
+        assert!(
+            result.specialist_ctx >= result.router_ctx,
+            "specialist {} should >= router {}",
+            result.specialist_ctx,
+            result.router_ctx
+        );
+    }
+
+    #[test]
+    fn test_budget_zero_kv_fallback() {
+        // When kv_bytes_per_token is 0 (no GGUF), should get minimum context
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: ModelProfile {
+                name: "no-gguf".to_string(),
+                file_size_bytes: 2 * GB,
+                kv_bytes_per_token: 0,
+                max_context_length: 32768,
+                practical_cap: 16384,
+            },
+            router: None,
+            specialist: None,
+        };
+        let result = compute_vram_budget(&input);
+        assert!(result.fits);
+        assert_eq!(result.main_ctx, 4096); // minimum when kv=0
+    }
+
+    #[test]
+    fn test_budget_round_down_to_1k() {
+        // Context sizes should be multiples of 1024
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main", 3 * GB, 131072),
+            router: Some(make_profile("router", 3 * GB, 131072)),
+            specialist: None,
+        };
+        let result = compute_vram_budget(&input);
+        assert_eq!(result.main_ctx % 1024, 0, "main_ctx should be multiple of 1024");
+        assert_eq!(result.router_ctx % 1024, 0, "router_ctx should be multiple of 1024");
+    }
+
+    #[test]
+    fn test_budget_breakdown_has_all_roles() {
+        let input = VramBudgetInput {
+            available_memory: 16 * GB,
+            vram_cap: 16 * GB,
+            overhead_per_model: 512 * MB,
+            main: make_profile("main-model", 3 * GB, 131072),
+            router: Some(make_profile("router-model", 2 * GB, 32768)),
+            specialist: Some(make_profile("spec-model", 2 * GB, 32768)),
+        };
+        let result = compute_vram_budget(&input);
+        assert_eq!(result.breakdown.len(), 3);
+        assert_eq!(result.breakdown[0].role, "main");
+        assert_eq!(result.breakdown[1].role, "router");
+        assert_eq!(result.breakdown[2].role, "specialist");
     }
 }

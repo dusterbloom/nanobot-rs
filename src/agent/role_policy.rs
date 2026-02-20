@@ -38,12 +38,12 @@ pub fn parse_router_decision_strict(raw: &str) -> Result<RouterDecision, String>
         serde_json::from_str(raw).map_err(|e| format!("invalid router JSON: {}", e))?;
     let action_ok = matches!(
         parsed.action.as_str(),
-        "tool" | "subagent" | "specialist" | "ask_user"
+        "tool" | "subagent" | "specialist" | "ask_user" | "respond"
     );
     if !action_ok {
         return Err(format!("invalid router action: {}", parsed.action));
     }
-    if parsed.target.trim().is_empty() {
+    if parsed.target.trim().is_empty() && parsed.action != "respond" {
         return Err("router target cannot be empty".to_string());
     }
     if !(0.0..=1.0).contains(&parsed.confidence) {
@@ -70,7 +70,7 @@ pub fn build_context_pack(
             user_intent, conversation_summary, task_state
         ),
         Role::Router => format!(
-            "Role: router\nTask state:\n{}\n\nAllowed actions:\n- tool\n- subagent\n- specialist\n- ask_user\n\nAvailable tools:\n{}\n",
+            "Role: router\nTask state:\n{}\n\nAllowed actions:\n- respond (simple conversation, greetings, direct answers)\n- tool (use a specific tool)\n- specialist (delegate complex reasoning)\n- ask_user (request clarification)\n\nAvailable tools:\n{}\n",
             task_state,
             if available_tools.is_empty() {
                 "(none)".to_string()
@@ -110,6 +110,19 @@ mod tests {
         assert_eq!(d.target, "read_file");
         assert_eq!(d.args["path"], "README.md");
         assert_eq!(d.confidence, 0.92);
+    }
+
+    #[test]
+    fn test_parse_router_decision_strict_accepts_respond() {
+        let raw = r#"{"action":"respond","target":"main","args":{},"confidence":0.95}"#;
+        let d = parse_router_decision_strict(raw).expect("respond should be valid");
+        assert_eq!(d.action, "respond");
+    }
+
+    #[test]
+    fn test_parse_router_decision_strict_respond_allows_empty_target() {
+        let raw = r#"{"action":"respond","target":"","args":{},"confidence":0.9}"#;
+        parse_router_decision_strict(raw).expect("respond with empty target should be valid");
     }
 
     #[test]

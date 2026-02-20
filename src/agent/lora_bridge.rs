@@ -275,13 +275,13 @@ fn count_unique_tools(tool_trace: &str) -> usize {
 }
 
 // =============================================================================
-// LoRA Hot-Swap (llama-server API)
+// LoRA Hot-Swap (local server API)
 // =============================================================================
 
 /// Configuration for LoRA adapter management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraConfig {
-    /// Base URL of the llama-server (e.g., "http://127.0.0.1:8080").
+    /// Base URL of the local inference server (e.g., "http://127.0.0.1:8080").
     pub server_url: String,
     /// Path to the LoRA adapter file (.gguf).
     pub adapter_path: Option<PathBuf>,
@@ -308,10 +308,9 @@ pub struct HotSwapResult {
     pub scale: f64,
 }
 
-/// Apply a LoRA adapter to a running llama-server via POST /lora-adapters.
+/// Apply a LoRA adapter to a running local server via POST /lora-adapters.
 ///
-/// Uses llama.cpp's hot-swap API (PR #10994) to load/unload adapters
-/// without restarting the server.
+/// Uses the hot-swap API to load/unload adapters without restarting the server.
 pub async fn apply_lora_adapter(config: &LoraConfig) -> Result<HotSwapResult> {
     let client = reqwest::Client::new();
     let url = format!("{}/lora-adapters", config.server_url);
@@ -355,7 +354,7 @@ pub async fn apply_lora_adapter(config: &LoraConfig) -> Result<HotSwapResult> {
     }
 }
 
-/// Remove all LoRA adapters from a running llama-server.
+/// Remove all LoRA adapters from a running local server.
 pub async fn remove_lora_adapters(server_url: &str) -> Result<HotSwapResult> {
     apply_lora_adapter(&LoraConfig {
         server_url: server_url.to_string(),
@@ -365,7 +364,7 @@ pub async fn remove_lora_adapters(server_url: &str) -> Result<HotSwapResult> {
     .await
 }
 
-/// Check if the llama-server supports LoRA hot-swap.
+/// Check if the local server supports LoRA hot-swap.
 pub async fn check_lora_support(server_url: &str) -> Result<bool> {
     let client = reqwest::Client::new();
     let url = format!("{}/lora-adapters", server_url);
@@ -408,7 +407,7 @@ pub struct TrainingStatus {
     pub pending_experiences: i64,
     /// Path to the latest adapter file (if any).
     pub latest_adapter: Option<PathBuf>,
-    /// Whether the adapter is currently loaded in llama-server.
+    /// Whether the adapter is currently loaded in the local server.
     pub adapter_loaded: bool,
 }
 
@@ -426,7 +425,7 @@ pub fn check_training_status(buffer: &ExperienceBuffer) -> Result<TrainingStatus
         } else {
             None
         },
-        adapter_loaded: false, // Would need to query llama-server
+        adapter_loaded: false, // Would need to query the local server
     })
 }
 

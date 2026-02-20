@@ -10,6 +10,7 @@ mod cli;
 mod config;
 mod cron;
 mod heartbeat;
+mod lms;
 mod providers;
 mod repl;
 mod server;
@@ -165,7 +166,7 @@ enum EvalAction {
         /// Ahead-by-k margin for voting. Default: 1.
         #[arg(short, long, default_value_t = 1)]
         k: usize,
-        /// Use local LLM (llama-server).
+        /// Use local LLM.
         #[arg(short, long)]
         local: bool,
         /// Local server port. Default: 8080.
@@ -183,7 +184,7 @@ enum EvalAction {
         /// Run Tier 2: aggregation tasks with LLM.
         #[arg(long)]
         aggregate: bool,
-        /// Use local LLM (llama-server).
+        /// Use local LLM.
         #[arg(short, long)]
         local: bool,
         /// Local server port. Default: 8080.
@@ -201,7 +202,7 @@ enum EvalAction {
         /// Depth/complexity parameter. Default: 3.
         #[arg(long, default_value_t = 3)]
         depth: usize,
-        /// Use local LLM (llama-server).
+        /// Use local LLM.
         #[arg(short, long)]
         local: bool,
         /// Local server port. Default: 8080.
@@ -216,7 +217,7 @@ enum EvalAction {
         /// Number of questions. Default: 20.
         #[arg(long, default_value_t = 20)]
         questions: usize,
-        /// Use local LLM (llama-server).
+        /// Use local LLM.
         #[arg(short, long)]
         local: bool,
         /// Local server port. Default: 8080.
@@ -281,20 +282,13 @@ enum CronAction {
 }
 
 fn main() {
-    // Safety net: restore terminal state and kill orphaned llama-server on panic
+    // Safety net: restore terminal state on panic
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Restore terminal before printing panic message
         tui::force_exit_raw_mode();
         print!("\x1b[r"); // reset scroll region
         print!("\x1b[?25h"); // show cursor
         let _ = std::io::Write::flush(&mut std::io::stdout());
-
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "llama-server"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         default_hook(info);
     }));
 

@@ -87,7 +87,12 @@ fn extract_local_port_from_api_base(api_base: &str) -> Option<u16> {
 }
 
 /// Resolve per-request local context limit with headroom.
-fn resolve_local_context_limit(provider: &dyn LLMProvider) -> usize {
+///
+/// When a parent-provided limit is available (e.g. from config), use it directly
+/// instead of querying the server — the server may be on a non-localhost IP
+/// (LM Studio on WSL2) or may not support the `/props` endpoint.
+fn resolve_local_context_limit(provider: &dyn LLMProvider, parent_limit: Option<usize>) -> usize {
+    // Try querying the server directly (works for local llama-server).
     if let Some(base) = provider.get_api_base() {
         if let Some(port) = extract_local_port_from_api_base(base) {
             if let Some(ctx) = crate::server::query_local_context_size(&port.to_string()) {
@@ -95,7 +100,8 @@ fn resolve_local_context_limit(provider: &dyn LLMProvider) -> usize {
             }
         }
     }
-    LOCAL_SUBAGENT_FALLBACK_CONTEXT
+    // Use parent's known limit (from config) if available.
+    parent_limit.unwrap_or(LOCAL_SUBAGENT_FALLBACK_CONTEXT)
 }
 
 /// Compute a conservative local response budget from the detected context size.
@@ -163,6 +169,9 @@ pub struct SubagentManager {
     >,
     /// Max chars per tool result (passed from config).
     max_tool_result_chars: usize,
+    /// Parent's context token limit — used as fallback when the server can't be
+    /// queried directly (e.g. LM Studio on a non-localhost IP).
+    local_context_limit: Option<usize>,
     /// Priority signal sender for the aha channel (proprioception Phase 6).
     aha_tx: Option<UnboundedSender<crate::agent::system_state::AhaSignal>>,
 }
@@ -204,6 +213,7 @@ impl SubagentManager {
             restrict_to_workspace,
             is_local,
             max_tool_result_chars,
+            local_context_limit: None,
             profiles,
             providers_config: None,
             display_tx: None,
@@ -231,6 +241,12 @@ impl SubagentManager {
     /// Set the providers config for multi-provider subagent routing.
     pub fn with_providers_config(mut self, config: ProvidersConfig) -> Self {
         self.providers_config = Some(config);
+        self
+    }
+
+    /// Set the parent's context token limit as fallback for subagents.
+    pub fn with_local_context_limit(mut self, limit: usize) -> Self {
+        self.local_context_limit = Some(limit);
         self
     }
 
@@ -376,7 +392,7 @@ impl SubagentManager {
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
         // Provider-routed subagents: check if the resolved API base is localhost.
-        // A groq/ prefix pointing to localhost:8083 is still a local llama-server
+        // A groq/ prefix pointing to localhost:8083 is still a local server
         // and needs strict alternation repair.
         let is_local = if routed_to_cloud {
             targets_local
@@ -389,6 +405,7 @@ impl SubagentManager {
         let lbl = display_label.clone();
         let tsk = task.clone();
         let aha_tx = self.aha_tx.clone();
+        let parent_ctx_limit = self.local_context_limit;
 
         let handle = tokio::spawn(async move {
             let result = Self::_run_subagent(
@@ -403,6 +420,7 @@ impl SubagentManager {
                 restrict_to_workspace,
                 is_local,
                 exec_working_dir.as_deref(),
+                parent_ctx_limit,
             )
             .await;
 
@@ -667,6 +685,7 @@ impl SubagentManager {
                 self.restrict_to_workspace,
                 is_local,
                 working_dir.as_deref(),
+                self.local_context_limit,
             )
             .await;
 
@@ -769,6 +788,7 @@ impl SubagentManager {
         restrict_to_workspace: bool,
         is_local: bool,
         exec_working_dir: Option<&str>,
+        parent_context_limit: Option<usize>,
     ) -> anyhow::Result<String> {
         debug!(
             "Subagent {} starting (model={}, max_iter={}, read_only={}, tools_filter={:?}): {}",
@@ -817,7 +837,7 @@ impl SubagentManager {
         ];
 
         let local_ctx_limit = if is_local {
-            Some(resolve_local_context_limit(provider))
+            Some(resolve_local_context_limit(provider, parent_context_limit))
         } else {
             None
         };
@@ -1249,6 +1269,7 @@ mod tests {
             false,
             false, // is_local
             None,  // exec_working_dir
+            None,  // parent_context_limit
         )
         .await
         .unwrap();
@@ -1320,6 +1341,7 @@ mod tests {
             false,
             false, // is_local
             None,  // exec_working_dir
+            None,  // parent_context_limit
         )
         .await
         .unwrap();

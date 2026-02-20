@@ -211,6 +211,9 @@ pub(crate) fn print_help() {
     println!("\nCommands:");
     println!("  /local, /l      - Toggle between local and cloud mode");
     println!("  /model, /m      - Select local model from ~/models/");
+    println!("  /trio           - Toggle trio mode (router + specialist)");
+    println!("  /trio budget    - Show VRAM budget breakdown");
+    println!("  /trio cap <GB>  - Set VRAM cap (e.g. /trio cap 12)");
     println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
     println!("  /think, /t      - Toggle extended thinking (/thinking on|off|N)");
     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
@@ -690,196 +693,69 @@ async fn stream_and_render_inner(
 // Server Lifecycle (DRY: replaces 6x copy-pasted spawn+wait+rebuild patterns)
 // ============================================================================
 
-/// Mutable server lifecycle state for the REPL.
+/// Which inference engine backend is managing the local server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceEngine {
+    /// No local engine active.
+    None,
+    /// LM Studio via `lms` CLI (daemon mode).
+    Lms,
+}
+
 pub(crate) struct ServerState {
-    pub llama_process: Option<std::process::Child>,
-    pub compaction_process: Option<std::process::Child>,
-    pub compaction_port: Option<String>,
-    pub delegation_process: Option<std::process::Child>,
-    pub delegation_port: Option<String>,
-    pub specialist_process: Option<std::process::Child>,
-    pub specialist_port: Option<String>,
     pub local_port: String,
+    /// True when LM Studio's `lms` CLI manages the server lifecycle.
+    pub lms_managed: bool,
+    /// Path to the `lms` binary (set when lms_managed is true).
+    pub lms_binary: Option<std::path::PathBuf>,
+    /// Which inference engine is currently active.
+    pub engine: InferenceEngine,
 }
 
 impl ServerState {
     pub fn new(port: String) -> Self {
         Self {
-            llama_process: None,
-            compaction_process: None,
-            compaction_port: None,
-            delegation_process: None,
-            delegation_port: None,
             local_port: port,
-            specialist_process: None,
-            specialist_port: None,
+            lms_managed: false,
+            lms_binary: None,
+            engine: InferenceEngine::None,
         }
     }
 
-    /// Kill the current llama process (if we own one) and any orphaned servers.
-    pub fn kill_current(&mut self) {
-        if let Some(ref mut child) = self.llama_process {
-            let pid = child.id();
-            child.kill().ok();
-            child.wait().ok();
-            server::unrecord_server_pid(pid);
+    /// Unload models from the current LMS-managed server.
+    pub async fn kill_current(&mut self, lms_port: u16) {
+        if self.lms_managed {
+            crate::lms::unload_all(lms_port).await.ok();
         }
-        self.llama_process = None;
-        server::kill_tracked_servers();
-        server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
-        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
-        self.stop_specialist();
+        self.engine = InferenceEngine::None;
     }
 
-    /// Full shutdown: kill llama + compaction + delegation servers.
+    /// Full shutdown: stop LM Studio server.
     pub fn shutdown(&mut self) {
-        if let Some(ref mut child) = self.llama_process {
-            println!("Stopping llama.cpp server...");
-            let pid = child.id();
-            child.kill().ok();
-            child.wait().ok();
-            server::unrecord_server_pid(pid);
-        }
-        self.llama_process = None;
-        server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
-        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
-        self.stop_specialist();
-    }
-
-    fn stop_specialist(&mut self) {
-        server::stop_custom_server(&mut self.specialist_process, &mut self.specialist_port);
-    }
-
-    async fn start_router(&mut self, config: &Config) {
-        if !config.trio.enabled || config.trio.router_model.is_empty() {
-            return;
-        }
-        server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
-        if let Some(model_path) = server::resolve_local_model_path(&config.trio.router_model) {
-            server::start_custom_server(
-                &mut self.delegation_process,
-                &mut self.delegation_port,
-                config.trio.router_port,
-                &model_path,
-                config.trio.router_ctx_tokens,
-                "trio-router",
-            )
-            .await;
-        } else {
-            println!(
-                "  {}{}Router model not found:{} {}{}",
-                tui::BOLD,
-                tui::YELLOW,
-                tui::RESET,
-                config.trio.router_model,
-                tui::RESET
-            );
-        }
-    }
-
-    async fn start_specialist(&mut self, config: &Config) {
-        self.stop_specialist();
-        if !config.trio.enabled || config.trio.specialist_model.is_empty() {
-            return;
-        }
-        if let Some(model_path) = server::resolve_local_model_path(&config.trio.specialist_model) {
-            server::start_custom_server(
-                &mut self.specialist_process,
-                &mut self.specialist_port,
-                config.trio.specialist_port,
-                &model_path,
-                config.trio.specialist_ctx_tokens,
-                "trio-specialist",
-            )
-            .await;
-        } else {
-            println!(
-                "  {}{}Specialist model not found:{} {}{}",
-                tui::BOLD,
-                tui::YELLOW,
-                tui::RESET,
-                config.trio.specialist_model,
-                tui::RESET
-            );
-        }
-    }
-
-    pub async fn start_trio_servers(&mut self, config: &Config) {
-        if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
-            self.stop_specialist();
-            return;
-        }
-        if config.trio.enabled {
-            // Trio lane must not run with legacy compaction/delegation stack.
-            server::stop_compaction_server(&mut self.compaction_process, &mut self.compaction_port);
-            let main_base = format!("http://localhost:{}/v1", self.local_port);
-            if !server::check_health(&main_base).await {
-                println!(
-                    "  {}{}Main server is unhealthy; skipping trio startup to avoid cascade failure.{}",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET
-                );
-                return;
+        if self.lms_managed {
+            if let Some(ref bin) = self.lms_binary {
+                println!("Stopping LM Studio server...");
+                crate::lms::server_stop(bin).ok();
             }
-            self.start_router(config).await;
-            if !server::check_health(&main_base).await {
-                println!(
-                    "  {}{}Router startup destabilized main server; stopping trio lanes.{}",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET
-                );
-                server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
-                self.stop_specialist();
-                return;
-            }
-            self.start_specialist(config).await;
-            if !server::check_health(&main_base).await {
-                println!(
-                    "  {}{}Specialist startup destabilized main server; stopping trio lanes.{}",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET
-                );
-                server::stop_delegation_server(&mut self.delegation_process, &mut self.delegation_port);
-                self.stop_specialist();
-            }
+            self.lms_managed = false;
         }
+        self.engine = InferenceEngine::None;
     }
 }
 
-/// Try to start a llama server with the given model and context size.
+/// Resolve which inference engine to use based on config preference.
 ///
-/// Deterministic policy: always bind the pinned `state.local_port`.
-///
-/// On success: updates `state.llama_process`, returns `Ok(port_string)`.
-/// On failure: cleans up and returns `Err(message)`.
-pub(crate) async fn try_start_server(
-    state: &mut ServerState,
-    model_path: &std::path::Path,
-    ctx_size: usize,
-) -> Result<String, String> {
-    let port = state.local_port.parse::<u16>().unwrap_or(8080);
-    state.local_port = port.to_string();
-    match server::spawn_main_server_adaptive(port, model_path, ctx_size).await {
-        Ok((child, used_layers)) => {
-            server::record_server_pid("main", child.id());
-            state.llama_process = Some(child);
-            let run_mode = if used_layers == 0 { "CPU fallback" } else { "GPU" };
-            println!("  {}Main server allocation: {}{}", tui::DIM, run_mode, tui::RESET);
-            Ok(state.local_port.clone())
-        }
-        Err(e) => Err(format!(
-            "failed to spawn server on pinned port {}: {}",
-            port, e
-        )),
-    }
+/// Returns `(engine_kind, binary_path)` for the first available engine.
+/// Currently only LM Studio is supported.
+pub(crate) fn resolve_inference_engine(
+    _preference: &str,
+) -> Option<(InferenceEngine, std::path::PathBuf)> {
+    crate::lms::find_lms_binary().map(|b| (InferenceEngine::Lms, b))
 }
 
 /// Rebuild the agent core and agent loop after a server change.
 ///
-/// Call this after a successful `try_start_server` or mode switch.
+/// Call this after a mode switch or config update.
 pub(crate) fn apply_server_change(
     state: &ServerState,
     model_path: &std::path::Path,
@@ -891,82 +767,10 @@ pub(crate) fn apply_server_change(
         config,
         &state.local_port,
         model_path.file_name().and_then(|n| n.to_str()),
-        state.compaction_port.as_deref(),
-        state.delegation_port.as_deref(),
-        state.specialist_port.as_deref(),
+        None,
+        None,
+        None,
     );
-}
-
-/// Outcome of a server start attempt with fallback.
-pub(crate) enum StartOutcome {
-    /// Primary model started successfully.
-    Started,
-    /// Primary failed, fallback succeeded (model path was restored).
-    Fallback,
-    /// Both primary and fallback failed — switched to cloud mode.
-    CloudFallback,
-}
-
-/// Start server with the primary model, falling back to `fallback_model` if it fails,
-/// and finally switching to cloud mode if both fail.
-///
-/// This replaces the 4x copy-pasted restart-with-fallback pattern.
-pub(crate) async fn start_with_fallback(
-    state: &mut ServerState,
-    primary_model: &std::path::Path,
-    primary_ctx: usize,
-    fallback: Option<(&std::path::Path, usize)>,
-) -> StartOutcome {
-    // Try primary
-    match try_start_server(state, primary_model, primary_ctx).await {
-        Ok(_) => return StartOutcome::Started,
-        Err(e) => {
-            println!(
-                "  {}{}Server failed:{} {}",
-                tui::BOLD,
-                tui::YELLOW,
-                tui::RESET,
-                e
-            );
-        }
-    }
-
-    // Try fallback model/ctx if provided
-    if let Some((fb_model, fb_ctx)) = fallback {
-        let fb_name = fb_model
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        println!(
-            "  {}Falling back to: {} ({}K)...{}",
-            tui::DIM,
-            fb_name,
-            fb_ctx / 1024,
-            tui::RESET
-        );
-        match try_start_server(state, fb_model, fb_ctx).await {
-            Ok(_) => return StartOutcome::Fallback,
-            Err(e) => {
-                println!(
-                    "  {}{}Fallback also failed:{} {}",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET,
-                    e
-                );
-            }
-        }
-    }
-
-    // Both failed — switch to cloud
-    println!(
-        "  {}{}Switching to cloud mode{}",
-        tui::BOLD,
-        tui::YELLOW,
-        tui::RESET
-    );
-    crate::LOCAL_MODE.store(false, Ordering::SeqCst);
-    StartOutcome::CloudFallback
 }
 
 // ============================================================================
@@ -986,7 +790,7 @@ pub(crate) fn cmd_agent(
     local_flag: bool,
     lang: Option<String>,
 ) {
-    let config = load_config(None);
+    let mut config = load_config(None);
 
     // Resolve voice language: CLI --lang > config voice.language > None (auto)
     let lang = lang.or_else(|| config.voice.language.clone());
@@ -996,8 +800,9 @@ pub(crate) fn cmd_agent(
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
-    // Set initial local mode from flag or environment
-    if local_flag || local_env {
+    // Set initial local mode from flag, environment, or config (localApiBase).
+    let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+    if local_flag || local_env || has_remote_local {
         crate::LOCAL_MODE.store(true, Ordering::SeqCst);
     }
 
@@ -1031,64 +836,160 @@ pub(crate) fn cmd_agent(
     runtime.block_on(async {
         // Create shared core and initial agent loop.
         // Use persisted local model name if available, else hardcoded default.
-        let local_model_name = if config.agents.defaults.local_model.is_empty() {
-            server::DEFAULT_LOCAL_MODEL
+        let mut local_model_name: String = if config.agents.defaults.local_model.is_empty() {
+            server::DEFAULT_LOCAL_MODEL.to_string()
         } else {
-            &config.agents.defaults.local_model
+            config.agents.defaults.local_model.clone()
         };
 
         // In local mode with single-message (-m), just start main server.
         // Trio is for interactive sessions - single messages use inline tools.
+        // When localApiBase is set, skip all local server spawning — use remote server.
         let mut trio_state: Option<ServerState> = None;
-        let (delegation_port, specialist_port) = if is_local && message.is_some() {
+        if !has_remote_local && is_local && message.is_some() {
+            // Single-message local mode: start LMS if available.
             let mut srv = ServerState::new(local_port.clone());
-            
-            // Resolve model path
-            let models_dir = dirs::home_dir().unwrap().join("models");
-            let model_path = if !config.agents.defaults.local_model.is_empty() {
-                let saved_path = models_dir.join(&config.agents.defaults.local_model);
-                if saved_path.exists() { saved_path } else { models_dir.join(server::DEFAULT_LOCAL_MODEL) }
-            } else {
-                models_dir.join(server::DEFAULT_LOCAL_MODEL)
-            };
-            
-            // Start main server only (no trio for single-message mode)
-            let ctx_size = config.agents.defaults.max_context_tokens;
-            match try_start_server(&mut srv, &model_path, ctx_size).await {
-                Ok(_) => {
-                    // Wait for main server to be healthy
-                    let main_base = format!("http://localhost:{}/v1", srv.local_port);
-                    for i in 0..30 {
-                        if server::check_health(&main_base).await {
-                            break;
+            let preference = &config.agents.defaults.inference_engine;
+            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
+                let lms_port = config.agents.defaults.lms_port;
+                match crate::lms::server_start(&bin, lms_port).await {
+                    Ok(()) => {
+                        let available = crate::lms::list_available(lms_port).await;
+                        let main_model = if !config.agents.defaults.lms_main_model.is_empty() {
+                            config.agents.defaults.lms_main_model.clone()
+                        } else {
+                            let hint = cli::strip_gguf_suffix(&local_model_name);
+                            crate::lms::resolve_model_name(&available, hint)
+                        };
+                        let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
+                        if let Err(e) = crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                            eprintln!("Warning: lms load failed: {}", e);
+                        } else {
+                            local_model_name = main_model;
+                            srv.lms_managed = true;
+                            srv.lms_binary = Some(bin);
+                            srv.local_port = lms_port.to_string();
+                            let lms_host = crate::lms::api_host();
+                            config.agents.defaults.local_api_base =
+                                format!("http://{}:{}/v1", lms_host, lms_port);
+                            config.agents.defaults.skip_jit_gate = true;
                         }
-                        if i == 29 {
-                            eprintln!("Warning: Main server health check timed out");
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: lms server start failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error: Failed to start local server: {}", e);
-                    std::process::exit(1);
+            } else {
+                eprintln!("Error: No local inference engine found. Install LM Studio (lms CLI).");
+                std::process::exit(1);
+            }
+            trio_state = Some(srv);
+        }
+
+        // Interactive REPL: detect LMS and set config BEFORE building core,
+        // so the initial core handle and SubagentManager get the right URL.
+        let mut srv = ServerState::new(local_port.clone());
+        let mut config = config; // shadow to allow mutation
+        let is_interactive = message.is_none();
+        if is_interactive && is_local && !has_remote_local {
+            tui::register_resize_handler();
+            tui::print_startup_splash(&local_port);
+
+            let preference = &config.agents.defaults.inference_engine;
+            if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
+                let lms_port = config.agents.defaults.lms_port;
+                println!(
+                    "  {}{}LM Studio{} detected, starting server on port {}...",
+                    tui::BOLD, tui::YELLOW, tui::RESET, lms_port
+                );
+
+                match crate::lms::server_start(&bin, lms_port).await {
+                    Ok(()) => {
+                        let available = crate::lms::list_available(lms_port).await;
+                        let main_model = if !config.agents.defaults.lms_main_model.is_empty() {
+                            config.agents.defaults.lms_main_model.clone()
+                        } else {
+                            let hint = cli::strip_gguf_suffix(&local_model_name);
+                            crate::lms::resolve_model_name(&available, hint)
+                        };
+                        let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
+                        print!("  Loading {}... ", main_model);
+                        io::stdout().flush().ok();
+                        match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+
+                        if config.trio.enabled {
+                            if !config.trio.router_model.is_empty() {
+                                print!("  Loading {}... ", config.trio.router_model);
+                                io::stdout().flush().ok();
+                                match crate::lms::load_model(lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens)).await {
+                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                                }
+                            }
+                            if !config.trio.specialist_model.is_empty() {
+                                print!("  Loading {}... ", config.trio.specialist_model);
+                                io::stdout().flush().ok();
+                                match crate::lms::load_model(lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens)).await {
+                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                                }
+                            }
+                        }
+
+                        local_model_name = main_model;
+                        srv.lms_managed = true;
+                        srv.lms_binary = Some(bin);
+                        srv.local_port = lms_port.to_string();
+                        let lms_host = crate::lms::api_host();
+                        config.agents.defaults.local_api_base =
+                            format!("http://{}:{}/v1", lms_host, lms_port);
+                        config.agents.defaults.skip_jit_gate = true;
+                    }
+                    Err(e) => {
+                        println!(
+                            "  {}{}lms server start failed:{} {}",
+                            tui::BOLD, tui::YELLOW, tui::RESET, e
+                        );
+                    }
                 }
             }
-            
-            trio_state = Some(srv);
-            (None::<String>, None::<String>) // No trio in single-message mode
-        } else {
-            (None, None)
-        };
+        }
 
-        // For single-message mode: no trio, use inline tools.
-        // For interactive mode: trio starts after splash if VRAM allows.
+        // Recompute has_remote_local after potential lms setup
+        let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+
+        // When no trio router is available, disable strict mode so the single model
+        // can handle tools directly. Must happen BEFORE build_core_handle so the core
+        // gets the updated tool_delegation_config.
+        if config.tool_delegation.strict_no_tools_main
+            && config.tool_delegation.strict_router_schema
+        {
+            let router_available = if srv.lms_managed {
+                let lms_port = config.agents.defaults.lms_port;
+                let available = crate::lms::list_available(lms_port).await;
+                crate::lms::is_model_available(&available, &config.trio.router_model)
+            } else if has_remote_local {
+                !config.trio.router_model.is_empty()
+            } else {
+                false
+            };
+
+            if !router_available {
+                config.tool_delegation.strict_no_tools_main = false;
+                config.tool_delegation.strict_router_schema = false;
+            }
+        }
+
         let core_handle = cli::build_core_handle(
             &config,
-            &local_port,
-            Some(local_model_name),
+            &srv.local_port,
+            Some(&local_model_name),
             None,
-            delegation_port.as_deref(),
-            specialist_port.as_deref(),
+            None,
+            None,
         );
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
@@ -1131,10 +1032,12 @@ pub(crate) fn cmd_agent(
             index_sessions_background();
         } else {
             // Interactive REPL mode.
-            tui::register_resize_handler();
-            tui::print_startup_splash(&local_port);
+            // Splash and LMS detection already happened above (before core build).
+            if !is_local || has_remote_local {
+                tui::register_resize_handler();
+                tui::print_startup_splash(&local_port);
+            }
 
-            let mut srv = ServerState::new(local_port.clone());
             // Load persisted local model preference, falling back to hardcoded default.
             let default_model = {
                 let models_dir = dirs::home_dir().unwrap().join("models");
@@ -1150,31 +1053,6 @@ pub(crate) fn cmd_agent(
                     models_dir.join(server::DEFAULT_LOCAL_MODEL)
                 }
             };
-
-            // Auto-spawn delegation server for cloud mode
-            if !is_local
-                && !config.trio.enabled
-                && config.tool_delegation.enabled
-                && config.tool_delegation.auto_local
-                && config.tool_delegation.provider.is_none()
-            {
-                server::start_delegation_if_available(
-                    &mut srv.delegation_process,
-                    &mut srv.delegation_port,
-                )
-                .await;
-                if srv.delegation_port.is_some() {
-                    cli::rebuild_core(
-                        &core_handle,
-                        &config,
-                        &local_port,
-                        Some(local_model_name),
-                        None,
-                        srv.delegation_port.as_deref(),
-                        None,
-                    );
-                }
-            }
 
             // Readline editor with history
             let history_path = get_data_dir().join("history.txt");
@@ -1211,115 +1089,51 @@ pub(crate) fn cmd_agent(
 
             let _ = ctx.rl.as_mut().unwrap().load_history(&history_path);
 
-            // Pre-flight health check: wait for llama-server to finish loading, then verify chat works.
-            if is_local {
-                let main_port = ctx.srv.local_port.clone();
-                let health_url = format!("http://localhost:{}/health", main_port);
+            // JIT warmup: pre-load models on the remote JIT server (e.g. LM Studio).
+            // This forces each model to load sequentially before any real requests,
+            // avoiding concurrent model-switch crashes and cold-start latency.
+            // Fires for any JIT server (localApiBase set), not just trio mode.
+            if has_remote_local && !ctx.srv.lms_managed {
+                use crate::providers::jit_gate::warmup_jit_models;
 
-                // Phase 1: wait for /health (lightweight — just checks the process is up).
-                let mut server_up = false;
-                for _ in 0..20 {
-                    if let Ok(resp) = reqwest::get(&health_url).await {
-                        if resp.status().is_success() {
-                            server_up = true;
-                            break;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                let base = &ctx.config.agents.defaults.local_api_base;
+                let mut models_to_warm: Vec<&str> = Vec::new();
 
-                if server_up {
-                    // Phase 2: one deep check to confirm chat completions work.
-                    if !server::check_chat_health(&main_port).await {
-                        println!(
-                            "  {}{}Server responded to /health but chat endpoint failed — restarting...{}",
-                            tui::BOLD, tui::RED, tui::RESET
-                        );
-                        ctx.cmd_restart().await;
-                        for _ in 0..10 {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            if server::check_chat_health(&ctx.srv.local_port).await {
-                                break;
-                            }
-                        }
-                    }
+                // Main model — always warm so first message is fast.
+                let main_model_ref = if ctx.config.agents.defaults.local_model.is_empty() {
+                    server::DEFAULT_LOCAL_MODEL
                 } else {
-                    println!(
-                        "  {}{}Server not responding — restarting...{}",
-                        tui::BOLD, tui::RED, tui::RESET
-                    );
-                    ctx.cmd_restart().await;
-                    for _ in 0..10 {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        if server::check_chat_health(&ctx.srv.local_port).await {
-                            break;
-                        }
+                    &ctx.config.agents.defaults.local_model
+                };
+                let main_id = cli::strip_gguf_suffix(main_model_ref);
+                models_to_warm.push(main_id);
+
+                // Trio models (router + specialist) when enabled.
+                if ctx.config.trio.enabled {
+                    // Router: prefer explicit endpoint model, fall back to trio config.
+                    if let Some(ref ep) = ctx.config.trio.router_endpoint {
+                        models_to_warm.push(&ep.model);
+                    } else if !ctx.config.trio.router_model.is_empty() {
+                        models_to_warm.push(&ctx.config.trio.router_model);
+                    }
+                    // Specialist: prefer explicit endpoint model, fall back to trio config.
+                    if let Some(ref ep) = ctx.config.trio.specialist_endpoint {
+                        models_to_warm.push(&ep.model);
+                    } else if !ctx.config.trio.specialist_model.is_empty() {
+                        models_to_warm.push(&ctx.config.trio.specialist_model);
                     }
                 }
-            }
 
-            // Start trio servers in local mode if configured.
-            // This must happen after main server is healthy but before first user message.
-            if is_local && ctx.config.trio.enabled {
                 print!(
-                    "  {}{}Starting{} trio servers... ",
-                    tui::BOLD, tui::YELLOW, tui::RESET
+                    "  {}Warming up {} model(s)...{} ",
+                    tui::DIM,
+                    models_to_warm.len(),
+                    tui::RESET
                 );
                 io::stdout().flush().ok();
-                
-                ctx.srv.start_trio_servers(&ctx.config).await;
-                
-                let router_ok = ctx.srv.delegation_port.is_some();
-                let specialist_ok = ctx.srv.specialist_port.is_some();
-                
-                if router_ok || specialist_ok {
-                    println!(
-                        "{}{}OK{} (router={}, specialist={})",
-                        tui::BOLD, tui::GREEN, tui::RESET,
-                        if router_ok { "up" } else { "down" },
-                        if specialist_ok { "up" } else { "down" }
-                    );
-                    
-                    // Rebuild core with trio ports
-                    let model_name = ctx.current_model_path
-                        .file_name()
-                        .and_then(|n| n.to_str());
-                    cli::rebuild_core(
-                        &ctx.core_handle,
-                        &ctx.config,
-                        &ctx.srv.local_port,
-                        model_name,
-                        ctx.srv.compaction_port.as_deref(),
-                        ctx.srv.delegation_port.as_deref(),
-                        ctx.srv.specialist_port.as_deref(),
-                    );
-                    ctx.agent_loop = cli::create_agent_loop(
-                        ctx.core_handle.clone(),
-                        &ctx.config,
-                        Some(ctx.cron_service.clone()),
-                        ctx.email_config.clone(),
-                        Some(ctx.display_tx.clone()),
-                    );
-                } else {
-                    println!(
-                        "{}{}SKIPPED{} (trio models not found)",
-                        tui::BOLD, tui::YELLOW, tui::RESET
-                    );
-                }
-                
-                // Safety check: strictNoToolsMain requires working router
-                if ctx.config.tool_delegation.strict_no_tools_main
-                    && ctx.config.tool_delegation.strict_router_schema
-                    && ctx.core_handle.swappable().router_provider.is_none()
-                {
-                    println!(
-                        "  {}{}WARNING:{} strictNoToolsMain is enabled but trio router is not available.",
-                        tui::BOLD, tui::YELLOW, tui::RESET
-                    );
-                    println!(
-                        "  Tools will be unavailable. Start trio servers or disable strictNoToolsMain."
-                    );
-                }
+
+                warmup_jit_models(base, "local", &models_to_warm).await;
+                println!("{}done{}", tui::DIM, tui::RESET);
             }
 
             // Start heartbeat: maintenance commands run on every tick (no LLM).
@@ -1337,7 +1151,9 @@ pub(crate) fn cmd_agent(
             heartbeat.start().await;
 
             // Start health watchdog for local servers (if any are running).
-            if is_local {
+            // Skip when using a remote local server (e.g. LM Studio) — there is
+            // no local server to monitor and the watchdog would spam the remote.
+            if is_local && !has_remote_local {
                 ctx.restart_watchdog();
             }
 
@@ -1730,20 +1546,18 @@ mod tests {
     #[test]
     fn test_server_state_new() {
         let state = ServerState::new("8080".to_string());
-        assert!(state.llama_process.is_none());
-        assert!(state.compaction_process.is_none());
-        assert!(state.compaction_port.is_none());
-        assert!(state.delegation_process.is_none());
-        assert!(state.delegation_port.is_none());
         assert_eq!(state.local_port, "8080");
+        assert!(!state.lms_managed);
+        assert!(state.lms_binary.is_none());
+        assert_eq!(state.engine, InferenceEngine::None);
     }
 
-    #[test]
-    fn test_server_state_kill_current_when_empty() {
+    #[tokio::test]
+    async fn test_server_state_kill_current_when_empty() {
         // Should not panic when there's no process to kill
         let mut state = ServerState::new("8080".to_string());
-        state.kill_current();
-        assert!(state.llama_process.is_none());
+        state.kill_current(1234).await;
+        assert_eq!(state.engine, InferenceEngine::None);
     }
 
     #[test]
@@ -1751,30 +1565,8 @@ mod tests {
         // Should not panic when there's nothing to shut down
         let mut state = ServerState::new("8080".to_string());
         state.shutdown();
-        assert!(state.llama_process.is_none());
-        assert!(state.compaction_process.is_none());
-        assert!(state.compaction_port.is_none());
-        assert!(state.delegation_process.is_none());
-        assert!(state.delegation_port.is_none());
-    }
-
-    #[test]
-    fn test_server_state_kill_terminates_child() {
-        // Spawn a real but harmless process, then verify kill_current terminates it
-        let child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("failed to spawn sleep");
-        let pid = child.id();
-        let mut state = ServerState::new("8080".to_string());
-        state.llama_process = Some(child);
-
-        state.kill_current();
-        assert!(state.llama_process.is_none());
-
-        // Verify the process is gone (kill(pid, 0) should fail)
-        let status = unsafe { libc::kill(pid as i32, 0) };
-        assert_ne!(status, 0, "process should be dead after kill_current");
+        assert!(!state.lms_managed);
+        assert_eq!(state.engine, InferenceEngine::None);
     }
 
     // --- truncate_output ---
@@ -1810,22 +1602,4 @@ mod tests {
         assert_eq!(result, "");
     }
 
-    // --- StartOutcome ---
-
-    #[test]
-    fn test_start_outcome_variants() {
-        // Just verify the enum variants exist and can be matched
-        let outcomes = vec![
-            StartOutcome::Started,
-            StartOutcome::Fallback,
-            StartOutcome::CloudFallback,
-        ];
-        for outcome in outcomes {
-            match outcome {
-                StartOutcome::Started => {}
-                StartOutcome::Fallback => {}
-                StartOutcome::CloudFallback => {}
-            }
-        }
-    }
 }

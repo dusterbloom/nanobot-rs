@@ -77,18 +77,16 @@ impl ReplContext {
     ///
     /// Aborts any previous watchdog task, collects current server ports, and
     /// spawns a fresh watchdog with auto-repair. Called on REPL init and on `/local` toggle-on.
+    /// No-op when using a remote local server (LM Studio) — nothing to watch.
     pub fn restart_watchdog(&mut self) {
         if let Some(handle) = self.watchdog_handle.take() {
             handle.abort();
         }
-        let mut ports = Vec::new();
-        ports.push(("main".to_string(), self.srv.local_port.clone()));
-        if let Some(ref cp) = self.srv.compaction_port {
-            ports.push(("compaction".to_string(), cp.clone()));
+        // LMS-managed server: nothing to watch locally.
+        if !self.config.agents.defaults.local_api_base.is_empty() {
+            return;
         }
-        if let Some(ref dp) = self.srv.delegation_port {
-            ports.push(("delegation".to_string(), dp.clone()));
-        }
+        let ports = vec![("main".to_string(), self.srv.local_port.clone())];
         self.watchdog_handle = Some(crate::server::start_health_watchdog_with_autorepair(
             ports,
             self.display_tx.clone(),
@@ -108,6 +106,12 @@ impl ReplContext {
     ///
     /// Returns true if a restart was performed.
     pub async fn handle_restart_requests(&mut self) -> bool {
+        // When using a remote local server (e.g. LM Studio), there are no
+        // local server processes to restart — drain and ignore any stale requests.
+        if !self.config.agents.defaults.local_api_base.is_empty() {
+            while self.restart_rx.try_recv().is_ok() {}
+            return false;
+        }
         let mut restarted = false;
         while let Ok(req) = self.restart_rx.try_recv() {
             if req.role == "main" {
@@ -130,84 +134,6 @@ impl ReplContext {
                             "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Main server failed to start\n"
                         ));
                     }
-                }
-                restarted = true;
-            } else if req.role == "delegation" {
-                let _ = self.display_tx.send(format!(
-                    "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting delegation server...\n"
-                ));
-                server::stop_delegation_server(
-                    &mut self.srv.delegation_process,
-                    &mut self.srv.delegation_port,
-                );
-                server::start_delegation_if_available(
-                    &mut self.srv.delegation_process,
-                    &mut self.srv.delegation_port,
-                ).await;
-                if self.srv.delegation_port.is_some() {
-                    // Wait for delegation server to become healthy before declaring ready
-                    let port = self.srv.delegation_port.as_ref().unwrap().clone();
-                    let mut ready = false;
-                    for i in 0..10 {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        let url = format!("http://localhost:{}/health", port);
-                        if let Ok(resp) = reqwest::get(&url).await {
-                            if resp.status().is_success() {
-                                ready = true;
-                                break;
-                            }
-                        }
-                        if i == 9 {
-                            let _ = self.display_tx.send(format!(
-                                "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Delegation server failed to start\n"
-                            ));
-                        }
-                    }
-                    if ready {
-                        self.core_handle
-                            .counters
-                            .delegation_healthy
-                            .store(true, Ordering::Relaxed);
-                        let _ = self.display_tx.send(format!(
-                            "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Delegation server \x1b[32mready\x1b[0m\n"
-                        ));
-                    }
-                }
-                restarted = true;
-            } else if req.role == "compaction" {
-                let _ = self.display_tx.send(format!(
-                    "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting compaction server...\n"
-                ));
-                server::stop_compaction_server(
-                    &mut self.srv.compaction_process,
-                    &mut self.srv.compaction_port,
-                );
-                let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-                server::start_compaction_if_available(
-                    &mut self.srv.compaction_process,
-                    &mut self.srv.compaction_port,
-                    ctx_size,
-                ).await;
-                if self.srv.compaction_port.is_some() {
-                    // Wait for compaction server to become healthy before declaring ready
-                    let port = self.srv.compaction_port.as_ref().unwrap().clone();
-                    for i in 0..10 {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        let url = format!("http://localhost:{}/health", port);
-                        if let Ok(resp) = reqwest::get(&url).await {
-                            if resp.status().is_success() {
-                                break;
-                            }
-                        }
-                        if i == 9 {
-                            let _ = self.display_tx.send(format!(
-                                "\x1b[RAW]\n  \x1b[31m\u{25cf}\x1b[0m Compaction server failed to start\n"
-                            ));
-                        }
-                    }
-                    let _ = self.display_tx.send(format!(
-                        "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Compaction server \x1b[32mready\x1b[0m\n"
-                    ));
                 }
                 restarted = true;
             }
@@ -404,6 +330,9 @@ impl ReplContext {
             "/email" => {
                 self.cmd_email();
             }
+            "/trio" => {
+                self.cmd_trio(arg).await;
+            }
             #[cfg(feature = "voice")]
             "/voice" => {
                 self.cmd_voice().await;
@@ -561,87 +490,44 @@ impl ReplContext {
         // Server health display (local mode or when delegation server is active).
         {
             let mut servers: Vec<String> = Vec::new();
+            let remote_base = &self.config.agents.defaults.local_api_base;
+            let has_remote_local = !remote_base.is_empty();
 
             if is_local {
-                let main_health = crate::server::check_health(&format!(
-                    "http://localhost:{}/v1",
-                    self.srv.local_port
-                ))
-                .await;
-                let (color, label) = if main_health {
-                    (tui::GREEN, "healthy")
+                if has_remote_local {
+                    // Remote local server (e.g. LM Studio): check the remote URL.
+                    let health = crate::server::check_health(remote_base).await;
+                    let (color, label) = if health {
+                        (tui::GREEN, "healthy")
+                    } else {
+                        (tui::RED, "DOWN")
+                    };
+                    servers.push(format!(
+                        "LM Studio ({}{}{}{})",
+                        color, tui::BOLD, label, tui::RESET
+                    ));
                 } else {
-                    (tui::RED, "DOWN")
-                };
-                servers.push(format!(
-                    "main:{} ({}{}{}{})",
-                    self.srv.local_port,
-                    color,
-                    tui::BOLD,
-                    label,
-                    tui::RESET
-                ));
+                    let main_health = crate::server::check_health(&format!(
+                        "http://localhost:{}/v1",
+                        self.srv.local_port
+                    ))
+                    .await;
+                    let (color, label) = if main_health {
+                        (tui::GREEN, "healthy")
+                    } else {
+                        (tui::RED, "DOWN")
+                    };
+                    servers.push(format!(
+                        "main:{} ({}{}{}{})",
+                        self.srv.local_port,
+                        color,
+                        tui::BOLD,
+                        label,
+                        tui::RESET
+                    ));
+                }
             }
 
-            if let Some(ref cp) = self.srv.compaction_port {
-                let health =
-                    crate::server::check_health(&format!("http://localhost:{}/v1", cp)).await;
-                let (color, label) = if health {
-                    (tui::GREEN, "healthy")
-                } else {
-                    (tui::RED, "DOWN")
-                };
-                servers.push(format!(
-                    "compact:{} ({}{}{}{})",
-                    cp,
-                    color,
-                    tui::BOLD,
-                    label,
-                    tui::RESET
-                ));
-            }
-
-            if let Some(ref dp) = self.srv.delegation_port {
-                let health =
-                    crate::server::check_health(&format!("http://localhost:{}/v1", dp)).await;
-                let (color, label) = if health {
-                    (tui::GREEN, "healthy")
-                } else {
-                    (tui::RED, "DOWN")
-                };
-                let lane_name = if self.config.trio.enabled {
-                    "router"
-                } else {
-                    "deleg"
-                };
-                servers.push(format!(
-                    "{}:{} ({}{}{}{})",
-                    lane_name,
-                    dp,
-                    color,
-                    tui::BOLD,
-                    label,
-                    tui::RESET
-                ));
-            }
-
-            if let Some(ref sp) = self.srv.specialist_port {
-                let health =
-                    crate::server::check_health(&format!("http://localhost:{}/v1", sp)).await;
-                let (color, label) = if health {
-                    (tui::GREEN, "healthy")
-                } else {
-                    (tui::RED, "DOWN")
-                };
-                servers.push(format!(
-                    "specialist:{} ({}{}{}{})",
-                    sp,
-                    color,
-                    tui::BOLD,
-                    label,
-                    tui::RESET
-                ));
-            }
 
             if !servers.is_empty() {
                 println!(
@@ -1222,9 +1108,9 @@ impl ReplContext {
             &toggled_config,
             &self.srv.local_port,
             self.current_model_path.file_name().and_then(|n| n.to_str()),
-            self.srv.compaction_port.as_deref(),
-            self.srv.delegation_port.as_deref(),
-            self.srv.specialist_port.as_deref(),
+            None,
+            None,
+            None,
         );
         self.agent_loop = cli::create_agent_loop(
             self.core_handle.clone(),
@@ -1242,122 +1128,76 @@ impl ReplContext {
         }
     }
 
-    /// /restart — restart local servers (or delegation server in cloud mode).
+    /// /restart — restart local servers and reload models.
     pub async fn cmd_restart(&mut self) {
-        let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
-        if is_local {
-            self.srv.kill_current();
-            let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-            let fallback_model = dirs::home_dir()
-                .map(|h| h.join("models").join(server::DEFAULT_LOCAL_MODEL))
-                .filter(|p| p.exists() && *p != self.current_model_path);
-            let fallback = fallback_model
-                .as_ref()
-                .map(|p| (p.as_path(), server::compute_optimal_context_size(p)));
+        if self.srv.lms_managed {
+            if let Some(ref bin) = self.srv.lms_binary.clone() {
+                let lms_port = self.config.agents.defaults.lms_port;
 
-            println!(
-                "  {}{}Restarting{} local server stack (ctx: {}K)...",
-                tui::BOLD,
-                tui::YELLOW,
-                tui::RESET,
-                ctx_size / 1024
-            );
-
-            match super::start_with_fallback(
-                &mut self.srv,
-                &self.current_model_path,
-                ctx_size,
-                fallback,
-            )
-            .await
-            {
-                super::StartOutcome::Started | super::StartOutcome::Fallback => {
-                    if self.config.trio.enabled {
-                        // Trio lane: router + specialist only (no compaction/delegation stack).
-                        server::stop_compaction_server(
-                            &mut self.srv.compaction_process,
-                            &mut self.srv.compaction_port,
-                        );
-                        self.srv.start_trio_servers(&self.config).await;
-                    } else if self.config.tool_delegation.enabled
-                        && self.config.tool_delegation.auto_local
-                        && self.config.tool_delegation.provider.is_none()
-                    {
-                        server::start_compaction_if_available(
-                            &mut self.srv.compaction_process,
-                            &mut self.srv.compaction_port,
-                            ctx_size,
-                        )
-                        .await;
-                        server::start_delegation_if_available(
-                            &mut self.srv.delegation_process,
-                            &mut self.srv.delegation_port,
-                        )
-                        .await;
-                    } else {
-                        server::start_compaction_if_available(
-                            &mut self.srv.compaction_process,
-                            &mut self.srv.compaction_port,
-                            ctx_size,
-                        )
-                        .await;
+                // Restart LMS server
+                print!("  Restarting LM Studio server... ");
+                io::stdout().flush().ok();
+                crate::lms::server_stop(bin).ok();
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match crate::lms::server_start(bin, lms_port).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => {
+                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                        return;
                     }
-                    self.apply_and_rebuild();
-                    self.restart_watchdog();
-                    tui::print_mode_banner(&self.srv.local_port);
                 }
-                super::StartOutcome::CloudFallback => {
-                    self.stop_watchdog();
-                    self.apply_and_rebuild();
+
+                // Reload main model
+                let main_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                    self.config.agents.defaults.lms_main_model.clone()
+                } else {
+                    self.config.agents.defaults.local_model.clone()
+                };
+                let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                print!("  Loading {}... ", main_model);
+                io::stdout().flush().ok();
+                match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
-            }
-        } else {
-            let core = self.core_handle.swappable();
-            if !core.tool_delegation_config.enabled {
-                println!("  Tool delegation is not enabled.");
-                return;
-            }
 
-            // Stop existing delegation server if any.
-            server::stop_delegation_server(
-                &mut self.srv.delegation_process,
-                &mut self.srv.delegation_port,
-            );
+                // Reload trio models if enabled
+                if self.config.trio.enabled {
+                    if !self.config.trio.router_model.is_empty() {
+                        print!("  Loading {}... ", self.config.trio.router_model);
+                        io::stdout().flush().ok();
+                        match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    }
+                    if !self.config.trio.specialist_model.is_empty() {
+                        print!("  Loading {}... ", self.config.trio.specialist_model);
+                        io::stdout().flush().ok();
+                        match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await {
+                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    }
+                }
 
-            // Try to start a fresh one.
-            server::start_delegation_if_available(
-                &mut self.srv.delegation_process,
-                &mut self.srv.delegation_port,
-            )
-            .await;
-
-            if self.srv.delegation_port.is_some() {
-                // Reset health flag and rebuild core with new provider.
-                self.core_handle
-                    .counters
-                    .delegation_healthy
-                    .store(true, Ordering::Relaxed);
-                self.core_handle
-                    .counters
-                    .delegation_retry_counter
-                    .store(0, Ordering::Relaxed);
-                cli::rebuild_core(
-                    &self.core_handle,
-                    &self.config,
-                    &self.srv.local_port,
-                    self.current_model_path.file_name().and_then(|n| n.to_str()),
-                    self.srv.compaction_port.as_deref(),
-                    self.srv.delegation_port.as_deref(),
-                    self.srv.specialist_port.as_deref(),
-                );
-                self.rebuild_agent_loop();
-            } else {
-                println!("  No suitable delegation model found in ~/models/");
+                // Update URL in case host/port changed
+                let lms_host = crate::lms::api_host();
+                self.config.agents.defaults.local_api_base =
+                    format!("http://{}:{}/v1", lms_host, lms_port);
             }
         }
+
+        self.apply_and_rebuild();
+        println!(
+            "  {}{}Rebuilt{} agent core.",
+            tui::BOLD,
+            tui::GREEN,
+            tui::RESET
+        );
     }
 
-    /// /ctx [size] — change context size.
+    /// /ctx [size] — show or set context size for the main model.
     async fn cmd_ctx(&mut self, arg: &str) {
         if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
             println!(
@@ -1371,48 +1211,171 @@ impl ReplContext {
         let new_ctx: usize = match super::parse_ctx_arg(arg) {
             Ok(Some(n)) => n,
             Ok(None) => {
-                // No argument → re-auto-detect
                 let auto = server::compute_optimal_context_size(&self.current_model_path);
-                println!("\n  Auto-detected: {}K", auto / 1024);
-                auto
+                let current = self.config.agents.defaults.local_max_context_tokens;
+                println!("\n  Current: {}K", current / 1024);
+                println!("  Auto-detected optimal: {}K", auto / 1024);
+                if self.config.trio.enabled {
+                    let budget = self.compute_current_vram_budget();
+                    let total_gb = budget.total_vram_bytes as f64 / 1e9;
+                    let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
+                    let status = if budget.fits { "OK" } else { "OVER" };
+                    println!("  VRAM: {:.1} / {:.1} GB [{}]", total_gb, limit_gb, status);
+                }
+                println!("\n  Usage: /ctx <size>  e.g. /ctx 32K or /ctx 32768\n");
+                return;
             }
             Err(msg) => {
                 println!("\n  {}\n", msg);
-                println!("  Usage: /ctx [size]  e.g. /ctx 32K or /ctx 32768\n");
+                println!("  Usage: /ctx <size>  e.g. /ctx 32K or /ctx 32768\n");
                 return;
             }
         };
 
-        // Restart server with new context size
-        self.srv.kill_current();
-        let fallback_ctx = server::compute_optimal_context_size(&self.current_model_path);
-        println!(
-            "  {}{}Restarting{} llama.cpp (ctx: {}K)...",
-            tui::BOLD,
-            tui::YELLOW,
-            tui::RESET,
-            new_ctx / 1024
-        );
-        match super::start_with_fallback(
-            &mut self.srv,
-            &self.current_model_path,
-            new_ctx,
-            Some((&self.current_model_path, fallback_ctx)),
-        )
-        .await
-        {
-            super::StartOutcome::Started | super::StartOutcome::Fallback => {
-                self.apply_and_rebuild();
-                tui::print_mode_banner(&self.srv.local_port);
-            }
-            super::StartOutcome::CloudFallback => {
-                self.apply_and_rebuild();
+        // Apply context change
+        self.config.agents.defaults.local_max_context_tokens = new_ctx;
+
+        // Persist to disk
+        let mut disk_cfg = load_config(None);
+        disk_cfg.agents.defaults.local_max_context_tokens = new_ctx;
+        save_config(&disk_cfg, None);
+
+        // Reload model in LMS with new context
+        if self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            let model_name = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                self.config.agents.defaults.lms_main_model.clone()
+            } else {
+                self.config.agents.defaults.local_model.clone()
+            };
+            if !model_name.is_empty() {
+                print!("  Reloading {} with {}K context... ", model_name, new_ctx / 1024);
+                io::stdout().flush().ok();
+                match crate::lms::load_model(lms_port, &model_name, Some(new_ctx)).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                }
             }
         }
+
+        // Warn if VRAM budget exceeded
+        if self.config.trio.enabled {
+            let budget = self.compute_current_vram_budget();
+            if !budget.fits {
+                println!(
+                    "  \x1b[33mWarning:\x1b[0m Total VRAM ({:.1} GB) exceeds limit ({:.1} GB).",
+                    budget.total_vram_bytes as f64 / 1e9,
+                    budget.effective_limit_bytes as f64 / 1e9,
+                );
+                println!("  Reduce context sizes or switch to smaller models.");
+            }
+        }
+
+        self.apply_and_rebuild();
+        println!(
+            "\n  Context size set to {}{}K{}.\n",
+            tui::BOLD,
+            new_ctx / 1024,
+            tui::RESET,
+        );
     }
 
     /// /model — select local model from ~/models/.
     async fn cmd_model(&mut self) {
+        // LMS-managed: list from LM Studio's downloaded models via HTTP API
+        if self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            let available = crate::lms::list_available(lms_port).await;
+            // Filter out embedding models (they contain "embedding" in the name)
+            let llm_models: Vec<&String> = available
+                .iter()
+                .filter(|m| !m.to_lowercase().contains("embedding"))
+                .collect();
+            if llm_models.is_empty() {
+                println!("\nNo models found in LM Studio.\n");
+                return;
+            }
+
+            let loaded = crate::lms::list_loaded(lms_port).await;
+            let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                &self.config.agents.defaults.lms_main_model
+            } else {
+                &self.config.agents.defaults.local_model
+            };
+
+            println!("\nLM Studio models:");
+            for (i, name) in llm_models.iter().enumerate() {
+                let is_loaded = loaded.iter().any(|l| l.contains(name.as_str()) || name.contains(l.as_str()));
+                let is_active = crate::lms::is_model_available(std::slice::from_ref(*name), current_model);
+                let marker = if is_active {
+                    " (active)"
+                } else if is_loaded {
+                    " (loaded)"
+                } else {
+                    ""
+                };
+                println!("  [{}] {}{}", i + 1, name, marker);
+            }
+
+            let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", llm_models.len());
+            let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
+                Ok(line) => line,
+                Err(_) => return,
+            };
+            let choice = choice.trim();
+            if choice.is_empty() {
+                return;
+            }
+            let idx: usize = match choice.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= llm_models.len() => n - 1,
+                _ => {
+                    println!("Invalid selection.\n");
+                    return;
+                }
+            };
+
+            let selected = llm_models[idx].clone();
+            println!("\nSelected: {}", selected);
+
+            // Load the model in LMS with context length
+            let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+            print!("  Loading {}... ", selected);
+            io::stdout().flush().ok();
+            match crate::lms::load_model(lms_port, &selected, ctx).await {
+                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+            }
+
+            // Persist selection and update current_model_path so rebuild_core
+            // sends the correct model identifier to LM Studio.
+            self.config.agents.defaults.local_model = selected.clone();
+            self.config.agents.defaults.lms_main_model = selected.clone();
+            self.current_model_path = PathBuf::from(&selected);
+            let mut disk_cfg = load_config(None);
+            disk_cfg.agents.defaults.local_model = selected.clone();
+            disk_cfg.agents.defaults.lms_main_model = selected;
+            save_config(&disk_cfg, None);
+
+            self.apply_and_rebuild();
+
+            // Warn if VRAM budget exceeded after model change
+            if self.config.trio.enabled {
+                let budget = self.compute_current_vram_budget();
+                if !budget.fits {
+                    println!(
+                        "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
+                        budget.total_vram_bytes as f64 / 1e9,
+                        budget.effective_limit_bytes as f64 / 1e9,
+                    );
+                    println!("  Use /trio budget for details.");
+                }
+            }
+
+            println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
+            return;
+        }
+
+        // Fallback: scan ~/models/*.gguf (llama-server or no engine)
         let models = server::list_local_models();
         if models.is_empty() {
             println!("\nNo .gguf models found in ~/models/\n");
@@ -1452,51 +1415,455 @@ impl ReplContext {
         };
 
         let selected = &models[idx];
-        let previous_model_path = self.current_model_path.clone();
         self.current_model_path = selected.clone();
         let name = selected.file_name().unwrap().to_string_lossy();
         println!("\nSelected: {}", name);
 
-        // Persist the selection to config.
+        // Persist the selection to config (load fresh to avoid clobbering
+        // fields changed externally, e.g. localApiBase).
         self.config.agents.defaults.local_model = name.to_string();
-        save_config(&self.config, None);
+        let mut disk_cfg = load_config(None);
+        disk_cfg.agents.defaults.local_model = name.to_string();
+        save_config(&disk_cfg, None);
 
-        // If local mode is active, restart the server with the new model
+        // If local mode is active, apply the new model.
         if crate::LOCAL_MODE.load(Ordering::SeqCst) {
-            self.srv.kill_current();
-            let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-            println!(
-                "  {}{}Starting{} llama.cpp (ctx: {}K)...",
-                tui::BOLD,
-                tui::YELLOW,
-                tui::RESET,
-                ctx_size / 1024
-            );
-            let fallback_ctx = server::compute_optimal_context_size(&previous_model_path);
-            match super::start_with_fallback(
-                &mut self.srv,
-                &self.current_model_path,
-                ctx_size,
-                Some((&previous_model_path, fallback_ctx)),
-            )
-            .await
-            {
-                super::StartOutcome::Started => {
-                    self.apply_and_rebuild();
-                    tui::print_mode_banner(&self.srv.local_port);
-                }
-                super::StartOutcome::Fallback => {
-                    self.current_model_path = previous_model_path.clone();
-                    self.apply_and_rebuild();
-                    println!("  {}Restored previous model{}", tui::DIM, tui::RESET);
-                }
-                super::StartOutcome::CloudFallback => {
-                    self.apply_and_rebuild();
+            self.apply_and_rebuild();
+
+            // Warn if VRAM budget exceeded after model change
+            if self.config.trio.enabled {
+                let budget = self.compute_current_vram_budget();
+                if !budget.fits {
+                    println!(
+                        "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
+                        budget.total_vram_bytes as f64 / 1e9,
+                        budget.effective_limit_bytes as f64 / 1e9,
+                    );
+                    println!("  Use /trio budget for details.");
                 }
             }
+
+            println!(
+                "  {}Model switched — server will load on next request.{}",
+                tui::DIM, tui::RESET
+            );
         } else {
             println!("Model will be used next time you toggle /local on.\n");
         }
+    }
+
+    /// /trio — manage trio mode (router + specialist helpers).
+    ///
+    /// Subcommands:
+    ///   /trio                      — toggle trio on/off
+    ///   /trio status               — show current trio config
+    ///   /trio budget               — show VRAM budget breakdown
+    ///   /trio router               — pick router model from LM Studio
+    ///   /trio specialist           — pick specialist model from LM Studio
+    ///   /trio router temp 0.3      — set router temperature
+    ///   /trio specialist ctx 8K    — set specialist context size
+    ///   /trio router nothink       — toggle router no_think
+    ///   /trio main nothink         — toggle main no_think
+    ///   /trio cap 12               — set VRAM cap (GB)
+    async fn cmd_trio(&mut self, arg: &str) {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            ["status" | "s"] => self.cmd_trio_status().await,
+            ["router" | "r"] => self.cmd_trio_pick_model("router").await,
+            ["specialist" | "spec"] => self.cmd_trio_pick_model("specialist").await,
+            ["budget" | "b"] => self.cmd_trio_budget().await,
+
+            // Parameter subcommands
+            ["router" | "r", "temp" | "temperature", val] =>
+                self.cmd_trio_set_param("router", "temperature", val),
+            ["specialist" | "spec", "temp" | "temperature", val] =>
+                self.cmd_trio_set_param("specialist", "temperature", val),
+            ["router" | "r", "ctx" | "context", val] =>
+                self.cmd_trio_set_param("router", "ctx", val),
+            ["specialist" | "spec", "ctx" | "context", val] =>
+                self.cmd_trio_set_param("specialist", "ctx", val),
+            ["router" | "r", "nothink" | "no_think"] =>
+                self.cmd_trio_set_param("router", "no_think", "toggle"),
+            ["main", "nothink" | "no_think"] =>
+                self.cmd_trio_set_param("main", "no_think", "toggle"),
+            ["cap" | "vram", val] =>
+                self.cmd_trio_set_param("trio", "vram_cap", val),
+
+            [] => self.cmd_trio_toggle().await,
+            _ => {
+                println!("\n  Usage: /trio [subcommand]");
+                println!("    /trio                      Toggle trio on/off");
+                println!("    /trio status               Show current trio config");
+                println!("    /trio budget               Show VRAM budget breakdown");
+                println!("    /trio router               Pick router model");
+                println!("    /trio specialist            Pick specialist model");
+                println!("    /trio router temp 0.3       Set router temperature");
+                println!("    /trio specialist temp 0.7   Set specialist temperature");
+                println!("    /trio router ctx 4K         Set router context");
+                println!("    /trio specialist ctx 8K     Set specialist context");
+                println!("    /trio router nothink        Toggle router no_think");
+                println!("    /trio main nothink          Toggle main no_think");
+                println!("    /trio cap 12                Set VRAM cap (GB)\n");
+            }
+        }
+    }
+
+    /// Set a trio parameter (temperature, context, no_think, vram_cap).
+    fn cmd_trio_set_param(&mut self, role: &str, param: &str, value: &str) {
+        match apply_trio_param(&mut self.config, role, param, value) {
+            Ok(desc) => {
+                self.persist_trio_config();
+                self.apply_and_rebuild();
+                println!("\n  Set {}.\n", desc);
+            }
+            Err(msg) => {
+                println!("\n  Error: {}\n", msg);
+            }
+        }
+    }
+
+    /// Show VRAM budget breakdown.
+    async fn cmd_trio_budget(&self) {
+        if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
+            println!(
+                "\n  {}Not in local mode — use /local first{}\n",
+                tui::DIM,
+                tui::RESET
+            );
+            return;
+        }
+        let budget = self.compute_current_vram_budget();
+        println!("{}", format_vram_budget(&budget));
+    }
+
+    /// Toggle trio mode on/off.
+    async fn cmd_trio_toggle(&mut self) {
+        let was_enabled = self.config.trio.enabled;
+
+        if was_enabled {
+            trio_disable(&mut self.config);
+
+            // Unload router + specialist from LMS (keep main loaded)
+            if self.srv.lms_managed {
+                let lms_port = self.config.agents.defaults.lms_port;
+                if !self.config.trio.router_model.is_empty() {
+                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.router_model).await;
+                }
+                if !self.config.trio.specialist_model.is_empty() {
+                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.specialist_model).await;
+                }
+            }
+
+            self.persist_trio_config();
+            self.apply_and_rebuild();
+            println!(
+                "\n  Trio \x1b[33mdisabled\x1b[0m — single model (inline) mode.\n"
+            );
+        } else {
+            let needs_warning = trio_enable(&mut self.config);
+            if needs_warning {
+                println!("\n  \x1b[33mWarning:\x1b[0m Router or specialist model not configured.");
+                println!("  Use /trio router and /trio specialist to pick models first.");
+                println!("  Or set them in config.json under \"trio\".\n");
+            }
+
+            // Auto-compute optimal context sizes to fit VRAM budget
+            if crate::LOCAL_MODE.load(Ordering::SeqCst) {
+                let budget = self.compute_current_vram_budget();
+                if budget.fits {
+                    // Apply computed context sizes
+                    self.config.agents.defaults.local_max_context_tokens = budget.main_ctx;
+                    if budget.router_ctx > 0 {
+                        self.config.trio.router_ctx_tokens = budget.router_ctx;
+                    }
+                    if budget.specialist_ctx > 0 {
+                        self.config.trio.specialist_ctx_tokens = budget.specialist_ctx;
+                    }
+                    let total_gb = budget.total_vram_bytes as f64 / 1e9;
+                    let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
+                    println!(
+                        "  Auto-computed contexts: main={}K router={}K specialist={}K ({:.1}/{:.1} GB)",
+                        budget.main_ctx / 1024,
+                        budget.router_ctx / 1024,
+                        budget.specialist_ctx / 1024,
+                        total_gb,
+                        limit_gb,
+                    );
+                } else {
+                    println!(
+                        "  \x1b[33mWarning:\x1b[0m Models may exceed VRAM ({:.1}/{:.1} GB).",
+                        budget.total_vram_bytes as f64 / 1e9,
+                        budget.effective_limit_bytes as f64 / 1e9,
+                    );
+                    println!("  Use /trio budget for details, /trio cap to adjust.");
+                }
+            }
+
+            // Load router + specialist on LMS if available
+            if self.srv.lms_managed {
+                let lms_port = self.config.agents.defaults.lms_port;
+                if !self.config.trio.router_model.is_empty() {
+                    print!(
+                        "  Loading {}... ",
+                        self.config.trio.router_model
+                    );
+                    io::stdout().flush().ok();
+                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                    }
+                }
+                if !self.config.trio.specialist_model.is_empty() {
+                    print!(
+                        "  Loading {}... ",
+                        self.config.trio.specialist_model
+                    );
+                    io::stdout().flush().ok();
+                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await
+                    {
+                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                    }
+                }
+            }
+
+            self.persist_trio_config();
+            self.apply_and_rebuild();
+            println!(
+                "\n  Trio \x1b[32menabled\x1b[0m — main + router + specialist.\n"
+            );
+        }
+    }
+
+    /// Show current trio configuration.
+    async fn cmd_trio_status(&self) {
+        let trio = &self.config.trio;
+        let td = &self.config.tool_delegation;
+        let enabled_label = if trio.enabled {
+            format!("{}enabled{}", tui::GREEN, tui::RESET)
+        } else {
+            format!("{}disabled{}", tui::YELLOW, tui::RESET)
+        };
+
+        println!();
+        println!(
+            "  {}TRIO{}       {}",
+            tui::BOLD, tui::RESET, enabled_label
+        );
+        println!(
+            "  {}MODE{}       {:?}",
+            tui::BOLD, tui::RESET, td.mode
+        );
+
+        // Main model
+        let main = if !self.config.agents.defaults.lms_main_model.is_empty() {
+            self.config.agents.defaults.lms_main_model.clone()
+        } else if !self.config.agents.defaults.local_model.is_empty() {
+            self.config.agents.defaults.local_model.clone()
+        } else {
+            "(default)".to_string()
+        };
+        println!(
+            "  {}MAIN{}       {}{}{}",
+            tui::BOLD, tui::RESET, tui::DIM, main, tui::RESET
+        );
+
+        // Router
+        let router = if trio.router_model.is_empty() {
+            "\x1b[33m(not set)\x1b[0m".to_string()
+        } else {
+            format!("{}{}{}", tui::DIM, trio.router_model, tui::RESET)
+        };
+        println!(
+            "  {}ROUTER{}     {}",
+            tui::BOLD, tui::RESET, router
+        );
+
+        // Specialist
+        let specialist = if trio.specialist_model.is_empty() {
+            "\x1b[33m(not set)\x1b[0m".to_string()
+        } else {
+            format!("{}{}{}", tui::DIM, trio.specialist_model, tui::RESET)
+        };
+        println!(
+            "  {}SPECIALIST{} {}",
+            tui::BOLD, tui::RESET, specialist
+        );
+
+        // Context sizes
+        println!(
+            "  {}CTX{}        main={}K  router={}K  specialist={}K",
+            tui::BOLD,
+            tui::RESET,
+            self.config.agents.defaults.local_max_context_tokens / 1024,
+            trio.router_ctx_tokens / 1024,
+            trio.specialist_ctx_tokens / 1024,
+        );
+
+        // Loaded models (if LMS managed)
+        if self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            let loaded = crate::lms::list_loaded(lms_port).await;
+            if !loaded.is_empty() {
+                println!(
+                    "  {}LOADED{}     {}{}{}",
+                    tui::BOLD,
+                    tui::RESET,
+                    tui::DIM,
+                    loaded.join(", "),
+                    tui::RESET
+                );
+            }
+        }
+
+        // VRAM budget summary (local mode only)
+        if crate::LOCAL_MODE.load(Ordering::SeqCst) {
+            let budget = self.compute_current_vram_budget();
+            let total_gb = budget.total_vram_bytes as f64 / 1e9;
+            let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
+            let status = if budget.fits {
+                format!("{}OK{}", tui::GREEN, tui::RESET)
+            } else {
+                format!("\x1b[31mOVER\x1b[0m")
+            };
+            println!(
+                "  {}VRAM{}       {:.1} / {:.1} GB  [{}]",
+                tui::BOLD, tui::RESET, total_gb, limit_gb, status,
+            );
+        }
+
+        println!();
+    }
+
+    /// Pick a model for a trio role (router or specialist) from LM Studio's available models.
+    async fn cmd_trio_pick_model(&mut self, role: &str) {
+        // Get available models from LMS
+        let models: Vec<String> = if self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            crate::lms::list_available(lms_port)
+                .await
+                .into_iter()
+                .filter(|m| {
+                    // Filter out embedding models
+                    !m.to_lowercase().contains("embedding")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if models.is_empty() {
+            println!("\n  No LLM models found in LM Studio.");
+            println!(
+                "  Set manually in config.json: trio.{}Model\n",
+                role
+            );
+            // Allow manual entry
+            let manual_prompt = format!("  Enter {} model ID (or Enter to cancel): ", role);
+            let input = match self.rl.as_mut().unwrap().readline(&manual_prompt) {
+                Ok(line) => line.trim().to_string(),
+                Err(_) => return,
+            };
+            if input.is_empty() {
+                return;
+            }
+            self.set_trio_role_model(role, &input).await;
+            return;
+        }
+
+        let current = match role {
+            "router" => &self.config.trio.router_model,
+            "specialist" => &self.config.trio.specialist_model,
+            _ => unreachable!(),
+        };
+
+        println!("\n  Available models for {}:", role);
+        for (i, model) in models.iter().enumerate() {
+            let marker = if crate::lms::is_model_available(std::slice::from_ref(model), current) {
+                " (active)"
+            } else {
+                ""
+            };
+            println!("  [{}] {}{}", i + 1, model, marker);
+        }
+
+        let pick_prompt = format!(
+            "  Select {} model [1-{}] or Enter to cancel: ",
+            role,
+            models.len()
+        );
+        let choice = match self.rl.as_mut().unwrap().readline(&pick_prompt) {
+            Ok(line) => line,
+            Err(_) => return,
+        };
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return;
+        }
+        let idx: usize = match choice.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= models.len() => n - 1,
+            _ => {
+                println!("  Invalid selection.\n");
+                return;
+            }
+        };
+
+        let selected = &models[idx];
+        self.set_trio_role_model(role, selected).await;
+    }
+
+    /// Apply a model selection to a trio role and persist.
+    async fn set_trio_role_model(&mut self, role: &str, model: &str) {
+        set_trio_role_model_pure(&mut self.config, role, model);
+
+        // Load the model in LMS if trio is active
+        if self.config.trio.enabled && self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            let ctx = match role {
+                "router" => Some(self.config.trio.router_ctx_tokens),
+                "specialist" => Some(self.config.trio.specialist_ctx_tokens),
+                _ => Some(self.config.agents.defaults.local_max_context_tokens),
+            };
+            print!("  Loading {}... ", model);
+            io::stdout().flush().ok();
+            match crate::lms::load_model(lms_port, model, ctx).await {
+                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+            }
+        }
+
+        self.persist_trio_config();
+        self.apply_and_rebuild();
+        println!(
+            "\n  {} {} set to {}{}{}.",
+            role.chars().next().unwrap().to_uppercase().collect::<String>()
+                + &role[1..],
+            tui::BOLD,
+            tui::RESET,
+            model,
+            ""
+        );
+
+        // Warn if VRAM budget exceeded after model change
+        if self.config.trio.enabled && crate::LOCAL_MODE.load(Ordering::SeqCst) {
+            let budget = self.compute_current_vram_budget();
+            if !budget.fits {
+                println!(
+                    "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
+                    budget.total_vram_bytes as f64 / 1e9,
+                    budget.effective_limit_bytes as f64 / 1e9,
+                );
+                println!("  Use /trio budget for details.");
+            }
+        }
+        println!();
+    }
+
+    /// Persist trio + tool_delegation config to disk.
+    fn persist_trio_config(&self) {
+        let mut disk_cfg = load_config(None);
+        persist_trio_fields(&self.config, &mut disk_cfg);
+        save_config(&disk_cfg, None);
     }
 
     /// /local — toggle between local and cloud mode.
@@ -1504,190 +1871,116 @@ impl ReplContext {
         let currently_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
 
         if !currently_local {
-            // Toggle ON with deterministic port pinning.
-            // Only reuse/start on the configured local port to avoid accidental
-            // attachment to unrelated local-agent servers.
-            let preferred_port = self.srv.local_port.parse::<u16>().unwrap_or(8080);
-            self.srv.local_port = preferred_port.to_string();
-            let mut reuse_preferred = false;
-
-            let url = format!("http://localhost:{}/health", preferred_port);
-            if let Ok(resp) = reqwest::blocking::get(&url) {
-                if resp.status().is_success() {
-                    let props_url = format!("http://localhost:{}/props", preferred_port);
-                    let n_parallel = reqwest::blocking::get(&props_url)
-                        .ok()
-                        .and_then(|r| r.json::<serde_json::Value>().ok())
-                        .and_then(|json| {
-                            json.get("default_generation_settings")
-                                .and_then(|s| s.get("n_parallel"))
-                                .and_then(|n| n.as_u64())
-                                .or_else(|| json.get("n_parallel").and_then(|n| n.as_u64()))
-                        })
-                        .unwrap_or(1);
-                    if n_parallel <= 1 {
-                        reuse_preferred = true;
-                    } else {
-                        println!(
-                            "\n  {}{}Port {} is healthy but n_parallel={} (shared). Starting dedicated server on pinned port instead.{}",
-                            tui::BOLD,
-                            tui::YELLOW,
-                            preferred_port,
-                            n_parallel,
-                            tui::RESET
-                        );
-                    }
-                }
-            }
-
-            if reuse_preferred {
-                // Reuse existing server
-                println!(
-                    "\n  {}{}Reusing{} llama.cpp server on pinned port {}",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET,
-                    preferred_port
-                );
-                crate::LOCAL_MODE.store(true, Ordering::SeqCst);
-                let main_ctx = server::compute_optimal_context_size(&self.current_model_path);
-                if self.config.trio.enabled {
-                    // Trio lane: ensure legacy auxiliaries are down.
-                    server::stop_compaction_server(
-                        &mut self.srv.compaction_process,
-                        &mut self.srv.compaction_port,
+            // Try to start LM Studio if no engine is active.
+            if self.config.agents.defaults.local_api_base.is_empty()
+                && !self.srv.lms_managed
+                && self.srv.engine == super::InferenceEngine::None
+            {
+                let preference = &self.config.agents.defaults.inference_engine;
+                if let Some((super::InferenceEngine::Lms, bin)) = super::resolve_inference_engine(preference) {
+                    let lms_port = self.config.agents.defaults.lms_port;
+                    println!(
+                        "\n  {}{}LM Studio{} detected, starting server on port {}...",
+                        tui::BOLD, tui::YELLOW, tui::RESET, lms_port
                     );
-                    self.srv.start_trio_servers(&self.config).await;
-                } else {
-                    server::start_compaction_if_available(
-                        &mut self.srv.compaction_process,
-                        &mut self.srv.compaction_port,
-                        main_ctx,
-                    )
-                    .await;
-                }
-                if !self.config.trio.enabled
-                    && self.config.tool_delegation.enabled
-                    && self.config.tool_delegation.auto_local
-                    && self.config.tool_delegation.provider.is_none()
-                {
-                    server::start_delegation_if_available(
-                        &mut self.srv.delegation_process,
-                        &mut self.srv.delegation_port,
-                    )
-                    .await;
-                }
-                cli::rebuild_core(
-                    &self.core_handle,
-                    &self.config,
-                    &self.srv.local_port,
-                    self.current_model_path.file_name().and_then(|n| n.to_str()),
-                    self.srv.compaction_port.as_deref(),
-                    self.srv.delegation_port.as_deref(),
-                    self.srv.specialist_port.as_deref(),
-                );
-                self.rebuild_agent_loop();
-                self.restart_watchdog();
-                tui::print_mode_banner(&self.srv.local_port);
-            } else {
-                // Kill any orphaned servers from previous runs
-                self.srv.kill_current();
-                let ctx_size = server::compute_optimal_context_size(&self.current_model_path);
-                println!(
-                    "\n  {}{}Starting{} llama.cpp server on pinned port {} (ctx: {}K)...",
-                    tui::BOLD,
-                    tui::YELLOW,
-                    tui::RESET,
-                    self.srv.local_port,
-                    ctx_size / 1024
-                );
-
-                match super::try_start_server(&mut self.srv, &self.current_model_path, ctx_size)
-                    .await
-                {
-                    Ok(_) => {
-                        crate::LOCAL_MODE.store(true, Ordering::SeqCst);
-                        if self.config.trio.enabled {
-                            // Trio lane: ensure legacy auxiliaries are down.
-                            server::stop_compaction_server(
-                                &mut self.srv.compaction_process,
-                                &mut self.srv.compaction_port,
+                    match crate::lms::server_start(&bin, lms_port).await {
+                        Ok(()) => {
+                            let main_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                                self.config.agents.defaults.lms_main_model.clone()
+                            } else {
+                                let mn = self.current_model_path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(server::DEFAULT_LOCAL_MODEL);
+                                cli::strip_gguf_suffix(mn).to_string()
+                            };
+                            let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                            print!("  Loading {}... ", main_model);
+                            io::stdout().flush().ok();
+                            match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                            }
+                            if self.config.trio.enabled {
+                                if !self.config.trio.router_model.is_empty() {
+                                    print!("  Loading {}... ", self.config.trio.router_model);
+                                    io::stdout().flush().ok();
+                                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                                    }
+                                }
+                                if !self.config.trio.specialist_model.is_empty() {
+                                    print!("  Loading {}... ", self.config.trio.specialist_model);
+                                    io::stdout().flush().ok();
+                                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await {
+                                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                                    }
+                                }
+                            }
+                            self.srv.lms_managed = true;
+                            self.srv.lms_binary = Some(bin);
+                            self.srv.engine = super::InferenceEngine::Lms;
+                            self.srv.local_port = lms_port.to_string();
+                            self.config.agents.defaults.local_api_base =
+                                format!("http://{}:{}/v1", crate::lms::api_host(), lms_port);
+                            self.config.agents.defaults.skip_jit_gate = true;
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {}{}lms server start failed:{} {}",
+                                tui::BOLD, tui::YELLOW, tui::RESET, e
                             );
-                            self.srv.start_trio_servers(&self.config).await;
-                        } else {
-                            server::start_compaction_if_available(
-                                &mut self.srv.compaction_process,
-                                &mut self.srv.compaction_port,
-                                ctx_size,
-                            )
-                            .await;
+                            println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
+                            return;
                         }
-                        if !self.config.trio.enabled
-                            && self.config.tool_delegation.enabled
-                            && self.config.tool_delegation.auto_local
-                            && self.config.tool_delegation.provider.is_none()
-                        {
-                            server::start_delegation_if_available(
-                                &mut self.srv.delegation_process,
-                                &mut self.srv.delegation_port,
-                            )
-                            .await;
-                        }
-                        self.apply_and_rebuild();
-                        self.restart_watchdog();
-                        tui::print_mode_banner(&self.srv.local_port);
                     }
-                    Err(e) => {
-                        println!("  {}{}Failed: {}{}", tui::BOLD, tui::YELLOW, e, tui::RESET);
-                        println!(
-                            "  {}Pinned local port is {} (set NANOBOT_LOCAL_PORT to change).{}",
-                            tui::DIM,
-                            self.srv.local_port,
-                            tui::RESET
-                        );
-                        println!("  {}Remaining in cloud mode{}\n", tui::DIM, tui::RESET);
-                    }
+                } else {
+                    println!(
+                        "\n  {}{}No local inference engine found.{} Install LM Studio (lms CLI).",
+                        tui::BOLD, tui::YELLOW, tui::RESET
+                    );
+                    return;
                 }
             }
+
+            // When trio strict mode is on but router model is unavailable,
+            // disable strict flags so the single model can handle tools directly.
+            if self.config.tool_delegation.strict_no_tools_main
+                && self.config.tool_delegation.strict_router_schema
+            {
+                let router_available = if self.srv.lms_managed {
+                    let lms_port = self.config.agents.defaults.lms_port;
+                    let available = crate::lms::list_available(lms_port).await;
+                    crate::lms::is_model_available(&available, &self.config.trio.router_model)
+                } else {
+                    !self.config.trio.router_model.is_empty()
+                };
+                if !router_available {
+                    self.config.tool_delegation.strict_no_tools_main = false;
+                    self.config.tool_delegation.strict_router_schema = false;
+                }
+            }
+
+            // Flip to local mode and rebuild.
+            crate::LOCAL_MODE.store(true, Ordering::SeqCst);
+            self.apply_and_rebuild();
+            tui::print_mode_banner(&self.srv.local_port);
         } else {
-            // Toggle OFF: kill main and compaction servers, but keep delegation alive
-            if let Some(ref mut child) = self.srv.llama_process {
-                child.kill().ok();
-                child.wait().ok();
+            // Toggle OFF
+            if self.srv.lms_managed {
+                let lms_port = self.config.agents.defaults.lms_port;
+                crate::lms::unload_all(lms_port).await.ok();
+                self.srv.lms_managed = false;
+                self.srv.lms_binary = None;
+                self.config.agents.defaults.local_api_base.clear();
+                self.config.agents.defaults.skip_jit_gate = false;
             }
-            self.srv.llama_process = None;
-            server::stop_compaction_server(
-                &mut self.srv.compaction_process,
-                &mut self.srv.compaction_port,
-            );
-            if self.config.trio.enabled {
-                // Trio lane shutdown: stop router/specialist too.
-                server::stop_delegation_server(
-                    &mut self.srv.delegation_process,
-                    &mut self.srv.delegation_port,
-                );
-                server::stop_custom_server(
-                    &mut self.srv.specialist_process,
-                    &mut self.srv.specialist_port,
-                );
-            }
+            self.srv.engine = super::InferenceEngine::None;
+            self.config.agents.defaults.skip_jit_gate = false;
             self.stop_watchdog();
             crate::LOCAL_MODE.store(false, Ordering::SeqCst);
-
-            // Re-spawn delegation if it wasn't already running
-            if self.srv.delegation_port.is_none()
-                && !self.config.trio.enabled
-                && self.config.tool_delegation.enabled
-                && self.config.tool_delegation.auto_local
-                && self.config.tool_delegation.provider.is_none()
-            {
-                server::start_delegation_if_available(
-                    &mut self.srv.delegation_process,
-                    &mut self.srv.delegation_port,
-                )
-                .await;
-            }
-
             self.apply_and_rebuild();
             tui::print_mode_banner(&self.srv.local_port);
         }
@@ -1869,6 +2162,60 @@ impl ReplContext {
 }
 
 // ============================================================================
+// Pure trio config helpers (testable without ReplContext)
+// ============================================================================
+
+/// Enable trio mode on a Config. Returns `true` if router/specialist are missing (needs warning).
+pub(crate) fn trio_enable(cfg: &mut crate::config::schema::Config) -> bool {
+    use crate::config::schema::DelegationMode;
+
+    let needs_warning =
+        cfg.trio.router_model.is_empty() || cfg.trio.specialist_model.is_empty();
+    cfg.trio.enabled = true;
+    cfg.tool_delegation.mode = DelegationMode::Trio;
+    cfg.tool_delegation.apply_mode();
+    needs_warning
+}
+
+/// Disable trio mode on a Config, switching to inline (single model).
+pub(crate) fn trio_disable(cfg: &mut crate::config::schema::Config) {
+    use crate::config::schema::DelegationMode;
+
+    cfg.trio.enabled = false;
+    cfg.tool_delegation.mode = DelegationMode::Inline;
+    cfg.tool_delegation.apply_mode();
+}
+
+/// Set a trio role model (router or specialist) on a Config.
+pub(crate) fn set_trio_role_model_pure(
+    cfg: &mut crate::config::schema::Config,
+    role: &str,
+    model: &str,
+) {
+    match role {
+        "router" => cfg.trio.router_model = model.to_string(),
+        "specialist" => cfg.trio.specialist_model = model.to_string(),
+        _ => {}
+    }
+}
+
+/// Copy trio-related fields from `live` config to `disk` config for persistence.
+/// Does NOT touch non-trio fields (model, api keys, etc).
+pub(crate) fn persist_trio_fields(
+    live: &crate::config::schema::Config,
+    disk: &mut crate::config::schema::Config,
+) {
+    disk.trio = live.trio.clone();
+    disk.tool_delegation.mode = live.tool_delegation.mode;
+    disk.tool_delegation.strict_no_tools_main = live.tool_delegation.strict_no_tools_main;
+    disk.tool_delegation.strict_router_schema = live.tool_delegation.strict_router_schema;
+    disk.tool_delegation.role_scoped_context_packs =
+        live.tool_delegation.role_scoped_context_packs;
+    disk.agents.defaults.local_max_context_tokens =
+        live.agents.defaults.local_max_context_tokens;
+}
+
+// ============================================================================
 // Utility
 // ============================================================================
 
@@ -1883,6 +2230,167 @@ impl ReplContext {
         {
             false
         }
+    }
+
+    /// Compute the current VRAM budget from live config and model paths.
+    fn compute_current_vram_budget(&self) -> crate::server::VramBudgetResult {
+        let (vram, ram) = server::detect_available_memory();
+        let available = vram.unwrap_or(ram);
+
+        let main_profile = if self.srv.lms_managed {
+            let model_name = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                &self.config.agents.defaults.lms_main_model
+            } else {
+                &self.config.agents.defaults.local_model
+            };
+            server::estimate_model_profile_from_name(model_name)
+        } else {
+            server::resolve_model_profile_from_path(
+                &self.current_model_path.display().to_string(),
+                &self.current_model_path,
+            )
+        };
+
+        let router_profile = if self.config.trio.enabled
+            && !self.config.trio.router_model.is_empty()
+        {
+            Some(server::estimate_model_profile_from_name(
+                &self.config.trio.router_model,
+            ))
+        } else {
+            None
+        };
+
+        let specialist_profile = if self.config.trio.enabled
+            && !self.config.trio.specialist_model.is_empty()
+        {
+            Some(server::estimate_model_profile_from_name(
+                &self.config.trio.specialist_model,
+            ))
+        } else {
+            None
+        };
+
+        let input = crate::server::VramBudgetInput {
+            available_memory: available,
+            vram_cap: (self.config.trio.vram_cap_gb * 1e9) as u64,
+            overhead_per_model: 512 * 1_000_000,
+            main: main_profile,
+            router: router_profile,
+            specialist: specialist_profile,
+        };
+
+        server::compute_vram_budget(&input)
+    }
+}
+
+// ============================================================================
+// VRAM Budget Display (pure, testable)
+// ============================================================================
+
+/// Format a VRAM budget result for display. Pure function.
+pub(crate) fn format_vram_budget(result: &crate::server::VramBudgetResult) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let cap_gb = result.effective_limit_bytes as f64 / 1e9;
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  \x1b[1mVRAM BUDGET\x1b[0m  (limit: {:.1} GB)", cap_gb);
+    let _ = writeln!(out, "  {}", "\u{2500}".repeat(52));
+
+    for b in &result.breakdown {
+        let role_upper = b.role.to_uppercase();
+        let weights_gb = b.weights_bytes as f64 / 1e9;
+        let kv_gb = b.kv_cache_bytes as f64 / 1e9;
+        let total_gb = weights_gb + kv_gb + b.overhead_bytes as f64 / 1e9;
+        let ctx_k = b.context_tokens / 1024;
+        let _ = writeln!(
+            out,
+            "  {:<11} {:<20} {:.1} GB + {:.1} GB KV ({}K ctx) = {:.1} GB",
+            role_upper, b.name, weights_gb, kv_gb, ctx_k, total_gb,
+        );
+    }
+
+    let overhead_count = result.breakdown.len();
+    let overhead_per = result.breakdown.first().map_or(0, |b| b.overhead_bytes);
+    let overhead_total = overhead_count as f64 * overhead_per as f64 / 1e9;
+    let _ = writeln!(
+        out,
+        "  {:<11} {} x {:.0} MB                                     = {:.1} GB",
+        "OVERHEAD",
+        overhead_count,
+        overhead_per as f64 / 1e6,
+        overhead_total,
+    );
+
+    let _ = writeln!(out, "  {}", "\u{2500}".repeat(52));
+    let total_gb = result.total_vram_bytes as f64 / 1e9;
+    let status = if result.fits {
+        format!("\x1b[32mOK\x1b[0m")
+    } else {
+        format!("\x1b[31mOVER\x1b[0m")
+    };
+    let _ = writeln!(
+        out,
+        "  {:<11} {:.1} GB / {:.1} GB  {}",
+        "TOTAL", total_gb, cap_gb, status,
+    );
+    let _ = writeln!(out);
+
+    out
+}
+
+// ============================================================================
+// Trio Parameter Helpers (pure, testable)
+// ============================================================================
+
+/// Apply a trio parameter change to a Config. Returns Ok(description) or Err(message).
+pub(crate) fn apply_trio_param(
+    config: &mut crate::config::schema::Config,
+    role: &str,
+    param: &str,
+    value: &str,
+) -> Result<String, String> {
+    match (role, param) {
+        ("router", "temperature") => {
+            let v: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            config.trio.router_temperature = v.clamp(0.0, 2.0);
+            Ok(format!("router temperature = {:.1}", config.trio.router_temperature))
+        }
+        ("specialist", "temperature") => {
+            let v: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            config.trio.specialist_temperature = v.clamp(0.0, 2.0);
+            Ok(format!("specialist temperature = {:.1}", config.trio.specialist_temperature))
+        }
+        ("router", "ctx") => {
+            let ctx = super::parse_ctx_arg(value).map_err(|e| e.to_string())?
+                .ok_or_else(|| "Missing context size".to_string())?;
+            config.trio.router_ctx_tokens = ctx;
+            Ok(format!("router ctx = {}K", ctx / 1024))
+        }
+        ("specialist", "ctx") => {
+            let ctx = super::parse_ctx_arg(value).map_err(|e| e.to_string())?
+                .ok_or_else(|| "Missing context size".to_string())?;
+            config.trio.specialist_ctx_tokens = ctx;
+            Ok(format!("specialist ctx = {}K", ctx / 1024))
+        }
+        ("router", "no_think") => {
+            config.trio.router_no_think = !config.trio.router_no_think;
+            Ok(format!("router no_think = {}", config.trio.router_no_think))
+        }
+        ("main", "no_think") => {
+            config.trio.main_no_think = !config.trio.main_no_think;
+            Ok(format!("main no_think = {}", config.trio.main_no_think))
+        }
+        ("trio", "vram_cap") => {
+            let gb: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            if gb < 1.0 || gb > 256.0 {
+                return Err("VRAM cap must be between 1 and 256 GB".to_string());
+            }
+            config.trio.vram_cap_gb = gb;
+            Ok(format!("vram cap = {:.1} GB", gb))
+        }
+        _ => Err(format!("Unknown parameter: {}.{}", role, param)),
     }
 }
 
@@ -1941,5 +2449,421 @@ mod tests {
             .unwrap_or((input2, ""));
         assert_eq!(cmd2, "/status");
         assert_eq!(arg2, "");
+    }
+
+    #[test]
+    fn test_trio_passthrough_not_aliased() {
+        assert_eq!(normalize_alias("/trio"), "/trio");
+    }
+
+    #[test]
+    fn test_trio_subcommand_arg_parsing() {
+        let input = "/trio status";
+        let (cmd, arg) = input
+            .split_once(' ')
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((input, ""));
+        assert_eq!(cmd, "/trio");
+        assert_eq!(arg, "status");
+
+        let input2 = "/trio router";
+        let (_, arg2) = input2
+            .split_once(' ')
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((input2, ""));
+        assert_eq!(arg2, "router");
+
+        // No subcommand = toggle
+        let input3 = "/trio";
+        let (_, arg3) = input3
+            .split_once(' ')
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((input3, ""));
+        assert_eq!(arg3, "");
+    }
+
+    // ---- trio toggle: pure config state transitions ----
+
+    #[test]
+    fn test_trio_enable_sets_all_strict_flags() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut cfg = Config::default();
+        trio_enable(&mut cfg);
+
+        assert!(cfg.trio.enabled);
+        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Trio);
+        assert!(cfg.tool_delegation.enabled, "delegation must stay on for trio");
+        assert!(cfg.tool_delegation.strict_no_tools_main);
+        assert!(cfg.tool_delegation.strict_router_schema);
+        assert!(cfg.tool_delegation.role_scoped_context_packs);
+    }
+
+    #[test]
+    fn test_trio_disable_clears_strict_flags() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut cfg = Config::default();
+        trio_enable(&mut cfg);
+        trio_disable(&mut cfg);
+
+        assert!(!cfg.trio.enabled);
+        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Inline);
+        assert!(!cfg.tool_delegation.enabled, "inline disables delegation");
+        assert!(!cfg.tool_delegation.strict_no_tools_main);
+        assert!(!cfg.tool_delegation.strict_router_schema);
+        assert!(!cfg.tool_delegation.role_scoped_context_packs);
+    }
+
+    #[test]
+    fn test_trio_double_enable_is_idempotent() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut cfg = Config::default();
+        trio_enable(&mut cfg);
+        trio_enable(&mut cfg);
+
+        assert!(cfg.trio.enabled);
+        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Trio);
+        assert!(cfg.tool_delegation.strict_no_tools_main);
+    }
+
+    #[test]
+    fn test_trio_double_disable_is_idempotent() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut cfg = Config::default();
+        trio_disable(&mut cfg);
+
+        assert!(!cfg.trio.enabled);
+        assert_eq!(cfg.tool_delegation.mode, DelegationMode::Inline);
+        assert!(!cfg.tool_delegation.strict_no_tools_main);
+    }
+
+    #[test]
+    fn test_trio_enable_preserves_model_names() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        cfg.trio.router_model = "qwen3-1.7b".to_string();
+        cfg.trio.specialist_model = "ministral-3-8b".to_string();
+
+        trio_enable(&mut cfg);
+
+        assert_eq!(cfg.trio.router_model, "qwen3-1.7b");
+        assert_eq!(cfg.trio.specialist_model, "ministral-3-8b");
+    }
+
+    #[test]
+    fn test_trio_disable_preserves_model_names() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        cfg.trio.router_model = "qwen3-1.7b".to_string();
+        cfg.trio.specialist_model = "ministral-3-8b".to_string();
+        trio_enable(&mut cfg);
+        trio_disable(&mut cfg);
+
+        // Models stay configured even when trio is off
+        assert_eq!(cfg.trio.router_model, "qwen3-1.7b");
+        assert_eq!(cfg.trio.specialist_model, "ministral-3-8b");
+    }
+
+    #[test]
+    fn test_trio_enable_with_empty_models_still_enables() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        assert!(cfg.trio.router_model.is_empty());
+        assert!(cfg.trio.specialist_model.is_empty());
+
+        let needs_warning = trio_enable(&mut cfg);
+        assert!(cfg.trio.enabled, "should enable even with empty models");
+        assert!(needs_warning, "should warn about missing models");
+    }
+
+    #[test]
+    fn test_trio_enable_with_both_models_no_warning() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        cfg.trio.router_model = "qwen3-1.7b".to_string();
+        cfg.trio.specialist_model = "ministral-3-8b".to_string();
+
+        let needs_warning = trio_enable(&mut cfg);
+        assert!(!needs_warning);
+    }
+
+    // ---- trio role assignment ----
+
+    #[test]
+    fn test_set_trio_router_model() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        set_trio_role_model_pure(&mut cfg, "router", "qwen3-1.7b");
+
+        assert_eq!(cfg.trio.router_model, "qwen3-1.7b");
+        assert!(cfg.trio.specialist_model.is_empty(), "specialist untouched");
+    }
+
+    #[test]
+    fn test_set_trio_specialist_model() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        set_trio_role_model_pure(&mut cfg, "specialist", "ministral-3-8b");
+
+        assert_eq!(cfg.trio.specialist_model, "ministral-3-8b");
+        assert!(cfg.trio.router_model.is_empty(), "router untouched");
+    }
+
+    #[test]
+    fn test_set_trio_role_overwrites_previous() {
+        use crate::config::schema::Config;
+
+        let mut cfg = Config::default();
+        set_trio_role_model_pure(&mut cfg, "router", "old-model");
+        set_trio_role_model_pure(&mut cfg, "router", "new-model");
+
+        assert_eq!(cfg.trio.router_model, "new-model");
+    }
+
+    // ---- persist_trio_fields: what gets copied to the disk config ----
+
+    #[test]
+    fn test_persist_trio_fields_copies_all_required() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut live = Config::default();
+        live.trio.enabled = true;
+        live.trio.router_model = "qwen3-1.7b".to_string();
+        live.trio.specialist_model = "ministral-3-8b".to_string();
+        live.tool_delegation.mode = DelegationMode::Trio;
+        live.tool_delegation.strict_no_tools_main = true;
+        live.tool_delegation.strict_router_schema = true;
+        live.tool_delegation.role_scoped_context_packs = true;
+
+        let mut disk = Config::default();
+        persist_trio_fields(&live, &mut disk);
+
+        assert!(disk.trio.enabled);
+        assert_eq!(disk.trio.router_model, "qwen3-1.7b");
+        assert_eq!(disk.trio.specialist_model, "ministral-3-8b");
+        assert_eq!(disk.tool_delegation.mode, DelegationMode::Trio);
+        assert!(disk.tool_delegation.strict_no_tools_main);
+        assert!(disk.tool_delegation.strict_router_schema);
+        assert!(disk.tool_delegation.role_scoped_context_packs);
+    }
+
+    #[test]
+    fn test_persist_trio_fields_does_not_clobber_other_config() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let live = Config::default();
+        let mut disk = Config::default();
+        disk.agents.defaults.model = "custom-cloud-model".to_string();
+        disk.providers.openrouter.api_key = "my-key".to_string();
+
+        persist_trio_fields(&live, &mut disk);
+
+        assert_eq!(disk.agents.defaults.model, "custom-cloud-model", "should not clobber model");
+        assert_eq!(disk.providers.openrouter.api_key, "my-key", "should not clobber api key");
+    }
+
+    // ---- roundtrip: enable → disable → enable preserves full config ----
+
+    #[test]
+    fn test_trio_roundtrip_enable_disable_enable() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let mut cfg = Config::default();
+        cfg.trio.router_model = "qwen3-1.7b".to_string();
+        cfg.trio.specialist_model = "ministral-3-8b".to_string();
+
+        trio_enable(&mut cfg);
+        assert!(cfg.trio.enabled);
+        assert!(cfg.tool_delegation.strict_no_tools_main);
+
+        trio_disable(&mut cfg);
+        assert!(!cfg.trio.enabled);
+        assert!(!cfg.tool_delegation.strict_no_tools_main);
+
+        trio_enable(&mut cfg);
+        assert!(cfg.trio.enabled);
+        assert!(cfg.tool_delegation.strict_no_tools_main);
+        assert_eq!(cfg.trio.router_model, "qwen3-1.7b", "models survive roundtrip");
+    }
+
+    // ---- apply_trio_param tests ----
+
+    #[test]
+    fn test_apply_trio_param_router_temp() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "router", "temperature", "0.3");
+        assert!(result.is_ok());
+        assert!((config.trio.router_temperature - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_trio_param_specialist_temp() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "specialist", "temperature", "0.5");
+        assert!(result.is_ok());
+        assert!((config.trio.specialist_temperature - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_trio_param_invalid_temp() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "router", "temperature", "abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_trio_param_temp_clamps() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "router", "temperature", "5.0");
+        assert!(result.is_ok());
+        assert!((config.trio.router_temperature - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_trio_param_router_ctx() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "router", "ctx", "8K");
+        assert!(result.is_ok());
+        assert_eq!(config.trio.router_ctx_tokens, 8192);
+    }
+
+    #[test]
+    fn test_apply_trio_param_specialist_ctx() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "specialist", "ctx", "16384");
+        assert!(result.is_ok());
+        assert_eq!(config.trio.specialist_ctx_tokens, 16384);
+    }
+
+    #[test]
+    fn test_apply_trio_param_vram_cap() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "trio", "vram_cap", "12");
+        assert!(result.is_ok());
+        assert!((config.trio.vram_cap_gb - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_trio_param_vram_cap_out_of_range() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "trio", "vram_cap", "0.1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_trio_param_router_nothink_toggle() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        assert!(config.trio.router_no_think); // default true
+        let result = apply_trio_param(&mut config, "router", "no_think", "toggle");
+        assert!(result.is_ok());
+        assert!(!config.trio.router_no_think);
+        let _ = apply_trio_param(&mut config, "router", "no_think", "toggle");
+        assert!(config.trio.router_no_think);
+    }
+
+    #[test]
+    fn test_apply_trio_param_main_nothink_toggle() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        assert!(config.trio.main_no_think);
+        let result = apply_trio_param(&mut config, "main", "no_think", "toggle");
+        assert!(result.is_ok());
+        assert!(!config.trio.main_no_think);
+    }
+
+    #[test]
+    fn test_apply_trio_param_unknown() {
+        use crate::config::schema::Config;
+        let mut config = Config::default();
+        let result = apply_trio_param(&mut config, "router", "unknown_param", "x");
+        assert!(result.is_err());
+    }
+
+    // ---- format_vram_budget tests ----
+
+    #[test]
+    fn test_format_vram_budget_contains_role_names() {
+        let result = crate::server::VramBudgetResult {
+            main_ctx: 16384,
+            router_ctx: 4096,
+            specialist_ctx: 8192,
+            total_vram_bytes: 12_000_000_000,
+            effective_limit_bytes: 16_000_000_000,
+            fits: true,
+            breakdown: vec![
+                crate::server::VramModelBreakdown {
+                    role: "main".to_string(),
+                    name: "test-main".to_string(),
+                    weights_bytes: 5_000_000_000,
+                    kv_cache_bytes: 1_000_000_000,
+                    context_tokens: 16384,
+                    overhead_bytes: 512_000_000,
+                },
+                crate::server::VramModelBreakdown {
+                    role: "router".to_string(),
+                    name: "test-router".to_string(),
+                    weights_bytes: 3_000_000_000,
+                    kv_cache_bytes: 200_000_000,
+                    context_tokens: 4096,
+                    overhead_bytes: 512_000_000,
+                },
+                crate::server::VramModelBreakdown {
+                    role: "specialist".to_string(),
+                    name: "test-specialist".to_string(),
+                    weights_bytes: 2_000_000_000,
+                    kv_cache_bytes: 500_000_000,
+                    context_tokens: 8192,
+                    overhead_bytes: 512_000_000,
+                },
+            ],
+        };
+        let output = format_vram_budget(&result);
+        assert!(output.contains("MAIN"), "Should contain MAIN role");
+        assert!(output.contains("ROUTER"), "Should contain ROUTER role");
+        assert!(output.contains("SPECIALIST"), "Should contain SPECIALIST role");
+        assert!(output.contains("OK"), "Should show OK when fits=true");
+        assert!(output.contains("TOTAL"), "Should contain TOTAL line");
+    }
+
+    #[test]
+    fn test_format_vram_budget_over_shows_over() {
+        let result = crate::server::VramBudgetResult {
+            main_ctx: 4096,
+            router_ctx: 2048,
+            specialist_ctx: 4096,
+            total_vram_bytes: 20_000_000_000,
+            effective_limit_bytes: 16_000_000_000,
+            fits: false,
+            breakdown: vec![
+                crate::server::VramModelBreakdown {
+                    role: "main".to_string(),
+                    name: "big-model".to_string(),
+                    weights_bytes: 10_000_000_000,
+                    kv_cache_bytes: 500_000_000,
+                    context_tokens: 4096,
+                    overhead_bytes: 512_000_000,
+                },
+            ],
+        };
+        let output = format_vram_budget(&result);
+        assert!(output.contains("OVER"), "Should show OVER when fits=false");
     }
 }

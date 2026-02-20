@@ -320,7 +320,7 @@ fn ensure_not_ending_with_assistant(messages: &mut Vec<Value>) {
 
 /// Repair messages for models that require strict user/assistant alternation.
 ///
-/// Some local models (Ministral-8B, nanbeige, gemma-3n) served via llama-server
+/// Some local models (Ministral-8B, nanbeige, gemma-3n) served via local inference
 /// with `--jinja` reject `role: "tool"` messages entirely. Their chat templates
 /// enforce strict `user/assistant/user/assistant/...` alternation.
 ///

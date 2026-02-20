@@ -435,7 +435,7 @@ impl ContextBuilder {
             String::new()
         } else if let Some(gguf_name) = self.model_name.strip_prefix("local:") {
             format!(
-                "\n\n## Model\nYou are running locally via llama.cpp. \
+                "\n\n## Model\nYou are running locally via LM Studio. \
                  Your model file: {}. You are NOT Claude or any cloud AI. \
                  Respond as nanobot powered by this local model.",
                 gguf_name

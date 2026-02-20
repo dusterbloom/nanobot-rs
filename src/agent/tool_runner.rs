@@ -26,9 +26,8 @@ pub struct ToolRunnerConfig {
     pub max_iterations: u32,
     pub max_tokens: u32,
     /// When true, append a `role: "user"` continuation after tool results
-    /// before calling the LLM.  Local models (llama-server) require this;
-    /// Mistral/Ministral handle tool→generate natively and break if a user
-    /// message is injected.
+    /// before calling the LLM.  Local models require this; some cloud models
+    /// handle tool→generate natively and break if a user message is injected.
     pub needs_user_continuation: bool,
     /// Maximum characters per tool result shown to the delegation model.
     /// Results exceeding this are truncated (with a marker) before the
@@ -3313,7 +3312,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scratch_pad_ignores_needs_user_continuation() {
-        // With needs_user_continuation=true (local llama-server mode),
+        // With needs_user_continuation=true (local model mode),
         // the scratch pad should still send only [system, user] messages.
         // No extra user continuation should be injected.
         let provider = Arc::new(CapturingProvider::new());

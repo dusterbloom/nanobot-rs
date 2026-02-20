@@ -6,14 +6,16 @@
 //! API format.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::jit_gate::{is_jit_loading_error, JitGate};
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -21,6 +23,8 @@ pub struct OpenAICompatProvider {
     api_base: String,
     default_model: String,
     client: Client,
+    /// Optional JIT gate for serialising requests to JIT-loading servers (e.g. LM Studio).
+    jit_gate: Option<Arc<JitGate>>,
 }
 
 /// Normalize Claude model short-names so the API always gets the canonical ID.
@@ -99,7 +103,18 @@ impl OpenAICompatProvider {
             api_base: resolved_base,
             default_model,
             client: Client::new(),
+            jit_gate: None,
         }
+    }
+
+    /// Attach a JIT gate for serialised access to a JIT-loading server.
+    ///
+    /// When set, every `chat()` and `chat_stream()` call acquires the gate's
+    /// single permit before sending the HTTP request. Streaming holds the
+    /// permit for the entire stream duration to prevent model switches mid-stream.
+    pub fn with_jit_gate(mut self, gate: Arc<JitGate>) -> Self {
+        self.jit_gate = Some(gate);
+        self
     }
 }
 
@@ -114,15 +129,46 @@ struct ThinkSplitState {
 
 fn is_local_api_base(api_base: &str) -> bool {
     let lower = api_base.to_ascii_lowercase();
-    lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("0.0.0.0")
+    lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("0.0.0.0")
+        || is_private_ip(&lower)
 }
 
-/// Apply llama.cpp local reasoning controls when talking to localhost.
+/// Check if a URL contains a private/LAN IP (RFC 1918).
+fn is_private_ip(url: &str) -> bool {
+    // Extract host portion from URL (between :// and next : or /)
+    let host = url
+        .find("://")
+        .map(|i| &url[i + 3..])
+        .unwrap_or(url)
+        .split(&[':', '/'][..])
+        .next()
+        .unwrap_or("");
+
+    // 10.0.0.0/8
+    if host.starts_with("10.") {
+        return true;
+    }
+    // 192.168.0.0/16
+    if host.starts_with("192.168.") {
+        return true;
+    }
+    // 172.16.0.0/12 (172.16.x.x – 172.31.x.x)
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            return (16..=31).contains(&second);
+        }
+    }
+    false
+}
+
+/// Apply local reasoning controls when talking to localhost.
 ///
 /// - `chat_template_kwargs.enable_thinking` toggles model reasoning mode for
 ///   templates that support it (Qwen3, etc.).
 /// - `reasoning_budget` enforces a token budget for reasoning traces.
-/// - `reasoning_format` tells llama-server how to split visible vs reasoning text.
+/// - `reasoning_format` tells the local server how to split visible vs reasoning text.
 fn apply_local_reasoning_controls(
     body: &mut serde_json::Value,
     api_base: &str,
@@ -146,6 +192,167 @@ fn apply_local_reasoning_controls(
             body["reasoning_budget"] = serde_json::json!(0);
             body["reasoning_format"] = serde_json::json!("none");
         }
+    }
+}
+
+/// Check if a model uses template-level thinking that requires the native LMS
+/// API to disable (Nemotron models with `/no_think` mode).
+///
+/// Only these models benefit from `try_native_lms_chat`; for everything else
+/// the extra HTTP roundtrip is pure overhead.
+fn needs_native_lms_api(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("nemotron") || m.contains("orchestrator")
+}
+
+/// Call the LM Studio native REST API (`/api/v1/chat`) with `reasoning: "off"`.
+///
+/// This is the proper way to disable reasoning for models like Nemotron that
+/// use template-level thinking (not API-level reasoning control). The OpenAI-
+/// compat `/v1/chat/completions` endpoint cannot actually disable reasoning
+/// for these models.
+///
+/// Returns `Some(LLMResponse)` on success, `None` if the native API isn't
+/// available (falls back to the regular path).
+async fn try_native_lms_chat(
+    client: &Client,
+    api_base: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    max_tokens: u32,
+    temperature: f64,
+) -> Option<LLMResponse> {
+    // Build native API URL: strip /v1 suffix from api_base.
+    let base = api_base.trim_end_matches('/');
+    let native_base = base.strip_suffix("/v1").unwrap_or(base);
+    let url = format!("{}/api/v1/chat", native_base);
+
+    // Extract system prompt (first system message) and user input.
+    let mut system_prompt = String::new();
+    let mut input_parts: Vec<String> = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        match role {
+            "system" => {
+                if system_prompt.is_empty() {
+                    system_prompt = content.to_string();
+                } else {
+                    system_prompt.push('\n');
+                    system_prompt.push_str(content);
+                }
+            }
+            "user" => input_parts.push(content.to_string()),
+            "assistant" => {
+                if !content.trim().is_empty() {
+                    input_parts.push(format!("Assistant: {}", content));
+                }
+            }
+            _ => {} // skip tool messages for native API
+        }
+    }
+
+    // Ensure /no_think is in system prompt for Nemotron.
+    if !system_prompt.contains("/no_think") {
+        if system_prompt.is_empty() {
+            system_prompt = "/no_think".to_string();
+        } else {
+            system_prompt = format!("/no_think\n{}", system_prompt);
+        }
+    }
+
+    let input = input_parts.join("\n");
+    if input.is_empty() {
+        return None;
+    }
+
+    let body = serde_json::json!({
+        "model": model,
+        "system_prompt": system_prompt,
+        "input": input,
+        "reasoning": "off",
+        "max_output_tokens": max_tokens,
+        "temperature": temperature,
+    });
+
+    tracing::debug!("native LMS chat: model={} input_len={}", model, input.len());
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!("native LMS chat failed (HTTP {}): {}", status, text);
+        return None; // Fall back to regular path
+    }
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+
+    // Parse native response: output is [{type: "message", content: "..."}, ...]
+    let content = json
+        .get("output")
+        .and_then(|o| o.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("message"))
+                .and_then(|item| item.get("content").and_then(|c| c.as_str()))
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut usage = std::collections::HashMap::new();
+    if let Some(stats) = json.get("stats") {
+        if let Some(input_tokens) = stats.get("input_tokens").and_then(|v| v.as_i64()) {
+            usage.insert("prompt_tokens".to_string(), input_tokens);
+        }
+        if let Some(output_tokens) = stats.get("total_output_tokens").and_then(|v| v.as_i64()) {
+            usage.insert("completion_tokens".to_string(), output_tokens);
+        }
+    }
+
+    Some(LLMResponse {
+        content,
+        tool_calls: Vec::new(),
+        finish_reason: "stop".to_string(),
+        usage,
+    })
+}
+
+/// For local thinking-capable models with thinking disabled: prefill the
+/// assistant response so the model skips `<think>` blocks and responds
+/// directly. Only applied when no tools are requested (tool-calling
+/// models need to start fresh to emit tool_calls).
+///
+/// Uses a single newline — neutral enough not to bias the response style
+/// while still preventing the model from starting a `<think>` block.
+fn apply_local_thinking_prefill(
+    body: &mut serde_json::Value,
+    api_base: &str,
+    thinking_budget: Option<u32>,
+) {
+    if !is_local_api_base(api_base) || thinking_budget.is_some() {
+        return;
+    }
+    let has_tools = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map_or(false, |a| !a.is_empty());
+    if has_tools {
+        return;
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "\n"
+        }));
     }
 }
 
@@ -263,13 +470,50 @@ impl LLMProvider for OpenAICompatProvider {
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
-        // Strip "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
+        // Strip "local:" prefix (internal routing tag, not part of actual model name)
+        // and "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
-        let model = if !self.api_base.contains("openrouter") {
-            raw_model.split('/').last().unwrap_or(raw_model)
+        let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
+        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://") {
+            // OpenRouter: keep org/model for routing.
+            // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
+            stripped
         } else {
-            raw_model
+            // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
+            // (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5").
+            stripped.split('/').last().unwrap_or(stripped)
         };
+
+        debug!(
+            "chat: api_base={} raw_model={} stripped={} model={}",
+            self.api_base, raw_model, stripped, model
+        );
+
+        // For Nemotron-family models with reasoning off and no tools: try the native
+        // LMS API which can disable reasoning at the template level. Skip for all
+        // other models to avoid a wasted HTTP roundtrip.
+        let has_tools = tools.map_or(false, |t| !t.is_empty());
+        if is_local_api_base(&self.api_base)
+            && thinking_budget.is_none()
+            && !has_tools
+            && needs_native_lms_api(model)
+        {
+            if let Some(response) = try_native_lms_chat(
+                &self.client,
+                &self.api_base,
+                &self.api_key,
+                model,
+                messages,
+                max_tokens,
+                temperature,
+            )
+            .await
+            {
+                return Ok(response);
+            }
+            // Native API failed — fall through to regular path.
+        }
+
         let url = format!("{}/chat/completions", self.api_base);
 
         // Inject cache_control breakpoints for Anthropic prompt caching.
@@ -299,70 +543,114 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
+        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget);
 
-        let response = match self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("HTTP request to LLM failed (base={}): {}", self.api_base, e);
+        // JIT gate: serialise access to JIT-loading servers.
+        let _jit_permit = match &self.jit_gate {
+            Some(gate) => Some(gate.acquire().await),
+            None => None,
+        };
+
+        // Retry loop for JIT loading errors (model still loading / not yet ready).
+        let backoff_ms = [2000u64, 4000, 8000];
+        let max_attempts = if self.jit_gate.is_some() { 3 } else { 1 };
+
+        for attempt in 0..max_attempts {
+            let response = match self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("HTTP request to LLM failed (base={}): {}", self.api_base, e);
+                    let err_msg = format!("Error calling LLM: {}", e);
+                    if attempt + 1 < max_attempts && is_jit_loading_error(&err_msg) {
+                        info!(
+                            "JIT loading error on attempt {}, retrying in {}ms",
+                            attempt + 1,
+                            backoff_ms[attempt]
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt]))
+                            .await;
+                        continue;
+                    }
+                    return Ok(LLMResponse {
+                        content: Some(err_msg),
+                        tool_calls: Vec::new(),
+                        finish_reason: "error".to_string(),
+                        usage: HashMap::new(),
+                    });
+                }
+            };
+
+            let status = response.status();
+            let response_text = match response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    return Ok(LLMResponse {
+                        content: Some(format!("Error reading LLM response: {}", e)),
+                        tool_calls: Vec::new(),
+                        finish_reason: "error".to_string(),
+                        usage: HashMap::new(),
+                    });
+                }
+            };
+
+            if !status.is_success() {
+                // Check for JIT loading errors and retry if possible.
+                if attempt + 1 < max_attempts && is_jit_loading_error(&response_text) {
+                    info!(
+                        "JIT loading error on attempt {} (HTTP {}), retrying in {}ms",
+                        attempt + 1,
+                        status,
+                        backoff_ms[attempt]
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt])).await;
+                    continue;
+                }
+
+                warn!(
+                    "LLM API returned status {} (base={}): {}",
+                    status, self.api_base, response_text
+                );
                 return Ok(LLMResponse {
-                    content: Some(format!("Error calling LLM: {}", e)),
+                    content: Some(format!(
+                        "Error calling LLM (HTTP {}): {}",
+                        status, response_text
+                    )),
                     tool_calls: Vec::new(),
                     finish_reason: "error".to_string(),
                     usage: HashMap::new(),
                 });
             }
-        };
 
-        let status = response.status();
-        let response_text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(LLMResponse {
-                    content: Some(format!("Error reading LLM response: {}", e)),
-                    tool_calls: Vec::new(),
-                    finish_reason: "error".to_string(),
-                    usage: HashMap::new(),
-                });
-            }
-        };
+            let data: serde_json::Value = match serde_json::from_str(&response_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(LLMResponse {
+                        content: Some(format!("Error parsing LLM response JSON: {}", e)),
+                        tool_calls: Vec::new(),
+                        finish_reason: "error".to_string(),
+                        usage: HashMap::new(),
+                    });
+                }
+            };
 
-        if !status.is_success() {
-            warn!(
-                "LLM API returned status {} (base={}): {}",
-                status, self.api_base, response_text
-            );
-            return Ok(LLMResponse {
-                content: Some(format!(
-                    "Error calling LLM (HTTP {}): {}",
-                    status, response_text
-                )),
-                tool_calls: Vec::new(),
-                finish_reason: "error".to_string(),
-                usage: HashMap::new(),
-            });
+            return parse_response(&data);
         }
 
-        let data: serde_json::Value = match serde_json::from_str(&response_text) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(LLMResponse {
-                    content: Some(format!("Error parsing LLM response JSON: {}", e)),
-                    tool_calls: Vec::new(),
-                    finish_reason: "error".to_string(),
-                    usage: HashMap::new(),
-                });
-            }
-        };
-
-        parse_response(&data)
+        // Should never reach here, but just in case:
+        Ok(LLMResponse {
+            content: Some("Error: JIT retry loop exhausted".to_string()),
+            tool_calls: Vec::new(),
+            finish_reason: "error".to_string(),
+            usage: HashMap::new(),
+        })
     }
 
     async fn chat_stream(
@@ -376,11 +664,50 @@ impl LLMProvider for OpenAICompatProvider {
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
-        let model = if !self.api_base.contains("openrouter") {
-            raw_model.split('/').last().unwrap_or(raw_model)
+        let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
+        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://") {
+            // OpenRouter: keep org/model for routing.
+            // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
+            stripped
         } else {
-            raw_model
+            // Cloud HTTPS APIs (Anthropic, OpenAI, etc.): strip org prefix
+            // (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5").
+            stripped.split('/').last().unwrap_or(stripped)
         };
+
+        debug!(
+            "chat_stream: api_base={} raw_model={} stripped={} model={}",
+            self.api_base, raw_model, stripped, model
+        );
+
+        // For Nemotron-family models with reasoning off and no tools: try native LMS API.
+        let has_tools = tools.map_or(false, |t| !t.is_empty());
+        if is_local_api_base(&self.api_base)
+            && thinking_budget.is_none()
+            && !has_tools
+            && needs_native_lms_api(model)
+        {
+            if let Some(response) = try_native_lms_chat(
+                &self.client,
+                &self.api_base,
+                &self.api_key,
+                model,
+                messages,
+                max_tokens,
+                temperature,
+            )
+            .await
+            {
+                // Wrap the non-streaming response as a fake stream.
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                if let Some(ref content) = response.content {
+                    let _ = tx.send(StreamChunk::TextDelta(content.clone()));
+                }
+                let _ = tx.send(StreamChunk::Done(response));
+                return Ok(StreamHandle { rx });
+            }
+        }
+
         let url = format!("{}/chat/completions", self.api_base);
 
         // Inject cache_control breakpoints for Anthropic prompt caching.
@@ -410,6 +737,15 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
+        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget);
+
+        // JIT gate: serialise access to JIT-loading servers.
+        // For streaming, the permit is moved into the spawned task so it's held
+        // for the entire stream duration, preventing model switches mid-stream.
+        let jit_permit = match &self.jit_gate {
+            Some(gate) => Some(gate.acquire().await),
+            None => None,
+        };
 
         let response = self
             .client
@@ -427,6 +763,8 @@ impl LLMProvider for OpenAICompatProvider {
                 "LLM streaming API returned status {} (base={}): {}",
                 status, self.api_base, error_text
             );
+            // Drop permit explicitly on error (it would drop anyway, but be clear).
+            drop(jit_permit);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamChunk::Done(LLMResponse {
                 content: Some(format!(
@@ -442,10 +780,14 @@ impl LLMProvider for OpenAICompatProvider {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Spawn a task to parse the SSE stream
+        // Spawn a task to parse the SSE stream.
+        // The JIT permit is moved into the task and held until the stream ends,
+        // preventing other providers from switching models mid-stream.
         let byte_stream = response.bytes_stream();
         tokio::spawn(async move {
             parse_sse_stream(byte_stream, tx).await;
+            // Permit drops here when the stream is fully consumed.
+            drop(jit_permit);
         });
 
         Ok(StreamHandle { rx })
@@ -528,20 +870,14 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or("stop")
         .to_string();
 
-    // Extract content. reasoning_content/reasoning deltas are logged
-    // but NOT merged into the user-facing content — it's internal chain-of-thought
-    // that pollutes display, TTS, and conversation history.
-    if let Some(reasoning) = message
+    // Extract reasoning_content (separate field used by reasoning models).
+    let reasoning_text = message
         .get("reasoning_content")
         .or_else(|| message.get("reasoning"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-    {
-        debug!(
-            "Model returned reasoning_content ({} chars), discarding from output",
-            reasoning.len()
-        );
-    }
+        .map(|s| s.to_string());
+
     let content = message
         .get("content")
         .and_then(|v| v.as_str())
@@ -568,6 +904,29 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
                 Some(cleaned)
             }
         });
+
+    // Fallback: if content is empty but reasoning_content is present, use it.
+    // Some models (e.g. NanBeige) put all output in reasoning_content with
+    // empty content — without this fallback the model appears silent.
+    let content = if content.is_none() {
+        if let Some(ref reasoning) = reasoning_text {
+            debug!(
+                "content empty, using reasoning_content ({} chars) as fallback",
+                reasoning.len()
+            );
+            Some(reasoning.trim().to_string()).filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    } else {
+        if let Some(ref reasoning) = reasoning_text {
+            debug!(
+                "Model returned reasoning_content ({} chars), discarding from output",
+                reasoning.len()
+            );
+        }
+        content
+    };
 
     // Extract tool calls.
     let mut tool_calls = Vec::new();
@@ -695,15 +1054,21 @@ async fn parse_sse_stream(
                     let _ = tx.send(StreamChunk::TextDelta(tail_content));
                 }
 
-                // Stream is complete — discard reasoning_content (internal chain-of-thought)
-                if !full_reasoning.is_empty() {
+                // Fallback: if content is empty but reasoning is present, use reasoning.
+                let content = if !full_content.is_empty() {
+                    if !full_reasoning.is_empty() {
+                        debug!(
+                            "Streaming: discarding reasoning_content ({} chars)",
+                            full_reasoning.len()
+                        );
+                    }
+                    Some(full_content.clone())
+                } else if !full_reasoning.is_empty() {
                     debug!(
-                        "Streaming: discarding reasoning_content ({} chars)",
+                        "Streaming: content empty, using reasoning_content ({} chars) as fallback",
                         full_reasoning.len()
                     );
-                }
-                let content = if !full_content.is_empty() {
-                    Some(full_content.clone())
+                    Some(full_reasoning.clone())
                 } else {
                     None
                 };
@@ -830,15 +1195,21 @@ async fn parse_sse_stream(
         let _ = tx.send(StreamChunk::TextDelta(tail_content));
     }
 
-    // Stream ended without [DONE] — emit whatever we have, discarding reasoning_content
-    if !full_reasoning.is_empty() {
+    // Stream ended without [DONE] — fallback to reasoning if content is empty.
+    let content = if !full_content.is_empty() {
+        if !full_reasoning.is_empty() {
+            debug!(
+                "Streaming (no DONE): discarding reasoning_content ({} chars)",
+                full_reasoning.len()
+            );
+        }
+        Some(full_content)
+    } else if !full_reasoning.is_empty() {
         debug!(
-            "Streaming (no DONE): discarding reasoning_content ({} chars)",
+            "Streaming (no DONE): content empty, using reasoning_content ({} chars) as fallback",
             full_reasoning.len()
         );
-    }
-    let content = if !full_content.is_empty() {
-        Some(full_content)
+        Some(full_reasoning)
     } else {
         None
     };
@@ -1072,9 +1443,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_response_reasoning_only_no_content() {
-        // If model returns ONLY reasoning_content with no main content,
-        // the response should be None (not a <thinking> block).
+    fn test_parse_response_reasoning_only_falls_back_to_reasoning() {
+        // If model returns ONLY reasoning_content with no main content
+        // (e.g. NanBeige), reasoning_content is used as fallback content.
         let data = serde_json::json!({
             "choices": [{
                 "message": {
@@ -1085,9 +1456,31 @@ mod tests {
         });
 
         let resp = parse_response(&data).expect("parse should succeed");
-        assert!(
-            resp.content.is_none(),
-            "reasoning-only response should have no content"
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("Hmm, let me think..."),
+            "reasoning-only response should use reasoning_content as fallback"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_empty_content_string_with_reasoning_fallback() {
+        // NanBeige returns content: "" (empty string) with reasoning_content.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "Step 1: analyze the question. Step 2: the answer is 7.",
+                    "content": ""
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("Step 1: analyze the question. Step 2: the answer is 7."),
+            "empty content string should trigger reasoning_content fallback"
         );
     }
 
@@ -1307,6 +1700,79 @@ mod tests {
     }
 
     #[test]
+    fn test_thinking_prefill_added_for_local_no_tools() {
+        let mut body = serde_json::json!({
+            "model": "nanbeige4.1-3b",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "\n");
+    }
+
+    #[test]
+    fn test_thinking_prefill_skipped_when_tools_present() {
+        let mut body = serde_json::json!({
+            "model": "ministral-3-3b",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "test"}}]
+        });
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "prefill should NOT be added when tools are present");
+    }
+
+    #[test]
+    fn test_thinking_prefill_skipped_when_thinking_enabled() {
+        let mut body = serde_json::json!({
+            "model": "nanbeige4.1-3b",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", Some(4096));
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "prefill should NOT be added when thinking is enabled");
+    }
+
+    #[test]
+    fn test_thinking_prefill_skipped_for_remote() {
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+        apply_local_thinking_prefill(&mut body, "https://api.openai.com/v1", None);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "prefill should NOT be added for remote APIs");
+    }
+
+    #[test]
+    fn test_is_local_api_base_private_ips() {
+        // RFC 1918 private ranges
+        assert!(is_local_api_base("http://192.168.1.22:1234/v1"));
+        assert!(is_local_api_base("http://10.0.0.5:8080/v1"));
+        assert!(is_local_api_base("http://172.16.0.1:1234/v1"));
+        assert!(is_local_api_base("http://172.31.255.1:1234/v1"));
+        // Existing localhost checks
+        assert!(is_local_api_base("http://localhost:8080/v1"));
+        assert!(is_local_api_base("http://127.0.0.1:8080/v1"));
+        // Cloud APIs must NOT match
+        assert!(!is_local_api_base("https://api.openai.com/v1"));
+        assert!(!is_local_api_base("https://openrouter.ai/api/v1"));
+        // Edge: 172.15 and 172.32 are NOT private
+        assert!(!is_local_api_base("http://172.15.0.1:1234/v1"));
+        assert!(!is_local_api_base("http://172.32.0.1:1234/v1"));
+    }
+
+    #[test]
     fn test_inject_cache_control_system_message() {
         let messages = vec![
             serde_json::json!({"role": "system", "content": "You are helpful."}),
@@ -1349,5 +1815,22 @@ mod tests {
         let (cached, _) = inject_cache_control(&messages, None);
         // User message should be unchanged (not treated as system).
         assert_eq!(cached[0]["content"], "Hello");
+    }
+
+    // -- needs_native_lms_api tests --
+
+    #[test]
+    fn test_needs_native_lms_api_nemotron() {
+        assert!(needs_native_lms_api("nvidia/nemotron-3-nano"));
+        assert!(needs_native_lms_api("huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"));
+        assert!(needs_native_lms_api("nvidia_orchestrator-8b"));
+    }
+
+    #[test]
+    fn test_needs_native_lms_api_non_nemotron() {
+        assert!(!needs_native_lms_api("Qwen3-8B"));
+        assert!(!needs_native_lms_api("ministral-3-8b-instruct-2512"));
+        assert!(!needs_native_lms_api("local-model"));
+        assert!(!needs_native_lms_api("nanbeige4.1-3b"));
     }
 }

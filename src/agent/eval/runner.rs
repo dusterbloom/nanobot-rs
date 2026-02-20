@@ -3,7 +3,7 @@
 //! This module connects the pure benchmark logic to actual LLM calls
 //! for calibration, solving, and evaluation orchestration.
 //!
-//! Requires a running LLM provider (cloud or local llama-server).
+//! Requires a running LLM provider (cloud or local LM Studio).
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;

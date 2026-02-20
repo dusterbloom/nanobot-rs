@@ -418,7 +418,7 @@ async fn request_strict_router_decision(
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["tool","subagent","specialist","ask_user"]},
+                    "action": {"type": "string", "enum": ["respond","tool","specialist","ask_user"]},
                     "target": {"type": "string"},
                     "args": {"type": "object"},
                     "confidence": {"type": "number"}
@@ -431,7 +431,16 @@ async fn request_strict_router_decision(
     let tool_messages = vec![
         json!({
             "role": "system",
-            "content": "ROLE=ROUTER\nCall route_decision exactly once. Do not emit prose."
+            "content": concat!(
+                "You are a routing agent. Analyze the user's request and call route_decision once.\n\n",
+                "Actions:\n",
+                "- respond: Greetings, chitchat, simple questions the main model can answer directly\n",
+                "- tool: Use a specific tool (set target=tool_name, args=tool_parameters)\n",
+                "- specialist: Delegate to specialist model for complex multi-step reasoning\n",
+                "- ask_user: ONLY when the request is truly ambiguous and cannot be answered\n\n",
+                "If the user is just saying hello or asking a simple question, use action=respond.\n",
+                "Call route_decision exactly once. No prose.",
+            )
         }),
         json!({
             "role": "user",
@@ -439,7 +448,7 @@ async fn request_strict_router_decision(
         }),
     ];
     if let Ok(tool_resp) = provider
-        .chat(&tool_messages, Some(&tool_defs), Some(model), 128, temperature, None)
+        .chat(&tool_messages, Some(&tool_defs), Some(model), 256, temperature, None)
         .await
     {
         if let Some(tc) = tool_resp.tool_calls.first() {
@@ -466,7 +475,14 @@ async fn request_strict_router_decision(
     let router_messages = vec![
         json!({
             "role": "system",
-            "content": "ROLE=ROUTER\nOutput EXACTLY one minified JSON object.\nSchema:{\"action\":\"tool|subagent|specialist|ask_user\",\"target\":\"string\",\"args\":{},\"confidence\":0..1}\nRules: no markdown, no prose, no extra keys."
+            "content": concat!(
+                "Output EXACTLY one JSON object. No markdown, no explanation, no extra text.\n",
+                "Schema: {\"action\":\"respond|tool|specialist|ask_user\",\"target\":\"string\",\"args\":{},\"confidence\":0.0-1.0}\n\n",
+                "Examples:\n",
+                "User says hello → {\"action\":\"respond\",\"target\":\"main\",\"args\":{},\"confidence\":0.95}\n",
+                "User asks to read a file → {\"action\":\"tool\",\"target\":\"read_file\",\"args\":{\"path\":\"README.md\"},\"confidence\":0.9}\n",
+                "User asks a simple question → {\"action\":\"respond\",\"target\":\"main\",\"args\":{},\"confidence\":0.9}\n",
+            )
         }),
         json!({
             "role": "user",
@@ -950,6 +966,7 @@ struct TurnContext {
     tool_guard: ToolGuard,
     turns_since_compaction: u32,
     forced_finalize_attempted: bool,
+    content_was_streamed: bool,
 }
 
 impl AgentLoopShared {
@@ -1465,6 +1482,7 @@ impl AgentLoopShared {
             tool_guard,
             turns_since_compaction: 0,
             forced_finalize_attempted: false,
+            content_was_streamed: false,
         }
     }
 
@@ -1622,8 +1640,9 @@ impl AgentLoopShared {
             } else {
                 ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
             };
-            if ctx.core.tool_delegation_config.strict_no_tools_main {
-                // Hard separation: main model is conversation/orchestration only.
+            if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
+                // Hard separation (local trio only): main model is conversation/orchestration only.
+                // Cloud providers handle tools natively and must never have them stripped.
                 tool_defs.clear();
             }
             if boundary_active {
@@ -1733,7 +1752,10 @@ impl AgentLoopShared {
             }
 
             // Router-first preflight for strict trio mode.
-            if ctx.core.tool_delegation_config.strict_no_tools_main
+            // Only applies in local mode — trio routing is a local-model orchestration
+            // pattern and must not block cloud providers (which handle tools natively).
+            if ctx.core.is_local
+                && ctx.core.tool_delegation_config.strict_no_tools_main
                 && ctx.core.tool_delegation_config.strict_router_schema
                 && !ctx.router_preflight_done
             {
@@ -1788,6 +1810,13 @@ impl AgentLoopShared {
                         break;
                     }
                 };
+
+                debug!(
+                    "Router decision: action={}, target={}, args={}",
+                    decision.action,
+                    decision.target,
+                    serde_json::to_string(&decision.args).unwrap_or_default()
+                );
 
                 match decision.action.as_str() {
                     "ask_user" => {
@@ -1853,7 +1882,13 @@ impl AgentLoopShared {
                         ctx.used_tools.insert(decision.target);
                         continue;
                     }
-                    _ => {}
+                    "respond" => {
+                        // Router says main model can handle this directly — fall through.
+                        debug!("Router: respond — forwarding to main model");
+                    }
+                    _ => {
+                        debug!("Router: unrecognized action '{}' — forwarding to main model", decision.action);
+                    }
                 }
             }
 
@@ -1975,6 +2010,7 @@ impl AgentLoopShared {
                                         in_thinking = false;
                                         let _ = delta_tx.send("\x1b[0m\n\n".to_string());
                                     }
+                                    ctx.content_was_streamed = true;
                                     let _ = delta_tx.send(delta);
                                 }
                                 Some(StreamChunk::Done(resp)) => {
@@ -2237,10 +2273,12 @@ impl AgentLoopShared {
                     }
                 }
 
-                if role_policy::should_block_main_tool_calls(
-                    ctx.core.tool_delegation_config.strict_no_tools_main,
-                    true,
-                ) && !router_decision_valid
+                if ctx.core.is_local
+                    && role_policy::should_block_main_tool_calls(
+                        ctx.core.tool_delegation_config.strict_no_tools_main,
+                        true,
+                    )
+                    && !router_decision_valid
                 {
                     if ctx.core.tool_delegation_config.deterministic_router_fallback {
                         warn!(
@@ -2423,8 +2461,8 @@ impl AgentLoopShared {
                             tr_model
                         );
 
-                        // Local delegation providers (llama-server) require
-                        // user-last messages for tool→generate flow.
+                        // Local delegation providers require user-last messages
+                        // for tool→generate flow.
                         // Check delegation provider's locality, not the main model's.
                         let needs_user_cont = ctx.core.is_local || delegation_provider.is_some();
 
@@ -2929,6 +2967,18 @@ impl AgentLoopShared {
                 break;
             }
         }
+
+        // If the loop exited via a non-streaming path (e.g. router preflight
+        // decision, error, ask_user) the final_content was set directly without
+        // any text deltas being sent through the streaming channel.  Emit it
+        // now so the REPL's incremental renderer actually displays something.
+        // Skip if content was already streamed via TextDelta chunks to avoid
+        // duplication.
+        if !ctx.final_content.is_empty() && !ctx.content_was_streamed {
+            if let Some(ref tx) = ctx.text_delta_tx {
+                let _ = tx.send(ctx.final_content.clone());
+            }
+        }
     }
 
     /// Phase 3: Finalize the response — persist session, build outbound message.
@@ -3159,6 +3209,9 @@ impl AgentLoop {
         );
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
+        }
+        if core.is_local {
+            subagent_mgr = subagent_mgr.with_local_context_limit(core.token_budget.max_context());
         }
 
         // Create aha channel before subagent manager so we can pass the sender.
@@ -3793,7 +3846,7 @@ mod tests {
 
     /// Real-provider trio probe.
     ///
-    /// Runs against live OpenAI-compatible endpoints (typically llama.cpp):
+    /// Runs against live OpenAI-compatible endpoints (e.g. LM Studio):
     /// - main: `NANOBOT_REAL_MAIN_BASE` (default: http://127.0.0.1:8080/v1)
     /// - router: `NANOBOT_REAL_ROUTER_BASE` (default: http://127.0.0.1:8094/v1)
     /// - specialist: `NANOBOT_REAL_SPECIALIST_BASE` (default: http://127.0.0.1:8095/v1)

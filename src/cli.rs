@@ -25,6 +25,7 @@ use crate::heartbeat::service::{
     HeartbeatService, DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_MAINTENANCE_COMMANDS,
 };
 use crate::providers::base::LLMProvider;
+use crate::providers::jit_gate::JitGate;
 use crate::providers::oauth::OAuthTokenManager;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use crate::utils::helpers::get_workspace_path;
@@ -244,7 +245,7 @@ mod tests {
             core.is_local,
             "local mode should force local provider wiring"
         );
-        assert_eq!(core.model, "local:Qwen3-8B-Q4_K_M.gguf");
+        assert_eq!(core.model, "local:Qwen3-8B");
         assert_eq!(
             core.provider.get_api_base(),
             Some("http://localhost:18080/v1"),
@@ -267,6 +268,24 @@ mod tests {
     #[test]
     fn test_eval_model_name_local_is_port_scoped() {
         assert_eq!(eval_model_name(true, 18082), "local:18082");
+    }
+
+    #[test]
+    fn test_strip_gguf_suffix() {
+        assert_eq!(strip_gguf_suffix("nanbeige4.1-3b-q8_0.gguf"), "nanbeige4.1-3b");
+        assert_eq!(strip_gguf_suffix("Qwen3-8B-Q4_K_M.gguf"), "Qwen3-8B");
+        assert_eq!(strip_gguf_suffix("ministral-3-8b-instruct-2512.gguf"), "ministral-3-8b-instruct-2512");
+        assert_eq!(strip_gguf_suffix("nanbeige4.1-3b"), "nanbeige4.1-3b");
+        assert_eq!(strip_gguf_suffix("model-f16.gguf"), "model");
+        assert_eq!(strip_gguf_suffix("local-model"), "local-model");
+        // Model variant suffixes like -i1 (imatrix) must NOT be stripped.
+        assert_eq!(
+            strip_gguf_suffix("huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"),
+            "huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"
+        );
+        // Real quant suffixes with >= 3 chars still get stripped.
+        assert_eq!(strip_gguf_suffix("model-Q4_K_M"), "model");
+        assert_eq!(strip_gguf_suffix("model-q8_0"), "model");
     }
 }
 
@@ -375,6 +394,178 @@ fn model_context_size(model: &str, config_default: usize) -> usize {
     }
 }
 
+/// Strip GGUF quantisation suffix and extension from a model filename to get
+/// the bare model identifier that LM Studio / remote servers recognise.
+///
+/// Examples:
+///   "nanbeige4.1-3b-q8_0.gguf"          → "nanbeige4.1-3b"
+///   "Qwen3-8B-Q4_K_M.gguf"              → "Qwen3-8B"
+///   "ministral-3-8b-instruct-2512.gguf"  → "ministral-3-8b-instruct-2512"
+///   "nanbeige4.1-3b"                     → "nanbeige4.1-3b" (no-op)
+pub(crate) fn strip_gguf_suffix(name: &str) -> &str {
+    let name = name.strip_suffix(".gguf").unwrap_or(name);
+    // Match common quant patterns: -q8_0, -Q4_K_M, -IQ2_XS, -f16, -f32, etc.
+    // Pattern: last segment starting with `-[qQfFiI]` followed by digits/underscores/letters.
+    // Minimum 3 chars to avoid stripping model variant suffixes like `-i1` (imatrix).
+    if let Some(idx) = name.rfind('-') {
+        let suffix = &name[idx + 1..];
+        let first = suffix.as_bytes().first().copied().unwrap_or(0);
+        if matches!(first, b'q' | b'Q' | b'f' | b'F' | b'i' | b'I')
+            && suffix.len() >= 3
+            && suffix.as_bytes()[1].is_ascii_digit()
+        {
+            return &name[..idx];
+        }
+    }
+    name
+}
+
+/// Resolve the API base URL for a local role.
+///
+/// When `localApiBase` is set in config, ALL local providers share that URL
+/// (LM Studio JIT loading differentiates by model name, not by port).
+/// Otherwise falls back to `http://localhost:{port}/v1`.
+fn local_base_url(config: &Config, fallback_port: &str) -> String {
+    let custom = &config.agents.defaults.local_api_base;
+    if !custom.is_empty() {
+        custom.clone()
+    } else {
+        format!("http://localhost:{}/v1", fallback_port)
+    }
+}
+
+/// Resolved local providers for all roles (main, compaction, delegation, specialist).
+struct LocalProviders {
+    main: Arc<dyn LLMProvider>,
+    model_id: String,
+    compaction: Option<Arc<dyn LLMProvider>>,
+    delegation: Option<Arc<dyn LLMProvider>>,
+    specialist: Option<Arc<dyn LLMProvider>>,
+    max_context_tokens: usize,
+}
+
+/// Build providers for all local roles from config + endpoint resolution.
+///
+/// Endpoint priority per trio role:
+///   1. `trio.router_endpoint` / `trio.specialist_endpoint` (explicit URL+model)
+///   2. `localApiBase` + `trio.router_model` / `trio.specialist_model` (shared JIT server)
+///   3. Separate port fallback (delegation_port / specialist_port)
+///   4. None (disabled)
+fn make_local_providers(
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
+) -> LocalProviders {
+    let has_custom_base = !config.agents.defaults.local_api_base.is_empty();
+    let base_url = local_base_url(config, local_port);
+
+    // Resolve main model name.
+    // Always strip GGUF suffix — config may hold a .gguf filename even when
+    // using LM Studio, which expects clean identifiers.
+    let model_id = strip_gguf_suffix(local_model_name.unwrap_or("local-model")).to_string();
+
+    // Create JIT gate for JIT-loading servers (e.g. LM Studio).
+    // All providers sharing the same JIT endpoint get the same gate so requests
+    // are serialised — prevents concurrent model switches that crash the server.
+    // Skip when lms CLI pre-loads models (skip_jit_gate = true).
+    let jit_gate: Option<Arc<JitGate>> = if has_custom_base && !config.agents.defaults.skip_jit_gate {
+        Some(Arc::new(JitGate::new()))
+    } else {
+        None
+    };
+
+    let mut main_prov = OpenAICompatProvider::new("local", Some(&base_url), Some(&model_id));
+    if let Some(ref gate) = jit_gate {
+        main_prov = main_prov.with_jit_gate(gate.clone());
+    }
+    let main: Arc<dyn LLMProvider> = Arc::new(main_prov);
+
+    // Auto-detect context size from local server; fall back to config default.
+    let max_context_tokens = if !has_custom_base {
+        crate::server::query_local_context_size(local_port)
+            .unwrap_or(config.agents.defaults.local_max_context_tokens)
+    } else {
+        config.agents.defaults.local_max_context_tokens
+    };
+
+    // Compaction provider (separate port only).
+    let compaction: Option<Arc<dyn LLMProvider>> = compaction_port.map(|p| -> Arc<dyn LLMProvider> {
+        let mut prov = OpenAICompatProvider::new(
+            "local-compaction",
+            Some(&local_base_url(config, p)),
+            None,
+        );
+        if let Some(ref gate) = jit_gate {
+            prov = prov.with_jit_gate(gate.clone());
+        }
+        Arc::new(prov)
+    });
+
+    // Helper: create a provider for a trio role with endpoint resolution.
+    let make_role_provider = |role_name: &str,
+                              endpoint: &Option<crate::config::schema::ModelEndpoint>,
+                              trio_model: &str,
+                              fallback_port: Option<&str>|
+     -> Option<Arc<dyn LLMProvider>> {
+        // Priority 1: explicit endpoint (url + model)
+        if let Some(ep) = endpoint {
+            let mut prov = OpenAICompatProvider::new(role_name, Some(&ep.url), Some(&ep.model));
+            // Use JIT gate if endpoint URL matches the shared base (same server).
+            if let Some(ref gate) = jit_gate {
+                if ep.url == base_url {
+                    prov = prov.with_jit_gate(gate.clone());
+                }
+            }
+            return Some(Arc::new(prov));
+        }
+
+        // Priority 2: shared JIT server (localApiBase set) + trio model name
+        if has_custom_base {
+            let model = if !trio_model.is_empty() { trio_model } else { role_name };
+            let mut prov = OpenAICompatProvider::new(role_name, Some(&base_url), Some(model));
+            if let Some(ref gate) = jit_gate {
+                prov = prov.with_jit_gate(gate.clone());
+            }
+            return Some(Arc::new(prov));
+        }
+
+        // Priority 3: separate port fallback
+        fallback_port.map(|p| -> Arc<dyn LLMProvider> {
+            Arc::new(OpenAICompatProvider::new(
+                role_name,
+                Some(&local_base_url(config, p)),
+                Some(role_name),
+            ))
+        })
+    };
+
+    let delegation = make_role_provider(
+        "local-delegation",
+        &config.trio.router_endpoint,
+        &config.trio.router_model,
+        delegation_port,
+    );
+
+    let specialist = make_role_provider(
+        "local-specialist",
+        &config.trio.specialist_endpoint,
+        &config.trio.specialist_model,
+        specialist_port,
+    );
+
+    LocalProviders {
+        main,
+        model_id,
+        compaction,
+        delegation,
+        specialist,
+        max_context_tokens,
+    }
+}
+
 pub(crate) fn build_core_handle(
     config: &Config,
     local_port: &str,
@@ -384,20 +575,16 @@ pub(crate) fn build_core_handle(
     specialist_port: Option<&str>,
 ) -> SharedCoreHandle {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
-    let provider: Arc<dyn LLMProvider> = if is_local {
-        Arc::new(OpenAICompatProvider::new(
-            "local",
-            Some(&format!("http://localhost:{}/v1", local_port)),
-            Some("local-model"),
-        ))
-    } else {
-        create_provider(config)
-    };
 
-    let model = if is_local {
-        format!("local:{}", local_model_name.unwrap_or("local-model"))
+    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+        let lp = make_local_providers(config, local_port, local_model_name, compaction_port, delegation_port, specialist_port);
+        let model = format!("local:{}", lp.model_id);
+        (lp.main, model, lp.max_context_tokens, lp.compaction, lp.delegation, lp.specialist)
     } else {
-        config.agents.defaults.model.clone()
+        let provider = create_provider(config);
+        let model = config.agents.defaults.model.clone();
+        let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
+        (provider, model, ctx, None, None, None)
     };
 
     let brave_key = if config.tools.web.search.api_key.is_empty() {
@@ -405,42 +592,6 @@ pub(crate) fn build_core_handle(
     } else {
         Some(config.tools.web.search.api_key.clone())
     };
-
-    // Auto-detect context size from local server; fall back to config/model default.
-    let max_context_tokens = if is_local {
-        crate::server::query_local_context_size(local_port)
-            .unwrap_or(config.agents.defaults.max_context_tokens)
-    } else {
-        model_context_size(&model, config.agents.defaults.max_context_tokens)
-    };
-
-    let cp: Option<Arc<dyn LLMProvider>> = if is_local {
-        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
-            Arc::new(OpenAICompatProvider::new(
-                "local-compaction",
-                Some(&format!("http://localhost:{}/v1", p)),
-                None,
-            ))
-        })
-    } else {
-        None
-    };
-
-    let dp: Option<Arc<dyn LLMProvider>> = delegation_port.map(|p| -> Arc<dyn LLMProvider> {
-        Arc::new(OpenAICompatProvider::new(
-            "local-delegation",
-            Some(&format!("http://localhost:{}/v1", p)),
-            Some("local-delegation"),
-        ))
-    });
-
-    let sp: Option<Arc<dyn LLMProvider>> = specialist_port.map(|p| -> Arc<dyn LLMProvider> {
-        Arc::new(OpenAICompatProvider::new(
-            "local-specialist",
-            Some(&format!("http://localhost:{}/v1", p)),
-            Some("local-specialist"),
-        ))
-    });
 
     let max_iters = effective_max_iterations(
         config.agents.defaults.max_tool_iterations,
@@ -470,6 +621,11 @@ pub(crate) fn build_core_handle(
         trio_config: config.trio.clone(),
     });
     let counters = Arc::new(RuntimeCounters::new(max_context_tokens));
+    // When main_no_think is enabled, also suppress thinking display from the start
+    // so the user doesn't need to run /nothink manually each session.
+    if config.trio.main_no_think {
+        counters.suppress_thinking_in_tts.store(true, Ordering::Relaxed);
+    }
     AgentHandle::new(core, counters)
 }
 
@@ -486,20 +642,16 @@ pub(crate) fn rebuild_core(
     specialist_port: Option<&str>,
 ) {
     let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
-    let provider: Arc<dyn LLMProvider> = if is_local {
-        Arc::new(OpenAICompatProvider::new(
-            "local",
-            Some(&format!("http://localhost:{}/v1", local_port)),
-            Some("local-model"),
-        ))
-    } else {
-        create_provider(config)
-    };
 
-    let model = if is_local {
-        format!("local:{}", local_model_name.unwrap_or("local-model"))
+    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+        let lp = make_local_providers(config, local_port, local_model_name, compaction_port, delegation_port, specialist_port);
+        let model = format!("local:{}", lp.model_id);
+        (lp.main, model, lp.max_context_tokens, lp.compaction, lp.delegation, lp.specialist)
     } else {
-        config.agents.defaults.model.clone()
+        let provider = create_provider(config);
+        let model = config.agents.defaults.model.clone();
+        let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
+        (provider, model, ctx, None, None, None)
     };
 
     let brave_key = if config.tools.web.search.api_key.is_empty() {
@@ -507,41 +659,6 @@ pub(crate) fn rebuild_core(
     } else {
         Some(config.tools.web.search.api_key.clone())
     };
-
-    // Auto-detect context size from local server; fall back to config/model default.
-    let max_context_tokens = if is_local {
-        crate::server::query_local_context_size(local_port)
-            .unwrap_or(config.agents.defaults.max_context_tokens)
-    } else {
-        model_context_size(&model, config.agents.defaults.max_context_tokens)
-    };
-
-    let cp: Option<Arc<dyn LLMProvider>> = if is_local {
-        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
-            Arc::new(OpenAICompatProvider::new(
-                "local-compaction",
-                Some(&format!("http://localhost:{}/v1", p)),
-                None,
-            ))
-        })
-    } else {
-        None
-    };
-
-    let dp: Option<Arc<dyn LLMProvider>> = delegation_port.map(|p| -> Arc<dyn LLMProvider> {
-        Arc::new(OpenAICompatProvider::new(
-            "local-delegation",
-            Some(&format!("http://localhost:{}/v1", p)),
-            Some("local-delegation"),
-        ))
-    });
-    let sp: Option<Arc<dyn LLMProvider>> = specialist_port.map(|p| -> Arc<dyn LLMProvider> {
-        Arc::new(OpenAICompatProvider::new(
-            "local-specialist",
-            Some(&format!("http://localhost:{}/v1", p)),
-            Some("local-specialist"),
-        ))
-    });
 
     let max_iters = effective_max_iterations(
         config.agents.defaults.max_tool_iterations,
@@ -1562,7 +1679,7 @@ pub(crate) fn cmd_search(query: String, limit: usize) {
 // Evaluation helpers
 // ============================================================================
 
-/// Build an LLM provider for eval: local llama-server or cloud API.
+/// Build an LLM provider for eval: local LM Studio or cloud API.
 fn make_eval_provider(local: bool, port: u16) -> Arc<dyn LLMProvider> {
     if local {
         Arc::new(OpenAICompatProvider::new(
