@@ -471,8 +471,7 @@ pub(crate) fn print_status_bar(
 }
 
 /// Print the current mode banner (compact, for mode switches mid-session).
-pub(crate) fn print_mode_banner(local_port: &str) {
-    let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
+pub(crate) fn print_mode_banner(local_port: &str, is_local: bool) {
     println!();
     if is_local {
         let props_url = format!("http://localhost:{}/props", local_port);
@@ -527,14 +526,12 @@ pub(crate) fn print_mode_banner(local_port: &str) {
 }
 
 /// Full startup splash: clear screen, ASCII logo, mode info, hints.
-pub(crate) fn print_startup_splash(local_port: &str) {
+pub(crate) fn print_startup_splash(local_port: &str, is_local: bool) {
     // Clear the terminal for a fresh start.
     print!("{CLEAR_SCREEN}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     print_logo();
-
-    let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     if is_local {
         let config = load_config(None);
         let base = &config.agents.defaults.local_api_base;

@@ -33,24 +33,7 @@ use crate::utils::helpers::get_workspace_path;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
-
-    struct LocalModeGuard {
-        previous: bool,
-    }
-
-    impl Drop for LocalModeGuard {
-        fn drop(&mut self) {
-            crate::LOCAL_MODE.store(self.previous, Ordering::SeqCst);
-        }
-    }
-
-    fn set_local_mode(value: bool) -> LocalModeGuard {
-        let previous = crate::LOCAL_MODE.swap(value, Ordering::SeqCst);
-        LocalModeGuard { previous }
-    }
 
     #[test]
     #[ignore] // Requires network access to Telegram API
@@ -223,8 +206,6 @@ mod tests {
 
     #[test]
     fn test_build_core_handle_local_forces_local_provider_even_with_cloud_keys() {
-        let _guard = set_local_mode(true);
-
         let mut cfg = Config::default();
         cfg.agents.defaults.model = "anthropic/claude-opus-4-5".to_string();
         cfg.providers.openrouter.api_key = "sk-or-cloud-key".to_string();
@@ -237,6 +218,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         );
         let core = handle.swappable();
 
@@ -565,8 +547,8 @@ pub(crate) fn build_core_handle(
     compaction_port: Option<&str>,
     delegation_port: Option<&str>,
     specialist_port: Option<&str>,
+    is_local: bool,
 ) -> SharedCoreHandle {
-    let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
 
     let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
         let lp = make_local_providers(config, local_port, local_model_name, compaction_port, delegation_port, specialist_port);
@@ -632,8 +614,8 @@ pub(crate) fn rebuild_core(
     compaction_port: Option<&str>,
     delegation_port: Option<&str>,
     specialist_port: Option<&str>,
+    is_local: bool,
 ) {
-    let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
 
     let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
         let lp = make_local_providers(config, local_port, local_model_name, compaction_port, delegation_port, specialist_port);
@@ -740,7 +722,7 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     let config = load_config(None);
     check_api_key(&config);
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -895,7 +877,7 @@ pub(crate) fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -959,7 +941,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }
@@ -1080,7 +1062,7 @@ pub(crate) fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None);
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }

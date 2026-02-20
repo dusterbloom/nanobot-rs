@@ -761,6 +761,7 @@ pub(crate) fn apply_server_change(
     model_path: &std::path::Path,
     core_handle: &SharedCoreHandle,
     config: &Config,
+    is_local: bool,
 ) {
     cli::rebuild_core(
         core_handle,
@@ -770,6 +771,7 @@ pub(crate) fn apply_server_change(
         None,
         None,
         None,
+        is_local,
     );
 }
 
@@ -802,14 +804,9 @@ pub(crate) fn cmd_agent(
 
     // Set initial local mode from flag, environment, or config (localApiBase).
     let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
-    if local_flag || local_env || has_remote_local {
-        crate::LOCAL_MODE.store(true, Ordering::SeqCst);
-    }
+    let is_local = local_flag || local_env || has_remote_local;
 
     let local_port = std::env::var("NANOBOT_LOCAL_PORT").unwrap_or_else(|_| "8080".to_string());
-
-    // Check if we can proceed
-    let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
     if !is_local {
         let api_key = config.get_api_key();
         let model = &config.agents.defaults.model;
@@ -893,7 +890,7 @@ pub(crate) fn cmd_agent(
         let is_interactive = message.is_none();
         if is_interactive && is_local && !has_remote_local {
             tui::register_resize_handler();
-            tui::print_startup_splash(&local_port);
+            tui::print_startup_splash(&local_port, is_local);
 
             let preference = &config.agents.defaults.inference_engine;
             if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
@@ -990,6 +987,7 @@ pub(crate) fn cmd_agent(
             None,
             None,
             None,
+            is_local,
         );
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
@@ -1035,7 +1033,7 @@ pub(crate) fn cmd_agent(
             // Splash and LMS detection already happened above (before core build).
             if !is_local || has_remote_local {
                 tui::register_resize_handler();
-                tui::print_startup_splash(&local_port);
+                tui::print_startup_splash(&local_port, is_local);
             }
 
             // Load persisted local model preference, falling back to hardcoded default.
@@ -1168,7 +1166,7 @@ pub(crate) fn cmd_agent(
                 // Handle auto-restart requests from watchdog.
                 ctx.handle_restart_requests().await;
 
-                let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
+                let is_local = ctx.core_handle.swappable().is_local;
                 let voice_on = ctx.voice_on();
                 let thinking_on = ctx
                     .core_handle

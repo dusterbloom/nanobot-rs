@@ -25,15 +25,11 @@ mod voice;
 mod voice_pipeline;
 
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
 
 use clap::{Parser, Subcommand};
 
 pub(crate) const VERSION: &str = "0.1.0";
 pub(crate) const LOGO: &str = "*";
-
-// Global flag for local mode
-pub(crate) static LOCAL_MODE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(name = "nanobot", about = "nanobot - Personal AI Assistant", version = VERSION)]

@@ -219,12 +219,22 @@ impl ReplContext {
     /// Rebuild the shared core from current ServerState and then rebuild the agent loop.
     ///
     /// Combines `apply_server_change` + `rebuild_agent_loop` into one call.
+    /// Reads `is_local` from the current core to pass through, unless the caller
+    /// is about to change modes — in which case use `apply_and_rebuild_with`.
     pub fn apply_and_rebuild(&mut self) {
+        let is_local = self.core_handle.swappable().is_local;
+        self.apply_and_rebuild_with(is_local);
+    }
+
+    /// Like `apply_and_rebuild` but with an explicit `is_local` override.
+    /// Use when toggling between local and cloud mode.
+    pub fn apply_and_rebuild_with(&mut self, is_local: bool) {
         super::apply_server_change(
             &self.srv,
             &self.current_model_path,
             &self.core_handle,
             &self.config,
+            is_local,
         );
         self.rebuild_agent_loop();
     }
@@ -355,7 +365,7 @@ impl ReplContext {
     async fn cmd_status(&mut self) {
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
-        let is_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
+        let is_local = core.is_local;
         let model_name = &core.model;
         let mode_label = if is_local { "local" } else { "cloud" };
         let lane_label = if is_local {
@@ -1112,6 +1122,7 @@ impl ReplContext {
             None,
             None,
             None,
+            self.core_handle.swappable().is_local,
         );
         self.agent_loop = cli::create_agent_loop(
             self.core_handle.clone(),
@@ -1200,7 +1211,7 @@ impl ReplContext {
 
     /// /ctx [size] — show or set context size for the main model.
     async fn cmd_ctx(&mut self, arg: &str) {
-        if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
+        if !self.core_handle.swappable().is_local {
             println!(
                 "\n  {}Not in local mode — use /local first{}\n",
                 tui::DIM,
@@ -1428,7 +1439,7 @@ impl ReplContext {
         save_config(&disk_cfg, None);
 
         // If local mode is active, apply the new model.
-        if crate::LOCAL_MODE.load(Ordering::SeqCst) {
+        if self.core_handle.swappable().is_local {
             self.apply_and_rebuild();
 
             // Warn if VRAM budget exceeded after model change
@@ -1525,7 +1536,7 @@ impl ReplContext {
 
     /// Show VRAM budget breakdown.
     async fn cmd_trio_budget(&self) {
-        if !crate::LOCAL_MODE.load(Ordering::SeqCst) {
+        if !self.core_handle.swappable().is_local {
             println!(
                 "\n  {}Not in local mode — use /local first{}\n",
                 tui::DIM,
@@ -1569,7 +1580,7 @@ impl ReplContext {
             }
 
             // Auto-compute optimal context sizes to fit VRAM budget
-            if crate::LOCAL_MODE.load(Ordering::SeqCst) {
+            if self.core_handle.swappable().is_local {
                 let budget = self.compute_current_vram_budget();
                 if budget.fits {
                     // Apply computed context sizes
@@ -1718,7 +1729,7 @@ impl ReplContext {
         }
 
         // VRAM budget summary (local mode only)
-        if crate::LOCAL_MODE.load(Ordering::SeqCst) {
+        if self.core_handle.swappable().is_local {
             let budget = self.compute_current_vram_budget();
             let total_gb = budget.total_vram_bytes as f64 / 1e9;
             let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
@@ -1846,7 +1857,7 @@ impl ReplContext {
         );
 
         // Warn if VRAM budget exceeded after model change
-        if self.config.trio.enabled && crate::LOCAL_MODE.load(Ordering::SeqCst) {
+        if self.config.trio.enabled && self.core_handle.swappable().is_local {
             let budget = self.compute_current_vram_budget();
             if !budget.fits {
                 println!(
@@ -1869,7 +1880,7 @@ impl ReplContext {
 
     /// /local — toggle between local and cloud mode.
     async fn cmd_local(&mut self) {
-        let currently_local = crate::LOCAL_MODE.load(Ordering::SeqCst);
+        let currently_local = self.core_handle.swappable().is_local;
 
         if !currently_local {
             // Try to start LM Studio if no engine is active.
@@ -1965,9 +1976,8 @@ impl ReplContext {
             }
 
             // Flip to local mode and rebuild.
-            crate::LOCAL_MODE.store(true, Ordering::SeqCst);
-            self.apply_and_rebuild();
-            tui::print_mode_banner(&self.srv.local_port);
+            self.apply_and_rebuild_with(true);
+            tui::print_mode_banner(&self.srv.local_port, true);
         } else {
             // Toggle OFF
             if self.srv.lms_managed {
@@ -1981,9 +1991,8 @@ impl ReplContext {
             self.srv.engine = super::InferenceEngine::None;
             self.config.agents.defaults.skip_jit_gate = false;
             self.stop_watchdog();
-            crate::LOCAL_MODE.store(false, Ordering::SeqCst);
-            self.apply_and_rebuild();
-            tui::print_mode_banner(&self.srv.local_port);
+            self.apply_and_rebuild_with(false);
+            tui::print_mode_banner(&self.srv.local_port, false);
         }
     }
 }
