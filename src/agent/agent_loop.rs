@@ -33,7 +33,7 @@ use crate::agent::validation;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{EmailConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
-use crate::providers::base::StreamChunk;
+use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
 
 // ---------------------------------------------------------------------------
 // Core types re-exported from agent_core module
@@ -142,6 +142,48 @@ pub(crate) struct FlowControl {
 pub(crate) struct CompactionHandle {
     pub(crate) slot: Arc<tokio::sync::Mutex<Option<PendingCompaction>>>,
     pub(crate) in_flight: Arc<AtomicBool>,
+}
+
+// ---------------------------------------------------------------------------
+// Iteration state machine
+// ---------------------------------------------------------------------------
+
+/// The phase within a single agent loop iteration.
+///
+/// Each variant carries only the data needed for that phase.
+/// Transitions are driven by the return value of each step method.
+enum IterationPhase {
+    /// Pre-LLM housekeeping: context hygiene, proprioception, aha channel,
+    /// heartbeat injection, compaction check.
+    Preparing,
+    /// Response boundary injection, tool definition filtering, message
+    /// trimming, compaction spawn, protocol repair, pre-flight check,
+    /// router preflight, adaptive max_tokens.
+    PreCall,
+    /// Call LLM (streaming or blocking).
+    Calling { tool_defs: Vec<Value>, max_tokens: u32 },
+    /// Validate response, rescue pass, error check, token telemetry.
+    Processing { response: LLMResponse },
+    /// Route and execute tool calls (delegated or inline).
+    Executing { response: LLMResponse, tool_calls: Vec<ToolCallRequest> },
+}
+
+/// Outcome of a single iteration, returned to the outer loop.
+enum IterationOutcome {
+    /// Continue to next iteration.
+    Continue,
+    /// Agent produced final content — use as response.
+    Finished(String),
+    /// Error occurred — use as final content.
+    Error(String),
+}
+
+/// What a step function produces: either the next phase or a terminal outcome.
+enum StepResult {
+    /// Transition to the next phase within this iteration.
+    Next(IterationPhase),
+    /// Iteration is done — report outcome to the outer loop.
+    Done(IterationOutcome),
 }
 
 impl AgentLoopShared {
@@ -395,11 +437,9 @@ impl AgentLoopShared {
 
     /// Phase 2: Run the main agent loop (LLM calls + tool execution).
     ///
-    /// Iterates up to `max_iterations`, calling the LLM, handling tool calls
-    /// or router decisions, and accumulating results in `ctx`.
+    /// Thin loop driver: delegates each iteration to [`run_iteration`] which
+    /// drives the inner state machine through `IterationPhase` steps.
     async fn run_agent_loop(&self, ctx: &mut TurnContext) {
-        let counters = &self.core_handle.counters;
-
         for iteration in 0..ctx.core.max_iterations {
             debug!(
                 "Agent iteration{} {}/{}",
@@ -408,685 +448,17 @@ impl AgentLoopShared {
                 ctx.core.max_iterations
             );
 
-            // --- Context Hygiene: clean up conversation history ---
-            context_hygiene::hygiene_pipeline(&mut ctx.messages);
-
-            // --- Proprioception: update SystemState ---
-            if self.proprioception_config.enabled {
-                let tools_list: Vec<String> = if let Ok(guard) = counters.last_tools_called.lock() {
-                    guard.clone()
-                } else {
-                    Vec::new()
-                };
-                let tool_refs: Vec<&str> = tools_list.iter().map(|s| s.as_str()).collect();
-                let phase = system_state::infer_phase(&tool_refs);
-                let active_subs = self.subagents.list_running().await.len().min(255) as u8;
-                let state = SystemState::snapshot(
-                    phase,
-                    counters.last_context_used.load(Ordering::Relaxed),
-                    counters.last_context_max.load(Ordering::Relaxed),
-                    ctx.turn_count,
-                    ctx.messages.len() as u64,
-                    ctx.flow.iterations_since_compaction,
-                    counters.delegation_healthy.load(Ordering::Relaxed),
-                    0,    // recent_tool_failures — not tracked yet
-                    true, // last_tool_ok
-                    active_subs,
-                    0, // pending_aha_signals filled below
-                );
-                self.system_state.store(Arc::new(state));
-            }
-
-            // --- Aha Channel: poll priority signals from subagents ---
-            if self.proprioception_config.enabled && self.proprioception_config.aha_channel {
-                if let Ok(mut rx) = self.aha_rx.try_lock() {
-                    while let Ok(signal) = rx.try_recv() {
-                        match signal.priority {
-                            AhaPriority::Critical => {
-                                ctx.messages.push(json!({
-                                    "role": "user",
-                                    "content": format!(
-                                        "[ALERT from subagent {}] {}",
-                                        signal.agent_id, signal.message
-                                    )
-                                }));
-                            }
-                            AhaPriority::High => {
-                                ctx.messages.push(json!({
-                                    "role": "user",
-                                    "content": format!(
-                                        "[Signal from subagent {}] {}",
-                                        signal.agent_id, signal.message
-                                    )
-                                }));
-                            }
-                            AhaPriority::Normal => {
-                                // Normal signals are informational — logged only.
-                                debug!(
-                                    "Aha signal (normal) from {}: {}",
-                                    signal.agent_id, signal.message
-                                );
-                            }
-                        }
-                    }
+            let outcome = self.run_iteration(ctx, iteration).await;
+            match outcome {
+                IterationOutcome::Continue => continue,
+                IterationOutcome::Finished(content) => {
+                    ctx.final_content = content;
+                    break;
                 }
-            }
-
-            // --- Heartbeat: inject grounding message ---
-            if self.proprioception_config.enabled {
-                let state = self.system_state.load_full();
-                if system_state::should_ground(
-                    iteration,
-                    self.proprioception_config.grounding_interval,
-                    state.context_pressure,
-                ) {
-                    let grounding = system_state::format_grounding(&state);
-                    ctx.messages.push(json!({
-                        "role": "user",
-                        "content": grounding
-                    }));
-                }
-            }
-
-            ctx.flow.iterations_since_compaction += 1;
-
-            // Check if background compaction finished — swap in compacted messages.
-            if let Ok(mut guard) = ctx.compaction.slot.try_lock() {
-                if let Some(pending) = guard.take() {
-                    debug!(
-                        "Compaction swap: {} msgs -> {} compacted + {} new",
-                        pending.watermark,
-                        pending.result.messages.len(),
-                        ctx.messages.len().saturating_sub(pending.watermark)
-                    );
-                    apply_compaction_result(&mut ctx.messages, pending);
-                    // After compaction, all messages in the array are "new" from
-                    // the perspective of persistence (the session file was rebuilt).
-                    ctx.new_start = ctx.messages.len();
-                    ctx.flow.iterations_since_compaction = 0;
-                }
-            }
-
-            // Response boundary: suppress exec/write_file tools to force text output.
-            let boundary_active = ctx.flow.force_response
-                && ctx.core.provenance_config.enabled
-                && ctx.core.provenance_config.response_boundary;
-            if boundary_active {
-                // Use "user" role, not "system". The Anthropic OpenAI-compat
-                // endpoint strips mid-conversation system messages, which would
-                // leave the conversation ending with an assistant message and
-                // trigger a "does not support assistant message prefill" error.
-                let remaining = ctx.core.max_iterations.saturating_sub(iteration as u32 + 1);
-                let budget_note = if remaining <= 5 {
-                    format!(
-                        " [Budget: {}/{} iterations remaining — wrap up soon]",
-                        remaining, ctx.core.max_iterations
-                    )
-                } else {
-                    String::new()
-                };
-                ctx.messages.push(json!({
-                    "role": "user",
-                    "content": format!(
-                        "[system] You just executed a tool that modifies files or runs commands. \
-                         Report the result to the user before making additional tool calls.{budget_note}"
-                    )
-                }));
-                ctx.flow.force_response = false;
-            }
-
-            // Filter tool definitions to relevant tools.
-            // Local models get a minimal set to conserve context tokens.
-            let current_phase = self.system_state.load_full().task_phase;
-            let mut tool_defs = if ctx.core.is_local {
-                ctx.tools.get_local_definitions(&ctx.messages, &ctx.used_tools)
-            } else if self.proprioception_config.enabled
-                && self.proprioception_config.dynamic_tool_scoping
-            {
-                ctx.tools.get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
-            } else {
-                ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
-            };
-            if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
-                // Hard separation (local trio only): main model is conversation/orchestration only.
-                // Cloud providers handle tools natively and must never have them stripped.
-                tool_defs.clear();
-            }
-            if boundary_active {
-                tool_defs.retain(|def| {
-                    let name = def
-                        .pointer("/function/name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    name != "exec" && name != "write_file"
-                });
-            }
-            let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-                None
-            } else {
-                Some(&tool_defs)
-            };
-
-            // Trim messages to fit context budget.
-            let tool_def_tokens =
-                TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-            ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
-                &ctx.messages,
-                tool_def_tokens,
-                ctx.turn_count,
-                ctx.core.max_message_age_turns,
-            );
-
-            // Spawn background compaction when threshold exceeded.
-            if !ctx.compaction.in_flight.load(Ordering::Relaxed)
-                && ctx.core
-                    .compactor
-                    .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
-            {
-                let slot = ctx.compaction.slot.clone();
-                let in_flight = ctx.compaction.in_flight.clone();
-                let bg_messages = ctx.messages.clone();
-                let bg_core = ctx.core.clone();
-                let bg_session_key = ctx.session_key.clone();
-                let watermark = ctx.messages.len();
-                in_flight.store(true, Ordering::SeqCst);
-
-                let bg_proprio = self.proprioception_config.clone();
-                tokio::spawn(async move {
-                    let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                        bg_core
-                            .compactor
-                            .compact_gradient(
-                                &bg_messages,
-                                &bg_core.token_budget,
-                                0,
-                                bg_proprio.raw_window,
-                                bg_proprio.light_window,
-                            )
-                            .await
-                    } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                        let reader =
-                            crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                        bg_core
-                            .compactor
-                            .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
-                            .await
-                    } else {
-                        bg_core
-                            .compactor
-                            .compact(&bg_messages, &bg_core.token_budget, 0)
-                            .await
-                    };
-                    if bg_core.memory_enabled {
-                        if let Some(ref summary) = result.observation {
-                            bg_core
-                                .working_memory
-                                .update_from_compaction(&bg_session_key, summary);
-                        }
-                    }
-                    if result.messages.len() < bg_messages.len() {
-                        *slot.lock().await = Some(PendingCompaction { result, watermark });
-                    }
-                    in_flight.store(false, Ordering::SeqCst);
-                });
-            }
-
-            // Repair protocol violations before calling the LLM.
-            if ctx.core.is_local {
-                thread_repair::repair_for_local(&mut ctx.messages);
-            } else {
-                thread_repair::repair_messages(&mut ctx.messages);
-            }
-
-            // Pre-flight context size check: emergency trim if we're about to
-            // exceed the model's context window. The 95% threshold leaves room
-            // for the response tokens.
-            let estimated = TokenBudget::estimate_tokens(&ctx.messages);
-            let max_ctx = ctx.core.token_budget.max_context();
-            if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
-                warn!(
-                    "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
-                    estimated, max_ctx
-                );
-                // tool_def_tokens=0 is conservative (trims more aggressively).
-                ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
-                // Re-run repair after trim in case truncation broke protocol.
-                if ctx.core.is_local {
-                    thread_repair::repair_for_local(&mut ctx.messages);
-                } else {
-                    thread_repair::repair_messages(&mut ctx.messages);
-                }
-            }
-
-            // Router-first preflight for strict trio mode.
-            match crate::agent::router::router_preflight(ctx).await {
-                crate::agent::router::PreflightResult::Continue => continue,
-                crate::agent::router::PreflightResult::Break(msg) => {
+                IterationOutcome::Error(msg) => {
                     ctx.final_content = msg;
                     break;
                 }
-                crate::agent::router::PreflightResult::Passthrough => {}
-            }
-
-            // Adaptive max_tokens: size the response budget to the task.
-            let effective_max_tokens = {
-                let base = ctx.core.max_tokens;
-                // Check for /long override (temporary boost).
-                let had_long = counters.long_mode_turns
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    })
-                    .is_ok();
-                if had_long {
-                    base.max(8192)
-                } else {
-                    // Detect long-form triggers in the user message.
-                    let user_text = ctx.messages
-                        .last()
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let lower = user_text.to_lowercase();
-                    let is_long_form = lower.contains("explain in detail")
-                        || lower.contains("write a ")
-                        || lower.contains("create a script")
-                        || lower.contains("write code")
-                        || lower.contains("implement ")
-                        || lower.contains("full example")
-                        || lower.starts_with("write ")
-                        || user_text.len() > 500;
-                    // Count recent tool calls: if tool-heavy, use smaller budget.
-                    let recent_tool_calls = ctx.messages
-                        .iter()
-                        .rev()
-                        .take(6)
-                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-                        .count();
-                    if is_long_form {
-                        base.max(4096)
-                    } else if recent_tool_calls > 3 {
-                        base.min(1024).max(512)
-                    } else {
-                        base
-                    }
-                }
-            };
-
-            // Call LLM — streaming or blocking depending on mode.
-            let thinking_budget = {
-                let stored = counters.thinking_budget.load(Ordering::Relaxed);
-                if stored > 0 {
-                    // Small local models can burn the whole completion budget in reasoning.
-                    // Hard-cap explicit thinking to keep them action-oriented.
-                    if ctx.core.is_local && is_small_local_model(&ctx.core.model) {
-                        Some(stored.min(256))
-                    } else {
-                        Some(stored)
-                    }
-                } else {
-                    None
-                }
-            };
-            // Signal watchdog: LLM inference is active — skip health checks.
-            counters.inference_active.store(true, Ordering::Relaxed);
-
-            let mut response = if let Some(ref delta_tx) = ctx.text_delta_tx {
-                // Streaming path: forward text deltas as they arrive.
-                let mut stream = match ctx.core
-                    .provider
-                    .chat_stream(
-                        &ctx.messages,
-                        tool_defs_opt,
-                        Some(&ctx.core.model),
-                        effective_max_tokens,
-                        ctx.core.temperature,
-                        thinking_budget,
-                    )
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        counters.inference_active.store(false, Ordering::Relaxed);
-                        error!("LLM streaming call failed: {}", e);
-                        ctx.final_content = format!("I encountered an error: {}", e);
-                        break;
-                    }
-                };
-
-                let mut streamed_response = None;
-                let mut in_thinking = false;
-                let suppress_thinking = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = async {
-                            if let Some(ref token) = ctx.cancellation_token {
-                                token.cancelled().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        } => {
-                            // Cancelled — drop stream to signal provider task.
-                            drop(stream);
-                            break;
-                        }
-                        chunk = stream.rx.recv() => {
-                            match chunk {
-                                Some(StreamChunk::ThinkingDelta(delta)) => {
-                                    if suppress_thinking {
-                                        // Skip thinking tokens entirely (voice mode / /nothink)
-                                        continue;
-                                    }
-                                    // Render thinking tokens as dimmed text
-                                    if !in_thinking {
-                                        in_thinking = true;
-                                        let _ = delta_tx.send("\x1b[90m\u{1f9e0} \x1b[2m".to_string());
-                                    }
-                                    let _ = delta_tx.send(delta);
-                                }
-                                Some(StreamChunk::TextDelta(delta)) => {
-                                    if in_thinking {
-                                        in_thinking = false;
-                                        let _ = delta_tx.send("\x1b[0m\n\n".to_string());
-                                    }
-                                    ctx.flow.content_was_streamed = true;
-                                    let _ = delta_tx.send(delta);
-                                }
-                                Some(StreamChunk::Done(resp)) => {
-                                    if in_thinking {
-                                        let _ = delta_tx.send("\x1b[0m\n\n".to_string());
-                                    }
-                                    streamed_response = Some(resp);
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-
-                match streamed_response {
-                    Some(r) => r,
-                    None => {
-                        counters.inference_active.store(false, Ordering::Relaxed);
-                        // Stream ended without Done — either cancelled or genuine error.
-                        if ctx.cancellation_token
-                            .as_ref()
-                            .map_or(false, |t| t.is_cancelled())
-                        {
-                            // Cancelled mid-stream — exit cleanly.
-                            break;
-                        }
-                        error!("LLM stream ended without Done");
-                        ctx.final_content = "I encountered a streaming error.".to_string();
-                        break;
-                    }
-                }
-            } else {
-                // Blocking path: single request/response.
-                match ctx.core
-                    .provider
-                    .chat(
-                        &ctx.messages,
-                        tool_defs_opt,
-                        Some(&ctx.core.model),
-                        effective_max_tokens,
-                        ctx.core.temperature,
-                        thinking_budget,
-                    )
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        counters.inference_active.store(false, Ordering::Relaxed);
-                        error!("LLM call failed: {}", e);
-                        ctx.final_content = format!("I encountered an error: {}", e);
-                        break;
-                    }
-                }
-            };
-
-            // Inference complete — allow watchdog health checks again.
-            counters.inference_active.store(false, Ordering::Relaxed);
-
-            // --- Response Validation: detect hallucinated tool calls ---
-            let content_str = response.content.as_deref().unwrap_or("");
-            let tool_calls_as_maps: Vec<HashMap<String, Value>> = response
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let mut map = HashMap::new();
-                    map.insert("id".to_string(), Value::String(tc.id.clone()));
-                    map.insert("name".to_string(), Value::String(tc.name.clone()));
-                    map.insert(
-                        "arguments".to_string(),
-                        Value::Object(tc.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                    );
-                    map
-                })
-                .collect();
-
-            if let Err(validation_err) = validation::validate_response(content_str, &tool_calls_as_maps) {
-                warn!("Response validation failed: {:?}", validation_err);
-                if !response.has_tool_calls() {
-                    let hint = validation::generate_retry_prompt(&validation_err, 1);
-                    ctx.messages.push(json!({
-                        "role": "assistant",
-                        "content": content_str
-                    }));
-                    ctx.messages.push(json!({
-                        "role": "user",
-                        "content": hint
-                    }));
-                    debug!("Injected validation retry hint");
-                    continue;
-                }
-            }
-
-            // Rescue pass: if local model consumed completion on reasoning and produced no
-            // visible answer, force one concise no-thinking completion once.
-            let empty_visible = response
-                .content
-                .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true);
-            if ctx.core.is_local
-                && !response.has_tool_calls()
-                && empty_visible
-                && response.finish_reason == "length"
-                && !ctx.flow.forced_finalize_attempted
-            {
-                ctx.flow.forced_finalize_attempted = true;
-                let rescue_tokens = effective_max_tokens.min(384).max(128);
-                let mut rescue_messages = ctx.messages.clone();
-                rescue_messages.push(json!({
-                    "role": "user",
-                    "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
-                }));
-                counters.inference_active.store(true, Ordering::Relaxed);
-                match ctx.core
-                    .provider
-                    .chat(
-                        &rescue_messages,
-                        None,
-                        Some(&ctx.core.model),
-                        rescue_tokens,
-                        0.2,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(r) => {
-                        response = r;
-                    }
-                    Err(e) => {
-                        warn!("Finalize rescue call failed: {}", e);
-                    }
-                }
-                counters.inference_active.store(false, Ordering::Relaxed);
-            }
-
-            // Check for LLM provider errors before processing the response.
-            if let Some(err_msg) = response.error_detail() {
-                error!("LLM provider error: {}", err_msg);
-
-                // In local mode, check if the server is still alive.
-                if ctx.core.is_local {
-                    if let Some(base) = ctx.core.provider.get_api_base() {
-                        if !crate::server::check_health(base).await {
-                            error!("Local LLM server is down!");
-                            ctx.final_content = "[LLM Error] Local server crashed. Use /restart or /local to recover.".into();
-                            break;
-                        }
-                    }
-                }
-
-                ctx.final_content = format!("[LLM Error] {}", err_msg);
-                break;
-            }
-
-            // Token telemetry: log actual vs estimated usage.
-            {
-                let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
-                let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
-                let actual_completion = response
-                    .usage
-                    .get("completion_tokens")
-                    .copied()
-                    .unwrap_or(-1);
-                info!(
-                    "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}, max_tokens={}",
-                    estimated_prompt, actual_prompt, actual_completion, effective_max_tokens
-                );
-                // Store actual tokens for /status display.
-                if actual_prompt > 0 {
-                    counters
-                        .last_actual_prompt_tokens
-                        .store(actual_prompt as u64, Ordering::Relaxed);
-                }
-                if actual_completion > 0 {
-                    counters
-                        .last_actual_completion_tokens
-                        .store(actual_completion as u64, Ordering::Relaxed);
-                }
-                counters
-                    .last_estimated_prompt_tokens
-                    .store(estimated_prompt as u64, Ordering::Relaxed);
-            }
-
-            if response.has_tool_calls() {
-                let routed_tool_calls = match crate::agent::router::route_tool_calls(
-                    ctx,
-                    response.content.as_deref(),
-                    response.tool_calls.clone(),
-                )
-                .await
-                {
-                    crate::agent::router::RouteResult::Continue => continue,
-                    crate::agent::router::RouteResult::Break(msg) => {
-                        ctx.final_content = msg;
-                        break;
-                    }
-                    crate::agent::router::RouteResult::Execute(calls) => calls,
-                };
-
-                // Context pressure check: if high, log a warning. The correct
-                // response is compaction, NOT spawning the main model as its
-                // own tool runner (which doubles cost for no benefit).
-                let context_tokens = TokenBudget::estimate_tokens(&ctx.messages);
-                let max_tokens = ctx.core.token_budget.max_context();
-                let pressure = if max_tokens > 0 {
-                    context_tokens as f64 / max_tokens as f64
-                } else {
-                    0.0
-                };
-                if pressure > 0.7 && !ctx.core.tool_delegation_config.enabled {
-                    debug!(
-                        "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
-                        pressure * 100.0,
-                    );
-                }
-
-                // Check if we should delegate to the tool runner.
-                // Skip delegation if the provider was previously marked dead.
-                let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
-                // Periodically re-probe: every 10 inline calls, try delegation
-                // once in case the server recovered (e.g. user restarted it).
-                if !delegation_alive && ctx.core.tool_delegation_config.enabled {
-                    let retries = counters
-                        .delegation_retry_counter
-                        .fetch_add(1, Ordering::Relaxed);
-                    if retries > 0 && retries % 10 == 0 {
-                        info!(
-                            "Re-probing delegation provider (attempt {} since failure)",
-                            retries
-                        );
-                        delegation_alive = true; // try this one time
-                    } else {
-                        debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
-                    }
-                }
-                let should_delegate = ctx.core.tool_delegation_config.enabled && delegation_alive;
-                // Resolve provider+model from explicit config.
-                let delegation_provider = ctx.core.tool_runner_provider.clone();
-                let delegation_model = ctx.core.tool_runner_model.clone();
-
-                if should_delegate {
-                    if crate::agent::tool_engine::execute_tools_delegated(
-                        ctx,
-                        &counters,
-                        &routed_tool_calls,
-                        &response,
-                        &delegation_provider,
-                        &delegation_model,
-                    )
-                    .await
-                    {
-                        // Delegation handled execution — continue the main loop.
-                        continue;
-                    }
-                }
-
-                // Inline path (default, unchanged): execute tools directly.
-                crate::agent::tool_engine::execute_tools_inline(
-                    ctx,
-                    &routed_tool_calls,
-                    &response,
-                )
-                .await;
-
-                // Local models via --jinja require strict user/assistant alternation.
-                // Tool results are folded into user messages by
-                // repair_for_strict_alternation() at the top of the loop.
-                // Do NOT add extra user continuation — it would create
-                // consecutive user messages.
-
-                // Check for priority user messages injected mid-task.
-                if let Some(ref mut rx) = ctx.priority_rx {
-                    if let Ok(priority_msg) = rx.try_recv() {
-                        ctx.messages.push(json!({
-                            "role": "user",
-                            "content": format!("[PRIORITY USER MESSAGE]: {}", priority_msg)
-                        }));
-                        // Continue to next LLM call — let the model see and adjust.
-                    }
-                }
-
-                // Check cancellation between tool call iterations.
-                if ctx.cancellation_token
-                    .as_ref()
-                    .map_or(false, |t| t.is_cancelled())
-                {
-                    break;
-                }
-            } else {
-                // No tool calls -- the agent is done.
-                ctx.final_content = response.content.unwrap_or_default();
-                if ctx.final_content.trim().is_empty() {
-                    ctx.final_content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
-                        .to_string();
-                }
-                break;
             }
         }
 
@@ -1101,6 +473,804 @@ impl AgentLoopShared {
                 let _ = tx.send(ctx.final_content.clone());
             }
         }
+    }
+
+    /// Drive a single iteration through the phase state machine.
+    async fn run_iteration(&self, ctx: &mut TurnContext, iteration: u32) -> IterationOutcome {
+        let mut phase = IterationPhase::Preparing;
+        loop {
+            match match phase {
+                IterationPhase::Preparing =>
+                    self.step_prepare(ctx, iteration).await,
+                IterationPhase::PreCall =>
+                    self.step_pre_call(ctx, iteration).await,
+                IterationPhase::Calling { tool_defs, max_tokens } =>
+                    self.step_call_llm(ctx, tool_defs, max_tokens).await,
+                IterationPhase::Processing { response } =>
+                    self.step_process_response(ctx, response).await,
+                IterationPhase::Executing { response, tool_calls } =>
+                    self.step_execute_tools(ctx, response, tool_calls).await,
+            } {
+                StepResult::Next(next_phase) => phase = next_phase,
+                StepResult::Done(outcome) => return outcome,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1: Preparing — pre-LLM housekeeping
+    // -----------------------------------------------------------------------
+
+    /// Context hygiene, proprioception, aha channel, heartbeat,
+    /// compaction-check, iteration counter.
+    async fn step_prepare(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
+        let counters = &self.core_handle.counters;
+
+        // --- Context Hygiene: clean up conversation history ---
+        context_hygiene::hygiene_pipeline(&mut ctx.messages);
+
+        // --- Proprioception: update SystemState ---
+        if self.proprioception_config.enabled {
+            let tools_list: Vec<String> = if let Ok(guard) = counters.last_tools_called.lock() {
+                guard.clone()
+            } else {
+                Vec::new()
+            };
+            let tool_refs: Vec<&str> = tools_list.iter().map(|s| s.as_str()).collect();
+            let phase = system_state::infer_phase(&tool_refs);
+            let active_subs = self.subagents.list_running().await.len().min(255) as u8;
+            let state = SystemState::snapshot(
+                phase,
+                counters.last_context_used.load(Ordering::Relaxed),
+                counters.last_context_max.load(Ordering::Relaxed),
+                ctx.turn_count,
+                ctx.messages.len() as u64,
+                ctx.flow.iterations_since_compaction,
+                counters.delegation_healthy.load(Ordering::Relaxed),
+                0,    // recent_tool_failures — not tracked yet
+                true, // last_tool_ok
+                active_subs,
+                0, // pending_aha_signals filled below
+            );
+            self.system_state.store(Arc::new(state));
+        }
+
+        // --- Aha Channel: poll priority signals from subagents ---
+        if self.proprioception_config.enabled && self.proprioception_config.aha_channel {
+            if let Ok(mut rx) = self.aha_rx.try_lock() {
+                while let Ok(signal) = rx.try_recv() {
+                    match signal.priority {
+                        AhaPriority::Critical => {
+                            ctx.messages.push(json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[ALERT from subagent {}] {}",
+                                    signal.agent_id, signal.message
+                                )
+                            }));
+                        }
+                        AhaPriority::High => {
+                            ctx.messages.push(json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[Signal from subagent {}] {}",
+                                    signal.agent_id, signal.message
+                                )
+                            }));
+                        }
+                        AhaPriority::Normal => {
+                            // Normal signals are informational — logged only.
+                            debug!(
+                                "Aha signal (normal) from {}: {}",
+                                signal.agent_id, signal.message
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Heartbeat: inject grounding message ---
+        if self.proprioception_config.enabled {
+            let state = self.system_state.load_full();
+            if system_state::should_ground(
+                iteration,
+                self.proprioception_config.grounding_interval,
+                state.context_pressure,
+            ) {
+                let grounding = system_state::format_grounding(&state);
+                ctx.messages.push(json!({
+                    "role": "user",
+                    "content": grounding
+                }));
+            }
+        }
+
+        ctx.flow.iterations_since_compaction += 1;
+
+        // Check if background compaction finished — swap in compacted messages.
+        if let Ok(mut guard) = ctx.compaction.slot.try_lock() {
+            if let Some(pending) = guard.take() {
+                debug!(
+                    "Compaction swap: {} msgs -> {} compacted + {} new",
+                    pending.watermark,
+                    pending.result.messages.len(),
+                    ctx.messages.len().saturating_sub(pending.watermark)
+                );
+                apply_compaction_result(&mut ctx.messages, pending);
+                // After compaction, all messages in the array are "new" from
+                // the perspective of persistence (the session file was rebuilt).
+                ctx.new_start = ctx.messages.len();
+                ctx.flow.iterations_since_compaction = 0;
+            }
+        }
+
+        StepResult::Next(IterationPhase::PreCall)
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: PreCall — build tool defs, trim, compaction, repair, preflight
+    // -----------------------------------------------------------------------
+
+    /// Response boundary injection, tool definition filtering, message
+    /// trimming, background compaction spawn, protocol repair, pre-flight
+    /// context size check, router preflight, adaptive max_tokens.
+    async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
+        let counters = &self.core_handle.counters;
+
+        // Response boundary: suppress exec/write_file tools to force text output.
+        let boundary_active = ctx.flow.force_response
+            && ctx.core.provenance_config.enabled
+            && ctx.core.provenance_config.response_boundary;
+        if boundary_active {
+            // Use "user" role, not "system". The Anthropic OpenAI-compat
+            // endpoint strips mid-conversation system messages, which would
+            // leave the conversation ending with an assistant message and
+            // trigger a "does not support assistant message prefill" error.
+            let remaining = ctx.core.max_iterations.saturating_sub(iteration as u32 + 1);
+            let budget_note = if remaining <= 5 {
+                format!(
+                    " [Budget: {}/{} iterations remaining — wrap up soon]",
+                    remaining, ctx.core.max_iterations
+                )
+            } else {
+                String::new()
+            };
+            ctx.messages.push(json!({
+                "role": "user",
+                "content": format!(
+                    "[system] You just executed a tool that modifies files or runs commands. \
+                     Report the result to the user before making additional tool calls.{budget_note}"
+                )
+            }));
+            ctx.flow.force_response = false;
+        }
+
+        // Filter tool definitions to relevant tools.
+        // Local models get a minimal set to conserve context tokens.
+        let current_phase = self.system_state.load_full().task_phase;
+        let mut tool_defs = if ctx.core.is_local {
+            ctx.tools.get_local_definitions(&ctx.messages, &ctx.used_tools)
+        } else if self.proprioception_config.enabled
+            && self.proprioception_config.dynamic_tool_scoping
+        {
+            ctx.tools.get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
+        } else {
+            ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
+        };
+        if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
+            // Hard separation (local trio only): main model is conversation/orchestration only.
+            // Cloud providers handle tools natively and must never have them stripped.
+            tool_defs.clear();
+        }
+        if boundary_active {
+            tool_defs.retain(|def| {
+                let name = def
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                name != "exec" && name != "write_file"
+            });
+        }
+        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(&tool_defs)
+        };
+
+        // Trim messages to fit context budget.
+        let tool_def_tokens =
+            TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
+            &ctx.messages,
+            tool_def_tokens,
+            ctx.turn_count,
+            ctx.core.max_message_age_turns,
+        );
+
+        // Spawn background compaction when threshold exceeded.
+        if !ctx.compaction.in_flight.load(Ordering::Relaxed)
+            && ctx.core
+                .compactor
+                .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
+        {
+            let slot = ctx.compaction.slot.clone();
+            let in_flight = ctx.compaction.in_flight.clone();
+            let bg_messages = ctx.messages.clone();
+            let bg_core = ctx.core.clone();
+            let bg_session_key = ctx.session_key.clone();
+            let watermark = ctx.messages.len();
+            in_flight.store(true, Ordering::SeqCst);
+
+            let bg_proprio = self.proprioception_config.clone();
+            tokio::spawn(async move {
+                let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
+                    bg_core
+                        .compactor
+                        .compact_gradient(
+                            &bg_messages,
+                            &bg_core.token_budget,
+                            0,
+                            bg_proprio.raw_window,
+                            bg_proprio.light_window,
+                        )
+                        .await
+                } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
+                    let reader =
+                        crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                    bg_core
+                        .compactor
+                        .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
+                        .await
+                } else {
+                    bg_core
+                        .compactor
+                        .compact(&bg_messages, &bg_core.token_budget, 0)
+                        .await
+                };
+                if bg_core.memory_enabled {
+                    if let Some(ref summary) = result.observation {
+                        bg_core
+                            .working_memory
+                            .update_from_compaction(&bg_session_key, summary);
+                    }
+                }
+                if result.messages.len() < bg_messages.len() {
+                    *slot.lock().await = Some(PendingCompaction { result, watermark });
+                }
+                in_flight.store(false, Ordering::SeqCst);
+            });
+        }
+
+        // Repair protocol violations before calling the LLM.
+        if ctx.core.is_local {
+            thread_repair::repair_for_local(&mut ctx.messages);
+        } else {
+            thread_repair::repair_messages(&mut ctx.messages);
+        }
+
+        // Pre-flight context size check: emergency trim if we're about to
+        // exceed the model's context window. The 95% threshold leaves room
+        // for the response tokens.
+        let estimated = TokenBudget::estimate_tokens(&ctx.messages);
+        let max_ctx = ctx.core.token_budget.max_context();
+        if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
+            warn!(
+                "Pre-flight check: {}tok > 95% of {}tok — emergency trim",
+                estimated, max_ctx
+            );
+            // tool_def_tokens=0 is conservative (trims more aggressively).
+            ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
+            // Re-run repair after trim in case truncation broke protocol.
+            if ctx.core.is_local {
+                thread_repair::repair_for_local(&mut ctx.messages);
+            } else {
+                thread_repair::repair_messages(&mut ctx.messages);
+            }
+        }
+
+        // Router-first preflight for strict trio mode.
+        match crate::agent::router::router_preflight(ctx).await {
+            crate::agent::router::PreflightResult::Continue => {
+                return StepResult::Done(IterationOutcome::Continue);
+            }
+            crate::agent::router::PreflightResult::Break(msg) => {
+                return StepResult::Done(IterationOutcome::Finished(msg));
+            }
+            crate::agent::router::PreflightResult::Passthrough => {}
+        }
+
+        // Adaptive max_tokens: size the response budget to the task.
+        let effective_max_tokens = {
+            let base = ctx.core.max_tokens;
+            // Check for /long override (temporary boost).
+            let had_long = counters.long_mode_turns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v > 0 { Some(v - 1) } else { None }
+                })
+                .is_ok();
+            if had_long {
+                base.max(8192)
+            } else {
+                // Detect long-form triggers in the user message.
+                let user_text = ctx.messages
+                    .last()
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let lower = user_text.to_lowercase();
+                let is_long_form = lower.contains("explain in detail")
+                    || lower.contains("write a ")
+                    || lower.contains("create a script")
+                    || lower.contains("write code")
+                    || lower.contains("implement ")
+                    || lower.contains("full example")
+                    || lower.starts_with("write ")
+                    || user_text.len() > 500;
+                // Count recent tool calls: if tool-heavy, use smaller budget.
+                let recent_tool_calls = ctx.messages
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                    .count();
+                if is_long_form {
+                    base.max(4096)
+                } else if recent_tool_calls > 3 {
+                    base.min(1024).max(512)
+                } else {
+                    base
+                }
+            }
+        };
+
+        StepResult::Next(IterationPhase::Calling {
+            tool_defs,
+            max_tokens: effective_max_tokens,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3: Calling — invoke the LLM (streaming or blocking)
+    // -----------------------------------------------------------------------
+
+    /// Thinking budget calculation, inference_active flag, streaming path
+    /// (with cancellation support) or blocking path.
+    async fn step_call_llm(
+        &self,
+        ctx: &mut TurnContext,
+        tool_defs: Vec<Value>,
+        max_tokens: u32,
+    ) -> StepResult {
+        let counters = &self.core_handle.counters;
+        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(&tool_defs)
+        };
+
+        let thinking_budget = {
+            let stored = counters.thinking_budget.load(Ordering::Relaxed);
+            if stored > 0 {
+                // Small local models can burn the whole completion budget in reasoning.
+                // Hard-cap explicit thinking to keep them action-oriented.
+                if ctx.core.is_local && is_small_local_model(&ctx.core.model) {
+                    Some(stored.min(256))
+                } else {
+                    Some(stored)
+                }
+            } else {
+                None
+            }
+        };
+        // Signal watchdog: LLM inference is active — skip health checks.
+        counters.inference_active.store(true, Ordering::Relaxed);
+
+        let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
+            // Streaming path: forward text deltas as they arrive.
+            let mut stream = match ctx.core
+                .provider
+                .chat_stream(
+                    &ctx.messages,
+                    tool_defs_opt,
+                    Some(&ctx.core.model),
+                    max_tokens,
+                    ctx.core.temperature,
+                    thinking_budget,
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    counters.inference_active.store(false, Ordering::Relaxed);
+                    error!("LLM streaming call failed: {}", e);
+                    return StepResult::Done(IterationOutcome::Error(
+                        format!("I encountered an error: {}", e),
+                    ));
+                }
+            };
+
+            let mut streamed_response = None;
+            let mut in_thinking = false;
+            let suppress_thinking = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        if let Some(ref token) = ctx.cancellation_token {
+                            token.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        // Cancelled — drop stream to signal provider task.
+                        drop(stream);
+                        break;
+                    }
+                    chunk = stream.rx.recv() => {
+                        match chunk {
+                            Some(StreamChunk::ThinkingDelta(delta)) => {
+                                if suppress_thinking {
+                                    // Skip thinking tokens entirely (voice mode / /nothink)
+                                    continue;
+                                }
+                                // Render thinking tokens as dimmed text
+                                if !in_thinking {
+                                    in_thinking = true;
+                                    let _ = delta_tx.send("\x1b[90m\u{1f9e0} \x1b[2m".to_string());
+                                }
+                                let _ = delta_tx.send(delta);
+                            }
+                            Some(StreamChunk::TextDelta(delta)) => {
+                                if in_thinking {
+                                    in_thinking = false;
+                                    let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                                }
+                                ctx.flow.content_was_streamed = true;
+                                let _ = delta_tx.send(delta);
+                            }
+                            Some(StreamChunk::Done(resp)) => {
+                                if in_thinking {
+                                    let _ = delta_tx.send("\x1b[0m\n\n".to_string());
+                                }
+                                streamed_response = Some(resp);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+
+            match streamed_response {
+                Some(r) => r,
+                None => {
+                    counters.inference_active.store(false, Ordering::Relaxed);
+                    // Stream ended without Done — either cancelled or genuine error.
+                    if ctx.cancellation_token
+                        .as_ref()
+                        .map_or(false, |t| t.is_cancelled())
+                    {
+                        // Cancelled mid-stream — exit cleanly.
+                        return StepResult::Done(IterationOutcome::Finished(String::new()));
+                    }
+                    error!("LLM stream ended without Done");
+                    return StepResult::Done(IterationOutcome::Error(
+                        "I encountered a streaming error.".to_string(),
+                    ));
+                }
+            }
+        } else {
+            // Blocking path: single request/response.
+            match ctx.core
+                .provider
+                .chat(
+                    &ctx.messages,
+                    tool_defs_opt,
+                    Some(&ctx.core.model),
+                    max_tokens,
+                    ctx.core.temperature,
+                    thinking_budget,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    counters.inference_active.store(false, Ordering::Relaxed);
+                    error!("LLM call failed: {}", e);
+                    return StepResult::Done(IterationOutcome::Error(
+                        format!("I encountered an error: {}", e),
+                    ));
+                }
+            }
+        };
+
+        // Inference complete — allow watchdog health checks again.
+        counters.inference_active.store(false, Ordering::Relaxed);
+
+        StepResult::Next(IterationPhase::Processing { response })
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 4: Processing — validate response, rescue pass, error check, telemetry
+    // -----------------------------------------------------------------------
+
+    /// Response validation (hallucinated tool calls), rescue pass for empty
+    /// local model responses, provider error check, token telemetry.
+    async fn step_process_response(
+        &self,
+        ctx: &mut TurnContext,
+        mut response: LLMResponse,
+    ) -> StepResult {
+        let counters = &self.core_handle.counters;
+
+        // --- Response Validation: detect hallucinated tool calls ---
+        let content_str = response.content.as_deref().unwrap_or("");
+        let tool_calls_as_maps: Vec<HashMap<String, Value>> = response
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let mut map = HashMap::new();
+                map.insert("id".to_string(), Value::String(tc.id.clone()));
+                map.insert("name".to_string(), Value::String(tc.name.clone()));
+                map.insert(
+                    "arguments".to_string(),
+                    Value::Object(tc.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                );
+                map
+            })
+            .collect();
+
+        if let Err(validation_err) = validation::validate_response(content_str, &tool_calls_as_maps) {
+            warn!("Response validation failed: {:?}", validation_err);
+            if !response.has_tool_calls() {
+                let hint = validation::generate_retry_prompt(&validation_err, 1);
+                ctx.messages.push(json!({
+                    "role": "assistant",
+                    "content": content_str
+                }));
+                ctx.messages.push(json!({
+                    "role": "user",
+                    "content": hint
+                }));
+                debug!("Injected validation retry hint");
+                return StepResult::Done(IterationOutcome::Continue);
+            }
+        }
+
+        // Rescue pass: if local model consumed completion on reasoning and produced no
+        // visible answer, force one concise no-thinking completion once.
+        let empty_visible = response
+            .content
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        if ctx.core.is_local
+            && !response.has_tool_calls()
+            && empty_visible
+            && response.finish_reason == "length"
+            && !ctx.flow.forced_finalize_attempted
+        {
+            ctx.flow.forced_finalize_attempted = true;
+            // Use the same max_tokens cap the original code used (from effective_max_tokens
+            // passed through the response, but we only need rescue_tokens here).
+            let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
+            let mut rescue_messages = ctx.messages.clone();
+            rescue_messages.push(json!({
+                "role": "user",
+                "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
+            }));
+            counters.inference_active.store(true, Ordering::Relaxed);
+            match ctx.core
+                .provider
+                .chat(
+                    &rescue_messages,
+                    None,
+                    Some(&ctx.core.model),
+                    rescue_tokens,
+                    0.2,
+                    None,
+                )
+                .await
+            {
+                Ok(r) => {
+                    response = r;
+                }
+                Err(e) => {
+                    warn!("Finalize rescue call failed: {}", e);
+                }
+            }
+            counters.inference_active.store(false, Ordering::Relaxed);
+        }
+
+        // Check for LLM provider errors before processing the response.
+        if let Some(err_msg) = response.error_detail() {
+            error!("LLM provider error: {}", err_msg);
+
+            // In local mode, check if the server is still alive.
+            if ctx.core.is_local {
+                if let Some(base) = ctx.core.provider.get_api_base() {
+                    if !crate::server::check_health(base).await {
+                        error!("Local LLM server is down!");
+                        return StepResult::Done(IterationOutcome::Error(
+                            "[LLM Error] Local server crashed. Use /restart or /local to recover.".into(),
+                        ));
+                    }
+                }
+            }
+
+            return StepResult::Done(IterationOutcome::Error(
+                format!("[LLM Error] {}", err_msg),
+            ));
+        }
+
+        // Token telemetry: log actual vs estimated usage.
+        {
+            let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
+            let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
+            let actual_completion = response
+                .usage
+                .get("completion_tokens")
+                .copied()
+                .unwrap_or(-1);
+            // Note: max_tokens is not available here (it was consumed by the Calling phase).
+            // We log what we can — the actual usage is the important part.
+            info!(
+                "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}",
+                estimated_prompt, actual_prompt, actual_completion
+            );
+            // Store actual tokens for /status display.
+            if actual_prompt > 0 {
+                counters
+                    .last_actual_prompt_tokens
+                    .store(actual_prompt as u64, Ordering::Relaxed);
+            }
+            if actual_completion > 0 {
+                counters
+                    .last_actual_completion_tokens
+                    .store(actual_completion as u64, Ordering::Relaxed);
+            }
+            counters
+                .last_estimated_prompt_tokens
+                .store(estimated_prompt as u64, Ordering::Relaxed);
+        }
+
+        // Branch: tool calls → Executing, no tool calls → finished.
+        if response.has_tool_calls() {
+            let tool_calls = response.tool_calls.clone();
+            StepResult::Next(IterationPhase::Executing { response, tool_calls })
+        } else {
+            let mut content = response.content.unwrap_or_default();
+            if content.trim().is_empty() {
+                content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
+                    .to_string();
+            }
+            StepResult::Done(IterationOutcome::Finished(content))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5: Executing — route and execute tool calls
+    // -----------------------------------------------------------------------
+
+    /// Route tool calls through the router, check context pressure,
+    /// delegation decision + execute, inline fallback, priority message
+    /// check, cancellation check.
+    async fn step_execute_tools(
+        &self,
+        ctx: &mut TurnContext,
+        response: LLMResponse,
+        _tool_calls: Vec<ToolCallRequest>,
+    ) -> StepResult {
+        let counters = &self.core_handle.counters;
+
+        let routed_tool_calls = match crate::agent::router::route_tool_calls(
+            ctx,
+            response.content.as_deref(),
+            response.tool_calls.clone(),
+        )
+        .await
+        {
+            crate::agent::router::RouteResult::Continue => {
+                return StepResult::Done(IterationOutcome::Continue);
+            }
+            crate::agent::router::RouteResult::Break(msg) => {
+                return StepResult::Done(IterationOutcome::Finished(msg));
+            }
+            crate::agent::router::RouteResult::Execute(calls) => calls,
+        };
+
+        // Context pressure check: if high, log a warning. The correct
+        // response is compaction, NOT spawning the main model as its
+        // own tool runner (which doubles cost for no benefit).
+        let context_tokens = TokenBudget::estimate_tokens(&ctx.messages);
+        let max_tokens = ctx.core.token_budget.max_context();
+        let pressure = if max_tokens > 0 {
+            context_tokens as f64 / max_tokens as f64
+        } else {
+            0.0
+        };
+        if pressure > 0.7 && !ctx.core.tool_delegation_config.enabled {
+            debug!(
+                "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
+                pressure * 100.0,
+            );
+        }
+
+        // Check if we should delegate to the tool runner.
+        // Skip delegation if the provider was previously marked dead.
+        let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
+        // Periodically re-probe: every 10 inline calls, try delegation
+        // once in case the server recovered (e.g. user restarted it).
+        if !delegation_alive && ctx.core.tool_delegation_config.enabled {
+            let retries = counters
+                .delegation_retry_counter
+                .fetch_add(1, Ordering::Relaxed);
+            if retries > 0 && retries % 10 == 0 {
+                info!(
+                    "Re-probing delegation provider (attempt {} since failure)",
+                    retries
+                );
+                delegation_alive = true; // try this one time
+            } else {
+                debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
+            }
+        }
+        let should_delegate = ctx.core.tool_delegation_config.enabled && delegation_alive;
+        // Resolve provider+model from explicit config.
+        let delegation_provider = ctx.core.tool_runner_provider.clone();
+        let delegation_model = ctx.core.tool_runner_model.clone();
+
+        if should_delegate {
+            if crate::agent::tool_engine::execute_tools_delegated(
+                ctx,
+                counters,
+                &routed_tool_calls,
+                &response,
+                &delegation_provider,
+                &delegation_model,
+            )
+            .await
+            {
+                // Delegation handled execution — continue the main loop.
+                return StepResult::Done(IterationOutcome::Continue);
+            }
+        }
+
+        // Inline path (default, unchanged): execute tools directly.
+        crate::agent::tool_engine::execute_tools_inline(
+            ctx,
+            &routed_tool_calls,
+            &response,
+        )
+        .await;
+
+        // Local models via --jinja require strict user/assistant alternation.
+        // Tool results are folded into user messages by
+        // repair_for_strict_alternation() at the top of the loop.
+        // Do NOT add extra user continuation — it would create
+        // consecutive user messages.
+
+        // Check for priority user messages injected mid-task.
+        if let Some(ref mut rx) = ctx.priority_rx {
+            if let Ok(priority_msg) = rx.try_recv() {
+                ctx.messages.push(json!({
+                    "role": "user",
+                    "content": format!("[PRIORITY USER MESSAGE]: {}", priority_msg)
+                }));
+                // Continue to next LLM call — let the model see and adjust.
+            }
+        }
+
+        // Check cancellation between tool call iterations.
+        if ctx.cancellation_token
+            .as_ref()
+            .map_or(false, |t| t.is_cancelled())
+        {
+            return StepResult::Done(IterationOutcome::Finished(String::new()));
+        }
+
+        StepResult::Done(IterationOutcome::Continue)
     }
 
     /// Phase 3: Finalize the response — persist session, build outbound message.
