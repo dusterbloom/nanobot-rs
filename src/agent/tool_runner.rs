@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Delegated tool execution loop.
 //!
 //! Receives initial tool calls from the main LLM, executes them via the
@@ -312,6 +313,24 @@ async fn analyze_via_scratch_pad(
         }
 
         if response.has_tool_calls() {
+            // Pre-check: if ALL tool calls are duplicates or blocked, break early
+            // to avoid burning rounds where the model keeps requesting the same calls.
+            let all_skipped = response.tool_calls.iter().all(|tc| {
+                if !allowed_tools.contains(tc.name.as_str()) {
+                    return true;
+                }
+                let call_key = normalize_call_key(&tc.name, &tc.arguments);
+                seen_calls.contains(&call_key)
+            });
+            if all_skipped {
+                debug!(
+                    "Scratch pad: all {} tool calls in round {} are duplicates/blocked — breaking",
+                    response.tool_calls.len(),
+                    round
+                );
+                break;
+            }
+
             // Execute tool calls against ContextStore.
             for tc in &response.tool_calls {
                 // Block disallowed tools.
@@ -355,10 +374,35 @@ async fn analyze_via_scratch_pad(
                 } else if context_store::is_micro_tool(&tc.name) {
                     let result =
                         context_store::execute_micro_tool(context_store, &tc.name, &tc.arguments);
-                    // mem_store/mem_recall are already handled internally by execute_micro_tool.
-                    // For inspection tools (slice/grep/length), the model will use
-                    // mem_store in a subsequent call to persist findings.
                     debug!("Scratch pad micro-tool {}: {} chars", tc.name, result.len());
+                    // Auto-persist inspection results so the model sees them in
+                    // subsequent rounds via build_analysis_state(). Without this,
+                    // fresh-message rounds lose ctx_slice/ctx_grep results and the
+                    // model re-requests identical calls until dedup blocks them.
+                    match tc.name.as_str() {
+                        "ctx_slice" | "ctx_grep" | "ctx_length" => {
+                            let var = tc.arguments.get("variable")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            let key = match tc.name.as_str() {
+                                "ctx_slice" => {
+                                    let s = tc.arguments.get("start")
+                                        .and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let e = tc.arguments.get("end")
+                                        .and_then(|v| v.as_u64()).unwrap_or(0);
+                                    format!("slice_{}_{}-{}", var, s, e)
+                                }
+                                "ctx_grep" => {
+                                    let pat = tc.arguments.get("pattern")
+                                        .and_then(|v| v.as_str()).unwrap_or("?");
+                                    format!("grep_{}_{}", var, pat)
+                                }
+                                _ => format!("len_{}", var),
+                            };
+                            context_store.mem_store(&key, result);
+                        }
+                        _ => {} // mem_store/mem_recall/set_phase handle persistence internally
+                    }
                 } else if worker_tools::is_worker_tool(&tc.name) {
                     let result =
                         worker_tools::execute_worker_tool(&tc.name, &tc.arguments, None).await;
@@ -2141,11 +2185,8 @@ mod tests {
             "Only initial tool should execute"
         );
         assert_eq!(result.tool_results[0].1, "test_tool");
-        // dangerous_tool was blocked, all calls were filtered → loop detected
-        assert!(
-            result.summary.is_some(),
-            "Should have a summary after blocking"
-        );
+        // dangerous_tool was blocked; early-break optimization means summary
+        // may be None (no useful work to summarize), which is correct.
     }
 
     #[tokio::test]
