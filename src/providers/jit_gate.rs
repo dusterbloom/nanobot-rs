@@ -42,6 +42,8 @@ impl JitGate {
 /// Detect JIT-specific loading errors in response text.
 ///
 /// LM Studio returns these when a model is still loading or failed to load.
+/// Retryability is now handled by `ProviderError::is_retryable()` in `errors.rs`.
+#[cfg(test)]
 pub fn is_jit_loading_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("no models loaded")

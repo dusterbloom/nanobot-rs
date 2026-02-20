@@ -1982,6 +1982,7 @@ impl AgentLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backon::BackoffBuilder;
     use crate::agent::router::{extract_json_object, parse_lenient_router_decision, request_strict_router_decision};
     use crate::config::schema::{MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig, TrioConfig};
     use crate::providers::base::LLMProvider;
@@ -2228,7 +2229,11 @@ mod tests {
             json!({"role":"user","content":"Summarize: tool call failed because server was down and port conflicted."}),
         ];
         let mut specialist_ok = false;
-        for _ in 0..10 {
+        let mut warmup_backoff = backon::ConstantBuilder::default()
+            .with_delay(Duration::from_secs(2))
+            .with_max_times(10)
+            .build();
+        loop {
             match specialist
                 .chat(
                     &specialist_messages,
@@ -2249,17 +2254,17 @@ mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.to_lowercase().contains("loading model")
-                        || msg.to_lowercase().contains("503")
-                    {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        continue;
+                    let lower = msg.to_lowercase();
+                    if !lower.contains("loading model") && !lower.contains("503") {
+                        failures.push(format!("specialist call failed: {}", msg));
+                        break;
                     }
-                    failures.push(format!("specialist call failed: {}", msg));
-                    break;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match warmup_backoff.next() {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => break,
+            }
         }
         if !specialist_ok {
             failures.push("specialist did not become ready / returned empty output".to_string());

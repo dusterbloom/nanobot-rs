@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::thread;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -265,26 +264,27 @@ impl AuditLog {
     }
 
     fn acquire_lock(&self) -> Option<AuditLockGuard> {
-        const MAX_ATTEMPTS: u32 = 50;
-        const RETRY_DELAY_MS: u64 = 20;
-        for _ in 0..MAX_ATTEMPTS {
-            match fs::OpenOptions::new()
+        use backon::BlockingRetryable;
+
+        let lock_path = &self.lock_path;
+        let result = (|| {
+            fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&self.lock_path)
-            {
-                Ok(_) => {
-                    return Some(AuditLockGuard {
-                        lock_path: self.lock_path.clone(),
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
-                }
-                Err(_) => return None,
-            }
-        }
-        None
+                .open(lock_path)
+                .map(|_| AuditLockGuard {
+                    lock_path: lock_path.clone(),
+                })
+        })
+        .retry(
+            backon::ConstantBuilder::default()
+                .with_delay(Duration::from_millis(20))
+                .with_max_times(50),
+        )
+        .when(|e: &std::io::Error| e.kind() == std::io::ErrorKind::AlreadyExists)
+        .call();
+
+        result.ok()
     }
 }
 

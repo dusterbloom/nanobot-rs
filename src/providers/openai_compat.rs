@@ -14,8 +14,11 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tracing::{debug, info, instrument, warn};
 
+use backon::Retryable;
+
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
-use super::jit_gate::{is_jit_loading_error, JitGate};
+use super::jit_gate::JitGate;
+use super::retry;
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -584,107 +587,99 @@ impl LLMProvider for OpenAICompatProvider {
             None => None,
         };
 
-        // Retry loop for JIT loading errors (model still loading / not yet ready).
-        let backoff_ms = [2000u64, 4000, 8000];
-        let max_attempts = if self.jit_gate.is_some() { 3 } else { 1 };
+        let backoff = if self.jit_gate.is_some() {
+            retry::jit_backoff()
+        } else {
+            retry::provider_backoff()
+        };
 
-        for attempt in 0..max_attempts {
-            let response = match self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("HTTP request to LLM failed (base={}): {}", self.api_base, e);
-                    let err_msg = format!("Error calling LLM: {}", e);
-                    if attempt + 1 < max_attempts && is_jit_loading_error(&err_msg) {
-                        info!(
-                            "JIT loading error on attempt {}, retrying in {}ms",
-                            attempt + 1,
-                            backoff_ms[attempt]
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt]))
-                            .await;
-                        continue;
-                    }
-                    return Err(crate::errors::ProviderError::HttpError(err_msg).into());
-                }
-            };
+        // Clone Arc-based/cheap values for the retry closure.
+        let client = self.client.clone();
+        let retry_url = url.clone();
+        let api_key = self.api_key.clone();
+        let api_base = self.api_base.clone();
+        let model_owned = model.to_string();
 
-            let status = response.status();
-            let response_text = match response.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    return Err(
-                        crate::errors::ProviderError::ResponseReadError(e.to_string()).into(),
+        use crate::errors::ProviderError;
+        let result: Result<LLMResponse, ProviderError> = (|| {
+            let client = client.clone();
+            let url = retry_url.clone();
+            let api_key = api_key.clone();
+            let api_base = api_base.clone();
+            let model_str = model_owned.clone();
+            let body = body.clone();
+            async move {
+                let response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        warn!("HTTP request to LLM failed (base={}): {}", api_base, e);
+                        ProviderError::HttpError(format!("Error calling LLM: {}", e))
+                    })?;
+
+                let status = response.status();
+                let response_text = response
+                    .text()
+                    .await
+                    .map_err(|e| ProviderError::ResponseReadError(e.to_string()))?;
+
+                if !status.is_success() {
+                    let status_code = status.as_u16();
+                    let body_snippet: String = response_text.chars().take(500).collect();
+                    warn!(
+                        model = %model_str,
+                        api_base = %api_base,
+                        status = status_code,
+                        body = %body_snippet,
+                        "llm_api_error"
                     );
-                }
-            };
-
-            if !status.is_success() {
-                // Check for JIT loading errors and retry if possible.
-                if attempt + 1 < max_attempts && is_jit_loading_error(&response_text) {
-                    info!(
-                        "JIT loading error on attempt {} (HTTP {}), retrying in {}ms",
-                        attempt + 1,
-                        status,
-                        backoff_ms[attempt]
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt])).await;
-                    continue;
-                }
-
-                let status_code = status.as_u16();
-                let body_snippet: String = response_text.chars().take(500).collect();
-                warn!(
-                    model = %model,
-                    api_base = %self.api_base,
-                    status = status_code,
-                    body = %body_snippet,
-                    "llm_api_error"
-                );
-                return Err(match status_code {
-                    429 => {
-                        // Try to extract retry-after from the response text.
-                        let retry_ms = parse_retry_after_ms(&response_text);
-                        crate::errors::ProviderError::RateLimited {
-                            status: status_code,
-                            retry_after_ms: retry_ms,
+                    return Err(match status_code {
+                        429 => {
+                            let retry_ms = parse_retry_after_ms(&response_text);
+                            ProviderError::RateLimited {
+                                status: status_code,
+                                retry_after_ms: retry_ms,
+                            }
                         }
-                    }
-                    401 | 403 => crate::errors::ProviderError::AuthError {
-                        status: status_code,
-                        message: response_text,
-                    },
-                    500..=599 => crate::errors::ProviderError::ServerError {
-                        status: status_code,
-                        message: response_text,
-                    },
-                    _ => crate::errors::ProviderError::HttpError(format!(
-                        "HTTP {}: {}",
-                        status_code, response_text
-                    )),
+                        401 | 403 => ProviderError::AuthError {
+                            status: status_code,
+                            message: response_text,
+                        },
+                        500..=599 => ProviderError::ServerError {
+                            status: status_code,
+                            message: response_text,
+                        },
+                        _ => ProviderError::HttpError(format!(
+                            "HTTP {}: {}",
+                            status_code, response_text
+                        )),
+                    });
                 }
-                .into());
+
+                let data: serde_json::Value = serde_json::from_str(&response_text)
+                    .map_err(|e| ProviderError::JsonParseError(e.to_string()))?;
+
+                parse_response(&data).map_err(|e| match e.downcast::<ProviderError>() {
+                    Ok(pe) => pe,
+                    Err(e) => ProviderError::JsonParseError(e.to_string()),
+                })
             }
+        })
+        .retry(backoff)
+        .when(|e| e.is_retryable())
+        .notify(|e, dur: std::time::Duration| {
+            warn!(error = %e, delay_ms = dur.as_millis() as u64, "provider_retry");
+        })
+        .adjust(retry::adjust_for_rate_limit)
+        .await;
 
-            let data: serde_json::Value = match serde_json::from_str(&response_text) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(
-                        crate::errors::ProviderError::JsonParseError(e.to_string()).into(),
-                    );
-                }
-            };
-
-            let result = parse_response(&data);
-            let elapsed_ms = call_start.elapsed().as_millis() as u64;
-            if let Ok(ref resp) = result {
+        let elapsed_ms = call_start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(resp) => {
                 let prompt_tokens = resp.usage.get("prompt_tokens").copied().unwrap_or(0);
                 let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
                 info!(
@@ -695,19 +690,18 @@ impl LLMProvider for OpenAICompatProvider {
                     api_base = %self.api_base,
                     "llm_call_complete"
                 );
-            } else {
+            }
+            Err(e) => {
                 warn!(
                     elapsed_ms = elapsed_ms,
                     model = %model,
                     api_base = %self.api_base,
+                    error = %e,
                     "llm_call_failed"
                 );
             }
-            return result;
         }
-
-        // Should never reach here, but just in case:
-        Err(crate::errors::ProviderError::HttpError("JIT retry loop exhausted".into()).into())
+        result.map_err(|e| e.into())
     }
 
     #[instrument(skip(self, messages, tools), fields(api_base = %self.api_base))]
@@ -806,47 +800,84 @@ impl LLMProvider for OpenAICompatProvider {
             None => None,
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let backoff = if self.jit_gate.is_some() {
+            retry::jit_backoff()
+        } else {
+            retry::provider_backoff()
+        };
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            // Drop permit explicitly on error (it would drop anyway, but be clear).
-            drop(jit_permit);
-            let status_code = status.as_u16();
-            warn!(
-                model = %model,
-                api_base = %self.api_base,
-                status = status_code,
-                "llm_stream_api_error"
-            );
-            return Err(match status_code {
-                429 => crate::errors::ProviderError::RateLimited {
-                    status: status_code,
-                    retry_after_ms: parse_retry_after_ms(&error_text),
-                },
-                401 | 403 => crate::errors::ProviderError::AuthError {
-                    status: status_code,
-                    message: error_text,
-                },
-                500..=599 => crate::errors::ProviderError::ServerError {
-                    status: status_code,
-                    message: error_text,
-                },
-                _ => crate::errors::ProviderError::HttpError(format!(
-                    "HTTP {}: {}",
-                    status_code, error_text
-                )),
+        use crate::errors::ProviderError;
+        let client = self.client.clone();
+        let stream_url = url.clone();
+        let api_key = self.api_key.clone();
+        let api_base = self.api_base.clone();
+        let model_owned = model.to_string();
+
+        let response: Result<reqwest::Response, ProviderError> = (|| {
+            let client = client.clone();
+            let url = stream_url.clone();
+            let api_key = api_key.clone();
+            let api_base = api_base.clone();
+            let model_str = model_owned.clone();
+            let body = body.clone();
+            async move {
+                let response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::HttpError(format!("Error calling LLM: {}", e)))?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    let status_code = status.as_u16();
+                    warn!(
+                        model = %model_str,
+                        api_base = %api_base,
+                        status = status_code,
+                        "llm_stream_api_error"
+                    );
+                    return Err(match status_code {
+                        429 => ProviderError::RateLimited {
+                            status: status_code,
+                            retry_after_ms: parse_retry_after_ms(&error_text),
+                        },
+                        401 | 403 => ProviderError::AuthError {
+                            status: status_code,
+                            message: error_text,
+                        },
+                        500..=599 => ProviderError::ServerError {
+                            status: status_code,
+                            message: error_text,
+                        },
+                        _ => ProviderError::HttpError(format!(
+                            "HTTP {}: {}",
+                            status_code, error_text
+                        )),
+                    });
+                }
+
+                Ok(response)
             }
-            .into());
-        }
+        })
+        .retry(backoff)
+        .when(|e| e.is_retryable())
+        .notify(|e, dur: std::time::Duration| {
+            warn!(error = %e, delay_ms = dur.as_millis() as u64, "provider_stream_retry");
+        })
+        .adjust(retry::adjust_for_rate_limit)
+        .await;
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                drop(jit_permit);
+                return Err(e.into());
+            }
+        };
 
         let ttfb_ms = call_start.elapsed().as_millis() as u64;
         info!(

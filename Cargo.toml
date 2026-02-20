@@ -70,6 +70,9 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "1"
 
+# Retry with backoff
+backon = { version = "1", features = ["tokio-sleep"] }
+
 # REPL
 rustyline = "15"
 

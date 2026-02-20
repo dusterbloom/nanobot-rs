@@ -7,14 +7,17 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, info, instrument, warn};
 
+use backon::Retryable;
+
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::retry;
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -411,89 +414,117 @@ impl LLMProvider for AnthropicProvider {
         );
 
         let call_start = std::time::Instant::now();
-        let mut req = self
-            .client
-            .post(&url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("Content-Type", "application/json");
 
-        if oauth {
-            req = req
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("anthropic-beta", OAUTH_BETA)
-                .header("user-agent", CLAUDE_CODE_UA)
-                .header("x-app", "cli");
-        } else {
-            req = req.header("x-api-key", &self.api_key);
-        }
+        use crate::errors::ProviderError;
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let model_owned = model.to_string();
 
-        let response = match req.json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(model = %model, provider = "anthropic", "Anthropic API request failed: {}", e);
-                return Err(crate::errors::ProviderError::HttpError(e.to_string()).into());
+        let result: Result<LLMResponse, ProviderError> = (|| {
+            let client = client.clone();
+            let url = url.clone();
+            let api_key = api_key.clone();
+            let model_str = model_owned.clone();
+            let body = body.clone();
+            async move {
+                let mut req = client
+                    .post(&url)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("Content-Type", "application/json");
+
+                if is_oauth_token(&api_key) {
+                    req = req
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("anthropic-beta", OAUTH_BETA)
+                        .header("user-agent", CLAUDE_CODE_UA)
+                        .header("x-app", "cli");
+                } else {
+                    req = req.header("x-api-key", &api_key);
+                }
+
+                let response = req.json(&body).send().await.map_err(|e| {
+                    warn!(model = %model_str, provider = "anthropic", "Anthropic API request failed: {}", e);
+                    ProviderError::HttpError(e.to_string())
+                })?;
+
+                let status = response.status();
+                let response_text = response
+                    .text()
+                    .await
+                    .map_err(|e| ProviderError::ResponseReadError(e.to_string()))?;
+
+                if !status.is_success() {
+                    let status_code = status.as_u16();
+                    let body_snippet: String = response_text.chars().take(500).collect();
+                    warn!(
+                        model = %model_str,
+                        provider = "anthropic",
+                        status = status_code,
+                        body = %body_snippet,
+                        "llm_api_error"
+                    );
+                    return Err(match status_code {
+                        429 => ProviderError::RateLimited {
+                            status: status_code,
+                            retry_after_ms: 1000,
+                        },
+                        401 | 403 => ProviderError::AuthError {
+                            status: status_code,
+                            message: response_text,
+                        },
+                        500..=599 => ProviderError::ServerError {
+                            status: status_code,
+                            message: response_text,
+                        },
+                        _ => ProviderError::HttpError(format!(
+                            "HTTP {}: {}",
+                            status_code, response_text
+                        )),
+                    });
+                }
+
+                let data: Value = serde_json::from_str(&response_text)
+                    .map_err(|e| ProviderError::JsonParseError(e.to_string()))?;
+
+                parse_anthropic_response(&data).map_err(|e| match e.downcast::<ProviderError>() {
+                    Ok(pe) => pe,
+                    Err(e) => ProviderError::JsonParseError(e.to_string()),
+                })
             }
-        };
+        })
+        .retry(retry::provider_backoff())
+        .when(|e| e.is_retryable())
+        .notify(|e, dur: std::time::Duration| {
+            warn!(error = %e, delay_ms = dur.as_millis() as u64, "anthropic_retry");
+        })
+        .adjust(retry::adjust_for_rate_limit)
+        .await;
 
-        let status = response.status();
-        let response_text = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            let status_code = status.as_u16();
-            let body_snippet: String = response_text.chars().take(500).collect();
-            warn!(
-                model = %model,
-                provider = "anthropic",
-                status = status_code,
-                body = %body_snippet,
-                "llm_api_error"
-            );
-            return Err(match status_code {
-                429 => crate::errors::ProviderError::RateLimited {
-                    status: status_code,
-                    retry_after_ms: 1000,
-                },
-                401 | 403 => crate::errors::ProviderError::AuthError {
-                    status: status_code,
-                    message: response_text,
-                },
-                500..=599 => crate::errors::ProviderError::ServerError {
-                    status: status_code,
-                    message: response_text,
-                },
-                _ => crate::errors::ProviderError::HttpError(format!(
-                    "HTTP {}: {}",
-                    status_code, response_text
-                )),
-            }
-            .into());
-        }
-
-        let data: Value = serde_json::from_str(&response_text)
-            .context("Failed to parse Anthropic API response")?;
-
-        let result = parse_anthropic_response(&data);
         let elapsed_ms = call_start.elapsed().as_millis() as u64;
-        if let Ok(ref resp) = result {
-            let prompt_tokens = resp.usage.get("prompt_tokens").copied().unwrap_or(0);
-            let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
-            info!(
-                elapsed_ms = elapsed_ms,
-                model = %model,
-                tokens_prompt = prompt_tokens,
-                tokens_completion = completion_tokens,
-                provider = "anthropic",
-                "llm_call_complete"
-            );
-        } else {
-            warn!(
-                elapsed_ms = elapsed_ms,
-                model = %model,
-                provider = "anthropic",
-                "llm_call_failed"
-            );
+        match &result {
+            Ok(resp) => {
+                let prompt_tokens = resp.usage.get("prompt_tokens").copied().unwrap_or(0);
+                let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
+                info!(
+                    elapsed_ms = elapsed_ms,
+                    model = %model,
+                    tokens_prompt = prompt_tokens,
+                    tokens_completion = completion_tokens,
+                    provider = "anthropic",
+                    "llm_call_complete"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    elapsed_ms = elapsed_ms,
+                    model = %model,
+                    provider = "anthropic",
+                    error = %e,
+                    "llm_call_failed"
+                );
+            }
         }
-        result
+        result.map_err(|e| e.into())
     }
 
     #[instrument(skip(self, messages, tools), fields(provider = "anthropic"))]
@@ -562,56 +593,82 @@ impl LLMProvider for AnthropicProvider {
         );
 
         let call_start = std::time::Instant::now();
-        let mut req = self
-            .client
-            .post(&url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("Content-Type", "application/json");
 
-        if oauth {
-            req = req
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("anthropic-beta", OAUTH_BETA)
-                .header("user-agent", CLAUDE_CODE_UA)
-                .header("x-app", "cli");
-        } else {
-            req = req.header("x-api-key", &self.api_key);
-        }
+        use crate::errors::ProviderError;
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let model_owned = model.to_string();
 
-        let response = req.json(&body).send().await?;
+        let response: Result<reqwest::Response, ProviderError> = (|| {
+            let client = client.clone();
+            let url = url.clone();
+            let api_key = api_key.clone();
+            let model_str = model_owned.clone();
+            let body = body.clone();
+            async move {
+                let mut req = client
+                    .post(&url)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .header("Content-Type", "application/json");
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            let status_code = status.as_u16();
-            let body_snippet: String = error_text.chars().take(500).collect();
-            warn!(
-                model = %model,
-                provider = "anthropic",
-                status = status_code,
-                body = %body_snippet,
-                "llm_stream_api_error"
-            );
-            return Err(match status_code {
-                429 => crate::errors::ProviderError::RateLimited {
-                    status: status_code,
-                    retry_after_ms: 1000,
-                },
-                401 | 403 => crate::errors::ProviderError::AuthError {
-                    status: status_code,
-                    message: error_text,
-                },
-                500..=599 => crate::errors::ProviderError::ServerError {
-                    status: status_code,
-                    message: error_text,
-                },
-                _ => crate::errors::ProviderError::HttpError(format!(
-                    "HTTP {}: {}",
-                    status_code, error_text
-                )),
+                if is_oauth_token(&api_key) {
+                    req = req
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("anthropic-beta", OAUTH_BETA)
+                        .header("user-agent", CLAUDE_CODE_UA)
+                        .header("x-app", "cli");
+                } else {
+                    req = req.header("x-api-key", &api_key);
+                }
+
+                let response = req.json(&body).send().await.map_err(|e| {
+                    ProviderError::HttpError(e.to_string())
+                })?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    let status_code = status.as_u16();
+                    let body_snippet: String = error_text.chars().take(500).collect();
+                    warn!(
+                        model = %model_str,
+                        provider = "anthropic",
+                        status = status_code,
+                        body = %body_snippet,
+                        "llm_stream_api_error"
+                    );
+                    return Err(match status_code {
+                        429 => ProviderError::RateLimited {
+                            status: status_code,
+                            retry_after_ms: 1000,
+                        },
+                        401 | 403 => ProviderError::AuthError {
+                            status: status_code,
+                            message: error_text,
+                        },
+                        500..=599 => ProviderError::ServerError {
+                            status: status_code,
+                            message: error_text,
+                        },
+                        _ => ProviderError::HttpError(format!(
+                            "HTTP {}: {}",
+                            status_code, error_text
+                        )),
+                    });
+                }
+
+                Ok(response)
             }
-            .into());
-        }
+        })
+        .retry(retry::provider_backoff())
+        .when(|e| e.is_retryable())
+        .notify(|e, dur: std::time::Duration| {
+            warn!(error = %e, delay_ms = dur.as_millis() as u64, "anthropic_stream_retry");
+        })
+        .adjust(retry::adjust_for_rate_limit)
+        .await;
+
+        let response = response.map_err(|e| -> anyhow::Error { e.into() })?;
 
         let ttfb_ms = call_start.elapsed().as_millis() as u64;
         info!(

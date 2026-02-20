@@ -38,6 +38,42 @@ pub enum ProviderError {
     Cancelled,
 }
 
+impl ProviderError {
+    /// Whether this error is transient and the request should be retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::ServerError { .. } => true,
+            Self::HttpError(msg) => is_transient_http_error(msg),
+            Self::ResponseReadError(_) | Self::JsonParseError(_) | Self::AuthError { .. } | Self::Cancelled => false,
+        }
+    }
+}
+
+/// Downcast an `anyhow::Error` and check retryability.
+#[allow(dead_code)]
+pub fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ProviderError>()
+        .map_or(false, |pe| pe.is_retryable())
+}
+
+/// Check if an HTTP error message indicates a transient/retryable condition.
+fn is_transient_http_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    // Connection errors
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("broken pipe")
+        // JIT model loading errors (LM Studio)
+        || lower.contains("no models loaded")
+        || lower.contains("failed to load model")
+        || lower.contains("error loading model")
+        || lower.contains("model is loading")
+        || lower.contains("model not found")
+}
+
 // ---------------------------------------------------------------------------
 // Tool error classification
 // ---------------------------------------------------------------------------
@@ -228,5 +264,81 @@ mod tests {
     #[test]
     fn test_extract_timeout_no_number() {
         assert_eq!(extract_timeout_secs("timed out after many seconds"), None);
+    }
+
+    // -- is_retryable tests --
+
+    #[test]
+    fn test_retryable_rate_limited() {
+        let e = ProviderError::RateLimited { status: 429, retry_after_ms: 1000 };
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_retryable_server_error() {
+        let e = ProviderError::ServerError { status: 503, message: "overloaded".into() };
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_retryable_http_connection_refused() {
+        let e = ProviderError::HttpError("Error calling LLM: connection refused".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_retryable_http_timeout() {
+        let e = ProviderError::HttpError("request timed out".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_retryable_http_jit_loading() {
+        let e = ProviderError::HttpError("no models loaded on this server".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_retryable_http_model_is_loading() {
+        let e = ProviderError::HttpError("Model is loading, please wait".into());
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_auth() {
+        let e = ProviderError::AuthError { status: 401, message: "invalid key".into() };
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_json_parse() {
+        let e = ProviderError::JsonParseError("unexpected token".into());
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_cancelled() {
+        assert!(!ProviderError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_generic_http() {
+        let e = ProviderError::HttpError("HTTP 400: bad request".into());
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_provider_error_downcast() {
+        let anyhow_err: anyhow::Error = ProviderError::RateLimited {
+            status: 429,
+            retry_after_ms: 5000,
+        }.into();
+        assert!(is_retryable_provider_error(&anyhow_err));
+    }
+
+    #[test]
+    fn test_is_retryable_provider_error_non_provider() {
+        let anyhow_err = anyhow::anyhow!("some random error");
+        assert!(!is_retryable_provider_error(&anyhow_err));
     }
 }
