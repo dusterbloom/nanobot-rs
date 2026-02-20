@@ -45,14 +45,14 @@ You: What's the weather like?
 
 ### Go local with `/local`
 
-Toggle between cloud and local inference mid-conversation. nanobot auto-spawns a llama.cpp server with a progress bar, waits for it to be ready, and switches over.
+Toggle between cloud and local inference mid-conversation. nanobot connects to LM Studio, loads a model, and switches over.
 
 ```
 You: /local
-  Starting llama.cpp server on port 8080...
-  Loading model [████████████████░░░░░░░░] 32s
+  Starting LM Studio server on port 1234...
+  Loading model...
 
-  LOCAL MODE llama.cpp on port 8080
+  LOCAL MODE LM Studio on port 1234
   Model: NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf
 
 You: /model
@@ -198,7 +198,7 @@ Key agent settings in `config.json`:
 | `agents.defaults.maxContextTokens` | `128000` | Context window size |
 | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
 
-For local mode, place GGUF models in `~/models/` and ensure llama.cpp is built at `~/llama.cpp/build/bin/llama-server`.
+For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). Models are managed through LM Studio.
 
 ## Architecture
 

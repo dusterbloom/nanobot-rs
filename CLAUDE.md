@@ -71,7 +71,7 @@ Markdown files at `{workspace}/skills/{name}/SKILL.md` with optional YAML frontm
 
 ### Local LLM Protocol Constraints
 
-Local models (llama-server) have stricter message protocol than cloud APIs:
+Local models (via LM Studio) have stricter message protocol than cloud APIs:
 
 - Conversations **MUST** end with a `role: "user"` message
 - Assistant message prefill is **NOT** supported
