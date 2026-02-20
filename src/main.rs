@@ -16,6 +16,7 @@ mod providers;
 mod repl;
 mod server;
 mod session;
+mod sessions_cmd;
 mod syntax;
 mod tui;
 mod utils;
@@ -465,16 +466,16 @@ fn main() {
             EvalAction::Report => cli::cmd_eval_report(),
         },
         Commands::Sessions { action } => match action {
-            SessionsAction::List => cli::cmd_sessions_list(),
+            SessionsAction::List => sessions_cmd::cmd_sessions_list(),
             SessionsAction::Resume { key, local } => repl::cmd_agent(None, key, local, None),
             SessionsAction::New { name, local } => {
-                let key = cli::make_session_key(name.as_deref());
+                let key = sessions_cmd::make_session_key(name.as_deref());
                 repl::cmd_agent(None, key, local, None)
             }
-            SessionsAction::Export { key, format } => cli::cmd_sessions_export(&key, &format),
-            SessionsAction::Purge { older_than } => cli::cmd_sessions_purge(&older_than),
-            SessionsAction::Archive => cli::cmd_sessions_archive(),
-            SessionsAction::Nuke { force } => cli::cmd_sessions_nuke(force),
+            SessionsAction::Export { key, format } => sessions_cmd::cmd_sessions_export(&key, &format),
+            SessionsAction::Purge { older_than } => sessions_cmd::cmd_sessions_purge(&older_than),
+            SessionsAction::Archive => sessions_cmd::cmd_sessions_archive(),
+            SessionsAction::Nuke { force } => sessions_cmd::cmd_sessions_nuke(force),
         },
     }
 }

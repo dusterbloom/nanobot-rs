@@ -511,8 +511,6 @@ impl LLMProvider for OpenAICompatProvider {
             "chat: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
-        let call_start = std::time::Instant::now();
-
         // For Nemotron-family models with reasoning off and no tools: try the native
         // LMS API which can disable reasoning at the template level. Skip for all
         // other models to avoid a wasted HTTP roundtrip.
@@ -522,6 +520,7 @@ impl LLMProvider for OpenAICompatProvider {
             && !has_tools
             && needs_native_lms_api(model)
         {
+            let call_start = std::time::Instant::now();
             if let Some(response) = try_native_lms_chat(
                 &self.client,
                 &self.api_base,
@@ -582,10 +581,18 @@ impl LLMProvider for OpenAICompatProvider {
         apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget);
 
         // JIT gate: serialise access to JIT-loading servers.
+        // Measure JIT wait separately from the actual API call.
+        let jit_wait_start = std::time::Instant::now();
         let _jit_permit = match &self.jit_gate {
             Some(gate) => Some(gate.acquire().await),
             None => None,
         };
+        let jit_wait_ms = if self.jit_gate.is_some() {
+            jit_wait_start.elapsed().as_millis() as u64
+        } else {
+            0
+        };
+        let call_start = std::time::Instant::now();
 
         let backoff = if self.jit_gate.is_some() {
             retry::jit_backoff()
@@ -684,6 +691,7 @@ impl LLMProvider for OpenAICompatProvider {
                 let completion_tokens = resp.usage.get("completion_tokens").copied().unwrap_or(0);
                 info!(
                     elapsed_ms = elapsed_ms,
+                    jit_wait_ms = jit_wait_ms,
                     model = %model,
                     tokens_prompt = prompt_tokens,
                     tokens_completion = completion_tokens,
@@ -694,6 +702,7 @@ impl LLMProvider for OpenAICompatProvider {
             Err(e) => {
                 warn!(
                     elapsed_ms = elapsed_ms,
+                    jit_wait_ms = jit_wait_ms,
                     model = %model,
                     api_base = %self.api_base,
                     error = %e,
@@ -731,8 +740,6 @@ impl LLMProvider for OpenAICompatProvider {
             "chat_stream: api_base={} raw_model={} stripped={} model={}",
             self.api_base, raw_model, stripped, model
         );
-        let call_start = std::time::Instant::now();
-
         // For Nemotron-family models with reasoning off and no tools: try native LMS API.
         let has_tools = tools.map_or(false, |t| !t.is_empty());
         if is_local_api_base(&self.api_base)
@@ -795,10 +802,18 @@ impl LLMProvider for OpenAICompatProvider {
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
         // for the entire stream duration, preventing model switches mid-stream.
+        // Measure JIT wait separately from the actual API call.
+        let jit_wait_start = std::time::Instant::now();
         let jit_permit = match &self.jit_gate {
             Some(gate) => Some(gate.acquire().await),
             None => None,
         };
+        let jit_wait_ms = if self.jit_gate.is_some() {
+            jit_wait_start.elapsed().as_millis() as u64
+        } else {
+            0
+        };
+        let call_start = std::time::Instant::now();
 
         let backoff = if self.jit_gate.is_some() {
             retry::jit_backoff()
@@ -882,6 +897,7 @@ impl LLMProvider for OpenAICompatProvider {
         let ttfb_ms = call_start.elapsed().as_millis() as u64;
         info!(
             ttfb_ms = ttfb_ms,
+            jit_wait_ms = jit_wait_ms,
             model = %model,
             api_base = %self.api_base,
             "llm_stream_started"
@@ -1226,7 +1242,7 @@ async fn parse_sse_stream(
             let chunk: serde_json::Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!("SSE parse error (skipping chunk): {}", e);
+                    warn!("SSE parse error (skipping chunk): {}", e);
                     continue;
                 }
             };

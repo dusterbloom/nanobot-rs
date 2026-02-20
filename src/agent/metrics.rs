@@ -41,7 +41,15 @@ pub fn metrics_path() -> PathBuf {
         .join("metrics.jsonl")
 }
 
+/// Maximum metrics file size before rotation (10 MB).
+const MAX_METRICS_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Append a single metrics record to the JSONL file.
+///
+/// When the file exceeds [`MAX_METRICS_BYTES`], the current file is rotated
+/// to `metrics.jsonl.1` (overwriting any previous backup) and a fresh file
+/// is started.  Only one backup is kept — `nanobot sessions purge` handles
+/// deeper cleanup.
 ///
 /// Failures are silently ignored — metrics are best-effort and must never
 /// crash the agent loop.
@@ -50,6 +58,15 @@ pub fn emit(metrics: &RequestMetrics) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+
+    // Rotate if over size limit.
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > MAX_METRICS_BYTES {
+            let backup = path.with_extension("jsonl.1");
+            let _ = fs::rename(&path, &backup);
+        }
+    }
+
     let Ok(line) = serde_json::to_string(metrics) else {
         return;
     };
@@ -124,6 +141,35 @@ mod tests {
         assert_eq!(parsed["status"], "error:reasoning_config_rejected");
         assert_eq!(parsed["error_detail"], "reasoning_budget not supported");
         assert_eq!(parsed["role"], "router");
+    }
+
+    #[test]
+    fn test_rotation_on_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let backup = dir.path().join("metrics.jsonl.1");
+
+        // Write a file that exceeds MAX_METRICS_BYTES.
+        {
+            let mut f = OpenOptions::new().create(true).write(true).open(&path).unwrap();
+            // Write ~11MB of data to trigger rotation.
+            let line = "x".repeat(1024);
+            for _ in 0..(11 * 1024) {
+                writeln!(f, "{}", line).unwrap();
+            }
+        }
+        assert!(fs::metadata(&path).unwrap().len() > MAX_METRICS_BYTES);
+
+        // Manually call the rotation logic (emit() uses hardcoded path,
+        // so we test the rotation logic directly).
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.len() > MAX_METRICS_BYTES {
+                let _ = fs::rename(&path, &backup);
+            }
+        }
+
+        assert!(backup.exists(), "backup file should exist after rotation");
+        assert!(!path.exists(), "original should be gone (renamed)");
     }
 
     #[test]

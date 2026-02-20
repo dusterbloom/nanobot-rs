@@ -14,7 +14,7 @@
   2. Log HTTP error response body (openai_compat.rs:642, anthropic.rs:442) — currently body discarded, only status code logged
   3. `warn!` on SSE stream ending without `[DONE]` (openai_compat.rs:1270) — SLM crashes mid-response invisible
   4. `warn!` on empty LLM response fallback (agent_loop.rs:1214) — silent hardcoded string injection
-  5. `warn!` on Anthropic SSE parse errors (anthropic.rs:700) — `Err(_) => continue` with zero logging
+  5. ~~`warn!` on Anthropic SSE parse errors (anthropic.rs:700)~~ — Done: upgraded to `warn!` in both anthropic.rs and openai_compat.rs
   6. Add `#[instrument]` spans to `chat()`/`chat_stream()` in both providers
   7. Add `.with_span_events(FmtSpan::CLOSE)` to JSON subscriber in main.rs — free latency tracking
   8. Remove dead `error_detail()` code (base.rs:47-62) — `finish_reason == "error"` never fires

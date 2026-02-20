@@ -755,7 +755,7 @@ async fn parse_anthropic_sse(
             let data: Value = match serde_json::from_str(data_str) {
                 Ok(v) => v,
                 Err(e) => {
-                    debug!(
+                    warn!(
                         error = %e,
                         raw_data = %data_str.chars().take(200).collect::<String>(),
                         "anthropic_sse_parse_error"

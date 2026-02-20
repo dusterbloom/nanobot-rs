@@ -66,12 +66,14 @@ fn is_transient_http_error(msg: &str) -> bool {
         || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("broken pipe")
-        // JIT model loading errors (LM Studio)
+        // JIT model loading errors (LM Studio) — excludes "model not found"
+        // which is ambiguous (could be a config typo on cloud APIs).
+        // JIT "model not found" during loading surfaces as 5xx → ServerError
+        // which is already retryable.
         || lower.contains("no models loaded")
         || lower.contains("failed to load model")
         || lower.contains("error loading model")
         || lower.contains("model is loading")
-        || lower.contains("model not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +304,14 @@ mod tests {
     fn test_retryable_http_model_is_loading() {
         let e = ProviderError::HttpError("Model is loading, please wait".into());
         assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_model_not_found() {
+        // "model not found" should NOT be retried — could be a config typo.
+        // JIT loading errors surface as 5xx (ServerError) which is already retryable.
+        let e = ProviderError::HttpError("HTTP 404: model not found".into());
+        assert!(!e.is_retryable());
     }
 
     #[test]
