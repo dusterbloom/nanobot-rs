@@ -27,7 +27,7 @@ use crate::heartbeat::service::{
 use crate::providers::base::LLMProvider;
 use crate::providers::jit_gate::JitGate;
 use crate::providers::oauth::OAuthTokenManager;
-use crate::providers::openai_compat::OpenAICompatProvider;
+use crate::providers::factory;
 use crate::utils::helpers::get_workspace_path;
 
 #[cfg(test)]
@@ -476,11 +476,10 @@ fn make_local_providers(
         None
     };
 
-    let mut main_prov = OpenAICompatProvider::new("local", Some(&base_url), Some(&model_id));
-    if let Some(ref gate) = jit_gate {
-        main_prov = main_prov.with_jit_gate(gate.clone());
-    }
-    let main: Arc<dyn LLMProvider> = Arc::new(main_prov);
+    let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
+        factory::ProviderSpec::local(&base_url, Some(&model_id))
+            .with_jit_gate_opt(jit_gate.clone()),
+    );
 
     // Auto-detect context size from local server; fall back to config default.
     let max_context_tokens = if !has_custom_base {
@@ -492,15 +491,10 @@ fn make_local_providers(
 
     // Compaction provider (separate port only).
     let compaction: Option<Arc<dyn LLMProvider>> = compaction_port.map(|p| -> Arc<dyn LLMProvider> {
-        let mut prov = OpenAICompatProvider::new(
-            "local-compaction",
-            Some(&local_base_url(config, p)),
-            None,
-        );
-        if let Some(ref gate) = jit_gate {
-            prov = prov.with_jit_gate(gate.clone());
-        }
-        Arc::new(prov)
+        factory::create_openai_compat(
+            factory::ProviderSpec::local(&local_base_url(config, p), None)
+                .with_jit_gate_opt(jit_gate.clone()),
+        )
     });
 
     // Helper: create a provider for a trio role with endpoint resolution.
@@ -511,33 +505,32 @@ fn make_local_providers(
      -> Option<Arc<dyn LLMProvider>> {
         // Priority 1: explicit endpoint (url + model)
         if let Some(ep) = endpoint {
-            let mut prov = OpenAICompatProvider::new(role_name, Some(&ep.url), Some(&ep.model));
             // Use JIT gate if endpoint URL matches the shared base (same server).
-            if let Some(ref gate) = jit_gate {
-                if ep.url == base_url {
-                    prov = prov.with_jit_gate(gate.clone());
-                }
-            }
-            return Some(Arc::new(prov));
+            let gate = jit_gate.as_ref().filter(|_| ep.url == base_url).cloned();
+            return Some(factory::create_openai_compat(
+                factory::ProviderSpec {
+                    api_key: role_name.to_string(),
+                    api_base: Some(ep.url.clone()),
+                    model: Some(ep.model.clone()),
+                    jit_gate: gate,
+                },
+            ));
         }
 
         // Priority 2: shared JIT server (localApiBase set) + trio model name
         if has_custom_base {
             let model = if !trio_model.is_empty() { trio_model } else { role_name };
-            let mut prov = OpenAICompatProvider::new(role_name, Some(&base_url), Some(model));
-            if let Some(ref gate) = jit_gate {
-                prov = prov.with_jit_gate(gate.clone());
-            }
-            return Some(Arc::new(prov));
+            return Some(factory::create_openai_compat(
+                factory::ProviderSpec::local(&base_url, Some(model))
+                    .with_jit_gate_opt(jit_gate.clone()),
+            ));
         }
 
         // Priority 3: separate port fallback
         fallback_port.map(|p| -> Arc<dyn LLMProvider> {
-            Arc::new(OpenAICompatProvider::new(
-                role_name,
-                Some(&local_base_url(config, p)),
-                Some(role_name),
-            ))
+            factory::create_openai_compat(
+                factory::ProviderSpec::local(&local_base_url(config, p), Some(role_name)),
+            )
         })
     };
 
@@ -1462,7 +1455,6 @@ pub(crate) fn cmd_cron_enable(job_id: String, disable: bool) {
 /// needed, and returns an `AnthropicProvider` with OAuth identity headers
 /// (same approach as OpenClaw — direct API, no proxy, no CLI subprocess).
 fn load_oauth_provider(sub_model: &str) -> anyhow::Result<Arc<dyn LLMProvider>> {
-    use crate::providers::anthropic::AnthropicProvider;
     use tracing::info;
 
     let mut mgr = OAuthTokenManager::load()?;
@@ -1483,7 +1475,7 @@ fn load_oauth_provider(sub_model: &str) -> anyhow::Result<Arc<dyn LLMProvider>> 
         &token[..token.len().min(20)]
     );
 
-    Ok(Arc::new(AnthropicProvider::new(&token, Some(sub_model))))
+    Ok(factory::create_anthropic(&token, Some(sub_model)))
 }
 
 pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
@@ -1535,11 +1527,12 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             "create_provider: prefix resolved model={} → base={}, stripped={}",
             model, api_base, stripped_model
         );
-        return Arc::new(OpenAICompatProvider::new(
-            &api_key,
-            Some(api_base.as_str()),
-            Some(stripped_model.as_str()),
-        ));
+        return factory::create_openai_compat(factory::ProviderSpec {
+            api_key,
+            api_base: Some(api_base),
+            model: Some(stripped_model),
+            jit_gate: None,
+        });
     }
 
     let api_key = config.get_api_key().unwrap_or_default();
@@ -1563,11 +1556,12 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         "create_provider: using OpenAICompatProvider (model={}, base={:?})",
         model, api_base
     );
-    Arc::new(OpenAICompatProvider::new(
-        &api_key,
-        api_base.as_deref(),
-        Some(model.as_str()),
-    ))
+    factory::create_openai_compat(factory::ProviderSpec {
+        api_key,
+        api_base,
+        model: Some(model.to_string()),
+        jit_gate: None,
+    })
 }
 
 // ============================================================================
@@ -1681,9 +1675,8 @@ pub(crate) fn cmd_search(query: String, limit: usize) {
 /// Build an LLM provider for eval: local LM Studio or cloud API.
 fn make_eval_provider(local: bool, port: u16) -> Arc<dyn LLMProvider> {
     if local {
-        Arc::new(OpenAICompatProvider::new(
-            "local",
-            Some(&format!("http://localhost:{}/v1", port)),
+        factory::create_openai_compat(factory::ProviderSpec::local(
+            &format!("http://localhost:{}/v1", port),
             Some("local-model"),
         ))
     } else {

@@ -21,7 +21,6 @@ use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::bus::events::InboundMessage;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::base::LLMProvider;
-use crate::providers::openai_compat::OpenAICompatProvider;
 
 /// Maximum iterations for a subagent run (default when no profile overrides).
 const MAX_SUBAGENT_ITERATIONS: u32 = 15;
@@ -763,11 +762,15 @@ impl SubagentManager {
                     "Subagent using {} provider (base={}, local={}) for model {}",
                     prefix, base, targets_local, rest
                 );
-                let provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
-                    &api_key,
-                    Some(&base),
-                    Some(&rest),
-                ));
+                let provider: Arc<dyn LLMProvider> =
+                    crate::providers::factory::create_openai_compat(
+                        crate::providers::factory::ProviderSpec {
+                            api_key,
+                            api_base: Some(base),
+                            model: Some(rest.clone()),
+                            jit_gate: None,
+                        },
+                    );
                 return (provider, rest, targets_local);
             }
         }
