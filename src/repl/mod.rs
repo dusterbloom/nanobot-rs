@@ -960,6 +960,18 @@ pub(crate) fn cmd_agent(
                             }
                         }
 
+                        // Load LCM compaction model when configured.
+                        if config.lcm.enabled {
+                            if let Some(ref ep) = config.lcm.compaction_endpoint {
+                                print!("  Loading {} (LCM compactor)... ", ep.model);
+                                io::stdout().flush().ok();
+                                match crate::lms::load_model(lms_port, &ep.model, Some(config.lcm.compaction_context_size)).await {
+                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                                }
+                            }
+                        }
+
                         local_model_name = main_model;
                         srv.lms_managed = true;
                         srv.lms_binary = Some(bin);
@@ -1170,6 +1182,13 @@ pub(crate) fn cmd_agent(
                         models_to_warm.push(&ep.model);
                     } else if !ctx.config.trio.specialist_model.is_empty() {
                         models_to_warm.push(&ctx.config.trio.specialist_model);
+                    }
+                }
+
+                // LCM compaction model when configured.
+                if let Some(ref ep) = ctx.config.lcm.compaction_endpoint {
+                    if ctx.config.lcm.enabled {
+                        models_to_warm.push(&ep.model);
                     }
                 }
 
