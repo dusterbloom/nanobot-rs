@@ -137,7 +137,8 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search across all memory layers (long-term facts, working sessions, archived conversations). \
+        "Search memory: long-term facts (MEMORY.md), session summaries, and archived sessions. \
+         Run /sessions index first to make historical conversations searchable. \
          Use this to find past context, user preferences, or previous decisions."
     }
 

@@ -202,6 +202,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 ## Done ✅
 
+- ~~Session indexer + REPL /sessions command~~ — Bridge between raw JSONL sessions (230 files, 116MB) and searchable SESSION_*.md memory files. `session_indexer.rs`: pure `extract_session_content()` + `index_sessions()` orchestrator (extracts user+assistant messages, skips tool results, caps at 50 messages, truncates to 500 chars each). REPL: `/sessions` command with list/export/purge/archive/index subcommands (`/ss` alias). CLI: `nanobot sessions index`. Fixed `process::exit(1)` in `sessions_cmd.rs` for REPL safety. Updated `recall` tool description. E2E verified: 149 sessions indexed (6→155 SESSION_*.md), idempotent re-run, grep finds content. 17 new tests, 1390 total green. (2026-02-21, `src/agent/session_indexer.rs`)
 - ~~B10: Auto-detect trio models from LM Studio~~ — `pick_trio_models()` scans available LMS models at startup for "orchestrator"/"router" (router) and "function-calling"/"instruct"/"ministral" (specialist) patterns. Only fills empty config slots — explicit config always wins. Fuzzy main-model exclusion handles org prefixes and unresolved GGUF hints. Wired into REPL startup before auto-activation. 13 tests including e2e flow and real LMS model list. (2026-02-21, commit `3774742`)
 - ~~B9: Compaction safety guard + tool guard death spiral~~ — Tool guard replays cached results instead of injecting error messages small models can't parse. Compaction respects summarizer model's actual context window via `compaction_model_context_size` config + pre-flight truncation (0.7 safety margin). Circuit breaker threshold 3→2. E2E verified against NanBeige on LM Studio. (2026-02-21, commit `0f7f365`)
 - ~~B8: Metrics accuracy + tool loop circuit breaker~~ — Fixed local model metrics capture (`prompt_tokens`, `completion_tokens`, `elapsed_ms`). Added circuit breaker for consecutive all-blocked tool call rounds. (2026-02-21, commit `0f80ad9`)
@@ -209,7 +210,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 - ~~B6: SLM provider observability~~ — 8 silent failure paths now logged. `#[instrument]` spans on `chat()`/`chat_stream()`. Promoted `llm_call_failed` to `warn!`. (2026-02-21, commit `0b6bc5f`)
 - ~~Fix: Audit log hash chain race condition~~ — `record()` had a TOCTOU bug: seq allocation + prev_hash read were not serialized under the file lock. Two concurrent executors (tool_runner + inline) both read seq 940 and wrote seq 941 with the same prev_hash, forking the chain at entry 942. Fix: acquire file lock first, re-read authoritative seq + prev_hash from file under lock, then compute hash and write. 12/12 audit tests pass. (2026-02-21, `src/agent/audit.rs`) ⚠️ _Code changes uncommitted — `audit.rs` modified in working tree._
 - ~~B1: 132 compiler warnings~~ → 0 warnings (2026-02-20)
-- ~~B2: 2 test failures~~ → 1378 pass, 0 fail (2026-02-21)
+- ~~B2: 2 test failures~~ → 1390 pass, 0 fail (2026-02-21)
 - ~~Fix: Subprocess stdin steal~~ — `.stdin(Stdio::null())` on all 4 spawn sites in shell.rs + worker_tools.rs (2026-02-20)
 - ~~Fix: Esc-mashing freezes REPL~~ — drain_stdin() after cancel (2026-02-20, commit 57ec883)
 - ~~Fix stale comment in `ensure_compaction_model`~~ (2026-02-17)

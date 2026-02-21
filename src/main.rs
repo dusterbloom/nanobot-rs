@@ -274,6 +274,8 @@ enum SessionsAction {
         #[arg(long)]
         force: bool,
     },
+    /// Index orphaned JSONL sessions into searchable SESSION_*.md files.
+    Index,
 }
 
 #[derive(Subcommand)]
@@ -476,6 +478,17 @@ fn main() {
             SessionsAction::Purge { older_than } => sessions_cmd::cmd_sessions_purge(&older_than),
             SessionsAction::Archive => sessions_cmd::cmd_sessions_archive(),
             SessionsAction::Nuke { force } => sessions_cmd::cmd_sessions_nuke(force),
+            SessionsAction::Index => {
+                let sessions_dir = dirs::home_dir().unwrap().join(".nanobot/sessions");
+                let workspace = crate::utils::helpers::get_workspace_path(None);
+                let memory_sessions_dir = workspace.join("memory").join("sessions");
+                let (indexed, skipped, errors) =
+                    agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
+                println!(
+                    "Indexed {} sessions ({} skipped, {} errors)",
+                    indexed, skipped, errors
+                );
+            }
         },
     }
 }

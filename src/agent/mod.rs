@@ -28,6 +28,7 @@ pub mod reflector;
 pub mod role_policy;
 pub mod router;
 pub mod router_fallback;
+pub mod session_indexer;
 pub mod skills;
 pub mod step_voter;
 pub mod subagent;

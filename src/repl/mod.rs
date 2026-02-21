@@ -226,6 +226,7 @@ pub(crate) fn print_help() {
     println!("  /memory         - Show working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
+    println!("  /sessions, /ss  - Session management (list, export, purge, archive, index)");
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");

@@ -73,7 +73,7 @@ pub fn cmd_sessions_export(key: &str, format: &str) {
         None => {
             eprintln!("Session '{}' not found.", key);
             eprintln!("Use `nanobot sessions list` to see available sessions.");
-            std::process::exit(1);
+            return;
         }
     };
 
@@ -81,7 +81,7 @@ pub fn cmd_sessions_export(key: &str, format: &str) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error reading session file: {}", e);
-            std::process::exit(1);
+            return;
         }
     };
 

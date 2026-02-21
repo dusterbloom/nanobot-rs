@@ -58,6 +58,7 @@
 - `cmd_sessions_purge()` - Remove files older than a duration
 - `cmd_sessions_archive()` - Show disk usage summary
 - `make_session_key()` - Generate session key from optional name
+- Also available in REPL via `/sessions` (`/ss` alias) with list/export/purge/archive/index subcommands
 
 ### 2. Agent Loop (`src/agent/agent_loop.rs`)
 
@@ -302,6 +303,13 @@ trait Channel: Send + Sync {
 - Stored at `{workspace}/memory/sessions/`
 - Auto-completes after inactivity
 - Injected into system prompt
+
+**SessionIndexer (`session_indexer.rs`):**
+- Bridges raw JSONL sessions → searchable `SESSION_{hash}.md` files
+- `extract_session_content()` — pure function: extracts user+assistant messages from JSONL lines
+- `index_sessions()` — scans `~/.nanobot/sessions/`, creates `.md` for orphaned JSONL files
+- Indexed files have `status: indexed` (distinct from `active`/`completed`/`archived`)
+- Run via `/sessions index` (REPL) or `nanobot sessions index` (CLI)
 
 **LearningStore (`learning.rs`):**
 - Experience database in JSONL (`{workspace}/memory/learnings.jsonl`)
@@ -593,7 +601,10 @@ Applied to live conversation
     ├── CONTEXT-cli.md    # Per-channel context
     ├── memory/
     │   ├── MEMORY.md     # Long-term facts
-    │   └── 2026-02-20.md # Daily notes
+    │   ├── 2026-02-20.md # Daily notes
+    │   └── sessions/     # Working memory + indexed sessions
+    │       ├── SESSION_{hash}.md  # Compaction summaries + indexed JSONL extracts
+    │       └── archived/          # Completed sessions
     ├── skills/           # Custom skills
     ├── profiles/         # Subagent profiles
     ├── events.jsonl      # Subagent results
@@ -607,7 +618,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1378 tests in codebase (run `cargo test -- --list` for current count)
+- ~1390 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 

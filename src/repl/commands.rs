@@ -252,6 +252,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/t" | "/thinking" => "/think",
         "/nt" => "/nothink",
         "/v" => "/voice",
+        "/ss" => "/sessions",
         "/wa" => "/whatsapp",
         "/tg" => "/telegram",
         "/p" | "/prov" => "/provenance",
@@ -343,6 +344,9 @@ impl ReplContext {
             }
             "/trio" => {
                 self.cmd_trio(arg).await;
+            }
+            "/sessions" => {
+                self.cmd_sessions(arg);
             }
             #[cfg(feature = "voice")]
             "/voice" => {
@@ -987,6 +991,55 @@ impl ReplContext {
             }
             self.active_channels.clear();
             println!("  All channels stopped.\n");
+        }
+    }
+
+    /// /sessions — session management (list, export, purge, archive, index).
+    fn cmd_sessions(&self, arg: &str) {
+        let (sub, rest) = arg
+            .split_once(' ')
+            .map(|(s, r)| (s.trim(), r.trim()))
+            .unwrap_or((if arg.is_empty() { "list" } else { arg }, ""));
+
+        match sub {
+            "list" => {
+                crate::sessions_cmd::cmd_sessions_list();
+            }
+            "export" => {
+                if rest.is_empty() {
+                    eprintln!("Usage: /sessions export <session-key> [format]");
+                    return;
+                }
+                let (key, fmt) = rest
+                    .split_once(' ')
+                    .map(|(k, f)| (k.trim(), f.trim()))
+                    .unwrap_or((rest, "md"));
+                crate::sessions_cmd::cmd_sessions_export(key, fmt);
+            }
+            "purge" => {
+                if rest.is_empty() {
+                    eprintln!("Usage: /sessions purge <duration> (e.g. 7d, 24h)");
+                    return;
+                }
+                crate::sessions_cmd::cmd_sessions_purge(rest);
+            }
+            "archive" => {
+                crate::sessions_cmd::cmd_sessions_archive();
+            }
+            "index" => {
+                let sessions_dir = dirs::home_dir().unwrap().join(".nanobot/sessions");
+                let core = self.core_handle.swappable();
+                let memory_sessions_dir = core.workspace.join("memory").join("sessions");
+                let (indexed, skipped, errors) =
+                    crate::agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
+                println!(
+                    "Indexed {} sessions ({} skipped, {} errors)",
+                    indexed, skipped, errors
+                );
+            }
+            _ => {
+                eprintln!("Unknown subcommand '{}'. Available: list, export, purge, archive, index", sub);
+            }
         }
     }
 
@@ -2521,6 +2574,7 @@ mod tests {
         assert_eq!(normalize_alias("/s"), "/status");
         assert_eq!(normalize_alias("/rd"), "/restart");
         assert_eq!(normalize_alias("/ctx-info"), "/context");
+        assert_eq!(normalize_alias("/ss"), "/sessions");
     }
 
     #[test]
