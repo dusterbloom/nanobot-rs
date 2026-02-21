@@ -32,7 +32,8 @@ use crate::agent::tool_guard::ToolGuard;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::validation;
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::config::schema::{EmailConfig, ProprioceptionConfig};
+use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
+use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
 
@@ -75,6 +76,10 @@ pub(crate) struct AgentLoopShared {
     pub(crate) aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
     /// Sticky per-session policy flags (e.g. local_only).
     pub(crate) session_policies: Arc<Mutex<HashMap<String, policy::SessionPolicy>>>,
+    /// Per-session LCM engines for lossless context management.
+    pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
+    /// LCM configuration.
+    pub(crate) lcm_config: LcmSchemaConfig,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -288,7 +293,23 @@ impl AgentLoopShared {
         };
 
         // Build per-message tools with context baked in.
-        let tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+        let mut tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
+
+        // Register lcm_expand tool when LCM is enabled.
+        if self.lcm_config.enabled {
+            let lcm_engine = {
+                let mut engines = self.lcm_engines.lock().await;
+                engines
+                    .entry(session_key.clone())
+                    .or_insert_with(|| {
+                        let config = LcmConfig::from(&self.lcm_config);
+                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
+                    })
+                    .clone()
+            };
+            use crate::agent::lcm::LcmExpandTool;
+            tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
+        }
 
         // Get session history. Track count so we know where new messages start.
         let history = core
@@ -724,7 +745,91 @@ impl AgentLoopShared {
         );
 
         // Spawn background compaction when threshold exceeded.
-        if !ctx.compaction.in_flight.load(Ordering::Relaxed)
+        // When LCM is enabled, use the LCM engine's control loop instead.
+        if self.lcm_config.enabled {
+            // LCM path: get or create per-session engine, check thresholds.
+            let lcm_engine = {
+                let mut engines = self.lcm_engines.lock().await;
+                engines
+                    .entry(ctx.session_key.clone())
+                    .or_insert_with(|| {
+                        let config = LcmConfig::from(&self.lcm_config);
+                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
+                    })
+                    .clone()
+            };
+
+            // Feed messages into the LCM engine's store (idempotent by index).
+            {
+                let mut engine = lcm_engine.lock().await;
+                let store_len = engine.store_len();
+                for msg in ctx.messages.iter().skip(store_len) {
+                    engine.ingest(msg.clone());
+                }
+            }
+
+            // Check thresholds and spawn compaction if needed.
+            if !ctx.compaction.in_flight.load(Ordering::Relaxed) {
+                let action = {
+                    let engine = lcm_engine.lock().await;
+                    engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens)
+                };
+
+                match action {
+                    CompactionAction::Async | CompactionAction::Blocking => {
+                        let slot = ctx.compaction.slot.clone();
+                        let in_flight = ctx.compaction.in_flight.clone();
+                        let bg_messages = ctx.messages.clone();
+                        let bg_core = ctx.core.clone();
+                        let bg_session_key = ctx.session_key.clone();
+                        let bg_lcm = lcm_engine.clone();
+                        let watermark = ctx.messages.len();
+                        in_flight.store(true, Ordering::SeqCst);
+
+                        if action == CompactionAction::Async {
+                            // Mark async pending so we don't re-trigger.
+                            let mut engine = lcm_engine.lock().await;
+                            engine.request_async_compaction();
+                        }
+
+                        tokio::spawn(async move {
+                            let observation = {
+                                let mut engine = bg_lcm.lock().await;
+                                engine
+                                    .compact(&bg_core.compactor, &bg_core.token_budget, 0)
+                                    .await
+                            };
+
+                            // Update working memory with compaction observation.
+                            if bg_core.memory_enabled {
+                                if let Some(ref summary) = observation {
+                                    bg_core
+                                        .working_memory
+                                        .update_from_compaction(&bg_session_key, summary);
+                                }
+                            }
+
+                            // Build CompactionResult from LCM's active context.
+                            let compacted_messages = {
+                                let engine = bg_lcm.lock().await;
+                                engine.active_context()
+                            };
+
+                            if compacted_messages.len() < bg_messages.len() {
+                                let result = crate::agent::compaction::CompactionResult {
+                                    messages: compacted_messages,
+                                    observation,
+                                };
+                                *slot.lock().await =
+                                    Some(PendingCompaction { result, watermark });
+                            }
+                            in_flight.store(false, Ordering::SeqCst);
+                        });
+                    }
+                    CompactionAction::None => {}
+                }
+            }
+        } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)
             && ctx.core
                 .compactor
                 .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
@@ -1561,6 +1666,7 @@ impl AgentLoop {
         repl_display_tx: Option<UnboundedSender<String>>,
         providers_config: Option<crate::config::schema::ProvidersConfig>,
         proprioception_config: ProprioceptionConfig,
+        lcm_config: LcmSchemaConfig,
     ) -> Self {
         // Read core to initialize the subagent manager.
         let core = core_handle.swappable();
@@ -1625,6 +1731,8 @@ impl AgentLoop {
             aha_rx: Arc::new(Mutex::new(aha_rx)),
             aha_tx,
             session_policies: Arc::new(Mutex::new(HashMap::new())),
+            lcm_engines: Arc::new(Mutex::new(HashMap::new())),
+            lcm_config,
         });
 
         Self {
@@ -2540,5 +2648,240 @@ mod tests {
             "delegation",
             "Tool runner should use delegation provider"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Full agent loop with LCM enabled against real local LLM.
+    //
+    // This test requires LM Studio (or compatible) running. Set env vars:
+    //   NANOBOT_LCM_TEST_BASE  — API base (default: http://127.0.0.1:1234/v1)
+    //   NANOBOT_LCM_TEST_MODEL — Model name (default: local-model)
+    //
+    // Run with: cargo test test_real_lcm_e2e -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "requires running local LLM on NANOBOT_LCM_TEST_BASE"]
+    async fn test_real_lcm_e2e_compact_and_expand() {
+        use crate::config::schema::LcmSchemaConfig;
+
+        let api_base = std::env::var("NANOBOT_LCM_TEST_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
+        let model_name = std::env::var("NANOBOT_LCM_TEST_MODEL")
+            .unwrap_or_else(|_| "local-model".to_string());
+
+        eprintln!("LCM E2E: using {} model={}", api_base, model_name);
+
+        // Real provider pointing at local LLM.
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            OpenAICompatProvider::new("local", Some(&api_base), Some(&model_name)),
+        );
+
+        // Warm up: verify the model is responding.
+        let warmup = provider
+            .chat(
+                &[json!({"role": "user", "content": "Reply with exactly: ok"})],
+                None,
+                Some(&model_name),
+                32,
+                0.0,
+                None,
+            )
+            .await;
+        match warmup {
+            Ok(r) => eprintln!("LCM E2E warmup: {}", r.content.as_deref().unwrap_or("(empty)")),
+            Err(e) => panic!("LCM E2E: model not responding at {}: {}", api_base, e),
+        }
+
+        let workspace = tempfile::tempdir().unwrap().keep();
+
+        // Build core with small context window + LCM thresholds that trigger fast.
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: provider.clone(),
+            workspace: workspace.clone(),
+            model: model_name.clone(),
+            max_iterations: 3,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 2048, // Tiny so compaction triggers quickly.
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: Some(provider.clone()),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+        });
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(2048));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let lcm_config = LcmSchemaConfig {
+            enabled: true,
+            tau_soft: 0.3,  // Trigger early.
+            tau_hard: 0.6,
+            deterministic_target: 128,
+        };
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None, // no cron
+            1,
+            None, // no email
+            None, // no repl display
+            None, // no providers config
+            ProprioceptionConfig::default(),
+            lcm_config,
+        );
+
+        let session_key = "lcm-e2e-test";
+        let mut responses = Vec::new();
+
+        // Send 12 verbose messages to fill the tiny 2K context.
+        let prompts = [
+            "Explain Rust ownership rules in detail with examples of move semantics. Be thorough and give at least 3 examples.",
+            "Now explain borrowing and the difference between mutable and immutable references with code examples.",
+            "Describe lifetime annotations and why they are needed. Give concrete examples with structs and functions.",
+            "What are the rules for lifetime elision? When can you omit lifetime annotations? List all three rules.",
+            "Explain smart pointers: Box, Rc, Arc, and when to use each one. Give a real-world use case for each.",
+            "What is interior mutability? Explain Cell, RefCell, and Mutex with examples of each.",
+            "Describe async/await in Rust. How do Futures work under the hood? Explain the state machine transformation.",
+            "Explain trait objects vs generics. When would you use dynamic dispatch vs static dispatch?",
+            "What are the differences between String and &str? When should you use each one in function signatures?",
+            "Explain the Drop trait and how Rust's destructors work. What is the order of dropping?",
+            "Describe the Pin and Unpin traits. Why are they needed for async Rust and self-referential structs?",
+            "Explain how pattern matching works in Rust. Cover match, if let, while let, and destructuring.",
+        ];
+
+        for (i, prompt) in prompts.iter().enumerate() {
+            eprintln!("LCM E2E: sending message {}/{}...", i + 1, prompts.len());
+            let resp = agent_loop
+                .process_direct(prompt, session_key, "test", "lcm-e2e")
+                .await;
+            eprintln!(
+                "LCM E2E: response {} ({} chars): {}",
+                i + 1,
+                resp.len(),
+                &resp[..resp.len().min(80)]
+            );
+            assert!(
+                !resp.is_empty(),
+                "Message {} should get a non-empty response",
+                i + 1
+            );
+            responses.push(resp);
+        }
+
+        // Check LCM engine state.
+        let engines = agent_loop.shared.lcm_engines.lock().await;
+        let engine_arc = engines
+            .get(session_key)
+            .expect("LCM engine should exist for session");
+        let engine = engine_arc.lock().await;
+
+        eprintln!(
+            "LCM E2E results: store={} active={} dag_nodes={}",
+            engine.store_len(),
+            engine.active_len(),
+            engine.dag_ref().len()
+        );
+
+        // Invariant 1: store has messages from the conversation.
+        // Note: with is_local + small context, trim_to_fit_with_age runs before
+        // LCM ingestion, so the store only contains messages that survived trimming.
+        // The session JSONL (on-disk) is the true immutable store; the in-memory
+        // LCM store tracks what entered the active context window.
+        assert!(
+            engine.store_len() >= 5,
+            "Store should have at least 5 messages (system + some turns), got {}",
+            engine.store_len()
+        );
+
+        // Invariant 2: active context should be shorter than store (compaction happened).
+        // With tau_soft=0.3 and 4K context, compaction should trigger early.
+        assert!(
+            engine.active_len() < engine.store_len(),
+            "Active ({}) should be shorter than store ({}) — compaction should have triggered",
+            engine.active_len(),
+            engine.store_len()
+        );
+
+        // Invariant 3: DAG should have at least one summary node.
+        assert!(
+            engine.dag_ref().len() >= 1,
+            "DAG should have at least 1 summary node, got {}",
+            engine.dag_ref().len()
+        );
+
+        // Invariant 4: every summary node's source IDs resolve to real messages.
+        for i in 0..engine.dag_ref().len() {
+            let node = engine.dag_ref().get(i).unwrap();
+            let expanded = engine.expand(&node.source_ids);
+            assert_eq!(
+                expanded.len(),
+                node.source_ids.len(),
+                "Summary node {} has {} source IDs but only {} resolve",
+                i,
+                node.source_ids.len(),
+                expanded.len()
+            );
+            eprintln!(
+                "  DAG node {}: level={} sources={:?} tokens={}",
+                i, node.level, node.source_ids, node.tokens
+            );
+        }
+
+        // Invariant 5: active context contains at least one Summary entry.
+        let summary_count = engine
+            .active_entries()
+            .iter()
+            .filter(|e| matches!(e, crate::agent::lcm::ContextEntry::Summary { .. }))
+            .count();
+        assert!(
+            summary_count >= 1,
+            "Active context should have at least 1 summary entry, got {}",
+            summary_count
+        );
+
+        // Invariant 6: lossless expand — all store IDs are retrievable.
+        let all_ids: Vec<usize> = (0..engine.store_len()).collect();
+        let expanded = engine.expand(&all_ids);
+        assert_eq!(
+            expanded.len(),
+            engine.store_len(),
+            "All {} store messages should be retrievable via expand",
+            engine.store_len()
+        );
+        for (id, msg) in &expanded {
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            assert!(
+                !content.is_empty(),
+                "Expanded message {} should have content",
+                id
+            );
+        }
+
+        eprintln!("LCM E2E: ALL INVARIANTS PASSED");
+        eprintln!(
+            "  Messages: {} stored, {} active, {} summary nodes",
+            engine.store_len(),
+            engine.active_len(),
+            engine.dag_ref().len()
+        );
+
+        // Cleanup.
+        drop(engine);
+        drop(engines);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

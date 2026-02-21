@@ -760,6 +760,25 @@ impl ContextCompactor {
         }
     }
 
+    /// Summarize messages for LCM escalation levels.
+    ///
+    /// `mode` selects the summarization strategy:
+    /// - `"preserve_details"`: Keep all facts, decisions, and tool results (Level 1).
+    /// - `"bullet_points"`: Compress to bullet points only (Level 2).
+    pub async fn summarize_for_lcm(&self, messages: &[Value], mode: &str) -> Result<String> {
+        if messages.is_empty() {
+            return Ok(String::new());
+        }
+
+        let prompt = match mode {
+            "preserve_details" => SUMMARIZE_PROMPT,
+            "bullet_points" => SUMMARIZE_PROMPT_ADVANCED,
+            _ => SUMMARIZE_PROMPT,
+        };
+
+        self.summarize_with_prompt(messages, prompt).await
+    }
+
     /// compact_via_summary with a custom prompt.
     async fn compact_via_summary_with_prompt(
         &self,

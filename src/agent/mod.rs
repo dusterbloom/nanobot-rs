@@ -14,6 +14,7 @@ pub mod context_hygiene;
 pub mod context_store;
 pub mod eval;
 pub mod knowledge_store;
+pub mod lcm;
 pub mod learning;
 pub mod lora_bridge;
 pub mod memory;

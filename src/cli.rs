@@ -702,6 +702,7 @@ pub(crate) fn create_agent_loop(
         repl_display_tx,
         Some(config.providers.clone()),
         config.proprioception.clone(),
+        config.lcm.clone(),
     )
 }
 
@@ -761,6 +762,7 @@ pub(crate) async fn run_gateway_async(
         repl_display_tx,
         Some(config.providers.clone()),
         config.proprioception.clone(),
+        config.lcm.clone(),
     );
 
     // Initialize voice pipeline for channels (when voice feature is enabled).

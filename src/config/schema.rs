@@ -1195,6 +1195,58 @@ pub struct VoiceConfig {
 }
 
 // ---------------------------------------------------------------------------
+// LCM (Lossless Context Management) config
+// ---------------------------------------------------------------------------
+
+fn default_lcm_tau_soft() -> f64 {
+    0.5
+}
+
+fn default_lcm_tau_hard() -> f64 {
+    0.85
+}
+
+fn default_lcm_deterministic_target() -> usize {
+    512
+}
+
+/// Configuration for Lossless Context Management.
+///
+/// LCM replaces destructive compaction with a dual-state memory:
+/// an immutable store (session JSONL) + active context with hierarchical
+/// summaries. Summaries contain pointers back to originals, so the LLM
+/// can `lcm_expand` any summary to recover the full messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LcmSchemaConfig {
+    /// Enable LCM (default: false for backward compatibility).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Soft threshold as fraction of available context (0.0-1.0).
+    /// Triggers async (non-blocking) compaction. Default: 0.5 (50%).
+    #[serde(default = "default_lcm_tau_soft")]
+    pub tau_soft: f64,
+    /// Hard threshold as fraction of available context (0.0-1.0).
+    /// Triggers blocking compaction. Default: 0.85 (85%).
+    #[serde(default = "default_lcm_tau_hard")]
+    pub tau_hard: f64,
+    /// Target tokens for Level 3 deterministic truncation (default: 512).
+    #[serde(default = "default_lcm_deterministic_target")]
+    pub deterministic_target: usize,
+}
+
+impl Default for LcmSchemaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tau_soft: default_lcm_tau_soft(),
+            tau_hard: default_lcm_tau_hard(),
+            deterministic_target: default_lcm_deterministic_target(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -1226,6 +1278,8 @@ pub struct Config {
     pub proprioception: ProprioceptionConfig,
     #[serde(default)]
     pub trio: TrioConfig,
+    #[serde(default)]
+    pub lcm: LcmSchemaConfig,
 }
 
 impl Config {
@@ -1815,5 +1869,46 @@ mod tests {
         let json = serde_json::to_string(&trio).unwrap();
         assert!(!json.contains("routerEndpoint"), "None endpoints should be skipped");
         assert!(!json.contains("specialistEndpoint"), "None endpoints should be skipped");
+    }
+
+    #[test]
+    fn test_lcm_config_defaults() {
+        let lcm = LcmSchemaConfig::default();
+        assert!(!lcm.enabled);
+        assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
+        assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
+        assert_eq!(lcm.deterministic_target, 512);
+    }
+
+    #[test]
+    fn test_lcm_config_roundtrip() {
+        let mut lcm = LcmSchemaConfig::default();
+        lcm.enabled = true;
+        lcm.tau_soft = 0.6;
+        lcm.tau_hard = 0.9;
+        lcm.deterministic_target = 256;
+        let json = serde_json::to_string(&lcm).unwrap();
+        let lcm2: LcmSchemaConfig = serde_json::from_str(&json).unwrap();
+        assert!(lcm2.enabled);
+        assert!((lcm2.tau_soft - 0.6).abs() < f64::EPSILON);
+        assert!((lcm2.tau_hard - 0.9).abs() < f64::EPSILON);
+        assert_eq!(lcm2.deterministic_target, 256);
+    }
+
+    #[test]
+    fn test_lcm_config_from_root_json() {
+        let json = r#"{"lcm": {"enabled": true, "tauSoft": 0.7, "tauHard": 0.9}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.lcm.enabled);
+        assert!((cfg.lcm.tau_soft - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.lcm.tau_hard - 0.9).abs() < f64::EPSILON);
+        assert_eq!(cfg.lcm.deterministic_target, 512); // default
+    }
+
+    #[test]
+    fn test_lcm_absent_defaults_to_disabled() {
+        let json = r#"{}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.lcm.enabled);
     }
 }
