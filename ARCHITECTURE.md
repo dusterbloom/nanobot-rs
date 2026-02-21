@@ -115,9 +115,11 @@ Modules extracted from or supporting `agent_loop.rs`:
 |--------|---------|
 | `agent_core.rs` | SwappableCore, RuntimeCounters, AgentHandle structs; core build helpers |
 | `tool_engine.rs` | Tool execution engine (delegated + inline paths) |
+| `tool_runner.rs` | Dedicated tool execution with separate LLM provider |
 | `tool_guard.rs` | Tool dedup/blocking guard — prevents repeated identical tool calls (B9) |
 | `tool_wiring.rs` | Dynamic per-phase tool registry assembly |
 | `toolplan.rs` | `ToolPlan` / `ToolPlanAction` types for router output |
+| `worker_tools.rs` | Worker-only tools: `verify`, `python_eval`, `diff_apply`, `fmt_convert` |
 | `router.rs` | Trio router preflight, dispatch, and specialist coordination |
 | `router_fallback.rs` | Deterministic fallback patterns (9 patterns + default) |
 | `anti_drift.rs` | Context hygiene hooks: pollution scoring, turn eviction, babble collapse, format anchors (I6) |
@@ -130,7 +132,26 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `context_gate.rs` | ContentGate — pass raw / structural briefing / drill-down (I3) |
 | `confidence_gate.rs` | Confidence-based gating for router decisions |
 | `budget_calibrator.rs` | Per-task-type budget calibration |
-| `eval/` | Evaluation framework: `hanoi.rs`, `haystack.rs`, `learning.rs`, `sprint.rs`, `runner.rs` |
+| `compaction.rs` | Context compaction — summarizes old messages to free token budget |
+| `token_budget.rs` | Token budget tracking and enforcement |
+| `audit.rs` | Append-only audit log with hash chain integrity (provenance) |
+| `provenance.rs` | Source provenance tracking for tool results |
+| `validation.rs` | Response validation and quality checks |
+| `session_indexer.rs` | JSONL session → searchable SESSION_*.md indexer |
+| `model_prices.rs` | Per-model token pricing for cost tracking |
+| `observer.rs` | Observation/summary generation |
+| `context_hygiene.rs` | Context cleanup utilities |
+| `context_store.rs` | Persistent context state storage |
+| `knowledge_store.rs` | Knowledge base storage |
+| `bulletin.rs` | Status bulletin injection |
+| `system_state.rs` | System state introspection |
+| `agent_profiles.rs` | Subagent profile loading and management |
+| `lora_bridge.rs` | LoRA adapter hot-swap bridge (Phase 3) |
+| `process_tree.rs` | Persistent execution tree for multi-step processes (Phase 2) |
+| `step_voter.rs` | MAKER voting for step validation (Phase 2) |
+| `reflector.rs` | Self-reflection and learning extraction |
+| `tuning.rs` | Runtime tuning parameters |
+| `eval/` | Evaluation framework: `hanoi.rs`, `haystack.rs`, `learning.rs`, `sprint.rs`, `runner.rs`, `results.rs` |
 
 ### 3. Provider System (`src/providers/`)
 
@@ -149,6 +170,10 @@ OpenAICompatProvider (main implementation)
 AnthropicProvider (native Anthropic Messages API)
 ├── Used exclusively for OAuth/Claude Max flows
 └── Speaks native Anthropic API, not OpenAI-compat
+
+factory.rs        - Provider instantiation from config
+oauth.rs          - OAuth token management for Anthropic
+transcription.rs  - Audio transcription provider
 ```
 
 **Provider Selection Priority:**
@@ -165,7 +190,7 @@ OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > ZhipuCoding > Groq
 ```rust
 ProviderError {
     HttpError(String),       // Network/transport failures
-    ResponseReadError,       // Body read failures
+    ResponseReadError(String),  // Body read failures
     JsonParseError,          // Malformed JSON
     RateLimited { status, retry_after_ms },  // 429 with server hint
     AuthError { status, message },           // 401/403
@@ -392,7 +417,7 @@ Config {
 **ProprioceptionConfig (8 fields):**
 - `enabled`, `dynamic_tool_scoping`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`
 
-**ToolDelegationConfig (17 fields):**
+**ToolDelegationConfig (18 fields):**
 - `mode: DelegationMode` — enum: `Inline` (no delegation), `Delegated` (default, tool runner model), `Trio` (strict role separation)
 - `apply_mode()` — Applies mode to flags: Inline disables all, Delegated enables tool runner, Trio enables `strict_no_tools_main` + `strict_router_schema` + `role_scoped_context_packs`
 - Key fields: `enabled`, `model`, `provider`, `max_iterations`, `max_tokens`, `slim_results`, `max_result_preview_chars`, `auto_local`, `cost_budget`, `default_subagent_model`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `strict_local_only`, `strict_toolplan_validation`, `deterministic_router_fallback`, `max_same_tool_call_per_turn`
@@ -618,7 +643,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1390 tests in codebase (run `cargo test -- --list` for current count)
+- ~1395 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 

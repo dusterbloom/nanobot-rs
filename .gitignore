@@ -7,3 +7,5 @@ bridge/whatsapp/node_modules/
 .DS_Store
 .claude/
 .sisyphus/
+.venv/
+experiments/**/.venv/
