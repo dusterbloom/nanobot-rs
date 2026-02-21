@@ -1168,9 +1168,9 @@ mod tests {
 
         let input_tokens = TokenBudget::estimate_tokens(&conversation[1..]); // skip system
 
-        eprintln!("\n{'=':.>70}");
+        eprintln!("\n{}", "=".repeat(70));
         eprintln!("LCM COMPACTION BENCHMARK");
-        eprintln!("{'=':.>70}");
+        eprintln!("{}", "=".repeat(70));
         eprintln!("Input: {} messages, {} tokens", turns.len(), input_tokens);
         eprintln!("API: {}", api_base);
         eprintln!("{:-<70}", "");
