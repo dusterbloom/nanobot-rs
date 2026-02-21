@@ -416,8 +416,8 @@ Config {
 **WorkerConfig (5 fields):**
 - `enabled`, `max_depth` (delegation depth, default 3), `python` (enable python_eval), `delegate` (enable recursive workers), `budget_multiplier` (0.0-1.0, default 0.5)
 
-**LcmSchemaConfig (4 fields):**
-- `enabled` (default: false), `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 truncation target tokens, default 512)
+**LcmSchemaConfig (6 fields):**
+- `enabled` (default: false), `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 truncation target tokens, default 512), `compaction_endpoint` (optional `ModelEndpoint` for dedicated compaction model), `compaction_context_size` (compaction model context window, default 4096)
 
 **ProprioceptionConfig (8 fields):**
 - `enabled`, `dynamic_tool_scoping`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`
@@ -427,7 +427,29 @@ Config {
 - `apply_mode()` — Applies mode to flags: Inline disables all, Delegated enables tool runner, Trio enables `strict_no_tools_main` + `strict_router_schema` + `role_scoped_context_packs`
 - Key fields: `enabled`, `model`, `provider`, `max_iterations`, `max_tokens`, `slim_results`, `max_result_preview_chars`, `auto_local`, `cost_budget`, `default_subagent_model`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `strict_local_only`, `strict_toolplan_validation`, `deterministic_router_fallback`, `max_same_tool_call_per_turn`
 
-### 11. Event Bus (`src/bus/events.rs`)
+### 11. Heartbeat & Health (`src/heartbeat/`)
+
+**HeartbeatService (`service.rs`):**
+- Periodic background loop with three layers:
+  - Layer 0: Health probe dispatch (lightweight, no LLM)
+  - Layer 1: Maintenance shell commands (unconditional)
+  - Layer 2: HEARTBEAT.md agent tasks (optional, requires LLM callback)
+- Configurable interval (default 300s)
+
+**HealthRegistry (`health.rs`):**
+- Pluggable `HealthProbe` trait: `name()`, `interval_secs()`, `check() -> ProbeResult`
+- `ProbeState` state machine: Unknown → Healthy (on success) → Degraded (after 3 consecutive failures) → Healthy (on recovery)
+- `is_healthy(name)` — optimistic default (unknown probes return true)
+- `build_registry(config)` — config-driven factory, registers probes for enabled features
+- `LcmCompactionProbe` — GET `/health` with 5s timeout, 60s interval
+- States readable via `/status` REPL command (HEALTH section)
+
+**Compaction Timeout Guard (`agent_loop.rs`):**
+- Both compaction spawns wrapped in 30s `tokio::time::timeout`
+- `in_flight` flag always resets (outside timeout scope)
+- Pre-flight check skips compaction when endpoint degraded
+
+### 12. Event Bus (`src/bus/events.rs`)
 
 **InboundMessage:**
 ```rust
@@ -459,7 +481,7 @@ Config {
 - Adds timing annotations `[+200ms]`
 - CLI/voice channels bypass coalescing
 
-### 12. Subagent System (`src/agent/subagent.rs`)
+### 13. Subagent System (`src/agent/subagent.rs`)
 
 **SubagentManager:**
 - Spawns background tasks with their own agent loops
@@ -476,7 +498,7 @@ Config {
 - `pipeline` - Run multi-step voting pipeline
 - `loop` - Autonomous refinement loop
 
-### 13. Observability
+### 14. Observability
 
 **Structured Tracing (both providers):**
 - `#[instrument]` spans on all 4 chat methods (`chat`/`chat_stream` x2 providers)
@@ -648,7 +670,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1407 tests in codebase (run `cargo test -- --list` for current count)
+- ~1429 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 

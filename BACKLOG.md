@@ -21,7 +21,7 @@
 > 2. **Start with a failing test or reproduction.** Show the broken state first.
 > 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
 > 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
-> 5. **B3-B10 are green. I7/LCM E2E verified. L1 concept router 80% accurate (2x orchestrator).** Blockers remaining: B5 (experiments), **B11 (heartbeat health layer)**, **B12 (config debt — proposal needed)**. Next priority: **B11 → B12 proposal → I9 (tiered routing) → I8 (SearXNG)**.
+> 5. **B3-B11 are green. I7/LCM E2E verified. L1 concept router 80% accurate (2x orchestrator).** Blockers remaining: B5 (experiments), **B12 (config debt — proposal needed)**. Next priority: **B12 proposal → I9 (tiered routing) → I8 (SearXNG)**.
 
 ---
 
@@ -29,7 +29,7 @@
 
 ### 🔴 Blocking — do first
 
-- [ ] **B11: Heartbeat as foundational liveness service** ⚡ — **Priority.** The current heartbeat is a glorified cron — shell commands + optional HEARTBEAT.md check. It needs to become the central liveness and health service that all modes (text/voice), channels (CLI/Telegram/WhatsApp), and configurations (local trio/cloud) depend on.
+- [x] **B11: Heartbeat as foundational liveness service** ⚡ — **Priority.** The current heartbeat is a glorified cron — shell commands + optional HEARTBEAT.md check. It needs to become the central liveness and health service that all modes (text/voice), channels (CLI/Telegram/WhatsApp), and configurations (local trio/cloud) depend on.
   **Current state (verified 2026-02-21):** Runs one hardcoded command (`qmd update -c sessions`), LLM callback always `None` (never wired), `#![allow(dead_code)]` on the module. Zero awareness of providers, endpoints, channels, or self-health.
   **Health probes needed:**
   | Probe | What | Frequency | Action on failure |
@@ -270,6 +270,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 ## Done ✅
 
+- ~~B11: Heartbeat as foundational liveness service~~ — `HealthRegistry` with pluggable `HealthProbe` trait, config-driven probe registration via `build_registry()`. First probe: `LcmCompactionProbe` (GET /health, 5s timeout, 60s interval, 3-failure degradation threshold). Critical fix: 30s timeout guard on both compaction spawns — `in_flight` always resets even on timeout/hang. Pre-flight check skips LCM compaction when endpoint degraded. Wired into HeartbeatService (Layer 0), AgentLoop, CLI, REPL. `/status` shows probe health with color indicators. 21 new tests (20 health module + 1 timeout guard), 1429 total green. (2026-02-21, `src/heartbeat/health.rs`, `src/agent/agent_loop.rs`)
 - ~~I7: Lossless Context Management (LCM)~~ — DAG-based lossless compaction. `LcmEngine` with three-level escalation (LLM preserve_details → bullet_points → deterministic truncate). Dual-threshold control loop (τ_soft/τ_hard). `lcm_expand` tool for lossless retrieval. E2E verified against 4 local models: qwen3-0.6b best compressor (83.2%, 3.4s), nemotron-nano-12b fastest (81.4%, 2.8s). 17 tests (4 mock E2E + 1 real E2E + 1 benchmark + 4 config + 9 unit). 1407 total green. (2026-02-21, `src/agent/lcm.rs`, commits `0697bd4`, `9893d91`, `bde583f`)
 - ~~B3: Update default local trio~~ — Trio configured: Main `gemma-3n-e4b-it`, Router `nvidia_orchestrator-8b`, Specialist `ministral-3-8b-instruct-2512`. Explicit config + B10 auto-detect. (2026-02-21)
 - ~~B4: Multi-model config schema~~ — Closed as obsolete. TrioConfig provides per-role model/port/endpoint. LM Studio JIT-loads models; no separate server spawning needed. (2026-02-21)
@@ -282,7 +283,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 - ~~B6: SLM provider observability~~ — 8 silent failure paths now logged. `#[instrument]` spans on `chat()`/`chat_stream()`. Promoted `llm_call_failed` to `warn!`. (2026-02-21, commit `0b6bc5f`)
 - ~~Fix: Audit log hash chain race condition~~ — `record()` had a TOCTOU bug: seq allocation + prev_hash read were not serialized under the file lock. Two concurrent executors (tool_runner + inline) both read seq 940 and wrote seq 941 with the same prev_hash, forking the chain at entry 942. Fix: acquire file lock first, re-read authoritative seq + prev_hash from file under lock, then compute hash and write. 12/12 audit tests pass. (2026-02-21, commit `835cf6d`, `src/agent/audit.rs`)
 - ~~B1: 132 compiler warnings~~ → 0 warnings (2026-02-20)
-- ~~B2: 2 test failures~~ → 1395 pass, 0 fail (2026-02-21)
+- ~~B2: 2 test failures~~ → 1429 pass, 0 fail (2026-02-21)
 - ~~Fix: Subprocess stdin steal~~ — `.stdin(Stdio::null())` on all 4 spawn sites in shell.rs + worker_tools.rs (2026-02-20)
 - ~~Fix: Esc-mashing freezes REPL~~ — drain_stdin() after cancel (2026-02-20, commit 57ec883)
 - ~~Fix stale comment in `ensure_compaction_model`~~ (2026-02-17)
