@@ -367,8 +367,9 @@ fn main() {
 
     // Chrome tracing: build layer + guard (feature-gated).
     // Guard must live until program exit to flush the trace file.
+    // Don't drop guard in async context — it can cause tokio panic on /local toggle.
     #[cfg(feature = "trace-chrome")]
-    let _chrome_guard: tracing_chrome::FlushGuard;
+    let mut _chrome_guard_opt: Option<tracing_chrome::FlushGuard> = None;
 
     if is_interactive_repl {
         // Redirect tracing to a daily-rotated log file to prevent WARN logs from
@@ -412,7 +413,7 @@ fn main() {
                 .file(trace_path)
                 .include_args(true)
                 .build();
-            _chrome_guard = guard;
+            _chrome_guard_opt = Some(guard);
 
             tracing_subscriber::registry()
                 .with(env_filter)
@@ -449,7 +450,7 @@ fn main() {
                 .file(trace_path)
                 .include_args(true)
                 .build();
-            _chrome_guard = guard;
+            _chrome_guard_opt = Some(guard);
 
             tracing_subscriber::registry()
                 .with(env_filter)
