@@ -323,10 +323,15 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     };
 
     let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+    let compaction_ctx_size = if memory_config.compaction_model_context_size > 0 {
+        memory_config.compaction_model_context_size
+    } else {
+        max_context_tokens
+    };
     let compactor = ContextCompactor::new(
         memory_provider.clone(),
         memory_model.clone(),
-        max_context_tokens,
+        compaction_ctx_size,
     )
     .with_thresholds(
         memory_config.compaction_threshold_percent,

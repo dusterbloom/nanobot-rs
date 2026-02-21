@@ -5,6 +5,26 @@
 
 ---
 
+## Ways of Working
+
+> The codebase has coherence debt. Features are designed but not wired end-to-end.
+> Trio mode exists in docs and config flags but never completed a real session.
+> Compaction exists but crashes when it matters most. Context budgets exist but
+> aren't enforced per role. The pattern: design → partial implement → patch holes → next feature.
+>
+> **New rule: every blocking item must have a verification step.**
+> "Done" means: ran a real session with local models, checked metrics, checked logs,
+> confirmed the feature actually fired. Not "code compiles and tests pass."
+>
+> When working with Claude Code on these items:
+> 1. **One item at a time.** Don't let it "also fix" adjacent things.
+> 2. **Start with a failing test or reproduction.** Show the broken state first.
+> 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
+> 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
+> 5. **No new features until B8 and B9 are green.** Everything else is noise if trio mode doesn't activate.
+
+---
+
 ## Phase 0: Foundation (current)
 
 ### 🔴 Blocking — do first
@@ -26,6 +46,20 @@
 - [ ] **B3.1: Smarter deterministic fallback** — `router_fallback.rs` only has 2 patterns (URL→web_fetch, "latest news"→spawn). Fails on "research report + URLs" which should spawn a researcher. Add pattern: research/report/summarize + URLs → `Subagent(researcher)`. _Ref: `src/agent/router_fallback.rs`_
 - [ ] **B4: Multi-model config schema** — Add `local.main`, `local.rlm`, `local.memory` to config. Each slot: `{ model, path, gpu, context_size, temperature }`. Server manager spawns up to 3 llama-server instances. _Ref: `docs/plans/local-model-matrix.md`_
 - [ ] **B5: RLM model evaluation** — Systematic experiments to find best RLM model per VRAM tier. Critical for "3 impossible things". See experiment plan below.
+- [ ] **B8: Trio mode activation & role-scoped context** ⚡ — **Root cause of 2026-02-20 local session failure.** NanBeige ran in Inline mode (full tool schemas in context) instead of Trio mode. Metrics showed `tool_calls_requested: 1, tool_calls_executed: 0` for 21 consecutive calls — Main was generating tool calls that got blocked as duplicates, proving `strict_no_tools_main` was NOT active. The existing architecture (`DelegationMode::Trio`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `router_preflight()`) is **designed but not wired for local sessions**. Steps:
+  1. **Trace config loading**: Follow the path from LM Studio detection → `DelegationMode` selection → `apply_mode()`. Find where Trio mode should activate and doesn't. Add `info!` log: `"delegation_mode={:?}"` at startup.
+  2. **Verify `router_preflight()` fires**: Add `info!` when preflight runs AND when it's skipped (with reason). Currently silent on skip.
+  3. **Verify role-scoped context packs differ by role**: When `role_scoped_context_packs = true`, Main must NOT receive tool schemas. Check `build_context()` or equivalent — does it actually branch on role?
+  4. **Slim Main's system prompt for local**: Main (3B) needs ~500 tokens of identity + conversation rules + task state. NOT the full AGENTS.md + SOUL.md + TOOLS.md (~15-20K tokens). Add a `build_local_main_prompt()` that strips everything except personality core and working memory.
+  5. **Verification**: Start local session → check `nanobot.log` for `delegation_mode=Trio` → send a message requiring a tool → confirm Main emits natural language intent (not a tool call) → confirm Router preflight intercepts → confirm Specialist executes tool → check `metrics.jsonl` for correct role labels.
+  _Ref: 2026-02-21 diagnostic session, `docs/local-ai-swarm-architecture.md`, `src/agent/router.rs`_
+- [ ] **B9: Compaction safety guard** — Compaction using ministral-3-8b crashes with `n_keep (12620) >= n_ctx (8192)` when context exceeds specialist's window. This creates a **death spiral**: failed tools → context grows → compaction fails → context grows more → model performance degrades. Two crashes observed at 22:49:46 and 22:53:56 in the same session. Steps:
+  1. **Pre-flight check**: Before sending compaction prompt, compare `estimated_tokens` against `model_ctx * 0.85`. If over, skip compaction gracefully (log `warn!`, don't error).
+  2. **Emergency truncation**: If compaction is skipped AND context > 90% of Main's window, drop oldest non-pinned turns (keep system prompt + last 3 turns + pinned context).
+  3. **Circuit breaker on duplicate tool calls**: After 2 consecutive all-blocked turns (not 7-8 as observed), force-stop the tool loop and emit the last text response. The current `max_same_tool_call_per_turn: 1` blocks individual calls but doesn't stop the retry loop.
+  4. **Better duplicate feedback**: Instead of just "blocked", inject: `"Tool already called with these args. Result was: [previous result]. Use it or try different arguments."` — give the model the cached result instead of an error.
+  5. **Verification**: Start local session → trigger a tool call → observe at most 2 retries in `nanobot.log` → confirm compaction either succeeds or gracefully skips → confirm no `n_keep >= n_ctx` errors.
+  _Ref: 2026-02-21 diagnostic session, `nanobot.log.2026-02-20` lines at 22:49:46 and 22:53:56_
 
 ### 🟡 Important — do soon
 
@@ -104,6 +138,9 @@
 - **Deterministic fallback too narrow**: `router_fallback.rs` has 2 patterns only — URLs→web_fetch (first URL), "latest news"→spawn. Everything else→ask_user. Misses research/report patterns.
 - **Specialist has no tools**: `dispatch_specialist()` sends a single-shot chat — no tool access. Can synthesize given context but cannot fetch/execute.
 - **Trio never tested end-to-end**: As of 2026-02-19 handoff, the full trio flow (Main→Router→Specialist) has never completed a real task through LM Studio.
+- **2026-02-21 diagnostic: Trio mode didn't activate.** NanBeige ran as Inline main with full tool schemas. 21 metrics entries show `tool_calls_requested: 1, tool_calls_executed: 0` — model generated tool calls (proving it had tool schemas) that were blocked as duplicates. Compaction crashed twice (`n_keep 12620 >= n_ctx 8192`). Death spiral: blocked tools → context grows → compaction fails → context grows more. Session lasted 8 minutes before manual switch to Opus. See B8 and B9.
+- **System prompt is ~15-20K tokens** even before conversation starts. Opus first call: `prompt_tokens: 21705`. A 3B model with 8K context has zero room. Even with 32K context, 15K of prompt leaves only 17K for conversation — and most of that prompt is AGENTS.md/SOUL.md/TOOLS.md that small models can't follow anyway.
+- **Metrics broken for local models**: All NanBeige calls show `prompt_tokens: 0, completion_tokens: 0, elapsed_ms: 0`. Token counts from llama.cpp `usage` field aren't being captured. Can't diagnose context issues without this data.
 
 ### Experiments Needed (one assumption at a time)
 

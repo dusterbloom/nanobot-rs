@@ -244,6 +244,7 @@ pub(crate) async fn execute_tools_delegated(
                 &injected,
             );
         }
+        ctx.flow.tool_guard.record_result(&tc.name, &tc.arguments, injected.clone());
         ctx.used_tools.insert(tc.name.clone());
     }
 
@@ -433,6 +434,7 @@ pub(crate) async fn execute_tools_inline(
         } else {
             ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &data);
         }
+        ctx.flow.tool_guard.record_result(&tc.name, &tc.arguments, data.clone());
 
         // Emit tool call end event.
         if let Some(ref tx) = ctx.tool_event_tx {

@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::TurnContext;
+use crate::agent::context::ContextBuilder;
 use crate::agent::policy;
 use crate::agent::role_policy;
 use crate::agent::router_fallback;
@@ -834,33 +835,62 @@ pub(crate) async fn route_tool_calls(
         }
     }
 
-    // Tool guard filtering.
+    // Tool guard filtering: split calls into allowed, blocked-with-cache, blocked-without-cache.
     let original_count = routed_tool_calls.len();
-    let mut blocked_calls = 0usize;
-    routed_tool_calls.retain(|tc| match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
-        Ok(()) => true,
-        Err(e) => {
-            blocked_calls += 1;
-            warn!("{}", e);
-            false
+    let mut allowed_calls: Vec<ToolCallRequest> = Vec::new();
+    let mut blocked_with_result: Vec<(ToolCallRequest, String)> = Vec::new();
+    let mut blocked_no_result = 0usize;
+
+    for tc in routed_tool_calls {
+        match ctx.flow.tool_guard.allow(&tc.name, &tc.arguments) {
+            Ok(()) => allowed_calls.push(tc),
+            Err(e) => {
+                warn!("{}", e);
+                let key = ToolGuard::key(&tc.name, &tc.arguments);
+                if let Some(cached) = ctx.flow.tool_guard.get_cached_result(&key) {
+                    blocked_with_result.push((tc, cached.to_string()));
+                } else {
+                    blocked_no_result += 1;
+                }
+            }
         }
-    });
-    if blocked_calls > 0 {
-        ctx.messages.push(json!({
-            "role":"user",
-            "content": format!(
-                "[tool-guard] blocked {} duplicate tool call(s). Continue without re-running identical calls.",
-                blocked_calls
-            ),
-        }));
     }
-    if routed_tool_calls.is_empty() {
-        // Track consecutive rounds where ALL tool calls were blocked.
-        if blocked_calls > 0 && blocked_calls == original_count {
+
+    let total_blocked = blocked_with_result.len() + blocked_no_result;
+
+    // Replay cached results for blocked calls that have them.
+    if !blocked_with_result.is_empty() {
+        let tc_json: Vec<Value> = blocked_with_result
+            .iter()
+            .map(|(tc, _)| tc.to_openai_json())
+            .collect();
+        ContextBuilder::add_assistant_message(
+            &mut ctx.messages,
+            response_content,
+            Some(&tc_json),
+        );
+        for (tc, cached_result) in &blocked_with_result {
+            ContextBuilder::add_tool_result(
+                &mut ctx.messages,
+                &tc.id,
+                &tc.name,
+                cached_result,
+            );
+        }
+    }
+
+    if allowed_calls.is_empty() {
+        // All tool calls were blocked.
+        if total_blocked > 0 && total_blocked == original_count {
+            if !blocked_with_result.is_empty() && blocked_no_result == 0 {
+                // All blocked calls had cached results — replay succeeded.
+                ctx.flow.consecutive_all_blocked = 0;
+                return RouteResult::Continue;
+            }
             ctx.flow.consecutive_all_blocked += 1;
-            // Circuit breaker: after 3 consecutive all-blocked rounds, force a
+            // Circuit breaker: after 2 consecutive all-blocked rounds, force a
             // text response. The LLM is stuck in a loop requesting the same tools.
-            if ctx.flow.consecutive_all_blocked >= 3 {
+            if ctx.flow.consecutive_all_blocked >= 2 {
                 warn!(
                     rounds = ctx.flow.consecutive_all_blocked,
                     "tool_loop_circuit_breaker: model stuck requesting blocked tools, forcing response"
@@ -879,5 +909,5 @@ pub(crate) async fn route_tool_calls(
 
     // Reset the consecutive blocked counter when tool calls succeed.
     ctx.flow.consecutive_all_blocked = 0;
-    RouteResult::Execute(routed_tool_calls)
+    RouteResult::Execute(allowed_calls)
 }

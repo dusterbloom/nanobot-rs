@@ -867,6 +867,32 @@ impl ContextCompactor {
     }
 
     async fn summarize_text(&self, input: &str, prompt: &str) -> Result<String> {
+        // Pre-flight truncation: if input exceeds the summarizer's budget,
+        // truncate proportionally to avoid overflowing its context window.
+        let budget = self.input_budget();
+        let input_tokens = TokenBudget::estimate_str_tokens(input);
+        let input = if input_tokens > budget && budget > 0 {
+            let max_chars = (input.len() as f64 * (budget as f64 / input_tokens as f64) * 0.7) as usize;
+            let truncated_end = max_chars.min(input.len());
+            // Respect char boundaries.
+            let safe_end = if input.is_char_boundary(truncated_end) {
+                truncated_end
+            } else {
+                input[..truncated_end]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            };
+            warn!(
+                "summarize_text: input ({} tokens) exceeds budget ({} tokens), truncating to {} chars",
+                input_tokens, budget, safe_end
+            );
+            &input[..safe_end]
+        } else {
+            input
+        };
+
         let summary_messages = vec![
             json!({
                 "role": "system",
@@ -1458,5 +1484,29 @@ mod tests {
             compressed, tool_msg,
             "Short tool results should be unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn test_summarize_text_truncates_oversized_input() {
+        let provider = Arc::new(MockProvider::new("Truncated summary."));
+        // Small compaction context: 2000 tokens. input_budget() = 2000 - 200 - 1024 - 300 = 476.
+        let compactor = ContextCompactor::new(provider, "test".into(), 2000);
+        let budget = compactor.input_budget();
+        assert!(budget < 600, "Budget should be small for a 2000-token context, got {}", budget);
+
+        // Create input that far exceeds the budget (~2000 tokens worth of text).
+        let big_input = "word ".repeat(3000); // ~3000 tokens
+        let input_tokens = TokenBudget::estimate_str_tokens(&big_input);
+        assert!(
+            input_tokens > budget,
+            "Input ({} tokens) should exceed budget ({} tokens)",
+            input_tokens,
+            budget
+        );
+
+        // summarize_text should succeed (truncates internally, not overflow).
+        let result = compactor.summarize_text(&big_input, SUMMARIZE_PROMPT).await;
+        assert!(result.is_ok(), "summarize_text should succeed with oversized input: {:?}", result.err());
+        assert_eq!(result.unwrap(), "Truncated summary.");
     }
 }

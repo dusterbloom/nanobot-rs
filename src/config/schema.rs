@@ -760,6 +760,12 @@ pub struct MemoryConfig {
     /// This keeps the system prompt lean (RLM pattern: context as variable).
     #[serde(default)]
     pub lazy_skills: bool,
+
+    /// Context window (tokens) of the compaction/memory model.
+    /// Set when the memory model differs from the main model (e.g. a 2K summarizer).
+    /// Default: 0 (use main model's context size).
+    #[serde(default)]
+    pub compaction_model_context_size: usize,
 }
 
 fn default_true() -> bool {
@@ -813,6 +819,7 @@ impl Default for MemoryConfig {
             max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),
             lazy_skills: true,
+            compaction_model_context_size: 0,
         }
     }
 }
