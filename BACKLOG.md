@@ -21,7 +21,7 @@
 > 2. **Start with a failing test or reproduction.** Show the broken state first.
 > 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
 > 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
-> 5. **B6-B10 are green.** Next priority: B8 step 5 (end-to-end trio verification), then B3 (TrioConfig defaults), then B4 (multi-model config).
+> 5. **B3.1, B6-B10 are green.** B8 E2E verified. Next priority: B3 (TrioConfig defaults), then B4 (multi-model config), then I8 (SearXNG).
 
 ---
 
@@ -33,13 +33,7 @@
 - [x] **B3.1: Smarter deterministic fallback** — ✅ `router_fallback.rs` now has 9 deterministic patterns + default ask_user (was 2). Includes: research+URL→spawn researcher, plain URL/HN→web_fetch, latest news→spawn, read/show+path→read_file, write/create+path→write_file, edit/modify+path→edit_file, list/ls→list_dir, run/execute/cargo→exec, search→web_search. All patterns guarded by `has_tool()` for graceful fallthrough. 19 tests. _Ref: `src/agent/router_fallback.rs`_
 - [ ] **B4: Multi-model config schema** — Add `local.main`, `local.rlm`, `local.memory` to config. Each slot: `{ model, path, gpu, context_size, temperature }`. Server manager spawns up to 3 llama-server instances. _Ref: `docs/plans/local-model-matrix.md`_
 - [ ] **B5: RLM model evaluation** — Systematic experiments to find best RLM model per VRAM tier. Critical for "3 impossible things". See experiment plan below. _Routing benchmarks started in `experiments/lcm-routing/` (orchestrator_bench.py, test_bench.py)._
-- [ ] **B8: Trio mode activation & role-scoped context** ⚡ — Metrics accuracy and tool loop circuit breaker shipped (commit `0f80ad9`). Auto-activation wiring + auto-detect shipped as B10 (commit `3774742`). Remaining: end-to-end verification. Steps:
-  1. ~~**Trace config loading**~~: ✅ Done in B10. `delegation_config_at_core_build` log at startup, `trio_auto_activated` when trio fires.
-  2. ~~**Verify `router_preflight()` fires**~~: ✅ `info!("router_preflight_firing")` exists in `router.rs:474` (uncommitted). Also logs `router_preflight_skipped` with reason at `router.rs:468`.
-  3. ~~**Verify role-scoped context packs differ by role**~~: ✅ `role_scoped_context_packs` field exists on `ToolDelegationConfig` and is used in `router.rs:368,499,661` and `tool_engine.rs:120` to build per-role context.
-  4. ~~**Slim Main's system prompt for local**~~: ✅ `ContextBuilder::new_lite()` (`context.rs:113-128`) and `set_lite_mode()` (`context.rs:131-139`) implemented. Lite mode: bootstrap 2%, memory 1%, skills 2%, profiles 1%, cap 30% of context.
-  5. **Verification**: Start local session → `delegation_mode=Trio` in log → Main emits natural language (not tool call) → Router preflight intercepts → Specialist executes tool. **This is the remaining work.**
-  _Ref: 2026-02-21 diagnostic session, `src/agent/router.rs`_
+- [x] **B8: Trio mode activation & role-scoped context** ⚡ — ✅ All 5 steps complete. Metrics + circuit breaker (commit `0f80ad9`). Auto-activation + auto-detect as B10 (commit `3774742`). E2E verified: local session → `delegation_mode=Trio` in log → Main emits natural language → Router preflight intercepts → Specialist executes tool. _Ref: `src/agent/router.rs`_
 
 ### 🟡 Important — do soon
 
@@ -202,6 +196,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 ## Done ✅
 
+- ~~B8: Trio mode activation & role-scoped context~~ — All 5 steps complete. Metrics + circuit breaker (commit `0f80ad9`). Auto-activation + auto-detect as B10 (commit `3774742`). E2E verified: delegation_mode=Trio in log, Main emits natural language, Router preflight intercepts, Specialist executes tool. (2026-02-21, `src/agent/router.rs`)
 - ~~Session indexer + REPL /sessions command~~ — Bridge between raw JSONL sessions (230 files, 116MB) and searchable SESSION_*.md memory files. `session_indexer.rs`: pure `extract_session_content()` + `index_sessions()` orchestrator (extracts user+assistant messages, skips tool results, caps at 50 messages, truncates to 500 chars each). REPL: `/sessions` command with list/export/purge/archive/index subcommands (`/ss` alias). CLI: `nanobot sessions index`. Fixed `process::exit(1)` in `sessions_cmd.rs` for REPL safety. Updated `recall` tool description. E2E verified: 149 sessions indexed (6→155 SESSION_*.md), idempotent re-run, grep finds content. 17 new tests, 1395 total green. (2026-02-21, `src/agent/session_indexer.rs`)
 - ~~B10: Auto-detect trio models from LM Studio~~ — `pick_trio_models()` scans available LMS models at startup for "orchestrator"/"router" (router) and "function-calling"/"instruct"/"ministral" (specialist) patterns. Only fills empty config slots — explicit config always wins. Fuzzy main-model exclusion handles org prefixes and unresolved GGUF hints. Wired into REPL startup before auto-activation. 13 tests including e2e flow and real LMS model list. (2026-02-21, commit `3774742`)
 - ~~B9: Compaction safety guard + tool guard death spiral~~ — Tool guard replays cached results instead of injecting error messages small models can't parse. Compaction respects summarizer model's actual context window via `compaction_model_context_size` config + pre-flight truncation (0.7 safety margin). Circuit breaker threshold 3→2. E2E verified against NanBeige on LM Studio. (2026-02-21, commit `0f7f365`)
