@@ -151,6 +151,7 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `step_voter.rs` | MAKER voting for step validation (Phase 2) |
 | `reflector.rs` | Self-reflection and learning extraction |
 | `tuning.rs` | Runtime tuning parameters |
+| `lcm.rs` | Lossless Context Management — Summary DAG, three-level escalation compaction, dual-threshold control loop (I7) |
 | `eval/` | Evaluation framework: `hanoi.rs`, `haystack.rs`, `learning.rs`, `sprint.rs`, `runner.rs`, `results.rs` |
 
 ### 3. Provider System (`src/providers/`)
@@ -395,7 +396,8 @@ Config {
     provenance: ProvenanceConfig,
     proprioception: ProprioceptionConfig,
     trio: TrioConfig,
-    worker: WorkerConfig
+    worker: WorkerConfig,
+    lcm: LcmSchemaConfig
 }
 ```
 
@@ -413,6 +415,9 @@ Config {
 
 **WorkerConfig (5 fields):**
 - `enabled`, `max_depth` (delegation depth, default 3), `python` (enable python_eval), `delegate` (enable recursive workers), `budget_multiplier` (0.0-1.0, default 0.5)
+
+**LcmSchemaConfig (4 fields):**
+- `enabled` (default: false), `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 truncation target tokens, default 512)
 
 **ProprioceptionConfig (8 fields):**
 - `enabled`, `dynamic_tool_scoping`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`
@@ -643,7 +648,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1395 tests in codebase (run `cargo test -- --list` for current count)
+- ~1404 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 

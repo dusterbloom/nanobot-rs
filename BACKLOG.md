@@ -45,22 +45,10 @@
 - [ ] **I5: Dynamic model router** — Prompt complexity scoring (light/standard/heavy), auto-downgrade simple messages to cheaper models. _Ref: `docs/plans/dynamic-model-router.md`_
 - [x] **I6: Context Hygiene Hooks** — ✅ Implemented as `anti_drift.rs` (851 lines, 25 tests). PreCompletion: pollution scoring, turn eviction, repetitive-attempt collapse, format anchor re-injection. PostCompletion: thinking tag stripping, babble collapse. _Ref: commit `56dedce`, `src/agent/anti_drift.rs`_
 - [ ] **I8: SearXNG search backend** — Replace Brave Search (API key required, rate-limited) with SearXNG (free, local, unlimited). 3 touchpoints: 1) `schema.rs`: add `provider: String` ("brave"|"searxng", default "searxng") + `searxng_url: String` (default "http://localhost:8888") to `WebSearchConfig`. 2) `web.rs`: add SearXNG path in `execute()` — `GET {url}/search?q={query}&format=json`, parse `results[].title/url/content`. No API key needed. 3) `registry.rs`+`tool_wiring.rs`: extend `ToolConfig` to carry `search_provider`+`searxng_url`. Fallback: if SearXNG unreachable and Brave key set, use Brave. If neither, helpful error: "Run `docker run -d -p 8888:8080 searxng/searxng` or set a Brave API key." Onboard integration: `cmd_onboard()` prints Docker one-liner. Optional `nanobot onboard --search` auto-pulls+starts+configures SearXNG. _SearXNG container tested working 2026-02-20: `docker run -d -p 8888:8080 --name searxng searxng/searxng` + enable JSON format in settings.yml._
-- [ ] **I7: Matryoshka Compaction** _(absorbs I2)_ — Recursive, parallel context compaction that works with any model size. Replaces monolithic "summarize everything" with nested layers, like matryoshka dolls. **Architecture:**
-  ```
-  Layer 0: Raw conversation (32K+ tokens)
-           ↓ kodama cluster into semantic blocks (TF-IDF, hand-rolled, ~40 lines)
-  Layer 1: N topic clusters (~2-3K each)
-           ↓ summarize each in parallel via tokio::spawn (even 2K model works)
-  Layer 2: N summaries (~200-400 tokens each)
-           ↓ if still too big, summarize the summaries
-  Layer 3: 1 meta-summary (~500 tokens)
-  ```
-  **Key properties:** Each step fits any model (never exceeds `model_ctx * 0.7`). All cluster summaries run as concurrent tasks. Last 2-3 turns stay verbatim. Incremental — only active cluster grows, dormant clusters stay compressed. Infinite conversation regardless of model context size.
-  **Role-scoped assembly:** Main (3B, 8K) gets meta-summary + last 2 turns + active cluster verbatim. Router (8B) gets task-relevant cluster summary + current intent. Specialist (8B) gets tool-relevant cluster + tool schemas. Each role sees exactly the context it needs.
-  **Deps:** `kodama = "0.3"` (MIT/Unlicense, zero transitive deps). TF-IDF vectors hand-rolled (~40 lines). Brute-force cosine similarity over clusters (sub-ms at <1000 clusters, no vector DB needed). New module `src/agent/semantic_context.rs`, ~400 lines.
-  **Compounds with:** I6 (hooks clean within a cluster, fragmentation cleans across clusters). B9 (pre-flight truncation becomes the per-chunk safety net). I3 (ContentGate decides raw vs summary per cluster).
-  **Agno L3 parallel:** This is nanobot's equivalent of Agno's hybrid-search memory layer — surface relevant context, compress the rest — but designed for 4-8K local models instead of 128K cloud models.
-  _Ref: 2026-02-21 matryoshka design session, `src/agent/compaction.rs`_
+- [ ] **I7: Lossless Context Management (LCM)** _(supersedes matryoshka design)_ — DAG-based lossless compaction per Ehrlich & Blackman (2026). Immutable store (session JSONL) + Summary DAG with pointers to originals + active context assembly. **Implemented:** `src/agent/lcm.rs` (717 lines, 10 tests): `SummaryDag`, `LcmEngine` (ingest/compact/expand), three-level escalation (preserve_details → bullet_points → deterministic truncate), dual-threshold control loop (τ_soft 50% / τ_hard 85%). `LcmSchemaConfig` in config schema. Wired into `agent_loop.rs`. `lcm_expand` tool stub exists.
+  **Remaining:** E2E verification with local models. Wire `lcm_expand` tool into registry. Verify compaction actually fires and reduces context. Test lossless retrieval round-trip. Performance profiling.
+  **Compounds with:** I6 (anti-drift cleans within summaries). B9 (pre-flight truncation as safety net). I3 (ContentGate decides raw vs summary).
+  _Ref: `src/agent/lcm.rs`, `src/config/schema.rs:1219`_
 
 ### 🟢 Nice to have — Phase 0
 
