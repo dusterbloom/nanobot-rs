@@ -1018,12 +1018,22 @@ pub(crate) fn cmd_agent(
         if config.tool_delegation.strict_no_tools_main
             && config.tool_delegation.strict_router_schema
         {
-            let router_available = if srv.lms_managed {
-                let lms_port = config.agents.defaults.lms_port;
+            let router_available = if srv.lms_managed || has_remote_local {
+                // For both managed (started by nanobot) and remote LM Studio,
+                // verify the model is actually loaded via list_available()
+                let lms_port = if srv.lms_managed {
+                    config.agents.defaults.lms_port
+                } else {
+                    // Extract port from local_api_base (e.g. "http://localhost:18080/v1")
+                    config.agents.defaults.local_api_base
+                        .split(':')
+                        .last()
+                        .and_then(|p| p.split('/').next())
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(18080)
+                };
                 let available = crate::lms::list_available(lms_port).await;
                 crate::lms::is_model_available(&available, &config.trio.router_model)
-            } else if has_remote_local {
-                !config.trio.router_model.is_empty()
             } else {
                 false
             };

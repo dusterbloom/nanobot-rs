@@ -2030,6 +2030,16 @@ impl ReplContext {
         save_config(&disk_cfg, None);
     }
 
+    fn persist_local_config(&self) {
+        let mut disk_cfg = load_config(None);
+        // Persist local mode settings
+        disk_cfg.agents.defaults.local_api_base = self.config.agents.defaults.local_api_base.clone();
+        disk_cfg.agents.defaults.skip_jit_gate = self.config.agents.defaults.skip_jit_gate;
+        disk_cfg.agents.defaults.lms_port = self.config.agents.defaults.lms_port;
+        disk_cfg.agents.defaults.lms_main_model = self.config.agents.defaults.lms_main_model.clone();
+        save_config(&disk_cfg, None);
+    }
+
     /// /local — toggle between local and cloud mode.
     async fn cmd_local(&mut self) {
         let currently_local = self.core_handle.swappable().is_local;
@@ -2128,6 +2138,7 @@ impl ReplContext {
             }
 
             // Flip to local mode and rebuild.
+            self.persist_local_config();
             self.apply_and_rebuild_with(true);
             tui::print_mode_banner(&self.srv.local_port, true);
         } else {
@@ -2143,6 +2154,7 @@ impl ReplContext {
             self.srv.engine = super::InferenceEngine::None;
             self.config.agents.defaults.skip_jit_gate = false;
             self.stop_watchdog();
+            self.persist_local_config();
             self.apply_and_rebuild_with(false);
             tui::print_mode_banner(&self.srv.local_port, false);
         }
