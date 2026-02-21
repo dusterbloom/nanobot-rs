@@ -1,0 +1,132 @@
+[package]
+name = "nanobot"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight personal AI assistant framework in Rust"
+license = "MIT"
+repository = "https://github.com/dusterbloom/nanobot-rs"
+
+[[bin]]
+name = "nanobot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking", "stream"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Regex
+regex = "1"
+
+# Cryptographic hashing for audit log chain
+sha2 = "0.10"
+
+# Directories
+dirs = "6"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Cron parsing
+cron = "0.15"
+
+# Byte buffers (used by reqwest streaming)
+bytes = "1"
+
+# Base64
+base64 = "0.22"
+
+# HTML processing
+scraper = "0.22"
+html-escape = "0.2"
+dom_smoothie = "0.15"
+
+# Async trait
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Retry with backoff
+backon = { version = "1", features = ["tokio-sleep"] }
+
+# REPL
+rustyline = "15"
+
+# Terminal markdown rendering
+termimad = "0.30"
+
+# Syntax highlighting for code blocks
+syntect = "5"
+once_cell = "1"
+
+# Unicode display width (terminal column counting)
+unicode-width = "0.2"
+
+# Unix terminal control (stdin flush after voice recording)
+libc = "0.2"
+
+# URL parsing
+url = "2"
+
+# Language detection (only used by voice mode for TTS routing)
+# Per-language features keep binary small: ~12MB for 8 langs vs ~110MB for all 75.
+lingua = { version = "1.7", default-features = false, features = [
+    "english", "spanish", "french", "hindi",
+    "italian", "japanese", "portuguese", "chinese",
+], optional = true }
+
+# Mime type guessing
+mime_guess = "2"
+
+# Accurate BPE token counting (cl100k_base, compatible with OpenAI/Claude)
+tiktoken-rs = "0.6"
+
+# SQLite with FTS5 (context store, budget calibrator, experience buffer)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Email channel (IMAP + SMTP)
+async-imap = "0.10"
+async-native-tls = "0.5"
+tokio-util = { version = "0.7", features = ["compat"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+mail-parser = "0.9"
+arc-swap = "1.8.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+voice = ["dep:jack-voice", "dep:crossterm", "dep:lingua"]
+
+[dependencies.jack-voice]
+path = "../jack-voice/jack-voice"
+optional = true
+
+[dependencies.crossterm]
+version = "0.28"
+optional = true
