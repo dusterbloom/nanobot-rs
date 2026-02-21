@@ -26,6 +26,42 @@ use crate::providers::base::{LLMProvider, ToolCallRequest};
 /// `max_msg_chars`. The total output is capped at `max_chars`.
 /// When LCM compaction is active, `messages` already contains summaries in
 /// place of old messages, so this naturally includes compressed context.
+/// Search backwards through recent messages for a scratch pad summary.
+/// Returns the summary text if found, otherwise None.
+fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
+    for msg in messages.iter().rev().take(10) {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        // Standalone summary from tool_engine.rs line 327: "[tool runner summary] ..."
+        if role == "user" && content.starts_with("[tool runner summary] ") {
+            if let Some(rest) = content.strip_prefix("[tool runner summary] ") {
+                let s = rest.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        // Inline summary from tool_engine.rs line 267: "[Tool analysis summary]\n..."
+        if role == "tool" && content.starts_with("[Tool analysis summary]\n") {
+            if let Some(rest) = content.strip_prefix("[Tool analysis summary]\n") {
+                let summary = rest
+                    .split("\n\n[Full output:")
+                    .next()
+                    .unwrap_or(rest)
+                    .trim()
+                    .to_string();
+                if !summary.is_empty() {
+                    return Some(summary);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
     let mut pairs: Vec<(Option<&str>, Option<&str>)> = Vec::new();
     let mut current_user: Option<&str> = None;
@@ -960,7 +996,12 @@ pub(crate) async fn route_tool_calls(
                 );
             }
             ToolPlanAction::Specialist => {
-                let context_summary = response_content.unwrap_or("(empty)");
+                // P3: Try to find scratch pad summary in recent messages, fallback to response_content
+                let summary_from_scratch_pad = find_scratch_pad_summary_in_messages(&ctx.messages);
+                let context_summary_owned = summary_from_scratch_pad
+                    .or_else(|| response_content.map(|s| s.to_string()))
+                    .unwrap_or_else(|| "(empty)".to_string());
+                let context_summary = context_summary_owned.as_str();
                 match dispatch_specialist(
                     &ctx.core,
                     &ctx.counters,

@@ -256,9 +256,24 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .unwrap_or("(no result)");
 
-        let injected = if ctx.core.specialist_provider.is_some()
-            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data) > 500
-        {
+        let full_tokens =
+            crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
+
+        let injected = if let Some(ref summary) = run_result.summary {
+            // Summary exists from scratch-pad analysis.
+            if full_tokens > 500 {
+                // Large data + good summary available: use the summary so compaction
+                // can never destroy the content by proportional truncation.
+                format!(
+                    "[Tool analysis summary]\n{}\n\n[Full output: {} chars, cached in context store]",
+                    summary,
+                    full_data.len()
+                )
+            } else {
+                // Small data — raw injection is safe; compaction won't truncate it.
+                ctx.content_gate.admit_simple(full_data).into_text()
+            }
+        } else if ctx.core.specialist_provider.is_some() && full_tokens > 500 {
             ctx.content_gate
                 .admit_with_specialist(
                     full_data,
