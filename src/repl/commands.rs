@@ -2208,6 +2208,77 @@ pub(crate) fn trio_enable(cfg: &mut crate::config::schema::Config) -> bool {
     needs_warning
 }
 
+/// Auto-detect router and specialist from available LM Studio models.
+///
+/// Scans model names for known patterns. Only picks models that aren't
+/// the main model. Returns (router, specialist) — either may be None.
+pub(crate) fn pick_trio_models(
+    available: &[String],
+    main_model: &str,
+) -> (Option<String>, Option<String>) {
+    let main_lower = main_model.to_lowercase();
+
+    // Fuzzy "is this the main model?" — matches the same way is_model_available does:
+    // exact, or either side is a substring of the other (handles org prefixes,
+    // resolved-vs-config name mismatches, etc.)
+    let is_main = |candidate_lower: &str| -> bool {
+        if main_lower.is_empty() {
+            return false;
+        }
+        candidate_lower == main_lower
+            || candidate_lower.contains(&main_lower)
+            || main_lower.contains(candidate_lower)
+    };
+
+    // Router detection (first match wins)
+    let router_patterns: &[&str] = &["orchestrator", "router"];
+    let router = router_patterns.iter().find_map(|pat| {
+        available.iter().find(|m| {
+            let low = m.to_lowercase();
+            low.contains(pat) && !is_main(&low)
+        })
+    }).cloned();
+
+    // Specialist detection (first match wins, excludes main + router)
+    let router_lower = router.as_ref().map(|r| r.to_lowercase());
+    let specialist_patterns: &[&str] = &[
+        "function-calling",
+        "functiongemma",
+        "instruct",
+        "ministral",
+    ];
+    let specialist = specialist_patterns.iter().find_map(|pat| {
+        available.iter().find(|m| {
+            let low = m.to_lowercase();
+            low.contains(pat)
+                && !is_main(&low)
+                && router_lower.as_deref() != Some(low.as_str())
+        })
+    }).cloned();
+
+    (router, specialist)
+}
+
+/// Whether trio mode should be auto-activated at REPL startup.
+///
+/// Returns `true` when all conditions hold:
+/// - Running in local mode (`is_local`)
+/// - Both router and specialist models are configured (non-empty)
+/// - Not already in `DelegationMode::Trio`
+pub(crate) fn should_auto_activate_trio(
+    is_local: bool,
+    router_model: &str,
+    specialist_model: &str,
+    current_mode: &crate::config::schema::DelegationMode,
+) -> bool {
+    use crate::config::schema::DelegationMode;
+
+    is_local
+        && !router_model.is_empty()
+        && !specialist_model.is_empty()
+        && *current_mode != DelegationMode::Trio
+}
+
 /// Disable trio mode on a Config, switching to inline (single model).
 pub(crate) fn trio_disable(cfg: &mut crate::config::schema::Config) {
     use crate::config::schema::DelegationMode;
@@ -2896,5 +2967,294 @@ mod tests {
         };
         let output = format_vram_budget(&result);
         assert!(output.contains("OVER"), "Should show OVER when fits=false");
+    }
+
+    // ---- should_auto_activate_trio ----
+
+    #[test]
+    fn test_should_auto_activate_trio_happy_path() {
+        use crate::config::schema::DelegationMode;
+        assert!(should_auto_activate_trio(
+            true,
+            "qwen3-1.7b",
+            "ministral-3-8b",
+            &DelegationMode::Delegated,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_not_local() {
+        use crate::config::schema::DelegationMode;
+        assert!(!should_auto_activate_trio(
+            false,
+            "qwen3-1.7b",
+            "ministral-3-8b",
+            &DelegationMode::Delegated,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_empty_router() {
+        use crate::config::schema::DelegationMode;
+        assert!(!should_auto_activate_trio(
+            true,
+            "",
+            "ministral-3-8b",
+            &DelegationMode::Delegated,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_empty_specialist() {
+        use crate::config::schema::DelegationMode;
+        assert!(!should_auto_activate_trio(
+            true,
+            "qwen3-1.7b",
+            "",
+            &DelegationMode::Delegated,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_already_trio() {
+        use crate::config::schema::DelegationMode;
+        assert!(!should_auto_activate_trio(
+            true,
+            "qwen3-1.7b",
+            "ministral-3-8b",
+            &DelegationMode::Trio,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_both_empty() {
+        use crate::config::schema::DelegationMode;
+        assert!(!should_auto_activate_trio(
+            true,
+            "",
+            "",
+            &DelegationMode::Delegated,
+        ));
+    }
+
+    // ---- pick_trio_models ----
+
+    #[test]
+    fn test_pick_trio_models_orchestrator_and_instruct() {
+        let available = vec![
+            "Nemotron-Orchestrator-8B".to_string(),
+            "Ministral-3-3B".to_string(),
+            "Qwen3-14B".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert_eq!(router.as_deref(), Some("Nemotron-Orchestrator-8B"));
+        assert_eq!(specialist.as_deref(), Some("Ministral-3-3B"));
+    }
+
+    #[test]
+    fn test_pick_trio_models_skips_main() {
+        let available = vec![
+            "Nemotron-Orchestrator-8B".to_string(),
+        ];
+        // Main model matches the only orchestrator — no router picked
+        let (router, specialist) = pick_trio_models(&available, "Nemotron-Orchestrator-8B");
+        assert!(router.is_none());
+        assert!(specialist.is_none());
+    }
+
+    #[test]
+    fn test_pick_trio_models_router_only() {
+        let available = vec![
+            "Nemotron-Orchestrator-8B".to_string(),
+            "Qwen3-14B".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert_eq!(router.as_deref(), Some("Nemotron-Orchestrator-8B"));
+        assert!(specialist.is_none());
+    }
+
+    #[test]
+    fn test_pick_trio_models_specialist_only() {
+        let available = vec![
+            "Qwen3-14B".to_string(),
+            "Hermes-3-Llama-instruct-8B".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert!(router.is_none());
+        assert_eq!(specialist.as_deref(), Some("Hermes-3-Llama-instruct-8B"));
+    }
+
+    #[test]
+    fn test_pick_trio_models_empty_list() {
+        let (router, specialist) = pick_trio_models(&[], "Qwen3-14B");
+        assert!(router.is_none());
+        assert!(specialist.is_none());
+    }
+
+    #[test]
+    fn test_pick_trio_models_function_calling_preferred() {
+        let available = vec![
+            "Qwen3-14B".to_string(),
+            "Hermes-function-calling-3B".to_string(),
+            "Llama-instruct-8B".to_string(),
+        ];
+        let (_, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert_eq!(specialist.as_deref(), Some("Hermes-function-calling-3B"));
+    }
+
+    #[test]
+    fn test_pick_trio_models_case_insensitive() {
+        let available = vec![
+            "nemotron-ORCHESTRATOR-8b".to_string(),
+            "MINISTRAL-3-3B".to_string(),
+            "Qwen3-14B".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert_eq!(router.as_deref(), Some("nemotron-ORCHESTRATOR-8b"));
+        assert_eq!(specialist.as_deref(), Some("MINISTRAL-3-3B"));
+    }
+
+    #[test]
+    fn test_pick_trio_models_no_duplicate_assignment() {
+        // A model matching both router and specialist patterns should only be assigned once
+        let available = vec![
+            "orchestrator-instruct-8B".to_string(),
+            "Qwen3-14B".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "Qwen3-14B");
+        assert_eq!(router.as_deref(), Some("orchestrator-instruct-8B"));
+        // specialist must not reuse the router
+        assert!(specialist.is_none());
+    }
+
+    // ---- e2e: pick → fill config → should_auto_activate ----
+
+    #[test]
+    fn test_pick_trio_e2e_auto_activates() {
+        use crate::config::schema::{Config, DelegationMode};
+
+        let available = vec![
+            "Qwen3-14B".to_string(),
+            "Nemotron-Orchestrator-8B".to_string(),
+            "Ministral-3-3B".to_string(),
+        ];
+        let main_model = "Qwen3-14B";
+
+        // Step 1: pick
+        let (auto_router, auto_specialist) = pick_trio_models(&available, main_model);
+
+        // Step 2: fill empty config slots (mirrors mod.rs wiring)
+        let mut config = Config::default();
+        assert!(config.trio.router_model.is_empty());
+        assert!(config.trio.specialist_model.is_empty());
+
+        if config.trio.router_model.is_empty() {
+            if let Some(r) = auto_router {
+                config.trio.router_model = r;
+            }
+        }
+        if config.trio.specialist_model.is_empty() {
+            if let Some(s) = auto_specialist {
+                config.trio.specialist_model = s;
+            }
+        }
+
+        assert_eq!(config.trio.router_model, "Nemotron-Orchestrator-8B");
+        assert_eq!(config.trio.specialist_model, "Ministral-3-3B");
+
+        // Step 3: should_auto_activate now returns true
+        assert!(should_auto_activate_trio(
+            true,
+            &config.trio.router_model,
+            &config.trio.specialist_model,
+            &DelegationMode::Delegated,
+        ));
+
+        // Step 4: trio_enable activates without warning
+        let needs_warning = trio_enable(&mut config);
+        assert!(!needs_warning);
+        assert!(config.trio.enabled);
+        assert_eq!(config.tool_delegation.mode, DelegationMode::Trio);
+    }
+
+    #[test]
+    fn test_pick_trio_e2e_explicit_config_not_overridden() {
+        use crate::config::schema::Config;
+
+        let available = vec![
+            "Qwen3-14B".to_string(),
+            "Nemotron-Orchestrator-8B".to_string(),
+            "Ministral-3-3B".to_string(),
+        ];
+
+        let mut config = Config::default();
+        config.trio.router_model = "my-custom-router".to_string();
+        config.trio.specialist_model = "my-custom-specialist".to_string();
+
+        let (auto_router, auto_specialist) = pick_trio_models(&available, "Qwen3-14B");
+        // Only fill empty slots
+        if config.trio.router_model.is_empty() {
+            if let Some(r) = auto_router {
+                config.trio.router_model = r;
+            }
+        }
+        if config.trio.specialist_model.is_empty() {
+            if let Some(s) = auto_specialist {
+                config.trio.specialist_model = s;
+            }
+        }
+
+        // Explicit config preserved
+        assert_eq!(config.trio.router_model, "my-custom-router");
+        assert_eq!(config.trio.specialist_model, "my-custom-specialist");
+    }
+
+    // ---- fuzzy main-model exclusion (real LM Studio keys have org prefixes) ----
+
+    #[test]
+    fn test_pick_trio_models_org_prefix_skips_main() {
+        // LMS returns "nvidia/nvidia-nemotron-nano-12b-v2-vl" but main_model
+        // was resolved to "nvidia-nemotron-nano-12b-v2-vl" (without org prefix).
+        let available = vec![
+            "nvidia/nvidia-nemotron-nano-12b-v2-vl".to_string(),
+            "nvidia/nemotron-orchestrator-8b".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "nvidia-nemotron-nano-12b-v2-vl");
+        assert_eq!(router.as_deref(), Some("nvidia/nemotron-orchestrator-8b"));
+        // Main model must NOT be picked as specialist even with org prefix mismatch
+        assert!(specialist.is_none());
+    }
+
+    #[test]
+    fn test_pick_trio_models_main_unresolved_hint() {
+        // main_model is the original GGUF hint that didn't resolve (returned as-is).
+        // available has the real LMS key. Substring match should still exclude it.
+        let available = vec![
+            "nvidia/nvidia-nemotron-nano-12b-v2-vl".to_string(),
+            "nvidia/nemotron-orchestrator-8b".to_string(),
+            "bartowski/ministral-3-3b".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "NVIDIA-Nemotron-Nano-12B-v2");
+        assert_eq!(router.as_deref(), Some("nvidia/nemotron-orchestrator-8b"));
+        // "nvidia-nemotron-nano-12b-v2" substring-matches available[0], so skip it
+        assert_eq!(specialist.as_deref(), Some("bartowski/ministral-3-3b"));
+    }
+
+    #[test]
+    fn test_pick_trio_models_real_lms_model_list() {
+        // Mimics the user's actual LM Studio model list from error output
+        let available = vec![
+            "nemotron-orchestrator-8b-claude-4.5-opus-distill".to_string(),
+            "nvidia-nemotron-nano-12b-v2-vl".to_string(),
+            "nvidia_orchestrator-8b".to_string(),
+        ];
+        let (router, specialist) = pick_trio_models(&available, "nvidia-nemotron-nano-12b-v2-vl");
+        // Should pick an orchestrator (not the main model)
+        assert_eq!(
+            router.as_deref(),
+            Some("nemotron-orchestrator-8b-claude-4.5-opus-distill")
+        );
+        // No specialist patterns match any available model
+        assert!(specialist.is_none());
     }
 }

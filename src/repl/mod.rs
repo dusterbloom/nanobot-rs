@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rustyline::error::ReadlineError;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::agent_loop::SharedCoreHandle;
 use crate::agent::audit::{AuditLog, ToolEvent};
@@ -924,6 +924,22 @@ pub(crate) fn cmd_agent(
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
 
+                        // Auto-detect trio roles from available models if not configured.
+                        let (auto_router, auto_specialist) =
+                            commands::pick_trio_models(&available, &main_model);
+                        if config.trio.router_model.is_empty() {
+                            if let Some(r) = auto_router {
+                                config.trio.router_model = r;
+                                info!(router = %config.trio.router_model, "trio_router_auto_detected");
+                            }
+                        }
+                        if config.trio.specialist_model.is_empty() {
+                            if let Some(s) = auto_specialist {
+                                config.trio.specialist_model = s;
+                                info!(specialist = %config.trio.specialist_model, "trio_specialist_auto_detected");
+                            }
+                        }
+
                         if config.trio.enabled {
                             if !config.trio.router_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.router_model);
@@ -965,6 +981,24 @@ pub(crate) fn cmd_agent(
         // Recompute has_remote_local after potential lms setup
         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
 
+        // Auto-activate trio mode for local sessions when both router and
+        // specialist models are configured.  The downgrade block below will
+        // revert strict flags if the router turns out to be unreachable.
+        if commands::should_auto_activate_trio(
+            is_local,
+            &config.trio.router_model,
+            &config.trio.specialist_model,
+            &config.tool_delegation.mode,
+        ) {
+            commands::trio_enable(&mut config);
+            info!(
+                delegation_mode = ?config.tool_delegation.mode,
+                router_model = %config.trio.router_model,
+                specialist_model = %config.trio.specialist_model,
+                "trio_auto_activated"
+            );
+        }
+
         // When no trio router is available, disable strict mode so the single model
         // can handle tools directly. Must happen BEFORE build_core_handle so the core
         // gets the updated tool_delegation_config.
@@ -982,10 +1016,19 @@ pub(crate) fn cmd_agent(
             };
 
             if !router_available {
+                info!("trio_downgrade: router not available, clearing strict flags");
                 config.tool_delegation.strict_no_tools_main = false;
                 config.tool_delegation.strict_router_schema = false;
             }
         }
+
+        info!(
+            delegation_mode = ?config.tool_delegation.mode,
+            strict_no_tools_main = config.tool_delegation.strict_no_tools_main,
+            strict_router_schema = config.tool_delegation.strict_router_schema,
+            is_local,
+            "delegation_config_at_core_build"
+        );
 
         let core_handle = cli::build_core_handle(
             &config,
