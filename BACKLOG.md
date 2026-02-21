@@ -21,13 +21,69 @@
 > 2. **Start with a failing test or reproduction.** Show the broken state first.
 > 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
 > 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
-> 5. **B3-B10 are green. I7/LCM E2E verified.** All blockers resolved except B5 (experiments). Next priority: I8 (SearXNG), then I0 (trio pipeline actions).
+> 5. **B3-B10 are green. I7/LCM E2E verified. L1 concept router 80% accurate (2x orchestrator).** Blockers remaining: B5 (experiments), **B11 (heartbeat health layer)**, **B12 (config debt — proposal needed)**. Next priority: **B11 → B12 proposal → I9 (tiered routing) → I8 (SearXNG)**.
 
 ---
 
 ## Phase 0: Foundation (current)
 
 ### 🔴 Blocking — do first
+
+- [ ] **B11: Heartbeat as foundational liveness service** ⚡ — **Priority.** The current heartbeat is a glorified cron — shell commands + optional HEARTBEAT.md check. It needs to become the central liveness and health service that all modes (text/voice), channels (CLI/Telegram/WhatsApp), and configurations (local trio/cloud) depend on.
+  **Current state (verified 2026-02-21):** Runs one hardcoded command (`qmd update -c sessions`), LLM callback always `None` (never wired), `#![allow(dead_code)]` on the module. Zero awareness of providers, endpoints, channels, or self-health.
+  **Health probes needed:**
+  | Probe | What | Frequency | Action on failure |
+  |-------|------|-----------|-------------------|
+  | Provider health | Ping each configured provider (`/v1/models` or equivalent) | Every tick | Mark provider unavailable, trigger fallback chain |
+  | LCM compactor | Ping `compactionEndpoint.url` + verify model loaded | Every tick | Set `lcm.available = false`, skip compaction gracefully, warn user |
+  | Trio models | Verify router/specialist models loaded in LM Studio | Every tick (local only) | Degrade to inline mode, log which role is missing |
+  | Search backend | Ping SearXNG / check Brave API key validity | Every 5 ticks | Disable `web_search` tool, surface in `/status` |
+  | Channel liveness | Telegram/WhatsApp/Email connection state | Per-channel interval | Reconnect with backoff, surface in `/status` |
+  | Self-health | Session size, memory pressure, disk space | Every tick | Trigger compaction, warn user, auto-rotate session |
+  **Critical gap — LCM compaction has no pre-flight health check:** When qwen3-0.6b is unreachable, Level 1+2 silently fail → Level 3 deterministic fallback fires (works, but lossy). No warning, no status surfaced. If the LLM **hangs** (not down, just slow), the compaction spawn blocks indefinitely and `in_flight` never resets — **blocking ALL future compaction for the session.**
+  **Design principles:**
+  1. **Channel-agnostic** — same health loop whether CLI, Telegram, or voice mode
+  2. **Mode-agnostic** — works for local trio, cloud, and hybrid configurations
+  3. **Graceful degradation** — failures disable features, never crash. Compactor down → LCM pauses. Router gone → deterministic routing. Provider down → queue + retry.
+  4. **Observable** — `/status` REPL command shows all probe states. Status injectable into context (connects to N6).
+  5. **No LLM required** — health probes are HTTP pings and process checks, not agent tasks. Existing Layer 2 (HEARTBEAT.md → agent) stays as optional add-on.
+  **Implementation sketch:**
+  - `HealthRegistry` — register probes at startup based on config (if `lcm.enabled`, register LCM probe; if trio, register trio probes; etc.)
+  - Each probe: `name`, `check() → Result<(), String>`, `interval`, `on_failure` callback
+  - `HeartbeatService` runs the registry on each tick, stores probe states in `SystemState`
+  - `/status` command reads probe states
+  - Provider/router/compaction code checks probe state before attempting calls
+  - Timeout guard on compaction spawn (default 30s) — kill task, reset `in_flight`, log error
+  **Compounds with:** N6 (status injection), I8 (SearXNG health), I4 (multi-provider fallback), I7 (LCM compactor availability), I9 (tiered routing needs health-aware escalation).
+  _Ref: `src/heartbeat/service.rs`, `src/agent/agent_loop.rs` (compaction spawn), `src/agent/system_state.rs`_
+
+- [ ] **B12: Configuration debt — eliminate hardcoded magic values** ⚡ — **Requires design proposal before implementation.** Audit (2026-02-21) found **40+ hardcoded values** across `src/` that should be configurable: timeouts (8), token limits (12), model name sniffing (5 files), subagent constraints (5), circuit breaker params (2), session rotation (2), URLs (6+), maintenance commands (1). These accumulate because adding a `const` in a `.rs` file is faster than threading a value through config schema → serde → builder → runtime.
+  **The problem is structural, not disciplinary.** Adding a config field today requires: 1) Add field + default fn to `schema.rs`. 2) Update `Default` impl. 3) Thread through `build_swappable_core()` or `AgentLoop::new()`. 4) Access via `ctx.core.xxx` or `self.xxx` at use site. 5) Write a serde test. That's 5 files touched for one knob — so devs take shortcuts and hardcode instead.
+  **Audit — worst offenders:**
+  | Category | Count | Where | Examples |
+  |----------|-------|-------|---------|
+  | Timeouts | 8 | lms.rs, tool_engine.rs, agent_loop.rs | LMS load 120s, delegation 30s, heartbeat 300s |
+  | Token limits | 12 | subagent.rs, compaction.rs, pipeline.rs, context.rs | Subagent ctx 8192, summary 1024, pipeline 30K |
+  | Model name sniffing | 5 files | tool_runner.rs, compaction.rs, agent_core.rs, thread_repair.rs | `nanbeige`, `ministral-3`, `qwen3-1.7b` string matches for capability detection |
+  | Subagent constraints | 5 | subagent.rs | MAX_ITERATIONS=15, MAX_DEPTH=3, ctx 8192/2048, response 1024/256 |
+  | Circuit breaker | 2 | circuit_breaker.rs | threshold=3, cooldown=300s |
+  | Session mgmt | 2 | session/manager.rs | Rotation at 1MB, carry 10 messages |
+  | Context bootstrap | 8 | context.rs | AGENTS.md 1500 tokens, memory 400, skills 1000, profiles 500 |
+  **Requires a proposal that satisfies all of:**
+  1. **KISS for users** — `config.json` stays simple. Normal users see ~20 top-level knobs (model, workspace, channels). Power users can override anything. Nobody needs to know about `subagent.local_fallback_context_tokens`.
+  2. **DRY for devs** — Adding a new configurable value should touch ≤2 files (define + use). No manual threading through 5 layers. No forgetting to update `Default` impls.
+  3. **SOLID** — Config values belong to the module that uses them, not a god struct. `subagent.rs` owns its defaults, `compaction.rs` owns its thresholds. The config system discovers them, not the other way around.
+  4. **Zero regression risk** — Defaults must be identical to current hardcoded values. Existing `config.json` files must work without changes. New fields use `#[serde(default)]`.
+  5. **Model capabilities, not model names** — Replace string sniffing (`if model.contains("nanbeige")`) with capability flags: `supports_tool_calling: bool`, `supports_thinking: bool`, `max_reliable_output: usize`. Populated from model metadata or config override.
+  **Candidate approaches (evaluate before implementing):**
+  - **A: Layered config with module-local defaults** — Each module declares its own `ModuleConfig` struct with `#[serde(default)]` fields. Root `Config` nests them. Modules access their own config directly. Pro: DRY, SOLID. Con: config.json grows nested sections.
+  - **B: Feature flags + profiles** — Named profiles (`potato`, `sweet`, `power`, `beast`) that set all knobs at once. `config.json` says `profile: "sweet"`, everything derives. Individual overrides still possible. Pro: KISS for users. Con: profile matrix is hard to maintain.
+  - **C: Convention-driven defaults with config overlay** — Keep `const` values in modules as defaults. Add a flat `overrides: {}` map in config that any module can query: `config.get_or("subagent.max_iterations", 15)`. Pro: zero structural change, 1-line to add a knob. Con: stringly-typed, no serde validation.
+  - **D: Model capability registry** — Separate concern: replace 5-file model name sniffing with `ModelCapabilities` struct looked up by model ID. Config can override: `"modelCapabilities": {"nanbeige": {"toolCalling": true, "maxReliableOutput": 512}}`. Pro: solves the worst offender cleanly. Con: only addresses model sniffing, not timeouts/thresholds.
+  - **E: Hybrid A+D** — Module-local configs (approach A) for numeric knobs + capability registry (approach D) for model sniffing. Two changes that together cover ~90% of the debt.
+  **Do NOT implement until a proposal is reviewed.** The wrong abstraction here is worse than the current hardcoded values.
+  **Compounds with:** B11 (heartbeat needs config-driven probes), I9 (tiered routing needs configurable thresholds), N1 (hardware auto-detection feeds profile selection).
+  _Ref: Audit data in this backlog entry. Files: `src/agent/subagent.rs`, `src/agent/compaction.rs`, `src/agent/tool_runner.rs`, `src/agent/agent_core.rs`, `src/agent/thread_repair.rs`, `src/server.rs`, `src/heartbeat/service.rs`, `src/config/schema.rs`_
 
 - [x] **B3: Update default local trio** — ✅ Trio configured: Main `gemma-3n-e4b-it` (`server.rs:18`), Router `nvidia_orchestrator-8b`, Specialist `ministral-3-8b-instruct-2512` (both in `config.json` trio section + B10 auto-detect as fallback). `TrioConfig::default()` has empty strings but runtime always populated via explicit config or auto-detect.
 - [x] **B3.1: Smarter deterministic fallback** — ✅ `router_fallback.rs` now has 9 deterministic patterns + default ask_user (was 2). Includes: research+URL→spawn researcher, plain URL/HN→web_fetch, latest news→spawn, read/show+path→read_file, write/create+path→write_file, edit/modify+path→edit_file, list/ls→list_dir, run/execute/cargo→exec, search→web_search. All patterns guarded by `has_tool()` for graceful fallthrough. 19 tests. _Ref: `src/agent/router_fallback.rs`_
@@ -37,7 +93,20 @@
 
 ### 🟡 Important — do soon
 
-- [ ] **I0: Trio pipeline actions** — Router can only emit ONE action per turn. Multi-step tasks (research + synthesize) fail because the router picks one tool and stops. Need pipeline-as-first-class router output + shared scratchpad between trio roles. _Ref: `thoughts/shared/plans/2026-02-20-trio-pipeline-architecture.md`_
+- [ ] **I0: Trio pipeline actions** — Router can only emit ONE action per turn. Multi-step tasks (research + synthesize) fail because the router picks one tool and stops. Need pipeline-as-first-class router output + shared scratchpad between trio roles. **Superseded by I9** for the routing layer — I0 remains relevant for the execution/scratchpad side. _Ref: `thoughts/shared/plans/2026-02-20-trio-pipeline-architecture.md`_
+- [ ] **I9: Tiered routing with orchestrator escalation** ⚡ — **Priority.** The L1 concept router (all-MiniLM-L6-v2, centroid classification) proved 80% accurate at 5ms/0 VRAM vs orchestrator-8b's 43% at 637ms/6GB. But rigid template matching (L2) caps at ~7 predefined multi-step patterns. **Real workflows need 10-100+ steps with dynamic re-planning, conditional branching, and error recovery — templates can't express this.**
+  **Architecture: Three-tier routing with orchestrator escalation:**
+  | Tier | Engine | Latency | When | Traffic % |
+  |------|--------|---------|------|-----------|
+  | T1: Concept Router | Embedding centroid (CPU) | ~5ms | Unambiguous single-action queries | ~70% |
+  | T2: Template Expander | Embedding → template match | ~10ms | Known multi-step patterns (L2 templates) | ~15% |
+  | T3: Orchestrator | Reasoning LLM (nemotron-orchestrator-8b or nanbeige) | ~600ms | Complex/novel/failing workflows, low-confidence T1 | ~15% |
+  **Escalation triggers (T1→T3):** (a) Cosine similarity margin <0.4 (low confidence). (b) No template match for detected multi-step intent. (c) Step failure mid-execution (re-plan). (d) User query references prior context (pragmatic ambiguity).
+  **T3 orchestrator responsibilities:** Dynamic step decomposition (not limited to templates). Mid-workflow re-planning when steps fail or return unexpected results. Conditional branching (if build fails → fix errors → retry). State tracking across 10-100+ steps via scratchpad. Budget/token cost monitoring.
+  **Key insight from L1 experiments:** The 6 concept router failures were all pragmatic (hedging, vagueness, context-dependent) — exactly the cases where an LLM reasoning model adds value. The concept router handles the ~70% easy cases at zero cost; the orchestrator handles the ~15% hard cases where reasoning matters. This is cheaper than running the orchestrator on 100% of traffic.
+  **Implementation path:** 1) Wire concept router into `router_preflight()` as fast path. 2) Add confidence threshold — below 0.4, escalate to LLM orchestrator. 3) Add step executor that consumes `Vec<RouterDecision>` from either T2 templates or T3 orchestrator. 4) Add shared scratchpad for multi-step state. 5) Add re-planning hook: when a step fails, send context + failure to T3 for new plan.
+  **Compounds with:** I0 (pipeline execution), L1/L2 experiments (`experiments/lcm-routing/`), B5 (model evaluation).
+  _Ref: `experiments/lcm-routing/results/L1_analysis.md`, `experiments/lcm-routing/multi_step_templates.json`_
 - [ ] **I1: Local role/protocol crashes** — Fix `system` role crash, alternation crash, orphan tool messages. Thread repair pipeline exists but needs hardening. _Ref: `docs/plans/local-trio-strategy-2026-02-18.md`, `docs/plans/local-model-reliability-tdd.md`_
 - [x] **I2: Non-blocking compaction** — ✅ Absorbed into I7 (matryoshka compaction). Per-cluster parallel summarization replaces the three-tier approach.
 - [ ] **I3: Context Gate** — Replace dumb char-limit truncation with `ContentGate`: pass raw / structural briefing / drill-down. Zero agent-facing API changes. _Ref: `docs/plans/context-gate.md`, `docs/plans/context-protocol.md`_
@@ -50,6 +119,20 @@
   **Remaining:** Performance profiling under sustained load. Verify `lcm_expand` actually invoked by LLM during conversation. Persist DAG across session rotations.
   **Compounds with:** I6 (anti-drift cleans within summaries). B9 (pre-flight truncation as safety net). I3 (ContentGate decides raw vs summary).
   _Ref: `src/agent/lcm.rs`, `src/config/schema.rs:1219`_
+- [ ] **I10: `/clear` and `/new` REPL commands** — Manual context reset for local models with small context windows (4K-8K). Essential for trio mode where the Main model accumulates full conversation history while Router and Specialist are already stateless (ephemeral per-turn message arrays).
+  **`/clear` — reset working context, keep session:**
+  1. If LCM enabled: compact all `ctx.messages` into a single summary node. Model starts "fresh" but can `lcm_expand` to retrieve originals.
+  2. If LCM disabled: truncate messages, carry forward last 2 as context seed.
+  3. Reset working memory section of CONTEXT.md.
+  4. Emit `--- context cleared (N messages compacted) ---` in REPL.
+  5. Session JSONL continues — no data lost from the audit trail.
+  **`/new [name]` — fresh session entirely:**
+  1. Start a new session file (new JSONL, clean slate).
+  2. Optional `name` parameter, otherwise auto-generate.
+  3. Existing session stays on disk, accessible via `/sessions`.
+  **Scope:** Only Main model context needs reset — Router and Specialist are already ephemeral (verified in `router.rs`: `tool_messages`/`router_messages` built fresh each turn, `specialist_messages` built fresh each dispatch). No per-role action needed.
+  **Compounds with:** I7/LCM (compaction on clear), B11 (health status after clear), N6 (status injection reset).
+  _Ref: `src/agent/router.rs` (trio context isolation), `src/agent/agent_loop.rs` (LCM wiring), `src/session/manager.rs` (session lifecycle)_
 
 ### 🟢 Nice to have — Phase 0
 
@@ -112,8 +195,10 @@
 - NanBeige 3B: Good with `<think>\n</think>\n\n` prefill, but weak as router.
 - Main + Orchestrator work well together in practice.
 - Sequential self-routing would add latency vs parallel separation. Keep roles split.
-- **Router single-action bottleneck**: `request_strict_router_decision()` returns ONE `RouterDecision`. Multi-step tasks (fetch 2 URLs + synthesize) cannot be expressed. The router picks one tool and the pipeline stalls.
+- **Router single-action bottleneck**: `request_strict_router_decision()` returns ONE `RouterDecision`. Multi-step tasks (fetch 2 URLs + synthesize) cannot be expressed. The router picks one tool and the pipeline stalls. **See I9 for solution.**
 - ~~**Deterministic fallback too narrow**~~: **Fixed** in B3.1. `router_fallback.rs` now has 9 patterns (research+URL, plain URL, HN, latest news, read, write, edit, list, search, exec) + default ask_user. All guarded by `has_tool()`.
+- **L1 Concept router validated (2026-02-21):** all-MiniLM-L6-v2 centroid classification: 24/30 (80%) vs orchestrator-8b 13/30 (43%). 5ms vs 637ms. 0 VRAM vs 6GB. 100% on non-ambiguous queries. 5/5 multilingual. Failures are all pragmatic/vague — exactly the cases where LLM reasoning adds value. Data: `experiments/lcm-routing/`.
+- **L2 Multi-step templates built:** 7 templates (research_and_summarize, read_and_analyze, fetch_and_compare, search_and_update, check_and_report, plan_and_implement, verify_and_fix). Max 4 steps. **Limitation: rigid patterns can't scale to 10-100+ step workflows or handle failures/branching.** Orchestrator model needed for dynamic planning. See I9.
 - **Specialist has no tools**: `dispatch_specialist()` sends a single-shot chat — no tool access. Can synthesize given context but cannot fetch/execute.
 - **Trio never tested end-to-end**: As of 2026-02-19 handoff, the full trio flow (Main→Router→Specialist) has never completed a real task through LM Studio.
 - **2026-02-21 diagnostic: Trio mode didn't activate.** NanBeige ran as Inline main with full tool schemas. 21 metrics entries show `tool_calls_requested: 1, tool_calls_executed: 0` — model generated tool calls (proving it had tool schemas) that were blocked as duplicates. Compaction crashed twice (`n_keep 12620 >= n_ctx 8192`). **Fixed:** B8 (metrics + circuit breaker) and B9 (tool guard replay + compaction overflow) shipped. Death spiral no longer occurs. Remaining: wire trio activation so NanBeige runs in Trio mode, not Inline.
