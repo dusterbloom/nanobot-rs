@@ -1210,6 +1210,10 @@ fn default_lcm_deterministic_target() -> usize {
     512
 }
 
+fn default_lcm_compaction_context_size() -> usize {
+    4096
+}
+
 /// Configuration for Lossless Context Management.
 ///
 /// LCM replaces destructive compaction with a dual-state memory:
@@ -1233,6 +1237,15 @@ pub struct LcmSchemaConfig {
     /// Target tokens for Level 3 deterministic truncation (default: 512).
     #[serde(default = "default_lcm_deterministic_target")]
     pub deterministic_target: usize,
+    /// Dedicated compaction endpoint (url + model). When set, LCM uses this
+    /// model for summarization instead of the default memory/compaction model.
+    /// Example: `{"url": "http://192.168.1.22:1234/v1", "model": "qwen3-0.6b"}`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_endpoint: Option<ModelEndpoint>,
+    /// Context window size of the compaction model in tokens (default: 4096).
+    /// Only used when `compaction_endpoint` is set.
+    #[serde(default = "default_lcm_compaction_context_size")]
+    pub compaction_context_size: usize,
 }
 
 impl Default for LcmSchemaConfig {
@@ -1242,6 +1255,8 @@ impl Default for LcmSchemaConfig {
             tau_soft: default_lcm_tau_soft(),
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
+            compaction_endpoint: None,
+            compaction_context_size: default_lcm_compaction_context_size(),
         }
     }
 }
@@ -1878,6 +1893,8 @@ mod tests {
         assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
         assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
         assert_eq!(lcm.deterministic_target, 512);
+        assert!(lcm.compaction_endpoint.is_none());
+        assert_eq!(lcm.compaction_context_size, 4096);
     }
 
     #[test]
@@ -1910,5 +1927,25 @@ mod tests {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(!cfg.lcm.enabled);
+    }
+
+    #[test]
+    fn test_lcm_compaction_endpoint() {
+        let json = r#"{
+            "lcm": {
+                "enabled": true,
+                "compactionEndpoint": {
+                    "url": "http://192.168.1.22:1234/v1",
+                    "model": "qwen3-0.6b"
+                },
+                "compactionContextSize": 2048
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.lcm.enabled);
+        let ep = cfg.lcm.compaction_endpoint.as_ref().unwrap();
+        assert_eq!(ep.url, "http://192.168.1.22:1234/v1");
+        assert_eq!(ep.model, "qwen3-0.6b");
+        assert_eq!(cfg.lcm.compaction_context_size, 2048);
     }
 }

@@ -27,6 +27,7 @@ use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
 use crate::agent::thread_repair;
+use crate::agent::compaction::ContextCompactor;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::tools::registry::ToolRegistry;
@@ -80,6 +81,8 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_engines: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LcmEngine>>>>>,
     /// LCM configuration.
     pub(crate) lcm_config: LcmSchemaConfig,
+    /// Dedicated LCM compactor (when `lcm.compaction_endpoint` is configured).
+    pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -783,6 +786,7 @@ impl AgentLoopShared {
                         let bg_core = ctx.core.clone();
                         let bg_session_key = ctx.session_key.clone();
                         let bg_lcm = lcm_engine.clone();
+                        let bg_lcm_compactor = self.lcm_compactor.clone();
                         let watermark = ctx.messages.len();
                         in_flight.store(true, Ordering::SeqCst);
 
@@ -793,10 +797,15 @@ impl AgentLoopShared {
                         }
 
                         tokio::spawn(async move {
+                            // Use dedicated LCM compactor if configured,
+                            // otherwise fall back to the core memory compactor.
+                            let compactor: &ContextCompactor = bg_lcm_compactor
+                                .as_deref()
+                                .unwrap_or(&bg_core.compactor);
                             let observation = {
                                 let mut engine = bg_lcm.lock().await;
                                 engine
-                                    .compact(&bg_core.compactor, &bg_core.token_budget, 0)
+                                    .compact(compactor, &bg_core.token_budget, 0)
                                     .await
                             };
 
@@ -1717,6 +1726,24 @@ impl AgentLoop {
 
         let system_state = Arc::new(arc_swap::ArcSwap::from_pointee(SystemState::default()));
 
+        // Build dedicated LCM compactor when compaction_endpoint is configured.
+        let lcm_compactor = lcm_config.compaction_endpoint.as_ref().map(|ep| {
+            let provider: Arc<dyn crate::providers::base::LLMProvider> =
+                crate::providers::factory::create_openai_compat(
+                    crate::providers::factory::ProviderSpec {
+                        api_key: "lcm-compactor".to_string(),
+                        api_base: Some(ep.url.clone()),
+                        model: Some(ep.model.clone()),
+                        jit_gate: None,
+                    },
+                );
+            Arc::new(ContextCompactor::new(
+                provider,
+                ep.model.clone(),
+                lcm_config.compaction_context_size,
+            ))
+        });
+
         let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
@@ -1733,6 +1760,7 @@ impl AgentLoop {
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
             lcm_config,
+            lcm_compactor,
         });
 
         Self {
@@ -2728,6 +2756,7 @@ mod tests {
             tau_soft: 0.3,  // Trigger early.
             tau_hard: 0.6,
             deterministic_target: 128,
+            ..Default::default()
         };
 
         let agent_loop = AgentLoop::new(
