@@ -96,6 +96,7 @@ pub trait LLMProvider: Send + Sync {
     /// * `max_tokens` - Maximum tokens in response.
     /// * `temperature` - Sampling temperature.
     /// * `thinking_budget` - If Some, enable extended thinking with this token budget.
+    /// * `top_p` - If Some, nucleus sampling probability mass.
     async fn chat(
         &self,
         messages: &[serde_json::Value],
@@ -104,6 +105,7 @@ pub trait LLMProvider: Send + Sync {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<LLMResponse>;
 
     /// Send a streaming chat completion request.
@@ -117,6 +119,7 @@ pub trait LLMProvider: Send + Sync {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<StreamHandle> {
         let response = self
             .chat(
@@ -126,6 +129,7 @@ pub trait LLMProvider: Send + Sync {
                 max_tokens,
                 temperature,
                 thinking_budget,
+                top_p,
             )
             .await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

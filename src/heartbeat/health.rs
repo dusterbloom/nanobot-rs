@@ -243,6 +243,73 @@ impl HealthProbe for LcmCompactionProbe {
     }
 }
 
+// --- TrioEndpointProbe ---
+
+/// Health probe for trio router/specialist endpoints.
+/// Sends a minimal chat completion request (max_tokens: 1) to verify the endpoint is reachable.
+pub struct TrioEndpointProbe {
+    name: String,
+    base_url: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl TrioEndpointProbe {
+    pub fn new(name: &str, base_url: &str, model: &str) -> Self {
+        let url = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+        Self {
+            name: name.to_string(),
+            base_url: url,
+            model: model.to_string(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HealthProbe for TrioEndpointProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn interval_secs(&self) -> u64 {
+        60
+    }
+
+    async fn check(&self) -> ProbeResult {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let start = Instant::now();
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1
+        });
+        match self.client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().as_u16() == 200 => ProbeResult {
+                healthy: true,
+                latency_ms: start.elapsed().as_millis() as u64,
+                detail: Some("ok".to_string()),
+            },
+            Ok(resp) => ProbeResult {
+                healthy: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                detail: Some(format!("HTTP {}", resp.status())),
+            },
+            Err(e) => {
+                warn!("Trio endpoint health check '{}' failed: {}", self.name, e);
+                ProbeResult {
+                    healthy: false,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    detail: Some(e.to_string()),
+                }
+            }
+        }
+    }
+}
+
 // --- Config-driven factory ---
 
 pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry {
@@ -250,6 +317,22 @@ pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry 
     if config.lcm.enabled {
         if let Some(ref ep) = config.lcm.compaction_endpoint {
             reg.register(Box::new(LcmCompactionProbe::new(&ep.url)));
+        }
+    }
+    if config.trio.enabled {
+        if let Some(ref ep) = config.trio.router_endpoint {
+            reg.register(Box::new(TrioEndpointProbe::new(
+                "trio_router",
+                &ep.url,
+                &ep.model,
+            )));
+        }
+        if let Some(ref ep) = config.trio.specialist_endpoint {
+            reg.register(Box::new(TrioEndpointProbe::new(
+                "trio_specialist",
+                &ep.url,
+                &ep.model,
+            )));
         }
     }
     reg
@@ -487,5 +570,71 @@ mod tests {
     fn test_summary_line_no_probes() {
         let reg = HealthRegistry::new();
         assert_eq!(reg.summary_line(), "no probes");
+    }
+
+    // --- TrioEndpointProbe tests ---
+
+    #[test]
+    fn trio_endpoint_probe_strips_v1() {
+        let probe = TrioEndpointProbe::new("trio_router", "http://localhost:1234/v1/", "qwen3");
+        assert_eq!(probe.name(), "trio_router");
+        assert_eq!(probe.base_url, "http://localhost:1234");
+        assert_eq!(probe.model, "qwen3");
+    }
+
+    #[test]
+    fn test_trio_probe_strips_v1_without_trailing_slash() {
+        let probe = TrioEndpointProbe::new("trio_specialist", "http://localhost:8095/v1", "ministral");
+        assert_eq!(probe.name(), "trio_specialist");
+        assert_eq!(probe.base_url, "http://localhost:8095");
+        assert_eq!(probe.model, "ministral");
+    }
+
+    #[test]
+    fn test_trio_probe_no_v1_suffix() {
+        let probe = TrioEndpointProbe::new("trio_router", "http://localhost:1234", "model-x");
+        assert_eq!(probe.base_url, "http://localhost:1234");
+    }
+
+    // --- build_registry trio tests ---
+
+    #[test]
+    fn test_build_registry_trio_disabled_no_probes() {
+        let mut config = crate::config::schema::Config::default();
+        config.trio.enabled = false;
+        config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
+            url: "http://localhost:1234/v1".to_string(),
+            model: "router".to_string(),
+        });
+        let reg = build_registry(&config);
+        assert_eq!(reg.probe_count(), 0);
+    }
+
+    #[test]
+    fn test_build_registry_trio_enabled_with_both_endpoints() {
+        let mut config = crate::config::schema::Config::default();
+        config.trio.enabled = true;
+        config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
+            url: "http://localhost:8094/v1".to_string(),
+            model: "router-model".to_string(),
+        });
+        config.trio.specialist_endpoint = Some(crate::config::schema::ModelEndpoint {
+            url: "http://localhost:8095/v1".to_string(),
+            model: "specialist-model".to_string(),
+        });
+        let reg = build_registry(&config);
+        assert_eq!(reg.probe_count(), 2);
+    }
+
+    #[test]
+    fn test_build_registry_trio_enabled_router_only() {
+        let mut config = crate::config::schema::Config::default();
+        config.trio.enabled = true;
+        config.trio.router_endpoint = Some(crate::config::schema::ModelEndpoint {
+            url: "http://localhost:8094/v1".to_string(),
+            model: "router-model".to_string(),
+        });
+        let reg = build_registry(&config);
+        assert_eq!(reg.probe_count(), 1);
     }
 }

@@ -158,6 +158,7 @@ pub(crate) async fn request_strict_router_decision(
     router_pack: &str,
     no_think: bool,
     temperature: f64,
+    top_p: f64,
 ) -> Result<role_policy::RouterDecision, String> {
     info!(role = "router", model = %model, "router_decision_start");
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
@@ -247,7 +248,7 @@ pub(crate) async fn request_strict_router_decision(
         }),
     ];
     if let Ok(tool_resp) = provider
-        .chat(&tool_messages, Some(&tool_defs), Some(model), 256, temperature, None)
+        .chat(&tool_messages, Some(&tool_defs), Some(model), 256, temperature, None, Some(top_p))
         .await
     {
         if let Some(tc) = tool_resp.tool_calls.first() {
@@ -290,7 +291,7 @@ pub(crate) async fn request_strict_router_decision(
     ];
 
     let router_resp = provider
-        .chat(&router_messages, None, Some(model), 256, temperature, None)
+        .chat(&router_messages, None, Some(model), 256, temperature, None, Some(top_p))
         .await
         .map_err(|e| format!("strict router call failed: {}", e))?;
     let raw = router_resp.content.unwrap_or_default();
@@ -343,6 +344,7 @@ pub(crate) async fn request_strict_router_decision(
 /// - `Err(msg)` on fatal error (break with msg)
 pub(crate) async fn dispatch_specialist(
     core: &SwappableCore,
+    counters: &crate::agent::agent_core::RuntimeCounters,
     target: &str,
     router_args: &Value,
     user_content: &str,
@@ -362,6 +364,11 @@ pub(crate) async fn dispatch_specialist(
             );
         }
     };
+
+    let cb_key = format!("specialist:{}", specialist_model);
+    if !counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+        return Err(format!("circuit breaker open for {}", cb_key));
+    }
     let specialist_state = format!(
         "Target: {}\nRouter args: {}\nUser intent: {}",
         target, router_args, context_summary
@@ -390,16 +397,21 @@ pub(crate) async fn dispatch_specialist(
             core.tool_delegation_config.max_tokens,
             0.3,
             None,
+            None,
         )
         .await
     {
         Ok(sp_resp) => {
+            counters.trio_circuit_breaker.lock().unwrap().record_success(&cb_key);
             let text = sp_resp
                 .content
                 .unwrap_or_else(|| "Specialist returned no content.".to_string());
             Ok(format!("[specialist:{}] {}", target, text))
         }
-        Err(e) => Err(format!("Specialist lane failed: {}", e)),
+        Err(e) => {
+            counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            Err(format!("Specialist lane failed: {}", e))
+        }
     }
 }
 
@@ -456,7 +468,10 @@ pub(crate) enum PreflightResult {
 ///
 /// Only applies in local mode with strict_no_tools_main + strict_router_schema.
 /// Returns a control flow signal for the main loop.
-pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
+pub(crate) async fn router_preflight(
+    ctx: &mut TurnContext,
+    health_registry: Option<&crate::heartbeat::health::HealthRegistry>,
+) -> PreflightResult {
     if !(ctx.core.is_local
         && ctx.core.tool_delegation_config.strict_no_tools_main
         && ctx.core.tool_delegation_config.strict_router_schema
@@ -484,6 +499,21 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
                 );
             }
         };
+
+    // Health gate: skip preflight if router endpoint is degraded.
+    if let Some(hr) = health_registry {
+        if !hr.is_healthy("trio_router") {
+            warn!("[router] trio_router probe degraded — falling through to main model");
+            return PreflightResult::Passthrough;
+        }
+    }
+
+    // Circuit breaker gate: skip if router has too many recent failures.
+    let cb_key = format!("router:{}", router_model);
+    if !ctx.counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+        warn!("[router] circuit breaker open for {cb_key} — falling through to main model");
+        return PreflightResult::Passthrough;
+    }
     let tool_list = if ctx.core.is_local {
         ctx.tools
             .get_local_definitions(&ctx.messages, &ctx.used_tools)
@@ -517,12 +547,18 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
         &router_pack,
         ctx.core.router_no_think,
         ctx.core.router_temperature,
+        ctx.core.router_top_p,
     )
     .await
     {
-        Ok(d) => d,
+        Ok(d) => {
+            ctx.counters.trio_circuit_breaker.lock().unwrap().record_success(&cb_key);
+            d
+        }
         Err(e) => {
-            return PreflightResult::Break(format!("Router policy failed: {}.", e));
+            warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
+            ctx.counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            return PreflightResult::Passthrough;
         }
     };
 
@@ -547,6 +583,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
         "specialist" => {
             match dispatch_specialist(
                 &ctx.core,
+                &ctx.counters,
                 &decision.target,
                 &decision.args,
                 &ctx.user_content,
@@ -685,6 +722,7 @@ pub(crate) async fn route_tool_calls(
                 &router_pack,
                 ctx.core.router_no_think,
                 ctx.core.router_temperature,
+                ctx.core.router_top_p,
             )
             .await
             {
@@ -783,6 +821,7 @@ pub(crate) async fn route_tool_calls(
                 let context_summary = response_content.unwrap_or("(empty)");
                 match dispatch_specialist(
                     &ctx.core,
+                    &ctx.counters,
                     &plan.target,
                     &plan.args,
                     &ctx.user_content,

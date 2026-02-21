@@ -153,7 +153,7 @@ impl Reflector {
 
         let response = self
             .provider
-            .chat(&messages, None, Some(&self.model), 2048, 0.3, None)
+            .chat(&messages, None, Some(&self.model), 2048, 0.3, None, None)
             .await?;
 
         let updated_memory = response
@@ -220,6 +220,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> Result<LLMResponse> {
             Ok(LLMResponse {
                 content: Some(self.response.clone()),
@@ -247,6 +248,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> Result<LLMResponse> {
             Err(anyhow::anyhow!("LLM unavailable"))
         }

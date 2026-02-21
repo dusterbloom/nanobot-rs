@@ -262,7 +262,7 @@ async fn execute_step_with_tools(
         }
 
         let response = match provider
-            .chat(&messages, tool_defs_opt, Some(model), 4096, 0.7, None)
+            .chat(&messages, tool_defs_opt, Some(model), 4096, 0.7, None, None)
             .await
         {
             Ok(r) => r,
@@ -355,7 +355,7 @@ async fn vote_on_step(
 async fn call_llm(provider: &dyn LLMProvider, model: &str, prompt: &str) -> String {
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
     match provider
-        .chat(&messages, None, Some(model), 512, 0.3, None)
+        .chat(&messages, None, Some(model), 512, 0.3, None, None)
         .await
     {
         Ok(resp) => resp.content.unwrap_or_default(),
@@ -446,6 +446,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             let idx = self
                 .call_count

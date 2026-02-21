@@ -358,6 +358,7 @@ impl LLMProvider for AnthropicProvider {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_claude_model(m.split('/').last().unwrap_or(m)));
         let model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -372,6 +373,10 @@ impl LLMProvider for AnthropicProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
+
+        if let Some(tp) = top_p {
+            body["top_p"] = json!(tp);
+        }
 
         // Extended thinking: add thinking block with budget
         if let Some(budget) = thinking_budget {
@@ -536,6 +541,7 @@ impl LLMProvider for AnthropicProvider {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_claude_model(m.split('/').last().unwrap_or(m)));
         let model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -551,6 +557,10 @@ impl LLMProvider for AnthropicProvider {
             "temperature": temperature,
             "stream": true,
         });
+
+        if let Some(tp) = top_p {
+            body["top_p"] = json!(tp);
+        }
 
         // Extended thinking: add thinking block with budget
         if let Some(budget) = thinking_budget {

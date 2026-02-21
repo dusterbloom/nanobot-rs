@@ -592,6 +592,45 @@ impl ReplContext {
             }
         }
 
+        // TRIO section — only shown when trio mode is active.
+        if self.config.trio.enabled {
+            let router_health = if let Some(ref hr) = self.health_registry {
+                if hr.is_healthy("trio_router") { "healthy" } else { "degraded" }
+            } else {
+                "n/a"
+            };
+            let specialist_health = if let Some(ref hr) = self.health_registry {
+                if hr.is_healthy("trio_specialist") { "healthy" } else { "degraded" }
+            } else {
+                "n/a"
+            };
+            let last_action = counters
+                .trio_metrics
+                .router_action
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+            let preflight = counters
+                .trio_metrics
+                .router_preflight_fired
+                .load(Ordering::Relaxed);
+            let specialist_dispatched = counters
+                .trio_metrics
+                .specialist_dispatched
+                .load(Ordering::Relaxed);
+            println!(
+                "  {}TRIO{}      router={} specialist={} last_action={} preflight={} dispatched={}",
+                tui::BOLD,
+                tui::RESET,
+                router_health,
+                specialist_health,
+                last_action,
+                preflight,
+                specialist_dispatched,
+            );
+        }
+
         println!();
     }
 

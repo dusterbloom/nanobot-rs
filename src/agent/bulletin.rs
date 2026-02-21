@@ -115,7 +115,7 @@ pub async fn generate_bulletin(
     ];
 
     let response = provider
-        .chat(&messages, None, Some(model), 1024, 0.3, None)
+        .chat(&messages, None, Some(model), 1024, 0.3, None, None)
         .await?;
 
     response
@@ -271,6 +271,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             Ok(LLMResponse {
                 content: Some("- User works on nanobot\n- Prefers Rust".into()),

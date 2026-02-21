@@ -16,6 +16,7 @@ use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
+use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::config::schema::{AntiDriftConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
 use crate::session::manager::SessionManager;
@@ -58,7 +59,6 @@ pub struct SwappableCore {
     pub router_model: Option<String>,
     pub router_no_think: bool,
     pub router_temperature: f64,
-    #[allow(dead_code)]
     pub router_top_p: f64,
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub specialist_model: Option<String>,
@@ -142,6 +142,8 @@ pub struct RuntimeCounters {
     pub inference_active: Arc<AtomicBool>,
     /// Trio routing observability.
     pub trio_metrics: TrioMetrics,
+    /// Circuit breaker for trio routing providers.
+    pub trio_circuit_breaker: std::sync::Mutex<CircuitBreaker>,
 }
 
 impl RuntimeCounters {
@@ -163,6 +165,7 @@ impl RuntimeCounters {
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
             trio_metrics: TrioMetrics::default(),
+            trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new()),
         }
     }
 }

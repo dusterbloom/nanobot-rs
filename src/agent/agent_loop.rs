@@ -85,6 +85,8 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    /// Budget calibrator for recording execution stats (append-only SQLite).
+    pub(crate) calibrator: Option<std::sync::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -123,6 +125,10 @@ pub(crate) struct TurnContext {
     pub(crate) used_tools: std::collections::HashSet<String>,
     pub(crate) final_content: String,
     pub(crate) turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
+    /// Number of LLM iterations consumed in this agent turn (for calibration).
+    pub(crate) iterations_used: u32,
+    /// Wall-clock start of this agent turn (for duration measurement).
+    pub(crate) turn_start: std::time::Instant,
 
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
@@ -133,6 +139,9 @@ pub(crate) struct TurnContext {
 
     // --- Flow control ---
     pub(crate) flow: FlowControl,
+
+    // --- Health ---
+    pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 }
 
 /// Per-turn flow control flags.
@@ -394,6 +403,18 @@ impl AgentLoopShared {
             }
         }
 
+        // Inject recent daily notes for local mode continuity.
+        if core.is_local && core.memory_enabled {
+            let memory_store = crate::agent::memory::MemoryStore::new(&core.workspace);
+            let notes = memory_store.read_recent_daily_notes(3);
+            if !notes.is_empty() {
+                append_to_system_prompt(
+                    &mut messages,
+                    &format!("\n\n## Recent Notes\n\n{}", notes),
+                );
+            }
+        }
+
         // Auto-inject background task status into system prompt so the agent
         // is naturally aware of running/completed subagents without explicit tool calls.
         {
@@ -476,6 +497,8 @@ impl AgentLoopShared {
             used_tools: std::collections::HashSet::new(),
             final_content: String::new(),
             turn_tool_entries: Vec::new(),
+            iterations_used: 0,
+            turn_start: std::time::Instant::now(),
             compaction: CompactionHandle {
                 slot: compaction_slot,
                 in_flight: compaction_in_flight,
@@ -492,6 +515,7 @@ impl AgentLoopShared {
                 consecutive_all_blocked: 0,
                 llm_call_start: None,
             },
+            health_registry: self.health_registry.clone(),
         }
     }
 
@@ -508,6 +532,7 @@ impl AgentLoopShared {
                 ctx.core.max_iterations
             );
 
+            ctx.iterations_used = iteration + 1;
             let outcome = self.run_iteration(ctx, iteration).await;
             match outcome {
                 IterationOutcome::Continue => continue,
@@ -952,7 +977,7 @@ impl AgentLoopShared {
         }
 
         // Router-first preflight for strict trio mode.
-        match crate::agent::router::router_preflight(ctx).await {
+        match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await {
             crate::agent::router::PreflightResult::Continue => {
                 return StepResult::Done(IterationOutcome::Continue);
             }
@@ -1060,6 +1085,7 @@ impl AgentLoopShared {
                     max_tokens,
                     ctx.core.temperature,
                     thinking_budget,
+                    None,
                 )
                 .await
             {
@@ -1154,6 +1180,7 @@ impl AgentLoopShared {
                     max_tokens,
                     ctx.core.temperature,
                     thinking_budget,
+                    None,
                 )
                 .await
             {
@@ -1266,6 +1293,7 @@ impl AgentLoopShared {
                     Some(&ctx.core.model),
                     rescue_tokens,
                     0.2,
+                    None,
                     None,
                 )
                 .await
@@ -1651,6 +1679,38 @@ impl AgentLoopShared {
             }
         }
 
+        // Record execution stats for budget calibration (append-only, errors silently logged).
+        if let Some(ref cal_mutex) = self.calibrator {
+            let task_type = if ctx.used_tools.contains("exec_command") {
+                "shell"
+            } else if ctx.used_tools.contains("web_search") {
+                "web_search"
+            } else if ctx.used_tools.contains("spawn_agent") {
+                "delegate"
+            } else if ctx.used_tools.is_empty() {
+                "chat"
+            } else {
+                "tool_use"
+            };
+            let record = crate::agent::budget_calibrator::ExecutionRecord {
+                task_type: task_type.to_string(),
+                model: ctx.core.model.clone(),
+                iterations_used: ctx.iterations_used,
+                max_iterations: ctx.core.max_iterations,
+                success: !ctx.final_content.is_empty(),
+                cost_usd: 0.0, // TODO: wire actual cost tracking
+                duration_ms: ctx.turn_start.elapsed().as_millis() as u64,
+                depth: 0,
+                tool_calls: ctx.used_tools.len() as u32,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Ok(cal) = cal_mutex.lock() {
+                if let Err(e) = cal.record(&record) {
+                    tracing::debug!("BudgetCalibrator record failed: {}", e);
+                }
+            }
+        }
+
         if ctx.final_content.is_empty() {
             None
         } else {
@@ -1794,6 +1854,13 @@ impl AgentLoop {
             lcm_config,
             lcm_compactor,
             health_registry,
+            calibrator: match crate::agent::budget_calibrator::BudgetCalibrator::open_default() {
+                Ok(c) => Some(std::sync::Mutex::new(c)),
+                Err(e) => {
+                    tracing::warn!("BudgetCalibrator init failed, recording disabled: {}", e);
+                    None
+                }
+            },
         });
 
         Self {
@@ -2189,6 +2256,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             Ok(crate::providers::base::LLMResponse {
                 content: Some("mock".to_string()),
@@ -2227,6 +2295,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
             Ok(crate::providers::base::LLMResponse {
                 content: Some(self.body.clone()),
@@ -2328,6 +2397,7 @@ mod tests {
                 "route this action with strict schema",
                 false,
                 0.6,
+                1.0,
             )
             .await
             .expect("valid strict router decision");
@@ -2387,7 +2457,7 @@ mod tests {
         ];
         for (expected_action, directive) in router_cases {
             let pack = format!("{}\nFollow schema strictly.", directive);
-            match request_strict_router_decision(&router, &router_model, &pack, false, 0.6).await {
+            match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0).await {
                 Ok(d) => {
                     if d.action != expected_action {
                         failures.push(format!(
@@ -2418,6 +2488,7 @@ mod tests {
                     Some(&specialist_model),
                     256,
                     0.2,
+                    None,
                     None,
                 )
                 .await
@@ -2450,7 +2521,7 @@ mod tests {
         // Main provider smoke: should answer plain text with no tools when none offered.
         let main_messages = vec![json!({"role":"user","content":"Reply with exactly: main-ok"})];
         match main
-            .chat(&main_messages, None, Some(&main_model), 64, 0.0, None)
+            .chat(&main_messages, None, Some(&main_model), 64, 0.0, None, None)
             .await
         {
             Ok(resp) => {
@@ -2746,6 +2817,7 @@ mod tests {
                 Some(&model_name),
                 32,
                 0.0,
+                None,
                 None,
             )
             .await;
@@ -3114,7 +3186,7 @@ mod tests {
             .with_max_times(10)
             .build();
         loop {
-            match provider.chat(&messages, None, Some(model), 32, 0.0, None).await {
+            match provider.chat(&messages, None, Some(model), 32, 0.0, None, None).await {
                 Ok(resp) => {
                     let text = resp.content.unwrap_or_default();
                     if !text.trim().is_empty() {
@@ -3137,6 +3209,99 @@ mod tests {
                 None => panic!("{} did not become ready after retries", role),
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_preflight() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E preflight: base={}", base);
+
+        // 1. Verify LM Studio /models endpoint is reachable
+        let models_url = format!("{}/models", base.trim_end_matches("/v1").trim_end_matches('/'));
+        // Try the /v1/models path first (standard OpenAI-compat)
+        let models_url_v1 = format!("{}/models", base.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let models_resp = client
+            .get(&models_url_v1)
+            .header("Authorization", "Bearer local")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+
+        match &models_resp {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!("  /models endpoint OK (status {})", resp.status());
+            }
+            Ok(resp) => {
+                panic!(
+                    "preflight FAILED: /models returned HTTP {} — is LM Studio running at {}?",
+                    resp.status(),
+                    base
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "preflight FAILED: cannot reach {} — {}\nStart LM Studio or set NANOBOT_TRIO_BASE.",
+                    models_url_v1, e
+                );
+            }
+        }
+
+        // 2. Parse model list and check availability
+        let body: serde_json::Value = models_resp
+            .unwrap()
+            .json()
+            .await
+            .expect("preflight: /models response is not valid JSON");
+
+        let model_ids: Vec<String> = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        eprintln!("  available models: {:?}", model_ids);
+
+        // Note: LM Studio with JIT loading may not list all models upfront.
+        // We log availability but don't fail — the warmup step below is the real gate.
+        for (name, role) in [
+            (&main_model, "main"),
+            (&router_model, "router"),
+            (&specialist_model, "specialist"),
+        ] {
+            if model_ids.iter().any(|id| id.contains(name.as_str())) {
+                eprintln!("  {} model '{}' found in /models", role, name);
+            } else {
+                eprintln!("  {} model '{}' NOT listed (may JIT-load on demand)", role, name);
+            }
+        }
+
+        // 3. Build harness and warmup all 3 providers (the real gate)
+        let (agent_loop, workspace) =
+            build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(
+            core.router_provider.as_ref().unwrap().as_ref(),
+            &router_model,
+            "router",
+        )
+        .await;
+        warmup_trio_provider(
+            core.specialist_provider.as_ref().unwrap().as_ref(),
+            &specialist_model,
+            "specialist",
+        )
+        .await;
+
+        eprintln!("trio E2E preflight: ALL OK — infrastructure ready");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]

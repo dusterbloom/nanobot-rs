@@ -908,6 +908,7 @@ impl SubagentManager {
                     max_response_tokens,
                     0.7,
                     None,
+                    None,
                 )
                 .await
             {
@@ -941,6 +942,7 @@ impl SubagentManager {
                             Some(&config.model),
                             retry_max_tokens,
                             0.7,
+                            None,
                             None,
                         )
                         .await?
@@ -1201,6 +1203,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             let mut captured = self.captured.lock().await;
             let call_num = captured.len();
@@ -1313,6 +1316,7 @@ mod tests {
                 _max_tokens: u32,
                 _temperature: f64,
                 _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
             ) -> anyhow::Result<LLMResponse> {
                 Ok(LLMResponse {
                     content: Some("Immediate answer.".to_string()),

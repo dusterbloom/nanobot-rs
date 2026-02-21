@@ -490,6 +490,7 @@ impl LLMProvider for OpenAICompatProvider {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<LLMResponse> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -565,6 +566,9 @@ impl LLMProvider for OpenAICompatProvider {
             "max_tokens": max_tokens,
             "temperature": temperature,
         });
+        if let Some(tp) = top_p {
+            body["top_p"] = serde_json::json!(tp);
+        }
         apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
 
         if let Some(ref tool_defs) = cached_tools {
@@ -722,6 +726,7 @@ impl LLMProvider for OpenAICompatProvider {
         max_tokens: u32,
         temperature: f64,
         thinking_budget: Option<u32>,
+        top_p: Option<f64>,
     ) -> Result<StreamHandle> {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
@@ -785,6 +790,9 @@ impl LLMProvider for OpenAICompatProvider {
             "stream": true,
             "stream_options": { "include_usage": true },
         });
+        if let Some(tp) = top_p {
+            body["top_p"] = serde_json::json!(tp);
+        }
         apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
 
         if let Some(ref tool_defs) = cached_tools {

@@ -697,6 +697,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             Ok(LLMResponse {
                 content: Some("User asked multiple questions about Rust ownership.".to_string()),
@@ -724,6 +725,7 @@ mod tests {
             _max_tokens: u32,
             _temperature: f64,
             _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
         ) -> anyhow::Result<LLMResponse> {
             Err(anyhow::anyhow!("No LLM available"))
         }
@@ -1208,6 +1210,7 @@ mod tests {
                     Some(model_name),
                     16,
                     0.0,
+                    None,
                     None,
                 )
                 .await;
