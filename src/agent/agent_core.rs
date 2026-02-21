@@ -5,7 +5,7 @@
 //! compaction utilities.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -71,6 +71,18 @@ pub struct SwappableCore {
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
     /// Number of recent messages to keep untruncated in context hygiene (default: 20).
     pub hygiene_keep_last_messages: usize,
+}
+
+/// Current trio routing state — transitions logged once, not per-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TrioState {
+    /// Trio routing fully operational.
+    Active = 0,
+    /// Trio degraded — some components unhealthy, falling back.
+    Degraded = 1,
+    /// Trio disabled — running as standalone single model.
+    Standalone = 2,
 }
 
 /// Observability counters for trio routing, populated by router.rs.
@@ -147,6 +159,8 @@ pub struct RuntimeCounters {
     pub trio_metrics: TrioMetrics,
     /// Circuit breaker for trio routing providers.
     pub trio_circuit_breaker: std::sync::Mutex<CircuitBreaker>,
+    /// Current trio routing state for observability.
+    pub trio_state: AtomicU8,
 }
 
 impl RuntimeCounters {
@@ -173,6 +187,29 @@ impl RuntimeCounters {
             inference_active: Arc::new(AtomicBool::new(false)),
             trio_metrics: TrioMetrics::default(),
             trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new(cb_config)),
+            trio_state: AtomicU8::new(TrioState::Standalone as u8),
+        }
+    }
+}
+
+impl RuntimeCounters {
+    /// Update trio state, logging only on transitions.
+    pub fn set_trio_state(&self, new_state: TrioState) {
+        let old = self.trio_state.swap(new_state as u8, std::sync::atomic::Ordering::Relaxed);
+        if old != new_state as u8 {
+            match new_state {
+                TrioState::Active => tracing::info!("trio_state_transition: -> Active"),
+                TrioState::Degraded => tracing::warn!("trio_state_transition: -> Degraded"),
+                TrioState::Standalone => tracing::warn!("trio_state_transition: -> Standalone"),
+            }
+        }
+    }
+
+    pub fn get_trio_state(&self) -> TrioState {
+        match self.trio_state.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => TrioState::Active,
+            1 => TrioState::Degraded,
+            _ => TrioState::Standalone,
         }
     }
 }
@@ -516,5 +553,42 @@ pub(crate) fn append_to_system_prompt(messages: &mut [Value], suffix: &str) {
         .map(|s| s.to_string())
     {
         messages[0]["content"] = Value::String(format!("{}{}", sys, suffix));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::schema::CircuitBreakerConfig;
+
+    #[test]
+    fn test_trio_state_default_is_standalone() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        assert_eq!(counters.get_trio_state(), TrioState::Standalone);
+    }
+
+    #[test]
+    fn test_trio_state_transitions() {
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+
+        counters.set_trio_state(TrioState::Active);
+        assert_eq!(counters.get_trio_state(), TrioState::Active);
+
+        counters.set_trio_state(TrioState::Degraded);
+        assert_eq!(counters.get_trio_state(), TrioState::Degraded);
+
+        counters.set_trio_state(TrioState::Standalone);
+        assert_eq!(counters.get_trio_state(), TrioState::Standalone);
+    }
+
+    #[test]
+    fn test_trio_state_no_log_on_same_state() {
+        // Setting the same state twice should not log (swap returns same value).
+        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+
+        counters.set_trio_state(TrioState::Active);
+        // Second call with same state — no log, no panic.
+        counters.set_trio_state(TrioState::Active);
+        assert_eq!(counters.get_trio_state(), TrioState::Active);
     }
 }

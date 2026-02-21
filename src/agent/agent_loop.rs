@@ -756,7 +756,24 @@ impl AgentLoopShared {
         if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
-            tool_defs.clear();
+            // BUT: if trio routing is degraded, keep tools so main model can still act.
+            let router_probe_healthy = self.health_registry
+                .as_ref()
+                .map_or(false, |reg| reg.is_healthy("trio_router"));
+            let cb_available = ctx.counters.trio_circuit_breaker.lock().unwrap()
+                .is_available("trio_router");
+            if should_strip_tools_for_trio(
+                ctx.core.is_local,
+                ctx.core.tool_delegation_config.strict_no_tools_main,
+                router_probe_healthy,
+                cb_available,
+            ) {
+                ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Active);
+                tool_defs.clear();
+            } else {
+                ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
+                debug!("trio degraded — keeping tools for main model fallback");
+            }
         }
         if boundary_active {
             tool_defs.retain(|def| {
@@ -1741,6 +1758,21 @@ impl AgentLoopShared {
             Some(outbound)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers (no IO — fully unit-testable)
+// ---------------------------------------------------------------------------
+
+/// Decide whether trio routing is healthy enough to strip tools from the main model.
+/// Pure function: takes health status as booleans, returns true if tools should be stripped.
+fn should_strip_tools_for_trio(
+    is_local: bool,
+    strict_no_tools_main: bool,
+    router_probe_healthy: bool,
+    circuit_breaker_available: bool,
+) -> bool {
+    is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available
 }
 
 // ---------------------------------------------------------------------------
@@ -3723,5 +3755,44 @@ mod tests {
         assert!(!resp3.is_empty(), "turn 3 should be non-empty");
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_strip_tools_for_trio — pure function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_strip_tools_all_healthy() {
+        assert!(should_strip_tools_for_trio(true, true, true, true));
+    }
+
+    #[test]
+    fn test_should_strip_tools_not_local() {
+        // Cloud mode: never strip tools via this path.
+        assert!(!should_strip_tools_for_trio(false, true, true, true));
+    }
+
+    #[test]
+    fn test_should_strip_tools_no_strict_mode() {
+        // strict_no_tools_main is false: don't strip.
+        assert!(!should_strip_tools_for_trio(true, false, true, true));
+    }
+
+    #[test]
+    fn test_should_strip_tools_router_unhealthy() {
+        // Router probe degraded: keep tools for fallback.
+        assert!(!should_strip_tools_for_trio(true, true, false, true));
+    }
+
+    #[test]
+    fn test_should_strip_tools_circuit_breaker_open() {
+        // Circuit breaker tripped: keep tools for fallback.
+        assert!(!should_strip_tools_for_trio(true, true, true, false));
+    }
+
+    #[test]
+    fn test_should_strip_tools_both_degraded() {
+        // Both degraded: definitely keep tools.
+        assert!(!should_strip_tools_for_trio(true, true, false, false));
     }
 }

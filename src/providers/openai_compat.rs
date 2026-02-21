@@ -206,30 +206,22 @@ fn apply_local_reasoning_controls(
     body: &mut serde_json::Value,
     api_base: &str,
     thinking_budget: Option<u32>,
-    supports_thinking: bool,
+    _supports_thinking: bool,
 ) {
     if !is_local_api_base(api_base) {
         return;
     }
 
-    match (thinking_budget, supports_thinking) {
-        (Some(budget), _) => {
-            body["chat_template_kwargs"] = serde_json::json!({
-                "enable_thinking": true
-            });
-            body["reasoning_budget"] = serde_json::json!(budget);
-            body["reasoning_format"] = serde_json::json!("deepseek");
-        }
-        (None, true) => {
-            // Thinking-capable model but user hasn't enabled thinking:
-            // explicitly disable so model doesn't reason by default.
-            body["reasoning_budget"] = serde_json::json!(0);
-            body["reasoning_format"] = serde_json::json!("none");
-        }
-        (None, false) => {
-            // Non-thinking model: send nothing, clean request.
-        }
+    if let Some(budget) = thinking_budget {
+        body["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": true
+        });
+        body["reasoning_budget"] = serde_json::json!(budget);
+        body["reasoning_format"] = serde_json::json!("deepseek");
     }
+    // When thinking_budget is None: send nothing.
+    // Prefill already suppresses reasoning for thinking-capable models;
+    // sending reasoning params causes LM Studio HTTP 400 for some models.
 }
 
 /// Check if a model uses template-level thinking that requires the native LMS
@@ -1956,8 +1948,8 @@ mod tests {
     fn test_reasoning_disabled_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
         apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, true);
-        assert_eq!(body["reasoning_budget"], 0);
-        assert_eq!(body["reasoning_format"], "none");
+        assert!(body.get("reasoning_budget").is_none(), "reasoning_budget should not be sent");
+        assert!(body.get("reasoning_format").is_none(), "reasoning_format should not be sent");
     }
 
     #[test]

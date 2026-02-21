@@ -505,6 +505,7 @@ pub(crate) async fn router_preflight(
     // Health gate: skip preflight if router endpoint is degraded.
     if let Some(hr) = health_registry {
         if !hr.is_healthy("trio_router") {
+            ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
             warn!("[router] trio_router probe degraded — falling through to main model");
             return PreflightResult::Passthrough;
         }
@@ -513,6 +514,7 @@ pub(crate) async fn router_preflight(
     // Circuit breaker gate: skip if router has too many recent failures.
     let cb_key = format!("router:{}", router_model);
     if !ctx.counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+        ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
         warn!("[router] circuit breaker open for {cb_key} — falling through to main model");
         return PreflightResult::Passthrough;
     }
