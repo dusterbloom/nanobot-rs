@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::TurnContext;
@@ -18,6 +18,72 @@ use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
+
+/// Build a compact conversation tail from the message history for the router.
+///
+/// Extracts the last `max_pairs` user/assistant exchanges (skipping system,
+/// tool_call, and tool-result messages). Each message is truncated to
+/// `max_msg_chars`. The total output is capped at `max_chars`.
+/// When LCM compaction is active, `messages` already contains summaries in
+/// place of old messages, so this naturally includes compressed context.
+fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
+    let mut pairs: Vec<(Option<&str>, Option<&str>)> = Vec::new();
+    let mut current_user: Option<&str> = None;
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        match role {
+            "user" => {
+                current_user = Some(content);
+            }
+            "assistant" => {
+                if current_user.is_some() || pairs.is_empty() {
+                    pairs.push((current_user.take(), Some(content)));
+                }
+            }
+            _ => {} // skip system, tool
+        }
+    }
+
+    // Take the last N pairs
+    let tail: Vec<_> = if pairs.len() > max_pairs {
+        pairs[pairs.len() - max_pairs..].to_vec()
+    } else {
+        pairs
+    };
+
+    let mut out = String::new();
+    for (user, assistant) in &tail {
+        if let Some(u) = user {
+            let truncated = if u.len() > max_msg_chars {
+                let end = crate::utils::helpers::floor_char_boundary(u, max_msg_chars);
+                format!("{}…", &u[..end])
+            } else {
+                u.to_string()
+            };
+            out.push_str(&format!("User: {}\n", truncated));
+        }
+        if let Some(a) = assistant {
+            let truncated = if a.len() > max_msg_chars {
+                let end = crate::utils::helpers::floor_char_boundary(a, max_msg_chars);
+                format!("{}…", &a[..end])
+            } else {
+                a.to_string()
+            };
+            out.push_str(&format!("Assistant: {}\n", truncated));
+        }
+    }
+
+    if out.len() > max_chars {
+        let end = crate::utils::helpers::floor_char_boundary(&out, max_chars);
+        out.truncate(end);
+    }
+    out
+}
 
 /// Extract the first top-level JSON object from raw text.
 ///
@@ -152,6 +218,11 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     }
 }
 
+#[instrument(name = "request_strict_router_decision", skip(provider, router_pack, tool_names), fields(
+    model,
+    no_think,
+    parse_strategy = tracing::field::Empty,
+))]
 pub(crate) async fn request_strict_router_decision(
     provider: &dyn LLMProvider,
     model: &str,
@@ -159,6 +230,7 @@ pub(crate) async fn request_strict_router_decision(
     no_think: bool,
     temperature: f64,
     top_p: f64,
+    tool_names: &str,
 ) -> Result<role_policy::RouterDecision, String> {
     info!(role = "router", model = %model, "router_decision_start");
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
@@ -227,20 +299,32 @@ pub(crate) async fn request_strict_router_decision(
             }
         }
     });
+    let tool_catalog = if tool_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nAvailable tools (use exact names for target): {}\n",
+            tool_names
+        )
+    };
+
     let tool_defs = vec![route_tool];
+    let tool_system = format!(
+        "You are a routing agent. Analyze the user's request and call route_decision once.\n\n\
+         Actions:\n\
+         - respond: Greetings, chitchat, simple questions the main model can answer directly\n\
+         - tool: Use a specific tool (set target=tool_name, args=tool_parameters)\n\
+         - specialist: Delegate to specialist model for complex multi-step reasoning\n\
+         - ask_user: ONLY when the request is truly ambiguous and cannot be answered\n\
+         {}\
+         If the user is just saying hello or asking a simple question, use action=respond.\n\
+         Call route_decision exactly once. No prose.",
+        tool_catalog
+    );
     let tool_messages = vec![
         json!({
             "role": "system",
-            "content": concat!(
-                "You are a routing agent. Analyze the user's request and call route_decision once.\n\n",
-                "Actions:\n",
-                "- respond: Greetings, chitchat, simple questions the main model can answer directly\n",
-                "- tool: Use a specific tool (set target=tool_name, args=tool_parameters)\n",
-                "- specialist: Delegate to specialist model for complex multi-step reasoning\n",
-                "- ask_user: ONLY when the request is truly ambiguous and cannot be answered\n\n",
-                "If the user is just saying hello or asking a simple question, use action=respond.\n",
-                "Call route_decision exactly once. No prose.",
-            )
+            "content": tool_system
         }),
         json!({
             "role": "user",
@@ -265,6 +349,7 @@ pub(crate) async fn request_strict_router_decision(
                     )
                     .is_ok()
                     {
+                        tracing::Span::current().record("parse_strategy", "tool_call");
                         return Ok(decision);
                     }
                 }
@@ -272,17 +357,20 @@ pub(crate) async fn request_strict_router_decision(
         }
     }
 
+    let json_system = format!(
+        "Output EXACTLY one JSON object. No markdown, no explanation, no extra text.\n\
+         Schema: {{\"action\":\"respond|tool|specialist|ask_user\",\"target\":\"string\",\"args\":{{}},\"confidence\":0.0-1.0}}\n\
+         {}\n\
+         Examples:\n\
+         User says hello → {{\"action\":\"respond\",\"target\":\"main\",\"args\":{{}},\"confidence\":0.95}}\n\
+         User asks to read a file → {{\"action\":\"tool\",\"target\":\"read_file\",\"args\":{{\"path\":\"README.md\"}},\"confidence\":0.9}}\n\
+         User asks a simple question → {{\"action\":\"respond\",\"target\":\"main\",\"args\":{{}},\"confidence\":0.9}}\n",
+        tool_catalog
+    );
     let router_messages = vec![
         json!({
             "role": "system",
-            "content": concat!(
-                "Output EXACTLY one JSON object. No markdown, no explanation, no extra text.\n",
-                "Schema: {\"action\":\"respond|tool|specialist|ask_user\",\"target\":\"string\",\"args\":{},\"confidence\":0.0-1.0}\n\n",
-                "Examples:\n",
-                "User says hello → {\"action\":\"respond\",\"target\":\"main\",\"args\":{},\"confidence\":0.95}\n",
-                "User asks to read a file → {\"action\":\"tool\",\"target\":\"read_file\",\"args\":{\"path\":\"README.md\"},\"confidence\":0.9}\n",
-                "User asks a simple question → {\"action\":\"respond\",\"target\":\"main\",\"args\":{},\"confidence\":0.9}\n",
-            )
+            "content": json_system
         }),
         json!({
             "role": "user",
@@ -343,6 +431,15 @@ pub(crate) async fn request_strict_router_decision(
 /// Shared by both preflight and post-tool router paths. Returns:
 /// - `Ok(text)` to inject as a user message and continue
 /// - `Err(msg)` on fatal error (break with msg)
+#[instrument(
+    name = "dispatch_specialist",
+    skip(core, counters, router_args, user_content, context_summary, tool_list, messages),
+    fields(
+        target = %target,
+        outcome = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn dispatch_specialist(
     core: &SwappableCore,
     counters: &crate::agent::agent_core::RuntimeCounters,
@@ -351,7 +448,9 @@ pub(crate) async fn dispatch_specialist(
     user_content: &str,
     context_summary: &str,
     tool_list: &[String],
+    messages: &[Value],
 ) -> Result<String, String> {
+    let start = std::time::Instant::now();
     info!(role = "specialist", target = %target, "dispatch_specialist_start");
     let (specialist_provider, specialist_model) = match (
         core.specialist_provider.as_ref(),
@@ -359,6 +458,7 @@ pub(crate) async fn dispatch_specialist(
     ) {
         (Some(p), Some(m)) => (p.clone(), m.to_string()),
         _ => {
+            tracing::Span::current().record("outcome", "error");
             return Err(
                 "Specialist lane requested by router but no specialist server is configured."
                     .to_string(),
@@ -368,17 +468,19 @@ pub(crate) async fn dispatch_specialist(
 
     let cb_key = format!("specialist:{}", specialist_model);
     if !counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+        tracing::Span::current().record("outcome", "error");
         return Err(format!("circuit breaker open for {}", cb_key));
     }
     let specialist_state = format!(
         "Target: {}\nRouter args: {}\nUser intent: {}",
         target, router_args, context_summary
     );
+    let conv_tail = build_conversation_tail(messages, 5, 200, 800);
     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
         role_policy::build_context_pack(
             role_policy::Role::Specialist,
             user_content,
-            "(live turn; summary omitted)",
+            &conv_tail,
             &specialist_state,
             tool_list,
             3000,
@@ -408,10 +510,13 @@ pub(crate) async fn dispatch_specialist(
                 .content
                 .unwrap_or_else(|| "Specialist returned no content.".to_string());
             let text = crate::agent::sanitize::sanitize_reasoning_output(&raw_text);
+            tracing::Span::current().record("outcome", "ok");
+            tracing::Span::current().record("elapsed_ms", start.elapsed().as_millis() as u64);
             Ok(format!("[specialist:{}] {}", target, text))
         }
         Err(e) => {
             counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            tracing::Span::current().record("outcome", "error");
             Err(format!("Specialist lane failed: {}", e))
         }
     }
@@ -470,6 +575,14 @@ pub(crate) enum PreflightResult {
 ///
 /// Only applies in local mode with strict_no_tools_main + strict_router_schema.
 /// Returns a control flow signal for the main loop.
+#[instrument(
+    name = "router_preflight",
+    skip(ctx, health_registry),
+    fields(
+        user_msg = %ctx.user_content.chars().take(80).collect::<String>(),
+        routing_decision = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn router_preflight(
     ctx: &mut TurnContext,
     health_registry: Option<&crate::heartbeat::health::HealthRegistry>,
@@ -486,6 +599,7 @@ pub(crate) async fn router_preflight(
                 "router_preflight_skipped"
             );
         }
+        tracing::Span::current().record("routing_decision", "passthrough");
         return PreflightResult::Passthrough;
     }
 
@@ -496,6 +610,7 @@ pub(crate) async fn router_preflight(
         match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {
             (Some(p), Some(m)) => (p.clone(), m.to_string()),
             _ => {
+                tracing::Span::current().record("routing_decision", "break_no_router");
                 return PreflightResult::Break(
                     "Router lane is required by policy but not configured. Start trio router server and retry.".to_string(),
                 );
@@ -507,6 +622,7 @@ pub(crate) async fn router_preflight(
         if !hr.is_healthy("trio_router") {
             ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
             warn!("[router] trio_router probe degraded — falling through to main model");
+            tracing::Span::current().record("routing_decision", "passthrough_degraded");
             return PreflightResult::Passthrough;
         }
     }
@@ -516,6 +632,7 @@ pub(crate) async fn router_preflight(
     if !ctx.counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
         ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
         warn!("[router] circuit breaker open for {cb_key} — falling through to main model");
+        tracing::Span::current().record("routing_decision", "passthrough_circuit_open");
         return PreflightResult::Passthrough;
     }
     let tool_list = if ctx.core.is_local {
@@ -531,12 +648,20 @@ pub(crate) async fn router_preflight(
     } else {
         ctx.tools.tool_names()
     };
-    let task_state = format!("Strict preflight. User message: {}", ctx.user_content);
+    let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
+    let task_state = if conv_tail.is_empty() {
+        format!("Strict preflight.\nUser message: {}", ctx.user_content)
+    } else {
+        format!(
+            "Strict preflight.\nRecent conversation:\n{}\nCurrent user message: {}",
+            conv_tail, ctx.user_content
+        )
+    };
     let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
         role_policy::build_context_pack(
             role_policy::Role::Router,
             &ctx.user_content,
-            "(live turn; summary omitted)",
+            &conv_tail,
             &task_state,
             &tool_list,
             2000,
@@ -552,6 +677,7 @@ pub(crate) async fn router_preflight(
         ctx.core.router_no_think,
         ctx.core.router_temperature,
         ctx.core.router_top_p,
+        &tool_list.join(", "),
     )
     .await
     {
@@ -562,6 +688,7 @@ pub(crate) async fn router_preflight(
         Err(e) => {
             warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
             ctx.counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            tracing::Span::current().record("routing_decision", "passthrough_router_error");
             return PreflightResult::Passthrough;
         }
     };
@@ -576,15 +703,19 @@ pub(crate) async fn router_preflight(
     *ctx.counters.trio_metrics.router_action.lock().unwrap() = Some(decision.action.clone());
 
     match decision.action.as_str() {
-        "ask_user" => PreflightResult::Break(
-            decision
-                .args
-                .get("question")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "I need clarification to continue.".to_string()),
-        ),
+        "ask_user" => {
+            tracing::Span::current().record("routing_decision", "ask_user");
+            PreflightResult::Break(
+                decision
+                    .args
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "I need clarification to continue.".to_string()),
+            )
+        }
         "specialist" => {
+            tracing::Span::current().record("routing_decision", "specialist");
             match dispatch_specialist(
                 &ctx.core,
                 &ctx.counters,
@@ -593,6 +724,7 @@ pub(crate) async fn router_preflight(
                 &ctx.user_content,
                 &ctx.user_content,
                 &tool_list,
+                &ctx.messages,
             )
             .await
             {
@@ -606,6 +738,7 @@ pub(crate) async fn router_preflight(
             }
         }
         "subagent" => {
+            tracing::Span::current().record("routing_decision", "subagent");
             match dispatch_subagent(
                 &ctx.tools,
                 &decision.target,
@@ -625,6 +758,7 @@ pub(crate) async fn router_preflight(
             }
         }
         "tool" => {
+            tracing::Span::current().record("routing_decision", "tool");
             if decision.target.trim().is_empty() {
                 return PreflightResult::Break(
                     "Router selected tool action but target is empty.".to_string(),
@@ -657,10 +791,12 @@ pub(crate) async fn router_preflight(
             PreflightResult::Continue
         }
         "respond" => {
+            tracing::Span::current().record("routing_decision", "respond");
             debug!("Router: respond — forwarding to main model");
             PreflightResult::Passthrough
         }
         _ => {
+            tracing::Span::current().record("routing_decision", "unknown_passthrough");
             debug!(
                 "Router: unrecognized action '{}' — forwarding to main model",
                 decision.action
@@ -704,11 +840,12 @@ pub(crate) async fn route_tool_calls(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
         let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
             role_policy::build_context_pack(
                 role_policy::Role::Router,
                 &ctx.user_content,
-                "(live turn; summary omitted)",
+                &conv_tail,
                 &task_state,
                 &available_tools,
                 2000,
@@ -727,6 +864,7 @@ pub(crate) async fn route_tool_calls(
                 ctx.core.router_no_think,
                 ctx.core.router_temperature,
                 ctx.core.router_top_p,
+                &available_tools.join(", "),
             )
             .await
             {
@@ -831,6 +969,7 @@ pub(crate) async fn route_tool_calls(
                     &ctx.user_content,
                     context_summary,
                     &ctx.tools.tool_names(),
+                    &ctx.messages,
                 )
                 .await
                 {

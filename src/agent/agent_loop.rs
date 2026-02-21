@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::anti_drift;
@@ -528,6 +528,12 @@ impl AgentLoopShared {
     ///
     /// Thin loop driver: delegates each iteration to [`run_iteration`] which
     /// drives the inner state machine through `IterationPhase` steps.
+    #[instrument(name = "agent_loop", skip(self, ctx), fields(
+        session = %ctx.session_key,
+        mode = if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main { "trio" } else { "inline" },
+        model = %ctx.core.model,
+        streaming = ctx.streaming,
+    ))]
     async fn run_agent_loop(&self, ctx: &mut TurnContext) {
         for iteration in 0..ctx.core.max_iterations {
             debug!(
@@ -593,6 +599,7 @@ impl AgentLoopShared {
 
     /// Context hygiene, proprioception, aha channel, heartbeat,
     /// compaction-check, iteration counter.
+    #[instrument(name = "step_prepare", skip(self, ctx), fields(iteration))]
     async fn step_prepare(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
         let counters = &self.core_handle.counters;
 
@@ -710,6 +717,12 @@ impl AgentLoopShared {
     /// Response boundary injection, tool definition filtering, message
     /// trimming, background compaction spawn, protocol repair, pre-flight
     /// context size check, router preflight, adaptive max_tokens.
+    #[instrument(name = "step_pre_call", skip(self, ctx), fields(
+        iteration,
+        trio_mode = ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main,
+        boundary_active = ctx.flow.force_response,
+        msg_count = ctx.messages.len(),
+    ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
         let counters = &self.core_handle.counters;
 
@@ -770,6 +783,17 @@ impl AgentLoopShared {
             ) {
                 ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Active);
                 tool_defs.clear();
+                // Tell the main model it's in orchestration mode (tools stripped).
+                append_to_system_prompt(&mut ctx.messages, concat!(
+                    "\n\n## Orchestration Mode (Active)\n",
+                    "A trio routing system handles tool execution on your behalf.\n",
+                    "- You do NOT have direct tool access in this mode.\n",
+                    "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
+                    "incorporate that result into your response.\n",
+                    "- If you need additional tool actions, describe them clearly ",
+                    "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
+                    "- Focus on reasoning, planning, and conversation.\n",
+                ));
             } else {
                 ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
                 debug!("trio degraded — keeping tools for main model fallback");
@@ -840,6 +864,11 @@ impl AgentLoopShared {
 
                 match action {
                     CompactionAction::Async | CompactionAction::Blocking => {
+                        tracing::info!(
+                            compaction_type = if action == CompactionAction::Async { "lcm_async" } else { "lcm_blocking" },
+                            msg_count = ctx.messages.len(),
+                            "lcm_compaction_triggered"
+                        );
                         let slot = ctx.compaction.slot.clone();
                         let in_flight = ctx.compaction.in_flight.clone();
                         let bg_messages = ctx.messages.clone();
@@ -912,6 +941,11 @@ impl AgentLoopShared {
                 .compactor
                 .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
         {
+            tracing::info!(
+                compaction_type = "core_async",
+                msg_count = ctx.messages.len(),
+                "core_compaction_triggered"
+            );
             let slot = ctx.compaction.slot.clone();
             let in_flight = ctx.compaction.in_flight.clone();
             let bg_messages = ctx.messages.clone();
@@ -1065,6 +1099,12 @@ impl AgentLoopShared {
 
     /// Thinking budget calculation, inference_active flag, streaming path
     /// (with cancellation support) or blocking path.
+    #[instrument(name = "step_call_llm", skip(self, ctx, tool_defs), fields(
+        model = %ctx.core.model,
+        streaming = ctx.streaming,
+        max_tokens,
+        n_tool_defs = tool_defs.len(),
+    ))]
     async fn step_call_llm(
         &self,
         ctx: &mut TurnContext,
@@ -1232,6 +1272,11 @@ impl AgentLoopShared {
 
     /// Response validation (hallucinated tool calls), rescue pass for empty
     /// local model responses, provider error check, token telemetry.
+    #[instrument(name = "step_process_response", skip(self, ctx, response), fields(
+        has_tool_calls = response.has_tool_calls(),
+        finish_reason = %response.finish_reason,
+        n_tool_calls = response.tool_calls.len(),
+    ))]
     async fn step_process_response(
         &self,
         ctx: &mut TurnContext,
@@ -1436,6 +1481,10 @@ impl AgentLoopShared {
     /// Route tool calls through the router, check context pressure,
     /// delegation decision + execute, inline fallback, priority message
     /// check, cancellation check.
+    #[instrument(name = "step_execute_tools", skip(self, ctx, response, _tool_calls), fields(
+        delegation_enabled = ctx.core.tool_delegation_config.enabled,
+        n_tool_calls = response.tool_calls.len(),
+    ))]
     async fn step_execute_tools(
         &self,
         ctx: &mut TurnContext,
@@ -1766,13 +1815,21 @@ impl AgentLoopShared {
 
 /// Decide whether trio routing is healthy enough to strip tools from the main model.
 /// Pure function: takes health status as booleans, returns true if tools should be stripped.
+#[instrument(name = "should_strip_tools_for_trio", fields(
+    is_local,
+    strict_no_tools_main,
+    router_probe_healthy,
+    circuit_breaker_available,
+))]
 fn should_strip_tools_for_trio(
     is_local: bool,
     strict_no_tools_main: bool,
     router_probe_healthy: bool,
     circuit_breaker_available: bool,
 ) -> bool {
-    is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available
+    let result = is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
+    tracing::debug!(strip_tools = result, "trio_strip_decision");
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3794,5 +3851,599 @@ mod tests {
     fn test_should_strip_tools_both_degraded() {
         // Both degraded: definitely keep tools.
         assert!(!should_strip_tools_for_trio(true, true, false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // Offline trio E2E tests (no network required — all providers are mocks)
+    // -----------------------------------------------------------------------
+
+    /// A mock LLM provider that returns responses from a pre-loaded queue.
+    ///
+    /// Each call pops the next response. When the queue is empty it returns a
+    /// sentinel error string so tests can detect over-calling.
+    struct SequenceProvider {
+        name: String,
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl SequenceProvider {
+        fn new(name: &str, responses: Vec<&str>) -> Self {
+            Self {
+                name: name.to_string(),
+                responses: std::sync::Mutex::new(
+                    responses.into_iter().map(|s| s.to_string()).collect(),
+                ),
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for SequenceProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let response = {
+                let mut deque = self.responses.lock().unwrap();
+                if deque.is_empty() {
+                    "ERROR: no responses left in SequenceProvider".to_string()
+                } else {
+                    deque.pop_front().unwrap()
+                }
+            };
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(response),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
+    /// Build an offline trio harness from pre-built mock providers.
+    ///
+    /// Mirrors `build_trio_e2e_harness` but accepts providers directly rather
+    /// than constructing real HTTP clients. No background probes are wired.
+    fn build_trio_offline_harness(
+        main: Arc<dyn LLMProvider>,
+        router: Arc<dyn LLMProvider>,
+        specialist: Arc<dyn LLMProvider>,
+    ) -> (AgentLoop, std::path::PathBuf) {
+        use crate::config::schema::LcmSchemaConfig;
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+
+        let mut td = ToolDelegationConfig {
+            mode: crate::config::schema::DelegationMode::Trio,
+            ..Default::default()
+        };
+        td.apply_mode(); // sets strict_no_tools_main = true, strict_router_schema = true
+
+        let router_model = router.get_default_model().to_string();
+        let specialist_model = specialist.get_default_model().to_string();
+
+        let trio_config = TrioConfig {
+            enabled: true,
+            router_model: router_model.clone(),
+            specialist_model: specialist_model.clone(),
+            ..Default::default()
+        };
+
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace: workspace.clone(),
+            model: "offline-main".to_string(),
+            max_iterations: 5,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(router),
+            specialist_provider: Some(specialist),
+            trio_config,
+            model_capabilities_overrides: std::collections::HashMap::new(),
+        });
+
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None, // no health_registry — offline tests manage their own
+        );
+
+        (agent_loop, workspace)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: router decides "respond" — specialist is never called
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_trio_offline_e2e_respond() {
+        let router_resp = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
+        let main_resp = "Four.";
+
+        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![router_resp, router_resp, router_resp],
+        ));
+        let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", main_resp));
+        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-specialist",
+            "specialist unused",
+        ));
+
+        let (agent_loop, workspace) =
+            build_trio_offline_harness(main, router, specialist);
+
+        let resp = agent_loop
+            .process_direct("What is 2+2?", "trio-offline-respond", "test", "offline")
+            .await;
+
+        eprintln!(
+            "test_trio_offline_e2e_respond: response ({} chars): {}",
+            resp.len(),
+            &resp[..resp.len().min(200)]
+        );
+
+        let counters = &agent_loop.shared.core_handle.counters;
+        let metrics = &counters.trio_metrics;
+
+        assert!(
+            metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+            "router preflight should have fired"
+        );
+        assert_eq!(
+            metrics.router_action.lock().unwrap().as_deref(),
+            Some("respond"),
+            "router_action should be 'respond'"
+        );
+        assert!(
+            !metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            "specialist should NOT have been dispatched for a 'respond' decision"
+        );
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: router decides "specialist" — specialist is called
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_trio_offline_e2e_specialist_dispatch() {
+        let router_resp = r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#;
+
+        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![router_resp, router_resp, router_resp],
+        ));
+        let main: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
+        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-specialist",
+            "Here is the specialist answer.",
+        ));
+
+        let (agent_loop, workspace) =
+            build_trio_offline_harness(main, router, specialist);
+
+        let resp = agent_loop
+            .process_direct(
+                "Explain for loops",
+                "trio-offline-specialist",
+                "test",
+                "offline",
+            )
+            .await;
+
+        eprintln!(
+            "test_trio_offline_e2e_specialist_dispatch: response ({} chars): {}",
+            resp.len(),
+            &resp[..resp.len().min(200)]
+        );
+
+        let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
+
+        assert_eq!(
+            metrics.router_action.lock().unwrap().as_deref(),
+            Some("specialist"),
+            "router_action should be 'specialist'"
+        );
+        assert!(
+            metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            "specialist should have been dispatched"
+        );
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: circuit breaker cascade
+    //
+    // The router returns non-JSON 3+ times. Each failure is recorded under
+    // the key "router:{model}" (as router.rs does). However, agent_loop.rs
+    // checks availability under "trio_router" — so the CB check at the
+    // should_strip_tools_for_trio call site never sees the tripped breaker.
+    //
+    // This test documents that discrepancy explicitly.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_trio_offline_e2e_circuit_breaker_cascade() {
+        // All 4 router calls return non-JSON to trip the circuit breaker.
+        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![
+                "this is not json at all !!!",
+                "this is not json at all !!!",
+                "this is not json at all !!!",
+                "this is not json at all !!!",
+            ],
+        ));
+        let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-main",
+            "main fallback response",
+        ));
+        let specialist: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("offline-specialist", "specialist unused"));
+
+        let (agent_loop, workspace) =
+            build_trio_offline_harness(main, router, specialist);
+
+        // Send 4 messages — each failure increments the CB counter.
+        // After 3 failures (default threshold) the CB is tripped.
+        // The 4th call will be via Passthrough (router returns early) because
+        // the CB key "router:offline-router" is open. Main answers directly.
+        for i in 0..4u32 {
+            let resp = agent_loop
+                .process_direct(
+                    &format!("message {}", i),
+                    "trio-offline-cb",
+                    "test",
+                    "offline",
+                )
+                .await;
+            eprintln!(
+                "  cascade msg {}: ({} chars) {}",
+                i,
+                resp.len(),
+                &resp[..resp.len().min(80)]
+            );
+        }
+
+        let counters = &agent_loop.shared.core_handle.counters;
+
+        // After repeated failures the trio state should be Degraded.
+        let state = counters.get_trio_state();
+        eprintln!("trio_state after cascade: {:?}", state);
+        assert_eq!(
+            state,
+            crate::agent::agent_core::TrioState::Degraded,
+            "trio_state should be Degraded after repeated router failures"
+        );
+
+        // --- Key mismatch bug documentation ---
+        //
+        // router.rs records failures under "router:{model}" (e.g. "router:offline-router").
+        // agent_loop.rs:763 checks availability under "trio_router".
+        //
+        // Consequence: the should_strip_tools_for_trio() call in step_pre_call uses the
+        // wrong key and therefore ALWAYS sees the circuit breaker as available, meaning
+        // the mismatch prevents the CB from protecting the tool-stripping decision.
+        //
+        // The CB IS correctly consulted inside router_preflight() (via the "router:{model}"
+        // key), so the router will still skip the LLM call after 3 failures. The bug is
+        // only in the secondary check at the tool-stripping site.
+        let cb_wrong_key_available = counters
+            .trio_circuit_breaker
+            .lock()
+            .unwrap()
+            .is_available("trio_router");
+        // Bug: this is true even though the router has failed 4 times,
+        // because the failures are stored under "router:offline-router", not "trio_router".
+        eprintln!(
+            "CB 'trio_router' available (should be wrong key): {}",
+            cb_wrong_key_available
+        );
+        assert!(
+            cb_wrong_key_available,
+            // Bug: agent_loop.rs checks 'trio_router' but router.rs records \
+            // 'router:{{model}}' — keys never match, so this is always true"
+            "CB check under 'trio_router' is always available — this confirms the key \
+             mismatch bug: agent_loop.rs checks 'trio_router' but router.rs records \
+             'router:offline-router'"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: health gate — degraded router probe bypasses preflight
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_trio_offline_e2e_health_gate() {
+        use crate::heartbeat::health::{HealthProbe, HealthRegistry, ProbeResult};
+        use crate::config::schema::LcmSchemaConfig;
+
+        // A mock probe that always returns unhealthy (simulates router being down).
+        struct AlwaysUnhealthyProbe;
+
+        #[async_trait]
+        impl HealthProbe for AlwaysUnhealthyProbe {
+            fn name(&self) -> &str {
+                "trio_router"
+            }
+
+            fn interval_secs(&self) -> u64 {
+                0 // always due
+            }
+
+            async fn check(&self) -> ProbeResult {
+                ProbeResult {
+                    healthy: false,
+                    latency_ms: 0,
+                    detail: Some("simulated failure".to_string()),
+                }
+            }
+        }
+
+        // Build a registry and degrade the trio_router probe.
+        let mut health_registry = HealthRegistry::new();
+        health_registry.register(Box::new(AlwaysUnhealthyProbe));
+        // Run 3 times to reach DEGRADED_THRESHOLD = 3.
+        for _ in 0..3 {
+            health_registry.run_due_probes().await;
+        }
+        assert!(
+            !health_registry.is_healthy("trio_router"),
+            "trio_router should be degraded after 3 failures"
+        );
+        let health_registry = Arc::new(health_registry);
+
+        // The router SequenceProvider would fail the test if called (empty queue).
+        // We keep a typed Arc so we can read call_count() after the run.
+        let router_seq = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![], // empty — calling this would return the sentinel error
+        ));
+        let router: Arc<dyn LLMProvider> = router_seq.clone();
+        let main: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("offline-main", "main answer"));
+        let specialist: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("offline-specialist", "specialist unused"));
+
+        // Build harness manually so we can wire in the health registry.
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let mut td = ToolDelegationConfig {
+            mode: crate::config::schema::DelegationMode::Trio,
+            ..Default::default()
+        };
+        td.apply_mode();
+
+        let router_model = router.get_default_model().to_string();
+        let specialist_model = specialist.get_default_model().to_string();
+        let trio_config = TrioConfig {
+            enabled: true,
+            router_model: router_model.clone(),
+            specialist_model: specialist_model.clone(),
+            ..Default::default()
+        };
+
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace: workspace.clone(),
+            model: "offline-main".to_string(),
+            max_iterations: 5,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(router.clone()),
+            specialist_provider: Some(specialist),
+            trio_config,
+            model_capabilities_overrides: std::collections::HashMap::new(),
+        });
+
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            Some(health_registry), // health registry is wired in here
+        );
+
+        let resp = agent_loop
+            .process_direct(
+                "Hello",
+                "trio-offline-health-gate",
+                "test",
+                "offline",
+            )
+            .await;
+
+        eprintln!(
+            "test_trio_offline_e2e_health_gate: response ({} chars): {}",
+            resp.len(),
+            &resp[..resp.len().min(200)]
+        );
+
+        // When the health gate fires, router_preflight returns Passthrough and sets Degraded.
+        let state = agent_loop
+            .shared
+            .core_handle
+            .counters
+            .get_trio_state();
+        eprintln!("trio_state after health gate: {:?}", state);
+        assert_eq!(
+            state,
+            crate::agent::agent_core::TrioState::Degraded,
+            "trio_state should be Degraded when health gate fires"
+        );
+
+        // Response must come from main (non-empty).
+        assert!(!resp.is_empty(), "response should come from main, not be empty");
+
+        // router_preflight_fired should be true (we entered preflight but returned Passthrough).
+        let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
+        assert!(
+            metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+            "router_preflight_fired should be true (preflight was entered)"
+        );
+
+        // Specialist must not have been dispatched.
+        assert!(
+            !metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            "specialist should not be dispatched when health gate is active"
+        );
+
+        // Router's chat() should never have been called — health gate fired before it.
+        assert_eq!(
+            router_seq.call_count(),
+            0,
+            "router provider's chat() call count should be 0 (health gate bypassed it)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: lenient parse fallback
+    //
+    // Router returns FunctionGemma comma-separated format:
+    //   "specialist,coding,{}"
+    // `parse_lenient_router_decision` handles this format.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_trio_offline_e2e_parse_fallback_lenient() {
+        // Lenient format: "action,target,{args}" — no JSON wrapper.
+        // This exercises the comma-separated branch in parse_lenient_router_decision.
+        let router_resp = "specialist,coding,{}";
+
+        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![router_resp, router_resp, router_resp],
+        ));
+        let main: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
+        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-specialist",
+            "lenient parse worked",
+        ));
+
+        // Verify that parse_lenient_router_decision handles this format before
+        // wiring it into the full agent loop.
+        let lenient_decision = parse_lenient_router_decision(router_resp);
+        assert!(
+            lenient_decision.is_some(),
+            "parse_lenient_router_decision should accept 'specialist,coding,{{}}'"
+        );
+        let lenient_decision = lenient_decision.unwrap();
+        assert_eq!(
+            lenient_decision.action, "specialist",
+            "lenient decision action should be 'specialist'"
+        );
+
+        let (agent_loop, workspace) =
+            build_trio_offline_harness(main, router, specialist);
+
+        let resp = agent_loop
+            .process_direct(
+                "Explain something complex",
+                "trio-offline-lenient",
+                "test",
+                "offline",
+            )
+            .await;
+
+        eprintln!(
+            "test_trio_offline_e2e_parse_fallback_lenient: response ({} chars): {}",
+            resp.len(),
+            &resp[..resp.len().min(200)]
+        );
+
+        let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
+
+        assert_eq!(
+            metrics.router_action.lock().unwrap().as_deref(),
+            Some("specialist"),
+            "router_action should be 'specialist' after lenient parse"
+        );
+        assert!(
+            metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            "specialist should have been dispatched after lenient parse"
+        );
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

@@ -26,6 +26,8 @@ mod voice;
 mod voice_pipeline;
 
 use std::io::IsTerminal;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use clap::{Parser, Subcommand};
 
@@ -363,6 +365,11 @@ fn main() {
         }
     };
 
+    // Chrome tracing: build layer + guard (feature-gated).
+    // Guard must live until program exit to flush the trace file.
+    #[cfg(feature = "trace-chrome")]
+    let _chrome_guard: tracing_chrome::FlushGuard;
+
     if is_interactive_repl {
         // Redirect tracing to a daily-rotated log file to prevent WARN logs from
         // interleaving with streaming output on stderr.  Rolling appender produces
@@ -374,15 +381,83 @@ fn main() {
         let _ = std::fs::create_dir_all(&log_dir);
         let file_appender = tracing_appender::rolling::daily(&log_dir, "nanobot.log");
 
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(file_appender)
             .json()
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .with_ansi(false)
-            .init();
+            .with_ansi(false);
+
+        #[cfg(not(feature = "trace-chrome"))]
+        {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .try_init()
+                .ok();
+        }
+
+        #[cfg(feature = "trace-chrome")]
+        {
+            let trace_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".nanobot")
+                .join("traces");
+            let _ = std::fs::create_dir_all(&trace_dir);
+            let trace_path = trace_dir.join(format!(
+                "nanobot-{}.json",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            ));
+            eprintln!("[trace] Writing chrome trace to {}", trace_path.display());
+            let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .file(trace_path)
+                .include_args(true)
+                .build();
+            _chrome_guard = guard;
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .with(chrome_layer)
+                .try_init()
+                .ok();
+        }
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        let fmt_layer = tracing_subscriber::fmt::layer();
+
+        #[cfg(not(feature = "trace-chrome"))]
+        {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .try_init()
+                .ok();
+        }
+
+        #[cfg(feature = "trace-chrome")]
+        {
+            let trace_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".nanobot")
+                .join("traces");
+            let _ = std::fs::create_dir_all(&trace_dir);
+            let trace_path = trace_dir.join(format!(
+                "nanobot-{}.json",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            ));
+            eprintln!("[trace] Writing chrome trace to {}", trace_path.display());
+            let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .file(trace_path)
+                .include_args(true)
+                .build();
+            _chrome_guard = guard;
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(fmt_layer)
+                .with(chrome_layer)
+                .try_init()
+                .ok();
+        }
     }
 
     tracing::info!(

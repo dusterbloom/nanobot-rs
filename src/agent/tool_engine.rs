@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
@@ -22,6 +22,14 @@ use super::agent_loop::TurnContext;
 ///
 /// Returns `true` if delegation was used (caller should `continue` the main loop).
 /// Returns `false` if delegation couldn't proceed (caller should fall through to inline).
+#[instrument(
+    name = "execute_tools_delegated",
+    skip(ctx, counters, routed_tool_calls, response, delegation_provider, delegation_model),
+    fields(
+        tools = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn execute_tools_delegated(
     ctx: &mut TurnContext,
     counters: &RuntimeCounters,
@@ -32,8 +40,18 @@ pub(crate) async fn execute_tools_delegated(
 ) -> bool {
     let (tr_provider, tr_model) = match (delegation_provider.as_ref(), delegation_model.as_ref()) {
         (Some(p), Some(m)) => (p.clone(), m.clone()),
-        _ => return false,
+        _ => {
+            tracing::Span::current().record("outcome", "skipped_no_provider");
+            return false;
+        }
     };
+
+    let tool_names_summary: String = routed_tool_calls
+        .iter()
+        .map(|tc| tc.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::Span::current().record("tools", &tool_names_summary.as_str());
 
     debug!(
         "Delegating {} tool calls to tool runner (model: {})",
@@ -356,6 +374,7 @@ pub(crate) async fn execute_tools_delegated(
         }
     }
 
+    tracing::Span::current().record("outcome", "ok");
     true
 }
 
@@ -378,6 +397,13 @@ pub(crate) async fn execute_tools_inline(
 
     // Execute each tool call.
     for tc in routed_tool_calls {
+        let tool_span = tracing::info_span!(
+            "execute_tool_inline",
+            tool = %tc.name,
+            ok = tracing::field::Empty,
+        );
+        let _tool_guard = tool_span.enter();
+
         debug!("Executing tool: {} (id: {})", tc.name, tc.id);
 
         // Taint check: warn if a sensitive tool is about to run while the
@@ -453,6 +479,7 @@ pub(crate) async fn execute_tools_inline(
             hb.abort();
         }
         let duration_ms = start.elapsed().as_millis() as u64;
+        tool_span.record("ok", result.ok);
         debug!(
             "Tool {} result ({}B, ok={}, {}ms)",
             tc.name,
