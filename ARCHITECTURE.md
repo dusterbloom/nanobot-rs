@@ -648,7 +648,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1404 tests in codebase (run `cargo test -- --list` for current count)
+- ~1407 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 
