@@ -236,6 +236,45 @@ impl ContentGate {
         }
     }
 
+    /// Gate content using the specialist provider for semantically aware summarization.
+    /// Falls back to `admit_simple()` on failure.
+    pub async fn admit_with_specialist(
+        &mut self,
+        content: &str,
+        provider: &dyn crate::providers::base::LLMProvider,
+        model: &str,
+    ) -> GateResult {
+        let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(content);
+        let available = self.budget.available();
+
+        // If it fits in budget, pass through raw.
+        if tokens <= available {
+            self.budget.consume(tokens);
+            return GateResult::Raw(content.to_string());
+        }
+
+        let cache_ref = self.cache.store(content);
+        let target_tokens = available / 2;
+
+        // Try specialist summarization, fall back to mechanical briefing.
+        let summary = match specialist_summarize(provider, model, content, target_tokens).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Specialist summarization failed, using simple briefing: {}", e);
+                build_simple_briefing(content, target_tokens)
+            }
+        };
+
+        let summary_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
+        self.budget.consume(summary_tokens);
+
+        GateResult::Briefing {
+            summary,
+            cache_ref,
+            original_size: content.len(),
+        }
+    }
+
     /// Run garbage collection on the cache.
     pub fn gc(&self, max_age: Duration) {
         self.cache.gc(max_age);
@@ -296,6 +335,36 @@ fn build_simple_briefing(content: &str, target_tokens: usize) -> String {
         shown.max(1),
         (shown + 50).min(total_lines),
     )
+}
+
+/// Ask the specialist provider to summarize a tool result.
+async fn specialist_summarize(
+    provider: &dyn crate::providers::base::LLMProvider,
+    model: &str,
+    content: &str,
+    target_tokens: usize,
+) -> Result<String, String> {
+    use serde_json::json;
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": format!(
+                "Summarize the following tool output concisely in ~{} tokens. \
+                 Preserve key facts, numbers, file paths, and error messages. \
+                 Omit boilerplate and repetition.",
+                target_tokens
+            )
+        }),
+        json!({
+            "role": "user",
+            "content": content
+        }),
+    ];
+    let resp = provider
+        .chat(&messages, None, Some(model), (target_tokens as u32) * 2, 0.2, None, None)
+        .await
+        .map_err(|e| format!("specialist chat failed: {}", e))?;
+    resp.content.ok_or_else(|| "specialist returned no content".to_string())
 }
 
 // ---------------------------------------------------------------------------

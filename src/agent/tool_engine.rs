@@ -227,7 +227,20 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .unwrap_or("(no result)");
 
-        let injected = ctx.content_gate.admit_simple(full_data).into_text();
+        let injected = if ctx.core.specialist_provider.is_some()
+            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data) > 500
+        {
+            ctx.content_gate
+                .admit_with_specialist(
+                    full_data,
+                    ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
+                    ctx.core.specialist_model.as_deref().unwrap_or(""),
+                )
+                .await
+                .into_text()
+        } else {
+            ctx.content_gate.admit_simple(full_data).into_text()
+        };
 
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
@@ -423,7 +436,20 @@ pub(crate) async fn execute_tools_inline(
             duration_ms
         );
         // Gate tool result through context budget.
-        let data = ctx.content_gate.admit_simple(&result.data).into_text();
+        let data = if ctx.core.specialist_provider.is_some()
+            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result.data) > 500
+        {
+            ctx.content_gate
+                .admit_with_specialist(
+                    &result.data,
+                    ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
+                    ctx.core.specialist_model.as_deref().unwrap_or(""),
+                )
+                .await
+                .into_text()
+        } else {
+            ctx.content_gate.admit_simple(&result.data).into_text()
+        };
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
                 &mut ctx.messages,

@@ -78,6 +78,33 @@ impl MemoryStore {
         files.sort_by(|a, b| b.cmp(a));
         files
     }
+
+    /// Read the most recent `n` daily notes, returning a combined string
+    /// with date headers. Caps total output at approximately 200 tokens (~800 chars).
+    pub fn read_recent_daily_notes(&self, n: usize) -> String {
+        let files = self.list_memory_files(); // already sorted newest-first
+        let mut result = String::new();
+        let cap = 800; // ~200 tokens
+        for path in files.into_iter().take(n) {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                let date = &name[..10]; // YYYY-MM-DD
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let entry = format!("### {}\n{}\n\n", date, content.trim());
+                    if result.len() + entry.len() > cap {
+                        // Add truncated remainder if there's room for at least the header
+                        let remaining = cap.saturating_sub(result.len());
+                        if remaining > 20 {
+                            result.push_str(&entry[..remaining.min(entry.len())]);
+                            result.push_str("...\n");
+                        }
+                        break;
+                    }
+                    result.push_str(&entry);
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]

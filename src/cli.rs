@@ -310,6 +310,8 @@ pub(crate) fn create_workspace_templates(workspace: &Path) {
         ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Remember important information in your memory files\n"),
         ("SOUL.md", "# Soul\n\nI am nanobot, a lightweight AI assistant.\n\n## Personality\n\n- Helpful and friendly\n- Concise and to the point\n- Curious and eager to learn\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions\n"),
         ("USER.md", "# User\n\nInformation about the user goes here.\n\n## Preferences\n\n- Communication style: (casual/formal)\n- Timezone: (your timezone)\n- Language: (your preferred language)\n"),
+        ("TOOLS.md", "# Tool Usage\n\nGuidelines for using tools effectively.\n\n## Principles\n\n- Use one tool at a time and verify results before proceeding\n- Prefer read operations before write operations\n- Always confirm destructive actions with the user\n- Check tool output for errors before continuing\n"),
+        ("IDENTITY.md", "# Identity\n\nYou are nanobot, a personal AI assistant.\n\n## Core Traits\n\n- You run locally on the user's hardware\n- You have access to the filesystem, shell, and web\n- You maintain memory across sessions via memory files\n- You can spawn subagents for parallel work\n"),
     ];
 
     for (filename, content) in &templates {
@@ -692,6 +694,12 @@ pub(crate) fn create_agent_loop(
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
+    let mut lcm_config = config.lcm.clone();
+    if core_handle.swappable().is_local && !lcm_config.enabled {
+        tracing::info!("Auto-enabling LCM for local mode");
+        lcm_config.enabled = true;
+    }
+
     AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -703,7 +711,7 @@ pub(crate) fn create_agent_loop(
         repl_display_tx,
         Some(config.providers.clone()),
         config.proprioception.clone(),
-        config.lcm.clone(),
+        lcm_config,
         health_registry,
     )
 }
@@ -755,6 +763,12 @@ pub(crate) async fn run_gateway_async(
 
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
+    let mut lcm_config = config.lcm.clone();
+    if core_handle.swappable().is_local && !lcm_config.enabled {
+        tracing::info!("Auto-enabling LCM for local mode");
+        lcm_config.enabled = true;
+    }
+
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -766,7 +780,7 @@ pub(crate) async fn run_gateway_async(
         repl_display_tx,
         Some(config.providers.clone()),
         config.proprioception.clone(),
-        config.lcm.clone(),
+        lcm_config,
         Some(health_registry.clone()),
     );
 
@@ -1697,7 +1711,7 @@ fn make_llm_caller(
         let p = provider.clone();
         Box::pin(async move {
             let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-            p.chat(&messages, None, None, 512, 0.3, None)
+            p.chat(&messages, None, None, 512, 0.3, None, None)
                 .await
                 .map(|r| r.content.unwrap_or_default())
                 .map_err(|e| e.to_string())
