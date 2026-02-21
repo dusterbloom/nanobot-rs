@@ -461,9 +461,17 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
         && ctx.core.tool_delegation_config.strict_router_schema
         && !ctx.flow.router_preflight_done)
     {
+        if ctx.core.is_local && !ctx.flow.router_preflight_done {
+            debug!(
+                strict_no_tools_main = ctx.core.tool_delegation_config.strict_no_tools_main,
+                strict_router_schema = ctx.core.tool_delegation_config.strict_router_schema,
+                "router_preflight_skipped"
+            );
+        }
         return PreflightResult::Passthrough;
     }
 
+    info!("router_preflight_firing");
     ctx.flow.router_preflight_done = true;
     let (router_provider, router_model) =
         match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {

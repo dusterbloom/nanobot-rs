@@ -86,6 +86,11 @@ impl AuditLog {
     }
 
     /// Record a tool invocation in the audit log.
+    ///
+    /// The entire seq-allocation → hash-computation → file-write → state-update
+    /// sequence is serialized under the file lock to prevent race conditions
+    /// both within a process (multiple threads) and across processes (parent +
+    /// tool_runner subagent sharing the same JSONL file).
     pub fn record(
         &self,
         tool_name: &str,
@@ -96,7 +101,6 @@ impl AuditLog {
         duration_ms: u64,
         executor: &str,
     ) {
-        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
         let timestamp = Utc::now().to_rfc3339();
 
         // Truncate result_data to MAX_RESULT_SIZE.
@@ -108,13 +112,26 @@ impl AuditLog {
             result_data.to_string()
         };
 
-        let prev_hash = {
-            let guard = self.last_hash.lock().unwrap_or_else(|e| e.into_inner());
-            guard.clone()
+        let args_json = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
+
+        // Acquire file lock FIRST — serializes across processes (parent + subagents).
+        let _guard = match self.acquire_lock() {
+            Some(g) => g,
+            None => {
+                tracing::warn!("Failed to acquire audit log lock, skipping entry");
+                return;
+            }
         };
 
-        // Compute hash: SHA256(prev_hash|seq|tool_name|tool_call_id|arguments_json|result_data|timestamp)
-        let args_json = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
+        // Re-read last entry from file under lock to get authoritative seq + prev_hash.
+        // This handles the cross-process case: another AuditLog instance may have
+        // appended entries since we initialized our in-memory state.
+        let (file_prev_hash, file_seq) = Self::read_last_entry(&self.file_path);
+
+        // Use the file's authoritative state, not our potentially-stale in-memory state.
+        let seq = file_seq;
+        let prev_hash = file_prev_hash;
+
         let hash = Self::compute_hash(
             &prev_hash,
             seq,
@@ -139,15 +156,6 @@ impl AuditLog {
             prev_hash,
         };
 
-        // Acquire lock and append.
-        let _guard = match self.acquire_lock() {
-            Some(g) => g,
-            None => {
-                tracing::warn!("Failed to acquire audit log lock, skipping entry");
-                return;
-            }
-        };
-
         if let Ok(mut f) = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -158,8 +166,9 @@ impl AuditLog {
             }
         }
 
-        // Update last_hash.
+        // Update in-memory state for next call from this instance.
         *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
+        self.seq_counter.store(seq + 1, Ordering::SeqCst);
     }
 
     /// Load all entries from the audit log.
