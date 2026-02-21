@@ -69,7 +69,7 @@ AgentHandle (cloneable)
 └── counters: Arc<RuntimeCounters>          -- Persists across swaps
 ```
 
-**SwappableCore** contains (39 fields total, key ones shown):
+**SwappableCore** contains (38 fields total, key ones shown):
 - `provider: Arc<dyn LLMProvider>` - Main LLM
 - `memory_provider: Arc<dyn LLMProvider>` - For compaction/reflection
 - `router_provider: Option<Arc<dyn LLMProvider>>` - For trio routing
@@ -83,8 +83,8 @@ AgentHandle (cloneable)
 - `working_memory: WorkingMemoryStore` - Per-session state
 - Plus: `workspace`, `model`, `max_iterations`, `max_tokens`, `temperature`, `is_local`, `brave_api_key`, `exec_timeout`, `restrict_to_workspace`, `memory_enabled`, delegation/provenance configs, and per-provider model overrides
 
-**RuntimeCounters** (survives core swaps, 15 atomic fields):
-- `delegation_healthy`, `thinking_budget`, `long_mode_turns`, `inference_active`, etc.
+**RuntimeCounters** (survives core swaps, 15 fields: 13 atomic, 1 `Mutex<Vec<String>>`, 1 `Arc<AtomicBool>`):
+- `delegation_healthy`, `thinking_budget`, `long_mode_turns`, `inference_active`, `last_tools_called`, etc.
 
 **Processing Phases:**
 
@@ -105,6 +105,31 @@ AgentHandle (cloneable)
    - Persist session to JSONL
    - Update working memory
    - Queue OutboundMessage
+
+### 2a. Agent Subsystem Modules (`src/agent/`)
+
+Modules extracted from or supporting `agent_loop.rs`:
+
+| Module | Purpose |
+|--------|---------|
+| `agent_core.rs` | SwappableCore, RuntimeCounters, AgentHandle structs; core build helpers |
+| `tool_engine.rs` | Tool execution engine (delegated + inline paths) |
+| `tool_guard.rs` | Tool dedup/blocking guard — prevents repeated identical tool calls (B9) |
+| `tool_wiring.rs` | Dynamic per-phase tool registry assembly |
+| `toolplan.rs` | `ToolPlan` / `ToolPlanAction` types for router output |
+| `router.rs` | Trio router preflight, dispatch, and specialist coordination |
+| `router_fallback.rs` | Deterministic fallback patterns (9 patterns + default) |
+| `anti_drift.rs` | Context hygiene hooks: pollution scoring, turn eviction, babble collapse, format anchors (I6) |
+| `circuit_breaker.rs` | Tool loop circuit breaker — forces text response after consecutive all-blocked rounds (B8) |
+| `metrics.rs` | Per-request JSONL metrics with 10MB rotation |
+| `pipeline.rs` | Multi-step tool pipelines for router (I0) |
+| `thread_repair.rs` | Message protocol repair for local models (role alternation, orphan tools) |
+| `policy.rs` | `SessionPolicy` — per-session flags (e.g. `local_only`) |
+| `role_policy.rs` | Role-based policy enforcement |
+| `context_gate.rs` | ContentGate — pass raw / structural briefing / drill-down (I3) |
+| `confidence_gate.rs` | Confidence-based gating for router decisions |
+| `budget_calibrator.rs` | Per-task-type budget calibration |
+| `eval/` | Evaluation framework: `hanoi.rs`, `haystack.rs`, `learning.rs`, `sprint.rs`, `runner.rs` |
 
 ### 3. Provider System (`src/providers/`)
 
@@ -341,10 +366,28 @@ Config {
 }
 ```
 
-**TrioConfig (SLM Trio):**
-- Router model for dispatch decisions
-- Specialist model for execution
-- Context size auto-computed from VRAM cap
+**TrioConfig (SLM Trio, 16 fields):**
+- `enabled` — Enable trio workflow
+- `main_no_think` — Suppress `<think>` for main model
+- `router_model`, `router_port`, `router_ctx_tokens`, `router_temperature`, `router_top_p`, `router_no_think` — Router config
+- `specialist_model`, `specialist_port`, `specialist_ctx_tokens`, `specialist_temperature` — Specialist config
+- `router_endpoint`, `specialist_endpoint` — Optional explicit `ModelEndpoint` overrides (take priority over port+model)
+- `vram_cap_gb` — VRAM budget cap; context sizes auto-computed to fit
+- `anti_drift: AntiDriftConfig` — Nested anti-drift hooks for SLM context stabilization
+
+**AntiDriftConfig (nested in TrioConfig, 5 fields):**
+- `enabled`, `anchor_interval`, `pollution_threshold`, `babble_max_tokens`, `repetition_min_count`
+
+**WorkerConfig (5 fields):**
+- `enabled`, `max_depth` (delegation depth, default 3), `python` (enable python_eval), `delegate` (enable recursive workers), `budget_multiplier` (0.0-1.0, default 0.5)
+
+**ProprioceptionConfig (8 fields):**
+- `enabled`, `dynamic_tool_scoping`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`
+
+**ToolDelegationConfig (17 fields):**
+- `mode: DelegationMode` — enum: `Inline` (no delegation), `Delegated` (default, tool runner model), `Trio` (strict role separation)
+- `apply_mode()` — Applies mode to flags: Inline disables all, Delegated enables tool runner, Trio enables `strict_no_tools_main` + `strict_router_schema` + `role_scoped_context_packs`
+- Key fields: `enabled`, `model`, `provider`, `max_iterations`, `max_tokens`, `slim_results`, `max_result_preview_chars`, `auto_local`, `cost_budget`, `default_subagent_model`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `strict_local_only`, `strict_toolplan_validation`, `deterministic_router_fallback`, `max_same_tool_call_per_turn`
 
 ### 11. Event Bus (`src/bus/events.rs`)
 
@@ -564,7 +607,7 @@ Applied to live conversation
 - `cargo test` runs all tests
 - `cargo test test_name` for specific test
 - `-- --nocapture` to see test output
-- ~1340 tests in codebase (run `cargo test -- --list` for current count)
+- ~1378 tests in codebase (run `cargo test -- --list` for current count)
 
 ## Feature Flags
 
@@ -577,17 +620,23 @@ Applied to live conversation
 
 ## Critical Flaws
 
-### 1. **Monolithic agent_loop.rs (4200+ lines)**
-**Problem:** Single file handles routing, streaming, tool execution, compaction, provenance, and trio mode. Hard to navigate and test in isolation.
+### 1. **agent_loop.rs size** *(substantially addressed)*
+**Previously:** 4200+ lines handling routing, streaming, tool execution, compaction, provenance, and trio mode.
 
-**Recommendation:**
-- Extract `ToolExecutionEngine` - handles tool running, delegation, routing
+**Progress (2544 lines remaining):** Major extractions completed:
+- `agent_core.rs` — SwappableCore, RuntimeCounters, AgentHandle (extracted from agent_loop)
+- `tool_engine.rs` — Tool execution engine (delegated + inline paths)
+- `router.rs` — Trio router preflight and dispatch
+- `router_fallback.rs` — Deterministic fallback patterns (9 patterns)
+- `tool_guard.rs` — Tool dedup/blocking guard
+- `tool_wiring.rs` — Dynamic per-phase tool registry assembly
+
+**Remaining recommendation:**
 - Extract `ConversationManager` - handles message assembly, history, compaction
-- Extract `TrioOrchestrator` - handles router/specialist coordination
 - Keep `agent_loop.rs` as thin coordinator
 
 ### 2. **Implicit State Machine in TurnContext**
-**Problem:** `TurnContext` has 27 fields tracking turn state, including 6 boolean flow-control flags (`force_response`, `router_preflight_done`, `forced_finalize_attempted`, `content_was_streamed`, `compaction_in_flight`, `new_start`). Easy to get into invalid states.
+**Problem:** `TurnContext` has 26 fields tracking turn state, with flow control delegated to `FlowControl` (8 fields: 4 booleans, `ToolGuard`, 2x `u32`, `Option<Instant>`). Easy to get into invalid states.
 
 **Recommendation:**
 - Model turn lifecycle as explicit state machine:
@@ -600,7 +649,7 @@ Applied to live conversation
 ### 3. **Error Handling Inconsistency** *(partially addressed)*
 **Problem:** Mix of `anyhow::Result`, `String` errors, `ToolExecutionResult`, and `LLMResponse` with `finish_reason: "error"`. Hard to track error origins.
 
-**Progress:** `ProviderError` (6 variants) and `ToolErrorKind` (5 variants) defined in `src/errors.rs` with `thiserror`. Provider errors have `is_retryable()` classification. Tool errors have `classify_tool_error()` from string matching.
+**Progress:** `ProviderError` (7 variants: HttpError, ResponseReadError, JsonParseError, RateLimited, AuthError, ServerError, Cancelled) and `ToolErrorKind` (6 variants: Timeout, PermissionDenied, NotFound, InvalidArgs, ToolNotFound, ExecutionFailed) defined in `src/errors.rs` with `thiserror`. Provider errors have `is_retryable()` classification. Tool errors have `classify_tool_error()` from string matching.
 
 **Remaining:**
 - Define top-level `AgentError` enum wrapping all domain errors

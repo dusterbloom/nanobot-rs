@@ -21,7 +21,7 @@
 > 2. **Start with a failing test or reproduction.** Show the broken state first.
 > 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
 > 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
-> 5. **No new features until B8 and B9 are green.** Everything else is noise if trio mode doesn't activate.
+> 5. **B6-B10 are green.** Next priority: B3 (new trio defaults) and B8's remaining steps (preflight verification, role-scoped context, slim Main prompt).
 
 ---
 
@@ -29,49 +29,44 @@
 
 ### 🔴 Blocking — do first
 
-- [ ] **B6: SLM Observability** — Flying blind with trio. 8 silent failure paths identified (2026-02-20 audit). Zero new deps — uses existing `tracing` crate. Changes:
-  1. `warn!` on malformed tool-call JSON (openai_compat.rs:1028, 1154, 1300) — currently silently wrapped in `{"raw":…}`
-  2. Log HTTP error response body (openai_compat.rs:642, anthropic.rs:442) — currently body discarded, only status code logged
-  3. `warn!` on SSE stream ending without `[DONE]` (openai_compat.rs:1270) — SLM crashes mid-response invisible
-  4. `warn!` on empty LLM response fallback (agent_loop.rs:1214) — silent hardcoded string injection
-  5. ~~`warn!` on Anthropic SSE parse errors (anthropic.rs:700)~~ — Done: upgraded to `warn!` in both anthropic.rs and openai_compat.rs
-  6. Add `#[instrument]` spans to `chat()`/`chat_stream()` in both providers
-  7. Add `.with_span_events(FmtSpan::CLOSE)` to JSON subscriber in main.rs — free latency tracking
-  8. Remove dead `error_detail()` code (base.rs:47-62) — `finish_reason == "error"` never fires
-  9. Fix duplicate `llm_stream_started` event in anthropic.rs:610-624
-  10. Promote `llm_call_failed` from `info!` to `warn!` (openai_compat.rs:696, anthropic.rs:485)
-  _Ref: session audit 2026-02-20, logs at ~/.nanobot/nanobot.log_
-- [ ] **B7: Provider retry with `backon`** — Three hand-rolled retry loops (JIT gate, specialist warm-up, audit persistence) with no jitter. `ProviderError::RateLimited { retry_after_ms }` created but never read. `chat_stream` has zero retry. Add `backon = "1.6"` (MIT, near-zero deps, used by `uv`). Shared `is_retryable_provider_error()` predicate. Replace all 3 loops + add retry to streaming path. _Ref: session audit 2026-02-20_
-- [ ] **B3: Update default local trio** — New defaults: 1) Main: `gemma-3n-e4b-it`, 2) Orchestrator: `nvidia_orchestrator-8b`, 3) Specialist: `ministral-3-8b-instruct-2512`. Update `agents.json`, `DEFAULT_LOCAL_MODEL`, config schema defaults, and `TrioConfig`. _Ref: experiments/tool-calling/_
-- [ ] **B3.1: Smarter deterministic fallback** — `router_fallback.rs` only has 2 patterns (URL→web_fetch, "latest news"→spawn). Fails on "research report + URLs" which should spawn a researcher. Add pattern: research/report/summarize + URLs → `Subagent(researcher)`. _Ref: `src/agent/router_fallback.rs`_
+- [ ] **B3: Update default local trio** — New defaults: 1) Main: `gemma-3n-e4b-it`, 2) Orchestrator: `nvidia_orchestrator-8b`, 3) Specialist: `ministral-3-8b-instruct-2512`. ~~Update `DEFAULT_LOCAL_MODEL`~~ ✅ (already `gemma-3n-e4b-it-Q4_K_M.gguf` in `server.rs:18`). Remaining: update `agents.json` defaults, config schema defaults, and `TrioConfig` default model names. _Ref: experiments/tool-calling/_
+- [x] **B3.1: Smarter deterministic fallback** — ✅ `router_fallback.rs` now has 9 deterministic patterns + default ask_user (was 2). Includes: research+URL→spawn researcher, plain URL/HN→web_fetch, latest news→spawn, read/show+path→read_file, write/create+path→write_file, edit/modify+path→edit_file, list/ls→list_dir, run/execute/cargo→exec, search→web_search. All patterns guarded by `has_tool()` for graceful fallthrough. 19 tests. _Ref: `src/agent/router_fallback.rs`_
 - [ ] **B4: Multi-model config schema** — Add `local.main`, `local.rlm`, `local.memory` to config. Each slot: `{ model, path, gpu, context_size, temperature }`. Server manager spawns up to 3 llama-server instances. _Ref: `docs/plans/local-model-matrix.md`_
 - [ ] **B5: RLM model evaluation** — Systematic experiments to find best RLM model per VRAM tier. Critical for "3 impossible things". See experiment plan below.
-- [ ] **B8: Trio mode activation & role-scoped context** ⚡ — **Root cause of 2026-02-20 local session failure.** NanBeige ran in Inline mode (full tool schemas in context) instead of Trio mode. Metrics showed `tool_calls_requested: 1, tool_calls_executed: 0` for 21 consecutive calls — Main was generating tool calls that got blocked as duplicates, proving `strict_no_tools_main` was NOT active. The existing architecture (`DelegationMode::Trio`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `router_preflight()`) is **designed but not wired for local sessions**. Steps:
-  1. **Trace config loading**: Follow the path from LM Studio detection → `DelegationMode` selection → `apply_mode()`. Find where Trio mode should activate and doesn't. Add `info!` log: `"delegation_mode={:?}"` at startup.
-  2. **Verify `router_preflight()` fires**: Add `info!` when preflight runs AND when it's skipped (with reason). Currently silent on skip.
-  3. **Verify role-scoped context packs differ by role**: When `role_scoped_context_packs = true`, Main must NOT receive tool schemas. Check `build_context()` or equivalent — does it actually branch on role?
-  4. **Slim Main's system prompt for local**: Main (3B) needs ~500 tokens of identity + conversation rules + task state. NOT the full AGENTS.md + SOUL.md + TOOLS.md (~15-20K tokens). Add a `build_local_main_prompt()` that strips everything except personality core and working memory.
-  5. **Verification**: Start local session → check `nanobot.log` for `delegation_mode=Trio` → send a message requiring a tool → confirm Main emits natural language intent (not a tool call) → confirm Router preflight intercepts → confirm Specialist executes tool → check `metrics.jsonl` for correct role labels.
-  _Ref: 2026-02-21 diagnostic session, `docs/local-ai-swarm-architecture.md`, `src/agent/router.rs`_
-- [ ] **B9: Compaction safety guard** — Compaction using ministral-3-8b crashes with `n_keep (12620) >= n_ctx (8192)` when context exceeds specialist's window. This creates a **death spiral**: failed tools → context grows → compaction fails → context grows more → model performance degrades. Two crashes observed at 22:49:46 and 22:53:56 in the same session. Steps:
-  1. **Pre-flight check**: Before sending compaction prompt, compare `estimated_tokens` against `model_ctx * 0.85`. If over, skip compaction gracefully (log `warn!`, don't error).
-  2. **Emergency truncation**: If compaction is skipped AND context > 90% of Main's window, drop oldest non-pinned turns (keep system prompt + last 3 turns + pinned context).
-  3. **Circuit breaker on duplicate tool calls**: After 2 consecutive all-blocked turns (not 7-8 as observed), force-stop the tool loop and emit the last text response. The current `max_same_tool_call_per_turn: 1` blocks individual calls but doesn't stop the retry loop.
-  4. **Better duplicate feedback**: Instead of just "blocked", inject: `"Tool already called with these args. Result was: [previous result]. Use it or try different arguments."` — give the model the cached result instead of an error.
-  5. **Verification**: Start local session → trigger a tool call → observe at most 2 retries in `nanobot.log` → confirm compaction either succeeds or gracefully skips → confirm no `n_keep >= n_ctx` errors.
-  _Ref: 2026-02-21 diagnostic session, `nanobot.log.2026-02-20` lines at 22:49:46 and 22:53:56_
+- [ ] **B8: Trio mode activation & role-scoped context** ⚡ — Metrics accuracy and tool loop circuit breaker shipped (commit `0f80ad9`). Auto-activation wiring + auto-detect shipped as B10 (commit `3774742`). Remaining: end-to-end verification. Steps:
+  1. ~~**Trace config loading**~~: ✅ Done in B10. `delegation_config_at_core_build` log at startup, `trio_auto_activated` when trio fires.
+  2. ~~**Verify `router_preflight()` fires**~~: ✅ `info!("router_preflight_firing")` exists in `router.rs:474` (uncommitted). Also logs `router_preflight_skipped` with reason at `router.rs:468`.
+  3. ~~**Verify role-scoped context packs differ by role**~~: ✅ `role_scoped_context_packs` field exists on `ToolDelegationConfig` and is used in `router.rs:368,499,661` and `tool_engine.rs:120` to build per-role context.
+  4. ~~**Slim Main's system prompt for local**~~: ✅ `ContextBuilder::new_lite()` (`context.rs:113-128`) and `set_lite_mode()` (`context.rs:131-139`) implemented. Lite mode: bootstrap 2%, memory 1%, skills 2%, profiles 1%, cap 30% of context.
+  5. **Verification**: Start local session → `delegation_mode=Trio` in log → Main emits natural language (not tool call) → Router preflight intercepts → Specialist executes tool. **This is the remaining work.**
+  _Ref: 2026-02-21 diagnostic session, `src/agent/router.rs`_
 
 ### 🟡 Important — do soon
 
 - [ ] **I0: Trio pipeline actions** — Router can only emit ONE action per turn. Multi-step tasks (research + synthesize) fail because the router picks one tool and stops. Need pipeline-as-first-class router output + shared scratchpad between trio roles. _Ref: `thoughts/shared/plans/2026-02-20-trio-pipeline-architecture.md`_
 - [ ] **I1: Local role/protocol crashes** — Fix `system` role crash, alternation crash, orphan tool messages. Thread repair pipeline exists but needs hardening. _Ref: `docs/plans/local-trio-strategy-2026-02-18.md`, `docs/plans/local-model-reliability-tdd.md`_
-- [ ] **I2: Non-blocking compaction** — Spawn compaction as background task via `tokio::spawn`, swap result when done. Three tiers: background (80%), aggressive (85%), emergency truncation (95%). _(Spacebot idea)_
+- [x] **I2: Non-blocking compaction** — ✅ Absorbed into I7 (matryoshka compaction). Per-cluster parallel summarization replaces the three-tier approach.
 - [ ] **I3: Context Gate** — Replace dumb char-limit truncation with `ContentGate`: pass raw / structural briefing / drill-down. Zero agent-facing API changes. _Ref: `docs/plans/context-gate.md`, `docs/plans/context-protocol.md`_
 - [ ] **I4: Multi-provider refactor** — Break up `SwappableCore` god struct, extensible provider registry, fallback chains. _Ref: `docs/plans/multi-provider-refactor.md`, `docs/plans/nanobot_architecture_review.md`_
 - [ ] **I5: Dynamic model router** — Prompt complexity scoring (light/standard/heavy), auto-downgrade simple messages to cheaper models. _Ref: `docs/plans/dynamic-model-router.md`_
 - [x] **I6: Context Hygiene Hooks** — ✅ Implemented as `anti_drift.rs` (851 lines, 25 tests). PreCompletion: pollution scoring, turn eviction, repetitive-attempt collapse, format anchor re-injection. PostCompletion: thinking tag stripping, babble collapse. _Ref: commit `56dedce`, `src/agent/anti_drift.rs`_
 - [ ] **I8: SearXNG search backend** — Replace Brave Search (API key required, rate-limited) with SearXNG (free, local, unlimited). 3 touchpoints: 1) `schema.rs`: add `provider: String` ("brave"|"searxng", default "searxng") + `searxng_url: String` (default "http://localhost:8888") to `WebSearchConfig`. 2) `web.rs`: add SearXNG path in `execute()` — `GET {url}/search?q={query}&format=json`, parse `results[].title/url/content`. No API key needed. 3) `registry.rs`+`tool_wiring.rs`: extend `ToolConfig` to carry `search_provider`+`searxng_url`. Fallback: if SearXNG unreachable and Brave key set, use Brave. If neither, helpful error: "Run `docker run -d -p 8888:8080 searxng/searxng` or set a Brave API key." Onboard integration: `cmd_onboard()` prints Docker one-liner. Optional `nanobot onboard --search` auto-pulls+starts+configures SearXNG. _SearXNG container tested working 2026-02-20: `docker run -d -p 8888:8080 --name searxng searxng/searxng` + enable JSON format in settings.yml._
-- [ ] **I7: Semantic Fragmentation** — Topic-aware context packing using TF-IDF clustering. Each message gets a TF-IDF vector (hand-rolled, ~40 lines — no LGPL deps). Pairwise cosine similarity → `kodama` (MIT, zero deps, fastcluster-speed) agglomerative clustering → topic clusters. On each LLM call: score clusters against current query, budget-pack active cluster verbatim + inactive clusters as 1-line summaries + last 2 turns always verbatim. Replaces all-or-nothing compaction with surgical per-cluster compaction. New module `src/agent/semantic_context.rs`, ~300 lines. **Deps**: `kodama = "0.3"` (MIT/Unlicense, zero transitive deps). **Why**: Nemotron 8B router gets focused context where routing is obvious; Ministral 8B specialist gets exactly the context needed for tool execution — not everything that ever happened. Compounds with I6 (hooks clean within a cluster, fragmentation cleans across clusters).
+- [ ] **I7: Matryoshka Compaction** _(absorbs I2)_ — Recursive, parallel context compaction that works with any model size. Replaces monolithic "summarize everything" with nested layers, like matryoshka dolls. **Architecture:**
+  ```
+  Layer 0: Raw conversation (32K+ tokens)
+           ↓ kodama cluster into semantic blocks (TF-IDF, hand-rolled, ~40 lines)
+  Layer 1: N topic clusters (~2-3K each)
+           ↓ summarize each in parallel via tokio::spawn (even 2K model works)
+  Layer 2: N summaries (~200-400 tokens each)
+           ↓ if still too big, summarize the summaries
+  Layer 3: 1 meta-summary (~500 tokens)
+  ```
+  **Key properties:** Each step fits any model (never exceeds `model_ctx * 0.7`). All cluster summaries run as concurrent tasks. Last 2-3 turns stay verbatim. Incremental — only active cluster grows, dormant clusters stay compressed. Infinite conversation regardless of model context size.
+  **Role-scoped assembly:** Main (3B, 8K) gets meta-summary + last 2 turns + active cluster verbatim. Router (8B) gets task-relevant cluster summary + current intent. Specialist (8B) gets tool-relevant cluster + tool schemas. Each role sees exactly the context it needs.
+  **Deps:** `kodama = "0.3"` (MIT/Unlicense, zero transitive deps). TF-IDF vectors hand-rolled (~40 lines). Brute-force cosine similarity over clusters (sub-ms at <1000 clusters, no vector DB needed). New module `src/agent/semantic_context.rs`, ~400 lines.
+  **Compounds with:** I6 (hooks clean within a cluster, fragmentation cleans across clusters). B9 (pre-flight truncation becomes the per-chunk safety net). I3 (ContentGate decides raw vs summary per cluster).
+  **Agno L3 parallel:** This is nanobot's equivalent of Agno's hybrid-search memory layer — surface relevant context, compress the rest — but designed for 4-8K local models instead of 128K cloud models.
+  _Ref: 2026-02-21 matryoshka design session, `src/agent/compaction.rs`_
 
 ### 🟢 Nice to have — Phase 0
 
@@ -135,12 +130,12 @@
 - Main + Orchestrator work well together in practice.
 - Sequential self-routing would add latency vs parallel separation. Keep roles split.
 - **Router single-action bottleneck**: `request_strict_router_decision()` returns ONE `RouterDecision`. Multi-step tasks (fetch 2 URLs + synthesize) cannot be expressed. The router picks one tool and the pipeline stalls.
-- **Deterministic fallback too narrow**: `router_fallback.rs` has 2 patterns only — URLs→web_fetch (first URL), "latest news"→spawn. Everything else→ask_user. Misses research/report patterns.
+- ~~**Deterministic fallback too narrow**~~: **Fixed** in B3.1. `router_fallback.rs` now has 9 patterns (research+URL, plain URL, HN, latest news, read, write, edit, list, search, exec) + default ask_user. All guarded by `has_tool()`.
 - **Specialist has no tools**: `dispatch_specialist()` sends a single-shot chat — no tool access. Can synthesize given context but cannot fetch/execute.
 - **Trio never tested end-to-end**: As of 2026-02-19 handoff, the full trio flow (Main→Router→Specialist) has never completed a real task through LM Studio.
-- **2026-02-21 diagnostic: Trio mode didn't activate.** NanBeige ran as Inline main with full tool schemas. 21 metrics entries show `tool_calls_requested: 1, tool_calls_executed: 0` — model generated tool calls (proving it had tool schemas) that were blocked as duplicates. Compaction crashed twice (`n_keep 12620 >= n_ctx 8192`). Death spiral: blocked tools → context grows → compaction fails → context grows more. Session lasted 8 minutes before manual switch to Opus. See B8 and B9.
+- **2026-02-21 diagnostic: Trio mode didn't activate.** NanBeige ran as Inline main with full tool schemas. 21 metrics entries show `tool_calls_requested: 1, tool_calls_executed: 0` — model generated tool calls (proving it had tool schemas) that were blocked as duplicates. Compaction crashed twice (`n_keep 12620 >= n_ctx 8192`). **Fixed:** B8 (metrics + circuit breaker) and B9 (tool guard replay + compaction overflow) shipped. Death spiral no longer occurs. Remaining: wire trio activation so NanBeige runs in Trio mode, not Inline.
 - **System prompt is ~15-20K tokens** even before conversation starts. Opus first call: `prompt_tokens: 21705`. A 3B model with 8K context has zero room. Even with 32K context, 15K of prompt leaves only 17K for conversation — and most of that prompt is AGENTS.md/SOUL.md/TOOLS.md that small models can't follow anyway.
-- **Metrics broken for local models**: All NanBeige calls show `prompt_tokens: 0, completion_tokens: 0, elapsed_ms: 0`. Token counts from llama.cpp `usage` field aren't being captured. Can't diagnose context issues without this data.
+- ~~**Metrics broken for local models**~~ — **Fixed** in B8 (commit `0f80ad9`). Token counts now captured from llama.cpp `usage` field.
 
 ### Experiments Needed (one assumption at a time)
 
@@ -196,7 +191,7 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 | Idea | Status | Mapped to |
 |------|--------|-----------|
-| Non-blocking compaction | Backlog I2 | Phase 0 |
+| Non-blocking compaction | ✅ Absorbed into I7 (matryoshka) | Phase 0 |
 | Status injection | Backlog N6 | Phase 0 |
 | Message coalescing | Backlog N7 | Phase 0 |
 | Branch concept (context-fork) | Not started | Phase 2 (related to swarm) |
@@ -207,8 +202,14 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 
 ## Done ✅
 
+- ~~B10: Auto-detect trio models from LM Studio~~ — `pick_trio_models()` scans available LMS models at startup for "orchestrator"/"router" (router) and "function-calling"/"instruct"/"ministral" (specialist) patterns. Only fills empty config slots — explicit config always wins. Fuzzy main-model exclusion handles org prefixes and unresolved GGUF hints. Wired into REPL startup before auto-activation. 13 tests including e2e flow and real LMS model list. (2026-02-21, commit `3774742`)
+- ~~B9: Compaction safety guard + tool guard death spiral~~ — Tool guard replays cached results instead of injecting error messages small models can't parse. Compaction respects summarizer model's actual context window via `compaction_model_context_size` config + pre-flight truncation (0.7 safety margin). Circuit breaker threshold 3→2. E2E verified against NanBeige on LM Studio. (2026-02-21, commit `0f7f365`)
+- ~~B8: Metrics accuracy + tool loop circuit breaker~~ — Fixed local model metrics capture (`prompt_tokens`, `completion_tokens`, `elapsed_ms`). Added circuit breaker for consecutive all-blocked tool call rounds. (2026-02-21, commit `0f80ad9`)
+- ~~B7: Provider retry with `backon`~~ — Replaced 3 hand-rolled retry loops with `backon` crate. Shared `is_retryable_provider_error()` predicate. Added retry to streaming path. (2026-02-21, commit `640bdc9`)
+- ~~B6: SLM provider observability~~ — 8 silent failure paths now logged. `#[instrument]` spans on `chat()`/`chat_stream()`. Promoted `llm_call_failed` to `warn!`. (2026-02-21, commit `0b6bc5f`)
+- ~~Fix: Audit log hash chain race condition~~ — `record()` had a TOCTOU bug: seq allocation + prev_hash read were not serialized under the file lock. Two concurrent executors (tool_runner + inline) both read seq 940 and wrote seq 941 with the same prev_hash, forking the chain at entry 942. Fix: acquire file lock first, re-read authoritative seq + prev_hash from file under lock, then compute hash and write. 12/12 audit tests pass. (2026-02-21, `src/agent/audit.rs`) ⚠️ _Code changes uncommitted — `audit.rs` modified in working tree._
 - ~~B1: 132 compiler warnings~~ → 0 warnings (2026-02-20)
-- ~~B2: 2 test failures~~ → 1248 pass, 0 fail (2026-02-20)
+- ~~B2: 2 test failures~~ → 1378 pass, 0 fail (2026-02-21)
 - ~~Fix: Subprocess stdin steal~~ — `.stdin(Stdio::null())` on all 4 spawn sites in shell.rs + worker_tools.rs (2026-02-20)
 - ~~Fix: Esc-mashing freezes REPL~~ — drain_stdin() after cancel (2026-02-20, commit 57ec883)
 - ~~Fix stale comment in `ensure_compaction_model`~~ (2026-02-17)
