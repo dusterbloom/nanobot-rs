@@ -43,7 +43,7 @@ use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
 // ---------------------------------------------------------------------------
 use crate::agent::agent_core::{
     append_to_system_prompt, apply_compaction_result, history_limit,
-    is_small_local_model, provenance_warning_role, PendingCompaction,
+    provenance_warning_role, PendingCompaction,
 };
 pub use crate::agent::agent_core::{
     build_swappable_core, AgentHandle, RuntimeCounters, SharedCoreHandle, SwappableCore,
@@ -142,6 +142,10 @@ pub(crate) struct TurnContext {
 
     // --- Health ---
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+
+    // --- Security ---
+    /// Tracks taint introduced by web tools; used to warn before sensitive tool calls.
+    pub(crate) taint_state: crate::agent::taint::TaintState,
 }
 
 /// Per-turn flow control flags.
@@ -516,6 +520,7 @@ impl AgentLoopShared {
                 llm_call_start: None,
             },
             health_registry: self.health_registry.clone(),
+            taint_state: crate::agent::taint::TaintState::new(),
         }
     }
 
@@ -592,7 +597,7 @@ impl AgentLoopShared {
         let counters = &self.core_handle.counters;
 
         // --- Context Hygiene: clean up conversation history ---
-        context_hygiene::hygiene_pipeline(&mut ctx.messages);
+        context_hygiene::hygiene_pipeline(&mut ctx.messages, ctx.core.hygiene_keep_last_messages);
 
         // --- Anti-Drift: quality-based cleanup for local models ---
         if ctx.core.is_local && ctx.core.anti_drift.enabled {
@@ -1061,7 +1066,7 @@ impl AgentLoopShared {
             if stored > 0 {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.
-                if ctx.core.is_local && is_small_local_model(&ctx.core.model) {
+                if ctx.core.is_local && ctx.core.model_capabilities.size_class == crate::agent::model_capabilities::ModelSizeClass::Small {
                     Some(stored.min(256))
                 } else {
                     Some(stored)
@@ -1711,6 +1716,9 @@ impl AgentLoopShared {
             }
         }
 
+        ctx.final_content =
+            crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
+
         if ctx.final_content.is_empty() {
             None
         } else {
@@ -1788,6 +1796,10 @@ impl AgentLoop {
         // Wire up the cheap default model for subagents from config.
         subagent_mgr = subagent_mgr.with_default_subagent_model(
             core.tool_delegation_config.default_subagent_model.clone(),
+        );
+        // Wire up subagent tuning from config.
+        subagent_mgr = subagent_mgr.with_subagent_tuning(
+            core.tool_delegation_config.subagent.clone(),
         );
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
@@ -2345,6 +2357,7 @@ mod tests {
             delegation_provider,
             specialist_provider: None,
             trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
         })
     }
 
@@ -2663,6 +2676,7 @@ mod tests {
             delegation_provider: None,
             specialist_provider: None,
             trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
         assert_eq!(
             core.tool_runner_model.as_deref(),
@@ -2717,6 +2731,7 @@ mod tests {
             delegation_provider: Some(dp),
             specialist_provider: None,
             trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
 
         assert!(core.is_local);
@@ -2764,6 +2779,7 @@ mod tests {
             delegation_provider: Some(delegation),
             specialist_provider: None,
             trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
 
         // Compaction provider goes to memory_provider, delegation to tool_runner
@@ -2849,6 +2865,7 @@ mod tests {
             delegation_provider: None,
             specialist_provider: None,
             trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
         let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(2048));
         let core_handle = AgentHandle::new(core, counters);
@@ -3146,6 +3163,7 @@ mod tests {
             delegation_provider: Some(router_provider),
             specialist_provider: Some(specialist_provider),
             trio_config,
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
 
         let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -3510,6 +3528,7 @@ mod tests {
             delegation_provider: Some(router_provider),
             specialist_provider: Some(specialist_provider),
             trio_config,
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
         let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
         let core_handle = AgentHandle::new(core, counters);
@@ -3607,6 +3626,7 @@ mod tests {
             delegation_provider: Some(router_provider),
             specialist_provider: Some(specialist_provider),
             trio_config,
+            model_capabilities_overrides: std::collections::HashMap::new(),
         });
         let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
         let core_handle = AgentHandle::new(core, counters);

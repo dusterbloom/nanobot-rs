@@ -140,20 +140,17 @@ impl Session {
 // SessionManager
 // ---------------------------------------------------------------------------
 
-const ROTATION_SIZE_BYTES: usize = 1_000_000; // 1 MB
-const ROTATION_CARRY_MESSAGES: usize = 10;
-
-pub fn should_rotate(session: &Session) -> bool {
+pub fn should_rotate(session: &Session, rotation_size_bytes: usize) -> bool {
     let age_hours = (Local::now() - session.updated_at).num_hours();
     if age_hours >= 24 {
         return true;
     }
-    
+
     let size: usize = session.messages.iter().map(|m| m.to_string().len()).sum();
-    if size > ROTATION_SIZE_BYTES {
+    if size > rotation_size_bytes {
         return true;
     }
-    
+
     false
 }
 
@@ -166,10 +163,14 @@ pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
     cache: Mutex<HashMap<String, Session>>,
+    /// Rotate session file when it exceeds this size in bytes.
+    rotation_size_bytes: usize,
+    /// Number of recent messages to carry into a new session on rotation.
+    rotation_carry_messages: usize,
 }
 
 impl SessionManager {
-    /// Create a new `SessionManager` rooted at `workspace`.
+    /// Create a new `SessionManager` rooted at `workspace` with default tuning.
     pub fn new(workspace: &Path) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let sessions_dir = ensure_dir(home.join(".nanobot").join("sessions"));
@@ -178,6 +179,22 @@ impl SessionManager {
             workspace: workspace.to_path_buf(),
             sessions_dir,
             cache: Mutex::new(HashMap::new()),
+            rotation_size_bytes: 1_000_000,
+            rotation_carry_messages: 10,
+        }
+    }
+
+    /// Create a new `SessionManager` with explicit tuning values from config.
+    pub fn with_tuning(workspace: &Path, rotation_size_bytes: usize, rotation_carry_messages: usize) -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let sessions_dir = ensure_dir(home.join(".nanobot").join("sessions"));
+
+        Self {
+            workspace: workspace.to_path_buf(),
+            sessions_dir,
+            cache: Mutex::new(HashMap::new()),
+            rotation_size_bytes,
+            rotation_carry_messages,
         }
     }
 
@@ -192,14 +209,14 @@ impl SessionManager {
         max_turns: usize,
     ) -> Vec<Value> {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
         session.get_history(max_messages, max_turns)
     }
 
     /// Add a message to a session and persist it.
     pub async fn add_message_and_save(&self, key: &str, role: &str, content: &str) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
         session.add_message(role, content);
         Self::save_session(session, &self.sessions_dir);
     }
@@ -207,7 +224,7 @@ impl SessionManager {
     /// Add multiple messages to a session and persist it.
     pub async fn add_messages_and_save(&self, key: &str, messages: &[(&str, &str)]) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
         for &(role, content) in messages {
             session.add_message(role, content);
         }
@@ -217,7 +234,7 @@ impl SessionManager {
     /// Save a batch of raw JSON messages (preserving tool_calls, tool_call_id, etc.)
     pub async fn add_messages_raw(&self, key: &str, messages: &[Value]) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
         for msg in messages {
             let mut m = msg.clone();
             // Add timestamp if not present.
@@ -317,12 +334,14 @@ impl SessionManager {
     ///
     /// Handles rotation:
     /// 1. Daily rotation: if session was created on a different day
-    /// 2. Size rotation: if session exceeds 1MB
-    /// When rotating, carries over last N messages to new session.
+    /// 2. Size rotation: if session exceeds `rotation_size_bytes`
+    /// When rotating, carries over last `rotation_carry_messages` messages to new session.
     fn get_or_create_inner<'a>(
         cache: &'a mut HashMap<String, Session>,
         key: &str,
         sessions_dir: &Path,
+        rotation_size_bytes: usize,
+        rotation_carry_messages: usize,
     ) -> &'a mut Session {
         let today = Local::now().format("%Y-%m-%d").to_string();
         let mut carry_messages: Option<Vec<Value>> = None;
@@ -330,22 +349,22 @@ impl SessionManager {
         if let Some(existing) = cache.get(key) {
             let session_date = existing.created_at.format("%Y-%m-%d").to_string();
             let size: usize = existing.messages.iter().map(|m| m.to_string().len()).sum();
-            
-            if session_date != today || size > ROTATION_SIZE_BYTES {
+
+            if session_date != today || size > rotation_size_bytes {
                 Self::save_session(existing, sessions_dir);
-                
+
                 let carried: Vec<Value> = existing.messages
                     .iter()
                     .rev()
-                    .take(ROTATION_CARRY_MESSAGES)
+                    .take(rotation_carry_messages)
                     .rev()
                     .cloned()
                     .collect();
-                
+
                 if !carried.is_empty() && session_date == today {
                     carry_messages = Some(carried);
                 }
-                
+
                 cache.remove(key);
             }
         }
@@ -724,15 +743,15 @@ mod tests {
         for _ in 0..12 {
             session.add_message("user", &large_content);
         }
-        
-        assert!(should_rotate(&session), "Should rotate when size > 1MB");
+
+        assert!(should_rotate(&session, 1_000_000), "Should rotate when size > 1MB");
     }
 
     #[test]
     fn test_should_not_rotate_small_session() {
         let session = Session::new("test:small");
         // Fresh session with no messages should not rotate
-        assert!(!should_rotate(&session), "Should not rotate small session");
+        assert!(!should_rotate(&session, 1_000_000), "Should not rotate small session");
     }
 
     #[tokio::test]
@@ -751,7 +770,6 @@ mod tests {
         let history = mgr.get_history(&key, 100, 0).await;
         
         // Should have carried over last 10 messages
-        assert!(history.len() <= 10, "After rotation should have at most {} messages, got {}", 
-                ROTATION_CARRY_MESSAGES, history.len());
+        assert!(history.len() <= 10, "After rotation should have at most 10 messages, got {}", history.len());
     }
 }

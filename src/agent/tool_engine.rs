@@ -138,6 +138,17 @@ pub(crate) async fn execute_tools_delegated(
         )
     };
 
+    // Taint pre-check: warn if any delegated call is sensitive while context is tainted.
+    for tc in routed_tool_calls {
+        if let Some(_spans) = ctx.taint_state.check_sensitive(&tc.name) {
+            warn!(
+                "TAINT WARNING: Executing sensitive tool '{}' (delegated) with tainted context from: {}",
+                tc.name,
+                ctx.taint_state.taint_summary()
+            );
+        }
+    }
+
     let delegation_start = std::time::Instant::now();
     let run_result = tool_runner::run_tool_loop(
         &runner_config,
@@ -331,6 +342,10 @@ pub(crate) async fn execute_tools_delegated(
             None,
         );
         ctx.used_tools.insert(tool_name.clone());
+
+        // Taint tracking: mark context tainted when a web tool ran via delegation.
+        // We don't have the original arguments here, so pass None for detail.
+        ctx.taint_state.mark_tainted(tool_name, None);
     }
 
     // Set response boundary flag if any delegated tool was exec/write_file.
@@ -364,6 +379,16 @@ pub(crate) async fn execute_tools_inline(
     // Execute each tool call.
     for tc in routed_tool_calls {
         debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+
+        // Taint check: warn if a sensitive tool is about to run while the
+        // context contains untrusted web content (prompt-injection guard).
+        if let Some(_spans) = ctx.taint_state.check_sensitive(&tc.name) {
+            warn!(
+                "TAINT WARNING: Executing sensitive tool '{}' with tainted context from: {}",
+                tc.name,
+                ctx.taint_state.taint_summary()
+            );
+        }
 
         // Emit tool call start event.
         if let Some(ref tx) = ctx.tool_event_tx {
@@ -489,6 +514,14 @@ pub(crate) async fn execute_tools_inline(
 
         // Track used tools.
         ctx.used_tools.insert(tc.name.clone());
+
+        // Taint tracking: mark context as tainted after a web tool executes.
+        // Extract URL or query from arguments as the taint detail.
+        let taint_detail = tc.arguments.get("url")
+            .or_else(|| tc.arguments.get("query"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(200).collect::<String>());
+        ctx.taint_state.mark_tainted(&tc.name, taint_detail);
 
         // Collect for turn audit summary.
         ctx.turn_tool_entries

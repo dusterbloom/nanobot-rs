@@ -753,7 +753,7 @@ mod tests {
         ];
 
         // Step 1: hygiene (structural)
-        crate::agent::context_hygiene::hygiene_pipeline(&mut messages);
+        crate::agent::context_hygiene::hygiene_pipeline(&mut messages, 20);
 
         // Orphan should be removed
         let has_orphan = messages.iter().any(|m| msg_content(m) == "orphan");

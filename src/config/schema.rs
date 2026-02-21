@@ -3,6 +3,7 @@
 //! All structs use `#[serde(rename_all = "camelCase")]` so that the JSON config
 //! file can use camelCase keys while Rust code uses snake_case fields.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -222,6 +223,12 @@ pub struct AgentDefaults {
     /// Currently only LM Studio ("lms") is supported.
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
+    /// Path to a YAML instruction profiles file for model-specific prompt
+    /// engineering. When set, profiles are loaded at startup and applied to
+    /// every LLM call based on the active model name and task kind.
+    /// Example: "~/.nanobot/instructions.yaml"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_path: Option<String>,
     /// Runtime flag: skip JitGate when models are pre-loaded by lms.
     /// Not serialized to config.json.
     #[serde(skip)]
@@ -289,6 +296,7 @@ impl Default for AgentDefaults {
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
             inference_engine: default_inference_engine(),
+            instructions_path: None,
             skip_jit_gate: false,
         }
     }
@@ -543,6 +551,25 @@ fn default_vram_cap_gb() -> f64 {
     16.0
 }
 
+/// Circuit breaker tuning. Nested under trio.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before tripping (default: 3).
+    pub threshold: u32,
+    /// Cooldown period in seconds after tripping (default: 300).
+    pub cooldown_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 3,
+            cooldown_secs: 300,
+        }
+    }
+}
+
 /// A URL + model pair identifying a specific model on a specific server.
 ///
 /// Used for trio roles (router, specialist) so that both single-server (LM Studio)
@@ -609,6 +636,9 @@ pub struct TrioConfig {
     /// Anti-drift hooks for SLM context quality stabilization.
     #[serde(default)]
     pub anti_drift: AntiDriftConfig,
+    /// Circuit breaker tuning for trio provider health tracking.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 /// Anti-drift configuration for SLM context stabilization.
@@ -683,6 +713,7 @@ impl Default for TrioConfig {
             specialist_endpoint: None,
             vram_cap_gb: default_vram_cap_gb(),
             anti_drift: AntiDriftConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }
@@ -690,6 +721,57 @@ impl Default for TrioConfig {
 // ---------------------------------------------------------------------------
 // Memory config
 // ---------------------------------------------------------------------------
+
+/// Tuning knobs for context compaction. Nested under memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompactionTuning {
+    /// Maximum merge rounds during compaction (default: 6).
+    pub max_merge_rounds: usize,
+}
+
+impl Default for CompactionTuning {
+    fn default() -> Self {
+        Self {
+            max_merge_rounds: 6,
+        }
+    }
+}
+
+/// Tuning knobs for session management. Nested under memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionTuning {
+    /// Rotate session file when it exceeds this size in bytes (default: 1_000_000).
+    pub rotation_size_bytes: usize,
+    /// Number of recent messages to carry into a new session (default: 10).
+    pub rotation_carry_messages: usize,
+}
+
+impl Default for SessionTuning {
+    fn default() -> Self {
+        Self {
+            rotation_size_bytes: 1_000_000,
+            rotation_carry_messages: 10,
+        }
+    }
+}
+
+/// Tuning knobs for context hygiene. Nested under memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ContextHygieneConfig {
+    /// Number of recent messages to keep untruncated (default: 20).
+    pub keep_last_messages: usize,
+}
+
+impl Default for ContextHygieneConfig {
+    fn default() -> Self {
+        Self {
+            keep_last_messages: 20,
+        }
+    }
+}
 
 /// Configuration for the observational memory system.
 ///
@@ -766,6 +848,18 @@ pub struct MemoryConfig {
     /// Default: 0 (use main model's context size).
     #[serde(default)]
     pub compaction_model_context_size: usize,
+
+    /// Tuning knobs for context compaction.
+    #[serde(default)]
+    pub compaction: CompactionTuning,
+
+    /// Tuning knobs for session management.
+    #[serde(default)]
+    pub session: SessionTuning,
+
+    /// Tuning knobs for context hygiene.
+    #[serde(default)]
+    pub hygiene: ContextHygieneConfig,
 }
 
 fn default_true() -> bool {
@@ -820,6 +914,9 @@ impl Default for MemoryConfig {
             max_history_turns: default_max_history_turns(),
             lazy_skills: true,
             compaction_model_context_size: 0,
+            compaction: CompactionTuning::default(),
+            session: SessionTuning::default(),
+            hygiene: ContextHygieneConfig::default(),
         }
     }
 }
@@ -875,6 +972,41 @@ impl Default for ProvenanceConfig {
             strict_mode: true,
             system_prompt_rules: true,
             response_boundary: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subagent tuning config
+// ---------------------------------------------------------------------------
+
+/// Tuning knobs for subagent execution. Nested under toolDelegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubagentTuning {
+    /// Maximum iterations for a subagent run (default: 15).
+    pub max_iterations: u32,
+    /// Maximum spawn depth for nested subagents (default: 3).
+    pub max_spawn_depth: u32,
+    /// Fallback context window for local subagents (default: 8192).
+    pub local_fallback_context: usize,
+    /// Minimum context window for local subagents (default: 2048).
+    pub local_min_context: usize,
+    /// Maximum response tokens for local subagents (default: 1024).
+    pub local_max_response_tokens: u32,
+    /// Minimum response tokens for local subagents (default: 256).
+    pub local_min_response_tokens: u32,
+}
+
+impl Default for SubagentTuning {
+    fn default() -> Self {
+        Self {
+            max_iterations: 15,
+            max_spawn_depth: 3,
+            local_fallback_context: 8192,
+            local_min_context: 2048,
+            local_max_response_tokens: 1024,
+            local_min_response_tokens: 256,
         }
     }
 }
@@ -998,6 +1130,10 @@ pub struct ToolDelegationConfig {
     /// Maximum identical tool calls allowed in one turn (dedup guard).
     #[serde(default = "default_td_max_same_tool_call")]
     pub max_same_tool_call_per_turn: u32,
+
+    /// Tuning knobs for subagent execution.
+    #[serde(default)]
+    pub subagent: SubagentTuning,
 }
 
 fn default_td_cost_budget() -> f64 {
@@ -1033,6 +1169,7 @@ impl Default for ToolDelegationConfig {
             strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: default_td_max_same_tool_call(),
+            subagent: SubagentTuning::default(),
         }
     }
 }
@@ -1295,6 +1432,8 @@ pub struct Config {
     pub trio: TrioConfig,
     #[serde(default)]
     pub lcm: LcmSchemaConfig,
+    #[serde(default)]
+    pub model_capabilities: HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
 }
 
 impl Config {
@@ -1568,6 +1707,7 @@ mod tests {
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: 1,
             mode: DelegationMode::Trio,
+            subagent: SubagentTuning::default(),
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
@@ -1930,6 +2070,34 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_tuning_defaults() {
+        let c = CompactionTuning::default();
+        assert_eq!(c.max_merge_rounds, 6);
+    }
+
+    #[test]
+    fn test_session_tuning_defaults() {
+        let s = SessionTuning::default();
+        assert_eq!(s.rotation_size_bytes, 1_000_000);
+        assert_eq!(s.rotation_carry_messages, 10);
+    }
+
+    #[test]
+    fn test_context_hygiene_config_defaults() {
+        let h = ContextHygieneConfig::default();
+        assert_eq!(h.keep_last_messages, 20);
+    }
+
+    #[test]
+    fn test_memory_config_nested_tuning() {
+        let json = r#"{"memory": {"compaction": {"maxMergeRounds": 10}, "session": {"rotationSizeBytes": 500000}, "hygiene": {"keepLastMessages": 30}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.memory.compaction.max_merge_rounds, 10);
+        assert_eq!(cfg.memory.session.rotation_size_bytes, 500000);
+        assert_eq!(cfg.memory.hygiene.keep_last_messages, 30);
+    }
+
+    #[test]
     fn test_lcm_compaction_endpoint() {
         let json = r#"{
             "lcm": {
@@ -1947,5 +2115,52 @@ mod tests {
         assert_eq!(ep.url, "http://192.168.1.22:1234/v1");
         assert_eq!(ep.model, "qwen3-0.6b");
         assert_eq!(cfg.lcm.compaction_context_size, 2048);
+    }
+
+    #[test]
+    fn test_subagent_tuning_defaults() {
+        let t = SubagentTuning::default();
+        assert_eq!(t.max_iterations, 15);
+        assert_eq!(t.max_spawn_depth, 3);
+        assert_eq!(t.local_fallback_context, 8192);
+        assert_eq!(t.local_min_context, 2048);
+        assert_eq!(t.local_max_response_tokens, 1024);
+        assert_eq!(t.local_min_response_tokens, 256);
+    }
+
+    #[test]
+    fn test_subagent_tuning_in_root_config() {
+        let json = r#"{"toolDelegation": {"subagent": {"maxIterations": 20, "maxSpawnDepth": 5}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tool_delegation.subagent.max_iterations, 20);
+        assert_eq!(cfg.tool_delegation.subagent.max_spawn_depth, 5);
+        // Unspecified fields get defaults
+        assert_eq!(cfg.tool_delegation.subagent.local_fallback_context, 8192);
+    }
+
+    #[test]
+    fn test_memory_tuning_in_root_config() {
+        let json = r#"{"memory": {"compaction": {"maxMergeRounds": 10}, "session": {"rotationSizeBytes": 500000}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.memory.compaction.max_merge_rounds, 10);
+        assert_eq!(cfg.memory.session.rotation_size_bytes, 500000);
+        // Unspecified fields keep defaults
+        assert_eq!(cfg.memory.session.rotation_carry_messages, 10);
+        assert_eq!(cfg.memory.hygiene.keep_last_messages, 20);
+    }
+
+    #[test]
+    fn test_circuit_breaker_config_defaults() {
+        let c = CircuitBreakerConfig::default();
+        assert_eq!(c.threshold, 3);
+        assert_eq!(c.cooldown_secs, 300);
+    }
+
+    #[test]
+    fn test_circuit_breaker_config_in_root_config() {
+        let json = r#"{"trio": {"circuitBreaker": {"threshold": 5, "cooldownSecs": 600}}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.trio.circuit_breaker.threshold, 5);
+        assert_eq!(cfg.trio.circuit_breaker.cooldown_secs, 600);
     }
 }

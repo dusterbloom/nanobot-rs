@@ -82,6 +82,7 @@
   - **D: Model capability registry** — Separate concern: replace 5-file model name sniffing with `ModelCapabilities` struct looked up by model ID. Config can override: `"modelCapabilities": {"nanbeige": {"toolCalling": true, "maxReliableOutput": 512}}`. Pro: solves the worst offender cleanly. Con: only addresses model sniffing, not timeouts/thresholds.
   - **E: Hybrid A+D** — Module-local configs (approach A) for numeric knobs + capability registry (approach D) for model sniffing. Two changes that together cover ~90% of the debt.
   **Do NOT implement until a proposal is reviewed.** The wrong abstraction here is worse than the current hardcoded values.
+  **Design:** [docs/plans/b12-config-debt-elimination.md](docs/plans/b12-config-debt-elimination.md)
   **Compounds with:** B11 (heartbeat needs config-driven probes), I9 (tiered routing needs configurable thresholds), N1 (hardware auto-detection feeds profile selection).
   _Ref: Audit data in this backlog entry. Files: `src/agent/subagent.rs`, `src/agent/compaction.rs`, `src/agent/tool_runner.rs`, `src/agent/agent_core.rs`, `src/agent/thread_repair.rs`, `src/server.rs`, `src/heartbeat/service.rs`, `src/config/schema.rs`_
 

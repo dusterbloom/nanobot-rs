@@ -85,6 +85,11 @@ pub struct ContextBuilder {
     /// Pre-rendered subagent profiles section (from `profiles_summary()`).
     /// Injected into the system prompt when non-empty.
     pub agent_profiles: String,
+    /// Optional instruction profiles for model-specific prompt engineering.
+    /// When set, resolved messages are appended to the developer context.
+    pub instruction_profiles: Option<crate::agent::instructions::InstructionProfiles>,
+    /// Task kind used when resolving instruction profiles (default: "main").
+    pub task_kind: String,
 }
 
 impl ContextBuilder {
@@ -103,6 +108,8 @@ impl ContextBuilder {
             provenance_enabled: false,
             lazy_skills: false,
             agent_profiles: String::new(),
+            instruction_profiles: None,
+            task_kind: "main".to_string(),
         }
     }
 
@@ -124,6 +131,8 @@ impl ContextBuilder {
             provenance_enabled: false,
             lazy_skills: false,
             agent_profiles: String::new(),
+            instruction_profiles: None,
+            task_kind: "main".to_string(),
         }
     }
 
@@ -155,15 +164,11 @@ impl ContextBuilder {
     // Public API
     // ------------------------------------------------------------------
 
-    /// Build the system prompt from bootstrap files, memory, and skills.
+    /// Build the core identity section of the system prompt.
     ///
-    /// When `channel` is provided, reads `CONTEXT-{channel}.md` for per-channel
-    /// session context (falls back to `CONTEXT.md` for backwards compatibility).
-    pub fn build_system_prompt(
-        &self,
-        skill_names: Option<&[String]>,
-        channel: Option<&str>,
-    ) -> String {
+    /// This is always sent as the `system` role message. Includes identity,
+    /// provenance rules, and bootstrap files (AGENTS.md, SOUL.md, etc.).
+    pub fn build_identity_prompt(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // Core identity.
@@ -190,6 +195,22 @@ impl ContextBuilder {
         if !bootstrap.is_empty() {
             parts.push(bootstrap);
         }
+
+        parts.join("\n\n---\n\n")
+    }
+
+    /// Build the injected context section for the `developer` role message.
+    ///
+    /// Contains session context, long-term memory, skills, and subagent
+    /// profiles. Returns an empty string when there is nothing to inject.
+    /// On cloud APIs this is emitted as a separate `developer` role message;
+    /// on local models it is folded back into the `system` message.
+    pub fn build_developer_context(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
 
         // Session context — structured snapshot from last compaction.
         // Per-channel file (CONTEXT-cli.md, CONTEXT-telegram.md) prevents
@@ -289,7 +310,44 @@ impl ContextBuilder {
             }
         }
 
-        let assembled = parts.join("\n\n---\n\n");
+        // Instruction profiles — model- and task-specific prompt engineering.
+        // Resolved messages are appended last so they can override earlier context.
+        if let Some(ref profiles) = self.instruction_profiles {
+            let messages = profiles.resolve(&self.model_name, &self.task_kind);
+            for msg in messages {
+                if !msg.content.is_empty() {
+                    parts.push(format!(
+                        "<!-- instruction-profile role={} -->\n{}",
+                        msg.role, msg.content
+                    ));
+                }
+            }
+        }
+
+        parts.join("\n\n---\n\n")
+    }
+
+    /// Build the system prompt from bootstrap files, memory, and skills.
+    ///
+    /// Returns the full prompt as a single concatenated string (identity +
+    /// developer context). Used by local models and as a convenience method
+    /// where a single string is needed.
+    ///
+    /// When `channel` is provided, reads `CONTEXT-{channel}.md` for per-channel
+    /// session context (falls back to `CONTEXT.md` for backwards compatibility).
+    pub fn build_system_prompt(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+    ) -> String {
+        let identity = self.build_identity_prompt();
+        let developer = self.build_developer_context(skill_names, channel);
+
+        let assembled = if developer.is_empty() {
+            identity
+        } else {
+            format!("{}\n\n---\n\n{}", identity, developer)
+        };
 
         // End-to-end safety net: hard cap on total system prompt size.
         if self.system_prompt_cap > 0 {
@@ -313,43 +371,95 @@ impl ContextBuilder {
     ) -> Vec<Value> {
         let mut messages: Vec<Value> = Vec::new();
 
-        // System prompt.
-        let mut system_prompt = self.build_system_prompt(skill_names, channel);
-        if let (Some(ch), Some(cid)) = (channel, chat_id) {
-            system_prompt.push_str(&format!(
-                "\n\n## Current Session\nChannel: {}\nChat ID: {}",
-                ch, cid
-            ));
-            if ch == "voice" || is_voice_message {
-                system_prompt.push_str(concat!(
-                    "\n\n## Voice Mode (IMPORTANT)\n",
-                    "The user is speaking via microphone and your response will be read aloud by TTS. ",
-                    "STRICT RULES:\n",
-                    "- Keep responses to 1-3 sentences. Be concise.\n",
-                    "- Use plain spoken language only.\n",
-                    "- NEVER use emoji, emoticons, or unicode symbols.\n",
-                    "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
-                    "- NEVER output code blocks or technical formatting.\n",
-                    "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
-                    "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
-                    "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
-                    "Never say 'sorry I can not' without exhausting your options.",
+        // Determine whether to use the `developer` role for injected context.
+        // Local models (model_name starts with "local:") only understand `system`.
+        let is_local = self.model_name.starts_with("local:");
+
+        if is_local {
+            // Local model: concatenate everything into a single `system` message.
+            let mut system_prompt = self.build_system_prompt(skill_names, channel);
+            if let (Some(ch), Some(cid)) = (channel, chat_id) {
+                system_prompt.push_str(&format!(
+                    "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                    ch, cid
                 ));
-                if let Some(lang) = detected_language {
-                    if lang == "en" {
-                        system_prompt.push_str(
-                            "\n- The user is speaking in English. You MUST respond in English.",
-                        );
-                    } else {
-                        system_prompt.push_str(&format!(
-                            "\n- The user is speaking in {}. You MUST respond in the same language.",
-                            lang_code_to_name(lang)
-                        ));
+                if ch == "voice" || is_voice_message {
+                    system_prompt.push_str(concat!(
+                        "\n\n## Voice Mode (IMPORTANT)\n",
+                        "The user is speaking via microphone and your response will be read aloud by TTS. ",
+                        "STRICT RULES:\n",
+                        "- Keep responses to 1-3 sentences. Be concise.\n",
+                        "- Use plain spoken language only.\n",
+                        "- NEVER use emoji, emoticons, or unicode symbols.\n",
+                        "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
+                        "- NEVER output code blocks or technical formatting.\n",
+                        "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
+                        "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
+                        "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
+                        "Never say 'sorry I can not' without exhausting your options.",
+                    ));
+                    if let Some(lang) = detected_language {
+                        if lang == "en" {
+                            system_prompt.push_str(
+                                "\n- The user is speaking in English. You MUST respond in English.",
+                            );
+                        } else {
+                            system_prompt.push_str(&format!(
+                                "\n- The user is speaking in {}. You MUST respond in the same language.",
+                                lang_code_to_name(lang)
+                            ));
+                        }
                     }
                 }
             }
+            messages.push(json!({"role": "system", "content": system_prompt}));
+        } else {
+            // Cloud model: emit `system` for core identity, then `developer` for
+            // injected context (memory, skills, profiles).
+            let identity = self.build_identity_prompt();
+            let mut developer = self.build_developer_context(skill_names, channel);
+
+            // Append session/voice metadata to the developer context block.
+            if let (Some(ch), Some(cid)) = (channel, chat_id) {
+                developer.push_str(&format!(
+                    "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                    ch, cid
+                ));
+                if ch == "voice" || is_voice_message {
+                    developer.push_str(concat!(
+                        "\n\n## Voice Mode (IMPORTANT)\n",
+                        "The user is speaking via microphone and your response will be read aloud by TTS. ",
+                        "STRICT RULES:\n",
+                        "- Keep responses to 1-3 sentences. Be concise.\n",
+                        "- Use plain spoken language only.\n",
+                        "- NEVER use emoji, emoticons, or unicode symbols.\n",
+                        "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
+                        "- NEVER output code blocks or technical formatting.\n",
+                        "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
+                        "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
+                        "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
+                        "Never say 'sorry I can not' without exhausting your options.",
+                    ));
+                    if let Some(lang) = detected_language {
+                        if lang == "en" {
+                            developer.push_str(
+                                "\n- The user is speaking in English. You MUST respond in English.",
+                            );
+                        } else {
+                            developer.push_str(&format!(
+                                "\n- The user is speaking in {}. You MUST respond in the same language.",
+                                lang_code_to_name(lang)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            messages.push(json!({"role": "system", "content": identity}));
+            if !developer.is_empty() {
+                messages.push(json!({"role": "developer", "content": developer}));
+            }
         }
-        messages.push(json!({"role": "system", "content": system_prompt}));
 
         // History.
         messages.extend(history.iter().cloned());
@@ -830,9 +940,15 @@ mod tests {
             false,
             None,
         );
-        let system_content = messages[0]["content"].as_str().unwrap();
-        assert!(system_content.contains("Channel: telegram"));
-        assert!(system_content.contains("Chat ID: 12345"));
+        // Channel/chat_id goes into the developer message for cloud models.
+        // Search all messages for the session metadata.
+        let all_content: String = messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(all_content.contains("Channel: telegram"));
+        assert!(all_content.contains("Chat ID: 12345"));
     }
 
     #[test]
@@ -1108,5 +1224,196 @@ mod tests {
     fn test_truncate_to_budget_head_empty() {
         assert_eq!(ContextBuilder::_truncate_to_budget_head("", 100), "");
         assert_eq!(ContextBuilder::_truncate_to_budget_head("hello", 0), "");
+    }
+
+    // ----- developer role -----
+
+    #[test]
+    fn test_developer_role_in_messages_cloud() {
+        // Cloud model (no "local:" prefix): memory/skills go into `developer` role,
+        // identity goes into `system` role.
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), "User prefers dark mode").unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "claude-opus-4-6".to_string(); // cloud model
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        // There should be a `system` message and a `developer` message (plus user).
+        let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
+        let developer_msg = messages.iter().find(|m| m["role"] == "developer").unwrap();
+
+        // Identity is in `system`.
+        let system_content = system_msg["content"].as_str().unwrap();
+        assert!(
+            system_content.contains("You are nanobot"),
+            "system message should contain identity"
+        );
+        assert!(
+            !system_content.contains("User prefers dark mode"),
+            "memory must NOT be in system message"
+        );
+
+        // Memory is in `developer`.
+        let dev_content = developer_msg["content"].as_str().unwrap();
+        assert!(
+            dev_content.contains("User prefers dark mode"),
+            "memory should be in developer message"
+        );
+        assert!(
+            !dev_content.contains("You are nanobot"),
+            "identity must NOT be in developer message"
+        );
+    }
+
+    #[test]
+    fn test_developer_role_local_model_uses_system_only() {
+        // Local model: everything goes into a single `system` message.
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), "User prefers dark mode").unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "local:Qwen3-8B.gguf".to_string(); // local model
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        // No `developer` role message for local models.
+        assert!(
+            messages.iter().all(|m| m["role"] != "developer"),
+            "local model should not emit a developer message"
+        );
+
+        // Both identity and memory must be in the `system` message.
+        let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
+        let system_content = system_msg["content"].as_str().unwrap();
+        assert!(system_content.contains("You are nanobot"));
+        assert!(system_content.contains("User prefers dark mode"));
+    }
+
+    #[test]
+    fn test_developer_role_no_context_no_extra_message() {
+        // When there is nothing to inject (no memory, no skills, no profiles),
+        // no `developer` message should be emitted even for cloud models.
+        let (_tmp, mut cb) = make_context();
+        cb.model_name = "claude-opus-4-6".to_string();
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        assert!(
+            messages.iter().all(|m| m["role"] != "developer"),
+            "no developer message when context is empty"
+        );
+        // Must still have a system message.
+        assert!(messages.iter().any(|m| m["role"] == "system"));
+    }
+
+    // --- Integration tests: instruction profiles injected into developer context ---
+
+    #[test]
+    fn test_instruction_profiles_injected_into_developer_context() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create instruction profiles YAML
+        let profiles_yaml = r#"
+base:
+  - role: developer
+    content: "Always respond in JSON format."
+model_profiles:
+  - pattern: "qwen*"
+    messages:
+      - role: developer
+        content: "Use strict tool calling. Never embed tool calls in prose."
+task_profiles:
+  - kind: main
+    messages:
+      - role: developer
+        content: "You are the main agent."
+"#;
+        let profiles_path = tmp.path().join("instructions.yaml");
+        fs::write(&profiles_path, profiles_yaml).unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "qwen-2.5-coder-32b".to_string();
+        cb.task_kind = "main".to_string();
+        cb.instruction_profiles = Some(
+            crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap(),
+        );
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        // Find the developer message
+        let dev_msg = messages.iter().find(|m| m["role"] == "developer");
+        assert!(
+            dev_msg.is_some(),
+            "Should have a developer message when profiles are set"
+        );
+
+        let dev_content = dev_msg.unwrap()["content"].as_str().unwrap();
+
+        // Base profile should be present
+        assert!(
+            dev_content.contains("Always respond in JSON format"),
+            "Base profile should be injected"
+        );
+
+        // Model-matched profile should be present (qwen* matches qwen-2.5-coder-32b)
+        assert!(
+            dev_content.contains("strict tool calling"),
+            "Qwen-specific profile should be injected"
+        );
+
+        // Task-matched profile should be present (kind=main)
+        assert!(
+            dev_content.contains("main agent"),
+            "Main task profile should be injected"
+        );
+    }
+
+    #[test]
+    fn test_instruction_profiles_no_match_still_injects_base() {
+        let tmp = TempDir::new().unwrap();
+
+        let profiles_yaml = r#"
+base:
+  - role: developer
+    content: "Base instruction."
+model_profiles:
+  - pattern: "llama*"
+    messages:
+      - role: developer
+        content: "Llama-specific."
+"#;
+        let profiles_path = tmp.path().join("instructions.yaml");
+        fs::write(&profiles_path, profiles_yaml).unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "deepseek-r1".to_string(); // doesn't match llama*
+        cb.task_kind = "main".to_string();
+        cb.instruction_profiles = Some(
+            crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap(),
+        );
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        let dev_msg = messages.iter().find(|m| m["role"] == "developer");
+        assert!(
+            dev_msg.is_some(),
+            "Should still have developer message for base profile"
+        );
+
+        let dev_content = dev_msg.unwrap()["content"].as_str().unwrap();
+        assert!(
+            dev_content.contains("Base instruction"),
+            "Base should be present"
+        );
+        assert!(
+            !dev_content.contains("Llama-specific"),
+            "Non-matching model profile should NOT be present"
+        );
     }
 }

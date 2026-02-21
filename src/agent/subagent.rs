@@ -19,23 +19,8 @@ use crate::agent::agent_profiles::{self, AgentProfile};
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::bus::events::InboundMessage;
-use crate::config::schema::ProvidersConfig;
+use crate::config::schema::{ProvidersConfig, SubagentTuning};
 use crate::providers::base::LLMProvider;
-
-/// Maximum iterations for a subagent run (default when no profile overrides).
-const MAX_SUBAGENT_ITERATIONS: u32 = 15;
-
-/// Maximum spawn depth to prevent infinite recursion.
-const MAX_SPAWN_DEPTH: u32 = 3;
-
-/// Conservative fallback context window for local subagent calls when /props
-/// is unavailable.
-const LOCAL_SUBAGENT_FALLBACK_CONTEXT: usize = 8192;
-/// Lower bound to avoid creating unusably tiny budgets.
-const LOCAL_SUBAGENT_MIN_CONTEXT: usize = 2048;
-/// Keep local subagent outputs short on constrained hardware.
-const LOCAL_SUBAGENT_MAX_RESPONSE_TOKENS: u32 = 1024;
-const LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS: u32 = 256;
 
 /// Configuration passed to `_run_subagent`, derived from profile + overrides.
 #[derive(Debug, Clone)]
@@ -91,24 +76,29 @@ fn extract_local_port_from_api_base(api_base: &str) -> Option<u16> {
 /// When a parent-provided limit is available (e.g. from config), use it directly
 /// instead of querying the server — the server may be on a non-localhost IP
 /// (LM Studio on WSL2) or may not support the `/props` endpoint.
-fn resolve_local_context_limit(provider: &dyn LLMProvider, parent_limit: Option<usize>) -> usize {
+fn resolve_local_context_limit(
+    provider: &dyn LLMProvider,
+    parent_limit: Option<usize>,
+    min_context: usize,
+    fallback_context: usize,
+) -> usize {
     // Try querying the server directly (works for local llama-server).
     if let Some(base) = provider.get_api_base() {
         if let Some(port) = extract_local_port_from_api_base(base) {
             if let Some(ctx) = crate::server::query_local_context_size(&port.to_string()) {
-                return ctx.max(LOCAL_SUBAGENT_MIN_CONTEXT);
+                return ctx.max(min_context);
             }
         }
     }
     // Use parent's known limit (from config) if available.
-    parent_limit.unwrap_or(LOCAL_SUBAGENT_FALLBACK_CONTEXT)
+    parent_limit.unwrap_or(fallback_context)
 }
 
 /// Compute a conservative local response budget from the detected context size.
-fn local_response_token_limit(ctx_limit: usize) -> u32 {
+fn local_response_token_limit(ctx_limit: usize, min_response_tokens: u32, max_response_tokens: u32) -> u32 {
     let adaptive = (ctx_limit / 6).clamp(
-        LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS as usize,
-        LOCAL_SUBAGENT_MAX_RESPONSE_TOKENS as usize,
+        min_response_tokens as usize,
+        max_response_tokens as usize,
     );
     adaptive as u32
 }
@@ -174,6 +164,8 @@ pub struct SubagentManager {
     local_context_limit: Option<usize>,
     /// Priority signal sender for the aha channel (proprioception Phase 6).
     aha_tx: Option<UnboundedSender<crate::agent::system_state::AhaSignal>>,
+    /// Tuning knobs for subagent execution (from config).
+    subagent_tuning: SubagentTuning,
 }
 
 impl SubagentManager {
@@ -220,7 +212,14 @@ impl SubagentManager {
             depth: 0,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             aha_tx: None,
+            subagent_tuning: SubagentTuning::default(),
         }
+    }
+
+    /// Set subagent execution tuning from config.
+    pub fn with_subagent_tuning(mut self, tuning: SubagentTuning) -> Self {
+        self.subagent_tuning = tuning;
+        self
     }
 
     /// Set the aha channel sender for priority signals (proprioception).
@@ -286,14 +285,15 @@ impl SubagentManager {
         working_dir: Option<String>,
     ) -> String {
         // Depth limit check: prevent infinite recursion.
-        if self.depth >= MAX_SPAWN_DEPTH {
+        let max_spawn_depth = self.subagent_tuning.max_spawn_depth;
+        if self.depth >= max_spawn_depth {
             warn!(
-                "Spawn rejected: depth {} >= MAX_SPAWN_DEPTH {}",
-                self.depth, MAX_SPAWN_DEPTH
+                "Spawn rejected: depth {} >= max_spawn_depth {}",
+                self.depth, max_spawn_depth
             );
             return format!(
                 "Error: spawn depth limit reached ({}/{}). Cannot spawn nested subagents beyond depth {}.",
-                self.depth, MAX_SPAWN_DEPTH, MAX_SPAWN_DEPTH
+                self.depth, max_spawn_depth, max_spawn_depth
             );
         }
 
@@ -348,7 +348,7 @@ impl SubagentManager {
         let base_iterations = profile
             .as_ref()
             .and_then(|p| p.max_iterations)
-            .unwrap_or(MAX_SUBAGENT_ITERATIONS);
+            .unwrap_or(self.subagent_tuning.max_iterations);
         let depth_budget = base_iterations >> self.depth; // halve per depth level
         let effective_iterations = depth_budget.max(3); // minimum 3 iterations
         if self.depth > 0 {
@@ -417,6 +417,7 @@ impl SubagentManager {
         let tsk = task.clone();
         let aha_tx = self.aha_tx.clone();
         let parent_ctx_limit = self.local_context_limit;
+        let tuning = self.subagent_tuning.clone();
 
         let handle = tokio::spawn(async move {
             let result = Self::_run_subagent(
@@ -432,6 +433,7 @@ impl SubagentManager {
                 is_local,
                 exec_working_dir.as_deref(),
                 parent_ctx_limit,
+                &tuning,
             )
             .await;
 
@@ -651,7 +653,7 @@ impl SubagentManager {
             system_prompt: None,
             tools_filter,
             read_only: false,
-            max_iterations: MAX_SUBAGENT_ITERATIONS,
+            max_iterations: self.subagent_tuning.max_iterations,
             max_tool_result_chars: self.max_tool_result_chars,
         };
 
@@ -697,6 +699,7 @@ impl SubagentManager {
                 is_local,
                 working_dir.as_deref(),
                 self.local_context_limit,
+                &self.subagent_tuning,
             )
             .await;
 
@@ -804,6 +807,7 @@ impl SubagentManager {
         is_local: bool,
         exec_working_dir: Option<&str>,
         parent_context_limit: Option<usize>,
+        tuning: &SubagentTuning,
     ) -> anyhow::Result<String> {
         debug!(
             "Subagent {} starting (model={}, max_iter={}, read_only={}, tools_filter={:?}): {}",
@@ -852,12 +856,21 @@ impl SubagentManager {
         ];
 
         let local_ctx_limit = if is_local {
-            Some(resolve_local_context_limit(provider, parent_context_limit))
+            Some(resolve_local_context_limit(
+                provider,
+                parent_context_limit,
+                tuning.local_min_context,
+                tuning.local_fallback_context,
+            ))
         } else {
             None
         };
         let max_response_tokens = local_ctx_limit
-            .map(local_response_token_limit)
+            .map(|ctx| local_response_token_limit(
+                ctx,
+                tuning.local_min_response_tokens,
+                tuning.local_max_response_tokens,
+            ))
             .unwrap_or(4096);
 
         let tool_defs = tools.get_definitions();
@@ -868,6 +881,7 @@ impl SubagentManager {
         };
 
         let mut final_content = String::new();
+        let mut taint_state = crate::agent::taint::TaintState::new();
 
         for iteration in 0..config.max_iterations {
             debug!(
@@ -914,11 +928,11 @@ impl SubagentManager {
             {
                 Ok(r) => r,
                 Err(e) if local_ctx_limit.is_some() && is_context_overflow_error(&e) => {
-                    let ctx_limit = local_ctx_limit.unwrap_or(LOCAL_SUBAGENT_FALLBACK_CONTEXT);
+                    let ctx_limit = local_ctx_limit.unwrap_or(tuning.local_fallback_context);
                     let retry_ctx = ((ctx_limit as f64) * 0.85).round() as usize;
-                    let retry_ctx = retry_ctx.max(LOCAL_SUBAGENT_MIN_CONTEXT);
+                    let retry_ctx = retry_ctx.max(tuning.local_min_context);
                     let retry_max_tokens =
-                        (max_response_tokens / 2).max(LOCAL_SUBAGENT_MIN_RESPONSE_TOKENS);
+                        (max_response_tokens / 2).max(tuning.local_min_response_tokens);
                     let tool_def_tokens = tool_defs_opt
                         .map(TokenBudget::estimate_tool_def_tokens)
                         .unwrap_or(0);
@@ -958,10 +972,25 @@ impl SubagentManager {
             if crate::agent::tool_runner::process_tool_response(
                 &response, &mut messages, &tools, is_local,
             ).await {
-                // Tool calls processed — continue loop.
+                // Taint tracking: check sensitive tools before marking new taint sources.
+                for tc in &response.tool_calls {
+                    if let Some(_spans) = taint_state.check_sensitive(&tc.name) {
+                        warn!(
+                            "TAINT WARNING [subagent {}]: Sensitive tool '{}' called with tainted context from: {}",
+                            label, tc.name, taint_state.taint_summary()
+                        );
+                    }
+                    let detail = tc.arguments.get("url")
+                        .or_else(|| tc.arguments.get("query"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    taint_state.mark_tainted(&tc.name, detail);
+                }
             } else {
                 // No tool calls — the subagent is done.
-                final_content = response.content.unwrap_or_default();
+                final_content = crate::agent::sanitize::sanitize_reasoning_output(
+                    &response.content.unwrap_or_default(),
+                );
                 break;
             }
         }
@@ -1248,7 +1277,7 @@ mod tests {
             system_prompt: None,
             tools_filter: None,
             read_only: false,
-            max_iterations: MAX_SUBAGENT_ITERATIONS,
+            max_iterations: SubagentTuning::default().max_iterations,
             max_tool_result_chars: 30000,
         }
     }
@@ -1272,6 +1301,7 @@ mod tests {
             false, // is_local
             None,  // exec_working_dir
             None,  // parent_context_limit
+            &SubagentTuning::default(),
         )
         .await
         .unwrap();
@@ -1345,6 +1375,7 @@ mod tests {
             false, // is_local
             None,  // exec_working_dir
             None,  // parent_context_limit
+            &SubagentTuning::default(),
         )
         .await
         .unwrap();

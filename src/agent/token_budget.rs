@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 use serde_json::Value;
 use tiktoken_rs::CoreBPE;
 
+use crate::agent::compaction::tool_output_digest;
+
 /// Manages the token budget for LLM context windows.
 ///
 /// Unified budget system: handles both context-window trimming (for message
@@ -244,12 +246,11 @@ impl TokenBudget {
             for &idx in &tool_msg_indices[..truncate_up_to] {
                 if let Some(content) = msgs[idx].get("content").and_then(|c| c.as_str()) {
                     if content.len() > 200 {
-                        let summary = format!(
-                            "[truncated: {}... ({} chars)]",
-                            &content[..crate::utils::helpers::floor_char_boundary(content, 100)],
-                            content.len()
-                        );
-                        msgs[idx]["content"] = Value::String(summary);
+                        // Replace with a digest marker so the LLM can see that
+                        // data existed and was compressed, rather than silently
+                        // dropping it.
+                        msgs[idx]["content"] =
+                            Value::String(tool_output_digest(content, 200));
                     }
                 }
             }

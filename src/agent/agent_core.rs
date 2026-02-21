@@ -17,7 +17,7 @@ use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::agent::circuit_breaker::CircuitBreaker;
-use crate::config::schema::{AntiDriftConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
+use crate::config::schema::{AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
 use crate::session::manager::SessionManager;
 
@@ -68,6 +68,9 @@ pub struct SwappableCore {
     pub session_complete_after_secs: u64,
     pub max_message_age_turns: usize,
     pub max_history_turns: usize,
+    pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
+    /// Number of recent messages to keep untruncated in context hygiene (default: 20).
+    pub hygiene_keep_last_messages: usize,
 }
 
 /// Observability counters for trio routing, populated by router.rs.
@@ -148,6 +151,10 @@ pub struct RuntimeCounters {
 
 impl RuntimeCounters {
     pub fn new(max_context_tokens: usize) -> Self {
+        Self::new_with_config(max_context_tokens, &CircuitBreakerConfig::default())
+    }
+
+    pub fn new_with_config(max_context_tokens: usize, cb_config: &CircuitBreakerConfig) -> Self {
         Self {
             learning_turn_counter: AtomicU64::new(0),
             last_context_used: AtomicU64::new(0),
@@ -165,7 +172,7 @@ impl RuntimeCounters {
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
             trio_metrics: TrioMetrics::default(),
-            trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new()),
+            trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new(cb_config)),
         }
     }
 }
@@ -212,16 +219,6 @@ pub(crate) fn provenance_warning_role(is_local: bool) -> &'static str {
     }
 }
 
-pub(crate) fn is_small_local_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("nanbeige")
-        || m.contains("functiongemma")
-        || m.contains("ministral-3")
-        || m.contains("qwen3-1.7b")
-        || m.contains("3b")
-        || m.contains("1.7b")
-}
-
 // ---------------------------------------------------------------------------
 // SwappableCore construction
 // ---------------------------------------------------------------------------
@@ -250,6 +247,7 @@ pub struct SwappableCoreConfig {
     pub delegation_provider: Option<Arc<dyn LLMProvider>>,
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub trio_config: TrioConfig,
+    pub model_capabilities_overrides: std::collections::HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -277,7 +275,9 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         delegation_provider,
         specialist_provider,
         trio_config,
+        model_capabilities_overrides,
     } = cfg;
+    let model_capabilities = crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
     let router_provider = delegation_provider.clone();
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
@@ -302,7 +302,11 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // what agents exist and when to delegate instead of doing everything itself.
     let profiles = agent_profiles::load_profiles(&workspace);
     context.agent_profiles = agent_profiles::profiles_summary(&profiles);
-    let sessions = SessionManager::new(&workspace);
+    let sessions = SessionManager::with_tuning(
+        &workspace,
+        memory_config.session.rotation_size_bytes,
+        memory_config.session.rotation_carry_messages,
+    );
 
     // Resolve memory provider + model.
     //
@@ -371,7 +375,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     .with_thresholds(
         memory_config.compaction_threshold_percent,
         memory_config.compaction_threshold_tokens,
-    );
+    )
+    .with_max_merge_rounds(memory_config.compaction.max_merge_rounds);
     let learning = LearningStore::new(&workspace);
     let working_memory = WorkingMemoryStore::new(&workspace);
 
@@ -454,6 +459,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         session_complete_after_secs: memory_config.session_complete_after_secs,
         max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
+        model_capabilities,
+        hygiene_keep_last_messages: memory_config.hygiene.keep_last_messages,
     }
 }
 

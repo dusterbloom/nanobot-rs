@@ -294,7 +294,8 @@ pub(crate) async fn request_strict_router_decision(
         .chat(&router_messages, None, Some(model), 256, temperature, None, Some(top_p))
         .await
         .map_err(|e| format!("strict router call failed: {}", e))?;
-    let raw = router_resp.content.unwrap_or_default();
+    let raw_router_content = router_resp.content.unwrap_or_default();
+    let raw = crate::agent::sanitize::sanitize_reasoning_output(&raw_router_content);
     let parsed = role_policy::parse_router_decision_strict(&raw)
         .or_else(|_| {
             extract_json_object(&raw)
@@ -403,9 +404,10 @@ pub(crate) async fn dispatch_specialist(
     {
         Ok(sp_resp) => {
             counters.trio_circuit_breaker.lock().unwrap().record_success(&cb_key);
-            let text = sp_resp
+            let raw_text = sp_resp
                 .content
                 .unwrap_or_else(|| "Specialist returned no content.".to_string());
+            let text = crate::agent::sanitize::sanitize_reasoning_output(&raw_text);
             Ok(format!("[specialist:{}] {}", target, text))
         }
         Err(e) => {

@@ -21,9 +21,8 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
-pub const DEFAULT_KEEP_LAST_MESSAGES: usize = 20;
 
-pub fn hygiene_pipeline(messages: &mut Vec<Value>) {
+pub fn hygiene_pipeline(messages: &mut Vec<Value>, keep_last_messages: usize) {
     if messages.is_empty() {
         return;
     }
@@ -32,8 +31,8 @@ pub fn hygiene_pipeline(messages: &mut Vec<Value>) {
 
     dedup_tool_results(messages);
     merge_consecutive_same_role(messages);
-    truncate_old_tool_results(messages, DEFAULT_KEEP_LAST_MESSAGES);
-    truncate_old_assistant_messages(messages, DEFAULT_KEEP_LAST_MESSAGES);
+    truncate_old_tool_results(messages, keep_last_messages);
+    truncate_old_assistant_messages(messages, keep_last_messages);
     strip_dangling_tool_calls(messages);
     remove_orphaned_tool_results(messages);
 
@@ -422,7 +421,7 @@ mod tests {
             assistant_with_tool_call("tc_new"),
             tool_result("tc_new", "valid result"),
         ];
-        hygiene_pipeline(&mut messages);
+        hygiene_pipeline(&mut messages, 20);
 
         assert!(messages.len() <= 4);
     }
@@ -430,7 +429,7 @@ mod tests {
     #[test]
     fn test_empty_messages_no_panic() {
         let mut messages: Vec<Value> = vec![];
-        hygiene_pipeline(&mut messages);
+        hygiene_pipeline(&mut messages, 20);
         assert!(messages.is_empty());
     }
 
@@ -443,7 +442,7 @@ mod tests {
             assistant_plain("doing well"),
         ];
         let before = messages.len();
-        hygiene_pipeline(&mut messages);
+        hygiene_pipeline(&mut messages, 20);
         assert_eq!(messages.len(), before);
     }
 

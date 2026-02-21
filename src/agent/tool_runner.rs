@@ -477,18 +477,9 @@ async fn analyze_via_scratch_pad(
 /// Small local models should spend fewer rounds "thinking about tool outputs"
 /// and move on faster to actionable tool execution/results.
 fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
-    let mut rounds = config.max_iterations.clamp(1, 10) as usize;
-    let model = config.model.to_ascii_lowercase();
-
-    if model.contains("nanbeige") {
-        rounds = rounds.min(3);
-    } else if model.contains("functiongemma") {
-        rounds = rounds.min(2);
-    } else if model.contains("ministral-3") || model.contains("qwen3-1.7b") {
-        rounds = rounds.min(4);
-    }
-
-    rounds.max(1)
+    let caps = crate::agent::model_capabilities::lookup(&config.model, &std::collections::HashMap::new());
+    let rounds = config.max_iterations.clamp(1, 10) as usize;
+    rounds.min(caps.scratch_pad_rounds).max(1)
 }
 
 /// Process tool calls from an LLM response: build assistant message,

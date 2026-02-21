@@ -220,8 +220,8 @@ fn apply_local_reasoning_controls(
 /// Only these models benefit from `try_native_lms_chat`; for everything else
 /// the extra HTTP roundtrip is pure overhead.
 fn needs_native_lms_api(model: &str) -> bool {
-    let m = model.to_lowercase();
-    m.contains("nemotron") || m.contains("orchestrator")
+    crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new())
+        .needs_native_lms_api
 }
 
 /// Call the LM Studio native REST API (`/api/v1/chat`) with `reasoning: "off"`.

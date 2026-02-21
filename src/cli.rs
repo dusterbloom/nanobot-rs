@@ -596,8 +596,9 @@ pub(crate) fn build_core_handle(
         delegation_provider: dp,
         specialist_provider: sp,
         trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
     });
-    let counters = Arc::new(RuntimeCounters::new(max_context_tokens));
+    let counters = Arc::new(RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker));
     // When main_no_think is enabled, also suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
     if config.trio.main_no_think {
@@ -663,6 +664,7 @@ pub(crate) fn rebuild_core(
         delegation_provider: dp,
         specialist_provider: sp,
         trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
     });
     // Swap only the core; counters survive.
     handle.swap_core(new_core);

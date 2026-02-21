@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::config::schema::CircuitBreakerConfig;
+
 /// Per-provider health state.
 struct ProviderState {
     consecutive_failures: u32,
@@ -22,12 +24,12 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Create a new circuit breaker with default settings (3 failures, 5 min cooldown).
-    pub fn new() -> Self {
+    /// Create a new circuit breaker from config (defaults: 3 failures, 5 min cooldown).
+    pub fn new(config: &CircuitBreakerConfig) -> Self {
         Self {
             states: HashMap::new(),
-            threshold: 3,
-            cooldown: Duration::from_secs(300),
+            threshold: config.threshold,
+            cooldown: Duration::from_secs(config.cooldown_secs),
         }
     }
 
@@ -79,7 +81,7 @@ impl CircuitBreaker {
 
 impl Default for CircuitBreaker {
     fn default() -> Self {
-        Self::new()
+        Self::new(&CircuitBreakerConfig::default())
     }
 }
 
@@ -89,13 +91,13 @@ mod tests {
 
     #[test]
     fn test_new_provider_is_available() {
-        let cb = CircuitBreaker::new();
+        let cb = CircuitBreaker::default();
         assert!(cb.is_available("openrouter:gpt-4"));
     }
 
     #[test]
     fn test_record_failure_below_threshold() {
-        let mut cb = CircuitBreaker::new();
+        let mut cb = CircuitBreaker::default();
         cb.record_failure("local:qwen");
         cb.record_failure("local:qwen");
         // 2 failures < threshold of 3, still available.
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_record_failure_above_threshold_trips() {
-        let mut cb = CircuitBreaker::new();
+        let mut cb = CircuitBreaker::default();
         for _ in 0..3 {
             cb.record_failure("local:qwen");
         }
@@ -126,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_record_success_resets() {
-        let mut cb = CircuitBreaker::new();
+        let mut cb = CircuitBreaker::default();
         cb.record_failure("flaky:model");
         cb.record_failure("flaky:model");
         cb.record_success("flaky:model");
@@ -138,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_independent_keys() {
-        let mut cb = CircuitBreaker::new();
+        let mut cb = CircuitBreaker::default();
         for _ in 0..3 {
             cb.record_failure("bad:model");
         }

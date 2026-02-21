@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -40,29 +41,13 @@ pub struct ReaderProfile {
 }
 
 impl ReaderProfile {
-    /// Infer reader capability from model name.
-    pub fn from_model(model: &str) -> Self {
-        let lower = model.to_lowercase();
-        let capability = if lower.contains("3b")
-            || lower.contains("0.5b")
-            || lower.contains("1.7b")
-            || lower.contains("1b")
-            || lower.contains("ministral")
-            || lower.contains("nanbeige")
-        {
-            ReaderCapability::Minimal
-        } else if lower.contains("claude")
-            || lower.contains("gpt-4")
-            || lower.contains("opus")
-            || lower.contains("sonnet")
-            || lower.contains("gemini-2")
-            || lower.contains("gemini-1.5")
-        {
-            ReaderCapability::Advanced
-        } else {
-            ReaderCapability::Standard
+    /// Build a ReaderProfile from pre-computed ModelCapabilities.
+    pub fn from_capabilities(caps: &crate::agent::model_capabilities::ModelCapabilities) -> Self {
+        let capability = match caps.reader_tier {
+            crate::agent::model_capabilities::ReaderTier::Minimal => ReaderCapability::Minimal,
+            crate::agent::model_capabilities::ReaderTier::Standard => ReaderCapability::Standard,
+            crate::agent::model_capabilities::ReaderTier::Advanced => ReaderCapability::Advanced,
         };
-        // Default context budget — callers should override.
         let context_budget = match capability {
             ReaderCapability::Minimal => 4096,
             ReaderCapability::Standard => 32768,
@@ -72,6 +57,15 @@ impl ReaderProfile {
             context_budget,
             capability,
         }
+    }
+
+    /// Infer reader capability from model name.
+    ///
+    /// Delegates to the model capabilities registry for consistency.
+    /// Use `from_capabilities()` when ModelCapabilities is already available.
+    pub fn from_model(model: &str) -> Self {
+        let caps = crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new());
+        Self::from_capabilities(&caps)
     }
 }
 
@@ -147,21 +141,48 @@ pub fn classify_tier(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Digest Markers
+// ---------------------------------------------------------------------------
+
+/// Create a digest marker for compacted tool output.
+///
+/// Format: `TOOL_OUTPUT_DIGEST v1 | sha256:<first-16-hex> | len:<bytes> | preview:<text>`
+///
+/// The marker lets the LLM know that data existed and was compressed, including
+/// a short preview and a hash for identity / deduplication.
+pub fn tool_output_digest(original: &str, preview_len: usize) -> String {
+    let hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(original.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let preview: String = original.chars().take(preview_len).collect();
+    let preview = preview.replace('\n', " "); // single-line preview
+    format!(
+        "TOOL_OUTPUT_DIGEST v1 | sha256:{} | len:{} | preview:{}",
+        &hash[..16], // first 16 hex chars for brevity
+        original.len(),
+        preview
+    )
+}
+
+/// Create an omitted marker for tool output that was completely dropped.
+pub fn tool_output_omitted() -> String {
+    "TOOL_OUTPUT_OMITTED v1 | status:ok".to_string()
+}
+
 /// Light-compress a message: truncate tool results, keep user/assistant text.
 pub fn compress_light(msg: &Value) -> Value {
     let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
     if role == "tool" {
-        // Truncate tool content to 200 chars.
+        // Replace long tool output with a digest marker so the LLM knows data
+        // existed and was compressed, rather than silently truncating.
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
         if content.len() > 200 {
-            let truncated: String = content.chars().take(200).collect();
             let mut new_msg = msg.clone();
-            new_msg["content"] = Value::String(format!(
-                "{}... [truncated, {} chars total]",
-                truncated,
-                content.len()
-            ));
+            new_msg["content"] = Value::String(tool_output_digest(content, 200));
             return new_msg;
         }
     }
@@ -257,9 +278,6 @@ Rules: copy exact terms, one sentence per bullet, max 10 per section, no meta-co
 // SUMMARIZER_INPUT_BUDGET_TOKENS removed — now dynamically computed via
 // ContextCompactor::input_budget() based on the compaction server's ctx size.
 
-/// Safety cap for iterative merge rounds.
-const MAX_MERGE_ROUNDS: usize = 6;
-
 /// Result of a compaction attempt.
 pub struct CompactionResult {
     /// The (possibly compacted) messages.
@@ -282,6 +300,8 @@ pub struct ContextCompactor {
     threshold_percent: f64,
     /// Compaction threshold in absolute tokens. Whichever fires first wins.
     threshold_tokens: usize,
+    /// Maximum merge rounds during compaction (default: 6).
+    max_merge_rounds: usize,
 }
 
 impl ContextCompactor {
@@ -304,7 +324,14 @@ impl ContextCompactor {
             compaction_context_size,
             threshold_percent: 66.6,
             threshold_tokens: 100_000,
+            max_merge_rounds: 6,
         }
+    }
+
+    /// Set the maximum merge rounds (from config).
+    pub fn with_max_merge_rounds(mut self, max_merge_rounds: usize) -> Self {
+        self.max_merge_rounds = max_merge_rounds;
+        self
     }
 
     /// Set the compaction thresholds (from config).
@@ -518,7 +545,7 @@ impl ContextCompactor {
         let mut rounds = 0usize;
         while summaries.len() > 1 {
             rounds += 1;
-            if rounds > MAX_MERGE_ROUNDS {
+            if rounds > self.max_merge_rounds {
                 anyhow::bail!(
                     "Exceeded merge rounds while summarizing (remaining chunks={})",
                     summaries.len()
@@ -866,7 +893,7 @@ impl ContextCompactor {
         let mut rounds = 0usize;
         while summaries.len() > 1 {
             rounds += 1;
-            if rounds > MAX_MERGE_ROUNDS {
+            if rounds > self.max_merge_rounds {
                 anyhow::bail!("Exceeded merge rounds (chunks={})", summaries.len());
             }
             let mut merged: Vec<String> = Vec::new();
@@ -1475,13 +1502,13 @@ mod tests {
         let compressed = compress_light(&tool_msg);
         let content = compressed["content"].as_str().unwrap();
         assert!(
-            content.len() < 300,
-            "Compressed tool result should be < 300 chars, got {}",
-            content.len()
+            content.starts_with("TOOL_OUTPUT_DIGEST v1"),
+            "Compressed tool result should be a digest marker, got: {}",
+            content
         );
         assert!(
-            content.contains("[truncated"),
-            "Should have truncation marker"
+            content.contains("len:3000"),
+            "Digest should include the original length"
         );
     }
 
@@ -1532,5 +1559,50 @@ mod tests {
         let result = compactor.summarize_text(&big_input, SUMMARIZE_PROMPT).await;
         assert!(result.is_ok(), "summarize_text should succeed with oversized input: {:?}", result.err());
         assert_eq!(result.unwrap(), "Truncated summary.");
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn test_digest_marker_format() {
+        let content = "Hello world, this is some tool output that would be compacted.";
+        let marker = tool_output_digest(content, 200);
+        assert!(marker.starts_with("TOOL_OUTPUT_DIGEST v1 | sha256:"));
+        assert!(marker.contains(&format!("len:{}", content.len())));
+        assert!(marker.contains("preview:"));
+    }
+
+    #[test]
+    fn test_digest_long_preview_truncated() {
+        let content = "x".repeat(500);
+        let marker = tool_output_digest(&content, 200);
+        // Preview should be max 200 chars
+        let preview_part = marker.split("preview:").nth(1).unwrap();
+        assert!(preview_part.len() <= 200);
+    }
+
+    #[test]
+    fn test_digest_multiline_preview_flattened() {
+        let content = "line1\nline2\nline3";
+        let marker = tool_output_digest(content, 200);
+        assert!(!marker.contains('\n') || marker.ends_with('\n'));
+        assert!(marker.contains("preview:line1 line2 line3"));
+    }
+
+    #[test]
+    fn test_omitted_marker() {
+        let marker = tool_output_omitted();
+        assert_eq!(marker, "TOOL_OUTPUT_OMITTED v1 | status:ok");
+    }
+
+    #[test]
+    fn test_digest_deterministic() {
+        let content = "same content";
+        let m1 = tool_output_digest(content, 200);
+        let m2 = tool_output_digest(content, 200);
+        assert_eq!(m1, m2);
     }
 }
