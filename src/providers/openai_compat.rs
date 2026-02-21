@@ -234,6 +234,31 @@ fn needs_native_lms_api(model: &str) -> bool {
         .needs_native_lms_api
 }
 
+/// Extract the unsupported feature name from an LMS error message.
+///
+/// Handles messages of the form:
+/// - `"Model does not support reasoning configuration"`
+/// - `"does not support reasoning"`
+/// - `"does not support <feature> configuration"`
+///
+/// Returns the feature name in lowercase if recognised, `None` otherwise.
+pub(crate) fn extract_unsupported_feature(error_text: &str) -> Option<String> {
+    let lower = error_text.to_ascii_lowercase();
+    // Pattern: "does not support <word>" or "does not support <word> configuration"
+    let marker = "does not support ";
+    let start = lower.find(marker)? + marker.len();
+    let rest = &lower[start..];
+    // Take the first word (stop at space, newline, or end)
+    let feature: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if feature.is_empty() {
+        return None;
+    }
+    Some(feature)
+}
+
 /// Call the LM Studio native REST API (`/api/v1/chat`) with `reasoning: "off"`.
 ///
 /// This is the proper way to disable reasoning for models like Nemotron that
@@ -296,16 +321,26 @@ async fn try_native_lms_chat(
         return None;
     }
 
-    let body = serde_json::json!({
+    // Build request body, omitting "reasoning" if the model is known to reject it.
+    let reasoning_unsupported =
+        crate::agent::model_feature_cache::is_feature_unsupported(model, "reasoning");
+    let mut body = serde_json::json!({
         "model": model,
         "system_prompt": system_prompt,
         "input": input,
-        "reasoning": "off",
         "max_output_tokens": max_tokens,
         "temperature": temperature,
     });
+    if !reasoning_unsupported {
+        body["reasoning"] = serde_json::Value::String("off".to_string());
+    }
 
-    tracing::debug!("native LMS chat: model={} input_len={}", model, input.len());
+    tracing::debug!(
+        "native LMS chat: model={} input_len={} reasoning_field={}",
+        model,
+        input.len(),
+        !reasoning_unsupported
+    );
 
     let resp = client
         .post(&url)
@@ -320,6 +355,15 @@ async fn try_native_lms_chat(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         tracing::warn!("native LMS chat failed (HTTP {}): {}", status, text);
+        // Cache any feature the model explicitly says it doesn't support.
+        if let Some(feature) = extract_unsupported_feature(&text) {
+            tracing::info!(
+                "model_feature_cache: caching '{}' as unsupported for model '{}'",
+                feature,
+                model
+            );
+            crate::agent::model_feature_cache::mark_feature_unsupported(model, &feature);
+        }
         return None; // Fall back to regular path
     }
 
@@ -2295,5 +2339,54 @@ mod tests {
         let resp = done_response.expect("should produce Done even for empty stream");
         assert!(resp.content.is_none(), "empty stream should have no content");
         assert!(resp.tool_calls.is_empty(), "empty stream should have no tool calls");
+    }
+
+    // ── extract_unsupported_feature tests ────────────────────────────────────
+
+    #[test]
+    fn test_extract_reasoning_unsupported() {
+        let msg = "Model does not support reasoning configuration";
+        assert_eq!(
+            extract_unsupported_feature(msg),
+            Some("reasoning".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_reasoning_lowercase() {
+        let msg = "does not support reasoning";
+        assert_eq!(
+            extract_unsupported_feature(msg),
+            Some("reasoning".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_other_feature() {
+        let msg = "error: does not support stream_options configuration";
+        assert_eq!(
+            extract_unsupported_feature(msg),
+            Some("stream_options".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_no_match_returns_none() {
+        let msg = "Internal server error";
+        assert_eq!(extract_unsupported_feature(msg), None);
+    }
+
+    #[test]
+    fn test_extract_empty_string_returns_none() {
+        assert_eq!(extract_unsupported_feature(""), None);
+    }
+
+    #[test]
+    fn test_extract_prefix_junk_still_works() {
+        let msg = r#"{"error":"Model does not support reasoning configuration","code":400}"#;
+        assert_eq!(
+            extract_unsupported_feature(msg),
+            Some("reasoning".to_string())
+        );
     }
 }

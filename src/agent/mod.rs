@@ -21,6 +21,7 @@ pub mod lora_bridge;
 pub mod memory;
 pub mod metrics;
 pub mod model_capabilities;
+pub mod model_feature_cache;
 pub mod model_prices;
 pub mod observer;
 pub mod pipeline;

@@ -2503,6 +2503,7 @@ mod tests {
                 false,
                 0.6,
                 1.0,
+                "",
             )
             .await
             .expect("valid strict router decision");
@@ -2562,7 +2563,7 @@ mod tests {
         ];
         for (expected_action, directive) in router_cases {
             let pack = format!("{}\nFollow schema strictly.", directive);
-            match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0).await {
+            match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0, "").await {
                 Ok(d) => {
                     if d.action != expected_action {
                         failures.push(format!(
