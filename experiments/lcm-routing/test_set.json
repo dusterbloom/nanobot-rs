@@ -1,0 +1,269 @@
+{
+  "_comment": "30 test cases for L1 concept router evaluation. No overlap with reference_set.json.",
+  "test_cases": [
+    {
+      "id": "T1",
+      "query": "Hello, how are you today?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "existing",
+      "category": "greeting"
+    },
+    {
+      "id": "T2",
+      "query": "Read the file src/main.rs",
+      "expected_action": "tool",
+      "expected_target": "read_file",
+      "source": "existing",
+      "category": "direct_tool"
+    },
+    {
+      "id": "T3",
+      "query": "Run cargo test",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "source": "existing",
+      "category": "indirect_tool"
+    },
+    {
+      "id": "T4",
+      "query": "Write comprehensive analysis of Rust ownership",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "source": "existing",
+      "category": "specialist"
+    },
+    {
+      "id": "T5",
+      "query": "What is 2+2?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "existing",
+      "category": "simple_question"
+    },
+    {
+      "id": "T6",
+      "query": "Search web for latest Rust release",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "source": "existing",
+      "category": "direct_tool"
+    },
+    {
+      "id": "T7",
+      "query": "Refactor auth to JWT",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "source": "existing",
+      "category": "specialist"
+    },
+    {
+      "id": "T8",
+      "query": "Tell me a joke",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "existing",
+      "category": "conversational"
+    },
+    {
+      "id": "T9",
+      "query": "Create notes.txt with shopping list",
+      "expected_action": "tool",
+      "expected_target": "write_file",
+      "source": "existing",
+      "category": "direct_tool"
+    },
+    {
+      "id": "T10",
+      "query": "hmm I'm not sure what to do",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "source": "existing",
+      "category": "ambiguous"
+    },
+
+    {
+      "id": "M1",
+      "query": "Research Rust async runtimes and write a comparison document",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "source": "new",
+      "category": "multi_step",
+      "notes": "Requires web research + writing. Currently fails in trio single-action routing."
+    },
+    {
+      "id": "M2",
+      "query": "Fetch these two URLs and compare their content",
+      "expected_action": "tool",
+      "expected_target": "web_browse",
+      "source": "new",
+      "category": "multi_step",
+      "notes": "Multi-target tool use. First action should be tool."
+    },
+    {
+      "id": "M3",
+      "query": "Read all Python files in src/ and find security vulnerabilities",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "source": "new",
+      "category": "multi_step",
+      "notes": "Requires listing + reading + analysis."
+    },
+    {
+      "id": "M4",
+      "query": "Search for the latest version of tokio, then update Cargo.toml",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "source": "new",
+      "category": "multi_step",
+      "notes": "First step is search, second is write_file."
+    },
+    {
+      "id": "M5",
+      "query": "Check the server logs, find errors, and write a summary report",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "source": "new",
+      "category": "multi_step",
+      "notes": "Exec to read logs, then specialist to analyze + write."
+    },
+
+    {
+      "id": "A1",
+      "query": "Maybe edit that file or something",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "source": "new",
+      "category": "ambiguous",
+      "notes": "Too vague to determine which file or action."
+    },
+    {
+      "id": "A2",
+      "query": "I wonder about the architecture",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "ambiguous",
+      "notes": "Musing, not a request. Should respond conversationally."
+    },
+    {
+      "id": "A3",
+      "query": "Can you do something with the database?",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "source": "new",
+      "category": "ambiguous",
+      "notes": "Vague request needs clarification."
+    },
+    {
+      "id": "A4",
+      "query": "That thing we talked about earlier",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "source": "new",
+      "category": "ambiguous",
+      "notes": "Reference to unknown prior context."
+    },
+    {
+      "id": "A5",
+      "query": "Fix it",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "source": "new",
+      "category": "ambiguous",
+      "notes": "No context about what to fix."
+    },
+
+    {
+      "id": "N1",
+      "query": "Lire le fichier main.rs",
+      "expected_action": "tool",
+      "expected_target": "read_file",
+      "source": "new",
+      "category": "non_english",
+      "notes": "French: 'Read the file main.rs'"
+    },
+    {
+      "id": "N2",
+      "query": "Busca en la web sobre machine learning",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "source": "new",
+      "category": "non_english",
+      "notes": "Spanish: 'Search the web about machine learning'"
+    },
+    {
+      "id": "N3",
+      "query": "Erklaere mir wie Hashing funktioniert",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "non_english",
+      "notes": "German: 'Explain to me how hashing works'"
+    },
+    {
+      "id": "N4",
+      "query": "Esegui i test del progetto",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "source": "new",
+      "category": "non_english",
+      "notes": "Italian: 'Run the project tests'"
+    },
+    {
+      "id": "N5",
+      "query": "Tee uusi tiedosto nimeltä muistiinpanot.txt",
+      "expected_action": "tool",
+      "expected_target": "write_file",
+      "source": "new",
+      "category": "non_english",
+      "notes": "Finnish: 'Create a new file called notes.txt'"
+    },
+
+    {
+      "id": "R1",
+      "query": "That makes sense, thanks for explaining",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "continuation",
+      "notes": "Acknowledgment, no action needed."
+    },
+    {
+      "id": "R2",
+      "query": "Interesting, tell me more about that approach",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "continuation",
+      "notes": "Follow-up question, respond with more detail."
+    },
+    {
+      "id": "R3",
+      "query": "Yes that's exactly what I meant",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "continuation",
+      "notes": "Confirmation, continue conversation."
+    },
+    {
+      "id": "R4",
+      "query": "What do you think is the best approach?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "continuation",
+      "notes": "Asking for opinion, not requesting any action."
+    },
+    {
+      "id": "R5",
+      "query": "OK cool, I'll keep that in mind",
+      "expected_action": "respond",
+      "expected_target": null,
+      "source": "new",
+      "category": "continuation",
+      "notes": "Casual acknowledgment."
+    }
+  ]
+}

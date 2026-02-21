@@ -1,0 +1,532 @@
+{
+  "experiment": "L1",
+  "description": "Concept-level router accuracy vs LLM router",
+  "timestamp": "2026-02-21T11:19:42",
+  "summary": {
+    "total": 30,
+    "correct_action": 24,
+    "correct_both": 22,
+    "mean_latency_ms": 5.069636765013759,
+    "median_latency_ms": 4.482370495679788,
+    "p95_latency_ms": 8.446662195638055,
+    "tokens_consumed": 0
+  },
+  "baseline": {
+    "model": "nvidia_orchestrator-8b",
+    "accuracy": "10/10",
+    "avg_latency_ms": 571,
+    "tokens_per_call": 578
+  },
+  "results": [
+    {
+      "query": "Hello, how are you today?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.39,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.09,
+      "top_k": [
+        "respond (0.179)",
+        "ask_user (0.140)",
+        "tool (0.113)",
+        "specialist (0.027)"
+      ]
+    },
+    {
+      "query": "Read the file src/main.rs",
+      "expected_action": "tool",
+      "expected_target": "read_file",
+      "predicted_action": "tool",
+      "predicted_target": "read_file",
+      "confidence": 0.7682,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 3.8,
+      "top_k": [
+        "tool (0.603)",
+        "ask_user (0.107)",
+        "respond (0.075)",
+        "specialist (-0.013)"
+      ]
+    },
+    {
+      "query": "Run cargo test",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "predicted_action": "tool",
+      "predicted_target": "exec",
+      "confidence": 0.4277,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.5,
+      "top_k": [
+        "tool (0.317)",
+        "ask_user (0.161)",
+        "specialist (0.161)",
+        "respond (0.102)"
+      ]
+    },
+    {
+      "query": "Write comprehensive analysis of Rust ownership",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "predicted_action": "specialist",
+      "predicted_target": null,
+      "confidence": 0.3435,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 5.81,
+      "top_k": [
+        "specialist (0.350)",
+        "tool (0.308)",
+        "respond (0.182)",
+        "ask_user (0.180)"
+      ]
+    },
+    {
+      "query": "What is 2+2?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.5783,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.28,
+      "top_k": [
+        "respond (0.375)",
+        "ask_user (0.200)",
+        "tool (0.040)",
+        "specialist (0.033)"
+      ]
+    },
+    {
+      "query": "Search web for latest Rust release",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "predicted_action": "tool",
+      "predicted_target": "web_search",
+      "confidence": 0.5224,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 3.68,
+      "top_k": [
+        "tool (0.437)",
+        "respond (0.153)",
+        "specialist (0.143)",
+        "ask_user (0.104)"
+      ]
+    },
+    {
+      "query": "Refactor auth to JWT",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "predicted_action": "specialist",
+      "predicted_target": null,
+      "confidence": 1.0,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.28,
+      "top_k": [
+        "specialist (0.237)",
+        "ask_user (-0.016)",
+        "tool (-0.037)",
+        "respond (-0.040)"
+      ]
+    },
+    {
+      "query": "Tell me a joke",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.4414,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.24,
+      "top_k": [
+        "respond (0.367)",
+        "ask_user (0.233)",
+        "tool (0.132)",
+        "specialist (0.100)"
+      ]
+    },
+    {
+      "query": "Create notes.txt with shopping list",
+      "expected_action": "tool",
+      "expected_target": "write_file",
+      "predicted_action": "tool",
+      "predicted_target": "write_file",
+      "confidence": 0.576,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.15,
+      "top_k": [
+        "tool (0.269)",
+        "ask_user (0.125)",
+        "specialist (0.057)",
+        "respond (0.015)"
+      ]
+    },
+    {
+      "query": "hmm I'm not sure what to do",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "predicted_action": "ask_user",
+      "predicted_target": null,
+      "confidence": 0.4448,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.17,
+      "top_k": [
+        "ask_user (0.364)",
+        "respond (0.279)",
+        "tool (0.153)",
+        "specialist (0.022)"
+      ]
+    },
+    {
+      "query": "Research Rust async runtimes and write a comparison document",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "predicted_action": "specialist",
+      "predicted_target": null,
+      "confidence": 0.3921,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.79,
+      "top_k": [
+        "specialist (0.461)",
+        "tool (0.298)",
+        "respond (0.214)",
+        "ask_user (0.204)"
+      ]
+    },
+    {
+      "query": "Fetch these two URLs and compare their content",
+      "expected_action": "tool",
+      "expected_target": "web_browse",
+      "predicted_action": "tool",
+      "predicted_target": "web_browse",
+      "confidence": 0.3703,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 8.36,
+      "top_k": [
+        "tool (0.178)",
+        "specialist (0.131)",
+        "ask_user (0.123)",
+        "respond (0.049)"
+      ]
+    },
+    {
+      "query": "Read all Python files in src/ and find security vulnerabilities",
+      "expected_action": "specialist",
+      "expected_target": null,
+      "predicted_action": "tool",
+      "predicted_target": "list_files",
+      "confidence": 0.6802,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 4.64,
+      "top_k": [
+        "tool (0.378)",
+        "specialist (0.167)",
+        "ask_user (0.011)",
+        "respond (-0.119)"
+      ]
+    },
+    {
+      "query": "Search for the latest version of tokio, then update Cargo.toml",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "predicted_action": "tool",
+      "predicted_target": "web_browse",
+      "confidence": 0.7111,
+      "correct_action": true,
+      "correct_target": false,
+      "latency_ms": 4.66,
+      "top_k": [
+        "tool (0.321)",
+        "respond (0.081)",
+        "ask_user (0.050)",
+        "specialist (-0.007)"
+      ]
+    },
+    {
+      "query": "Check the server logs, find errors, and write a summary report",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "predicted_action": "tool",
+      "predicted_target": "web_browse",
+      "confidence": 0.3994,
+      "correct_action": true,
+      "correct_target": false,
+      "latency_ms": 11.01,
+      "top_k": [
+        "tool (0.357)",
+        "specialist (0.301)",
+        "ask_user (0.173)",
+        "respond (0.062)"
+      ]
+    },
+    {
+      "query": "Maybe edit that file or something",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "predicted_action": "tool",
+      "predicted_target": "read_file",
+      "confidence": 0.5936,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 4.86,
+      "top_k": [
+        "tool (0.442)",
+        "respond (0.160)",
+        "ask_user (0.143)",
+        "specialist (-0.043)"
+      ]
+    },
+    {
+      "query": "I wonder about the architecture",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.3179,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.46,
+      "top_k": [
+        "respond (0.339)",
+        "specialist (0.270)",
+        "ask_user (0.244)",
+        "tool (0.214)"
+      ]
+    },
+    {
+      "query": "Can you do something with the database?",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "predicted_action": "specialist",
+      "predicted_target": null,
+      "confidence": 0.2969,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 4.15,
+      "top_k": [
+        "specialist (0.302)",
+        "ask_user (0.252)",
+        "tool (0.237)",
+        "respond (0.226)"
+      ]
+    },
+    {
+      "query": "That thing we talked about earlier",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.4933,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 4.65,
+      "top_k": [
+        "respond (0.351)",
+        "ask_user (0.143)",
+        "specialist (0.111)",
+        "tool (0.107)"
+      ]
+    },
+    {
+      "query": "Fix it",
+      "expected_action": "ask_user",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.3797,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 3.88,
+      "top_k": [
+        "respond (0.280)",
+        "ask_user (0.250)",
+        "tool (0.208)",
+        "specialist (0.000)"
+      ]
+    },
+    {
+      "query": "Lire le fichier main.rs",
+      "expected_action": "tool",
+      "expected_target": "read_file",
+      "predicted_action": "tool",
+      "predicted_target": "read_file",
+      "confidence": 0.5407,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.18,
+      "top_k": [
+        "tool (0.192)",
+        "ask_user (0.070)",
+        "specialist (0.060)",
+        "respond (0.033)"
+      ]
+    },
+    {
+      "query": "Busca en la web sobre machine learning",
+      "expected_action": "tool",
+      "expected_target": "web_search",
+      "predicted_action": "tool",
+      "predicted_target": "web_search",
+      "confidence": 0.3081,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 7.18,
+      "top_k": [
+        "tool (0.231)",
+        "specialist (0.208)",
+        "ask_user (0.184)",
+        "respond (0.127)"
+      ]
+    },
+    {
+      "query": "Erklaere mir wie Hashing funktioniert",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.2952,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 8.52,
+      "top_k": [
+        "respond (0.134)",
+        "tool (0.134)",
+        "specialist (0.104)",
+        "ask_user (0.082)"
+      ]
+    },
+    {
+      "query": "Esegui i test del progetto",
+      "expected_action": "tool",
+      "expected_target": "exec",
+      "predicted_action": "tool",
+      "predicted_target": "exec",
+      "confidence": 0.3424,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 5.66,
+      "top_k": [
+        "tool (0.238)",
+        "ask_user (0.213)",
+        "respond (0.132)",
+        "specialist (0.112)"
+      ]
+    },
+    {
+      "query": "Tee uusi tiedosto nimelt\u00e4 muistiinpanot.txt",
+      "expected_action": "tool",
+      "expected_target": "write_file",
+      "predicted_action": "tool",
+      "predicted_target": "write_file",
+      "confidence": 0.442,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.88,
+      "top_k": [
+        "tool (0.306)",
+        "ask_user (0.195)",
+        "respond (0.102)",
+        "specialist (0.089)"
+      ]
+    },
+    {
+      "query": "That makes sense, thanks for explaining",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.7576,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.76,
+      "top_k": [
+        "respond (0.524)",
+        "ask_user (0.161)",
+        "tool (0.007)",
+        "specialist (-0.090)"
+      ]
+    },
+    {
+      "query": "Interesting, tell me more about that approach",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.3755,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 7.13,
+      "top_k": [
+        "respond (0.453)",
+        "ask_user (0.397)",
+        "specialist (0.276)",
+        "tool (0.079)"
+      ]
+    },
+    {
+      "query": "Yes that's exactly what I meant",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.5319,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 4.14,
+      "top_k": [
+        "respond (0.415)",
+        "ask_user (0.194)",
+        "tool (0.102)",
+        "specialist (0.069)"
+      ]
+    },
+    {
+      "query": "What do you think is the best approach?",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "ask_user",
+      "predicted_target": null,
+      "confidence": 0.5818,
+      "correct_action": false,
+      "correct_target": true,
+      "latency_ms": 3.6,
+      "top_k": [
+        "ask_user (0.449)",
+        "specialist (0.230)",
+        "respond (0.090)",
+        "tool (0.003)"
+      ]
+    },
+    {
+      "query": "OK cool, I'll keep that in mind",
+      "expected_action": "respond",
+      "expected_target": null,
+      "predicted_action": "respond",
+      "predicted_target": null,
+      "confidence": 0.4741,
+      "correct_action": true,
+      "correct_target": true,
+      "latency_ms": 3.57,
+      "top_k": [
+        "respond (0.446)",
+        "ask_user (0.301)",
+        "specialist (0.123)",
+        "tool (0.071)"
+      ]
+    }
+  ]
+}

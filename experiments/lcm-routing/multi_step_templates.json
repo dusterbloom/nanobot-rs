@@ -1,0 +1,110 @@
+{
+  "_comment": "L2: Multi-step concept decomposition templates. Each template maps a query pattern to a sequence of RouterDecisions.",
+  "templates": [
+    {
+      "id": "research_and_summarize",
+      "description": "Search for information then synthesize into a document",
+      "trigger_queries": [
+        "Research X and write a summary",
+        "Find information about X and create a report",
+        "Look up X and summarize your findings",
+        "Search for X and write a comprehensive analysis"
+      ],
+      "steps": [
+        {"action": "tool", "target": "web_search", "description": "Search for the topic"},
+        {"action": "tool", "target": "web_browse", "description": "Read top results in detail"},
+        {"action": "specialist", "target": null, "description": "Synthesize findings into document"}
+      ]
+    },
+    {
+      "id": "read_and_analyze",
+      "description": "Read files then perform analysis",
+      "trigger_queries": [
+        "Read the codebase and find bugs",
+        "Check all files in src/ for security issues",
+        "Analyze the code quality of this project",
+        "Read the source files and suggest improvements"
+      ],
+      "steps": [
+        {"action": "tool", "target": "list_files", "description": "List relevant files"},
+        {"action": "tool", "target": "read_file", "description": "Read each file"},
+        {"action": "specialist", "target": null, "description": "Analyze and report findings"}
+      ]
+    },
+    {
+      "id": "fetch_and_compare",
+      "description": "Fetch multiple sources and compare them",
+      "trigger_queries": [
+        "Fetch these URLs and compare their content",
+        "Read these two files and find the differences",
+        "Compare the documentation from these two sources",
+        "Get data from these sources and make a comparison table"
+      ],
+      "steps": [
+        {"action": "tool", "target": "web_browse", "description": "Fetch first source"},
+        {"action": "tool", "target": "web_browse", "description": "Fetch second source"},
+        {"action": "specialist", "target": null, "description": "Compare and report differences"}
+      ]
+    },
+    {
+      "id": "search_and_update",
+      "description": "Search for information then update a file",
+      "trigger_queries": [
+        "Find the latest version of X and update the config",
+        "Search for the correct API endpoint and update the code",
+        "Look up the new syntax and update the file",
+        "Check the docs and fix the configuration"
+      ],
+      "steps": [
+        {"action": "tool", "target": "web_search", "description": "Search for latest information"},
+        {"action": "tool", "target": "read_file", "description": "Read current file"},
+        {"action": "tool", "target": "write_file", "description": "Update file with new information"}
+      ]
+    },
+    {
+      "id": "check_and_report",
+      "description": "Run a command, analyze output, write report",
+      "trigger_queries": [
+        "Check the server logs and write a summary",
+        "Run the tests and report which ones fail",
+        "Check disk usage and flag anything unusual",
+        "Run the benchmark and analyze the results"
+      ],
+      "steps": [
+        {"action": "tool", "target": "exec", "description": "Run command to gather data"},
+        {"action": "specialist", "target": null, "description": "Analyze output and write report"}
+      ]
+    },
+    {
+      "id": "plan_and_implement",
+      "description": "Read existing code, plan changes, implement",
+      "trigger_queries": [
+        "Refactor the auth module to use JWT",
+        "Add error handling to all API endpoints",
+        "Implement caching for the database queries",
+        "Redesign the data model for better performance"
+      ],
+      "steps": [
+        {"action": "tool", "target": "list_files", "description": "Survey the codebase"},
+        {"action": "tool", "target": "read_file", "description": "Read relevant files"},
+        {"action": "specialist", "target": null, "description": "Plan and implement changes"}
+      ]
+    },
+    {
+      "id": "verify_and_fix",
+      "description": "Run tests/checks, identify failures, fix them",
+      "trigger_queries": [
+        "Run the tests and fix any failures",
+        "Check for lint errors and fix them",
+        "Verify the build passes and fix any issues",
+        "Run the type checker and resolve all errors"
+      ],
+      "steps": [
+        {"action": "tool", "target": "exec", "description": "Run verification command"},
+        {"action": "tool", "target": "read_file", "description": "Read failing files"},
+        {"action": "tool", "target": "write_file", "description": "Fix identified issues"},
+        {"action": "tool", "target": "exec", "description": "Re-run verification to confirm"}
+      ]
+    }
+  ]
+}
