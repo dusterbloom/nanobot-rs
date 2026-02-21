@@ -1063,6 +1063,9 @@ impl AgentLoopShared {
 
         let thinking_budget = {
             let stored = counters.thinking_budget.load(Ordering::Relaxed);
+            // Reasoning params are user-controlled via /think — any model can receive them.
+            // The provider layer omits params entirely when budget is None, so non-thinking
+            // models get a clean request with no unknown fields.
             if stored > 0 {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.

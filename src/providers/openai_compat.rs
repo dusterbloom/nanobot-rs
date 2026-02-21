@@ -182,34 +182,52 @@ fn is_private_ip(url: &str) -> bool {
     false
 }
 
+/// Check if a model name indicates thinking/reasoning capability.
+///
+/// Delegates to the centralized `model_capabilities` registry so the logic
+/// stays in one place.
+fn model_supports_thinking(model: &str) -> bool {
+    crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new()).thinking
+}
+
 /// Apply local reasoning controls when talking to localhost.
 ///
 /// - `chat_template_kwargs.enable_thinking` toggles model reasoning mode for
 ///   templates that support it (Qwen3, etc.).
 /// - `reasoning_budget` enforces a token budget for reasoning traces.
 /// - `reasoning_format` tells the local server how to split visible vs reasoning text.
+///
+/// Reasoning params are USER-CONTROLLED via `/think`, not model-gated.
+/// When `thinking_budget` is None, ALL reasoning params are omitted entirely —
+/// non-reasoning models reject unknown fields like `reasoning_budget`.
+/// When `thinking_budget` is Some, params are sent regardless of model capability,
+/// because the user explicitly opted in via `/think`.
 fn apply_local_reasoning_controls(
     body: &mut serde_json::Value,
     api_base: &str,
     thinking_budget: Option<u32>,
+    supports_thinking: bool,
 ) {
     if !is_local_api_base(api_base) {
         return;
     }
 
-    let enable_thinking = thinking_budget.is_some();
-    body["chat_template_kwargs"] = serde_json::json!({
-        "enable_thinking": enable_thinking
-    });
-
-    match thinking_budget {
-        Some(budget) => {
+    match (thinking_budget, supports_thinking) {
+        (Some(budget), _) => {
+            body["chat_template_kwargs"] = serde_json::json!({
+                "enable_thinking": true
+            });
             body["reasoning_budget"] = serde_json::json!(budget);
             body["reasoning_format"] = serde_json::json!("deepseek");
         }
-        None => {
+        (None, true) => {
+            // Thinking-capable model but user hasn't enabled thinking:
+            // explicitly disable so model doesn't reason by default.
             body["reasoning_budget"] = serde_json::json!(0);
             body["reasoning_format"] = serde_json::json!("none");
+        }
+        (None, false) => {
+            // Non-thinking model: send nothing, clean request.
         }
     }
 }
@@ -362,12 +380,20 @@ async fn try_native_lms_chat(
 ///
 /// Skipped when thinking is explicitly enabled (`/think` / `/t`) so the
 /// user can toggle reasoning on demand.
+///
+/// When `supports_thinking` is false the function returns immediately.
+/// Prefilling a `<think>` block into a model that has no thinking template
+/// would inject garbage into the prompt.
 fn apply_local_thinking_prefill(
     body: &mut serde_json::Value,
     api_base: &str,
     thinking_budget: Option<u32>,
+    supports_thinking: bool,
 ) {
     if !is_local_api_base(api_base) || thinking_budget.is_some() {
+        return;
+    }
+    if !supports_thinking {
         return;
     }
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -569,7 +595,8 @@ impl LLMProvider for OpenAICompatProvider {
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
         }
-        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
+        let supports_thinking = model_supports_thinking(model);
+        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget, supports_thinking);
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -582,7 +609,7 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
-        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget);
+        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget, supports_thinking);
 
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
@@ -793,7 +820,8 @@ impl LLMProvider for OpenAICompatProvider {
         if let Some(tp) = top_p {
             body["top_p"] = serde_json::json!(tp);
         }
-        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget);
+        let supports_thinking = model_supports_thinking(model);
+        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget, supports_thinking);
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -806,7 +834,7 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
-        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget);
+        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget, supports_thinking);
 
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
@@ -1835,14 +1863,14 @@ mod tests {
 
     #[test]
     fn test_apply_local_reasoning_controls_local_and_remote() {
-        let mut local_body = serde_json::json!({"model": "local-model"});
-        apply_local_reasoning_controls(&mut local_body, "http://localhost:18080/v1", Some(4096));
+        let mut local_body = serde_json::json!({"model": "qwen3-1.7b"});
+        apply_local_reasoning_controls(&mut local_body, "http://localhost:18080/v1", Some(4096), true);
         assert_eq!(local_body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(local_body["reasoning_budget"], 4096);
         assert_eq!(local_body["reasoning_format"], "deepseek");
 
         let mut remote_body = serde_json::json!({"model": "gpt-4o"});
-        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", Some(4096));
+        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", Some(4096), true);
         assert!(remote_body.get("chat_template_kwargs").is_none());
         assert!(remote_body.get("reasoning_budget").is_none());
         assert!(remote_body.get("reasoning_format").is_none());
@@ -1851,12 +1879,12 @@ mod tests {
     #[test]
     fn test_thinking_prefill_added_for_local_no_tools() {
         let mut body = serde_json::json!({
-            "model": "nanbeige4.1-3b",
+            "model": "qwen3-1.7b",
             "messages": [
                 {"role": "user", "content": "Hello"}
             ]
         });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None);
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None, true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1866,13 +1894,13 @@ mod tests {
     #[test]
     fn test_thinking_prefill_added_when_tools_present() {
         let mut body = serde_json::json!({
-            "model": "ministral-3-3b",
+            "model": "qwen3-1.7b",
             "messages": [
                 {"role": "user", "content": "Hello"}
             ],
             "tools": [{"type": "function", "function": {"name": "test"}}]
         });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None);
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None, true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2, "pre-closed think prefill works with tools too");
         assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
@@ -1881,12 +1909,12 @@ mod tests {
     #[test]
     fn test_thinking_prefill_skipped_when_thinking_enabled() {
         let mut body = serde_json::json!({
-            "model": "nanbeige4.1-3b",
+            "model": "qwen3-1.7b",
             "messages": [
                 {"role": "user", "content": "Hello"}
             ]
         });
-        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", Some(4096));
+        apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", Some(4096), true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1, "prefill should NOT be added when thinking is enabled");
     }
@@ -1899,9 +1927,61 @@ mod tests {
                 {"role": "user", "content": "Hello"}
             ]
         });
-        apply_local_thinking_prefill(&mut body, "https://api.openai.com/v1", None);
+        apply_local_thinking_prefill(&mut body, "https://api.openai.com/v1", None, true);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1, "prefill should NOT be added for remote APIs");
+    }
+
+    // --- supports_thinking guard tests ---
+
+    #[test]
+    fn test_reasoning_params_not_sent_for_non_thinking_model() {
+        let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": []});
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, false);
+        assert!(body.get("reasoning_budget").is_none());
+        assert!(body.get("reasoning_format").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_params_sent_for_thinking_model() {
+        let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", Some(1024), true);
+        assert_eq!(body["reasoning_budget"], 1024);
+        assert_eq!(body["reasoning_format"], "deepseek");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn test_reasoning_disabled_for_thinking_model() {
+        let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
+        apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, true);
+        assert_eq!(body["reasoning_budget"], 0);
+        assert_eq!(body["reasoning_format"], "none");
+    }
+
+    #[test]
+    fn test_prefill_not_added_for_non_thinking_model() {
+        let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": [{"role": "user", "content": "hi"}]});
+        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "prefill must not be added for non-thinking models");
+    }
+
+    #[test]
+    fn test_prefill_added_for_thinking_model() {
+        let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": [{"role": "user", "content": "hi"}]});
+        apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, true);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "prefill must be added for thinking models");
+        assert_eq!(messages[1]["content"], "<think>\n</think>\n\n");
+    }
+
+    #[test]
+    fn test_model_supports_thinking_helper() {
+        assert!(model_supports_thinking("qwen3-1.7b-q4_k_m"));
+        assert!(!model_supports_thinking("nanbeige-2-8b"));
+        assert!(!model_supports_thinking("ministral-3b-instruct"));
     }
 
     #[test]
