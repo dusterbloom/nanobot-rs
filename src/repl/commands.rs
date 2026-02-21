@@ -52,6 +52,8 @@ pub(crate) struct ReplContext {
     pub restart_tx: mpsc::UnboundedSender<crate::server::RestartRequest>,
     /// Receiver for auto-restart requests from the health watchdog.
     pub restart_rx: mpsc::UnboundedReceiver<crate::server::RestartRequest>,
+    /// Health probe registry for endpoint liveness (shown in /status).
+    pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     #[cfg(feature = "voice")]
     pub voice_session: Option<crate::voice::VoiceSession>,
 }
@@ -71,6 +73,7 @@ impl ReplContext {
             Some(self.cron_service.clone()),
             self.email_config.clone(),
             Some(self.display_tx.clone()),
+            self.health_registry.clone(),
         );
     }
 
@@ -550,6 +553,41 @@ impl ReplContext {
                     tui::BOLD,
                     tui::RESET,
                     servers.join("  ")
+                );
+            }
+        }
+
+        // Health probes
+        if let Some(ref registry) = self.health_registry {
+            let states = registry.all_states();
+            if !states.is_empty() {
+                let probe_labels: Vec<String> = states.iter().map(|s| {
+                    use crate::heartbeat::health::ProbeStatus;
+                    let (indicator, label) = match s.status {
+                        ProbeStatus::Healthy => {
+                            let ms = s.last_result.as_ref()
+                                .map(|r| format!(" ({}ms)", r.latency_ms))
+                                .unwrap_or_default();
+                            (format!("{}{}●{}", tui::GREEN, tui::BOLD, tui::RESET), format!("{}{}", s.name, ms))
+                        }
+                        ProbeStatus::Degraded => {
+                            let ago = s.last_healthy.map(|t| {
+                                let secs = t.elapsed().as_secs();
+                                if secs < 60 { format!(" ({}s ago)", secs) }
+                                else { format!(" ({}m ago)", secs / 60) }
+                            }).unwrap_or_default();
+                            (format!("{}{}●{}", tui::RED, tui::BOLD, tui::RESET), format!("{}: DOWN{}", s.name, ago))
+                        }
+                        ProbeStatus::Unknown => {
+                            (format!("{}{}●{}", tui::YELLOW, tui::BOLD, tui::RESET), format!("{}: pending", s.name))
+                        }
+                    };
+                    format!("{} {}", indicator, label)
+                }).collect();
+                println!(
+                    "  {}HEALTH{}    {}",
+                    tui::BOLD, tui::RESET,
+                    probe_labels.join("  ")
                 );
             }
         }
@@ -1188,6 +1226,7 @@ impl ReplContext {
             Some(self.cron_service.clone()),
             self.email_config.clone(),
             Some(self.display_tx.clone()),
+            self.health_registry.clone(),
         );
         if !was_enabled {
             println!(

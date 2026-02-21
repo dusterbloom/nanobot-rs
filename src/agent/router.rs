@@ -3,6 +3,7 @@
 //! Extracted from `agent_loop.rs` to isolate routing logic into a focused module.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -472,6 +473,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
     }
 
     info!("router_preflight_firing");
+    ctx.counters.trio_metrics.router_preflight_fired.store(true, Ordering::Relaxed);
     ctx.flow.router_preflight_done = true;
     let (router_provider, router_model) =
         match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {
@@ -531,6 +533,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
         target = %decision.target,
         "router_decision"
     );
+    *ctx.counters.trio_metrics.router_action.lock().unwrap() = Some(decision.action.clone());
 
     match decision.action.as_str() {
         "ask_user" => PreflightResult::Break(
@@ -553,6 +556,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
             .await
             {
                 Ok(text) => {
+                    ctx.counters.trio_metrics.specialist_dispatched.store(true, Ordering::Relaxed);
                     ctx.messages
                         .push(json!({"role":"user","content": text}));
                     PreflightResult::Continue
@@ -607,6 +611,7 @@ pub(crate) async fn router_preflight(ctx: &mut TurnContext) -> PreflightResult {
                 "role":"user",
                 "content": format!("[router:tool:{}] {}", decision.target, tr.data),
             }));
+            *ctx.counters.trio_metrics.tool_dispatched.lock().unwrap() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target);
             PreflightResult::Continue
         }

@@ -97,6 +97,8 @@ pub struct HeartbeatService {
     running: Arc<AtomicBool>,
     /// Handle to the spawned background task.
     task_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Optional health probe registry, driven on each heartbeat tick.
+    health_registry: Option<Arc<super::health::HealthRegistry>>,
 }
 
 impl HeartbeatService {
@@ -107,6 +109,7 @@ impl HeartbeatService {
         maintenance_commands: Vec<String>,
         interval_s: u64,
         enabled: bool,
+        health_registry: Option<Arc<super::health::HealthRegistry>>,
     ) -> Self {
         Self {
             workspace,
@@ -116,7 +119,13 @@ impl HeartbeatService {
             enabled,
             running: Arc::new(AtomicBool::new(false)),
             task_handle: tokio::sync::Mutex::new(None),
+            health_registry,
         }
+    }
+
+    /// Access the health probe registry.
+    pub fn registry(&self) -> Option<&Arc<super::health::HealthRegistry>> {
+        self.health_registry.as_ref()
     }
 
     /// Path to `HEARTBEAT.md` inside the workspace.
@@ -157,6 +166,7 @@ impl HeartbeatService {
         let workspace = self.workspace.clone();
         let on_heartbeat = self.on_heartbeat.clone();
         let maintenance_commands = self.maintenance_commands.clone();
+        let health_registry = self.health_registry.clone();
 
         let handle = tokio::spawn(async move {
             Self::run_loop(
@@ -165,6 +175,7 @@ impl HeartbeatService {
                 workspace,
                 on_heartbeat,
                 maintenance_commands,
+                health_registry,
             )
             .await;
         });
@@ -203,12 +214,20 @@ impl HeartbeatService {
         workspace: PathBuf,
         on_heartbeat: Option<HeartbeatCallback>,
         maintenance_commands: Vec<String>,
+        health_registry: Option<Arc<super::health::HealthRegistry>>,
     ) {
         loop {
             tokio::time::sleep(Duration::from_secs(interval_s)).await;
 
             if !running.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // ---------------------------------------------------------------
+            // Layer 0: Health probes (lightweight, no LLM)
+            // ---------------------------------------------------------------
+            if let Some(ref registry) = health_registry {
+                registry.run_due_probes().await;
             }
 
             // ---------------------------------------------------------------

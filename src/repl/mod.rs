@@ -1068,12 +1068,15 @@ pub(crate) fn cmd_agent(
         // Channel for subagents/background gateways to send display lines to the REPL.
         let (display_tx, display_rx) = mpsc::unbounded_channel::<String>();
 
+        let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
+
         let agent_loop = cli::create_agent_loop(
             core_handle.clone(),
             &config,
             Some(cron_service.clone()),
             email_config.clone(),
             Some(display_tx.clone()),
+            Some(health_registry.clone()),
         );
 
         if let Some(msg) = message {
@@ -1144,6 +1147,7 @@ pub(crate) fn cmd_agent(
                 watchdog_handle: None,
                 restart_tx: restart_tx.clone(),
                 restart_rx,
+                health_registry: Some(health_registry),
                 #[cfg(feature = "voice")]
                 voice_session: None,
             };
@@ -1215,6 +1219,7 @@ pub(crate) fn cmd_agent(
                 maintenance_cmds,
                 DEFAULT_HEARTBEAT_INTERVAL_S,
                 true,
+                ctx.health_registry.clone(),
             );
             heartbeat.start().await;
 

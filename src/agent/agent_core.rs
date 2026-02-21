@@ -5,7 +5,7 @@
 //! compaction utilities.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -70,6 +70,35 @@ pub struct SwappableCore {
     pub max_history_turns: usize,
 }
 
+/// Observability counters for trio routing, populated by router.rs.
+pub struct TrioMetrics {
+    pub router_preflight_fired: AtomicBool,
+    pub router_action: std::sync::Mutex<Option<String>>,
+    pub specialist_dispatched: AtomicBool,
+    pub tool_dispatched: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for TrioMetrics {
+    fn default() -> Self {
+        Self {
+            router_preflight_fired: AtomicBool::new(false),
+            router_action: std::sync::Mutex::new(None),
+            specialist_dispatched: AtomicBool::new(false),
+            tool_dispatched: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl TrioMetrics {
+    /// Reset all metrics for a new turn/test.
+    pub fn reset(&self) {
+        self.router_preflight_fired.store(false, Ordering::Relaxed);
+        *self.router_action.lock().unwrap() = None;
+        self.specialist_dispatched.store(false, Ordering::Relaxed);
+        *self.tool_dispatched.lock().unwrap() = None;
+    }
+}
+
 /// Atomic counters that survive core swaps — never behind `RwLock`.
 ///
 /// These counters persist across `/local` and `/model` hot-swaps because
@@ -111,6 +140,8 @@ pub struct RuntimeCounters {
     /// Wrapped in Arc so the watchdog can hold a cheap clone without needing
     /// the full RuntimeCounters.
     pub inference_active: Arc<AtomicBool>,
+    /// Trio routing observability.
+    pub trio_metrics: TrioMetrics,
 }
 
 impl RuntimeCounters {
@@ -131,6 +162,7 @@ impl RuntimeCounters {
             last_estimated_prompt_tokens: AtomicU64::new(0),
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
+            trio_metrics: TrioMetrics::default(),
         }
     }
 }

@@ -687,6 +687,7 @@ pub(crate) fn create_agent_loop(
     cron_service: Option<Arc<CronService>>,
     email_config: Option<crate::config::schema::EmailConfig>,
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 ) -> AgentLoop {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
@@ -703,6 +704,7 @@ pub(crate) fn create_agent_loop(
         Some(config.providers.clone()),
         config.proprioception.clone(),
         config.lcm.clone(),
+        health_registry,
     )
 }
 
@@ -751,6 +753,8 @@ pub(crate) async fn run_gateway_async(
     let cron_status = cron_service.status();
     let cron_arc = Arc::new(cron_service);
 
+    let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
+
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -763,6 +767,7 @@ pub(crate) async fn run_gateway_async(
         Some(config.providers.clone()),
         config.proprioception.clone(),
         config.lcm.clone(),
+        Some(health_registry.clone()),
     );
 
     // Initialize voice pipeline for channels (when voice feature is enabled).
@@ -830,6 +835,7 @@ pub(crate) async fn run_gateway_async(
         maintenance_cmds,
         DEFAULT_HEARTBEAT_INTERVAL_S,
         true,
+        Some(health_registry.clone()),
     );
     heartbeat.start().await;
 

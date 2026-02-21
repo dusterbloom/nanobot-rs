@@ -83,6 +83,8 @@ pub(crate) struct AgentLoopShared {
     pub(crate) lcm_config: LcmSchemaConfig,
     /// Dedicated LCM compactor (when `lcm.compaction_endpoint` is configured).
     pub(crate) lcm_compactor: Option<Arc<ContextCompactor>>,
+    /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
+    pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -125,6 +127,9 @@ pub(crate) struct TurnContext {
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
+
+    // --- Observability ---
+    pub(crate) counters: Arc<RuntimeCounters>,
 
     // --- Flow control ---
     pub(crate) flow: FlowControl,
@@ -476,6 +481,7 @@ impl AgentLoopShared {
                 in_flight: compaction_in_flight,
             },
             content_gate,
+            counters: self.core_handle.counters.clone(),
             flow: FlowControl {
                 force_response: false,
                 router_preflight_done: false,
@@ -772,7 +778,14 @@ impl AgentLoopShared {
             }
 
             // Check thresholds and spawn compaction if needed.
-            if !ctx.compaction.in_flight.load(Ordering::Relaxed) {
+            // Pre-flight: skip LCM compaction if endpoint is degraded.
+            let lcm_healthy = self.health_registry
+                .as_ref()
+                .map_or(true, |reg| reg.is_healthy("lcm_compaction"));
+            if !lcm_healthy {
+                debug!("LCM compaction skipped: endpoint degraded");
+            }
+            if lcm_healthy && !ctx.compaction.in_flight.load(Ordering::Relaxed) {
                 let action = {
                     let engine = lcm_engine.lock().await;
                     engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens)
@@ -797,40 +810,49 @@ impl AgentLoopShared {
                         }
 
                         tokio::spawn(async move {
-                            // Use dedicated LCM compactor if configured,
-                            // otherwise fall back to the core memory compactor.
-                            let compactor: &ContextCompactor = bg_lcm_compactor
-                                .as_deref()
-                                .unwrap_or(&bg_core.compactor);
-                            let observation = {
-                                let mut engine = bg_lcm.lock().await;
-                                engine
-                                    .compact(compactor, &bg_core.token_budget, 0)
-                                    .await
-                            };
+                            let timeout_result = tokio::time::timeout(
+                                Duration::from_secs(30),
+                                async {
+                                    // Use dedicated LCM compactor if configured,
+                                    // otherwise fall back to the core memory compactor.
+                                    let compactor: &ContextCompactor = bg_lcm_compactor
+                                        .as_deref()
+                                        .unwrap_or(&bg_core.compactor);
+                                    let observation = {
+                                        let mut engine = bg_lcm.lock().await;
+                                        engine
+                                            .compact(compactor, &bg_core.token_budget, 0)
+                                            .await
+                                    };
 
-                            // Update working memory with compaction observation.
-                            if bg_core.memory_enabled {
-                                if let Some(ref summary) = observation {
-                                    bg_core
-                                        .working_memory
-                                        .update_from_compaction(&bg_session_key, summary);
-                                }
-                            }
+                                    // Update working memory with compaction observation.
+                                    if bg_core.memory_enabled {
+                                        if let Some(ref summary) = observation {
+                                            bg_core
+                                                .working_memory
+                                                .update_from_compaction(&bg_session_key, summary);
+                                        }
+                                    }
 
-                            // Build CompactionResult from LCM's active context.
-                            let compacted_messages = {
-                                let engine = bg_lcm.lock().await;
-                                engine.active_context()
-                            };
+                                    // Build CompactionResult from LCM's active context.
+                                    let compacted_messages = {
+                                        let engine = bg_lcm.lock().await;
+                                        engine.active_context()
+                                    };
 
-                            if compacted_messages.len() < bg_messages.len() {
-                                let result = crate::agent::compaction::CompactionResult {
-                                    messages: compacted_messages,
-                                    observation,
-                                };
-                                *slot.lock().await =
-                                    Some(PendingCompaction { result, watermark });
+                                    if compacted_messages.len() < bg_messages.len() {
+                                        let result = crate::agent::compaction::CompactionResult {
+                                            messages: compacted_messages,
+                                            observation,
+                                        };
+                                        *slot.lock().await =
+                                            Some(PendingCompaction { result, watermark });
+                                    }
+                                },
+                            )
+                            .await;
+                            if timeout_result.is_err() {
+                                warn!("LCM compaction timed out after 30s, resetting in_flight");
                             }
                             in_flight.store(false, Ordering::SeqCst);
                         });
@@ -853,39 +875,48 @@ impl AgentLoopShared {
 
             let bg_proprio = self.proprioception_config.clone();
             tokio::spawn(async move {
-                let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                    bg_core
-                        .compactor
-                        .compact_gradient(
-                            &bg_messages,
-                            &bg_core.token_budget,
-                            0,
-                            bg_proprio.raw_window,
-                            bg_proprio.light_window,
-                        )
-                        .await
-                } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                    let reader =
-                        crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                    bg_core
-                        .compactor
-                        .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
-                        .await
-                } else {
-                    bg_core
-                        .compactor
-                        .compact(&bg_messages, &bg_core.token_budget, 0)
-                        .await
-                };
-                if bg_core.memory_enabled {
-                    if let Some(ref summary) = result.observation {
-                        bg_core
-                            .working_memory
-                            .update_from_compaction(&bg_session_key, summary);
-                    }
-                }
-                if result.messages.len() < bg_messages.len() {
-                    *slot.lock().await = Some(PendingCompaction { result, watermark });
+                let timeout_result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    async {
+                        let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
+                            bg_core
+                                .compactor
+                                .compact_gradient(
+                                    &bg_messages,
+                                    &bg_core.token_budget,
+                                    0,
+                                    bg_proprio.raw_window,
+                                    bg_proprio.light_window,
+                                )
+                                .await
+                        } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
+                            let reader =
+                                crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                            bg_core
+                                .compactor
+                                .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
+                                .await
+                        } else {
+                            bg_core
+                                .compactor
+                                .compact(&bg_messages, &bg_core.token_budget, 0)
+                                .await
+                        };
+                        if bg_core.memory_enabled {
+                            if let Some(ref summary) = result.observation {
+                                bg_core
+                                    .working_memory
+                                    .update_from_compaction(&bg_session_key, summary);
+                            }
+                        }
+                        if result.messages.len() < bg_messages.len() {
+                            *slot.lock().await = Some(PendingCompaction { result, watermark });
+                        }
+                    },
+                )
+                .await;
+                if timeout_result.is_err() {
+                    warn!("Core compaction timed out after 30s, resetting in_flight");
                 }
                 in_flight.store(false, Ordering::SeqCst);
             });
@@ -1676,6 +1707,7 @@ impl AgentLoop {
         providers_config: Option<crate::config::schema::ProvidersConfig>,
         proprioception_config: ProprioceptionConfig,
         lcm_config: LcmSchemaConfig,
+        health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     ) -> Self {
         // Read core to initialize the subagent manager.
         let core = core_handle.swappable();
@@ -1761,6 +1793,7 @@ impl AgentLoop {
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
             lcm_config,
             lcm_compactor,
+            health_registry,
         });
 
         Self {
@@ -2771,6 +2804,7 @@ mod tests {
             None, // no providers config
             ProprioceptionConfig::default(),
             lcm_config,
+            None, // no health registry
         );
 
         let session_key = "lcm-e2e-test";
@@ -2911,6 +2945,595 @@ mod tests {
         // Cleanup.
         drop(engine);
         drop(engines);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn test_compaction_timeout_resets_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let in_flight = Arc::new(AtomicBool::new(false));
+
+        // Simulate: set in_flight before spawning compaction
+        in_flight.store(true, Ordering::SeqCst);
+        assert!(in_flight.load(Ordering::SeqCst));
+
+        let flag = in_flight.clone();
+        let handle = tokio::spawn(async move {
+            let timeout_result = tokio::time::timeout(
+                Duration::from_millis(100), // Short timeout for test
+                async {
+                    // Simulate a hanging compaction endpoint
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                },
+            )
+            .await;
+            assert!(timeout_result.is_err(), "should have timed out");
+            flag.store(false, Ordering::SeqCst); // Must always execute
+        });
+
+        // Wait for the spawned task to complete
+        handle.await.unwrap();
+
+        // The critical assertion: in_flight must be reset even after timeout
+        assert!(
+            !in_flight.load(Ordering::SeqCst),
+            "in_flight must reset to false after timeout"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Trio E2E test harness
+    //
+    // All tests require a single LM Studio endpoint serving three models.
+    // Configure via env vars:
+    //   NANOBOT_TRIO_BASE            — API base (default: http://192.168.1.22:1234/v1)
+    //   NANOBOT_TRIO_MAIN_MODEL      — Main model name
+    //   NANOBOT_TRIO_ROUTER_MODEL    — Router model name
+    //   NANOBOT_TRIO_SPECIALIST_MODEL — Specialist model name
+    //
+    // Run with: cargo test test_trio_e2e -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    /// Read trio E2E env vars (single shared endpoint).
+    fn trio_e2e_env() -> (String, String, String, String) {
+        let base = std::env::var("NANOBOT_TRIO_BASE")
+            .unwrap_or_else(|_| "http://192.168.1.22:1234/v1".to_string());
+        let main_model = std::env::var("NANOBOT_TRIO_MAIN_MODEL")
+            .unwrap_or_else(|_| "gemma-3n-e4b-it".to_string());
+        let router_model = std::env::var("NANOBOT_TRIO_ROUTER_MODEL")
+            .unwrap_or_else(|_| "nvidia_orchestrator-8b".to_string());
+        let specialist_model = std::env::var("NANOBOT_TRIO_SPECIALIST_MODEL")
+            .unwrap_or_else(|_| "qwen3-1.7b".to_string());
+        (base, main_model, router_model, specialist_model)
+    }
+
+    /// Build an AgentLoop wired for trio E2E testing.
+    ///
+    /// All three providers share one LM Studio endpoint, differentiated by model name.
+    /// A shared JitGate serialises requests to prevent concurrent model-loading crashes.
+    fn build_trio_e2e_harness(
+        base_url: &str,
+        main_model: &str,
+        router_model: &str,
+        specialist_model: &str,
+    ) -> (AgentLoop, std::path::PathBuf) {
+        use crate::providers::factory;
+        use crate::providers::jit_gate::JitGate;
+        use crate::config::schema::LcmSchemaConfig;
+
+        let jit_gate = std::sync::Arc::new(JitGate::new());
+
+        let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(base_url, Some(main_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+        let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(base_url, Some(router_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+        let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(base_url, Some(specialist_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+
+        let mut td = ToolDelegationConfig {
+            mode: crate::config::schema::DelegationMode::Trio,
+            ..Default::default()
+        };
+        td.apply_mode();
+
+        let trio_config = TrioConfig {
+            enabled: true,
+            router_model: router_model.to_string(),
+            specialist_model: specialist_model.to_string(),
+            ..Default::default()
+        };
+
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main_provider,
+            workspace: workspace.clone(),
+            model: main_model.to_string(),
+            max_iterations: 5,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(router_provider),
+            specialist_provider: Some(specialist_provider),
+            trio_config,
+        });
+
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+
+        (agent_loop, workspace)
+    }
+
+    /// Warmup a provider with backon retries (models may need JIT loading time).
+    async fn warmup_trio_provider(
+        provider: &dyn LLMProvider,
+        model: &str,
+        role: &str,
+    ) {
+        use backon::ConstantBuilder;
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Reply with: ok"})];
+        let mut backoff = ConstantBuilder::default()
+            .with_delay(Duration::from_secs(2))
+            .with_max_times(10)
+            .build();
+        loop {
+            match provider.chat(&messages, None, Some(model), 32, 0.0, None).await {
+                Ok(resp) => {
+                    let text = resp.content.unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        eprintln!("  {} warmup OK: {}", role, &text[..text.len().min(40)]);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if !msg.contains("loading") && !msg.contains("503") {
+                        panic!("{} warmup failed (non-retryable): {}", role, e);
+                    }
+                }
+            }
+            match backoff.next() {
+                Some(delay) => {
+                    eprintln!("  {} warming up, retrying in {:?}...", role, delay);
+                    tokio::time::sleep(delay).await;
+                }
+                None => panic!("{} did not become ready after retries", role),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_respond() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E respond: base={}", base);
+
+        let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        // Warmup all 3 models
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+        warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct("Hello, what is 2 + 2?", "trio-e2e-respond", "test", "trio-e2e"),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E respond: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_tool_dispatch() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E tool dispatch: base={}", base);
+
+        let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        // Write a known file to workspace
+        std::fs::write(workspace.join("README.md"), "Nanobot is a lightweight AI assistant framework written in Rust.").unwrap();
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+        warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct(
+                "Read the file README.md and tell me what it says",
+                "trio-e2e-tool",
+                "test",
+                "trio-e2e",
+            ),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E tool dispatch: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        // Check TrioMetrics
+        let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
+        eprintln!(
+            "  metrics: preflight={} action={:?} specialist={} tool={:?}",
+            metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+            metrics.router_action.lock().unwrap(),
+            metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            metrics.tool_dispatched.lock().unwrap(),
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_specialist_dispatch() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E specialist: base={}", base);
+
+        let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+        warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct(
+                "Provide a detailed technical analysis of REST vs GraphQL",
+                "trio-e2e-specialist",
+                "test",
+                "trio-e2e",
+            ),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E specialist: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "response should be non-empty");
+        assert!(resp.len() > 50, "specialist response should be substantive (>50 chars)");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_ask_user() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E ask_user: base={}", base);
+
+        let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+        warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct(
+                "Do that thing with the file",
+                "trio-e2e-ask",
+                "test",
+                "trio-e2e",
+            ),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E ask_user: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_router_unreachable() {
+        let (base, main_model, _router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E router unreachable: base={}", base);
+
+        // Router on dead port, main + specialist on real endpoint
+        let (agent_loop, workspace) = build_trio_e2e_harness(
+            &base,
+            &main_model,
+            &"unreachable-router-model".to_string(), // model doesn't matter since we override the provider
+            &specialist_model,
+        );
+
+        // Actually, the harness uses shared base for all providers.
+        // For unreachable router, we need a custom build with bad router URL.
+        // Let's build it manually.
+        drop(agent_loop);
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        use crate::providers::factory;
+        use crate::providers::jit_gate::JitGate;
+        use crate::config::schema::{DelegationMode, LcmSchemaConfig};
+
+        let jit_gate = std::sync::Arc::new(JitGate::new());
+        let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(&base, Some(&main_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+        // Router points to dead port
+        let router_provider: Arc<dyn LLMProvider> = Arc::new(
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:19999/v1"), Some("dead-router")),
+        );
+        let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(&base, Some(&specialist_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let mut td = ToolDelegationConfig {
+            mode: DelegationMode::Trio,
+            ..Default::default()
+        };
+        td.apply_mode();
+
+        let trio_config = TrioConfig {
+            enabled: true,
+            router_model: "dead-router".to_string(),
+            specialist_model: specialist_model.to_string(),
+            ..Default::default()
+        };
+
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main_provider,
+            workspace: workspace.clone(),
+            model: main_model.to_string(),
+            max_iterations: 5,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(router_provider),
+            specialist_provider: Some(specialist_provider),
+            trio_config,
+        });
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+
+        // Only warmup main (router is intentionally dead)
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(60),
+            agent_loop.process_direct("Hello", "trio-e2e-router-dead", "test", "trio-e2e"),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E router unreachable: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "should get error response, not panic");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_specialist_unreachable() {
+        let (base, main_model, router_model, _specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E specialist unreachable: base={}", base);
+
+        use crate::providers::factory;
+        use crate::providers::jit_gate::JitGate;
+        use crate::config::schema::{DelegationMode, LcmSchemaConfig};
+
+        let jit_gate = std::sync::Arc::new(JitGate::new());
+        let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(&base, Some(&main_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+        let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
+            factory::ProviderSpec::local(&base, Some(&router_model))
+                .with_jit_gate_opt(Some(jit_gate.clone())),
+        );
+        // Specialist points to dead port
+        let specialist_provider: Arc<dyn LLMProvider> = Arc::new(
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:19999/v1"), Some("dead-specialist")),
+        );
+
+        let workspace = tempfile::tempdir().unwrap().into_path();
+        let mut td = ToolDelegationConfig {
+            mode: DelegationMode::Trio,
+            ..Default::default()
+        };
+        td.apply_mode();
+
+        let trio_config = TrioConfig {
+            enabled: true,
+            router_model: router_model.to_string(),
+            specialist_model: "dead-specialist".to_string(),
+            ..Default::default()
+        };
+
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: main_provider,
+            workspace: workspace.clone(),
+            model: main_model.to_string(),
+            max_iterations: 5,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            compaction_provider: None,
+            tool_delegation: td,
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: Some(router_provider),
+            specialist_provider: Some(specialist_provider),
+            trio_config,
+        });
+        let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct(
+                "Provide a detailed technical analysis of REST vs GraphQL",
+                "trio-e2e-specialist-dead",
+                "test",
+                "trio-e2e",
+            ),
+        )
+        .await
+        .expect("test timed out");
+
+        eprintln!("trio E2E specialist unreachable: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+        assert!(!resp.is_empty(), "should get response despite dead specialist");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
+    async fn test_trio_e2e_multi_turn() {
+        let (base, main_model, router_model, specialist_model) = trio_e2e_env();
+        eprintln!("trio E2E multi-turn: base={}", base);
+
+        let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+
+        // Write test file
+        std::fs::write(workspace.join("README.md"), "Nanobot is a lightweight AI assistant.").unwrap();
+
+        let core = agent_loop.shared.core_handle.swappable();
+        warmup_trio_provider(&*core.provider, &main_model, "main").await;
+        warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+        warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+
+        let session_key = "trio-e2e-multi";
+
+        // Turn 1: simple greeting (respond path)
+        let resp1 = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct("Hello", session_key, "test", "trio-e2e"),
+        )
+        .await
+        .expect("turn 1 timed out");
+        eprintln!("turn 1 ({} chars): {}", resp1.len(), &resp1[..resp1.len().min(100)]);
+        assert!(!resp1.is_empty(), "turn 1 should be non-empty");
+
+        // Turn 2: tool path
+        let resp2 = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct("Read README.md", session_key, "test", "trio-e2e"),
+        )
+        .await
+        .expect("turn 2 timed out");
+        eprintln!("turn 2 ({} chars): {}", resp2.len(), &resp2[..resp2.len().min(100)]);
+        assert!(!resp2.is_empty(), "turn 2 should be non-empty");
+
+        // Turn 3: follow-up (tests session state persistence)
+        let resp3 = tokio::time::timeout(
+            Duration::from_secs(180),
+            agent_loop.process_direct("Summarize what you found", session_key, "test", "trio-e2e"),
+        )
+        .await
+        .expect("turn 3 timed out");
+        eprintln!("turn 3 ({} chars): {}", resp3.len(), &resp3[..resp3.len().min(100)]);
+        assert!(!resp3.is_empty(), "turn 3 should be non-empty");
+
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }
