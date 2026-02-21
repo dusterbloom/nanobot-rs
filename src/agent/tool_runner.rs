@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::context::ContextBuilder;
 use crate::agent::context_store::{self, ContextStore};
+use crate::agent::sanitize::strip_tool_output;
 use crate::agent::tools::ToolRegistry;
 use crate::agent::worker_tools;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
@@ -965,17 +966,18 @@ pub async fn run_tool_loop(
                 } else {
                     tools.execute(&tc.name, tc.arguments.clone()).await
                 };
-                let (_, metadata) = context_store.store(result.data.clone());
-                let delegation_data = if result.data.len() > config.max_tool_result_chars {
+                let stripped = strip_tool_output(&result.data);
+                let (_, metadata) = context_store.store(stripped.clone());
+                let delegation_data = if stripped.len() > config.max_tool_result_chars {
                     // Large result: model sees metadata, uses micro-tools to dig in.
                     metadata
                 } else {
                     // Small result: model sees full result directly.
-                    result.data.clone()
+                    stripped.clone()
                 };
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &delegation_data);
                 let original_id = id_map.get(&tc.id).cloned().unwrap_or_else(|| tc.id.clone());
-                all_results.push((original_id, tc.name.clone(), result.data.clone()));
+                all_results.push((original_id, tc.name.clone(), stripped));
 
                 // Track result hashes for loop detection.
                 use std::hash::{Hash, Hasher};
