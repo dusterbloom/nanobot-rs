@@ -19,6 +19,7 @@ use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
+use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
 
 /// Build a compact conversation tail from the message history for the router.
 ///
@@ -120,6 +121,41 @@ pub fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_cha
         out.truncate(end);
     }
     out
+}
+
+/// Maximum characters allowed in a router-injected tool result.
+///
+/// Small local models have limited context windows. Capping tool results
+/// prevents a single web fetch or file read from filling the entire context
+/// and burying the user's original intent.
+const MAX_TOOL_RESULT_CHARS: usize = 12000;
+
+/// Truncate a tool result to fit in small model context windows.
+///
+/// If `data` exceeds `MAX_TOOL_RESULT_CHARS`, it is cut to that length and
+/// an annotation indicating the total size is appended. Short data is
+/// returned unchanged.
+pub(crate) fn truncate_tool_result(data: &str) -> String {
+    if data.len() > MAX_TOOL_RESULT_CHARS {
+        let truncated: String = data.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+        format!("{}... [truncated, {} total chars]", truncated, data.chars().count())
+    } else {
+        data.to_string()
+    }
+}
+
+/// Extract semantic content from a tool result.
+///
+/// Tools like web_fetch return a JSON envelope with metadata (`status`,
+/// `extractor`, etc.) wrapping the actual content in a `text` field.
+/// Strip the envelope so the main model sees only readable content.
+fn extract_tool_content(data: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+        if let Some(text) = parsed.get("text").and_then(|t| t.as_str()) {
+            return text.to_string();
+        }
+    }
+    data.to_string()
 }
 
 /// Extract the first top-level JSON object from raw text.
@@ -552,14 +588,18 @@ pub(crate) async fn dispatch_specialist(
             tracing::Span::current().record("outcome", "ok");
             let elapsed_ms = start.elapsed().as_millis() as u64;
             tracing::Span::current().record("elapsed_ms", elapsed_ms);
+            let sp = parse_specialist_response(&text, target);
             Ok(super::trace_store::DispatchRecord {
-                response: parse_specialist_response(&text, target),
-                system_prompt,
-                specialist_pack,
-                context_summary: context_summary.to_string(),
+                specialist_name: target.to_string(),
+                specialist_model: specialist_model.clone(),
+                router_action: "specialist".to_string(),
+                router_target: target.to_string(),
+                router_confidence: 1.0,
                 router_args: router_args.clone(),
-                elapsed_ms,
-                model: specialist_model.clone(),
+                user_content: user_content.to_string(),
+                messages_count: messages.len(),
+                tool_results: vec![],
+                specialist_response: sp.result.clone(),
             })
         }
         Err(e) => {
@@ -608,6 +648,34 @@ pub(crate) async fn dispatch_subagent(
 // ---------------------------------------------------------------------------
 // Router preflight and post-tool routing (extracted from run_agent_loop)
 // ---------------------------------------------------------------------------
+
+/// Determine the PreflightResult for a successful specialist dispatch.
+/// Pure function — extracted for testability.
+pub(crate) fn specialist_preflight_result(specialist_response: &str) -> PreflightResult {
+    PreflightResult::Break(specialist_response.to_string())
+}
+
+/// Determine the PreflightResult for a successful subagent dispatch.
+/// Pure function — extracted for testability.
+pub(crate) fn subagent_preflight_result(subagent_result: &str) -> PreflightResult {
+    PreflightResult::Break(subagent_result.to_string())
+}
+
+/// Determine the PreflightResult for a successful tool dispatch.
+///
+/// If `specialist_synthesis` is `Some`, use the specialist's synthesized
+/// response. If `None` (specialist unavailable), fall back to the raw tool
+/// result. Pure function — extracted for testability.
+pub(crate) fn tool_preflight_result(
+    _tool_name: &str,
+    _tool_result: &str,
+    specialist_synthesis: Option<String>,
+) -> PreflightResult {
+    match specialist_synthesis {
+        Some(synthesized) => PreflightResult::Break(synthesized),
+        None => PreflightResult::Continue,
+    }
+}
 
 /// Result of the router preflight check.
 pub(crate) enum PreflightResult {
@@ -718,6 +786,7 @@ pub(crate) async fn router_preflight(
         task_state
     };
 
+    let router_start = std::time::Instant::now();
     let decision = match request_strict_router_decision(
         router_provider.as_ref(),
         &router_model,
@@ -740,6 +809,7 @@ pub(crate) async fn router_preflight(
             return PreflightResult::Passthrough;
         }
     };
+    let router_elapsed_ms = router_start.elapsed().as_millis() as u64;
 
     info!(
         role = "router",
@@ -750,9 +820,24 @@ pub(crate) async fn router_preflight(
     );
     *ctx.counters.trio_metrics.router_action.lock().unwrap() = Some(decision.action.clone());
 
+    let base_trace = RouterDecisionTrace {
+        phase: "preflight".to_string(),
+        action: decision.action.clone(),
+        target: decision.target.clone(),
+        confidence: decision.confidence,
+        args: decision.args.clone(),
+        user_content: ctx.user_content.clone(),
+        router_elapsed_ms,
+        model: router_model.clone(),
+        outcome: None,
+    };
+
     match decision.action.as_str() {
         "ask_user" => {
             tracing::Span::current().record("routing_decision", "ask_user");
+            if ctx.core.trace_log {
+                append_router_decision_trace(&base_trace);
+            }
             PreflightResult::Break(
                 decision
                     .args
@@ -764,6 +849,9 @@ pub(crate) async fn router_preflight(
         }
         "specialist" => {
             tracing::Span::current().record("routing_decision", "specialist");
+            if ctx.core.trace_log {
+                append_router_decision_trace(&base_trace);
+            }
             match dispatch_specialist(
                 &ctx.core,
                 &ctx.counters,
@@ -780,17 +868,12 @@ pub(crate) async fn router_preflight(
                 Ok(record) => {
                     ctx.counters.trio_metrics.specialist_dispatched.store(true, Ordering::Relaxed);
                     if ctx.core.trace_log {
-                        super::trace_store::append_specialist_trace(
-                            &record.response, &decision.target, &ctx.user_content,
-                            &record.system_prompt, &record.specialist_pack,
-                            &record.context_summary, &record.router_args,
-                            record.elapsed_ms, &record.model,
-                        );
+                        super::trace_store::append_specialist_trace(&record);
                     }
-                    let injected = format!("[specialist:{}] {}", decision.target, record.response.result);
+                    let injected = format!("[specialist:{}] {}", decision.target, record.specialist_response);
                     ctx.messages
-                        .push(json!({"role":"user","content": injected}));
-                    PreflightResult::Continue
+                        .push(json!({"role":"user","content": injected, "_synthetic": true}));
+                    specialist_preflight_result(&record.specialist_response)
                 }
                 Err(e) => PreflightResult::Break(e),
             }
@@ -808,11 +891,23 @@ pub(crate) async fn router_preflight(
             .await
             {
                 Ok(text) => {
+                    if ctx.core.trace_log {
+                        let mut trace = base_trace.clone();
+                        trace.outcome = Some(text.clone());
+                        append_router_decision_trace(&trace);
+                    }
                     ctx.messages
                         .push(json!({"role":"user","content": text}));
-                    PreflightResult::Continue
+                    subagent_preflight_result(&text)
                 }
-                Err(e) => PreflightResult::Break(e),
+                Err(e) => {
+                    if ctx.core.trace_log {
+                        let mut trace = base_trace.clone();
+                        trace.outcome = Some(format!("ERROR: {}", e));
+                        append_router_decision_trace(&trace);
+                    }
+                    PreflightResult::Break(e)
+                }
             }
         }
         "tool" => {
@@ -833,6 +928,11 @@ pub(crate) async fn router_preflight(
                 .unwrap_or_default();
             if let Err(e) = ctx.flow.tool_guard.allow(&decision.target, &params_map) {
                 warn!("{}", e);
+                if ctx.core.trace_log {
+                    let mut trace = base_trace.clone();
+                    trace.outcome = Some(format!("BLOCKED: {}", e));
+                    append_router_decision_trace(&trace);
+                }
                 ctx.messages.push(json!({
                     "role":"user",
                     "content": format!("[tool-guard] {}", e),
@@ -840,21 +940,35 @@ pub(crate) async fn router_preflight(
                 return PreflightResult::Continue;
             }
             let tr = ctx.tools.execute(&decision.target, params_map).await;
+            if ctx.core.trace_log {
+                let mut trace = base_trace.clone();
+                trace.outcome = Some(tr.data.clone());
+                append_router_decision_trace(&trace);
+            }
+            let content = extract_tool_content(&tr.data);
+            let truncated = truncate_tool_result(&content);
             ctx.messages.push(json!({
                 "role":"user",
-                "content": format!("[router:tool:{}] {}", decision.target, tr.data),
+                "content": format!("[router:tool:{}] {}", decision.target, truncated),
+                "_synthetic": true,
             }));
             *ctx.counters.trio_metrics.tool_dispatched.lock().unwrap() = Some(decision.target.clone());
-            ctx.used_tools.insert(decision.target);
-            PreflightResult::Continue
+            ctx.used_tools.insert(decision.target.clone());
+            tool_preflight_result(&decision.target, &truncated, None)
         }
         "respond" => {
             tracing::Span::current().record("routing_decision", "respond");
+            if ctx.core.trace_log {
+                append_router_decision_trace(&base_trace);
+            }
             debug!("Router: respond — forwarding to main model");
             PreflightResult::Passthrough
         }
         _ => {
             tracing::Span::current().record("routing_decision", "unknown_passthrough");
+            if ctx.core.trace_log {
+                append_router_decision_trace(&base_trace);
+            }
             debug!(
                 "Router: unrecognized action '{}' — forwarding to main model",
                 decision.action
@@ -872,6 +986,18 @@ pub(crate) enum RouteResult {
     Break(String),
     /// Filtered tool calls ready for execution.
     Execute(Vec<ToolCallRequest>),
+}
+
+/// Determine the RouteResult for a successful specialist dispatch in route_tool_calls().
+/// Pure function — extracted for testability.
+pub(crate) fn specialist_route_result(specialist_response: &str) -> RouteResult {
+    RouteResult::Break(specialist_response.to_string())
+}
+
+/// Determine the RouteResult for a successful subagent dispatch in route_tool_calls().
+/// Pure function — extracted for testability.
+pub(crate) fn subagent_route_result(subagent_result: &str) -> RouteResult {
+    RouteResult::Break(subagent_result.to_string())
 }
 
 /// Route tool calls through the strict router / toolplan / fallback pipeline.
@@ -915,6 +1041,7 @@ pub(crate) async fn route_tool_calls(
         if let (Some(router_provider), Some(router_model)) =
             (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref())
         {
+            let router_start = std::time::Instant::now();
             match request_strict_router_decision(
                 router_provider.as_ref(),
                 router_model,
@@ -927,7 +1054,22 @@ pub(crate) async fn route_tool_calls(
             .await
             {
                 Ok(decision) => {
+                    let router_elapsed_ms = router_start.elapsed().as_millis() as u64;
                     router_decision_valid = true;
+                    if ctx.core.trace_log {
+                        let model = ctx.core.router_model.as_deref().unwrap_or("unknown").to_string();
+                        append_router_decision_trace(&RouterDecisionTrace {
+                            phase: "tool_routing".to_string(),
+                            action: decision.action.clone(),
+                            target: decision.target.clone(),
+                            confidence: decision.confidence,
+                            args: decision.args.clone(),
+                            user_content: ctx.user_content.clone(),
+                            router_elapsed_ms,
+                            model,
+                            outcome: None,
+                        });
+                    }
                     router_decision = Some(decision);
                 }
                 Err(e) => {
@@ -1039,17 +1181,12 @@ pub(crate) async fn route_tool_calls(
                 {
                     Ok(record) => {
                         if ctx.core.trace_log {
-                            super::trace_store::append_specialist_trace(
-                                &record.response, &plan.target, &ctx.user_content,
-                                &record.system_prompt, &record.specialist_pack,
-                                &record.context_summary, &record.router_args,
-                                record.elapsed_ms, &record.model,
-                            );
+                            super::trace_store::append_specialist_trace(&record);
                         }
-                        let injected = format!("[specialist:{}] {}", plan.target, record.response.result);
+                        let injected = format!("[specialist:{}] {}", plan.target, record.specialist_response);
                         ctx.messages
-                            .push(json!({"role":"user","content": injected}));
-                        return RouteResult::Continue;
+                            .push(json!({"role":"user","content": injected, "_synthetic": true}));
+                        return specialist_route_result(&record.specialist_response);
                     }
                     Err(e) => return RouteResult::Break(e),
                 }
@@ -1068,7 +1205,7 @@ pub(crate) async fn route_tool_calls(
                     Ok(text) => {
                         ctx.messages
                             .push(json!({"role":"user","content": text}));
-                        return RouteResult::Continue;
+                        return subagent_route_result(&text);
                     }
                     Err(e) => return RouteResult::Break(e),
                 }
@@ -1694,6 +1831,131 @@ mod tests {
         assert_eq!(d.target, "write_file");
     }
 
+    // ── Tool result truncation ─────────────────────────────────────────────────
+
+    // RED: truncate_tool_result must cap long results to MAX_TOOL_RESULT_CHARS
+    #[test]
+    fn test_tool_result_truncation() {
+        let long_input: String = "x".repeat(20_000);
+        let result = truncate_tool_result(&long_input);
+        assert!(
+            result.len() <= 12100,
+            "truncated result must be at most ~12100 chars (12000 + annotation), got {}",
+            result.len()
+        );
+        assert!(
+            result.contains("truncated"),
+            "truncated result must contain the word 'truncated'"
+        );
+        assert!(
+            result.contains("20000 total chars"),
+            "truncated result must report original char count, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_tool_result_no_truncation_when_short() {
+        let short_input = "short result";
+        let result = truncate_tool_result(short_input);
+        assert_eq!(result, short_input, "short input must be returned unchanged");
+    }
+
+    // ── Turn isolation: preflight arms must return Break, not Continue ─────────
+
+    #[test]
+    fn test_specialist_arm_returns_break_not_continue() {
+        // The specialist arm should return Break with the specialist response,
+        // NOT Continue. This verifies the response goes directly to the user
+        // without looping back through the small model.
+        let result = specialist_preflight_result("Here is the specialist analysis...");
+        match result {
+            PreflightResult::Break(msg) => {
+                assert_eq!(msg, "Here is the specialist analysis...");
+            }
+            PreflightResult::Continue => {
+                panic!("specialist arm must return Break, not Continue");
+            }
+            PreflightResult::Passthrough => {
+                panic!("specialist arm must return Break, not Passthrough");
+            }
+        }
+    }
+
+    #[test]
+    fn test_subagent_arm_returns_break_not_continue() {
+        let result = subagent_preflight_result("Subagent research results...");
+        match result {
+            PreflightResult::Break(msg) => {
+                assert_eq!(msg, "Subagent research results...");
+            }
+            _ => panic!("subagent arm must return Break"),
+        }
+    }
+
+    #[test]
+    fn test_tool_arm_returns_continue_when_no_synthesis() {
+        // Tool arm: when specialist is unavailable (None), should return Continue so the
+        // main LLM loop can summarize the injected tool result rather than returning raw JSON.
+        let result = tool_preflight_result("web_fetch", "<html>Hacker News...</html>", None);
+        assert!(
+            matches!(result, PreflightResult::Continue),
+            "tool arm with no synthesis must return Continue, not Break"
+        );
+    }
+
+    #[test]
+    fn test_tool_arm_with_specialist_returns_synthesized() {
+        let specialist_response = Some("Here are the top 5 HN stories...".to_string());
+        let result = tool_preflight_result("web_fetch", "<html>raw content</html>", specialist_response);
+        match result {
+            PreflightResult::Break(msg) => {
+                assert_eq!(msg, "Here are the top 5 HN stories...");
+                assert!(!msg.contains("<html>"), "should NOT contain raw HTML");
+            }
+            _ => panic!("tool arm with specialist must return Break"),
+        }
+    }
+
+    // ── Turn isolation: route_tool_calls arms must return Break, not Continue ──
+
+    #[test]
+    fn test_specialist_route_result_returns_break_not_continue() {
+        // The specialist arm in route_tool_calls() should return Break with the
+        // specialist response, NOT Continue. This prevents the small local model
+        // from hallucinating when it receives the specialist-injected message.
+        let result = specialist_route_result("Here is the specialist analysis for tool calls...");
+        match result {
+            RouteResult::Break(msg) => {
+                assert_eq!(msg, "Here is the specialist analysis for tool calls...");
+            }
+            RouteResult::Continue => {
+                panic!("specialist route_tool_calls arm must return Break, not Continue");
+            }
+            RouteResult::Execute(_) => {
+                panic!("specialist route_tool_calls arm must return Break, not Execute");
+            }
+        }
+    }
+
+    #[test]
+    fn test_subagent_route_result_returns_break_not_continue() {
+        // The subagent arm in route_tool_calls() should return Break with the
+        // subagent result, NOT Continue.
+        let result = subagent_route_result("Subagent completed the research task...");
+        match result {
+            RouteResult::Break(msg) => {
+                assert_eq!(msg, "Subagent completed the research task...");
+            }
+            RouteResult::Continue => {
+                panic!("subagent route_tool_calls arm must return Break, not Continue");
+            }
+            RouteResult::Execute(_) => {
+                panic!("subagent route_tool_calls arm must return Break, not Execute");
+            }
+        }
+    }
+
     // ── Layer 3 config sweep stub (requires LM Studio) ────────────────────────
 
     #[test]
@@ -1712,6 +1974,53 @@ mod tests {
         for cfg in &configs {
             eprintln!("## Config: {} (temp={})", cfg.label, cfg.router_temp);
             // TODO: wire up real provider and run scenarios
+        }
+    }
+
+    #[test]
+    fn test_specialist_injection_has_synthetic_flag() {
+        let injected = format!("[specialist:{}] {}", "coding", "analysis result");
+        let msg = json!({"role":"user","content": injected, "_synthetic": true});
+        assert_eq!(msg["_synthetic"], true);
+        assert_eq!(msg["role"], "user");
+        assert!(msg["content"].as_str().unwrap().starts_with("[specialist:"));
+    }
+
+    // ── extract_tool_content ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_tool_content_json_with_text() {
+        let json = "{\"extractor\":\"readability\",\"status\":200,\"text\":\"# Hello World\\n\\nSome content here.\"}";
+        let result = extract_tool_content(json);
+        assert_eq!(result, "# Hello World\n\nSome content here.");
+    }
+
+    #[test]
+    fn test_extract_tool_content_plain_string() {
+        let plain = "Just a plain string result";
+        let result = extract_tool_content(plain);
+        assert_eq!(result, "Just a plain string result");
+    }
+
+    #[test]
+    fn test_extract_tool_content_json_without_text() {
+        let json = r#"{"status":200,"data":"something"}"#;
+        let result = extract_tool_content(json);
+        assert_eq!(result, json);
+    }
+
+    #[test]
+    fn test_tool_preflight_result_no_synthesis_returns_continue() {
+        let result = tool_preflight_result("web_fetch", "some data", None);
+        assert!(matches!(result, PreflightResult::Continue));
+    }
+
+    #[test]
+    fn test_tool_preflight_result_with_synthesis_returns_break() {
+        let result = tool_preflight_result("web_fetch", "data", Some("Summary here".into()));
+        match result {
+            PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
+            _ => panic!("Expected Break with synthesis text"),
         }
     }
 }

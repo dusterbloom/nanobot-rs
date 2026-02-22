@@ -376,6 +376,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         } else if let Some(cp) = compaction_provider {
             cp
         } else {
+            // In local mode, provider is already the local server — use it directly.
             provider.clone()
         };
         (mem_provider, mem_model)

@@ -81,7 +81,7 @@ fn is_local_base(base: &str) -> bool {
 }
 
 /// Check whether a model name belongs to the Claude family.
-fn is_claude_model(model: &str) -> bool {
+pub fn is_claude_model(model: &str) -> bool {
     model.starts_with("claude")
 }
 
