@@ -13,6 +13,7 @@ use crate::agent::agent_loop::TurnContext;
 use crate::agent::context::ContextBuilder;
 use crate::agent::policy;
 use crate::agent::role_policy;
+use crate::agent::role_policy::{build_specialist_system_prompt, parse_specialist_response};
 use crate::agent::router_fallback;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
@@ -28,7 +29,7 @@ use crate::providers::base::{LLMProvider, ToolCallRequest};
 /// place of old messages, so this naturally includes compressed context.
 /// Search backwards through recent messages for a scratch pad summary.
 /// Returns the summary text if found, otherwise None.
-pub(crate) fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
+pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
     for msg in messages.iter().rev().take(10) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -62,7 +63,7 @@ pub(crate) fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option
     None
 }
 
-pub(crate) fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
+pub fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
     let mut pairs: Vec<(Option<&str>, Option<&str>)> = Vec::new();
     let mut current_user: Option<&str> = None;
 
@@ -259,7 +260,7 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     no_think,
     parse_strategy = tracing::field::Empty,
 ))]
-pub(crate) async fn request_strict_router_decision(
+pub async fn request_strict_router_decision(
     provider: &dyn LLMProvider,
     model: &str,
     router_pack: &str,
@@ -465,7 +466,7 @@ pub(crate) async fn request_strict_router_decision(
 /// Dispatch a router decision to the specialist lane.
 ///
 /// Shared by both preflight and post-tool router paths. Returns:
-/// - `Ok(text)` to inject as a user message and continue
+/// - `Ok(DispatchRecord)` with the response and inputs captured for tracing
 /// - `Err(msg)` on fatal error (break with msg)
 #[instrument(
     name = "dispatch_specialist",
@@ -485,7 +486,8 @@ pub(crate) async fn dispatch_specialist(
     context_summary: &str,
     tool_list: &[String],
     messages: &[Value],
-) -> Result<String, String> {
+    schema_enabled: bool,
+) -> Result<super::trace_store::DispatchRecord, String> {
     let start = std::time::Instant::now();
     info!(role = "specialist", target = %target, "dispatch_specialist_start");
     let (specialist_provider, specialist_model) = match (
@@ -524,8 +526,9 @@ pub(crate) async fn dispatch_specialist(
     } else {
         specialist_state
     };
+    let system_prompt = build_specialist_system_prompt(schema_enabled);
     let specialist_messages = vec![
-        json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise actionable output only. No markdown unless requested."}),
+        json!({"role":"system","content": system_prompt}),
         json!({"role":"user","content": specialist_pack}),
     ];
     match specialist_provider
@@ -547,8 +550,17 @@ pub(crate) async fn dispatch_specialist(
                 .unwrap_or_else(|| "Specialist returned no content.".to_string());
             let text = crate::agent::sanitize::sanitize_reasoning_output(&raw_text);
             tracing::Span::current().record("outcome", "ok");
-            tracing::Span::current().record("elapsed_ms", start.elapsed().as_millis() as u64);
-            Ok(format!("[specialist:{}] {}", target, text))
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            tracing::Span::current().record("elapsed_ms", elapsed_ms);
+            Ok(super::trace_store::DispatchRecord {
+                response: parse_specialist_response(&text, target),
+                system_prompt,
+                specialist_pack,
+                context_summary: context_summary.to_string(),
+                router_args: router_args.clone(),
+                elapsed_ms,
+                model: specialist_model.clone(),
+            })
         }
         Err(e) => {
             counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
@@ -761,13 +773,23 @@ pub(crate) async fn router_preflight(
                 &ctx.user_content,
                 &tool_list,
                 &ctx.messages,
+                ctx.core.specialist_output_schema,
             )
             .await
             {
-                Ok(text) => {
+                Ok(record) => {
                     ctx.counters.trio_metrics.specialist_dispatched.store(true, Ordering::Relaxed);
+                    if ctx.core.trace_log {
+                        super::trace_store::append_specialist_trace(
+                            &record.response, &decision.target, &ctx.user_content,
+                            &record.system_prompt, &record.specialist_pack,
+                            &record.context_summary, &record.router_args,
+                            record.elapsed_ms, &record.model,
+                        );
+                    }
+                    let injected = format!("[specialist:{}] {}", decision.target, record.response.result);
                     ctx.messages
-                        .push(json!({"role":"user","content": text}));
+                        .push(json!({"role":"user","content": injected}));
                     PreflightResult::Continue
                 }
                 Err(e) => PreflightResult::Break(e),
@@ -1011,12 +1033,22 @@ pub(crate) async fn route_tool_calls(
                     context_summary,
                     &ctx.tools.tool_names(),
                     &ctx.messages,
+                    ctx.core.specialist_output_schema,
                 )
                 .await
                 {
-                    Ok(text) => {
+                    Ok(record) => {
+                        if ctx.core.trace_log {
+                            super::trace_store::append_specialist_trace(
+                                &record.response, &plan.target, &ctx.user_content,
+                                &record.system_prompt, &record.specialist_pack,
+                                &record.context_summary, &record.router_args,
+                                record.elapsed_ms, &record.model,
+                            );
+                        }
+                        let injected = format!("[specialist:{}] {}", plan.target, record.response.result);
                         ctx.messages
-                            .push(json!({"role":"user","content": text}));
+                            .push(json!({"role":"user","content": injected}));
                         return RouteResult::Continue;
                     }
                     Err(e) => return RouteResult::Break(e),
@@ -1155,7 +1187,27 @@ pub(crate) async fn route_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::TrioConfig;
     use serde_json::json;
+
+    // T9 — TrioConfig has specialist_output_schema field, defaults to false
+    #[test]
+    fn test_trio_config_specialist_output_schema_default_false() {
+        let config = TrioConfig::default();
+        assert!(!config.specialist_output_schema);
+    }
+
+    // T10 — SpecialistResponse success field defaults to true
+    #[test]
+    fn test_specialist_response_success_field_default_true() {
+        let sr = crate::agent::role_policy::SpecialistResponse {
+            result: "test".to_string(),
+            success: true,
+            vote_key: "test".to_string(),
+            parsed_json: false,
+        };
+        assert!(sr.success);
+    }
 
     // ── A. extract_json_object ────────────────────────────────────────────────
 

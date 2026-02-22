@@ -30,6 +30,7 @@ pub mod process_tree;
 pub mod provenance;
 pub mod reflector;
 pub mod role_policy;
+pub(crate) mod trace_store;
 pub mod router;
 pub mod sanitize;
 pub mod router_fallback;

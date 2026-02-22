@@ -71,6 +71,10 @@ pub struct SwappableCore {
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
     /// Number of recent messages to keep untruncated in context hygiene (default: 20).
     pub hygiene_keep_last_messages: usize,
+    /// When true, specialist is instructed to return strict JSON and the response
+    /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
+    pub specialist_output_schema: bool,
+    pub trace_log: bool,
 }
 
 /// Current trio routing state — transitions logged once, not per-check.
@@ -503,6 +507,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         max_history_turns: memory_config.max_history_turns,
         model_capabilities,
         hygiene_keep_last_messages: memory_config.hygiene.keep_last_messages,
+        specialist_output_schema: trio_config.specialist_output_schema,
+        trace_log: trio_config.trace_log,
     }
 }
 

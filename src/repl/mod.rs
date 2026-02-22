@@ -879,6 +879,50 @@ pub(crate) fn cmd_agent(
                                 format!("http://{}:{}/v1", lms_host, lms_port);
                             config.agents.defaults.skip_jit_gate = true;
                         }
+
+                        // Trio model loading for single-message mode.
+                        let (auto_router, auto_specialist) =
+                            commands::pick_trio_models(&available, &local_model_name);
+                        if config.trio.router_model.is_empty() {
+                            if let Some(r) = auto_router {
+                                config.trio.router_model = r;
+                            }
+                        }
+                        if config.trio.specialist_model.is_empty() {
+                            if let Some(s) = auto_specialist {
+                                config.trio.specialist_model = s;
+                            }
+                        }
+                        if config.trio.enabled
+                            || commands::should_auto_activate_trio(
+                                is_local,
+                                &config.trio.router_model,
+                                &config.trio.specialist_model,
+                                config.trio.router_endpoint.is_some(),
+                                config.trio.specialist_endpoint.is_some(),
+                                &config.tool_delegation.mode,
+                            )
+                        {
+                            // Load router model if configured.
+                            if !config.trio.router_model.is_empty() {
+                                let _ = crate::lms::load_model(
+                                    lms_port,
+                                    &config.trio.router_model,
+                                    Some(config.trio.router_ctx_tokens),
+                                )
+                                .await;
+                            }
+                            // Load specialist model if configured.
+                            if !config.trio.specialist_model.is_empty() {
+                                let _ = crate::lms::load_model(
+                                    lms_port,
+                                    &config.trio.specialist_model,
+                                    Some(config.trio.specialist_ctx_tokens),
+                                )
+                                .await;
+                            }
+                            commands::trio_enable(&mut config);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Warning: lms server start failed: {}", e);
@@ -1001,6 +1045,8 @@ pub(crate) fn cmd_agent(
             is_local,
             &config.trio.router_model,
             &config.trio.specialist_model,
+            config.trio.router_endpoint.is_some(),
+            config.trio.specialist_endpoint.is_some(),
             &config.tool_delegation.mode,
         ) {
             commands::trio_enable(&mut config);

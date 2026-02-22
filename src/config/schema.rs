@@ -639,6 +639,13 @@ pub struct TrioConfig {
     /// Circuit breaker tuning for trio provider health tracking.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    /// When true, specialist is instructed to return a strict JSON envelope
+    /// (`SpecialistResponse`) and the raw output is parsed accordingly.
+    /// Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub specialist_output_schema: bool,
+    #[serde(default)]
+    pub trace_log: bool,
 }
 
 /// Anti-drift configuration for SLM context stabilization.
@@ -714,6 +721,8 @@ impl Default for TrioConfig {
             vram_cap_gb: default_vram_cap_gb(),
             anti_drift: AntiDriftConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            specialist_output_schema: false,
+            trace_log: false,
         }
     }
 }
