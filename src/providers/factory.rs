@@ -75,11 +75,36 @@ pub fn create_anthropic(token: &str, model: Option<&str>) -> Arc<dyn LLMProvider
     Arc::new(AnthropicProvider::new(token, model))
 }
 
+/// Determine whether an api_base URL points to a local server.
+fn is_local_base(base: &str) -> bool {
+    base.contains("localhost") || base.contains("127.0.0.1")
+}
+
 /// Create a provider from a `ProviderConfig` with `localhost:8080` fallback.
 ///
-/// This is the common pattern for memory / delegation provider overrides
-/// in `build_swappable_core()`.
+/// Routing rules (applied in order):
+/// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
+/// 2. `api_key` starts with `sk-ant-` → AnthropicProvider (native Messages API).
+/// 3. Otherwise → OpenAICompat (safe fallback for all other cloud providers).
+///
+/// This ensures tool-delegation and memory providers use a compatible wire
+/// format. Previously this always returned OpenAICompat, which broke when the
+/// configured key was an Anthropic key but the target model was a Mistral or
+/// other non-Anthropic model served via the OpenAI-compat endpoint.
 pub fn from_provider_config(cfg: &ProviderConfig) -> Arc<dyn LLMProvider> {
+    // Rule 1: explicit local base URL → always OpenAICompat.
+    if let Some(ref base) = cfg.api_base {
+        if is_local_base(base) {
+            return create_openai_compat(ProviderSpec::from_config(cfg, None));
+        }
+    }
+
+    // Rule 2: Anthropic API key → native AnthropicProvider.
+    if cfg.api_key.starts_with("sk-ant-") {
+        return create_anthropic(&cfg.api_key, None);
+    }
+
+    // Rule 3: default – OpenAICompat with localhost:8080 fallback.
     create_openai_compat(ProviderSpec::from_config(cfg, Some("http://localhost:8080/v1")))
 }
 
@@ -159,13 +184,89 @@ mod tests {
     }
 
     #[test]
-    fn test_from_provider_config() {
+    fn test_from_provider_config_unknown_key_uses_openai_compat() {
         let cfg = ProviderConfig {
             api_key: "sk-test".to_string(),
             api_base: None,
         };
         let provider = from_provider_config(&cfg);
-        // Should use the localhost:8080 fallback and the default model.
+        // Should use the localhost:8080 fallback.
         assert!(provider.get_api_base().is_some());
+        assert_eq!(
+            provider.get_api_base().as_deref(),
+            Some("http://localhost:8080/v1")
+        );
+    }
+
+    #[test]
+    fn test_from_provider_config_local_base_uses_openai_compat() {
+        let cfg = ProviderConfig {
+            api_key: "local".to_string(),
+            api_base: Some("http://localhost:11434/v1".to_string()),
+        };
+        let provider = from_provider_config(&cfg);
+        assert_eq!(
+            provider.get_api_base().as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+    }
+
+    #[test]
+    fn test_from_provider_config_127_base_uses_openai_compat() {
+        let cfg = ProviderConfig {
+            api_key: "local".to_string(),
+            api_base: Some("http://127.0.0.1:8080/v1".to_string()),
+        };
+        let provider = from_provider_config(&cfg);
+        assert_eq!(
+            provider.get_api_base().as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+    }
+
+    #[test]
+    fn test_from_provider_config_anthropic_key_uses_anthropic_provider() {
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config(&cfg);
+        // AnthropicProvider reports None for get_api_base() or the Anthropic base.
+        // The key check: it should NOT be pointing to localhost.
+        let base = provider.get_api_base();
+        if let Some(b) = base {
+            assert!(!is_local_base(&b), "Anthropic key should not route to local server");
+        }
+    }
+
+    #[test]
+    fn test_from_provider_config_anthropic_oauth_key_uses_anthropic_provider() {
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-oat01-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config(&cfg);
+        let base = provider.get_api_base();
+        if let Some(b) = base {
+            assert!(!is_local_base(&b), "OAuth key should not route to local server");
+        }
+    }
+
+    #[test]
+    fn test_is_local_base_localhost() {
+        assert!(is_local_base("http://localhost:8080/v1"));
+        assert!(is_local_base("http://localhost/v1"));
+    }
+
+    #[test]
+    fn test_is_local_base_127() {
+        assert!(is_local_base("http://127.0.0.1:11434/v1"));
+    }
+
+    #[test]
+    fn test_is_local_base_remote() {
+        assert!(!is_local_base("https://api.anthropic.com/v1"));
+        assert!(!is_local_base("https://openrouter.ai/api/v1"));
+        assert!(!is_local_base("https://api.openai.com/v1"));
     }
 }
