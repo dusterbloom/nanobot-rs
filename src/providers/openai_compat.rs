@@ -6,7 +6,7 @@
 //! API format.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -19,6 +19,20 @@ use backon::Retryable;
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
 use super::jit_gate::JitGate;
 use super::retry;
+
+/// Per-base-URL cache for the native LMS `/api/v1/chat` probe result.
+///
+/// `true`  = endpoint is available and responding.
+/// `false` = endpoint timed out or returned a non-2xx response; skip future probes.
+/// absent  = not yet probed.
+///
+/// This avoids the 10s timeout on every call when LM Studio does not serve
+/// the native endpoint (e.g. 100 calls in trio_bench → 16+ minutes wasted).
+static NATIVE_LMS_AVAILABLE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+fn native_lms_cache() -> &'static Mutex<HashMap<String, bool>> {
+    NATIVE_LMS_AVAILABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -101,11 +115,20 @@ impl OpenAICompatProvider {
             "https://openrouter.ai/api/v1".to_string()
         };
 
+        // 120s timeout prevents a non-responsive local server (e.g. LM Studio's
+        // /api/v1/chat endpoint) from hanging forever. Cloud providers rarely
+        // approach this limit; local inference can be slow but should complete
+        // within two minutes for the token budgets used here.
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
             api_key: api_key.to_string(),
             api_base: resolved_base,
             default_model,
-            client: Client::new(),
+            client,
             jit_gate: None,
         }
     }
@@ -282,6 +305,19 @@ async fn try_native_lms_chat(
     let native_base = base.strip_suffix("/v1").unwrap_or(base);
     let url = format!("{}/api/v1/chat", native_base);
 
+    // Check the per-base-URL availability cache.  If a previous probe already
+    // determined the endpoint is unavailable, skip the 10s timeout entirely.
+    {
+        let cache = native_lms_cache().lock().unwrap();
+        if cache.get(native_base) == Some(&false) {
+            tracing::debug!(
+                "native LMS chat skipped (cached unavailable) for {}",
+                native_base
+            );
+            return None;
+        }
+    }
+
     // Extract system prompt (first system message) and user input.
     let mut system_prompt = String::new();
     let mut input_parts: Vec<String> = Vec::new();
@@ -342,14 +378,45 @@ async fn try_native_lms_chat(
         !reasoning_unsupported
     );
 
-    let resp = client
+    // Use a short probe timeout so a missing or unresponsive /api/v1/chat
+    // endpoint fails fast (within 10s) and lets the caller fall back to the
+    // standard /v1/chat/completions path.  The parent client may have a much
+    // longer timeout (120s) which would cause multi-minute hangs when LM
+    // Studio only serves the OpenAI-compat endpoint.
+    let send_future = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
-        .send()
-        .await
-        .ok()?;
+        .send();
+
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        send_future,
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::debug!("native LMS chat send error (will fall back): {}", e);
+            native_lms_cache()
+                .lock()
+                .unwrap()
+                .insert(native_base.to_string(), false);
+            return None;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "native LMS chat timed out after 2s for {} — marking unavailable, falling back to OpenAI-compat",
+                url
+            );
+            native_lms_cache()
+                .lock()
+                .unwrap()
+                .insert(native_base.to_string(), false);
+            return None;
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -364,8 +431,19 @@ async fn try_native_lms_chat(
             );
             crate::agent::model_feature_cache::mark_feature_unsupported(model, &feature);
         }
+        // Mark the endpoint as unavailable so future calls skip the probe.
+        native_lms_cache()
+            .lock()
+            .unwrap()
+            .insert(native_base.to_string(), false);
         return None; // Fall back to regular path
     }
+
+    // Endpoint responded successfully — mark it available for future calls.
+    native_lms_cache()
+        .lock()
+        .unwrap()
+        .insert(native_base.to_string(), true);
 
     let json: serde_json::Value = resp.json().await.ok()?;
 
@@ -2387,6 +2465,122 @@ mod tests {
         assert_eq!(
             extract_unsupported_feature(msg),
             Some("reasoning".to_string())
+        );
+    }
+
+    // ── try_native_lms_chat fast-fallback tests ──────────────────────────────
+
+    /// When the /api/v1/chat endpoint is unavailable (connection refused),
+    /// try_native_lms_chat must return None within the 10s probe timeout
+    /// rather than hanging for the parent client's 120s timeout.
+    #[tokio::test]
+    async fn test_native_lms_chat_returns_none_on_connection_refused() {
+        // Port 19999 is almost certainly not listening; connect will be refused.
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "ping"})];
+
+        let start = std::time::Instant::now();
+        let result = try_native_lms_chat(
+            &client,
+            "http://127.0.0.1:19999/v1",
+            "",
+            "nvidia/nemotron-mini-4b",
+            &messages,
+            64,
+            0.7,
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "should return None when server is unreachable");
+        // Must fail fast — well under the 120s parent timeout.
+        // We allow up to 11s to account for the 10s probe timeout plus OS latency.
+        assert!(
+            elapsed.as_secs() < 11,
+            "native LMS chat took too long: {:?} (should fail fast on connection refused)",
+            elapsed
+        );
+    }
+
+    // ── native_lms_cache tests ────────────────────────────────────────────────
+
+    /// After marking a base URL as unavailable, the cache returns false immediately.
+    #[test]
+    fn test_native_lms_cache_marks_unavailable() {
+        let base = "http://127.0.0.1:29991";
+        // Mark unavailable.
+        native_lms_cache()
+            .lock()
+            .unwrap()
+            .insert(base.to_string(), false);
+        // Verify the cache entry.
+        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        assert_eq!(val, Some(false), "cache should hold false after marking unavailable");
+    }
+
+    /// After marking a base URL as available, the cache returns true.
+    #[test]
+    fn test_native_lms_cache_marks_available() {
+        let base = "http://127.0.0.1:29992";
+        native_lms_cache()
+            .lock()
+            .unwrap()
+            .insert(base.to_string(), true);
+        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        assert_eq!(val, Some(true), "cache should hold true after marking available");
+    }
+
+    /// An unprobed base URL is absent from the cache (None).
+    #[test]
+    fn test_native_lms_cache_absent_for_unknown_base() {
+        let base = "http://127.0.0.1:29993";
+        // Do NOT insert — just read.
+        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        assert_eq!(val, None, "cache should return None for an un-probed endpoint");
+    }
+
+    /// Second call with a cached-unavailable endpoint returns None instantly,
+    /// spending well under 1ms (no 10s timeout).
+    #[tokio::test]
+    async fn test_native_lms_chat_skips_probe_when_cached_unavailable() {
+        // Use a unique port that would time out, not connection-refuse, to ensure
+        // we're testing the cache bypass and not just fast TCP rejection.
+        let api_base = "http://10.255.255.1:29994/v1"; // non-routable IP
+        let native_base = "http://10.255.255.1:29994";
+        // Pre-populate cache as unavailable.
+        native_lms_cache()
+            .lock()
+            .unwrap()
+            .insert(native_base.to_string(), false);
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "ping"})];
+
+        let start = std::time::Instant::now();
+        let result = try_native_lms_chat(
+            &client,
+            api_base,
+            "",
+            "nvidia/nemotron-mini-4b",
+            &messages,
+            64,
+            0.7,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_none(), "should return None immediately for cached-unavailable endpoint");
+        // Should complete in well under 100ms — the cache bypass is synchronous.
+        assert!(
+            elapsed.as_millis() < 100,
+            "cache bypass should be instant, got {:?}",
+            elapsed
         );
     }
 }

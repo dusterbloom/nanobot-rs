@@ -5,10 +5,15 @@ edition = "2021"
 description = "A lightweight personal AI assistant framework in Rust"
 license = "MIT"
 repository = "https://github.com/dusterbloom/nanobot-rs"
+default-run = "nanobot"
 
 [[bin]]
 name = "nanobot"
 path = "src/main.rs"
+
+[[bin]]
+name = "trio_bench"
+path = "src/bin/trio_bench.rs"
 
 [dependencies]
 # Async runtime

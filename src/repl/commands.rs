@@ -2406,20 +2406,21 @@ pub(crate) fn pick_trio_models(
 ///
 /// Returns `true` when all conditions hold:
 /// - Running in local mode (`is_local`)
-/// - Both router and specialist models are configured (non-empty)
+/// - Both router and specialist are configured (non-empty model name OR explicit endpoint)
 /// - Not already in `DelegationMode::Trio`
 pub(crate) fn should_auto_activate_trio(
     is_local: bool,
     router_model: &str,
     specialist_model: &str,
+    has_router_endpoint: bool,
+    has_specialist_endpoint: bool,
     current_mode: &crate::config::schema::DelegationMode,
 ) -> bool {
     use crate::config::schema::DelegationMode;
 
-    is_local
-        && !router_model.is_empty()
-        && !specialist_model.is_empty()
-        && *current_mode != DelegationMode::Trio
+    let has_router = !router_model.is_empty() || has_router_endpoint;
+    let has_specialist = !specialist_model.is_empty() || has_specialist_endpoint;
+    is_local && has_router && has_specialist && *current_mode != DelegationMode::Trio
 }
 
 /// Disable trio mode on a Config, switching to inline (single model).
@@ -3122,6 +3123,8 @@ mod tests {
             true,
             "qwen3-1.7b",
             "ministral-3-8b",
+            false,
+            false,
             &DelegationMode::Delegated,
         ));
     }
@@ -3133,6 +3136,8 @@ mod tests {
             false,
             "qwen3-1.7b",
             "ministral-3-8b",
+            false,
+            false,
             &DelegationMode::Delegated,
         ));
     }
@@ -3144,6 +3149,8 @@ mod tests {
             true,
             "",
             "ministral-3-8b",
+            false,
+            false,
             &DelegationMode::Delegated,
         ));
     }
@@ -3155,6 +3162,8 @@ mod tests {
             true,
             "qwen3-1.7b",
             "",
+            false,
+            false,
             &DelegationMode::Delegated,
         ));
     }
@@ -3166,6 +3175,8 @@ mod tests {
             true,
             "qwen3-1.7b",
             "ministral-3-8b",
+            false,
+            false,
             &DelegationMode::Trio,
         ));
     }
@@ -3177,7 +3188,26 @@ mod tests {
             true,
             "",
             "",
+            false,
+            false,
             &DelegationMode::Delegated,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_with_explicit_endpoints() {
+        use crate::config::schema::DelegationMode;
+        // Empty GGUF model names but explicit endpoints → should activate
+        assert!(should_auto_activate_trio(
+            true, "", "", true, true, &DelegationMode::Delegated,
+        ));
+        // Neither GGUF nor endpoints → should NOT activate
+        assert!(!should_auto_activate_trio(
+            true, "", "", false, false, &DelegationMode::Delegated,
+        ));
+        // GGUF models (no endpoint) → still activates (existing behavior preserved)
+        assert!(should_auto_activate_trio(
+            true, "router.gguf", "spec.gguf", false, false, &DelegationMode::Delegated,
         ));
     }
 
@@ -3311,6 +3341,8 @@ mod tests {
             true,
             &config.trio.router_model,
             &config.trio.specialist_model,
+            false,
+            false,
             &DelegationMode::Delegated,
         ));
 
