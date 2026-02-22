@@ -365,7 +365,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         let mem_provider: Arc<dyn LLMProvider> = if let Some(ref mem_provider_cfg) =
             memory_config.provider
         {
-            crate::providers::factory::from_provider_config(mem_provider_cfg)
+            crate::providers::factory::from_provider_config_for_model(mem_provider_cfg, Some(&mem_model))
         } else if let Some(ref sp) = specialist_provider {
             // Reuse trio specialist provider when no explicit memory provider.
             sp.clone()
@@ -391,7 +391,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         };
         let mem_provider: Arc<dyn LLMProvider> =
             if let Some(ref mem_provider_cfg) = memory_config.provider {
-                crate::providers::factory::from_provider_config(mem_provider_cfg)
+                crate::providers::factory::from_provider_config_for_model(mem_provider_cfg, Some(&mem_model))
             } else {
                 provider.clone()
             };
@@ -423,7 +423,12 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         let tr_provider: Arc<dyn LLMProvider> = if let Some(dp) = delegation_provider {
             dp // Auto-spawned local delegation server
         } else if let Some(ref tr_cfg) = tool_delegation.provider {
-            crate::providers::factory::from_provider_config(tr_cfg)
+            let model_hint = if !tool_delegation.model.is_empty() {
+                Some(tool_delegation.model.as_str())
+            } else {
+                None
+            };
+            crate::providers::factory::from_provider_config_for_model(tr_cfg, model_hint)
         } else {
             provider.clone() // Fallback to main
         };

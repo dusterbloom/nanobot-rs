@@ -80,18 +80,32 @@ fn is_local_base(base: &str) -> bool {
     base.contains("localhost") || base.contains("127.0.0.1")
 }
 
+/// Check whether a model name belongs to the Claude family.
+fn is_claude_model(model: &str) -> bool {
+    model.starts_with("claude")
+}
+
 /// Create a provider from a `ProviderConfig` with `localhost:8080` fallback.
 ///
 /// Routing rules (applied in order):
 /// 1. `api_base` contains `localhost` / `127.0.0.1` → OpenAICompat (local server).
-/// 2. `api_key` starts with `sk-ant-` → AnthropicProvider (native Messages API).
+/// 2. `api_key` starts with `sk-ant-` AND model is Claude (or unspecified) → AnthropicProvider.
 /// 3. Otherwise → OpenAICompat (safe fallback for all other cloud providers).
 ///
-/// This ensures tool-delegation and memory providers use a compatible wire
-/// format. Previously this always returned OpenAICompat, which broke when the
-/// configured key was an Anthropic key but the target model was a Mistral or
-/// other non-Anthropic model served via the OpenAI-compat endpoint.
+/// The model hint prevents misrouting non-Claude models (e.g. ministral) to
+/// the Anthropic Messages API, which would 404.
 pub fn from_provider_config(cfg: &ProviderConfig) -> Arc<dyn LLMProvider> {
+    from_provider_config_for_model(cfg, None)
+}
+
+/// Model-aware variant of [`from_provider_config`].
+///
+/// When the target `model` is known at the call site, pass it here so the
+/// routing logic can avoid sending non-Claude models to the Anthropic API.
+pub fn from_provider_config_for_model(
+    cfg: &ProviderConfig,
+    model: Option<&str>,
+) -> Arc<dyn LLMProvider> {
     // Rule 1: explicit local base URL → always OpenAICompat.
     if let Some(ref base) = cfg.api_base {
         if is_local_base(base) {
@@ -99,9 +113,18 @@ pub fn from_provider_config(cfg: &ProviderConfig) -> Arc<dyn LLMProvider> {
         }
     }
 
-    // Rule 2: Anthropic API key → native AnthropicProvider.
+    // Rule 2: Anthropic API key + Claude model (or no model specified) → AnthropicProvider.
     if cfg.api_key.starts_with("sk-ant-") {
-        return create_anthropic(&cfg.api_key, None);
+        let use_anthropic = match model {
+            Some(m) => is_claude_model(m),
+            None => true, // No model hint → assume Claude (backward compat).
+        };
+        if use_anthropic {
+            return create_anthropic(&cfg.api_key, model);
+        }
+        // Non-Claude model with Anthropic key → fall through to OpenAICompat.
+        // The key won't authenticate against localhost, but the caller should
+        // have configured an api_base for non-Claude models.
     }
 
     // Rule 3: default – OpenAICompat with localhost:8080 fallback.
@@ -268,5 +291,116 @@ mod tests {
         assert!(!is_local_base("https://api.anthropic.com/v1"));
         assert!(!is_local_base("https://openrouter.ai/api/v1"));
         assert!(!is_local_base("https://api.openai.com/v1"));
+    }
+
+    // --- Model-aware routing tests (from_provider_config_for_model) ---
+
+    #[test]
+    fn test_anthropic_key_with_claude_model_uses_anthropic() {
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model(&cfg, Some("claude-3-haiku-20240307"));
+        // AnthropicProvider has no api_base or returns the Anthropic URL.
+        let base = provider.get_api_base();
+        if let Some(b) = base {
+            assert!(
+                b.contains("anthropic"),
+                "Claude model + Anthropic key should route to Anthropic, got: {}",
+                b
+            );
+        }
+        // Also: the default model should be set.
+        assert_eq!(provider.get_default_model(), "claude-3-haiku-20240307");
+    }
+
+    #[test]
+    fn test_anthropic_key_with_non_claude_model_uses_openai_compat() {
+        // THIS IS THE BUG: sk-ant-* + ministral was being sent to Anthropic → 404
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model(&cfg, Some("ministral-3-8b-instruct-2512"));
+        // Should NOT be Anthropic — should be OpenAICompat.
+        let base = provider.get_api_base();
+        assert!(
+            base.is_some(),
+            "Non-Claude model should use OpenAICompat (which has an api_base)"
+        );
+        let b = base.unwrap();
+        assert!(
+            !b.contains("anthropic"),
+            "ministral should NOT be routed to Anthropic, got: {}",
+            b
+        );
+    }
+
+    #[test]
+    fn test_anthropic_key_with_gemma_model_uses_openai_compat() {
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model(&cfg, Some("gemma-2-9b-it"));
+        let base = provider.get_api_base();
+        assert!(base.is_some(), "gemma should use OpenAICompat");
+    }
+
+    #[test]
+    fn test_anthropic_key_no_model_hint_uses_anthropic() {
+        // Backward compat: no model → assume Claude.
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model(&cfg, None);
+        let base = provider.get_api_base();
+        // Should be Anthropic (None base or anthropic URL).
+        if let Some(b) = &base {
+            assert!(!is_local_base(b), "No model hint + Anthropic key should not go to localhost");
+        }
+    }
+
+    #[test]
+    fn test_local_base_overrides_model_hint() {
+        // Local base always wins, even with Claude model.
+        let cfg = ProviderConfig {
+            api_key: "sk-ant-api03-abc123".to_string(),
+            api_base: Some("http://localhost:1234/v1".to_string()),
+        };
+        let provider = from_provider_config_for_model(&cfg, Some("claude-3-haiku-20240307"));
+        assert_eq!(
+            provider.get_api_base().as_deref(),
+            Some("http://localhost:1234/v1"),
+            "Local base should override Anthropic key even for Claude model"
+        );
+    }
+
+    #[test]
+    fn test_non_anthropic_key_with_any_model_uses_openai_compat() {
+        let cfg = ProviderConfig {
+            api_key: "sk-or-test123".to_string(),
+            api_base: None,
+        };
+        let provider = from_provider_config_for_model(&cfg, Some("ministral-3-8b-instruct-2512"));
+        let base = provider.get_api_base();
+        assert_eq!(
+            base.as_deref(),
+            Some("http://localhost:8080/v1"),
+            "Non-Anthropic key should always use OpenAICompat"
+        );
+    }
+
+    #[test]
+    fn test_is_claude_model() {
+        assert!(is_claude_model("claude-3-haiku-20240307"));
+        assert!(is_claude_model("claude-sonnet-4-20250514"));
+        assert!(is_claude_model("claude-opus-4-20250514"));
+        assert!(!is_claude_model("ministral-3-8b-instruct-2512"));
+        assert!(!is_claude_model("gemma-2-9b-it"));
+        assert!(!is_claude_model("llama-3.3-70b"));
+        assert!(!is_claude_model("gpt-4o"));
     }
 }
