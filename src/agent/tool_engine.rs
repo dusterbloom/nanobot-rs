@@ -72,11 +72,11 @@ pub(crate) async fn execute_tools_delegated(
         .map(|c| c.contains("[VERBATIM]"))
         .unwrap_or(false);
 
-    // The delegation model has a small context (8K tokens).
-    // Cap tool results to ~750 tokens (~3000 chars) so the system
-    // prompt, tool call messages, and response all fit comfortably.
+    // Delegation models (Qwen, Nemotron, Claude) typically have 8K+ context.
+    // Cap tool results to ~2000 tokens (~8000 chars) to allow meaningful content
+    // while leaving room for system prompt, tool calls, and response.
     // Use the main model's limit only if it's already smaller.
-    let delegation_result_limit = ctx.core.max_tool_result_chars.min(3000);
+    let delegation_result_limit = ctx.core.max_tool_result_chars.min(8000);
 
     let runner_config = ToolRunnerConfig {
         provider: tr_provider.clone(),
@@ -313,7 +313,7 @@ pub(crate) async fn execute_tools_delegated(
             let extra = tool_runner::format_results_for_context(
                 &run_result,
                 preview_max,
-                None, // TODO: wire ContentGate here
+                Some(&mut ctx.content_gate),  // Wire ContentGate for budget-aware truncation
             );
             format!(
                 "[Tool runner executed {} additional calls]\n{}",
