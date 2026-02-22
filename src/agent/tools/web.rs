@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use html2md::rewrite_html;
 use regex::Regex;
 use reqwest::Client;
 use url::Url;
@@ -447,7 +448,7 @@ fn fallback_extract(html: &str, mode: &str) -> String {
         if let Ok(sel) = Selector::parse(sel_str) {
             if let Some(el) = document.select(&sel).next() {
                 body_text = if mode == "markdown" {
-                    html_to_markdown_simple(&el.html())
+                    rewrite_html(&el.html(), false)
                 } else {
                     el.text().collect::<Vec<_>>().join(" ")
                 };
@@ -471,43 +472,6 @@ fn fallback_extract(html: &str, mode: &str) -> String {
     }
 }
 
-/// Very simple HTML-to-markdown converter.
-fn html_to_markdown_simple(html: &str) -> String {
-    // Convert links.
-    let re_links =
-        Regex::new(r#"(?is)<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>"#).unwrap();
-    let text = re_links.replace_all(html, |caps: &regex::Captures| {
-        let href = &caps[1];
-        let inner = strip_tags(&caps[2]);
-        format!("[{}]({})", inner, href)
-    });
-
-    // Convert headings (h1-h6). We can't use backreferences (\1) in the regex
-    // crate, so we match any closing </hN> and extract the level from the opening tag.
-    let re_headings = Regex::new(r"(?is)<h([1-6])[^>]*>([\s\S]*?)</h[1-6]>").unwrap();
-    let text = re_headings.replace_all(&text, |caps: &regex::Captures| {
-        let level: usize = caps[1].parse().unwrap_or(1);
-        let inner = strip_tags(&caps[2]);
-        format!("\n{} {}\n", "#".repeat(level), inner)
-    });
-
-    // Convert list items.
-    let re_li = Regex::new(r"(?is)<li[^>]*>([\s\S]*?)</li>").unwrap();
-    let text = re_li.replace_all(&text, |caps: &regex::Captures| {
-        let inner = strip_tags(&caps[1]);
-        format!("\n- {}", inner)
-    });
-
-    // Convert block-end tags to newlines.
-    let re_block = Regex::new(r"(?i)</(p|div|section|article)>").unwrap();
-    let text = re_block.replace_all(&text, "\n\n");
-
-    // Convert br/hr.
-    let re_br = Regex::new(r"(?i)<(br|hr)\s*/?>").unwrap();
-    let text = re_br.replace_all(&text, "\n");
-
-    normalize_whitespace(&strip_tags(&text))
-}
 
 #[cfg(test)]
 mod tests {
@@ -668,59 +632,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // html_to_markdown_simple tests
+    // fallback_extract markdown conversion tests (via rewrite_html)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_html_to_markdown_headings() {
-        let html = "<h1>Title</h1><h2>Subtitle</h2>";
-        let result = html_to_markdown_simple(html);
-        assert!(result.contains("# Title"), "result: {}", result);
-        assert!(result.contains("## Subtitle"), "result: {}", result);
+    fn test_fallback_extract_headings() {
+        let html = "<html><body><h1>Title</h1><h2>Subtitle</h2></body></html>";
+        let result = fallback_extract(html, "markdown");
+        assert!(result.contains("Title"), "result should contain heading text: {}", result);
+        assert!(result.contains("Subtitle"), "result should contain subheading text: {}", result);
     }
 
     #[test]
-    fn test_html_to_markdown_links() {
-        let html = r#"<a href="https://example.com">Example</a>"#;
-        let result = html_to_markdown_simple(html);
-        assert!(
-            result.contains("[Example](https://example.com)"),
-            "result: {}",
-            result
-        );
+    fn test_fallback_extract_links() {
+        let html = r#"<html><body><a href="https://example.com">Example</a></body></html>"#;
+        let result = fallback_extract(html, "markdown");
+        assert!(result.contains("Example"), "result should contain link text: {}", result);
+        assert!(result.contains("https://example.com"), "result should contain URL: {}", result);
     }
 
     #[test]
-    fn test_html_to_markdown_list_items() {
-        let html = "<ul><li>First</li><li>Second</li></ul>";
-        let result = html_to_markdown_simple(html);
-        assert!(result.contains("- First"), "result: {}", result);
-        assert!(result.contains("- Second"), "result: {}", result);
+    fn test_fallback_extract_list_items() {
+        let html = "<html><body><ul><li>First</li><li>Second</li></ul></body></html>";
+        let result = fallback_extract(html, "markdown");
+        assert!(result.contains("First"), "result should contain first item: {}", result);
+        assert!(result.contains("Second"), "result should contain second item: {}", result);
     }
 
     #[test]
-    fn test_html_to_markdown_paragraphs() {
-        let html = "<p>First paragraph</p><p>Second paragraph</p>";
-        let result = html_to_markdown_simple(html);
+    fn test_fallback_extract_paragraphs() {
+        let html = "<html><body><p>First paragraph</p><p>Second paragraph</p></body></html>";
+        let result = fallback_extract(html, "markdown");
         assert!(result.contains("First paragraph"), "result: {}", result);
         assert!(result.contains("Second paragraph"), "result: {}", result);
     }
 
     #[test]
-    fn test_html_to_markdown_br() {
-        let html = "line1<br/>line2";
-        let result = html_to_markdown_simple(html);
-        assert!(result.contains("line1"), "result: {}", result);
-        assert!(result.contains("line2"), "result: {}", result);
+    fn test_fallback_extract_no_raw_tags() {
+        let html = "<html><body><div><span>text content</span></div></body></html>";
+        let result = fallback_extract(html, "markdown");
+        assert!(result.contains("text content"), "result should contain text: {}", result);
+        assert!(!result.contains("<span>"), "result should not contain raw span tags: {}", result);
+        assert!(!result.contains("<div>"), "result should not contain raw div tags: {}", result);
     }
 
     #[test]
-    fn test_html_to_markdown_strips_remaining_tags() {
-        let html = "<div><span>text</span></div>";
-        let result = html_to_markdown_simple(html);
-        assert!(result.contains("text"), "result: {}", result);
-        assert!(!result.contains("<span>"), "result: {}", result);
-        assert!(!result.contains("<div>"), "result: {}", result);
+    fn test_fallback_extract_text_mode_no_markdown() {
+        let html = "<html><body><h1>Heading</h1><p>Paragraph text</p></body></html>";
+        let result = fallback_extract(html, "text");
+        assert!(result.contains("Heading"), "result should contain heading text: {}", result);
+        assert!(result.contains("Paragraph text"), "result should contain paragraph: {}", result);
     }
 
     // -----------------------------------------------------------------------
