@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 use tracing::debug;
 
+use super::is_synthetic_injection;
+
 const TRUNCATED_ASSISTANT_PLACEHOLDER: &str = "[assistant message truncated]";
 
 pub fn hygiene_pipeline(messages: &mut Vec<Value>, keep_last_messages: usize) {
@@ -88,7 +90,14 @@ pub fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
 
     for message in messages.drain(..) {
         if let Some(prev) = merged.last_mut() {
-            if get_role(prev) == get_role(&message) && get_role(&message) != "tool" {
+            // Never merge tool-role messages (OpenAI protocol).
+            // Never merge synthetic router/specialist injections — they must
+            // remain as distinct messages so the model can see both the user's
+            // original prompt and the injected tool result separately.
+            let same_role = get_role(prev) == get_role(&message) && get_role(&message) != "tool";
+            let either_synthetic = is_synthetic_injection(prev) || is_synthetic_injection(&message);
+
+            if same_role && !either_synthetic {
                 let prev_content = get_content(prev);
                 let msg_content = get_content(&message);
                 let combined = format!("{}\n{}", prev_content, msg_content);
@@ -483,6 +492,70 @@ mod tests {
 
         let remaining_results: Vec<_> = messages.iter().filter(|m| get_role(m) == "tool").collect();
         assert!(remaining_results.len() <= 2);
+    }
+
+    // Router tool injections tagged with _synthetic should NOT be merged with the preceding user prompt
+    #[test]
+    fn test_router_tool_injection_not_merged_with_user_prompt() {
+        let mut messages = vec![
+            user_message("Fetch https://news.ycombinator.com and summarize top 5"),
+            json!({
+                "role": "user",
+                "content": "[router:tool:web_fetch] <html>Hacker News content...</html>",
+                "_synthetic": true
+            }),
+        ];
+        merge_consecutive_same_role(&mut messages);
+
+        // The user's original prompt must remain in a SEPARATE message from the tool result.
+        // The _synthetic flag prevents the merge function from combining them.
+        assert_eq!(
+            messages.len(),
+            2,
+            "router:tool injection must stay in its own message, not merged with user prompt"
+        );
+        let first_content = messages[0]["content"].as_str().unwrap();
+        let second_content = messages[1]["content"].as_str().unwrap();
+        assert!(
+            first_content.contains("Fetch https://news.ycombinator.com"),
+            "user prompt must be in the first message"
+        );
+        assert!(
+            second_content.contains("[router:tool:web_fetch]"),
+            "router tool injection must be in the second message"
+        );
+    }
+
+    // RED: specialist injections tagged with _synthetic should NOT be merged
+    #[test]
+    fn test_specialist_injection_not_merged_with_user_prompt() {
+        let mut messages = vec![
+            user_message("Original question"),
+            json!({
+                "role": "user",
+                "content": "[specialist:coding] Here is the specialist result...",
+                "_synthetic": true
+            }),
+        ];
+        merge_consecutive_same_role(&mut messages);
+
+        // The specialist injection should stay separate from the user's original question.
+        // This test will FAIL because merge_consecutive_same_role does not check _synthetic.
+        assert_eq!(
+            messages.len(),
+            2,
+            "specialist injection must stay in its own message, not merged with user prompt"
+        );
+        let first_content = messages[0]["content"].as_str().unwrap();
+        let second_content = messages[1]["content"].as_str().unwrap();
+        assert!(
+            first_content.contains("Original question"),
+            "user prompt must be in the first message"
+        );
+        assert!(
+            second_content.contains("[specialist:coding]"),
+            "specialist injection must be in the second message"
+        );
     }
 
     #[test]

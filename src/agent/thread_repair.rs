@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use std::sync::LazyLock;
 use tracing::{debug, warn};
 
+use super::is_synthetic_injection;
+
 static STRIP_TOOL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[Called\s+\w+\([^]]*\)\]\s*").expect("Invalid strip tool pattern regex")
 });
@@ -232,13 +234,20 @@ fn fix_orphaned_tool_results(messages: &mut Vec<Value>) {
 }
 
 /// Merge consecutive messages with the given role into a single message.
+///
+/// Synthetic router/specialist injection messages are never merged even if
+/// their role matches the adjacent message — they must remain distinct so
+/// the model sees both the user's original prompt and the injected result.
 fn merge_consecutive_role(messages: &mut Vec<Value>, role: &str) {
     let mut i = 0;
     while i + 1 < messages.len() {
         let is_role = messages[i].get("role").and_then(|r| r.as_str()) == Some(role);
         let next_is_role = messages[i + 1].get("role").and_then(|r| r.as_str()) == Some(role);
 
-        if is_role && next_is_role {
+        let either_synthetic =
+            is_synthetic_injection(&messages[i]) || is_synthetic_injection(&messages[i + 1]);
+
+        if is_role && next_is_role && !either_synthetic {
             let next_content = messages[i + 1]
                 .get("content")
                 .and_then(|c| c.as_str())

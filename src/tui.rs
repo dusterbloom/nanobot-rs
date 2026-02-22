@@ -549,7 +549,7 @@ pub(crate) fn print_startup_splash(local_port: &str, is_local: bool) {
     }
     println!(
         "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}",
-        crate::VERSION
+        env!("CARGO_PKG_VERSION")
     );
     println!();
 

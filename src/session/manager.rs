@@ -106,6 +106,10 @@ impl Session {
 
         self.messages[safe_start..]
             .iter()
+            .filter(|m| {
+                // Skip synthetic router/specialist injections — ephemeral to the turn they were created
+                !m.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+            })
             .map(|m| {
                 let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                 let mut msg = json!({
@@ -771,5 +775,72 @@ mod tests {
         
         // Should have carried over last 10 messages
         assert!(history.len() <= 10, "After rotation should have at most 10 messages, got {}", history.len());
+    }
+
+    #[test]
+    fn test_get_history_filters_synthetic_flag() {
+        let mut session = Session::new("test_synthetic_flag");
+        session.messages.push(json!({"role": "user", "content": "hello"}));
+        session.messages.push(json!({"role": "assistant", "content": "hi"}));
+        session.messages.push(json!({"role": "user", "content": "injected", "_synthetic": true}));
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["content"], "hi");
+    }
+
+    #[test]
+    fn test_get_history_filters_router_prefix() {
+        // Router injections are identified by the _synthetic flag, not by prefix.
+        let mut session = Session::new("test_router_prefix");
+        session.messages.push(json!({"role": "user", "content": "search something"}));
+        session.messages.push(json!({"role": "user", "content": "[router:tool:web_fetch] <html>big page</html>", "_synthetic": true}));
+        session.messages.push(json!({"role": "assistant", "content": "here are results"}));
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "search something");
+        assert_eq!(history[1]["content"], "here are results");
+    }
+
+    #[test]
+    fn test_get_history_filters_specialist_prefix() {
+        // Specialist injections are identified by the _synthetic flag, not by prefix.
+        let mut session = Session::new("test_specialist_prefix");
+        session.messages.push(json!({"role": "user", "content": "explain code"}));
+        session.messages.push(json!({"role": "user", "content": "[specialist:coding] Here is my analysis of the code...", "_synthetic": true}));
+        session.messages.push(json!({"role": "assistant", "content": "done"}));
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "explain code");
+        assert_eq!(history[1]["content"], "done");
+    }
+
+    #[test]
+    fn test_get_history_keeps_normal_messages() {
+        let mut session = Session::new("test_normal_messages");
+        session.messages.push(json!({"role": "user", "content": "hello"}));
+        session.messages.push(json!({"role": "assistant", "content": "world"}));
+        session.messages.push(json!({"role": "user", "content": "how are you?"}));
+        session.messages.push(json!({"role": "assistant", "content": "fine"}));
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn test_get_history_filters_mixed() {
+        // Only messages with _synthetic: true are filtered.
+        let mut session = Session::new("test_mixed");
+        session.messages.push(json!({"role": "user", "content": "real question"}));
+        session.messages.push(json!({"role": "user", "content": "[specialist:coding] long analysis...", "_synthetic": true}));
+        session.messages.push(json!({"role": "user", "content": "[router:tool:web_fetch] <html>...</html>", "_synthetic": true}));
+        session.messages.push(json!({"role": "assistant", "content": "real answer"}));
+        session.messages.push(json!({"role": "user", "content": "follow up"}));
+        session.messages.push(json!({"role": "assistant", "content": "follow up answer"}));
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0]["content"], "real question");
+        assert_eq!(history[1]["content"], "real answer");
+        assert_eq!(history[2]["content"], "follow up");
+        assert_eq!(history[3]["content"], "follow up answer");
     }
 }

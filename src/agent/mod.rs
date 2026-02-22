@@ -1,3 +1,10 @@
+/// Returns true if a message is a synthetic router/specialist injection that
+/// must not be merged with adjacent messages. Synthetic messages carry a
+/// `_synthetic: true` field.
+pub(crate) fn is_synthetic_injection(message: &serde_json::Value) -> bool {
+    message.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 pub mod agent_core;
 pub mod agent_loop;
 pub mod agent_profiles;
