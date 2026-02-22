@@ -28,7 +28,7 @@ use crate::providers::base::{LLMProvider, ToolCallRequest};
 /// place of old messages, so this naturally includes compressed context.
 /// Search backwards through recent messages for a scratch pad summary.
 /// Returns the summary text if found, otherwise None.
-fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
+pub(crate) fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
     for msg in messages.iter().rev().take(10) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -62,7 +62,7 @@ fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
     None
 }
 
-fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
+pub(crate) fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
     let mut pairs: Vec<(Option<&str>, Option<&str>)> = Vec::new();
     let mut current_user: Option<&str> = None;
 
@@ -1147,3 +1147,520 @@ pub(crate) async fn route_tool_calls(
     ctx.flow.consecutive_all_blocked = 0;
     RouteResult::Execute(allowed_calls)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── A. extract_json_object ────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_json_object_valid() {
+        let raw = r#"{"action":"respond","confidence":0.9}"#;
+        let result = extract_json_object(raw);
+        assert!(result.is_some(), "valid JSON object should be extracted");
+        assert_eq!(result.unwrap(), raw);
+    }
+
+    #[test]
+    fn test_extract_json_object_markdown_wrapped() {
+        let raw = "```json\n{\"action\":\"respond\"}\n```";
+        let result = extract_json_object(raw);
+        assert!(result.is_some(), "markdown-wrapped JSON should be extracted");
+        assert_eq!(result.unwrap(), r#"{"action":"respond"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_object_nested_braces() {
+        let raw = r#"{"outer":{"inner":"val"},"confidence":0.9}"#;
+        let result = extract_json_object(raw);
+        assert!(result.is_some(), "nested braces should be handled");
+        assert_eq!(result.unwrap(), raw);
+    }
+
+    #[test]
+    fn test_extract_json_object_no_json() {
+        let raw = "just plain text";
+        let result = extract_json_object(raw);
+        assert!(result.is_none(), "plain text should return None");
+    }
+
+    #[test]
+    fn test_extract_json_object_empty_string() {
+        let result = extract_json_object("");
+        assert!(result.is_none(), "empty string should return None");
+    }
+
+    #[test]
+    fn test_extract_json_object_empty_braces() {
+        let result = extract_json_object("{}");
+        assert!(result.is_some(), "empty object {{}} is valid");
+        assert_eq!(result.unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_extract_json_object_with_surrounding_text() {
+        let raw = r#"Here is the result: {"action":"tool","target":"read_file"} end."#;
+        let result = extract_json_object(raw);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), r#"{"action":"tool","target":"read_file"}"#);
+    }
+
+    // ── B. parse_lenient_router_decision ─────────────────────────────────────
+    //
+    // Key implementation notes:
+    // - normalize_action only recognizes: "tool" | "subagent" | "specialist" | "ask_user"
+    //   All other actions (including "respond") fall through and get remapped to "tool"
+    // - Lenient path falls back target="" to "clarify" by default (via unwrap_or_else)
+    // - strict_router_decision_strict rejects: empty target (unless action=="respond"),
+    //   out-of-range confidence, and unknown actions
+    // - "respond" action is NOT handled in the lenient path (only in the strict JSON path
+    //   invoked by request_strict_router_decision, not by parse_lenient_router_decision)
+
+    #[test]
+    fn test_parse_lenient_strict_json_respond() {
+        // "respond" with empty target: normalize_action maps "respond" -> "tool",
+        // then strict validation fails because "tool" requires non-empty target.
+        // The lenient parser returns None for respond-action inputs.
+        let raw = r#"{"action":"respond","target":"","args":{},"confidence":0.95}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "parse_lenient_router_decision does not handle 'respond' action (normalize maps it to 'tool' which fails empty-target check)"
+        );
+    }
+
+    #[test]
+    fn test_parse_lenient_strict_json_specialist() {
+        // "specialist" IS in the normalize_action known set, and target is non-empty.
+        let raw = r#"{"action":"specialist","target":"coding","args":{},"confidence":0.9}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "valid specialist JSON should parse");
+        let d = result.unwrap();
+        assert_eq!(d.action, "specialist");
+        assert_eq!(d.target, "coding");
+    }
+
+    #[test]
+    fn test_parse_lenient_comma_separated_specialist() {
+        // Comma-separated path: "specialist,coding,{...}" — action,target,args
+        // normalize_action("specialist", "coding", ...) = "specialist"
+        // strict: specialist+coding+0.9 => Ok
+        let raw = r#"specialist,coding,{"confidence":0.9}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "comma-separated specialist should parse");
+        assert_eq!(result.unwrap().action, "specialist");
+    }
+
+    #[test]
+    fn test_parse_lenient_embedded_marker() {
+        // "[specialist:coding] Here is the answer" — no comma path, no "action" key.
+        // extract_quoted falls back to default "tool". extract_quoted("target") = None -> "clarify".
+        // normalize_action("tool","clarify",{}) = "tool".
+        // strict: tool+clarify+0.5 => Ok.
+        // So this returns Some(action="tool", target="clarify").
+        let raw = "[specialist:coding] Here is the answer";
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "embedded marker falls through to lenient fallback: Some");
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool", "lenient fallback normalizes to 'tool'");
+        assert_eq!(d.target, "clarify", "lenient fallback target defaults to 'clarify'");
+    }
+
+    #[test]
+    fn test_parse_lenient_malformed_garbage_returns_some_tool() {
+        // Garbage text: no "action" key found, defaults to action="tool", target="clarify".
+        // strict: tool+clarify+0.5 => Ok. Returns Some(action="tool").
+        let raw = "this is not valid at all!!!";
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_some(),
+            "garbage with no action/target falls back to tool+clarify which passes strict"
+        );
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool");
+        assert_eq!(d.target, "clarify");
+    }
+
+    #[test]
+    fn test_parse_lenient_empty_string_returns_some_tool() {
+        // Same fallback: no keys found -> action="tool", target="clarify".
+        let result = parse_lenient_router_decision("");
+        assert!(
+            result.is_some(),
+            "empty string falls back to tool+clarify which passes strict validation"
+        );
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool");
+        assert_eq!(d.target, "clarify");
+    }
+
+    #[test]
+    fn test_parse_lenient_unknown_action_frobnicate() {
+        // "frobnicate" action with empty target:
+        // extract_quoted("action") = "frobnicate", normalize_action -> "tool" (not in known set)
+        // extract_quoted("target") = "" -> stays as ""
+        // strict: "tool" with empty target -> Err (target cannot be empty for non-respond)
+        // Returns None.
+        let raw = r#"{"action":"frobnicate","target":"","args":{},"confidence":0.5}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "unknown action with empty target normalizes to tool with empty target, which fails strict validation"
+        );
+    }
+
+    // ── C. find_scratch_pad_summary_in_messages ───────────────────────────────
+
+    #[test]
+    fn test_find_summary_tool_runner_marker() {
+        let msgs = vec![
+            json!({"role": "user", "content": "[tool runner summary] found 5 files"}),
+        ];
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert_eq!(result, Some("found 5 files".to_string()));
+    }
+
+    #[test]
+    fn test_find_summary_tool_analysis_marker() {
+        let msgs = vec![
+            json!({"role": "tool", "content": "[Tool analysis summary]\nSome analysis\n\n[Full output: 10 lines]"}),
+        ];
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert_eq!(result, Some("Some analysis".to_string()));
+    }
+
+    #[test]
+    fn test_find_summary_no_markers() {
+        let msgs = vec![
+            json!({"role": "user", "content": "Hello, how are you?"}),
+            json!({"role": "assistant", "content": "I'm doing well, thanks!"}),
+        ];
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert!(result.is_none(), "no markers should return None");
+    }
+
+    #[test]
+    fn test_find_summary_beyond_10_message_window() {
+        // Summary message at position 11 from the end — outside the 10-message window.
+        let mut msgs: Vec<Value> = Vec::new();
+        // First message (index 0) has the summary, but we'll add 11 more after it
+        msgs.push(json!({"role": "user", "content": "[tool runner summary] early summary"}));
+        // Push 11 more messages to push the summary outside the window
+        for i in 0..11 {
+            msgs.push(json!({"role": "assistant", "content": format!("message {}", i)}));
+        }
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert!(result.is_none(), "summary outside 10-message window should return None");
+    }
+
+    #[test]
+    fn test_find_summary_empty_messages() {
+        let result = find_scratch_pad_summary_in_messages(&[]);
+        assert!(result.is_none(), "empty messages should return None");
+    }
+
+    #[test]
+    fn test_find_summary_within_10_message_window() {
+        // Summary at exactly position 10 from the end (within window).
+        let mut msgs: Vec<Value> = Vec::new();
+        msgs.push(json!({"role": "user", "content": "[tool runner summary] recent summary"}));
+        // Push 9 more messages — summary is now at index 0, 10 messages total.
+        for i in 0..9 {
+            msgs.push(json!({"role": "assistant", "content": format!("reply {}", i)}));
+        }
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert_eq!(result, Some("recent summary".to_string()));
+    }
+
+    #[test]
+    fn test_find_summary_tool_analysis_multiline() {
+        // Multi-line summary with [Full output:...] section stripped
+        let content = "[Tool analysis summary]\nLine one\nLine two\n\n[Full output: lots of data]";
+        let msgs = vec![json!({"role": "tool", "content": content})];
+        let result = find_scratch_pad_summary_in_messages(&msgs);
+        assert_eq!(result, Some("Line one\nLine two".to_string()));
+    }
+
+    // ── D. build_conversation_tail ────────────────────────────────────────────
+
+    #[test]
+    fn test_build_tail_normal_pairs() {
+        let msgs = vec![
+            json!({"role": "user", "content": "Hello there"}),
+            json!({"role": "assistant", "content": "Hi back"}),
+            json!({"role": "user", "content": "How are you"}),
+            json!({"role": "assistant", "content": "Doing well"}),
+        ];
+        let result = build_conversation_tail(&msgs, 5, 1000, 10_000);
+        assert!(result.contains("User:"), "should contain User: prefix");
+        assert!(result.contains("Hello there"), "should contain first user message");
+        assert!(result.contains("How are you"), "should contain second user message");
+        assert!(result.contains("Hi back"), "should contain assistant response");
+    }
+
+    #[test]
+    fn test_build_tail_oversized_message_gets_truncated() {
+        let long_msg = "A".repeat(500);
+        let msgs = vec![
+            json!({"role": "user", "content": long_msg}),
+            json!({"role": "assistant", "content": "Short reply"}),
+        ];
+        // max_msg_chars = 100
+        let result = build_conversation_tail(&msgs, 5, 100, 10_000);
+        assert!(result.contains("User:"), "should contain User: prefix");
+        assert!(result.contains('…'), "truncated message should end with ellipsis");
+        // The user message should be truncated to ~100 chars + ellipsis
+        let user_line = result.lines().find(|l| l.starts_with("User:")).unwrap();
+        assert!(user_line.len() <= 120, "truncated line should not be too long");
+    }
+
+    #[test]
+    fn test_build_tail_system_and_tool_roles_skipped() {
+        let msgs = vec![
+            json!({"role": "system", "content": "You are a helpful assistant."}),
+            json!({"role": "tool", "content": "Tool result data"}),
+            json!({"role": "tool_call", "content": "function call"}),
+        ];
+        let result = build_conversation_tail(&msgs, 5, 1000, 10_000);
+        assert!(result.is_empty(), "system and tool messages should be skipped");
+    }
+
+    #[test]
+    fn test_build_tail_max_pairs_limits_output() {
+        let msgs = vec![
+            json!({"role": "user", "content": "First question"}),
+            json!({"role": "assistant", "content": "First answer"}),
+            json!({"role": "user", "content": "Second question"}),
+            json!({"role": "assistant", "content": "Second answer"}),
+            json!({"role": "user", "content": "Third question"}),
+            json!({"role": "assistant", "content": "Third answer"}),
+        ];
+        // max_pairs = 1 — only the last pair should appear
+        let result = build_conversation_tail(&msgs, 1, 1000, 10_000);
+        assert!(result.contains("Third question"), "last pair user message should be present");
+        assert!(result.contains("Third answer"), "last pair assistant message should be present");
+        assert!(!result.contains("First question"), "earlier pairs should be excluded");
+        assert!(!result.contains("Second question"), "earlier pairs should be excluded");
+    }
+
+    #[test]
+    fn test_build_tail_empty_messages() {
+        let result = build_conversation_tail(&[], 5, 1000, 10_000);
+        assert!(result.is_empty(), "empty messages should produce empty tail");
+    }
+
+    #[test]
+    fn test_build_tail_max_chars_truncates_total_output() {
+        let msgs = vec![
+            json!({"role": "user", "content": "Question one"}),
+            json!({"role": "assistant", "content": "Answer one"}),
+            json!({"role": "user", "content": "Question two"}),
+            json!({"role": "assistant", "content": "Answer two"}),
+        ];
+        // max_chars = 20 — very small limit
+        let result = build_conversation_tail(&msgs, 5, 1000, 20);
+        assert!(result.len() <= 20, "output should be capped at max_chars");
+    }
+
+    // ── Scenario tests (15 trio eval scenarios) ───────────────────────────────
+    // These test parse_lenient_router_decision with realistic LLM outputs.
+    // Note: "respond" and "ask_user" with empty targets fail strict validation
+    // in the lenient path (normalize_action does not preserve "respond").
+
+    #[test]
+    fn test_respond_simple_math() {
+        // "respond" with empty target: normalize maps to "tool" with empty target -> None
+        let raw = r#"{"action":"respond","target":"","args":{},"confidence":0.95}"#;
+        let result = parse_lenient_router_decision(raw);
+        // The lenient parser does not successfully round-trip respond+empty-target.
+        assert!(
+            result.is_none(),
+            "respond with empty target does not survive lenient normalization"
+        );
+    }
+
+    #[test]
+    fn test_respond_hello() {
+        // Same: respond+empty-target -> None from parse_lenient_router_decision
+        let raw = r#"{"action":"respond","target":"","args":{},"confidence":0.99}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "respond with empty target does not survive lenient normalization"
+        );
+    }
+
+    #[test]
+    fn test_specialist_coding() {
+        // "specialist" is preserved by normalize_action, non-empty target passes strict.
+        let raw = r#"{"action":"specialist","target":"coding","args":{},"confidence":0.9}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some());
+        let d = result.unwrap();
+        assert_eq!(d.action, "specialist");
+        assert_eq!(d.target, "coding");
+    }
+
+    #[test]
+    fn test_specialist_lenient_comma() {
+        // Comma-separated format: "specialist,coding,{...}"
+        let raw = r#"specialist,coding,{"confidence":0.9}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "comma-separated specialist should parse");
+        assert_eq!(result.unwrap().action, "specialist");
+    }
+
+    #[test]
+    fn test_specialist_embedded_marker() {
+        // "[specialist:coding] ..." — no "action" key, extract_quoted defaults to "tool".
+        // target defaults to "clarify". Returns Some(action="tool", target="clarify").
+        let raw = "[specialist:coding] Here is the answer";
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "embedded marker falls back to tool+clarify");
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool");
+    }
+
+    #[test]
+    fn test_tool_file_read() {
+        // "tool" is in normalize_action known set, "read_file" is non-empty target.
+        let raw = r#"{"action":"tool","target":"read_file","args":{"path":"README"},"confidence":0.85}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some());
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool");
+        assert_eq!(d.target, "read_file");
+    }
+
+    #[test]
+    fn test_ask_user_ambiguous() {
+        // "ask_user" IS in normalize_action known set, but empty target fails strict
+        // validation (target must be non-empty for all actions except "respond").
+        let raw = r#"{"action":"ask_user","target":"","args":{"question":"Which file?"},"confidence":0.7}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "ask_user with empty target fails strict validation in lenient path"
+        );
+    }
+
+    #[test]
+    fn test_respond_fallback_on_malformed() {
+        // Garbage: no "action" key, defaults to action="tool", target="clarify".
+        // strict: tool+clarify+0.5 => Ok. Returns Some(action="tool").
+        let raw = "this is garbage output!!!";
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_some(),
+            "garbage falls back to tool+clarify which passes strict validation"
+        );
+        assert_eq!(result.unwrap().action, "tool");
+    }
+
+    #[test]
+    fn test_strict_json_markdown_wrapped() {
+        // Markdown-wrapped respond: extract_quoted finds "action":"respond",
+        // normalize maps to "tool", but target="" found from extract_quoted -> fails strict.
+        // Returns None.
+        let raw = "```json\n{\"action\":\"respond\",\"target\":\"\",\"args\":{},\"confidence\":0.99}\n```";
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "markdown-wrapped respond with empty target: normalize->tool with empty target fails strict"
+        );
+    }
+
+    #[test]
+    fn test_lenient_malformed_json() {
+        // {action: specialist, target: math} — unquoted keys.
+        // extract_quoted won't find "action" (no quotes) -> default "tool".
+        // extract_quoted won't find "target" -> default "clarify".
+        // Returns Some(action="tool", target="clarify").
+        let raw = "{action: specialist, target: math}";
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "unquoted-key JSON defaults to tool+clarify");
+        assert_eq!(result.unwrap().action, "tool");
+    }
+
+    #[test]
+    fn test_unknown_action_in_strict_json() {
+        // "frobnicate" with empty target: normalize -> "tool", target="" -> fails strict.
+        let raw = r#"{"action":"frobnicate","target":"","args":{},"confidence":0.5}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "frobnicate normalizes to tool with empty target, failing strict validation"
+        );
+    }
+
+    #[test]
+    fn test_high_confidence_respond() {
+        // Same as other respond+empty-target tests: normalize -> tool+empty -> None
+        let raw = r#"{"action":"respond","target":"","args":{},"confidence":1.0}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(
+            result.is_none(),
+            "respond with confidence=1.0 and empty target still fails lenient normalization"
+        );
+    }
+
+    #[test]
+    fn test_low_confidence_specialist() {
+        // Low confidence (0.1) is still in [0.0, 1.0] range — passes strict validation.
+        // The lenient parser does not filter by confidence threshold.
+        let raw = r#"{"action":"specialist","target":"math","args":{},"confidence":0.1}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some(), "low confidence specialist should still parse");
+        assert_eq!(result.unwrap().action, "specialist");
+    }
+
+    #[test]
+    fn test_subagent_action() {
+        // "subagent" is in normalize_action known set, target "search" is non-empty.
+        let raw = r#"{"action":"subagent","target":"search","args":{},"confidence":0.85}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some());
+        let d = result.unwrap();
+        assert_eq!(d.action, "subagent");
+        assert_eq!(d.target, "search");
+    }
+
+    #[test]
+    fn test_tool_with_args() {
+        // "tool" with non-empty target and args — passes everything.
+        let raw = r#"{"action":"tool","target":"write_file","args":{"path":"out.txt","content":"hello"},"confidence":0.9}"#;
+        let result = parse_lenient_router_decision(raw);
+        assert!(result.is_some());
+        let d = result.unwrap();
+        assert_eq!(d.action, "tool");
+        assert_eq!(d.target, "write_file");
+    }
+
+    // ── Layer 3 config sweep stub (requires LM Studio) ────────────────────────
+
+    #[test]
+    #[ignore = "requires LM Studio running"]
+    fn trio_config_sweep() {
+        struct SweepConfig {
+            label: &'static str,
+            router_temp: f64,
+        }
+        let configs = vec![
+            SweepConfig { label: "conservative", router_temp: 0.1 },
+            SweepConfig { label: "default", router_temp: 0.2 },
+            SweepConfig { label: "warm", router_temp: 0.3 },
+            SweepConfig { label: "exploratory", router_temp: 0.4 },
+        ];
+        for cfg in &configs {
+            eprintln!("## Config: {} (temp={})", cfg.label, cfg.router_temp);
+            // TODO: wire up real provider and run scenarios
+        }
+    }
+}
+
