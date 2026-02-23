@@ -1,9 +1,9 @@
-# nanobot - Agent Instructions
+# AGENTS.md
 
+# nanobot - Agent Instructions
 A lightweight personal AI assistant framework in Rust. Binary name: `nanobot`.
 
 ## Build Commands
-
 ```bash
 cargo build --release        # Release build (optimized)
 cargo build                  # Debug build
@@ -13,12 +13,11 @@ cargo test module::tests     # Run tests for a specific module
 RUST_LOG=debug cargo run -- agent -m "Hello"  # Run with debug logging
 ```
 
-**Testing Notes**:
+**Testing Notes**: 
 - All tests are inline in modules under `#[cfg(test)] mod tests { ... }`
 - Use `cargo test -- --nocapture` to see test output
 
 ## Project Structure
-
 ```
 src/
 ├── main.rs              # CLI entry point, command routing
@@ -36,7 +35,6 @@ src/
 ```
 
 ## Code Style Guidelines
-
 ### Imports
 Group imports: std → external crates → internal modules
 ```rust
@@ -103,13 +101,12 @@ pub struct Config {
 
 ### Tool Development
 All tools implement the `Tool` trait from `src/agent/tools/base.rs`:
-
 ```rust
 #[async_trait]
 impl Tool for MyTool {
     fn name(&self) -> &str { "my_tool" }
-    fn description(&self) -> &str { "Brief description" }
-    
+    fn description(&self) -> &str { "Brief description" };
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -119,12 +116,12 @@ impl Tool for MyTool {
             "required": ["param_name"]
         })
     }
-    
+
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
         let value = params.get("param_name")
             .and_then(|v| v.as_str())
             .unwrap_or("default");
-        format!("Result: {}", value)
+        format!("Result: {}",$value)
     }
 }
 ```
@@ -139,14 +136,14 @@ impl Tool for MyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_feature_name() {
         let tool = MyTool::new();
         let result = tool.method();
         assert_eq!(result, expected);
     }
-    
+
     #[tokio::test]
     async fn test_async_operation() {
         let result = async_function().await;
@@ -156,13 +153,11 @@ mod tests {
 ```
 
 ## Configuration
-
 - Config location: `~/.nanobot/config.json`
 - Session storage: `~/.nanobot/sessions/`
 - Workspace (skills, memory): `~/.nanobot/workspace/`
 
 ## Provider Selection
-
 Config chooses provider in this order (first non-empty API key wins):
 OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM
 

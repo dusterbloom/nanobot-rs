@@ -21,7 +21,7 @@
 > 2. **Start with a failing test or reproduction.** Show the broken state first.
 > 3. **Verify with `metrics.jsonl` + `nanobot.log`** after every change.
 > 4. **Read the existing code before writing.** Half these bugs are "feature exists but isn't called."
-> 5. **B3-B11 are green. I7/LCM E2E verified. L1 concept router 80% accurate (2x orchestrator). QW1+QW2 shipped (tool guards + error hints).** Blockers remaining: B5 (experiments), **B12 (config debt — proposal needed)**. Next priority: **B12 proposal → I9 (tiered routing) → I8 (SearXNG)**.
+> 5. **B3-B11 are green. I7/LCM E2E verified. L1 concept router 80% accurate (2x orchestrator). QW1-QW4 shipped.** Blockers remaining: B5 (experiments), **B12 (config debt — proposal needed)**. Next priority: **B12 proposal → I9 (tiered routing) → I8 (SearXNG)**.
 >
 > **Anti-patterns (from 2026-02-23 review):**
 > 1. Stop adding router parsing fallbacks — 4 parsers mask model quality. Use constrained decoding instead.
@@ -110,7 +110,7 @@
   **Remaining:** Performance profiling under sustained load. Verify `lcm_expand` actually invoked by LLM during conversation. Persist DAG across session rotations.
   **Compounds with:** I6 (anti-drift cleans within summaries). B9 (pre-flight truncation as safety net). I3 (ContentGate decides raw vs summary).
   _Ref: `src/agent/lcm.rs`, `src/config/schema.rs:1219`_
-- [ ] **I10: `/clear` and `/new` REPL commands** — Manual context reset for local models with small context windows (4K-8K). Essential for trio mode where the Main model accumulates full conversation history while Router and Specialist are already stateless (ephemeral per-turn message arrays).
+- [~] **I10: `/clear` and `/new` REPL commands** — Manual context reset for local models with small context windows (4K-8K). _(Gateway `/clear` shipped 2026-02-23 — clears working memory + history via `gateway_commands.rs`.)_ Essential for trio mode where the Main model accumulates full conversation history while Router and Specialist are already stateless (ephemeral per-turn message arrays).
   **`/clear` — reset working context, keep session:**
   1. If LCM enabled: compact all `ctx.messages` into a single summary node. Model starts "fresh" but can `lcm_expand` to retrieve originals.
   2. If LCM disabled: truncate messages, carry forward last 2 as context seed.
@@ -135,9 +135,8 @@
 - [ ] **N2: `nanobot setup`** — Interactive first-run: detect hardware, download models, generate optimal config.
 - [ ] **N3: Streaming rewrite** — Incremental markdown renderer, line-by-line syntax highlighting, no full-response rerender. _Ref: `docs/plans/streaming-rewrite.md`_
 - [ ] **N4: Full-duplex REPL** — ESC+ESC instant cancel, backtick injection prompt, priority message channel. _Ref: `docs/plans/full-duplex-repl.md`_
-- [ ] **N5: Thinking toggle** — `/think` command + Ctrl+T toggle for extended thinking mode. _Ref: `docs/plans/thinking-toggle.md`_
+- [~] **N5: Thinking toggle** — `/think` command works in REPL + gateway channels. Remaining: Ctrl+T toggle for REPL. _Ref: `docs/plans/thinking-toggle.md`_
 - [ ] **N6: Status injection** — Auto-inject background worker status into context each turn. _(Spacebot idea)_
-- [ ] **N7: Message coalescing** — Batch rapid messages in channels into single LLM turn. _(Spacebot idea)_
 - [ ] **N8: Narration stress test** — Validate narration compliance across local models. _Ref: `docs/plans/narration-stress-test.md`_
 
 ---
@@ -295,3 +294,6 @@ Captured from [spacebot](https://github.com/spacedriveapp/spacebot). Ideas only,
 - ~~QW1: Per-tool guard limits~~ — Replaced blanket `max_same_tool_call_per_turn: 1` with per-tool-category limits. Read-only tools (`read_file`, `list_dir`, `recall`, `read_skill`, `web_search`, `web_fetch`) get limit 5. All other tools use default 3 (raised from 1). `ToolGuard` now has `tool_limits: HashMap<String, u32>` populated from `READ_TOOLS` constant. 6 new tests, 1679 total green. (2026-02-23, `src/agent/tool_guard.rs`, `src/config/schema.rs`)
 - ~~QW2: Recovery hints on tool errors~~ — Added actionable `Hint:` suffixes to error messages in filesystem, web, and shell tools. Filesystem: file-not-found → "use list_dir", permission-denied → "check permissions", old_text-not-found → "use read_file for exact text". Web: Brave 401/403 → "check API key", 422 → "subscription may be inactive", 429 → "rate limited, wait", 5xx → "service error". Shell: timeout → "try simpler command", exec error → "verify command in PATH". 9 new tests. (2026-02-23, `src/agent/tools/filesystem.rs`, `src/agent/tools/web.rs`, `src/agent/tools/shell.rs`)
 - ~~Strategic review~~ — Comprehensive review saved as `REVIEW-2026-02-23.md`. 5 architectural recommendations, 5 strategic recommendations, 5 UX recommendations, 5 quick wins, 5 anti-patterns. Recommended 4-week execution order. (2026-02-23)
+- ~~QW3: Gateway slash commands + trio auto-detection~~ — 10 slash commands (`/start`, `/help`, `/status`, `/clear`, `/agents`, `/kill`, `/think`, `/long`, `/context`, `/memory`) intercepted before LLM processing in gateway mode via `gateway_commands.rs`. Anti-coalesce guard prevents commands from being batched with adjacent messages. Telegram bot-mention suffix stripping (`/status@my_bot` → `/status`). Trio auto-detection added to `cmd_gateway()` (was REPL-only). Fixed `is_local` hardcoded to `false` in gateway. (2026-02-23, `src/agent/gateway_commands.rs`, `src/agent/agent_loop.rs`, `src/cli.rs`)
+- ~~QW4: Exec tool working directory + tool call dedup~~ — Three-layer fix for exec tool defaulting to workspace instead of process cwd: (1) `tool_wiring.rs` sets `exec_working_dir` to process cwd, (2) `registry.rs` fallback chain: config → process cwd → workspace, (3) `agent_loop.rs` injects `working_dir` into exec calls when LLM omits it. Three-layer tool call dedup for local models emitting duplicate calls: (1) batch dedup in `step_execute_tools()`, (2) initial batch dedup in `run_tool_loop()`, (3) cross-iteration dedup via `seen_calls` in `analyze_via_scratch_pad()`. System prompt improved: "Rules" section with "ALWAYS use tools, NEVER guess" + "File Operations" section with pwd-first guidance. `/m` command fixed for remote LM Studio (queries API instead of scanning `~/models/`). (2026-02-23, `src/agent/agent_loop.rs`, `src/agent/tool_wiring.rs`, `src/agent/tools/registry.rs`, `src/agent/context.rs`, `src/repl/commands.rs`)
+- ~~N7: Message coalescing~~ — Already implemented: 400ms coalesce window in `agent_loop.rs:run()` batches rapid messages from same session (Telegram/WhatsApp). Anti-coalesce guard added for slash commands. (Pre-existing, noted 2026-02-23)
