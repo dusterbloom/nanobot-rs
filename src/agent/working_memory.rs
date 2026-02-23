@@ -55,6 +55,8 @@ pub struct WorkingSession {
     /// Markdown body after frontmatter.
     pub content: String,
     pub path: PathBuf,
+    /// Turn number at which this session was last updated via compaction.
+    pub last_updated_turn: u64,
 }
 
 /// Persistent store for per-session working memory files.
@@ -108,6 +110,7 @@ impl WorkingMemoryStore {
             status: SessionStatus::Active,
             content: String::new(),
             path,
+            last_updated_turn: 0,
         }
     }
 
@@ -115,7 +118,7 @@ impl WorkingMemoryStore {
     pub fn save(&self, session: &WorkingSession) {
         ensure_dir(&self.sessions_dir);
         let frontmatter = format!(
-            "---\nsession_key: \"{}\"\ncreated: \"{}\"\nupdated: \"{}\"\nstatus: {}\n---\n",
+            "---\nsession_key: \"{}\"\ncreated: \"{}\"\nupdated: \"{}\"\nstatus: {}\nlast_updated_turn: {}\n---\n",
             session.session_key,
             session
                 .created
@@ -124,6 +127,7 @@ impl WorkingMemoryStore {
                 .updated
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             session.status,
+            session.last_updated_turn,
         );
         let full = if session.content.is_empty() {
             frontmatter
@@ -175,12 +179,13 @@ impl WorkingMemoryStore {
     /// Overwrites instead of appending — the structured template output
     /// from each compaction is a complete snapshot, not an increment.
     /// Also writes to `{workspace}/CONTEXT-{channel}.md` for system prompt injection.
-    pub fn update_from_compaction(&self, session_key: &str, summary: &str) {
+    pub fn update_from_compaction(&self, session_key: &str, summary: &str, turn: u64) {
         let mut session = self.get_or_create(session_key);
 
         // Overwrite, not append — each compaction is a complete snapshot.
         session.content = summary.trim().to_string();
         session.updated = Utc::now();
+        session.last_updated_turn = turn;
         self.save(&session);
 
         // Write per-channel context file for system prompt injection.
@@ -214,6 +219,29 @@ impl WorkingMemoryStore {
             move_file(&path, &dest)?;
         }
         Ok(())
+    }
+
+    /// Clear working memory for a session (reset content, keep session file).
+    ///
+    /// Also removes the corresponding `CONTEXT-{channel}.md` file so stale
+    /// compaction summaries are not re-injected into the next system prompt.
+    pub fn clear(&self, session_key: &str) {
+        let mut session = self.get_or_create(session_key);
+        session.content = String::new();
+        session.updated = Utc::now();
+        self.save(&session);
+
+        // Remove the CONTEXT file written by update_from_compaction().
+        let channel = session_key.split(':').next().unwrap_or("default");
+        let per_channel = self.workspace.join(format!("CONTEXT-{}.md", channel));
+        if per_channel.exists() {
+            let _ = fs::remove_file(&per_channel);
+        }
+        // Also remove legacy fallback if it exists.
+        let legacy = self.workspace.join("CONTEXT.md");
+        if legacy.exists() {
+            let _ = fs::remove_file(&legacy);
+        }
     }
 
     /// List all active sessions.
@@ -273,6 +301,7 @@ impl WorkingMemoryStore {
         let mut updated = Utc::now();
         let mut status = SessionStatus::Active;
         let mut content = raw.clone();
+        let mut last_updated_turn: u64 = 0;
 
         if raw.starts_with("---") {
             if let Some(end) = raw[3..].find("---") {
@@ -293,6 +322,8 @@ impl WorkingMemoryStore {
                         }
                     } else if let Some(val) = line.strip_prefix("status:") {
                         status = SessionStatus::from_str(val.trim());
+                    } else if let Some(val) = line.strip_prefix("last_updated_turn:") {
+                        last_updated_turn = val.trim().parse().unwrap_or(0);
                     }
                 }
             }
@@ -305,6 +336,7 @@ impl WorkingMemoryStore {
             status,
             content,
             path: path.to_path_buf(),
+            last_updated_turn,
         })
     }
 }
@@ -360,7 +392,7 @@ mod tests {
     #[test]
     fn test_update_from_compaction() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "User asked about Rust memory management.");
+        store.update_from_compaction("cli:default", "User asked about Rust memory management.", 0);
 
         let session = store.get_or_create("cli:default");
         assert!(session.content.contains("Rust memory management"));
@@ -369,8 +401,8 @@ mod tests {
     #[test]
     fn test_multiple_compactions_overwrite() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "First summary.");
-        store.update_from_compaction("cli:default", "Second summary.");
+        store.update_from_compaction("cli:default", "First summary.", 0);
+        store.update_from_compaction("cli:default", "Second summary.", 0);
 
         let session = store.get_or_create("cli:default");
         // Overwrite semantics: only latest snapshot survives.
@@ -388,7 +420,7 @@ mod tests {
     #[test]
     fn test_get_context_within_budget() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "Short summary.");
+        store.update_from_compaction("cli:default", "Short summary.", 0);
         let ctx = store.get_context("cli:default", 5000);
         assert!(ctx.contains("Short summary."));
         assert!(!ctx.contains("[truncated"));
@@ -402,7 +434,7 @@ mod tests {
             .map(|i| format!("line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        store.update_from_compaction("cli:default", &content);
+        store.update_from_compaction("cli:default", &content, 0);
         let ctx = store.get_context("cli:default", 50);
         // Should be silently truncated — no marker visible to the model.
         assert!(!ctx.contains("[truncated"));
@@ -413,7 +445,7 @@ mod tests {
     #[test]
     fn test_complete_session() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "Some work.");
+        store.update_from_compaction("cli:default", "Some work.", 0);
         store.complete("cli:default");
 
         let session = store.get_or_create("cli:default");
@@ -423,7 +455,7 @@ mod tests {
     #[test]
     fn test_archive_session() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "Some work.");
+        store.update_from_compaction("cli:default", "Some work.", 0);
         let path = store.session_path("cli:default");
         assert!(path.exists());
 
@@ -435,9 +467,9 @@ mod tests {
     #[test]
     fn test_list_active() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("session:a", "Work A.");
-        store.update_from_compaction("session:b", "Work B.");
-        store.update_from_compaction("session:c", "Work C.");
+        store.update_from_compaction("session:a", "Work A.", 0);
+        store.update_from_compaction("session:b", "Work B.", 0);
+        store.update_from_compaction("session:c", "Work C.", 0);
         store.complete("session:b");
 
         let active = store.list_active();
@@ -450,8 +482,8 @@ mod tests {
     #[test]
     fn test_list_completed() {
         let (_tmp, store) = make_store();
-        store.update_from_compaction("session:a", "Work A.");
-        store.update_from_compaction("session:b", "Work B.");
+        store.update_from_compaction("session:a", "Work A.", 0);
+        store.update_from_compaction("session:b", "Work B.", 0);
         store.complete("session:a");
 
         let completed = store.list_completed();
@@ -466,7 +498,7 @@ mod tests {
         // Verify that ContextBuilder picks up working memory via get_context().
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
-        wm.update_from_compaction("cli:test", "User prefers dark mode and Vim keybindings.");
+        wm.update_from_compaction("cli:test", "User prefers dark mode and Vim keybindings.", 0);
 
         // Build system prompt (won't have working memory — that's injected by agent_loop).
         // But verify get_context returns the right content for injection.
@@ -494,9 +526,9 @@ mod tests {
         let wm = WorkingMemoryStore::new(tmp.path());
 
         // Simulate 3 compaction cycles — overwrite semantics.
-        wm.update_from_compaction("cli:session1", "Discussed Rust ownership model.");
-        wm.update_from_compaction("cli:session1", "Implemented borrow checker example.");
-        wm.update_from_compaction("cli:session1", "User wants to learn async next.");
+        wm.update_from_compaction("cli:session1", "Discussed Rust ownership model.", 0);
+        wm.update_from_compaction("cli:session1", "Implemented borrow checker example.", 0);
+        wm.update_from_compaction("cli:session1", "User wants to learn async next.", 0);
 
         // Only the latest snapshot survives (overwrite, not append).
         let ctx = wm.get_context("cli:session1", 10000);
@@ -532,9 +564,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
 
-        wm.update_from_compaction("s:1", "Facts from session 1.");
-        wm.update_from_compaction("s:2", "Facts from session 2.");
-        wm.update_from_compaction("s:3", "Facts from session 3.");
+        wm.update_from_compaction("s:1", "Facts from session 1.", 0);
+        wm.update_from_compaction("s:2", "Facts from session 2.", 0);
+        wm.update_from_compaction("s:3", "Facts from session 3.", 0);
 
         // Only complete sessions are visible to the reflector.
         assert_eq!(wm.list_completed().len(), 0);
@@ -603,5 +635,48 @@ mod tests {
             prompt.contains("recall"),
             "Identity should mention recall tool"
         );
+    }
+
+    #[test]
+    fn test_clear_session() {
+        let (_tmp, store) = make_store();
+        store.update_from_compaction("cli:default", "Important context.", 5);
+        assert!(!store.get_context("cli:default", 5000).is_empty());
+        store.clear("cli:default");
+        assert!(store.get_context("cli:default", 5000).is_empty());
+        let session = store.get_or_create("cli:default");
+        assert_eq!(session.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn test_clear_removes_context_file() {
+        let (tmp, store) = make_store();
+        store.update_from_compaction("cli:default", "Stale task context.", 3);
+
+        let context_file = tmp.path().join("CONTEXT-cli.md");
+        assert!(context_file.exists(), "CONTEXT-cli.md should exist after compaction");
+
+        store.clear("cli:default");
+
+        assert!(!context_file.exists(), "CONTEXT-cli.md should be removed after clear()");
+    }
+
+    #[test]
+    fn test_clear_removes_legacy_context_file() {
+        let (tmp, store) = make_store();
+        let legacy = tmp.path().join("CONTEXT.md");
+        std::fs::write(&legacy, "Legacy stale context.").unwrap();
+
+        store.clear("cli:default");
+
+        assert!(!legacy.exists(), "CONTEXT.md should be removed after clear()");
+    }
+
+    #[test]
+    fn test_last_updated_turn_roundtrip() {
+        let (_tmp, store) = make_store();
+        store.update_from_compaction("cli:default", "Summary.", 42);
+        let session = store.get_or_create("cli:default");
+        assert_eq!(session.last_updated_turn, 42);
     }
 }

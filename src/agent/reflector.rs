@@ -266,7 +266,7 @@ mod tests {
         let wm = WorkingMemoryStore::new(&workspace);
         for i in 0..count {
             let key = format!("test_session:{}", i);
-            wm.update_from_compaction(&key, &"x".repeat(content_size));
+            wm.update_from_compaction(&key, &"x".repeat(content_size), 0);
             wm.complete(&key);
         }
         workspace

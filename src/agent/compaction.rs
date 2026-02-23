@@ -212,22 +212,26 @@ Rules:
 2. One sentence per bullet, max 10 bullets per section
 3. Skip anything you're unsure about
 4. No meta-commentary (no 'I should...', 'Let me...')
-5. ONLY output the filled template, nothing else
+5. Completed tasks: include ONLY if they produced artifacts or facts still needed
+6. ONLY output the filled template, nothing else
 
-## Task
-[What is the user doing?]
+## Completed Tasks
+[Tasks that are finished - include only facts/artifacts still relevant to current work. Omit if nothing carries forward.]
+
+## Current Task
+[What the user is actively working on RIGHT NOW based on the most recent messages]
 
 ## Decisions
-[What was decided?]
+[What was decided for the current task?]
 
-## Facts
-[What was discovered?]
+## Key Facts
+[Technical details still relevant - file paths, versions, config values]
 
 ## Pending
-[What's still to do?]
+[What's still to do for the current task?]
 
 ## Errors
-[What went wrong?]";
+[Unresolved errors only]";
 
 /// Briefing prompt for structural content summaries (used by ContentGate).
 ///
@@ -259,21 +263,25 @@ Format:
 const MERGE_SUMMARIES_PROMPT: &str = "\
 Merge these context summaries into one using the same template.
 Rules: copy exact terms, one sentence per bullet, max 10 per section, no meta-commentary.
+Drop completed tasks that have no carry-forward relevance.
 
-## Task
-[Combined task description]
+## Completed Tasks
+[Only if artifacts/facts still needed]
+
+## Current Task
+[Combined current task description]
 
 ## Decisions
-[All decisions]
+[All decisions for current work]
 
-## Facts
+## Key Facts
 [All facts]
 
 ## Pending
 [All pending items]
 
 ## Errors
-[All errors]";
+[Unresolved errors only]";
 
 // SUMMARIZER_INPUT_BUDGET_TOKENS removed — now dynamically computed via
 // ContextCompactor::input_budget() based on the compaction server's ctx size.

@@ -541,6 +541,12 @@ impl ContextBuilder {
             .unwrap_or_else(|_| self.workspace.clone())
             .to_string_lossy()
             .to_string();
+        let home_dir = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "~".to_string());
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
 
         let model_section = if self.model_name.is_empty() {
             String::new()
@@ -577,9 +583,12 @@ You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, mes
 
 ## Context
 Time: {now}{model_section}
+Home: {home_dir}
 Workspace: {workspace_path}
+Working directory: {cwd}
 
 Be concise (1-5 sentences) unless asked for detail. Use tools to verify; never fabricate.
+When using file tools, use paths relative to workspace or absolute paths starting with {home_dir}.
 Reply directly for conversation; use 'message' tool only for chat channels.{delegation_hint}
 
 ## Memory

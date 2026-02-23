@@ -2,7 +2,7 @@
 //!
 //! Extracted from `agent_loop.rs` to isolate routing logic into a focused module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
@@ -20,6 +20,60 @@ use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
 use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
+
+/// Per-domain ring buffer for specialist multi-turn memory.
+/// Stores compressed summaries of past specialist outputs so subsequent
+/// specialist calls in the same domain can build on prior analysis.
+pub(crate) struct SpecialistMemory {
+    entries: HashMap<String, VecDeque<String>>,
+    max_entries: usize,
+    max_chars_per_entry: usize,
+}
+
+impl SpecialistMemory {
+    pub fn new(max_entries: usize, max_chars_per_entry: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+            max_chars_per_entry,
+        }
+    }
+
+    /// Push a specialist response summary into the domain's ring buffer.
+    pub fn push(&mut self, domain: &str, summary: &str) {
+        let truncated = if summary.len() > self.max_chars_per_entry {
+            &summary[..self.max_chars_per_entry]
+        } else {
+            summary
+        };
+        let buf = self.entries.entry(domain.to_string()).or_insert_with(|| VecDeque::with_capacity(self.max_entries));
+        if buf.len() >= self.max_entries {
+            buf.pop_front();
+        }
+        buf.push_back(truncated.to_string());
+    }
+
+    /// Format accumulated context for a domain. Returns empty string if no entries.
+    pub fn format_context(&self, domain: &str) -> String {
+        match self.entries.get(domain) {
+            None => String::new(),
+            Some(buf) if buf.is_empty() => String::new(),
+            Some(buf) => {
+                let mut ctx = String::from("[prior specialist context]\n");
+                for (i, entry) in buf.iter().enumerate() {
+                    ctx.push_str(&format!("- turn {}: {}\n", i + 1, entry));
+                }
+                ctx
+            }
+        }
+    }
+}
+
+impl Default for SpecialistMemory {
+    fn default() -> Self {
+        Self::new(3, 200)
+    }
+}
 
 /// Build a compact conversation tail from the message history for the router.
 ///
@@ -252,9 +306,13 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
     }
 
     // Malformed JSON-ish output: recover fields leniently.
+    // When no target is extractable, default to empty string. This fails strict
+    // validation (action="tool" requires non-empty target), causing the parse
+    // chain to fall through to Passthrough → main model handles the request.
+    // Previously defaulted to "clarify" which dispatched to a nonexistent tool.
     let target = extract_quoted(&tail, "target")
         .or_else(|| extract_quoted(raw, "target"))
-        .unwrap_or_else(|| "clarify".to_string());
+        .unwrap_or_default();
     let raw_action = extract_quoted(&tail, "action")
         .or_else(|| extract_quoted(&tail, "call"))
         .or_else(|| extract_quoted(raw, "action"))
@@ -562,6 +620,13 @@ pub(crate) async fn dispatch_specialist(
     } else {
         specialist_state
     };
+    // Load specialist domain memory and prepend to pack if available.
+    let domain_memory = counters.specialist_memory.lock().unwrap().format_context(target);
+    let specialist_pack = if !domain_memory.is_empty() {
+        format!("{}\n\n{}", domain_memory, specialist_pack)
+    } else {
+        specialist_pack
+    };
     let system_prompt = build_specialist_system_prompt(schema_enabled);
     let specialist_messages = vec![
         json!({"role":"system","content": system_prompt}),
@@ -651,8 +716,12 @@ pub(crate) async fn dispatch_subagent(
 
 /// Determine the PreflightResult for a successful specialist dispatch.
 /// Pure function — extracted for testability.
-pub(crate) fn specialist_preflight_result(specialist_response: &str) -> PreflightResult {
-    PreflightResult::Break(specialist_response.to_string())
+pub(crate) fn specialist_preflight_result(specialist_response: &str, synthesis: bool) -> PreflightResult {
+    if synthesis {
+        PreflightResult::Continue
+    } else {
+        PreflightResult::Break(specialist_response.to_string())
+    }
 }
 
 /// Determine the PreflightResult for a successful subagent dispatch.
@@ -685,6 +754,8 @@ pub(crate) enum PreflightResult {
     Break(String),
     /// No router intervention — fall through to normal processing.
     Passthrough,
+    /// Router selected pipeline action — steps JSON injected, continue to main model.
+    Pipeline(String),
 }
 
 /// Router-first preflight for strict trio mode.
@@ -870,10 +941,12 @@ pub(crate) async fn router_preflight(
                     if ctx.core.trace_log {
                         super::trace_store::append_specialist_trace(&record);
                     }
+                    // Record specialist output for domain memory.
+                    ctx.counters.specialist_memory.lock().unwrap().push(&decision.target, &record.specialist_response);
                     let injected = format!("[specialist:{}] {}", decision.target, record.specialist_response);
                     ctx.messages
                         .push(json!({"role":"user","content": injected, "_synthetic": true}));
-                    specialist_preflight_result(&record.specialist_response)
+                    specialist_preflight_result(&record.specialist_response, ctx.core.tool_delegation_config.specialist_synthesis)
                 }
                 Err(e) => PreflightResult::Break(e),
             }
@@ -949,7 +1022,11 @@ pub(crate) async fn router_preflight(
             let truncated = truncate_tool_result(&content);
             ctx.messages.push(json!({
                 "role":"user",
-                "content": format!("[router:tool:{}] {}", decision.target, truncated),
+                "content": format!(
+                    "[router:tool:{}] The tool returned the following data. \
+                     Summarize it concisely for the user:\n\n{}",
+                    decision.target, truncated
+                ),
                 "_synthetic": true,
             }));
             *ctx.counters.trio_metrics.tool_dispatched.lock().unwrap() = Some(decision.target.clone());
@@ -963,6 +1040,20 @@ pub(crate) async fn router_preflight(
             }
             debug!("Router: respond — forwarding to main model");
             PreflightResult::Passthrough
+        }
+        "pipeline" => {
+            tracing::Span::current().record("routing_decision", "pipeline");
+            if ctx.core.trace_log {
+                append_router_decision_trace(&base_trace);
+            }
+            let steps_json = decision.args.to_string();
+            info!("[trio] pipeline action selected by router, injecting steps");
+            ctx.messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("[router:pipeline] {}", steps_json),
+                "_synthetic": true,
+            }));
+            PreflightResult::Pipeline(steps_json)
         }
         _ => {
             tracing::Span::current().record("routing_decision", "unknown_passthrough");
@@ -1405,7 +1496,7 @@ mod tests {
     // Key implementation notes:
     // - normalize_action only recognizes: "tool" | "subagent" | "specialist" | "ask_user"
     //   All other actions (including "respond") fall through and get remapped to "tool"
-    // - Lenient path falls back target="" to "clarify" by default (via unwrap_or_else)
+    // - Lenient path falls back target="" to "" (empty) by default — fails strict validation
     // - strict_router_decision_strict rejects: empty target (unless action=="respond"),
     //   out-of-range confidence, and unknown actions
     // - "respond" action is NOT handled in the lenient path (only in the strict JSON path
@@ -1449,44 +1540,35 @@ mod tests {
     #[test]
     fn test_parse_lenient_embedded_marker() {
         // "[specialist:coding] Here is the answer" — no comma path, no "action" key.
-        // extract_quoted falls back to default "tool". extract_quoted("target") = None -> "clarify".
-        // normalize_action("tool","clarify",{}) = "tool".
-        // strict: tool+clarify+0.5 => Ok.
-        // So this returns Some(action="tool", target="clarify").
+        // extract_quoted falls back to default action="tool", target="" (empty).
+        // strict: tool with empty target fails validation → None.
+        // Falls through to main model via Passthrough.
         let raw = "[specialist:coding] Here is the answer";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_some(), "embedded marker falls through to lenient fallback: Some");
-        let d = result.unwrap();
-        assert_eq!(d.action, "tool", "lenient fallback normalizes to 'tool'");
-        assert_eq!(d.target, "clarify", "lenient fallback target defaults to 'clarify'");
+        assert!(result.is_none(), "embedded marker with no extractable fields returns None");
     }
 
     #[test]
-    fn test_parse_lenient_malformed_garbage_returns_some_tool() {
-        // Garbage text: no "action" key found, defaults to action="tool", target="clarify".
-        // strict: tool+clarify+0.5 => Ok. Returns Some(action="tool").
+    fn test_parse_lenient_malformed_garbage_returns_none() {
+        // Garbage text: no "action" or "target" key found.
+        // Defaults to action="tool", target="" → fails strict (empty target) → None.
+        // Falls through to main model via Passthrough.
         let raw = "this is not valid at all!!!";
         let result = parse_lenient_router_decision(raw);
         assert!(
-            result.is_some(),
-            "garbage with no action/target falls back to tool+clarify which passes strict"
+            result.is_none(),
+            "garbage with no action/target fails strict validation and returns None"
         );
-        let d = result.unwrap();
-        assert_eq!(d.action, "tool");
-        assert_eq!(d.target, "clarify");
     }
 
     #[test]
-    fn test_parse_lenient_empty_string_returns_some_tool() {
-        // Same fallback: no keys found -> action="tool", target="clarify".
+    fn test_parse_lenient_empty_string_returns_none() {
+        // No keys found → action="tool", target="" → fails strict → None.
         let result = parse_lenient_router_decision("");
         assert!(
-            result.is_some(),
-            "empty string falls back to tool+clarify which passes strict validation"
+            result.is_none(),
+            "empty string fails strict validation (empty target) and returns None"
         );
-        let d = result.unwrap();
-        assert_eq!(d.action, "tool");
-        assert_eq!(d.target, "clarify");
     }
 
     #[test]
@@ -1707,13 +1789,11 @@ mod tests {
 
     #[test]
     fn test_specialist_embedded_marker() {
-        // "[specialist:coding] ..." — no "action" key, extract_quoted defaults to "tool".
-        // target defaults to "clarify". Returns Some(action="tool", target="clarify").
+        // "[specialist:coding] ..." — no "action" key, no extractable target.
+        // Defaults to action="tool", target="" → fails strict → None.
         let raw = "[specialist:coding] Here is the answer";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_some(), "embedded marker falls back to tool+clarify");
-        let d = result.unwrap();
-        assert_eq!(d.action, "tool");
+        assert!(result.is_none(), "embedded marker with no extractable fields returns None");
     }
 
     #[test]
@@ -1741,15 +1821,15 @@ mod tests {
 
     #[test]
     fn test_respond_fallback_on_malformed() {
-        // Garbage: no "action" key, defaults to action="tool", target="clarify".
-        // strict: tool+clarify+0.5 => Ok. Returns Some(action="tool").
+        // Garbage: no "action" key, defaults to action="tool", target="" (empty).
+        // strict: tool with empty target fails → None.
+        // Falls through to main model via Passthrough.
         let raw = "this is garbage output!!!";
         let result = parse_lenient_router_decision(raw);
         assert!(
-            result.is_some(),
-            "garbage falls back to tool+clarify which passes strict validation"
+            result.is_none(),
+            "garbage with empty target fails strict validation and returns None"
         );
-        assert_eq!(result.unwrap().action, "tool");
     }
 
     #[test]
@@ -1767,13 +1847,13 @@ mod tests {
 
     #[test]
     fn test_lenient_malformed_json() {
-        // {action: specialist, target: math} — unquoted keys.
-        // extract_quoted won't find "action" (no quotes) -> default "tool".
-        // extract_quoted won't find "target" -> default "clarify".
-        // Returns Some(action="tool", target="clarify").
+        // {action: specialist, target: math} — unquoted keys but has commas.
+        // Hits comma-separated parser: raw_action="{action: specialist",
+        // target=" target: math}". normalize_action maps to "tool".
+        // Non-empty target passes strict validation.
         let raw = "{action: specialist, target: math}";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_some(), "unquoted-key JSON defaults to tool+clarify");
+        assert!(result.is_some(), "comma-separated path extracts non-empty target");
         assert_eq!(result.unwrap().action, "tool");
     }
 
@@ -1864,21 +1944,20 @@ mod tests {
     // ── Turn isolation: preflight arms must return Break, not Continue ─────────
 
     #[test]
-    fn test_specialist_arm_returns_break_not_continue() {
-        // The specialist arm should return Break with the specialist response,
-        // NOT Continue. This verifies the response goes directly to the user
-        // without looping back through the small model.
-        let result = specialist_preflight_result("Here is the specialist analysis...");
+    fn test_specialist_synthesis_enabled_returns_continue() {
+        let result = specialist_preflight_result("Here is the specialist analysis...", true);
+        assert!(matches!(result, PreflightResult::Continue),
+            "with synthesis enabled, specialist should return Continue so main model presents");
+    }
+
+    #[test]
+    fn test_specialist_synthesis_disabled_returns_break() {
+        let result = specialist_preflight_result("Here is the specialist analysis...", false);
         match result {
             PreflightResult::Break(msg) => {
                 assert_eq!(msg, "Here is the specialist analysis...");
             }
-            PreflightResult::Continue => {
-                panic!("specialist arm must return Break, not Continue");
-            }
-            PreflightResult::Passthrough => {
-                panic!("specialist arm must return Break, not Passthrough");
-            }
+            _ => panic!("with synthesis disabled, specialist should return Break"),
         }
     }
 
@@ -2022,6 +2101,67 @@ mod tests {
             PreflightResult::Break(text) => assert_eq!(text, "Summary here"),
             _ => panic!("Expected Break with synthesis text"),
         }
+    }
+
+    #[test]
+    fn test_preflight_pipeline_variant_exists() {
+        let steps_json = r#"[{"instruction":"step 1"}]"#.to_string();
+        let result = PreflightResult::Pipeline(steps_json);
+        match result {
+            PreflightResult::Pipeline(s) => assert!(s.contains("step 1")),
+            _ => panic!("expected Pipeline variant"),
+        }
+    }
+
+    // ── SpecialistMemory ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_specialist_memory_new_empty() {
+        let mem = SpecialistMemory::default();
+        assert_eq!(mem.format_context("coding"), "");
+    }
+
+    #[test]
+    fn test_specialist_memory_push_and_retrieve() {
+        let mut mem = SpecialistMemory::new(3, 200);
+        mem.push("coding", "analyzed the error in main.rs");
+        let ctx = mem.format_context("coding");
+        assert!(ctx.contains("analyzed the error"));
+        assert!(ctx.contains("[prior specialist context]"));
+    }
+
+    #[test]
+    fn test_specialist_memory_ring_eviction() {
+        let mut mem = SpecialistMemory::new(2, 200);
+        mem.push("math", "first analysis");
+        mem.push("math", "second analysis");
+        mem.push("math", "third analysis");
+        let ctx = mem.format_context("math");
+        assert!(!ctx.contains("first"), "oldest entry should be evicted");
+        assert!(ctx.contains("second"));
+        assert!(ctx.contains("third"));
+    }
+
+    #[test]
+    fn test_specialist_memory_domain_isolation() {
+        let mut mem = SpecialistMemory::new(3, 200);
+        mem.push("coding", "code analysis");
+        mem.push("math", "math analysis");
+        let coding_ctx = mem.format_context("coding");
+        let math_ctx = mem.format_context("math");
+        assert!(coding_ctx.contains("code analysis"));
+        assert!(!coding_ctx.contains("math analysis"));
+        assert!(math_ctx.contains("math analysis"));
+        assert!(!math_ctx.contains("code analysis"));
+    }
+
+    #[test]
+    fn test_specialist_memory_char_cap() {
+        let mut mem = SpecialistMemory::new(3, 10);
+        mem.push("coding", "this is a very long specialist response that should be truncated");
+        let ctx = mem.format_context("coding");
+        assert!(ctx.contains("this is a "));
+        assert!(!ctx.contains("truncated"));
     }
 }
 

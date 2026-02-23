@@ -103,7 +103,7 @@ pub fn parse_router_decision_strict(raw: &str) -> Result<RouterDecision, String>
         serde_json::from_str(raw).map_err(|e| format!("invalid router JSON: {}", e))?;
     let action_ok = matches!(
         parsed.action.as_str(),
-        "tool" | "subagent" | "specialist" | "ask_user" | "respond"
+        "tool" | "subagent" | "specialist" | "ask_user" | "respond" | "pipeline"
     );
     if !action_ok {
         return Err(format!("invalid router action: {}", parsed.action));
@@ -259,6 +259,13 @@ mod tests {
         assert!(should_block_main_tool_calls(true, true));
         assert!(!should_block_main_tool_calls(false, true));
         assert!(!should_block_main_tool_calls(true, false));
+    }
+
+    #[test]
+    fn test_pipeline_action_validates() {
+        let json_str = r#"{"action":"pipeline","target":"multi_fetch","args":{"steps":[{"instruction":"fetch weather"}]},"confidence":0.9}"#;
+        let parsed: RouterDecision = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed.action, "pipeline");
     }
 
     #[test]

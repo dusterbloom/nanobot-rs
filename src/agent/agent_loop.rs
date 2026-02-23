@@ -766,6 +766,10 @@ impl AgentLoopShared {
         } else {
             ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
         };
+        // Save tool_defs before potential stripping so we can restore them if
+        // the router preflight returns Passthrough (router said "respond") — in
+        // that case the main model must have tools as fallback.
+        let saved_tool_defs = tool_defs.clone();
         if ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
@@ -773,8 +777,14 @@ impl AgentLoopShared {
             let router_probe_healthy = self.health_registry
                 .as_ref()
                 .map_or(false, |reg| reg.is_healthy("trio_router"));
+            // Use the same key format as router.rs: "router:{model}".
+            // Fallback to "trio_router" only when no router model is configured
+            // (in which case trio won't run anyway).
+            let cb_key = ctx.core.router_model
+                .as_deref()
+                .map_or_else(|| "trio_router".to_string(), |m| format!("router:{}", m));
             let cb_available = ctx.counters.trio_circuit_breaker.lock().unwrap()
-                .is_available("trio_router");
+                .is_available(&cb_key);
             if should_strip_tools_for_trio(
                 ctx.core.is_local,
                 ctx.core.tool_delegation_config.strict_no_tools_main,
@@ -877,6 +887,7 @@ impl AgentLoopShared {
                         let bg_lcm = lcm_engine.clone();
                         let bg_lcm_compactor = self.lcm_compactor.clone();
                         let watermark = ctx.messages.len();
+                        let bg_turn_count = ctx.turn_count;
                         in_flight.store(true, Ordering::SeqCst);
 
                         if action == CompactionAction::Async {
@@ -906,7 +917,7 @@ impl AgentLoopShared {
                                         if let Some(ref summary) = observation {
                                             bg_core
                                                 .working_memory
-                                                .update_from_compaction(&bg_session_key, summary);
+                                                .update_from_compaction(&bg_session_key, summary, bg_turn_count);
                                         }
                                     }
 
@@ -952,6 +963,7 @@ impl AgentLoopShared {
             let bg_core = ctx.core.clone();
             let bg_session_key = ctx.session_key.clone();
             let watermark = ctx.messages.len();
+            let bg_turn_count = ctx.turn_count;
             in_flight.store(true, Ordering::SeqCst);
 
             let bg_proprio = self.proprioception_config.clone();
@@ -987,7 +999,7 @@ impl AgentLoopShared {
                             if let Some(ref summary) = result.observation {
                                 bg_core
                                     .working_memory
-                                    .update_from_compaction(&bg_session_key, summary);
+                                    .update_from_compaction(&bg_session_key, summary, bg_turn_count);
                             }
                         }
                         if result.messages.len() < bg_messages.len() {
@@ -1040,7 +1052,22 @@ impl AgentLoopShared {
             crate::agent::router::PreflightResult::Break(msg) => {
                 return StepResult::Done(IterationOutcome::Finished(msg));
             }
-            crate::agent::router::PreflightResult::Passthrough => {}
+            crate::agent::router::PreflightResult::Passthrough => {
+                // Router decided not to handle this request — restore tools so
+                // the main model can still call them directly as a fallback.
+                // Without this, tool_defs was cleared in the trio stripping block
+                // above and the main model would answer "I cannot directly do X"
+                // instead of calling list_dir, exec, etc.
+                if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
+                    debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
+                    tool_defs = saved_tool_defs;
+                }
+            }
+            crate::agent::router::PreflightResult::Pipeline(_steps_json) => {
+                info!("[trio] pipeline action received");
+                // Message already injected by router_preflight.
+                // Continue to main model — full pipeline execution TBD.
+            }
         }
 
         // Adaptive max_tokens: size the response budget to the task.
@@ -1749,6 +1776,21 @@ impl AgentLoopShared {
                         ctx.core.working_memory.complete(&session.session_key);
                         debug!("Auto-completed stale session: {}", session.session_key);
                     }
+                }
+            }
+
+            // Clear current session's working memory if stale (no compaction in N turns).
+            {
+                let current = ctx.core.working_memory.get_or_create(&ctx.session_key);
+                if !current.content.is_empty()
+                    && current.last_updated_turn > 0
+                    && ctx.turn_count.saturating_sub(current.last_updated_turn) > ctx.core.stale_memory_turn_threshold
+                {
+                    ctx.core.working_memory.clear(&ctx.session_key);
+                    debug!(
+                        "Cleared stale working memory for {} (last update turn {}, current turn {})",
+                        ctx.session_key, current.last_updated_turn, ctx.turn_count
+                    );
                 }
             }
         }
@@ -4168,36 +4210,39 @@ mod tests {
             "trio_state should be Degraded after repeated router failures"
         );
 
-        // --- Key mismatch bug documentation ---
+        // Verify CB key alignment after the fix.
         //
-        // router.rs records failures under "router:{model}" (e.g. "router:offline-router").
-        // agent_loop.rs:763 checks availability under "trio_router".
+        // The offline harness returns mock responses that fail strict AND lenient
+        // parsing (lenient no longer defaults to phantom "clarify" target — it
+        // returns None when no target can be extracted). Each parse failure records
+        // a CB failure, so after 4 turns the CB should be tripped.
         //
-        // Consequence: the should_strip_tools_for_trio() call in step_pre_call uses the
-        // wrong key and therefore ALWAYS sees the circuit breaker as available, meaning
-        // the mismatch prevents the CB from protecting the tool-stripping decision.
-        //
-        // The CB IS correctly consulted inside router_preflight() (via the "router:{model}"
-        // key), so the router will still skip the LLM call after 3 failures. The bug is
-        // only in the secondary check at the tool-stripping site.
-        let cb_wrong_key_available = counters
+        // The shared CB key format ("router:{model}") ensures that the
+        // tool-stripping guard in step_pre_call and the routing skip in
+        // router_preflight observe the same state.
+        let cb_correct_key_available = counters
+            .trio_circuit_breaker
+            .lock()
+            .unwrap()
+            .is_available("router:offline-router");
+        eprintln!(
+            "CB 'router:offline-router' available after 4 turns: {}",
+            cb_correct_key_available
+        );
+        // Parse failures are now correctly recorded — CB should be tripped.
+        assert!(
+            !cb_correct_key_available,
+            "CB 'router:offline-router' should be tripped: parse failures are now recorded"
+        );
+        // The legacy key "trio_router" is also untouched.
+        let cb_legacy_key_available = counters
             .trio_circuit_breaker
             .lock()
             .unwrap()
             .is_available("trio_router");
-        // Bug: this is true even though the router has failed 4 times,
-        // because the failures are stored under "router:offline-router", not "trio_router".
-        eprintln!(
-            "CB 'trio_router' available (should be wrong key): {}",
-            cb_wrong_key_available
-        );
         assert!(
-            cb_wrong_key_available,
-            // Bug: agent_loop.rs checks 'trio_router' but router.rs records \
-            // 'router:{{model}}' — keys never match, so this is always true"
-            "CB check under 'trio_router' is always available — this confirms the key \
-             mismatch bug: agent_loop.rs checks 'trio_router' but router.rs records \
-             'router:offline-router'"
+            cb_legacy_key_available,
+            "CB 'trio_router' should be untouched — agent_loop now uses 'router:{{model}}' key"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);

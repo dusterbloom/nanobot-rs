@@ -66,6 +66,7 @@ pub struct SwappableCore {
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
     pub session_complete_after_secs: u64,
+    pub stale_memory_turn_threshold: u64,
     pub max_message_age_turns: usize,
     pub max_history_turns: usize,
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
@@ -165,6 +166,8 @@ pub struct RuntimeCounters {
     pub trio_circuit_breaker: std::sync::Mutex<CircuitBreaker>,
     /// Current trio routing state for observability.
     pub trio_state: AtomicU8,
+    /// Per-domain ring buffer memory for specialist multi-turn context.
+    pub specialist_memory: std::sync::Mutex<crate::agent::router::SpecialistMemory>,
 }
 
 impl RuntimeCounters {
@@ -192,6 +195,7 @@ impl RuntimeCounters {
             trio_metrics: TrioMetrics::default(),
             trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new(cb_config)),
             trio_state: AtomicU8::new(TrioState::Standalone as u8),
+            specialist_memory: std::sync::Mutex::new(crate::agent::router::SpecialistMemory::default()),
         }
     }
 }
@@ -504,6 +508,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         provenance_config: provenance,
         max_tool_result_chars,
         session_complete_after_secs: memory_config.session_complete_after_secs,
+        stale_memory_turn_threshold: memory_config.stale_memory_turn_threshold,
         max_message_age_turns: memory_config.max_message_age_turns,
         max_history_turns: memory_config.max_history_turns,
         model_capabilities,

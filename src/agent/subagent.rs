@@ -829,6 +829,7 @@ impl SubagentManager {
             read_only: config.read_only,
             tools_filter: config.tools_filter.clone(),
             exec_working_dir: exec_working_dir.map(|s| s.to_string()),
+            ..ToolConfig::new(workspace)
         };
         let tools = ToolRegistry::with_standard_tools(&tool_config);
 
