@@ -448,10 +448,22 @@ pub struct WebSearchConfig {
     pub api_key: String,
     #[serde(default = "default_max_results")]
     pub max_results: u32,
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    #[serde(default = "default_searxng_url")]
+    pub searxng_url: String,
 }
 
 fn default_max_results() -> u32 {
     5
+}
+
+fn default_search_provider() -> String {
+    "searxng".to_string()
+}
+
+fn default_searxng_url() -> String {
+    "http://localhost:8888".to_string()
 }
 
 impl Default for WebSearchConfig {
@@ -459,6 +471,8 @@ impl Default for WebSearchConfig {
         Self {
             api_key: String::new(),
             max_results: default_max_results(),
+            provider: default_search_provider(),
+            searxng_url: default_searxng_url(),
         }
     }
 }
@@ -824,6 +838,10 @@ pub struct MemoryConfig {
     #[serde(default = "default_session_complete_after_secs")]
     pub session_complete_after_secs: u64,
 
+    /// Turns of inactivity before clearing the current session's working memory (default: 15).
+    #[serde(default = "default_stale_memory_turn_threshold")]
+    pub stale_memory_turn_threshold: u64,
+
     /// Compaction threshold as a percentage of available context (default: 66.6%).
     /// Compaction fires when this OR `compaction_threshold_tokens` is exceeded.
     #[serde(default = "default_compaction_threshold_percent")]
@@ -887,6 +905,10 @@ fn default_session_complete_after_secs() -> u64 {
     3600
 }
 
+fn default_stale_memory_turn_threshold() -> u64 {
+    15
+}
+
 fn default_compaction_threshold_percent() -> f64 {
     66.6
 }
@@ -917,6 +939,7 @@ impl Default for MemoryConfig {
             working_memory_budget: default_working_memory_budget(),
             reflection_threshold: default_reflection_threshold(),
             session_complete_after_secs: default_session_complete_after_secs(),
+            stale_memory_turn_threshold: default_stale_memory_turn_threshold(),
             compaction_threshold_percent: default_compaction_threshold_percent(),
             compaction_threshold_tokens: default_compaction_threshold_tokens(),
             max_message_age_turns: default_max_message_age_turns(),
@@ -1143,6 +1166,12 @@ pub struct ToolDelegationConfig {
     /// Tuning knobs for subagent execution.
     #[serde(default)]
     pub subagent: SubagentTuning,
+
+    /// When true (default), the specialist response is injected into messages
+    /// and the main model synthesizes it in its own voice (Continue).
+    /// When false, the specialist response goes directly to the user (Break).
+    #[serde(default = "default_true")]
+    pub specialist_synthesis: bool,
 }
 
 fn default_td_cost_budget() -> f64 {
@@ -1154,7 +1183,7 @@ fn default_td_preview_chars() -> usize {
 }
 
 fn default_td_max_same_tool_call() -> u32 {
-    1
+    3
 }
 
 impl Default for ToolDelegationConfig {
@@ -1179,6 +1208,7 @@ impl Default for ToolDelegationConfig {
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: default_td_max_same_tool_call(),
             subagent: SubagentTuning::default(),
+            specialist_synthesis: true,
         }
     }
 }
@@ -1689,7 +1719,7 @@ mod tests {
         assert!(!td.strict_local_only);
         assert!(td.strict_toolplan_validation);
         assert!(td.deterministic_router_fallback);
-        assert_eq!(td.max_same_tool_call_per_turn, 1);
+        assert_eq!(td.max_same_tool_call_per_turn, 3);
     }
 
     #[test]
@@ -1715,6 +1745,7 @@ mod tests {
             strict_toolplan_validation: true,
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: 1,
+            specialist_synthesis: true,
             mode: DelegationMode::Trio,
             subagent: SubagentTuning::default(),
         };

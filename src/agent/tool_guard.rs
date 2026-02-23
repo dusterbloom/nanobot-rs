@@ -4,17 +4,34 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+/// Read-only tools that benefit from higher repeat limits.
+const READ_TOOL_LIMIT: u32 = 5;
+const READ_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "recall",
+    "read_skill",
+    "web_search",
+    "web_fetch",
+];
+
 pub struct ToolGuard {
     seen: HashMap<String, u32>,
     max_same_call: u32,
+    tool_limits: HashMap<String, u32>,
     results: HashMap<String, String>,
 }
 
 impl ToolGuard {
     pub fn new(max_same_call: u32) -> Self {
+        let mut tool_limits = HashMap::new();
+        for &tool in READ_TOOLS {
+            tool_limits.insert(tool.to_string(), READ_TOOL_LIMIT);
+        }
         Self {
             seen: HashMap::new(),
             max_same_call: max_same_call.max(1),
+            tool_limits,
             results: HashMap::new(),
         }
     }
@@ -44,10 +61,11 @@ impl ToolGuard {
         let key = Self::key(name, args);
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
-        if *count > self.max_same_call {
+        let limit = self.tool_limits.get(name).copied().unwrap_or(self.max_same_call);
+        if *count > limit {
             return Err(format!(
                 "duplicate tool call blocked for '{}': exceeded {} identical calls in one turn",
-                name, self.max_same_call
+                name, limit
             ));
         }
         Ok(())
@@ -58,13 +76,18 @@ impl ToolGuard {
 mod tests {
     use super::*;
 
+    fn args(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect()
+    }
+
     #[test]
     fn test_tool_guard_blocks_duplicates() {
         let mut g = ToolGuard::new(1);
         let mut args = HashMap::new();
-        args.insert("url".to_string(), Value::String("https://a".to_string()));
-        assert!(g.allow("web_fetch", &args).is_ok());
-        assert!(g.allow("web_fetch", &args).is_err());
+        args.insert("command".to_string(), Value::String("ls".to_string()));
+        // exec is not in the read-tool list, so it uses the default limit of 1
+        assert!(g.allow("exec", &args).is_ok());
+        assert!(g.allow("exec", &args).is_err());
     }
 
     #[test]
@@ -84,6 +107,67 @@ mod tests {
         args.insert("path".to_string(), Value::String("/tmp/bar".to_string()));
         let key = ToolGuard::key("read_file", &args);
         assert_eq!(g.get_cached_result(&key), None);
+    }
+
+    #[test]
+    fn test_read_tool_higher_limit() {
+        let mut guard = ToolGuard::new(1);
+        let a = args(&[("path", "/tmp/a.txt")]);
+        // read_file should allow up to 5 identical calls
+        for _ in 0..5 {
+            assert!(guard.allow("read_file", &a).is_ok());
+        }
+        // 6th should be blocked
+        assert!(guard.allow("read_file", &a).is_err());
+    }
+
+    #[test]
+    fn test_write_tool_uses_default_limit() {
+        let mut guard = ToolGuard::new(1);
+        let a = args(&[("path", "/tmp/a.txt"), ("content", "hello")]);
+        // First call allowed
+        assert!(guard.allow("write_file", &a).is_ok());
+        // Second identical call blocked at default limit
+        assert!(guard.allow("write_file", &a).is_err());
+    }
+
+    #[test]
+    fn test_different_args_not_blocked() {
+        let mut guard = ToolGuard::new(1);
+        let a1 = args(&[("path", "/tmp/a.txt")]);
+        let a2 = args(&[("path", "/tmp/b.txt")]);
+        assert!(guard.allow("write_file", &a1).is_ok());
+        assert!(guard.allow("write_file", &a2).is_ok());
+    }
+
+    #[test]
+    fn test_list_dir_higher_limit() {
+        let mut guard = ToolGuard::new(1);
+        let a = args(&[("path", "/tmp")]);
+        for _ in 0..5 {
+            assert!(guard.allow("list_dir", &a).is_ok());
+        }
+        assert!(guard.allow("list_dir", &a).is_err());
+    }
+
+    #[test]
+    fn test_recall_higher_limit() {
+        let mut guard = ToolGuard::new(1);
+        let a = args(&[("query", "test")]);
+        for _ in 0..5 {
+            assert!(guard.allow("recall", &a).is_ok());
+        }
+        assert!(guard.allow("recall", &a).is_err());
+    }
+
+    #[test]
+    fn test_default_limit_raised_to_three() {
+        let mut guard = ToolGuard::new(3);
+        let a = args(&[("command", "ls")]);
+        for _ in 0..3 {
+            assert!(guard.allow("exec", &a).is_ok());
+        }
+        assert!(guard.allow("exec", &a).is_err());
     }
 }
 

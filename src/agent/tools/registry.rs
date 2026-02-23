@@ -29,6 +29,10 @@ pub struct ToolConfig {
     pub tools_filter: Option<Vec<String>>,
     /// Optional override for exec working directory.
     pub exec_working_dir: Option<String>,
+    /// Search backend: "searxng" (default) or "brave".
+    pub search_provider: String,
+    /// Base URL of the SearXNG instance (default: "http://localhost:8888").
+    pub searxng_url: String,
 }
 
 impl ToolConfig {
@@ -43,6 +47,8 @@ impl ToolConfig {
             read_only: false,
             tools_filter: None,
             exec_working_dir: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
         }
     }
 }
@@ -140,11 +146,57 @@ impl ToolRegistry {
 
         if canonical_name == "read_file" {
             if !params.contains_key("path") {
-                if let Some(v) = params.get("file").cloned() {
+                if let Some(v) = params
+                    .get("file_path")
+                    .cloned()
+                    .or_else(|| params.get("filepath").cloned())
+                    .or_else(|| params.get("file").cloned())
+                {
                     params.insert("path".to_string(), v);
                 }
             }
             Self::require_non_empty_string(&params, "path", "read_file")?;
+        }
+
+        if canonical_name == "write_file" {
+            if !params.contains_key("path") {
+                if let Some(v) = params
+                    .get("file_path")
+                    .cloned()
+                    .or_else(|| params.get("filepath").cloned())
+                    .or_else(|| params.get("file").cloned())
+                {
+                    params.insert("path".to_string(), v);
+                }
+            }
+            Self::require_non_empty_string(&params, "path", "write_file")?;
+        }
+
+        if canonical_name == "edit_file" {
+            if !params.contains_key("path") {
+                if let Some(v) = params
+                    .get("file_path")
+                    .cloned()
+                    .or_else(|| params.get("filepath").cloned())
+                    .or_else(|| params.get("file").cloned())
+                {
+                    params.insert("path".to_string(), v);
+                }
+            }
+            Self::require_non_empty_string(&params, "path", "edit_file")?;
+        }
+
+        if canonical_name == "list_dir" {
+            if !params.contains_key("path") {
+                if let Some(v) = params
+                    .get("dir_path")
+                    .cloned()
+                    .or_else(|| params.get("directory").cloned())
+                    .or_else(|| params.get("dir").cloned())
+                {
+                    params.insert("path".to_string(), v);
+                }
+            }
         }
 
         Ok((canonical_name.to_string(), params))
@@ -228,6 +280,8 @@ impl ToolRegistry {
             self.register(Box::new(WebSearchTool::new(
                 config.brave_api_key.clone(),
                 5,
+                config.search_provider.clone(),
+                config.searxng_url.clone(),
             )));
         }
         if should_include("web_fetch") {
@@ -908,6 +962,206 @@ mod tests {
         assert!(result.ok, "{}", result.data);
         let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
         assert_eq!(parsed["query"], "latest news");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_file_path_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("/tmp/test.txt".to_string()),
+        );
+
+        let result = registry.execute("read_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test.txt");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_filepath_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "filepath".to_string(),
+            serde_json::Value::String("/tmp/test.txt".to_string()),
+        );
+
+        let result = registry.execute("read_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test.txt");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_file_alias_still_works() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "file".to_string(),
+            serde_json::Value::String("/tmp/test.txt".to_string()),
+        );
+
+        let result = registry.execute("read_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/test.txt");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_path_alias_priority_file_path_over_file() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("read_file")));
+
+        // When both file_path and file are present, file_path wins.
+        let mut params = HashMap::new();
+        params.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("/correct.txt".to_string()),
+        );
+        params.insert(
+            "file".to_string(),
+            serde_json::Value::String("/wrong.txt".to_string()),
+        );
+
+        let result = registry.execute("read_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/correct.txt");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_file_path_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("write_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("/tmp/out.txt".to_string()),
+        );
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
+
+        let result = registry.execute("write_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/out.txt");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_filepath_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("write_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "filepath".to_string(),
+            serde_json::Value::String("/tmp/out.txt".to_string()),
+        );
+        params.insert(
+            "content".to_string(),
+            serde_json::Value::String("hello".to_string()),
+        );
+
+        let result = registry.execute("write_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/out.txt");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_file_path_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("edit_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("/tmp/edit.txt".to_string()),
+        );
+
+        let result = registry.execute("edit_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/edit.txt");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_filepath_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("edit_file")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "filepath".to_string(),
+            serde_json::Value::String("/tmp/edit.txt".to_string()),
+        );
+
+        let result = registry.execute("edit_file", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp/edit.txt");
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_directory_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("list_dir")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "directory".to_string(),
+            serde_json::Value::String("/tmp".to_string()),
+        );
+
+        let result = registry.execute("list_dir", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_dir_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("list_dir")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "dir".to_string(),
+            serde_json::Value::String("/tmp".to_string()),
+        );
+
+        let result = registry.execute("list_dir", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_dir_path_alias() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("list_dir")));
+
+        let mut params = HashMap::new();
+        params.insert(
+            "dir_path".to_string(),
+            serde_json::Value::String("/tmp".to_string()),
+        );
+
+        let result = registry.execute("list_dir", params).await;
+        assert!(result.ok, "Expected ok, got error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.data).unwrap();
+        assert_eq!(parsed["path"], "/tmp");
     }
 
     // -----------------------------------------------------------------------

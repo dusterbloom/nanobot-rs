@@ -50,10 +50,10 @@ impl Tool for ReadFileTool {
         let file_path = expand_path(path);
 
         if !file_path.exists() {
-            return format!("Error: File not found: {}", path);
+            return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
         }
         if !file_path.is_file() {
-            return format!("Error: Not a file: {}", path);
+            return format!("Error: Not a file: {}. Hint: this path is a directory, not a file. Use list_dir to see its contents.", path);
         }
 
         // Read raw bytes first for binary detection.
@@ -61,7 +61,7 @@ impl Tool for ReadFileTool {
             Ok(b) => b,
             Err(e) => {
                 return if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}", path)
+                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
                 } else {
                     format!("Error reading file: {}", e)
                 }
@@ -134,7 +134,7 @@ impl Tool for WriteFileTool {
         // Create parent directories.
         if let Some(parent) = file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return format!("Error creating directories: {}", e);
+                return format!("Error creating directories: {}. Hint: check file permissions or try a different path.", e);
             }
         }
 
@@ -142,7 +142,7 @@ impl Tool for WriteFileTool {
             Ok(()) => format!("Successfully wrote {} bytes to {}", content.len(), path),
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}", path)
+                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
                 } else {
                     format!("Error writing file: {}", e)
                 }
@@ -206,7 +206,7 @@ impl Tool for EditFileTool {
         let file_path = expand_path(path);
 
         if !file_path.exists() {
-            return format!("Error: File not found: {}", path);
+            return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
         }
 
         let content = match tokio::fs::read_to_string(&file_path).await {
@@ -215,7 +215,7 @@ impl Tool for EditFileTool {
         };
 
         if !content.contains(old_text) {
-            return "Error: old_text not found in file. Make sure it matches exactly.".to_string();
+            return "Error: old_text not found in file. Make sure it matches exactly. Hint: use read_file to see the current file contents, then copy the exact text to match.".to_string();
         }
 
         // Count occurrences.
@@ -233,7 +233,7 @@ impl Tool for EditFileTool {
             Ok(()) => format!("Successfully edited {}", path),
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}", path)
+                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
                 } else {
                     format!("Error writing file: {}", e)
                 }
@@ -281,10 +281,10 @@ impl Tool for ListDirTool {
         let dir_path = expand_path(path);
 
         if !dir_path.exists() {
-            return format!("Error: Directory not found: {}", path);
+            return format!("Error: Directory not found: {}. Hint: parent directory does not exist. Use list_dir to find the correct path.", path);
         }
         if !dir_path.is_dir() {
-            return format!("Error: Not a directory: {}", path);
+            return format!("Error: Not a directory: {}. Hint: this path is a file, not a directory. Use read_file instead.", path);
         }
 
         match tokio::fs::read_dir(&dir_path).await {
@@ -329,7 +329,7 @@ impl Tool for ListDirTool {
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    format!("Error: Permission denied: {}", path)
+                    format!("Error: Permission denied: {}. Hint: check file permissions or try a different path.", path)
                 } else {
                     format!("Error listing directory: {}", e)
                 }
@@ -812,5 +812,80 @@ mod tests {
             result
         );
         assert!(result.contains("bytes]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery hint tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_file_not_found_has_hint() {
+        let tool = ReadFileTool;
+        let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_xyz.txt")]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_not_a_file_has_hint() {
+        let dir = TempDir::new().unwrap();
+        let tool = ReadFileTool;
+        let params = make_params(&[("path", dir.path().to_str().unwrap())]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_not_found_has_hint() {
+        let tool = EditFileTool;
+        let params = make_params(&[
+            ("path", "/tmp/nanobot_hint_test_nonexistent_edit_xyz.txt"),
+            ("old_text", "a"),
+            ("new_text", "b"),
+        ]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_old_text_not_found_has_hint() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("edit_hint.txt");
+        std::fs::write(&file_path, "some existing content").unwrap();
+
+        let tool = EditFileTool;
+        let params = make_params(&[
+            ("path", file_path.to_str().unwrap()),
+            ("old_text", "text that does not exist in file"),
+            ("new_text", "replacement"),
+        ]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("read_file"), "Expected read_file hint: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_not_found_has_hint() {
+        let tool = ListDirTool;
+        let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_dir_xyz")]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_not_a_directory_has_hint() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, "content").unwrap();
+
+        let tool = ListDirTool;
+        let params = make_params(&[("path", file_path.to_str().unwrap())]);
+        let result = tool.execute(params).await;
+        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
+        assert!(result.contains("read_file"), "Expected read_file hint: {}", result);
     }
 }
