@@ -7,6 +7,8 @@
 mod commands;
 mod incremental;
 
+pub(crate) use commands::{should_auto_activate_trio, trio_enable};
+
 use std::io::{self, IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

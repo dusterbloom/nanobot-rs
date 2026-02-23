@@ -161,7 +161,7 @@ pub struct ToolRunResult {
 }
 
 /// Normalize a tool call key for dedup: sort JSON keys and use compact serialization.
-fn normalize_call_key(name: &str, arguments: &HashMap<String, Value>) -> String {
+pub(crate) fn normalize_call_key(name: &str, arguments: &HashMap<String, Value>) -> String {
     let mut sorted: Vec<_> = arguments.iter().collect();
     sorted.sort_by_key(|(k, _)| *k);
     let normalized = serde_json::to_string(&sorted).unwrap_or_default();
@@ -627,8 +627,22 @@ pub async fn run_tool_loop(
     // Execute the initial tool calls from the main model.
     let mut pending_calls: Vec<ToolCallRequest> = initial_tool_calls.to_vec();
 
+    // Deduplicate within the initial batch itself.
+    let mut batch_seen = std::collections::HashSet::new();
+    pending_calls.retain(|tc| {
+        let key = normalize_call_key(&tc.name, &tc.arguments);
+        batch_seen.insert(key)
+    });
+    if pending_calls.len() < initial_tool_calls.len() {
+        tracing::warn!(
+            before = initial_tool_calls.len(),
+            after = pending_calls.len(),
+            "Deduplicated identical tool calls in initial batch"
+        );
+    }
+
     // Seed seen_calls with initial calls so the model can't re-request them.
-    for tc in initial_tool_calls {
+    for tc in &pending_calls {
         let call_key = normalize_call_key(&tc.name, &tc.arguments);
         seen_calls.insert(call_key);
     }
@@ -1210,7 +1224,9 @@ mod tests {
                 name: name.to_string(),
                 arguments: {
                     let mut m = HashMap::new();
-                    m.insert("query".to_string(), json!("test"));
+                    // Use index in query so calls with the same name are not
+                    // treated as duplicates by normalize_call_key dedup.
+                    m.insert("query".to_string(), json!(format!("test_{}", i)));
                     m
                 },
             })

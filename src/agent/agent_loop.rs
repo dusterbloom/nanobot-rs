@@ -1602,6 +1602,46 @@ impl AgentLoopShared {
             crate::agent::router::RouteResult::Execute(calls) => calls,
         };
 
+        // Deduplicate identical tool calls within the same batch.
+        // Local models sometimes emit the same call multiple times in a single response.
+        let routed_tool_calls = {
+            let mut seen = std::collections::HashSet::new();
+            let before = routed_tool_calls.len();
+            let deduped: Vec<_> = routed_tool_calls
+                .into_iter()
+                .filter(|tc| {
+                    let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
+                    seen.insert(key)
+                })
+                .collect();
+            if deduped.len() < before {
+                tracing::warn!(
+                    before,
+                    after = deduped.len(),
+                    "Deduplicated identical tool calls in batch"
+                );
+            }
+            deduped
+        };
+
+        // Inject working_dir into exec tool calls when missing.
+        // Local models often omit working_dir, causing commands to run in
+        // the wrong directory. Default to the process's current directory.
+        let routed_tool_calls: Vec<_> = routed_tool_calls
+            .into_iter()
+            .map(|mut tc| {
+                if tc.name == "exec" && !tc.arguments.contains_key("working_dir") {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        tc.arguments.insert(
+                            "working_dir".to_string(),
+                            serde_json::Value::String(cwd.to_string_lossy().to_string()),
+                        );
+                    }
+                }
+                tc
+            })
+            .collect();
+
         // Context pressure check: if high, log a warning. The correct
         // response is compaction, NOT spawning the main model as its
         // own tool runner (which doubles cost for no benefit).
@@ -2219,7 +2259,9 @@ impl AgentLoop {
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
             // Waits up to 400ms for follow-up messages before processing.
-            let msg = if crate::bus::events::should_coalesce(&msg.channel) {
+            let msg = if crate::bus::events::should_coalesce(&msg.channel)
+                && !msg.content.trim_start().starts_with('/')
+            {
                 let session = msg.session_key();
                 let mut batch = vec![msg];
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
@@ -2285,6 +2327,17 @@ impl AgentLoop {
                     error!("Failed to publish outbound message: {}", e);
                 }
                 continue;
+            }
+
+            // Gateway slash command interception — handle before LLM processing.
+            if msg.content.trim().starts_with('/') {
+                if let Some(response_text) = crate::agent::gateway_commands::dispatch(&self.shared, &msg).await {
+                    let outbound = crate::bus::events::OutboundMessage::new(&msg.channel, &msg.chat_id, &response_text);
+                    if let Err(e) = self.shared.bus_outbound_tx.send(outbound) {
+                        tracing::error!("Failed to send command response: {}", e);
+                    }
+                    continue;
+                }
             }
 
             // Acquire a concurrency permit.

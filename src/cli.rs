@@ -844,10 +844,28 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         port
     );
 
-    let config = load_config(None);
+    let mut config = load_config(None);
     check_api_key(&config);
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
+    // Trio auto-detection (same logic as REPL startup)
+    if crate::repl::should_auto_activate_trio(
+        !config.agents.defaults.local_api_base.is_empty(),
+        &config.trio.router_model,
+        &config.trio.specialist_model,
+        config.trio.router_endpoint.is_some(),
+        config.trio.specialist_endpoint.is_some(),
+        &config.tool_delegation.mode,
+    ) {
+        crate::repl::trio_enable(&mut config);
+        tracing::info!(
+            router_model = %config.trio.router_model,
+            specialist_model = %config.trio.specialist_model,
+            "trio_auto_activated_gateway"
+        );
+    }
+
+    let is_local = !config.agents.defaults.local_api_base.is_empty();
+    let core_handle = build_core_handle(&config, "8080", None, None, None, None, is_local);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None));
 }

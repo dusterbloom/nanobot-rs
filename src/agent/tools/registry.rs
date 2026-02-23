@@ -266,7 +266,11 @@ impl ToolRegistry {
             let exec_cwd = config
                 .exec_working_dir
                 .clone()
-                .unwrap_or_else(|| config.workspace.to_string_lossy().to_string());
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| config.workspace.to_string_lossy().to_string())
+                });
             self.register(Box::new(ExecTool::new(
                 config.exec_timeout,
                 Some(exec_cwd),
