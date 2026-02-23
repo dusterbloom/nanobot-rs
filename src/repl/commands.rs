@@ -264,6 +264,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/s" => "/status",
         "/rd" => "/restart",
         "/ctx-info" => "/context",
+        "/c" => "/clear",
         other => other,
     }
 }
@@ -350,6 +351,9 @@ impl ReplContext {
             }
             "/sessions" => {
                 self.cmd_sessions(arg);
+            }
+            "/clear" => {
+                self.cmd_clear().await;
             }
             #[cfg(feature = "voice")]
             "/voice" => {
@@ -794,6 +798,27 @@ impl ReplContext {
                 }
                 println!();
             }
+        }
+    }
+
+    /// /clear — clear working memory and conversation history for the current session.
+    async fn cmd_clear(&self) {
+        let core = self.core_handle.swappable();
+        if !core.memory_enabled {
+            println!("\n  Memory system is disabled.\n");
+            return;
+        }
+        let had_content = !core
+            .working_memory
+            .get_context(&self.session_id, 1)
+            .is_empty();
+        core.working_memory.clear(&self.session_id);
+        // Also clear conversation history so the next turn starts fresh.
+        core.sessions.clear_history(&self.session_id).await;
+        if had_content {
+            println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
+        } else {
+            println!("\n  Conversation history cleared.\n");
         }
     }
 
@@ -2666,6 +2691,7 @@ mod tests {
         assert_eq!(normalize_alias("/rd"), "/restart");
         assert_eq!(normalize_alias("/ctx-info"), "/context");
         assert_eq!(normalize_alias("/ss"), "/sessions");
+        assert_eq!(normalize_alias("/c"), "/clear");
     }
 
     #[test]

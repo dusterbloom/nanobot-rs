@@ -267,6 +267,17 @@ impl SessionManager {
         }
     }
 
+    /// Clear the in-memory message history for a session key.
+    ///
+    /// Only clears the cache — the JSONL file on disk is preserved as an
+    /// audit trail. The next turn will start with an empty conversation.
+    pub async fn clear_history(&self, key: &str) {
+        let mut cache = self.cache.lock().await;
+        if let Some(session) = cache.get_mut(key) {
+            session.messages.clear();
+        }
+    }
+
     /// Delete a session from cache and disk.
     ///
     /// Returns `true` if the file was actually removed.

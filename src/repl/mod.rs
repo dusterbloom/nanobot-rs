@@ -224,6 +224,7 @@ pub(crate) fn print_help() {
     println!("  /status, /s     - Show current mode, model, and channel info");
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
     println!("  /memory         - Show working memory for current session");
+    println!("  /clear, /c      - Clear working memory for current session");
     println!("  /replay         - Show session message history (/replay full | /replay N)");
     println!("  /restart, /rd   - Restart local servers (or delegation in cloud mode)");
     println!("  /sessions, /ss  - Session management (list, export, purge, archive, index)");
