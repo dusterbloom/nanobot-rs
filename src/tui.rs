@@ -338,19 +338,19 @@ pub(crate) fn render_input_bar(
     // prompt_row is where the user types — just above the bar
     let prompt_row = bar_row.saturating_sub(1);
 
+    // Reset scroll region to full screen so we can position cursor freely
+    print!("\x1b[r");
+
     if push_content {
         // First render: push existing content up to make room for the bar.
-        print!("\x1b[r"); // reset scroll region to full screen
         print!("\x1b[{};1H", height); // move to last row
         for _ in 0..bar_lines + 1 {
             println!(); // push content up by scrolling
         }
-    } else {
-        // Refresh: save cursor, update bar content in place, restore cursor.
-        print!("\x1b[s");
     }
 
     // Render the bar at its fixed position (outside scroll region)
+    // Only clear from bar_row onwards, not the whole screen
     print!("\x1b[{};1H", bar_row);
     print!("\x1b[J"); // clear from bar_row to end of screen
     println!("{DIM}{separator}{RESET}");
@@ -360,13 +360,8 @@ pub(crate) fn render_input_bar(
     // Set scroll region to rows 1..prompt_row so text never overwrites the bar
     print!("\x1b[1;{}r", prompt_row);
 
-    if push_content {
-        // Position cursor at prompt_row for initial input
-        print!("\x1b[{};1H\x1b[2K", prompt_row);
-    } else {
-        // Restore cursor to where it was (inside scroll region)
-        print!("\x1b[u");
-    }
+    // Always position cursor at prompt_row for input
+    print!("\x1b[{};1H\x1b[2K", prompt_row);
     std::io::stdout().flush().ok();
 
     bar_lines
