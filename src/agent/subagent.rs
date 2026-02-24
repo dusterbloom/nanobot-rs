@@ -856,6 +856,13 @@ impl SubagentManager {
             json!({"role": "user", "content": task}),
         ];
 
+        // Select conversation protocol based on whether we're talking to a local model.
+        let protocol: std::sync::Arc<dyn crate::agent::protocol::ConversationProtocol> = if is_local {
+            std::sync::Arc::new(crate::agent::protocol::LocalProtocol)
+        } else {
+            std::sync::Arc::new(crate::agent::protocol::CloudProtocol)
+        };
+
         let local_ctx_limit = if is_local {
             Some(resolve_local_context_limit(
                 provider,
@@ -915,9 +922,11 @@ impl SubagentManager {
                 }
             }
 
+            // Render protocol-correct wire format before each LLM call.
+            let wire = crate::agent::protocol::render_to_wire(&*protocol, &messages);
             let response = match provider
                 .chat(
-                    &messages,
+                    &wire,
                     tool_defs_opt,
                     Some(&config.model),
                     max_response_tokens,
@@ -950,9 +959,10 @@ impl SubagentManager {
                         retry_max_tokens,
                         e,
                     );
+                    let wire_retry = crate::agent::protocol::render_to_wire(&*protocol, &messages);
                     provider
                         .chat(
-                            &messages,
+                            &wire_retry,
                             tool_defs_opt,
                             Some(&config.model),
                             retry_max_tokens,
@@ -971,7 +981,7 @@ impl SubagentManager {
             }
 
             if crate::agent::tool_runner::process_tool_response(
-                &response, &mut messages, &tools, is_local,
+                &response, &mut messages, &tools,
             ).await {
                 // Taint tracking: check sensitive tools before marking new taint sources.
                 for tc in &response.tool_calls {
