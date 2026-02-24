@@ -12,13 +12,22 @@ fn safe_copy(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 fn main() {
-    // When the voice feature is enabled, sherpa-rs links against libsherpa-onnx-c-api.so
+    // When the voice feature is enabled, sherpa-rs links against libsherpa-onnx-c-api.so/.dylib
     // which gets copied to the target dir at build time. Set rpath so the binary can find
-    // it at runtime relative to the executable ($ORIGIN) and also at ~/.local/lib.
+    // it at runtime relative to the executable ($ORIGIN on Linux, @executable_path on macOS)
+    // and also at ~/.local/lib.
     #[cfg(feature = "voice")]
     {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+        #[cfg(target_os = "macos")]
+        {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+        }
 
         // Copy sherpa-onnx shared libraries to the target directory so they're
         // next to the binary after build. Also copy to ~/.local/lib for the
@@ -39,6 +48,15 @@ fn main() {
             let home = std::env::var("HOME").unwrap_or_default();
             let sherpa_cache = std::path::PathBuf::from(&home).join(".cache/sherpa-rs");
             if sherpa_cache.exists() {
+                // On macOS the libs are .dylib; on Linux they are .so.
+                #[cfg(target_os = "macos")]
+                let libs = [
+                    "libsherpa-onnx-c-api.dylib",
+                    "libsherpa-onnx-cxx-api.dylib",
+                    "libonnxruntime.dylib",
+                    "libonnxruntime.1.17.1.dylib",
+                ];
+                #[cfg(not(target_os = "macos"))]
                 let libs = [
                     "libsherpa-onnx-c-api.so",
                     "libonnxruntime.so",
