@@ -922,19 +922,28 @@ impl AgentLoopShared {
                                     let compactor: &ContextCompactor = bg_lcm_compactor
                                         .as_deref()
                                         .unwrap_or(&bg_core.compactor);
-                                    let observation = {
+                                    let summary_turn = {
                                         let mut engine = bg_lcm.lock().await;
                                         engine
                                             .compact(compactor, &bg_core.token_budget, 0)
                                             .await
                                     };
 
+                                    // Extract text from Turn::Summary for working memory and result.
+                                    let observation: Option<String> = summary_turn.as_ref().and_then(|t| {
+                                        if let crate::agent::turn::Turn::Summary { text, .. } = t {
+                                            Some(text.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+
                                     // Update working memory with compaction observation.
                                     if bg_core.memory_enabled {
-                                        if let Some(ref summary) = observation {
+                                        if let Some(ref summary_text) = observation {
                                             bg_core
                                                 .working_memory
-                                                .update_from_compaction(&bg_session_key, summary, bg_turn_count);
+                                                .update_from_compaction(&bg_session_key, summary_text, bg_turn_count);
                                         }
                                     }
 
