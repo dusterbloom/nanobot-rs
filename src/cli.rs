@@ -272,6 +272,115 @@ mod tests {
 }
 
 // ============================================================================
+// Voice Library Setup
+// ============================================================================
+
+fn setup_voice_libs() {
+    use std::fs;
+
+    // Find sherpa-rs cache directory
+    let cache_base = dirs::home_dir()
+        .map(|h| h.join("Library/Caches/sherpa-rs/aarch64-apple-darwin"))
+        .filter(|p| p.exists());
+
+    let Some(cache_base) = cache_base else {
+        return;
+    };
+
+    // Find the sherpa-onnx lib directory
+    // Structure: ~/Library/Caches/sherpa-rs/aarch64-apple-darwin/{hash}/sherpa-onnx-{version}/lib/
+    let mut lib_dir: Option<std::path::PathBuf> = None;
+
+    if let Ok(entries) = std::fs::read_dir(&cache_base) {
+        for entry in entries.flatten() {
+            let hash_dir = entry.path();
+            if !hash_dir.is_dir() {
+                continue;
+            }
+            // Check if it's a 40-char hash directory
+            if let Some(name) = hash_dir.file_name().and_then(|n| n.to_str()) {
+                if name.len() >= 40 {
+                    // Look for sherpa-onnx-* inside
+                    if let Ok(sub_entries) = std::fs::read_dir(&hash_dir) {
+                        for sub_entry in sub_entries.flatten() {
+                            let onnx_dir = sub_entry.path();
+                            if onnx_dir.is_dir() {
+                                if let Some(onnx_name) = onnx_dir.file_name().and_then(|n| n.to_str()) {
+                                    if onnx_name.starts_with("sherpa-onnx-") {
+                                        lib_dir = Some(onnx_dir.join("lib"));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if lib_dir.is_some() {
+                break;
+            }
+        }
+    }
+
+    let Some(lib_dir) = lib_dir.filter(|p| p.exists()) else {
+        return;
+    };
+
+    // Destination: ~/.local/lib/
+    let dest_dir = dirs::home_dir()
+        .map(|h| h.join(".local/lib"))
+        .expect("Failed to get home directory");
+
+    // Create destination if needed
+    if !dest_dir.exists() {
+        if let Err(e) = fs::create_dir_all(&dest_dir) {
+            eprintln!("  Warning: Could not create ~/.local/lib: {}", e);
+            return;
+        }
+    }
+
+    // Libraries to copy
+    let libs = ["libonnxruntime.1.17.1.dylib", "libsherpa-onnx-c-api.dylib"];
+
+    for lib_name in &libs {
+        let src = lib_dir.join(lib_name);
+        let dst = dest_dir.join(lib_name);
+
+        if src.exists() {
+            // Copy if destination doesn't exist or source is different size
+            let src_meta = fs::metadata(&src).ok();
+            let dst_meta = fs::metadata(&dst).ok();
+            let needs_copy = !dst.exists()
+                || src_meta
+                    .zip(dst_meta)
+                    .map(|(s, d)| s.len() != d.len())
+                    .unwrap_or(true);
+
+            if needs_copy {
+                match fs::copy(&src, &dst) {
+                    Ok(_) => println!("  Installed voice library: {}", lib_name),
+                    Err(e) => {
+                        eprintln!("  Warning: Could not copy {}: {}", lib_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also create a symlink for libonnxruntime.dylib if needed
+    let src_onnx = lib_dir.join("libonnxruntime.dylib");
+    let dst_onnx = dest_dir.join("libonnxruntime.dylib");
+    if src_onnx.exists() && !dst_onnx.exists() {
+        if let Err(e) = std::os::unix::fs::symlink(&src_onnx, &dst_onnx) {
+            // If symlink fails, try copying
+            if fs::copy(&src_onnx, &dst_onnx).is_ok() {
+                println!("  Installed voice library: libonnxruntime.dylib");
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Onboard
 // ============================================================================
 
@@ -297,6 +406,8 @@ pub(crate) fn cmd_onboard() {
     println!("  Created workspace at {}", workspace.display());
 
     create_workspace_templates(&workspace);
+
+    setup_voice_libs();
 
     println!("\n{} nanobot is ready!", crate::LOGO);
     println!("\nNext steps:");
