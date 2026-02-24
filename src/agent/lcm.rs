@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,9 +20,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::agent::compaction::ContextCompactor;
-use crate::agent::protocol::{ConversationProtocol, render_to_wire};
+use crate::agent::protocol::ConversationProtocol;
 use crate::agent::token_budget::TokenBudget;
-use crate::agent::turn::{Turn, ToolCall};
+use crate::agent::turn::Turn;
 use crate::config::schema::LcmSchemaConfig;
 
 // ---------------------------------------------------------------------------

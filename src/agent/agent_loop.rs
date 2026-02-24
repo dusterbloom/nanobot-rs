@@ -855,15 +855,41 @@ impl AgentLoopShared {
         // When LCM is enabled, use the LCM engine's control loop instead.
         if self.lcm_config.enabled {
             // LCM path: get or create per-session engine, check thresholds.
+            // On first creation, check for existing summaries and rebuild DAG if present.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
-                engines
-                    .entry(ctx.session_key.clone())
-                    .or_insert_with(|| {
-                        let config = LcmConfig::from(&self.lcm_config);
-                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
-                    })
-                    .clone()
+                if !engines.contains_key(&ctx.session_key) {
+                    let config = LcmConfig::from(&self.lcm_config);
+                    
+                    // Check if session has existing summary turns.
+                    let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_key).await;
+                    let turns: Vec<crate::agent::turn::Turn> = all_msgs
+                        .iter()
+                        .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
+                        .collect();
+                    let has_summaries = turns.iter().any(|t| t.is_summary());
+                    
+                    let engine = if has_summaries {
+                        // Rebuild from persisted summaries.
+                        debug!(
+                            session = %ctx.session_key,
+                            summary_count = turns.iter().filter(|t| t.is_summary()).count(),
+                            "LCM: rebuilding engine from persisted summaries"
+                        );
+                        LcmEngine::rebuild_from_turns(
+                            &turns,
+                            config,
+                            ctx.protocol.as_ref(),
+                            "", // system prompt not needed for rebuild
+                        )
+                    } else {
+                        // Fresh engine - will ingest messages below.
+                        LcmEngine::new(config)
+                    };
+                    
+                    engines.insert(ctx.session_key.clone(), Arc::new(tokio::sync::Mutex::new(engine)));
+                }
+                engines.get(&ctx.session_key).cloned().unwrap()
             };
 
             // Feed messages into the LCM engine's store (idempotent by index).
@@ -937,6 +963,17 @@ impl AgentLoopShared {
                                             None
                                         }
                                     });
+
+                                    // Persist Turn::Summary to session JSONL for lossless restart.
+                                    if let Some(ref turn) = summary_turn {
+                                        if let Some(summary_json) = turn.summary_to_json() {
+                                            debug!(
+                                                session = %bg_session_key,
+                                                "LCM: persisting summary turn to session"
+                                            );
+                                            bg_core.sessions.add_message_raw(&bg_session_key, &summary_json).await;
+                                        }
+                                    }
 
                                     // Update working memory with compaction observation.
                                     if bg_core.memory_enabled {

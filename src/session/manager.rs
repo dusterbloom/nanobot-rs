@@ -251,6 +251,31 @@ impl SessionManager {
         Self::save_session(session, &self.sessions_dir);
     }
 
+    /// Add a single raw JSON message (e.g., LCM summary turn) and persist.
+    pub async fn add_message_raw(&self, key: &str, message: &Value) {
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let mut m = message.clone();
+        if m.get("timestamp").is_none() {
+            m["timestamp"] = json!(Local::now().to_rfc3339());
+        }
+        session.messages.push(m);
+        session.updated_at = Local::now();
+        Self::save_session(session, &self.sessions_dir);
+    }
+
+    /// Get all raw messages for a session (for LCM rebuild).
+    ///
+    /// Returns the full message array without filtering.
+    pub async fn get_all_messages(&self, key: &str) -> Vec<Value> {
+        let cache = self.cache.lock().await;
+        if let Some(session) = cache.get(key) {
+            session.messages.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Persist a session to disk as JSONL.
     ///
     /// The first line is a metadata header (`_type: "metadata"`), followed by

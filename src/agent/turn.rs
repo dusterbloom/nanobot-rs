@@ -12,7 +12,7 @@
 //! protocol renders correctly from clean data — no repair needed.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // ─────────────────────────────────────────────────────────────
 // Core types
@@ -100,6 +100,11 @@ impl Turn {
         matches!(self, Turn::User { .. })
     }
 
+    /// Returns true if this is a summary turn (LCM compaction output).
+    pub fn is_summary(&self) -> bool {
+        matches!(self, Turn::Summary { .. })
+    }
+
     /// Returns the assistant text content, if any.
     pub fn assistant_text(&self) -> Option<&str> {
         if let Turn::Assistant { text, .. } = self {
@@ -122,6 +127,22 @@ impl Turn {
     /// `Turn::System` is reconstructed each turn and is never stored.
     pub fn is_persistable(&self) -> bool {
         !matches!(self, Turn::System { .. })
+    }
+
+    /// Convert a `Turn::Summary` to a JSON Value for session storage.
+    ///
+    /// Returns `None` if the turn is not a summary.
+    pub fn summary_to_json(&self) -> Option<Value> {
+        if let Turn::Summary { text, source_ids, level } = self {
+            Some(json!({
+                "role": "summary",
+                "text": text,
+                "source_ids": source_ids,
+                "level": level,
+            }))
+        } else {
+            None
+        }
     }
 }
 
@@ -184,6 +205,25 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .unwrap_or("")
                 .to_string();
             Some(Turn::System { content })
+        }
+        "summary" => {
+            // LCM summary entry persisted in session JSONL.
+            let text = v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source_ids = v
+                .get("source_ids")
+                .and_then(|ids| ids.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
+            let level = v
+                .get("level")
+                .and_then(|l| l.as_u64())
+                .map(|n| n as u8)
+                .unwrap_or(1);
+            Some(Turn::Summary { text, source_ids, level })
         }
         _ => None,
     }
@@ -376,5 +416,54 @@ mod tests {
         let t = Turn::User { content: "hi".into(), media: vec![] };
         let v = serde_json::to_value(&t).unwrap();
         assert!(v.get("media").is_none(), "empty media should be omitted");
+    }
+
+    #[test]
+    fn is_summary_detects_summary_turn() {
+        let summary = Turn::Summary {
+            text: "Context covered.".into(),
+            source_ids: vec![0, 1, 2],
+            level: 1,
+        };
+        assert!(summary.is_summary());
+        assert!(!Turn::User { content: "hi".into(), media: vec![] }.is_summary());
+    }
+
+    #[test]
+    fn summary_to_json_produces_role_summary() {
+        let summary = Turn::Summary {
+            text: "Earlier context summary.".into(),
+            source_ids: vec![0, 1, 2],
+            level: 2,
+        };
+        let v = summary.summary_to_json().unwrap();
+        assert_eq!(v["role"], "summary");
+        assert_eq!(v["text"], "Earlier context summary.");
+        assert_eq!(v["source_ids"], json!([0, 1, 2]));
+        assert_eq!(v["level"], 2);
+    }
+
+    #[test]
+    fn non_summary_to_json_returns_none() {
+        let user = Turn::User { content: "hi".into(), media: vec![] };
+        assert!(user.summary_to_json().is_none());
+    }
+
+    #[test]
+    fn legacy_summary_converts_to_turn_summary() {
+        let v = json!({
+            "role": "summary",
+            "text": "Messages 1-10 covered: X, Y, Z.",
+            "source_ids": [0, 1, 2, 3],
+            "level": 1
+        });
+        let t = turn_from_legacy(&v).unwrap();
+        if let Turn::Summary { text, source_ids, level } = t {
+            assert!(text.contains("Messages 1-10"));
+            assert_eq!(source_ids.len(), 4);
+            assert_eq!(level, 1);
+        } else {
+            panic!("expected Turn::Summary");
+        }
     }
 }
