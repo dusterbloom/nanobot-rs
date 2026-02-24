@@ -5,8 +5,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use jack_voice::{
+    AudioCapture, AudioError, AudioPlayer,
     models::{self, ModelProgressCallback},
     SpeechToText, SttMode, TextToSpeech, TtsEngine,
 };
@@ -144,6 +146,90 @@ fn samples_to_f32le_bytes(samples: &[f32]) -> Vec<u8> {
     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
+fn f32le_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn play_chunks_native(
+    audio_rx: std_mpsc::Receiver<AudioChunk>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut player = AudioPlayer::new()
+        .map_err(|e| format!("Audio playback failed: {e}. Check macOS output device settings."))?;
+
+    for chunk in audio_rx {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let samples = f32le_bytes_to_samples(&chunk.data);
+        if samples.is_empty() {
+            continue;
+        }
+        player.play(samples, chunk.sample_rate);
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        player.stop();
+    } else {
+        player.wait();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn play_chunks_paplay(
+    audio_rx: std_mpsc::Receiver<AudioChunk>,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    // Wait for the first chunk to get the sample rate.
+    let first_chunk = match audio_rx.recv() {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // no audio produced
+    };
+
+    let mut child = Command::new("paplay")
+        .args([
+            "--raw",
+            "--format=float32le",
+            "--channels=1",
+            &format!("--rate={}", first_chunk.sample_rate),
+        ])
+        .env("PULSE_SERVER", pulse_server())
+        .env("PULSE_LATENCY_MSEC", "10")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils"))?;
+
+    let mut stdin = child.stdin.take().unwrap();
+
+    if stdin.write_all(&first_chunk.data).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    for chunk in audio_rx {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if stdin.write_all(&chunk.data).is_err() {
+            break;
+        }
+    }
+
+    drop(stdin); // close stdin so paplay can finish
+    if cancel.load(Ordering::Relaxed) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 /// Block SIGINT delivery in the current thread.
 ///
 /// Prevents Ctrl+C from interrupting native TTS/playback code mid-execution,
@@ -177,8 +263,36 @@ pub struct VoiceSession {
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     /// Kokoro TTS engine (multilingual).
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
-    playback: Option<Child>,
     cancel: Arc<AtomicBool>,
+}
+
+enum CaptureSession {
+    Process(Child),
+    Native(AudioCapture),
+}
+
+fn format_native_capture_error(error: AudioError) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        match error {
+            AudioError::NoInputDevice => {
+                "No microphone input device found. Connect/select an input in macOS Sound settings and retry /voice.".to_string()
+            }
+            AudioError::StreamError(e) | AudioError::ConfigError(e) => format!(
+                "Microphone capture failed: {e}. Enable microphone access for your terminal in System Settings > Privacy & Security > Microphone, then restart the terminal and retry /voice."
+            ),
+            other => format!(
+                "Microphone capture failed: {other}. Check microphone access in System Settings > Privacy & Security > Microphone and retry /voice."
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!(
+            "Microphone capture failed: {error}. Verify your default audio input device and retry /voice."
+        )
+    }
 }
 
 fn pulse_server() -> String {
@@ -215,6 +329,41 @@ fn start_parec(sample_tx: std_mpsc::Sender<Vec<f32>>) -> Result<Child, String> {
     });
 
     Ok(child)
+}
+
+fn start_native_capture(sample_tx: std_mpsc::Sender<Vec<f32>>) -> Result<AudioCapture, String> {
+    AudioCapture::start(sample_tx).map_err(format_native_capture_error)
+}
+
+fn start_capture(sample_tx: std_mpsc::Sender<Vec<f32>>) -> Result<CaptureSession, String> {
+    #[cfg(target_os = "macos")]
+    {
+        start_native_capture(sample_tx).map(CaptureSession::Native)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        match start_parec(sample_tx.clone()) {
+            Ok(child) => Ok(CaptureSession::Process(child)),
+            Err(parec_err) => {
+                start_native_capture(sample_tx)
+                    .map(CaptureSession::Native)
+                    .map_err(|native_err| {
+                        format!("{parec_err}\nFallback native capture failed: {native_err}")
+                    })
+            }
+        }
+    }
+}
+
+fn stop_capture(capture: &mut CaptureSession) {
+    match capture {
+        CaptureSession::Process(child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        CaptureSession::Native(stream) => stream.stop(),
+    }
 }
 
 fn start_playback(samples: Vec<f32>, sample_rate: u32) -> Result<Child, String> {
@@ -363,7 +512,6 @@ impl VoiceSession {
             stt,
             tts_en,
             tts_multi,
-            playback: None,
             cancel: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -378,56 +526,47 @@ impl VoiceSession {
         std::io::stdout().flush().ok();
 
         let (sample_tx, sample_rx) = std_mpsc::channel::<Vec<f32>>();
-        let mut parec = start_parec(sample_tx)?;
+        let mut capture = start_capture(sample_tx)?;
 
         // Accumulate audio in a background thread
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop_flag.clone();
-
+        let stop_flag_clone = stop_flag.clone();
         let collector = std::thread::spawn(move || {
-            let mut all_samples: Vec<f32> = Vec::new();
-            while !stop_clone.load(Ordering::Relaxed) {
-                match sample_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(samples) => all_samples.extend_from_slice(&samples),
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            let mut all_samples = Vec::new();
+            let mut buf = Vec::new();
+            while !stop_flag_clone.load(Ordering::Relaxed) {
+                match sample_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(samples) => {
+                        buf.extend(samples);
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(_) => break,
                 }
             }
-            // Drain any remaining samples in the channel
-            while let Ok(samples) = sample_rx.try_recv() {
-                all_samples.extend_from_slice(&samples);
+            if !buf.is_empty() {
+                all_samples.extend(buf.drain(..));
             }
             all_samples
         });
 
-        // Wait for stop keypress
-        tokio::task::block_in_place(|| {
-            let owned = crate::tui::enter_raw_mode();
-            if owned || crate::tui::RAW_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                loop {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        let is_stop = key.code == KeyCode::Enter
-                            || (key.code == KeyCode::Char(' ')
-                                && key.modifiers.contains(KeyModifiers::CONTROL))
-                            || (key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL));
-                        if is_stop {
-                            break;
-                        }
-                    }
+        // Listen for Enter or Ctrl+Space to stop recording
+        loop {
+            if let Ok(Event::Key(key)) = event::read() {
+                let is_stop = key.code == KeyCode::Enter
+                    || (key.code == KeyCode::Char(' ')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || key.code == KeyCode::Esc;
+                if is_stop {
+                    break;
                 }
-                crate::tui::exit_raw_mode(owned);
-            } else {
-                // Fallback: wait for Enter
-                let mut line = String::new();
-                let _ = std::io::stdin().read_line(&mut line);
+            } else if let Ok(Event::Resize(_, _)) = event::read() {
+                // Terminal resize - ignore
             }
-        });
+        }
 
-        // Signal collector to stop and kill parec
+        // Signal collector to stop and close capture
         stop_flag.store(true, Ordering::Relaxed);
-        let _ = parec.kill();
-        let _ = parec.wait();
+        stop_capture(&mut capture);
 
         let all_samples = collector.join().map_err(|_| "Audio collector panicked")?;
 
@@ -507,6 +646,10 @@ impl VoiceSession {
         // Capacity of 2 allows synthesis to stay ~2 sentences ahead.
         let (audio_tx, audio_rx) = std_mpsc::sync_channel::<AudioChunk>(2);
 
+        // Clone cancel for each thread before spawning
+        let cancel_synth = cancel.clone();
+        let cancel_play = cancel.clone();
+
         // --- Synthesis thread ---
         // Must be a plain std::thread (not tokio) because Kokoro internally
         // creates a tokio Runtime which panics inside an existing runtime.
@@ -519,11 +662,11 @@ impl VoiceSession {
             }
 
             for (i, sentence) in sentences.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
+                if cancel_synth.load(Ordering::Relaxed) {
                     break;
                 }
                 tracing::debug!("Synthesizing sentence {}/{}...", i + 1, sentences.len());
-                let cancel_ref = &cancel;
+                let cancel_ref = &cancel_synth;
                 let tx_ref = &audio_tx;
                 match guard.synthesize_streaming(sentence, |samples, sample_rate| {
                     if cancel_ref.load(Ordering::Relaxed) {
@@ -546,59 +689,25 @@ impl VoiceSession {
         });
 
         // --- Playback thread ---
-        // Spawns a single paplay process and writes audio chunks as they arrive.
-        let playback_handle = std::thread::spawn(move || -> Result<Option<Child>, String> {
+        let playback_handle = std::thread::spawn(move || -> Result<(), String> {
             #[cfg(unix)]
             mask_sigint();
-            // Wait for the first chunk to get the sample rate.
-            let first_chunk = match audio_rx.recv() {
-                Ok(c) => c,
-                Err(_) => return Ok(None), // no audio produced
-            };
-
-            let mut child = Command::new("paplay")
-                .args([
-                    "--raw",
-                    "--format=float32le",
-                    "--channels=1",
-                    &format!("--rate={}", first_chunk.sample_rate),
-                ])
-                .env("PULSE_SERVER", pulse_server())
-                .env("PULSE_LATENCY_MSEC", "10")
-                .stdin(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|e| {
-                    format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils")
-                })?;
-
-            let mut stdin = child.stdin.take().unwrap();
-
-            // Write first chunk
-            if stdin.write_all(&first_chunk.data).is_err() {
-                return Ok(Some(child));
+            #[cfg(target_os = "macos")]
+            {
+                play_chunks_native(audio_rx, cancel_play)
             }
-
-            // Write remaining chunks as they arrive
-            for chunk in audio_rx {
-                if stdin.write_all(&chunk.data).is_err() {
-                    break;
-                }
+            #[cfg(not(target_os = "macos"))]
+            {
+                play_chunks_paplay(audio_rx, cancel_play)
             }
-
-            drop(stdin); // close stdin so paplay finishes
-            Ok(Some(child))
         });
 
         // Wait for synthesis to complete (playback continues in parallel).
         let _ = synth_handle.join();
 
-        // Wait for playback thread and store the child process for stop_playback().
+        // Wait for playback thread
         match playback_handle.join() {
-            Ok(Ok(Some(child))) => {
-                self.playback = Some(child);
-            }
-            Ok(Ok(None)) => {} // no audio
+            Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err("Playback thread panicked".to_string()),
         }
@@ -677,54 +786,29 @@ impl VoiceSession {
             // audio_tx dropped → playback finishes
         });
 
-        // Pre-spawn paplay so PA connection is established while LLM streams.
-        // Both Pocket and Kokoro output 24kHz; verified at runtime via debug log.
-        let mut paplay = Command::new("paplay")
-            .args([
-                "--raw",
-                "--format=float32le",
-                "--channels=1",
-                "--rate=24000",
-            ])
-            .env("PULSE_SERVER", pulse_server())
-            .env("PULSE_LATENCY_MSEC", "10")
-            .stdin(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                format!("paplay failed: {e}\n  Install: sudo apt install pulseaudio-utils")
-            })?;
-        let paplay_stdin = paplay.stdin.take().unwrap();
-
-        // --- Playback thread: writes audio chunks to pre-opened stdin ---
-        let cancel_play = cancel;
-        let playback_handle = std::thread::spawn(move || {
+        // --- Playback thread ---
+        let cancel_play = cancel.clone();
+        let playback_handle = std::thread::spawn(move || -> Result<(), String> {
             #[cfg(unix)]
             mask_sigint();
-            let mut stdin = paplay_stdin;
-            for chunk in audio_rx {
-                if cancel_play.load(Ordering::Relaxed) {
-                    break;
-                }
-                if chunk.sample_rate != 24000 {
-                    tracing::warn!("TTS sample rate {} != expected 24000", chunk.sample_rate);
-                }
-                if stdin.write_all(&chunk.data).is_err() {
-                    break;
-                }
+            #[cfg(target_os = "macos")]
+            {
+                play_chunks_native(audio_rx, cancel_play)
             }
-            drop(stdin); // close pipe so paplay finishes
+            #[cfg(not(target_os = "macos"))]
+            {
+                play_chunks_paplay(audio_rx, cancel_play)
+            }
         });
 
-        // --- Coordinator thread: waits for both threads, kills paplay on cancel ---
-        let cancel_coord = self.cancel.clone();
+        // --- Coordinator thread: waits for both threads ---
         let join_handle = std::thread::spawn(move || {
             let _ = synth_handle.join();
-            let _ = playback_handle.join();
-            if cancel_coord.load(Ordering::Relaxed) {
-                let _ = paplay.kill();
+            match playback_handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("Streaming playback failed: {}", e),
+                Err(_) => tracing::error!("Streaming playback thread panicked"),
             }
-            let _ = paplay.wait();
         });
 
         Ok((sentence_tx, join_handle))
@@ -739,11 +823,7 @@ impl VoiceSession {
     }
 
     pub fn stop_playback(&mut self) {
-        if let Some(ref mut child) = self.playback {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.playback = None;
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
     /// Clean shutdown: stop playback and leak the entire session so native
