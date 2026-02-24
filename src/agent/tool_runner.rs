@@ -484,15 +484,19 @@ fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
 }
 
 /// Process tool calls from an LLM response: build assistant message,
-/// execute each tool, add results to messages, and optionally repair for local.
+/// execute each tool, and add results to messages.
 ///
-/// This is the common core shared by agent_loop, subagent, and pipeline.
+/// This is the common core shared by subagent and pipeline.
 /// Returns `true` if tool calls were processed, `false` if none were present.
+///
+/// **Protocol compliance** is handled by the caller: before the next LLM call,
+/// pass `messages` through `protocol::render_to_wire()` to get the correct wire
+/// format. Do NOT call `repair_for_local` here — rendering at call time is the
+/// correct approach.
 pub async fn process_tool_response(
     response: &crate::providers::base::LLMResponse,
     messages: &mut Vec<Value>,
     tools: &ToolRegistry,
-    is_local: bool,
 ) -> bool {
     if !response.has_tool_calls() {
         return false;
@@ -509,10 +513,6 @@ pub async fn process_tool_response(
     for tc in &response.tool_calls {
         let result = tools.execute(&tc.name, tc.arguments.clone()).await;
         ContextBuilder::add_tool_result(messages, &tc.id, &tc.name, &result.data);
-    }
-
-    if is_local {
-        crate::agent::thread_repair::repair_for_local(messages);
     }
 
     true

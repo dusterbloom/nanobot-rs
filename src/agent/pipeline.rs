@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::agent::thread_repair;
 use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::providers::base::LLMProvider;
 
@@ -255,14 +254,18 @@ async fn execute_step_with_tools(
             max_iter
         );
 
-        // Local models with Jinja templates require strict user/assistant alternation.
-        // Repair tool messages before each LLM call (skip iteration 0 — freshly built).
-        if is_local && iteration > 0 {
-            thread_repair::repair_for_local(&mut messages);
-        }
+        // Render messages through the correct protocol before LLM call.
+        // Local models get strict user/assistant alternation; cloud models get
+        // standard OpenAI function-calling format.
+        let protocol: &dyn crate::agent::protocol::ConversationProtocol = if is_local {
+            &crate::agent::protocol::LocalProtocol
+        } else {
+            &crate::agent::protocol::CloudProtocol
+        };
+        let wire_messages = crate::agent::protocol::render_to_wire(protocol, &messages);
 
         let response = match provider
-            .chat(&messages, tool_defs_opt, Some(model), 4096, 0.7, None, None)
+            .chat(&wire_messages, tool_defs_opt, Some(model), 4096, 0.7, None, None)
             .await
         {
             Ok(r) => r,
@@ -278,7 +281,7 @@ async fn execute_step_with_tools(
         }
 
         if crate::agent::tool_runner::process_tool_response(
-            &response, &mut messages, &tools, is_local,
+            &response, &mut messages, &tools,
         ).await {
             // Tool calls processed — continue loop.
         } else {

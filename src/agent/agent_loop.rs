@@ -23,10 +23,11 @@ use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::anti_drift;
 use crate::agent::context_hygiene;
 use crate::agent::policy;
+use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
-use crate::agent::thread_repair;
+use crate::agent::turn::turn_from_legacy;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
@@ -120,6 +121,12 @@ pub(crate) struct TurnContext {
     // --- Conversation state ---
     pub(crate) messages: Vec<Value>,
     pub(crate) new_start: usize,
+    /// Protocol-rendered wire format, computed in `step_pre_call` and used
+    /// exclusively for LLM provider calls. `messages` remains the raw
+    /// accumulator (with metadata tags) for trimming and session persistence.
+    pub(crate) rendered_messages: Vec<Value>,
+    /// Protocol selected for this turn based on `core.is_local`.
+    pub(crate) protocol: Arc<dyn ConversationProtocol>,
 
     // --- Tracking ---
     pub(crate) used_tools: std::collections::HashSet<String>,
@@ -477,6 +484,14 @@ impl AgentLoopShared {
             "request_started"
         );
 
+        // Select conversation protocol based on whether we're talking to a local model.
+        // Protocol correctness is enforced at render time — no repair needed.
+        let protocol: Arc<dyn ConversationProtocol> = if core.is_local {
+            Arc::new(LocalProtocol)
+        } else {
+            Arc::new(CloudProtocol)
+        };
+
         TurnContext {
             core,
             request_id,
@@ -498,6 +513,8 @@ impl AgentLoopShared {
             priority_rx,
             messages,
             new_start,
+            rendered_messages: Vec::new(),
+            protocol,
             used_tools: std::collections::HashSet::new(),
             final_content: String::new(),
             turn_tool_entries: Vec::new(),
@@ -838,15 +855,41 @@ impl AgentLoopShared {
         // When LCM is enabled, use the LCM engine's control loop instead.
         if self.lcm_config.enabled {
             // LCM path: get or create per-session engine, check thresholds.
+            // On first creation, check for existing summaries and rebuild DAG if present.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
-                engines
-                    .entry(ctx.session_key.clone())
-                    .or_insert_with(|| {
-                        let config = LcmConfig::from(&self.lcm_config);
-                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
-                    })
-                    .clone()
+                if !engines.contains_key(&ctx.session_key) {
+                    let config = LcmConfig::from(&self.lcm_config);
+                    
+                    // Check if session has existing summary turns.
+                    let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_key).await;
+                    let turns: Vec<crate::agent::turn::Turn> = all_msgs
+                        .iter()
+                        .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
+                        .collect();
+                    let has_summaries = turns.iter().any(|t| t.is_summary());
+                    
+                    let engine = if has_summaries {
+                        // Rebuild from persisted summaries.
+                        debug!(
+                            session = %ctx.session_key,
+                            summary_count = turns.iter().filter(|t| t.is_summary()).count(),
+                            "LCM: rebuilding engine from persisted summaries"
+                        );
+                        LcmEngine::rebuild_from_turns(
+                            &turns,
+                            config,
+                            ctx.protocol.as_ref(),
+                            "", // system prompt not needed for rebuild
+                        )
+                    } else {
+                        // Fresh engine - will ingest messages below.
+                        LcmEngine::new(config)
+                    };
+                    
+                    engines.insert(ctx.session_key.clone(), Arc::new(tokio::sync::Mutex::new(engine)));
+                }
+                engines.get(&ctx.session_key).cloned().unwrap()
             };
 
             // Feed messages into the LCM engine's store (idempotent by index).
@@ -905,19 +948,39 @@ impl AgentLoopShared {
                                     let compactor: &ContextCompactor = bg_lcm_compactor
                                         .as_deref()
                                         .unwrap_or(&bg_core.compactor);
-                                    let observation = {
+                                    let summary_turn = {
                                         let mut engine = bg_lcm.lock().await;
                                         engine
                                             .compact(compactor, &bg_core.token_budget, 0)
                                             .await
                                     };
 
+                                    // Extract text from Turn::Summary for working memory and result.
+                                    let observation: Option<String> = summary_turn.as_ref().and_then(|t| {
+                                        if let crate::agent::turn::Turn::Summary { text, .. } = t {
+                                            Some(text.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+
+                                    // Persist Turn::Summary to session JSONL for lossless restart.
+                                    if let Some(ref turn) = summary_turn {
+                                        if let Some(summary_json) = turn.summary_to_json() {
+                                            debug!(
+                                                session = %bg_session_key,
+                                                "LCM: persisting summary turn to session"
+                                            );
+                                            bg_core.sessions.add_message_raw(&bg_session_key, &summary_json).await;
+                                        }
+                                    }
+
                                     // Update working memory with compaction observation.
                                     if bg_core.memory_enabled {
-                                        if let Some(ref summary) = observation {
+                                        if let Some(ref summary_text) = observation {
                                             bg_core
                                                 .working_memory
-                                                .update_from_compaction(&bg_session_key, summary, bg_turn_count);
+                                                .update_from_compaction(&bg_session_key, summary_text, bg_turn_count);
                                         }
                                     }
 
@@ -1015,17 +1078,15 @@ impl AgentLoopShared {
             });
         }
 
-        // Repair protocol violations before calling the LLM.
-        if ctx.core.is_local {
-            thread_repair::repair_for_local(&mut ctx.messages);
-        } else {
-            thread_repair::repair_messages(&mut ctx.messages);
-        }
+        // Render protocol-correct wire format for the LLM call.
+        // `ctx.messages` retains raw format (with metadata) for trimming/LCM.
+        // `ctx.rendered_messages` is what gets sent to the provider.
+        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
 
         // Pre-flight context size check: emergency trim if we're about to
         // exceed the model's context window. The 95% threshold leaves room
         // for the response tokens.
-        let estimated = TokenBudget::estimate_tokens(&ctx.messages);
+        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages);
         let max_ctx = ctx.core.token_budget.max_context();
         if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
             warn!(
@@ -1036,12 +1097,8 @@ impl AgentLoopShared {
             );
             // tool_def_tokens=0 is conservative (trims more aggressively).
             ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
-            // Re-run repair after trim in case truncation broke protocol.
-            if ctx.core.is_local {
-                thread_repair::repair_for_local(&mut ctx.messages);
-            } else {
-                thread_repair::repair_messages(&mut ctx.messages);
-            }
+            // Re-render after trim to rebuild protocol-correct wire format.
+            ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         }
 
         // Router-first preflight for strict trio mode.
@@ -1166,12 +1223,21 @@ impl AgentLoopShared {
         counters.inference_active.store(true, Ordering::Relaxed);
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
 
+        // Use the protocol-rendered wire format for the provider call.
+        // `ctx.rendered_messages` was computed by `render_via_protocol()` in step_pre_call.
+        let messages_for_llm = if ctx.rendered_messages.is_empty() {
+            // Fallback: render now if step_pre_call was bypassed (should not happen in practice).
+            render_via_protocol(&*ctx.protocol, &ctx.messages)
+        } else {
+            ctx.rendered_messages.clone()
+        };
+
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas as they arrive.
             let mut stream = match ctx.core
                 .provider
                 .chat_stream(
-                    &ctx.messages,
+                    &messages_for_llm,
                     tool_defs_opt,
                     Some(&ctx.core.model),
                     max_tokens,
@@ -1266,7 +1332,7 @@ impl AgentLoopShared {
             match ctx.core
                 .provider
                 .chat(
-                    &ctx.messages,
+                    &messages_for_llm,
                     tool_defs_opt,
                     Some(&ctx.core.model),
                     max_tokens,
@@ -1854,6 +1920,40 @@ impl AgentLoopShared {
 // ---------------------------------------------------------------------------
 // Pure helpers (no IO — fully unit-testable)
 // ---------------------------------------------------------------------------
+
+/// Convert raw wire-format messages to canonical `Turn` sequence, then render
+/// via the given protocol to produce a clean wire format for the LLM call.
+///
+/// - Position 0 is expected to be `role:system`; it is extracted and passed as
+///   the `system` argument to `protocol.render()`.
+/// - Any `_turn` / `_synthetic` metadata tags on raw messages are not forwarded
+///   to the wire output (they are internal-only fields used for trimming).
+fn render_via_protocol(protocol: &dyn ConversationProtocol, messages: &[Value]) -> Vec<Value> {
+    // Extract system prompt from the leading system message (if present).
+    let system = messages
+        .first()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    let non_system_start = if messages
+        .first()
+        .map(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        0
+    };
+
+    let turns: Vec<_> = messages[non_system_start..]
+        .iter()
+        .filter_map(|m| turn_from_legacy(m))
+        .collect();
+
+    protocol.render(&system, &turns)
+}
 
 /// Decide whether trio routing is healthy enough to strip tools from the main model.
 /// Pure function: takes health status as booleans, returns true if tools should be stripped.

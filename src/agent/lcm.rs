@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,7 +20,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::agent::compaction::ContextCompactor;
+use crate::agent::protocol::ConversationProtocol;
 use crate::agent::token_budget::TokenBudget;
+use crate::agent::turn::Turn;
 use crate::config::schema::LcmSchemaConfig;
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,163 @@ impl LcmEngine {
         }
     }
 
+    /// Rebuild the LCM engine from persisted turns (including summaries).
+    ///
+    /// This is called when loading a session that has `Turn::Summary` entries.
+    /// It reconstructs the summary DAG and builds the active context from:
+    /// - All summary nodes (representing compacted older messages)
+    /// - Raw messages after the last summary
+    ///
+    /// # Arguments
+    /// * `turns` - All turns from the session, including `Turn::Summary` entries
+    /// * `protocol` - The conversation protocol for rendering
+    /// * `system_prompt` - System prompt to prepend to active context
+    pub fn rebuild_from_turns(
+        turns: &[Turn],
+        config: LcmConfig,
+        _protocol: &dyn ConversationProtocol,
+        _system_prompt: &str,
+    ) -> Self {
+        let mut engine = Self::new(config);
+        
+        // Track which raw message IDs have been summarized
+        let mut summarized_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
+        let mut last_summary_end: Option<MessageId> = None;
+        
+        // First pass: ingest all raw messages into store, track summaries
+        for turn in turns {
+            match turn {
+                Turn::User { content, media: _ } => {
+                    let msg = serde_json::json!({"role": "user", "content": content});
+                    engine.store.push(msg);
+                }
+                Turn::Assistant { text, tool_calls } => {
+                    let content = text.clone().unwrap_or_default();
+                    let tc_json: Vec<Value> = tool_calls.iter().map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.tool,
+                                "arguments": serde_json::to_string(&tc.args).unwrap_or_default(),
+                            }
+                        })
+                    }).collect();
+                    let msg = if tc_json.is_empty() {
+                        serde_json::json!({"role": "assistant", "content": content})
+                    } else {
+                        serde_json::json!({"role": "assistant", "content": content, "tool_calls": tc_json})
+                    };
+                    engine.store.push(msg);
+                }
+                Turn::ToolResult { call_id, tool, result, ok: _ } => {
+                    let msg = serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": tool,
+                        "content": result,
+                    });
+                    engine.store.push(msg);
+                }
+                Turn::System { content } => {
+                    let msg = serde_json::json!({"role": "system", "content": content});
+                    engine.store.push(msg);
+                }
+                Turn::Summary { text, source_ids, level } => {
+                    // Create summary node in DAG
+                    let _node = engine.dag.create_node(source_ids.clone(), text.clone(), *level);
+                    
+                    // Track which raw messages are covered by summaries
+                    for &id in source_ids {
+                        summarized_ids.insert(id);
+                    }
+                    last_summary_end = Some(*source_ids.last().unwrap_or(&0));
+                    
+                    // Summaries are NOT added to store - they reference store entries
+                }
+            }
+        }
+        
+        // Second pass: build active context
+        // Start with system prompt (as ContextEntry, not from store)
+        // Then add summary nodes, then raw messages not covered by summaries
+        
+        // Add summary entries to active context
+        for node in &engine.dag.nodes {
+            let id_list: String = node.source_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let summary_message = serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
+                    node.source_ids.first().unwrap_or(&0),
+                    node.source_ids.last().unwrap_or(&0),
+                    id_list,
+                    node.text
+                )
+            });
+            engine.active.push(ContextEntry::Summary {
+                node_id: node.id,
+                message: summary_message,
+            });
+        }
+        
+        // Add raw messages that aren't covered by summaries (after last summary)
+        let start_raw = last_summary_end.map(|id| id + 1).unwrap_or(0);
+        for msg_id in start_raw..engine.store.len() {
+            if !summarized_ids.contains(&msg_id) {
+                let message = engine.store[msg_id].clone();
+                engine.active.push(ContextEntry::Raw { msg_id, message });
+            }
+        }
+        
+        debug!(
+            "LCM rebuild: {} store entries, {} summary nodes, {} active entries",
+            engine.store.len(),
+            engine.dag.len(),
+            engine.active.len()
+        );
+        
+        engine
+    }
+
+    /// Get the active context rendered through a protocol.
+    ///
+    /// This is the preferred way to get messages for the LLM - it ensures
+    /// the protocol is applied correctly.
+    pub fn active_context_with_protocol(
+        &self,
+        protocol: &dyn ConversationProtocol,
+        system_prompt: &str,
+    ) -> Vec<Value> {
+        // Convert active entries to Turns, then render via protocol
+        let mut turns: Vec<Turn> = Vec::new();
+        
+        for entry in &self.active {
+            match entry {
+                ContextEntry::Raw { message, .. } => {
+                    if let Some(turn) = crate::agent::turn::turn_from_legacy(message) {
+                        turns.push(turn);
+                    }
+                }
+                ContextEntry::Summary { node_id, .. } => {
+                    if let Some(node) = self.dag.get(*node_id) {
+                        turns.push(Turn::Summary {
+                            text: node.text.clone(),
+                            source_ids: node.source_ids.clone(),
+                            level: node.level,
+                        });
+                    }
+                }
+            }
+        }
+        
+        protocol.render(system_prompt, &turns)
+    }
+
     /// Ingest a new message into the immutable store and active context.
     ///
     /// Returns the assigned MessageId.
@@ -256,13 +414,14 @@ impl LcmEngine {
     /// - Level 2: LLM summarize with mode="bullet_points", target T/2 tokens
     /// - Level 3: Deterministic truncation to 512 tokens (no LLM)
     ///
-    /// Returns the observation text (for cross-session memory) if compaction occurred.
+    /// Returns a `Turn::Summary` if compaction occurred. The caller should persist
+    /// this turn in the session JSONL so the DAG can be rebuilt on restart.
     pub async fn compact(
         &mut self,
         compactor: &ContextCompactor,
         budget: &TokenBudget,
         tool_def_tokens: usize,
-    ) -> Option<String> {
+    ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
 
@@ -361,7 +520,11 @@ impl LcmEngine {
         self.active = new_active;
         self.async_compaction_pending = false;
 
-        Some(summary_text)
+        Some(Turn::Summary {
+            text: summary_text,
+            source_ids,
+            level,
+        })
     }
 
     /// Find the oldest contiguous block of raw messages (skipping system prompt).
@@ -908,7 +1071,11 @@ mod tests {
         let result = engine.compact(&compactor, &budget, 100).await;
         assert!(result.is_some(), "Compaction should produce a summary");
 
-        let summary_text = result.unwrap();
+        let summary_turn = result.unwrap();
+        let summary_text = match &summary_turn {
+            Turn::Summary { text, .. } => text.clone(),
+            _ => panic!("Expected Turn::Summary"),
+        };
         assert!(
             summary_text.contains("Rust ownership"),
             "Summary should contain key content"
@@ -997,10 +1164,14 @@ mod tests {
         let result = engine.compact(&compactor, &budget, 100).await;
         assert!(result.is_some(), "Level 3 must always produce output");
 
-        let summary = result.unwrap();
+        let summary_turn = result.unwrap();
+        let summary_text = match &summary_turn {
+            Turn::Summary { text, .. } => text.clone(),
+            _ => panic!("Expected Turn::Summary"),
+        };
         // Level 3 uses first_sentence extraction.
         assert!(
-            summary.contains("User:") || summary.contains("Assistant:"),
+            summary_text.contains("User:") || summary_text.contains("Assistant:"),
             "Deterministic truncation should contain role prefixes"
         );
 
@@ -1252,7 +1423,11 @@ mod tests {
             let elapsed = start.elapsed().as_millis();
 
             match result {
-                Some(summary_text) => {
+                Some(summary_turn) => {
+                    let summary_text = match &summary_turn {
+                        Turn::Summary { text, .. } => text.clone(),
+                        _ => String::new(),
+                    };
                     let out_tokens = TokenBudget::estimate_str_tokens(&summary_text);
                     let ratio = if input_tokens > 0 {
                         out_tokens as f64 / input_tokens as f64
