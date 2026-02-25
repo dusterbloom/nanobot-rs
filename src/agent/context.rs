@@ -376,7 +376,6 @@ impl ContextBuilder {
         let is_local = self.model_name.starts_with("local:");
 
         if is_local {
-            // Local model: concatenate everything into a single `system` message.
             let mut system_prompt = self.build_system_prompt(skill_names, channel);
             if let (Some(ch), Some(cid)) = (channel, chat_id) {
                 system_prompt.push_str(&format!(
@@ -412,6 +411,15 @@ impl ContextBuilder {
                     }
                 }
             }
+            system_prompt.push_str(concat!(
+                "\n\n## Tool Usage (IMPORTANT for Local Models)\n",
+                "1. AFTER getting tool results, SYNTHESIZE and ANSWER the user's question directly.\n",
+                "2. Do NOT call more tools after you have the information you need.\n",
+                "3. Do NOT use tools for simple conversational queries (e.g., greetings, opinions).\n",
+                "4. When you see [VERBATIM TOOL OUTPUT], use that information to answer.\n",
+                "5. If the user asks for a summary, summarize the tool results in your own words.\n",
+                "6. One tool call at a time. Wait for results before deciding next action.\n",
+            ));
             messages.push(json!({"role": "system", "content": system_prompt}));
         } else {
             // Cloud model: emit `system` for core identity, then `developer` for

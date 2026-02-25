@@ -98,10 +98,39 @@ The agent has hands. It can read and write files, run shell commands, search the
 |------|-------------|
 | File read/write/edit | Workspace file operations |
 | Shell exec | Run commands with timeout and sandboxing |
-| Web search + fetch | Brave Search API + page fetching |
+| Web search + fetch | SearXNG (default) or Brave Search API + page fetching |
 | Message | Send messages to channels |
 | Spawn | Launch sub-agent conversations |
 | Cron | Schedule recurring tasks with cron expressions |
+
+#### Web Search Setup
+
+By default, `web_search` uses [SearXNG](https://github.com/searxng/searxng) running locally. To set it up:
+
+```bash
+# Run SearXNG with JSON API enabled
+docker run -d --name searxng -p 8888:8080 \
+  -e SEARXNG_BASE_URL=http://localhost:8888 \
+  searxng/searxng:latest
+
+# Enable JSON format (required for API access)
+docker exec searxng sed -i 's/^formats:$/formats:\n    - html\n    - json/' /etc/searxng/settings.yml
+docker restart searxng
+```
+
+Add to `~/.nanobot/config.json`:
+```json
+{
+  "tools": {
+    "web": {
+      "provider": "searxng",
+      "searxngUrl": "http://localhost:8888"
+    }
+  }
+}
+```
+
+Alternatively, set `"provider": "brave"` and add a `braveApiKey` to use Brave Search API (cloud).
 
 ### Channels
 
