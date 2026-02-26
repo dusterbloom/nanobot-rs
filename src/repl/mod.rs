@@ -1211,7 +1211,7 @@ pub(crate) fn cmd_agent(
 
         let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
 
-        let agent_loop = cli::create_agent_loop(
+        let mut agent_loop = cli::create_agent_loop(
             core_handle.clone(),
             &config,
             Some(cron_service.clone()),
@@ -1219,6 +1219,11 @@ pub(crate) fn cmd_agent(
             Some(display_tx.clone()),
             Some(health_registry.clone()),
         );
+
+        // Set up cluster discovery for the REPL path (feature-gated).
+        // Returns the ClusterState so /cluster commands can query it.
+        #[cfg(feature = "cluster")]
+        let cluster_state = cli::setup_cluster_for_repl(&mut agent_loop, &config);
 
         if let Some(msg) = message {
             // Single-message mode: process and exit.
@@ -1291,6 +1296,8 @@ pub(crate) fn cmd_agent(
                 health_registry: Some(health_registry),
                 #[cfg(feature = "voice")]
                 voice_session: None,
+                #[cfg(feature = "cluster")]
+                cluster_state,
             };
 
             let _ = ctx.rl.as_mut().unwrap().load_history(&history_path);

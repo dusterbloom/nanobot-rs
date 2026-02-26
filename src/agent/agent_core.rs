@@ -52,6 +52,9 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    /// Whether the current main provider is a cluster peer (feature-gated).
+    #[cfg(feature = "cluster")]
+    pub is_cluster_peer: bool,
     pub anti_drift: AntiDriftConfig,
     pub main_no_think: bool,
     pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
@@ -77,6 +80,21 @@ pub struct SwappableCore {
     /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
     pub specialist_output_schema: bool,
     pub trace_log: bool,
+}
+
+impl SwappableCore {
+    /// Whether this core needs local-model protocol constraints.
+    /// True for both local servers and cluster peers (which are also local LAN servers).
+    pub fn needs_local_protocol(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            self.is_local || self.is_cluster_peer
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            self.is_local
+        }
+    }
 }
 
 /// Current trio routing state — transitions logged once, not per-check.
@@ -508,6 +526,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        #[cfg(feature = "cluster")]
+        is_cluster_peer: false,
         anti_drift: trio_config.anti_drift.clone(),
         main_no_think: trio_config.main_no_think,
         tool_runner_provider,

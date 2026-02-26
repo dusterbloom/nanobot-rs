@@ -56,6 +56,9 @@ pub(crate) struct ReplContext {
     pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     #[cfg(feature = "voice")]
     pub voice_session: Option<crate::voice::VoiceSession>,
+    /// Cluster state for /cluster command (peer discovery, model listing).
+    #[cfg(feature = "cluster")]
+    pub cluster_state: Option<Arc<crate::cluster::state::ClusterState>>,
 }
 
 // ============================================================================
@@ -265,6 +268,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/rd" => "/restart",
         "/ctx-info" => "/context",
         "/c" => "/clear",
+        "/cl" => "/cluster",
         other => other,
     }
 }
@@ -358,6 +362,9 @@ impl ReplContext {
             #[cfg(feature = "voice")]
             "/voice" => {
                 self.cmd_voice().await;
+            }
+            "/cluster" => {
+                self.cmd_cluster(arg).await;
             }
             _ => {
                 return false;
@@ -2459,6 +2466,143 @@ impl ReplContext {
                 Err(e) => eprintln!("\nFailed to start voice mode: {}\n", e),
             }
         }
+    }
+}
+
+// ============================================================================
+// Cluster command (/cluster)
+// ============================================================================
+
+impl ReplContext {
+    /// /cluster — show cluster peers, models, and routing status.
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster(&mut self, arg: &str) {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            [] | ["status"] => self.cmd_cluster_status().await,
+            ["models"] => self.cmd_cluster_models().await,
+            ["peers"] => self.cmd_cluster_peers().await,
+            _ => {
+                println!("
+  Usage: /cluster [subcommand]");
+                println!("    /cluster              Show cluster status");
+                println!("    /cluster peers        List discovered peers");
+                println!("    /cluster models       List all models across peers
+");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    async fn cmd_cluster(&mut self, _arg: &str) {
+        println!("
+  Cluster mode not available (compile with --features cluster).
+");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster_status(&self) {
+        let state = match &self.cluster_state {
+            Some(s) => s,
+            None => {
+                println!("
+  Cluster not enabled. Add to config:");
+                println!("    \"cluster\": {{ \"enabled\": true }}\n");
+                return;
+            }
+        };
+
+        let peers = state.get_all_peers().await;
+        let healthy = peers.iter().filter(|p| p.healthy).count();
+        let total_models: usize = peers.iter().map(|p| p.models.len()).sum();
+
+        println!("
+  {}CLUSTER{}", tui::BOLD, tui::RESET);
+        println!("    Peers: {} ({} healthy)", peers.len(), healthy);
+        println!("    Models: {} total", total_models);
+
+        for peer in &peers {
+            let status = if peer.healthy { "●" } else { "○" };
+            let age = peer.last_seen.elapsed().as_secs();
+            println!(
+                "    {} {} ({}) — {} models, seen {}s ago",
+                status, peer.endpoint, peer.peer_type, peer.models.len(), age
+            );
+        }
+        println!();
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster_peers(&self) {
+        let state = match &self.cluster_state {
+            Some(s) => s,
+            None => {
+                println!("
+  Cluster not enabled.
+");
+                return;
+            }
+        };
+
+        let peers = state.get_all_peers().await;
+        if peers.is_empty() {
+            println!("
+  No peers discovered.
+");
+            return;
+        }
+
+        println!("
+  Discovered peers:");
+        for (i, peer) in peers.iter().enumerate() {
+            let status = if peer.healthy { "healthy" } else { "down" };
+            println!("    {}. {} [{}] ({})", i + 1, peer.endpoint, peer.peer_type, status);
+            println!("       Models: {}", peer.models.len());
+            if let Some(vram) = peer.total_vram_mb {
+                println!("       VRAM: {} MB", vram);
+            }
+        }
+        println!();
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster_models(&self) {
+        let state = match &self.cluster_state {
+            Some(s) => s,
+            None => {
+                println!("
+  Cluster not enabled.
+");
+                return;
+            }
+        };
+
+        let peers = state.get_healthy_peers().await;
+        if peers.is_empty() {
+            println!("
+  No healthy peers found.
+");
+            return;
+        }
+
+        println!("
+  Cluster models:");
+        for peer in &peers {
+            // Extract short name from endpoint (e.g. "192.168.1.62" from "http://192.168.1.62:1234/v1")
+            let short = peer.endpoint
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .split(':')
+                .next()
+                .unwrap_or(&peer.endpoint);
+
+            println!("
+    {} ({}):", short, peer.peer_type);
+            for model in &peer.models {
+                println!("      - {}", model.id);
+            }
+        }
+        println!();
     }
 }
 
