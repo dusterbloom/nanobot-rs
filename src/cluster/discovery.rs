@@ -339,11 +339,13 @@ async fn probe_endpoint_with_client(
 ) -> Option<ClusterPeer> {
     let url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
 
-    let result = timeout(
-        Duration::from_secs(PROBE_TIMEOUT_SECS),
-        client.get(&url).send(),
-    )
-    .await;
+    // JAN (port 1337) validates the Host header and rejects requests from
+    // remote IPs. Sending `Host: localhost` works around this.
+    let mut req = client.get(&url);
+    if extract_port(endpoint) == Some(1337) {
+        req = req.header("Host", "localhost");
+    }
+    let result = timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), req.send()).await;
 
     match result {
         Ok(Ok(resp)) => {

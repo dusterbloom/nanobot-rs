@@ -2482,12 +2482,14 @@ impl ReplContext {
             [] | ["status"] => self.cmd_cluster_status().await,
             ["models"] => self.cmd_cluster_models().await,
             ["peers"] => self.cmd_cluster_peers().await,
+            ["use", rest @ ..] => self.cmd_cluster_use(&rest.join(" ")).await,
             _ => {
                 println!("
   Usage: /cluster [subcommand]");
                 println!("    /cluster              Show cluster status");
                 println!("    /cluster peers        List discovered peers");
-                println!("    /cluster models       List all models across peers
+                println!("    /cluster models       List all models across peers");
+                println!("    /cluster use <model>  Switch to a model on a cluster peer
 ");
             }
         }
@@ -2603,6 +2605,57 @@ impl ReplContext {
             }
         }
         println!();
+    }
+
+    /// `/cluster use <model>` — switch the active model to one on a cluster peer.
+    #[cfg(feature = "cluster")]
+    async fn cmd_cluster_use(&mut self, query: &str) {
+        if query.is_empty() {
+            println!("\n  Usage: /cluster use <model>\n  Example: /cluster use qwen3.5-35b\n");
+            return;
+        }
+
+        let state = match &self.cluster_state {
+            Some(s) => s.clone(),
+            None => {
+                println!("\n  Cluster not enabled.\n");
+                return;
+            }
+        };
+
+        let found = state.find_model(query).await;
+        match found {
+            Some(m) => {
+                let peer_endpoint = &m.peer.endpoint;
+                let model_id = &m.model.id;
+
+                println!(
+                    "\n  Switching to {}{}{}  on  {}",
+                    tui::BOLD, model_id, tui::RESET, peer_endpoint,
+                );
+
+                // Update in-memory config.
+                self.config.agents.defaults.local_api_base = peer_endpoint.clone();
+                self.config.agents.defaults.lms_main_model = model_id.clone();
+                self.config.agents.defaults.local_model = model_id.clone();
+                self.current_model_path = PathBuf::from(model_id);
+
+                // Persist to disk.
+                self.persist_local_config();
+
+                // Rebuild the agent core with the new model/endpoint.
+                self.apply_and_rebuild_with(true);
+
+                println!("  {}Done.{}\n", tui::GREEN, tui::RESET);
+            }
+            None => {
+                println!(
+                    "\n  No healthy peer has a model matching \"{}\".",
+                    query
+                );
+                println!("  Use /cluster models to see available models.\n");
+            }
+        }
     }
 }
 
