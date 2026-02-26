@@ -309,6 +309,7 @@ pub(crate) fn print_help() {
     println!("  /audit          - Show audit log for current session");
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
+    println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
 }

@@ -499,8 +499,71 @@ fn find_lan_ip() -> Option<std::net::Ipv4Addr> {
 
     // Fallback: first RFC-1918 from fib_trie (original behaviour).
     let content = fib_content
-        .or_else(|| std::fs::read_to_string("/proc/net/fib_trie").ok())?;
-    parse_lan_ip_from_fib_trie(&content)
+        .or_else(|| std::fs::read_to_string("/proc/net/fib_trie").ok());
+
+    #[cfg(target_os = "linux")]
+    {
+        return content.and_then(|c| parse_lan_ip_from_fib_trie(&c));
+    }
+
+    // BSD/macOS fallback: use route + ifconfig commands.
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(ref c) = content {
+            if let Some(ip) = parse_lan_ip_from_fib_trie(c) {
+                return Some(ip);
+            }
+        }
+        return find_lan_ip_bsd();
+    }
+}
+
+/// macOS/BSD fallback: use `route` and `ifconfig` commands to find the host's
+/// RFC-1918 IPv4 address on the default-route interface.
+#[cfg(not(target_os = "linux"))]
+fn find_lan_ip_bsd() -> Option<std::net::Ipv4Addr> {
+    use std::process::Command;
+
+    // Get default route info.
+    let route_out = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let route_str = String::from_utf8_lossy(&route_out.stdout);
+
+    // Parse gateway IP.
+    let gateway_line = route_str.lines().find(|l| l.trim().starts_with("gateway:"))?;
+    let _gateway_ip: std::net::Ipv4Addr = gateway_line
+        .trim()
+        .strip_prefix("gateway:")?
+        .trim()
+        .parse()
+        .ok()?;
+
+    // Parse interface name.
+    let iface_line = route_str.lines().find(|l| l.trim().starts_with("interface:"))?;
+    let iface = iface_line.trim().strip_prefix("interface:")?.trim();
+
+    // Get our IP on that interface.
+    let ifconfig_out = Command::new("ifconfig").arg(iface).output().ok()?;
+    let ifconfig_str = String::from_utf8_lossy(&ifconfig_out.stdout);
+
+    // Find "inet X.X.X.X" line (skip inet6 lines).
+    for line in ifconfig_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("inet ") && !trimmed.contains("inet6") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(ip) = parts[1].parse::<std::net::Ipv4Addr>() {
+                    if is_rfc1918(ip) {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Parse the interface name of the default route from `/proc/net/route` content.
@@ -977,6 +1040,37 @@ eth0\t00000000\tC01AA8C0\t0003\n";
             preferred.unwrap(),
             "192.168.1.50".parse::<std::net::Ipv4Addr>().unwrap()
         );
+    }
+
+    // --- find_lan_ip_bsd route parsing ---
+
+    #[test]
+    fn test_parse_bsd_route_output() {
+        let route_output = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n";
+
+        let gateway_line = route_output
+            .lines()
+            .find(|l| l.trim().starts_with("gateway:"))
+            .unwrap();
+        let gw: std::net::Ipv4Addr = gateway_line
+            .trim()
+            .strip_prefix("gateway:")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(gw, std::net::Ipv4Addr::new(192, 168, 1, 1));
+
+        let iface_line = route_output
+            .lines()
+            .find(|l| l.trim().starts_with("interface:"))
+            .unwrap();
+        let iface = iface_line
+            .trim()
+            .strip_prefix("interface:")
+            .unwrap()
+            .trim();
+        assert_eq!(iface, "en0");
     }
 
     // --- integration: ClusterDiscovery wiring ---
