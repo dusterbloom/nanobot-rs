@@ -88,6 +88,9 @@ pub(crate) struct AgentLoopShared {
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Budget calibrator for recording execution stats (append-only SQLite).
     pub(crate) calibrator: Option<std::sync::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
+    /// Cluster router for distributed inference (feature-gated).
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -2191,6 +2194,8 @@ impl AgentLoop {
                     None
                 }
             },
+            #[cfg(feature = "cluster")]
+            cluster_router: None,
         });
 
         Self {
@@ -2200,6 +2205,21 @@ impl AgentLoop {
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
         }
+    }
+
+    /// Set the cluster router for distributed inference routing.
+    ///
+    /// Must be called before `run()` or `process_direct()` to take effect.
+    #[cfg(feature = "cluster")]
+    pub fn set_cluster_router(&mut self, router: Arc<crate::cluster::router::ClusterRouter>) {
+        // SAFETY: we hold &mut self so no concurrent access exists yet.
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_cluster_router called after shared Arc was cloned");
+        shared.cluster_router = Some(router.clone());
+        // Also pass the router down to the subagent manager.
+        let subagents = Arc::get_mut(&mut shared.subagents)
+            .expect("set_cluster_router: subagents Arc already shared");
+        subagents.cluster_router = Some(router);
     }
 
     /// Spawn a periodic bulletin refresh task (compaction model, when idle).

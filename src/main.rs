@@ -6,6 +6,8 @@
 mod agent;
 mod bus;
 mod channels;
+#[cfg(feature = "cluster")]
+mod cluster;
 mod cli;
 mod config;
 mod cron;

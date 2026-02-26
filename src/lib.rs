@@ -1,6 +1,8 @@
 //! nanobot library — exposes internal modules for the trio_bench binary.
 
 pub mod agent;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod bus;
 pub mod channels;
 pub mod config;

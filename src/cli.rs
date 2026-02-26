@@ -813,7 +813,7 @@ pub(crate) fn create_agent_loop(
         lcm_config.enabled = true;
     }
 
-    AgentLoop::new(
+    let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
         outbound_tx,
@@ -826,7 +826,27 @@ pub(crate) fn create_agent_loop(
         config.proprioception.clone(),
         lcm_config,
         health_registry,
-    )
+    );
+
+    // Start cluster discovery for the REPL path (when cluster feature is enabled).
+    // Discovery background task is detached; it runs until the runtime shuts down.
+    #[cfg(feature = "cluster")]
+    if config.cluster.enabled {
+        let cluster_state = crate::cluster::state::ClusterState::new();
+        let discovery = crate::cluster::discovery::ClusterDiscovery::new(
+            config.cluster.clone(),
+            cluster_state.clone(),
+        );
+        let _discovery_handle = discovery.run();
+        tracing::info!("cluster_discovery_started");
+        let router = Arc::new(crate::cluster::router::ClusterRouter::new(
+            cluster_state,
+            config.cluster.clone(),
+        ));
+        agent_loop.set_cluster_router(router);
+    }
+
+    agent_loop
 }
 
 // ============================================================================
@@ -914,6 +934,23 @@ pub(crate) async fn run_gateway_async(
         lcm_config,
         Some(health_registry.clone()),
     );
+
+    // Start cluster discovery in the background (when cluster feature is enabled).
+    #[cfg(feature = "cluster")]
+    if config.cluster.enabled {
+        let cluster_state = crate::cluster::state::ClusterState::new();
+        let discovery = crate::cluster::discovery::ClusterDiscovery::new(
+            config.cluster.clone(),
+            cluster_state.clone(),
+        );
+        let _discovery_handle = discovery.run();
+        tracing::info!("cluster_discovery_started");
+        let router = Arc::new(crate::cluster::router::ClusterRouter::new(
+            cluster_state,
+            config.cluster.clone(),
+        ));
+        agent_loop.set_cluster_router(router);
+    }
 
     // Initialize voice pipeline for channels (when voice feature is enabled).
     #[cfg(feature = "voice")]

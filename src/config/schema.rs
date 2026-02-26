@@ -1440,6 +1440,51 @@ impl Default for LcmSchemaConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster config (distributed inference via Exo / LAN peers)
+// ---------------------------------------------------------------------------
+
+fn default_cluster_scan_ports() -> Vec<u16> {
+    vec![52415, 1234, 8080]
+}
+
+fn default_cluster_scan_interval() -> u64 {
+    60
+}
+
+/// Configuration for distributed inference cluster discovery and routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ClusterConfig {
+    /// Enable cluster mode (default: false).
+    pub enabled: bool,
+    /// Enable mDNS + HTTP probe auto-discovery (default: true when enabled).
+    pub auto_discover: bool,
+    /// Manual peer endpoint URLs (e.g. ["http://192.168.1.50:52415"]).
+    pub endpoints: Vec<String>,
+    /// Ports to scan during HTTP probe discovery (default: [52415, 1234, 8080]).
+    #[serde(default = "default_cluster_scan_ports")]
+    pub scan_ports: Vec<u16>,
+    /// Seconds between discovery scans (default: 60).
+    #[serde(default = "default_cluster_scan_interval")]
+    pub scan_interval_secs: u64,
+    /// Prefer cluster over cloud when model is available on both (default: true).
+    pub prefer_cluster: bool,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_discover: true,
+            endpoints: Vec::new(),
+            scan_ports: default_cluster_scan_ports(),
+            scan_interval_secs: default_cluster_scan_interval(),
+            prefer_cluster: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -1471,6 +1516,8 @@ pub struct Config {
     pub proprioception: ProprioceptionConfig,
     #[serde(default)]
     pub trio: TrioConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
     #[serde(default)]
     pub lcm: LcmSchemaConfig,
     #[serde(default)]

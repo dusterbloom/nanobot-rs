@@ -166,6 +166,9 @@ pub struct SubagentManager {
     aha_tx: Option<UnboundedSender<crate::agent::system_state::AhaSignal>>,
     /// Tuning knobs for subagent execution (from config).
     subagent_tuning: SubagentTuning,
+    /// Cluster router for distributed inference (feature-gated).
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_router: Option<std::sync::Arc<crate::cluster::router::ClusterRouter>>,
 }
 
 impl SubagentManager {
@@ -213,6 +216,8 @@ impl SubagentManager {
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             aha_tx: None,
             subagent_tuning: SubagentTuning::default(),
+            #[cfg(feature = "cluster")]
+            cluster_router: None,
         }
     }
 
@@ -240,6 +245,16 @@ impl SubagentManager {
     /// Set the providers config for multi-provider subagent routing.
     pub fn with_providers_config(mut self, config: ProvidersConfig) -> Self {
         self.providers_config = Some(config);
+        self
+    }
+
+    /// Set the cluster router for distributed inference routing.
+    #[cfg(feature = "cluster")]
+    pub fn with_cluster_router(
+        mut self,
+        router: std::sync::Arc<crate::cluster::router::ClusterRouter>,
+    ) -> Self {
+        self.cluster_router = Some(router);
         self
     }
 
@@ -768,6 +783,40 @@ impl SubagentManager {
     /// localhost, which means strict alternation repair is still needed even
     /// though the model was "routed" via a provider prefix.
     fn resolve_provider_for_model(&self, model: &str) -> (Arc<dyn LLMProvider>, String, bool) {
+        // Cluster routing: check if the model is available on a LAN peer.
+        // This runs BEFORE provider-prefix resolution so cluster endpoints take
+        // priority when `prefer_cluster` is set.
+        #[cfg(feature = "cluster")]
+        if let Some(ref router) = self.cluster_router {
+            use crate::cluster::router::RoutingDecision;
+            let has_local = self.is_local;
+            let has_cloud = self.providers_config.is_some();
+            let decision = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(router.route(model, has_local, has_cloud))
+            });
+            if let RoutingDecision::Cluster {
+                ref endpoint,
+                model: ref cluster_model,
+            } = decision
+            {
+                let maybe_provider = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(router.create_cluster_provider(&decision))
+                });
+                if let Some((provider, resolved_model)) = maybe_provider {
+                    let targets_local =
+                        crate::providers::openai_compat::is_local_api_base(endpoint);
+                    tracing::info!(
+                        endpoint = %endpoint,
+                        model = %cluster_model,
+                        "subagent_using_cluster_provider"
+                    );
+                    return (provider, resolved_model, targets_local);
+                }
+            }
+        }
+
         if let Some(ref pc) = self.providers_config {
             if let Some((api_key, base, rest)) = pc.resolve_model_prefix(model) {
                 let prefix = model.split('/').next().unwrap_or("unknown");
