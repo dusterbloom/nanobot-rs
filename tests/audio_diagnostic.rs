@@ -47,9 +47,9 @@ fn audio_diagnostic() {
     let max_val = all_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     let rms = (all_samples.iter().map(|s| s * s).sum::<f32>() / all_samples.len() as f32).sqrt();
 
-    // STT thresholds
-    const STT_MIN_RMS: f32 = 0.01;
-    const STT_MIN_AMP: f32 = 0.03;
+    // STT thresholds (updated - more sensitive for built-in mics)
+    const STT_MIN_RMS: f32 = 0.0005;
+    const STT_MIN_AMP: f32 = 0.002;
 
     println!("Collected {} samples in {} chunks", all_samples.len(), chunk_count);
     println!("Device sample rate: {}Hz", capture.device_sample_rate);
