@@ -26,6 +26,7 @@ pub mod lcm;
 pub mod learning;
 pub mod lora_bridge;
 pub mod memory;
+pub mod markers;
 pub mod metrics;
 pub mod model_capabilities;
 pub mod model_feature_cache;

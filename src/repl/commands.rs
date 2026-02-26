@@ -813,8 +813,8 @@ impl ReplContext {
             .get_context(&self.session_id, 1)
             .is_empty();
         core.working_memory.clear(&self.session_id);
-        // Also clear conversation history so the next turn starts fresh.
         core.sessions.clear_history(&self.session_id).await;
+        self.agent_loop.clear_lcm_engine(&self.session_id).await;
         if had_content {
             println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
         } else {
@@ -1424,7 +1424,7 @@ impl ReplContext {
             if !model_name.is_empty() {
                 print!("  Reloading {} with {}K context... ", model_name, new_ctx / 1024);
                 io::stdout().flush().ok();
-                match crate::lms::load_model(lms_port, &model_name, Some(new_ctx)).await {
+                match crate::lms::reload_model_with_context(lms_port, &model_name, new_ctx).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }

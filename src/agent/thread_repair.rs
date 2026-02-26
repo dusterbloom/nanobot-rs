@@ -30,6 +30,9 @@ static STRIP_INTENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Invalid intent pattern regex")
 });
 
+const SYSTEM_NOTICE_PREFIX: &str = "[System notice]";
+const TOOL_RESULT_PREFIX: &str = "[Tool result from";
+
 /// Repair protocol violations in a message array.
 ///
 /// Fixes:
@@ -358,7 +361,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
             .to_string();
         *msg = json!({
             "role": "user",
-            "content": format!("[System notice] {}", content)
+            "content": format!("{} {}", SYSTEM_NOTICE_PREFIX, content)
         });
     }
 
@@ -428,7 +431,7 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
 
         *msg = json!({
             "role": "user",
-            "content": format!("[Tool result from {} ({})]: {}", tool_name, call_id, content)
+            "content": format!("{} {} ({})]: {}", TOOL_RESULT_PREFIX, tool_name, call_id, content)
         });
     }
 
@@ -1088,7 +1091,7 @@ mod tests {
                     && m.get("content")
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
-                        .contains("[System notice]")
+                        .contains(SYSTEM_NOTICE_PREFIX)
             }),
             "Expected converted system notice as user message"
         );

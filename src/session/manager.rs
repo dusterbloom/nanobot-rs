@@ -72,10 +72,20 @@ impl Session {
             0
         };
 
+        // Respect logical session clears: ignore everything before the most
+        // recent clear marker. We keep markers on disk for append-only audit,
+        // but runtime history must start fresh after /clear.
+        let clear_start = self
+            .messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("clear"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
         // Advance past any orphaned tool results at the window boundary.
         // A tool result at the boundary is orphaned because its matching
         // assistant+tool_calls message was before the window and got dropped.
-        let mut safe_start = start;
+        let mut safe_start = start.max(clear_start);
         while safe_start < self.messages.len() {
             let role = self.messages[safe_start]
                 .get("role")
@@ -109,6 +119,8 @@ impl Session {
             .filter(|m| {
                 // Skip synthetic router/specialist injections — ephemeral to the turn they were created
                 !m.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
+                    // Skip clear markers in the runtime wire history.
+                    && m.get("role").and_then(|v| v.as_str()) != Some("clear")
             })
             .map(|m| {
                 let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -294,12 +306,35 @@ impl SessionManager {
 
     /// Clear the in-memory message history for a session key.
     ///
-    /// Only clears the cache — the JSONL file on disk is preserved as an
-    /// audit trail. The next turn will start with an empty conversation.
+    /// Appends a clear marker to the JSONL file. The LCM rebuild respects
+    /// this marker and ignores everything before it. This preserves the
+    /// append-only property while logically clearing the conversation.
     pub async fn clear_history(&self, key: &str) {
+        let clear_marker = json!({
+            "role": "clear",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        
+        // Append clear marker to the JSONL file.
+        let path = Self::session_path(key, &self.sessions_dir);
+        if let Err(e) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{}", clear_marker)
+            })
+        {
+            warn!("Failed to append clear marker to {}: {}", path.display(), e);
+        }
+        
+        // Clear in-memory cache and add the clear marker so LCM sees it.
         let mut cache = self.cache.lock().await;
         if let Some(session) = cache.get_mut(key) {
             session.messages.clear();
+            session.messages.push(clear_marker);
+            session.updated_at = Local::now();
         }
     }
 
@@ -878,5 +913,33 @@ mod tests {
         assert_eq!(history[1]["content"], "real answer");
         assert_eq!(history[2]["content"], "follow up");
         assert_eq!(history[3]["content"], "follow up answer");
+    }
+
+    #[test]
+    fn test_get_history_respects_last_clear_marker() {
+        let mut session = Session::new("test_clear_marker");
+        session.messages.push(json!({"role": "user", "content": "old question"}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": "old answer"}));
+        session
+            .messages
+            .push(json!({"role": "clear", "timestamp": Local::now().to_rfc3339()}));
+        session
+            .messages
+            .push(json!({"role": "user", "content": "new question"}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": "new answer"}));
+
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "new question");
+        assert_eq!(history[1]["content"], "new answer");
+        assert!(
+            history
+                .iter()
+                .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("clear"))
+        );
     }
 }

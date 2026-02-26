@@ -219,6 +219,9 @@ impl LcmEngine {
     /// - All summary nodes (representing compacted older messages)
     /// - Raw messages after the last summary
     ///
+    /// Respects `Turn::Clear` markers: everything before the last clear marker
+    /// is ignored, starting fresh from that point.
+    ///
     /// # Arguments
     /// * `turns` - All turns from the session, including `Turn::Summary` entries
     /// * `protocol` - The conversation protocol for rendering
@@ -229,14 +232,19 @@ impl LcmEngine {
         _protocol: &dyn ConversationProtocol,
         _system_prompt: &str,
     ) -> Self {
-        let mut engine = Self::new(config);
+        let mut engine = Self::new(config.clone());
+        
+        // Find the last clear marker - everything before it is ignored.
+        let clear_idx = turns.iter().rposition(|t| matches!(t, Turn::Clear));
+        let start_idx = clear_idx.map(|i| i + 1).unwrap_or(0);
+        let turns_to_process = &turns[start_idx..];
         
         // Track which raw message IDs have been summarized
         let mut summarized_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
         let mut last_summary_end: Option<MessageId> = None;
         
         // First pass: ingest all raw messages into store, track summaries
-        for turn in turns {
+        for turn in turns_to_process {
             match turn {
                 Turn::User { content, media: _ } => {
                     let msg = serde_json::json!({"role": "user", "content": content});
@@ -286,6 +294,12 @@ impl LcmEngine {
                     
                     // Summaries are NOT added to store - they reference store entries
                 }
+                Turn::Clear => {
+                    // Should not happen since we sliced turns_to_process,
+                    // but handle defensively by resetting the engine.
+                    debug!("LCM rebuild: unexpected Clear marker in processed turns, resetting");
+                    return Self::new(config);
+                }
             }
         }
         
@@ -326,10 +340,11 @@ impl LcmEngine {
         }
         
         debug!(
-            "LCM rebuild: {} store entries, {} summary nodes, {} active entries",
+            "LCM rebuild: {} store entries, {} summary nodes, {} active entries (cleared at idx {:?})",
             engine.store.len(),
             engine.dag.len(),
-            engine.active.len()
+            engine.active.len(),
+            clear_idx
         );
         
         engine
@@ -427,7 +442,7 @@ impl LcmEngine {
 
         // Find the oldest contiguous block of raw messages to compact.
         // Skip the system message (index 0) and any existing summaries.
-        let (block_start, block_end) = match self.find_oldest_raw_block() {
+        let (block_start, block_end) = match self.find_oldest_raw_block_impl() {
             Some(range) => range,
             None => {
                 debug!("LCM: no raw block to compact");
@@ -527,12 +542,28 @@ impl LcmEngine {
         })
     }
 
-    /// Find the oldest contiguous block of raw messages (skipping system prompt).
-    fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
+    /// Find the oldest contiguous block of raw messages after the last summary.
+    ///
+    /// If no summary exists, starts from the beginning (after system prompt).
+    /// This ensures we don't re-compact messages that have already been summarized.
+    fn find_oldest_raw_block_impl(&self) -> Option<(usize, usize)> {
+        let mut last_summary_idx: Option<usize> = None;
+        
+        // Find the position of the last summary in active context
+        for (i, entry) in self.active.iter().enumerate() {
+            if matches!(entry, ContextEntry::Summary { .. }) {
+                last_summary_idx = Some(i);
+            }
+        }
+        
+        // Start searching for raw messages after the last summary
+        let search_start = last_summary_idx.map(|idx| idx + 1).unwrap_or(0);
+        
         let mut start = None;
         let mut end = 0;
 
-        for (i, entry) in self.active.iter().enumerate() {
+        for i in search_start..self.active.len() {
+            let entry = &self.active[i];
             match entry {
                 ContextEntry::Raw { msg_id: _, message } => {
                     // Skip system message.
@@ -546,7 +577,8 @@ impl LcmEngine {
                     end = i + 1;
                 }
                 ContextEntry::Summary { .. } => {
-                    // If we've found a raw block before this summary, use it.
+                    // Shouldn't happen since we start after the last summary,
+                    // but handle it just in case.
                     if start.is_some() {
                         break;
                     }
@@ -628,13 +660,18 @@ impl LcmEngine {
     }
 
     /// Access the summary DAG (for inspection in tests).
-    pub(crate) fn dag_ref(&self) -> &SummaryDag {
+    pub fn dag_ref(&self) -> &SummaryDag {
         &self.dag
     }
 
     /// Access the active context entries (for inspection in tests).
-    pub(crate) fn active_entries(&self) -> &[ContextEntry] {
+    pub fn active_entries(&self) -> &[ContextEntry] {
         &self.active
+    }
+
+    /// Find the oldest contiguous block of raw messages (for testing).
+    pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
+        self.find_oldest_raw_block_impl()
     }
 }
 
@@ -671,21 +708,29 @@ async fn escalated_summary(
     // Level 1: Preserve details.
     if let Ok(summary) = compactor.summarize_for_lcm(messages, "preserve_details").await {
         let tokens = TokenBudget::estimate_str_tokens(&summary);
-        if tokens < original_tokens {
+        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
             debug!("LCM escalation: Level 1 succeeded ({} -> {} tokens)", original_tokens, tokens);
             return (summary, 1);
         }
-        debug!("LCM escalation: Level 1 failed (output {} >= input {})", tokens, original_tokens);
+        if contains_refusal_pattern(&summary) {
+            debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
+        } else {
+            debug!("LCM escalation: Level 1 failed (output {} >= input {})", tokens, original_tokens);
+        }
     }
 
     // Level 2: Bullet points, half the target.
     if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
         let tokens = TokenBudget::estimate_str_tokens(&summary);
-        if tokens < original_tokens {
+        if tokens < original_tokens && !contains_refusal_pattern(&summary) {
             debug!("LCM escalation: Level 2 succeeded ({} -> {} tokens)", original_tokens, tokens);
             return (summary, 2);
         }
-        debug!("LCM escalation: Level 2 failed (output {} >= input {})", tokens, original_tokens);
+        if contains_refusal_pattern(&summary) {
+            debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
+        } else {
+            debug!("LCM escalation: Level 2 failed (output {} >= input {})", tokens, original_tokens);
+        }
     }
 
     // Level 3: Deterministic truncation — guaranteed convergence, no LLM.
@@ -771,6 +816,47 @@ fn first_sentence(text: &str) -> &str {
         .map(|(i, _)| i)
         .unwrap_or(trimmed.len());
     &trimmed[..end]
+}
+
+/// Check if text contains an LLM refusal pattern.
+///
+/// Refusal patterns indicate the LLM declined to help, which should not
+/// be captured in summaries as it pollutes future context.
+pub fn contains_refusal_pattern(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let refusal_indicators = [
+        "i cannot",
+        "i can't",
+        "i'm unable",
+        "i am unable",
+        "i apologize",
+        "i'm sorry",
+        "as an ai",
+        "as a language model",
+        "unable to help",
+        "cannot assist",
+        "can't assist",
+        "cannot fulfill",
+        "can't fulfill",
+        "not able to provide",
+        "unable to provide",
+        "i won't",
+        "i will not",
+        "against my guidelines",
+        "violates my",
+        "i'm not comfortable",
+        "i am not comfortable",
+        "ethically",
+        "unethical",
+        "harmful",
+    ];
+    
+    for indicator in &refusal_indicators {
+        if lower.contains(indicator) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

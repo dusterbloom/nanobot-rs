@@ -3,7 +3,8 @@
 //! Two implementations:
 //! - [`CloudProtocol`] — standard OpenAI function-calling format (tool_calls / role:tool).
 //! - [`LocalProtocol`] — strict user/assistant alternation for local models (LM Studio / vLLM).
-//!   Tool results become user messages; assistant tool_calls become text summaries.
+//!   Tool results become user messages. Assistant replay can be native `tool_calls`
+//!   or textual summaries, selected by replay mode.
 //!   No `role:tool`, no `role:system` after index 0, always ends with user.
 //!
 //! Protocol selection happens once per turn in `agent_loop.rs`:
@@ -16,8 +17,32 @@
 //! ```
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use super::turn::{ToolCall, Turn};
+use crate::agent::model_capabilities::{lookup, ModelSizeClass};
+
+const CONTINUE_SENTINEL: &str = "Continue.";
+const SYSTEM_NOTICE_PREFIX: &str = "[System notice]";
+const CONTEXT_SUMMARY_PREFIX: &str = "[Context summary]:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReplayMode {
+    NativeToolCalls,
+    TextualReplay,
+}
+
+impl LocalReplayMode {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("NANOBOT_LOCAL_PROTOCOL_MODE").ok()?;
+        let value = raw.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "native" | "tool_calls" | "native_tool_calls" => Some(Self::NativeToolCalls),
+            "text" | "textual" | "textual_replay" => Some(Self::TextualReplay),
+            _ => None,
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Trait
@@ -100,12 +125,15 @@ impl ConversationProtocol for CloudProtocol {
                     // Summaries render as assistant messages summarising prior context.
                     out.push(json!({"role": "assistant", "content": text}));
                 }
+                Turn::Clear => {
+                    // Clear marker is not rendered - it only affects LCM rebuild.
+                }
             }
         }
 
         // Anthropic compat: must not end with assistant.
         if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
-            out.push(json!({"role": "user", "content": "Continue."}));
+            out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 
         out
@@ -125,11 +153,46 @@ impl ConversationProtocol for CloudProtocol {
 /// Invariants enforced:
 /// - No `role:tool` — tool results become user messages.
 /// - No `role:system` after index 0 — mid-thread system turns become user messages.
-/// - Assistant `tool_calls` are converted to a text summary with arguments so the model
-///   can verify results match: `"[I called: name(args)]"`.
+/// - Assistant replay mode can preserve native `tool_calls` or convert to textual replay.
 /// - Consecutive same-role messages are merged.
 /// - Output always ends with `role:user`.
-pub struct LocalProtocol;
+#[derive(Debug, Clone, Copy)]
+pub struct LocalProtocol {
+    replay_mode: LocalReplayMode,
+}
+
+impl LocalProtocol {
+    pub const fn native() -> Self {
+        Self {
+            replay_mode: LocalReplayMode::NativeToolCalls,
+        }
+    }
+
+    pub const fn textual() -> Self {
+        Self {
+            replay_mode: LocalReplayMode::TextualReplay,
+        }
+    }
+
+    pub fn auto_for_model(model: &str) -> Self {
+        if let Some(mode) = LocalReplayMode::from_env() {
+            return Self { replay_mode: mode };
+        }
+
+        let caps = lookup(model, &HashMap::new());
+        if !caps.tool_calling || caps.size_class == ModelSizeClass::Small {
+            Self::textual()
+        } else {
+            Self::native()
+        }
+    }
+}
+
+impl Default for LocalProtocol {
+    fn default() -> Self {
+        Self::native()
+    }
+}
 
 impl ConversationProtocol for LocalProtocol {
     fn render(&self, system: &str, turns: &[Turn]) -> Vec<Value> {
@@ -142,40 +205,60 @@ impl ConversationProtocol for LocalProtocol {
             let msg = match turn {
                 Turn::System { content } => {
                     // Mid-thread system → user notice.
-                    json!({"role": "user", "content": format!("[System notice] {}", content)})
+                    json!({"role": "user", "content": format!("{} {}", SYSTEM_NOTICE_PREFIX, content)})
                 }
                 Turn::User { content, .. } => {
                     json!({"role": "user", "content": content})
                 }
                 Turn::Assistant { text, tool_calls } => {
-                    // Convert tool_calls to a text summary with arguments so the
-                    // model can verify that the subsequent tool results match what
-                    // was called.  Without arguments, small models re-call tools
-                    // because they cannot confirm the result is authoritative.
-                    let tool_summary = if tool_calls.is_empty() {
-                        String::new()
-                    } else {
-                        let calls: Vec<String> = tool_calls
-                            .iter()
-                            .map(|tc| {
-                                let args_str = serde_json::to_string(&tc.args)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                format!("{}({})", tc.tool, args_str)
-                            })
-                            .collect();
-                        format!("[I called: {}]", calls.join(", "))
-                    };
-                    let content = match text.as_deref() {
-                        Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
-                            format!("{}\n{}", t, tool_summary)
+                    match self.replay_mode {
+                        LocalReplayMode::NativeToolCalls => {
+                            let content_val = match text {
+                                Some(t) if !t.is_empty() => Value::String(t.clone()),
+                                _ => Value::Null,
+                            };
+                            if tool_calls.is_empty() {
+                                json!({"role": "assistant", "content": content_val})
+                            } else {
+                                let tc_json: Vec<Value> = tool_calls
+                                    .iter()
+                                    .map(tool_call_to_openai_json)
+                                    .collect();
+                                json!({
+                                    "role": "assistant",
+                                    "content": content_val,
+                                    "tool_calls": tc_json,
+                                })
+                            }
                         }
-                        Some(t) if !t.is_empty() => t.to_string(),
-                        _ if !tool_summary.is_empty() => tool_summary,
-                        _ => String::new(),
-                    };
-                    json!({"role": "assistant", "content": content})
+                        LocalReplayMode::TextualReplay => {
+                            let tool_summary = if tool_calls.is_empty() {
+                                String::new()
+                            } else {
+                                let calls: Vec<String> = tool_calls
+                                    .iter()
+                                    .map(|tc| {
+                                        let args_str = serde_json::to_string(&tc.args)
+                                            .unwrap_or_else(|_| "{}".to_string());
+                                        format!("{}({})", tc.tool, args_str)
+                                    })
+                                    .collect();
+                                format!("[I called: {}]", calls.join(", "))
+                            };
+                            let content = match text.as_deref() {
+                                Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
+                                    format!("{}\n{}", t, tool_summary)
+                                }
+                                Some(t) if !t.is_empty() => t.to_string(),
+                                _ if !tool_summary.is_empty() => tool_summary,
+                                _ => String::new(),
+                            };
+                            json!({"role": "assistant", "content": content})
+                        }
+                    }
                 }
                 Turn::ToolResult { tool, call_id, result, .. } => {
+                    // Tool results become user messages for alternation compliance.
                     json!({
                         "role": "user",
                         "content": format!("[System: tool execution complete — {}({}) returned]:\n{}", tool, call_id, result),
@@ -186,8 +269,12 @@ impl ConversationProtocol for LocalProtocol {
                     // assistant-role summaries reliably).
                     json!({
                         "role": "user",
-                        "content": format!("[Context summary]: {}", text),
+                        "content": format!("{} {}", CONTEXT_SUMMARY_PREFIX, text),
                     })
+                }
+                Turn::Clear => {
+                    // Clear marker is not rendered - it only affects LCM rebuild.
+                    continue;
                 }
             };
             out.push(msg);
@@ -198,7 +285,7 @@ impl ConversationProtocol for LocalProtocol {
 
         // Must always end with user.
         if out.last().map(|m| m["role"] != "user").unwrap_or(true) {
-            out.push(json!({"role": "user", "content": "Continue."}));
+            out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 
         out
@@ -283,6 +370,10 @@ fn merge_consecutive_role(messages: Vec<Value>) -> Vec<Value> {
             let last_role = last["role"].as_str().unwrap_or("");
             // Don't merge system messages.
             if last_role == role && role != "system" {
+                if !is_merge_safe(last, &msg, &role) {
+                    out.push(msg);
+                    continue;
+                }
                 let last_content = last["content"].as_str().unwrap_or("").to_string();
                 let merged = if last_content.is_empty() {
                     content
@@ -298,6 +389,35 @@ fn merge_consecutive_role(messages: Vec<Value>) -> Vec<Value> {
         out.push(msg);
     }
     out
+}
+
+fn is_merge_safe(last: &Value, current: &Value, role: &str) -> bool {
+    if role == "assistant" {
+        // Assistant metadata like tool_calls must never be dropped by merge.
+        let last_has_tool_calls = last
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        let current_has_tool_calls = current
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|arr| !arr.is_empty())
+            .unwrap_or(false);
+        if last_has_tool_calls || current_has_tool_calls {
+            return false;
+        }
+    }
+
+    let last_has_extra_fields = has_non_content_fields(last);
+    let current_has_extra_fields = has_non_content_fields(current);
+    !(last_has_extra_fields || current_has_extra_fields)
+}
+
+fn has_non_content_fields(msg: &Value) -> bool {
+    msg.as_object()
+        .map(|obj| obj.keys().any(|k| k != "role" && k != "content"))
+        .unwrap_or(false)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -333,7 +453,7 @@ mod tests {
 
     #[test]
     fn local_no_tool_role() {
-        let wire = LocalProtocol.render("sys", &tool_turns());
+        let wire = LocalProtocol::default().render("sys", &tool_turns());
         assert!(wire.iter().all(|m| m["role"] != "tool"));
     }
 
@@ -343,16 +463,20 @@ mod tests {
             Turn::User { content: "hi".into(), media: vec![] },
             Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
         ];
-        let wire = LocalProtocol.render("sys", &turns);
+        let wire = LocalProtocol::default().render("sys", &turns);
         assert_eq!(wire.last().unwrap()["role"], "user");
     }
 
     #[test]
-    fn local_assistant_has_no_tool_calls_field() {
-        let wire = LocalProtocol.render("sys", &tool_turns());
-        for msg in &wire {
-            if msg["role"] == "assistant" {
-                assert!(msg.get("tool_calls").is_none());
+    fn local_assistant_preserves_tool_calls() {
+        let wire = LocalProtocol::native().render("sys", &tool_turns());
+        // LocalProtocol now preserves tool_calls for native tool-calling support (LM Studio).
+        let assistant_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "assistant").collect();
+        assert!(!assistant_msgs.is_empty(), "Should have assistant messages");
+        for msg in &assistant_msgs {
+            if msg.get("tool_calls").is_some() {
+                let tc = msg["tool_calls"].as_array().unwrap();
+                assert!(!tc.is_empty(), "tool_calls should not be empty if present");
             }
         }
     }
@@ -364,7 +488,7 @@ mod tests {
             Turn::System { content: "Injected notice".into() },
             Turn::User { content: "go on".into(), media: vec![] },
         ];
-        let wire = LocalProtocol.render("sys", &turns);
+        let wire = LocalProtocol::default().render("sys", &turns);
         let non_first_system = wire.iter().skip(1).any(|m| m["role"] == "system");
         assert!(!non_first_system);
         let has_notice = wire
@@ -411,5 +535,58 @@ mod tests {
         assert_eq!(merged.len(), 3); // system + merged_user + assistant
         assert!(merged[1]["content"].as_str().unwrap().contains("hello"));
         assert!(merged[1]["content"].as_str().unwrap().contains("world"));
+    }
+
+    #[test]
+    fn merge_consecutive_role_preserves_assistant_tool_call_metadata() {
+        let msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "assistant", "content": "Calling tool now"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let merged = merge_consecutive_role(msgs);
+        assert_eq!(merged.len(), 4, "assistant entries with metadata must not merge");
+        assert!(merged[1].get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn local_textual_replay_includes_called_tool_arguments() {
+        let wire = LocalProtocol::textual().render("sys", &tool_turns());
+        let assistant = wire
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assert!(assistant.contains("[I called: read_file"));
+        assert!(assistant.contains("\"path\":\"Cargo.toml\""));
+    }
+
+    #[test]
+    fn local_textual_replay_formats_tool_result_as_system_completion() {
+        let wire = LocalProtocol::textual().render("sys", &tool_turns());
+        let tool_result = wire
+            .iter()
+            .find(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("tool execution complete")
+            })
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("");
+        assert!(tool_result.contains("read_file(tc_1)"));
+        assert!(tool_result.contains("data"));
     }
 }

@@ -486,7 +486,7 @@ impl AgentLoopShared {
         // Select conversation protocol based on whether we're talking to a local model.
         // Protocol correctness is enforced at render time — no repair needed.
         let protocol: Arc<dyn ConversationProtocol> = if core.is_local {
-            Arc::new(LocalProtocol)
+            Arc::new(LocalProtocol::auto_for_model(&core.model))
         } else {
             Arc::new(CloudProtocol)
         };
@@ -1135,39 +1135,34 @@ impl AgentLoopShared {
                     if v > 0 { Some(v - 1) } else { None }
                 })
                 .is_ok();
-            if had_long {
-                base.max(8192)
-            } else {
-                // Detect long-form triggers in the user message.
-                let user_text = ctx.messages
-                    .last()
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                let lower = user_text.to_lowercase();
-                let is_long_form = lower.contains("explain in detail")
-                    || lower.contains("write a ")
-                    || lower.contains("create a script")
-                    || lower.contains("write code")
-                    || lower.contains("implement ")
-                    || lower.contains("full example")
-                    || lower.starts_with("write ")
-                    || user_text.len() > 500;
-                // Count recent tool calls: if tool-heavy, use smaller budget.
-                let recent_tool_calls = ctx.messages
-                    .iter()
-                    .rev()
-                    .take(6)
-                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-                    .count();
-                if is_long_form {
-                    base.max(4096)
-                } else if recent_tool_calls > 3 {
-                    base.min(1024).max(512)
+            let user_text = ctx.messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            // Count recent tool calls: if tool-heavy, use smaller budget.
+            let recent_tool_calls = ctx.messages
+                .iter()
+                .rev()
+                .take(6)
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                .count();
+            let thinking_budget = {
+                let stored = counters.thinking_budget.load(Ordering::Relaxed);
+                if stored > 0 {
+                    Some(stored)
                 } else {
-                    base
+                    None
                 }
-            }
+            };
+            adaptive_max_tokens(
+                base,
+                had_long,
+                user_text,
+                recent_tool_calls,
+                ctx.core.is_local,
+                thinking_budget,
+            )
         };
 
         StepResult::Next(IterationPhase::Calling {
@@ -1210,7 +1205,7 @@ impl AgentLoopShared {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.
                 if ctx.core.is_local && ctx.core.model_capabilities.size_class == crate::agent::model_capabilities::ModelSizeClass::Small {
-                    Some(stored.min(256))
+                    Some(stored.min(LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS))
                 } else {
                     Some(stored)
                 }
@@ -2013,6 +2008,56 @@ fn should_strip_tools_for_trio(
     result
 }
 
+const LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS: u32 = 512;
+const LOCAL_THINKING_MIN_COMPLETION_TOKENS: u32 = 256;
+const LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS: u32 = 256;
+const ADAPTIVE_LONG_MODE_MIN_TOKENS: u32 = 8192;
+const ADAPTIVE_LONG_FORM_MIN_TOKENS: u32 = 4096;
+const ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD: usize = 3;
+const ADAPTIVE_TOOL_HEAVY_MAX_TOKENS: u32 = 1024;
+const ADAPTIVE_TOOL_HEAVY_MIN_TOKENS: u32 = 512;
+const ADAPTIVE_LONG_FORM_TRIGGER_CHARS: usize = 500;
+
+fn adaptive_max_tokens(
+    base: u32,
+    had_long: bool,
+    user_text: &str,
+    recent_tool_calls: usize,
+    is_local: bool,
+    thinking_budget: Option<u32>,
+) -> u32 {
+    let mut effective = if had_long {
+        base.max(ADAPTIVE_LONG_MODE_MIN_TOKENS)
+    } else {
+        let lower = user_text.to_lowercase();
+        let is_long_form = lower.contains("explain in detail")
+            || lower.contains("write a ")
+            || lower.contains("create a script")
+            || lower.contains("write code")
+            || lower.contains("implement ")
+            || lower.contains("full example")
+            || lower.starts_with("write ")
+            || user_text.len() > ADAPTIVE_LONG_FORM_TRIGGER_CHARS;
+
+        if is_long_form {
+            base.max(ADAPTIVE_LONG_FORM_MIN_TOKENS)
+        } else if recent_tool_calls > ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD {
+            base.min(ADAPTIVE_TOOL_HEAVY_MAX_TOKENS)
+                .max(ADAPTIVE_TOOL_HEAVY_MIN_TOKENS)
+        } else {
+            base
+        }
+    };
+
+    if is_local && thinking_budget.is_some() {
+        effective = effective
+            .saturating_sub(LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS)
+            .max(LOCAL_THINKING_MIN_COMPLETION_TOKENS);
+    }
+
+    effective
+}
+
 // ---------------------------------------------------------------------------
 // AgentLoop (owns the receiver + orchestrates concurrency)
 // ---------------------------------------------------------------------------
@@ -2412,6 +2457,17 @@ impl AgentLoop {
     /// Return a handle to the subagent manager.
     pub fn subagent_manager(&self) -> Arc<SubagentManager> {
         self.shared.subagents.clone()
+    }
+
+    /// Clear the LCM engine for a session (e.g. on /clear command).
+    ///
+    /// This resets the summary DAG and active context so stale summaries
+    /// don't pollute fresh conversations after /clear.
+    pub async fn clear_lcm_engine(&self, session_key: &str) {
+        let mut engines = self.shared.lcm_engines.lock().await;
+        if engines.remove(session_key).is_some() {
+            debug!(session = %session_key, "LCM engine cleared");
+        }
     }
 
     /// Signal the agent loop to stop.
@@ -4048,6 +4104,30 @@ mod tests {
         assert!(!should_strip_tools_for_trio(true, true, false, false));
     }
 
+    #[test]
+    fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
+        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, Some(512));
+        assert_eq!(out, 3584);
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_no_reserve_without_thinking() {
+        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, None);
+        assert_eq!(out, 4096);
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_no_reserve_for_cloud() {
+        let out = adaptive_max_tokens(4096, false, "What time is it?", 0, false, Some(512));
+        assert_eq!(out, 4096);
+    }
+
+    #[test]
+    fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
+        let out = adaptive_max_tokens(512, false, "short", 0, true, Some(128));
+        assert_eq!(out, 256);
+    }
+
     // -----------------------------------------------------------------------
     // Offline trio E2E tests (no network required — all providers are mocks)
     // -----------------------------------------------------------------------
@@ -4102,6 +4182,54 @@ mod tests {
             };
             Ok(crate::providers::base::LLMResponse {
                 content: Some(response),
+                tool_calls: vec![],
+                finish_reason: "stop".to_string(),
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            &self.name
+        }
+    }
+
+    struct RecordingProvider {
+        name: String,
+        response: String,
+        last_max_tokens: std::sync::atomic::AtomicU32,
+    }
+
+    impl RecordingProvider {
+        fn new(name: &str, response: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                response: response.to_string(),
+                last_max_tokens: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn last_max_tokens(&self) -> u32 {
+            self.last_max_tokens
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.last_max_tokens
+                .store(max_tokens, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::providers::base::LLMResponse {
+                content: Some(self.response.clone()),
                 tool_calls: vec![],
                 finish_reason: "stop".to_string(),
                 usage: std::collections::HashMap::new(),
@@ -4240,6 +4368,41 @@ mod tests {
             "specialist should NOT have been dispatched for a 'respond' decision"
         );
         assert!(!resp.is_empty(), "response should be non-empty");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn test_local_thinking_reserves_max_tokens_end_to_end() {
+        let router_resp = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
+        let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
+            "offline-router",
+            vec![router_resp, router_resp, router_resp],
+        ));
+        let main = Arc::new(RecordingProvider::new("offline-main", "ok"));
+        let main_dyn: Arc<dyn LLMProvider> = main.clone();
+        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+            "offline-specialist",
+            "unused",
+        ));
+
+        let (agent_loop, workspace) = build_trio_offline_harness(main_dyn, router, specialist);
+        agent_loop
+            .shared
+            .core_handle
+            .counters
+            .thinking_budget
+            .store(128, std::sync::atomic::Ordering::Relaxed);
+
+        let _ = agent_loop
+            .process_direct("What is the current date?", "reserve-max-tokens", "test", "offline")
+            .await;
+
+        assert_eq!(
+            main.last_max_tokens(),
+            256,
+            "local thinking should reserve tool-call budget from base max_tokens=512"
+        );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

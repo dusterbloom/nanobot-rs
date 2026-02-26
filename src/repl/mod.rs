@@ -10,6 +10,7 @@ mod incremental;
 pub(crate) use commands::{should_auto_activate_trio, trio_enable};
 
 use std::io::{self, IsTerminal, Write as _};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,6 +131,81 @@ fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
             String::new()
         }
         _ => String::new(),
+    }
+}
+
+async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
+    let base = config.agents.defaults.local_api_base.trim();
+    if base.is_empty() {
+        return;
+    }
+    let native = base.trim_end_matches('/').trim_end_matches("/v1");
+    let url = format!("{}/api/v1/models/load", native);
+
+    let mut models: Vec<(String, Option<usize>)> = Vec::new();
+    if !main_model.trim().is_empty() {
+        models.push((
+            main_model.trim().to_string(),
+            Some(config.agents.defaults.local_max_context_tokens),
+        ));
+    }
+
+    let role_models_enabled = config.trio.enabled
+        || commands::should_auto_activate_trio(
+            true,
+            &config.trio.router_model,
+            &config.trio.specialist_model,
+            config.trio.router_endpoint.is_some(),
+            config.trio.specialist_endpoint.is_some(),
+            &config.tool_delegation.mode,
+        );
+
+    if role_models_enabled {
+        if !config.trio.router_model.trim().is_empty() {
+            models.push((
+                config.trio.router_model.trim().to_string(),
+                Some(config.trio.router_ctx_tokens),
+            ));
+        }
+        if !config.trio.specialist_model.trim().is_empty() {
+            models.push((
+                config.trio.specialist_model.trim().to_string(),
+                Some(config.trio.specialist_ctx_tokens),
+            ));
+        }
+    }
+
+    if config.lcm.enabled {
+        if let Some(ref ep) = config.lcm.compaction_endpoint {
+            if !ep.model.trim().is_empty() {
+                models.push((ep.model.trim().to_string(), Some(config.lcm.compaction_context_size)));
+            }
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    let client = reqwest::Client::new();
+    for (model, ctx) in models {
+        if !seen.insert(model.clone()) {
+            continue;
+        }
+        let mut body = serde_json::json!({ "model": model });
+        if let Some(c) = ctx {
+            body["context_length"] = serde_json::json!(c);
+        }
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(model = %body["model"].as_str().unwrap_or(""), "remote_lms_prewarm_ok");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                warn!(model = %body["model"].as_str().unwrap_or(""), %status, body = %text, "remote_lms_prewarm_failed");
+            }
+            Err(e) => {
+                warn!(model = %body["model"].as_str().unwrap_or(""), error = %e, "remote_lms_prewarm_error");
+            }
+        }
     }
 }
 
@@ -1040,6 +1116,12 @@ pub(crate) fn cmd_agent(
 
         // Recompute has_remote_local after potential lms setup
         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+
+        // Remote LM Studio base: proactively prewarm main/router/specialist models
+        // to avoid first-turn latency spikes from JIT loading.
+        if is_local && has_remote_local && !srv.lms_managed {
+            prewarm_remote_lms_models(&config, &local_model_name).await;
+        }
 
         // Auto-activate trio mode for local sessions when both router and
         // specialist models are configured.  The downgrade block below will

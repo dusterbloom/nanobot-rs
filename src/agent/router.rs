@@ -17,9 +17,21 @@ use crate::agent::role_policy::{build_specialist_system_prompt, parse_specialist
 use crate::agent::router_fallback;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
+use crate::agent::markers::{
+    TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
+};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
 use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
+
+const ROUTER_MAX_TOKENS: u32 = 256;
+const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
+const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
+const ROUTER_USER_MSG_TRACE_PREVIEW_CHARS: usize = 80;
+const ROUTER_TAIL_MAX_PAIRS: usize = 5;
+const ROUTER_TAIL_MAX_MSG_CHARS: usize = 200;
+const ROUTER_TAIL_MAX_CHARS: usize = 800;
+const SCRATCH_PAD_LOOKBACK_MESSAGES: usize = 10;
 
 /// Per-domain ring buffer for specialist multi-turn memory.
 /// Stores compressed summaries of past specialist outputs so subsequent
@@ -85,15 +97,16 @@ impl Default for SpecialistMemory {
 /// Search backwards through recent messages for a scratch pad summary.
 /// Returns the summary text if found, otherwise None.
 pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String> {
-    for msg in messages.iter().rev().take(10) {
+    for msg in messages.iter().rev().take(SCRATCH_PAD_LOOKBACK_MESSAGES) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
         if content.is_empty() {
             continue;
         }
         // Standalone summary from tool_engine.rs line 327: "[tool runner summary] ..."
-        if role == "user" && content.starts_with("[tool runner summary] ") {
-            if let Some(rest) = content.strip_prefix("[tool runner summary] ") {
+        if role == "user" && content.starts_with(TOOL_RUNNER_SUMMARY_PREFIX) {
+            if let Some(rest) = content.strip_prefix(TOOL_RUNNER_SUMMARY_PREFIX) {
+                let rest = rest.trim_start();
                 let s = rest.trim().to_string();
                 if !s.is_empty() {
                     return Some(s);
@@ -101,10 +114,11 @@ pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String
             }
         }
         // Inline summary from tool_engine.rs line 267: "[Tool analysis summary]\n..."
-        if role == "tool" && content.starts_with("[Tool analysis summary]\n") {
-            if let Some(rest) = content.strip_prefix("[Tool analysis summary]\n") {
+        if role == "tool" && content.starts_with(TOOL_ANALYSIS_SUMMARY_PREFIX) {
+            if let Some(rest) = content.strip_prefix(TOOL_ANALYSIS_SUMMARY_PREFIX) {
+                let rest = rest.trim_start_matches('\n');
                 let summary = rest
-                    .split("\n\n[Full output:")
+                    .split(TOOL_ANALYSIS_FULL_OUTPUT_MARKER)
                     .next()
                     .unwrap_or(rest)
                     .trim()
@@ -406,8 +420,12 @@ pub async fn request_strict_router_decision(
         }
     }
 
-    // Build user content with optional /no_think prefix for Nemotron-Orchestrator-8B
-    let user_content = if no_think {
+    // Build user content with optional /no_think prefix, but only for
+    // models that actually require template-level no_think handling.
+    let model_needs_no_think_prefix =
+        crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new())
+            .needs_native_lms_api;
+    let user_content = if no_think && model_needs_no_think_prefix {
         format!(" /no_think\n{}", router_pack)
     } else {
         router_pack.to_string()
@@ -463,7 +481,15 @@ pub async fn request_strict_router_decision(
         }),
     ];
     if let Ok(tool_resp) = provider
-        .chat(&tool_messages, Some(&tool_defs), Some(model), 256, temperature, None, Some(top_p))
+        .chat(
+            &tool_messages,
+            Some(&tool_defs),
+            Some(model),
+            ROUTER_MAX_TOKENS,
+            temperature,
+            None,
+            Some(top_p),
+        )
         .await
     {
         if let Some(tc) = tool_resp.tool_calls.first() {
@@ -510,7 +536,15 @@ pub async fn request_strict_router_decision(
     ];
 
     let router_resp = provider
-        .chat(&router_messages, None, Some(model), 256, temperature, None, Some(top_p))
+        .chat(
+            &router_messages,
+            None,
+            Some(model),
+            ROUTER_MAX_TOKENS,
+            temperature,
+            None,
+            Some(top_p),
+        )
         .await
         .map_err(|e| format!("strict router call failed: {}", e))?;
     let raw_router_content = router_resp.content.unwrap_or_default();
@@ -530,7 +564,7 @@ pub async fn request_strict_router_decision(
         Ok(mut decision) => {
             let suspicious = raw.contains('|')
                 || decision.target.contains("\"target\"")
-                || decision.target.len() > 96;
+                || decision.target.len() > ROUTER_SUSPICIOUS_TARGET_MAX_LEN;
             if suspicious {
                 if let Some(from_pack) = parse_router_directive_pack(router_pack) {
                     decision = from_pack;
@@ -551,7 +585,9 @@ pub async fn request_strict_router_decision(
             Err(format!(
                 "strict router parse failed: {}. raw={}",
                 e,
-                raw.chars().take(220).collect::<String>()
+                raw.chars()
+                    .take(ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS)
+                    .collect::<String>()
             ))
         }
     }
@@ -607,7 +643,12 @@ pub(crate) async fn dispatch_specialist(
         "Target: {}\nRouter args: {}\nUser intent: {}",
         target, router_args, context_summary
     );
-    let conv_tail = build_conversation_tail(messages, 5, 200, 800);
+    let conv_tail = build_conversation_tail(
+        messages,
+        ROUTER_TAIL_MAX_PAIRS,
+        ROUTER_TAIL_MAX_MSG_CHARS,
+        ROUTER_TAIL_MAX_CHARS,
+    );
     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
         role_policy::build_context_pack(
             role_policy::Role::Specialist,
@@ -766,7 +807,11 @@ pub(crate) enum PreflightResult {
     name = "router_preflight",
     skip(ctx, health_registry),
     fields(
-        user_msg = %ctx.user_content.chars().take(80).collect::<String>(),
+        user_msg = %ctx
+            .user_content
+            .chars()
+            .take(ROUTER_USER_MSG_TRACE_PREVIEW_CHARS)
+            .collect::<String>(),
         routing_decision = tracing::field::Empty,
     )
 )]
@@ -835,7 +880,12 @@ pub(crate) async fn router_preflight(
     } else {
         ctx.tools.tool_names()
     };
-    let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
+    let conv_tail = build_conversation_tail(
+        &ctx.messages,
+        ROUTER_TAIL_MAX_PAIRS,
+        ROUTER_TAIL_MAX_MSG_CHARS,
+        ROUTER_TAIL_MAX_CHARS,
+    );
     let task_state = if conv_tail.is_empty() {
         format!("Strict preflight.\nUser message: {}", ctx.user_content)
     } else {
@@ -1115,7 +1165,12 @@ pub(crate) async fn route_tool_calls(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let conv_tail = build_conversation_tail(&ctx.messages, 5, 200, 800);
+        let conv_tail = build_conversation_tail(
+            &ctx.messages,
+            ROUTER_TAIL_MAX_PAIRS,
+            ROUTER_TAIL_MAX_MSG_CHARS,
+            ROUTER_TAIL_MAX_CHARS,
+        );
         let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
             role_policy::build_context_pack(
                 role_policy::Role::Router,
@@ -2164,4 +2219,3 @@ mod tests {
         assert!(!ctx.contains("truncated"));
     }
 }
-

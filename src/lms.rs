@@ -161,9 +161,56 @@ pub(crate) async fn load_model(
 ) -> Result<(), String> {
     // Check if already loaded
     let loaded = list_loaded(port).await;
-    if loaded.iter().any(|m| m == model || m.contains(model) || model.contains(m)) {
+    if should_skip_load(&loaded, model, context_length) {
         return Ok(());
     }
+
+    post_load_model(port, model, context_length).await
+}
+
+/// Reload a model with a specific context length.
+///
+/// Unlike `load_model`, this forces a reload when the model is already loaded,
+/// so context-size changes actually take effect.
+pub(crate) async fn reload_model_with_context(
+    port: u16,
+    model: &str,
+    context_length: usize,
+) -> Result<(), String> {
+    let loaded = list_loaded(port).await;
+    for loaded_model in loaded.iter().filter(|m| model_matches(m, model)) {
+        if let Err(e) = unload_model(port, loaded_model).await {
+            tracing::warn!(
+                "lms unload before reload failed: model={} loaded_model={} error={}",
+                model,
+                loaded_model,
+                e
+            );
+        }
+    }
+
+    post_load_model(port, model, Some(context_length)).await
+}
+
+fn model_matches(loaded: &str, model: &str) -> bool {
+    loaded == model || loaded.contains(model) || model.contains(loaded)
+}
+
+fn should_skip_load(loaded: &[String], model: &str, context_length: Option<usize>) -> bool {
+    // If caller requests a specific context length, we must NOT skip because
+    // context changes require an explicit reload.
+    if context_length.is_some() {
+        return false;
+    }
+
+    loaded.iter().any(|m| model_matches(m, model))
+}
+
+async fn post_load_model(
+    port: u16,
+    model: &str,
+    context_length: Option<usize>,
+) -> Result<(), String> {
 
     let url = format!("{}/api/v1/models/load", rest_base(port));
     let mut body = serde_json::json!({ "model": model });
@@ -427,6 +474,55 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
 mod tests {
     use super::*;
 
+    async fn fetch_loaded_context_length(port: u16, model: &str) -> Option<usize> {
+        let url = format!("{}/api/v1/models", rest_base(port));
+        let resp = reqwest::get(&url).await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        let models = json.get("models")?.as_array()?;
+        for m in models {
+            let key = m.get("key")?.as_str()?;
+            if !model_matches(key, model) {
+                continue;
+            }
+            let instances = m.get("loaded_instances")?.as_array()?;
+            if instances.is_empty() {
+                return None;
+            }
+            return instances
+                .iter()
+                .find_map(|inst| {
+                    inst.get("config")
+                        .and_then(|c| c.get("context_length"))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                });
+        }
+        None
+    }
+
+    async fn fetch_max_context_length(port: u16, model: &str) -> Option<usize> {
+        let url = format!("{}/api/v1/models", rest_base(port));
+        let resp = reqwest::get(&url).await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        let models = json.get("models")?.as_array()?;
+        for m in models {
+            let key = m.get("key")?.as_str()?;
+            if model_matches(key, model) {
+                return m
+                    .get("max_context_length")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+            }
+        }
+        None
+    }
+
     // -- is_model_available tests --
 
     #[test]
@@ -551,5 +647,84 @@ mod tests {
         assert_eq!(strip_match_suffixes("model-chat"), "model");
         assert_eq!(strip_match_suffixes("model-it"), "model");
         assert_eq!(strip_match_suffixes("plain-model"), "plain-model");
+    }
+
+    #[test]
+    fn test_should_skip_load_when_loaded_and_no_context_requested() {
+        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
+        assert!(should_skip_load(
+            &loaded,
+            "qwen2.5-coder-7b-instruct-mlx",
+            None
+        ));
+    }
+
+    #[test]
+    fn test_should_not_skip_load_when_context_requested() {
+        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
+        assert!(!should_skip_load(
+            &loaded,
+            "qwen2.5-coder-7b-instruct-mlx",
+            Some(6144)
+        ));
+    }
+
+    #[test]
+    fn test_model_matches_supports_fuzzy_key_matching() {
+        assert!(model_matches(
+            "qwen/qwen3-4b-thinking-2507",
+            "qwen3-4b-thinking-2507"
+        ));
+        assert!(model_matches(
+            "qwen3-4b-thinking-2507",
+            "qwen/qwen3-4b-thinking-2507"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running LM Studio server and loaded model"]
+    async fn test_reload_model_with_context_updates_loaded_instance_context_live() {
+        let port: u16 = std::env::var("NANOBOT_TEST_LMS_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1234);
+        let model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
+            .unwrap_or_else(|_| "qwen/qwen3-4b-thinking-2507".to_string());
+
+        let max_ctx = fetch_max_context_length(port, &model)
+            .await
+            .expect("model not found on LM Studio /api/v1/models");
+
+        let target_a = 4096.min(max_ctx).max(2048);
+        let target_b = 6144.min(max_ctx).max(2048);
+        let original = fetch_loaded_context_length(port, &model).await;
+
+        reload_model_with_context(port, &model, target_a)
+            .await
+            .expect("failed to reload model at target_a context");
+        let observed_a = fetch_loaded_context_length(port, &model)
+            .await
+            .expect("model not loaded after target_a reload");
+        assert_eq!(
+            observed_a, target_a,
+            "LM Studio loaded_instances context_length mismatch after first reload"
+        );
+
+        if target_b != target_a {
+            reload_model_with_context(port, &model, target_b)
+                .await
+                .expect("failed to reload model at target_b context");
+            let observed_b = fetch_loaded_context_length(port, &model)
+                .await
+                .expect("model not loaded after target_b reload");
+            assert_eq!(
+                observed_b, target_b,
+                "LM Studio loaded_instances context_length mismatch after second reload"
+            );
+        }
+
+        if let Some(orig_ctx) = original {
+            let _ = reload_model_with_context(port, &model, orig_ctx).await;
+        }
     }
 }

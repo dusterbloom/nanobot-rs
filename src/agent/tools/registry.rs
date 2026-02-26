@@ -42,7 +42,7 @@ impl ToolConfig {
             workspace: workspace.to_path_buf(),
             exec_timeout: 30,
             restrict_to_workspace: false,
-            max_tool_result_chars: 30_000,
+            max_tool_result_chars: crate::config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS,
             brave_api_key: None,
             read_only: false,
             tools_filter: None,
@@ -768,6 +768,15 @@ mod tests {
         let registry = ToolRegistry::default();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_tool_config_new_uses_global_default_max_tool_result_chars() {
+        let cfg = ToolConfig::new(std::path::Path::new("/tmp"));
+        assert_eq!(
+            cfg.max_tool_result_chars,
+            crate::config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS
+        );
     }
 
     #[test]

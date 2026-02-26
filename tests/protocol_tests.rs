@@ -237,7 +237,7 @@ fn make_multi_tool_turns() -> Vec<Turn> {
 
 #[test]
 fn local_renders_system_as_first_message() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     let turns = vec![Turn::User { content: "hi".into(), media: vec![] }];
     let wire = protocol.render("You are helpful.", &turns);
     assert_eq!(wire[0]["role"], "system");
@@ -246,7 +246,7 @@ fn local_renders_system_as_first_message() {
 
 #[test]
 fn local_renders_tool_result_as_user_message() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     let wire = protocol.render("sys", &make_tool_calling_turns());
     // Last non-appended message before possible continuation
     let tool_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "tool").collect();
@@ -261,7 +261,7 @@ fn local_renders_tool_result_as_user_message() {
 
 #[test]
 fn local_no_tool_role_in_any_message() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     let wire = protocol.render("sys", &make_multi_tool_turns());
     assert!(
         wire.iter().all(|m| m["role"] != "tool"),
@@ -271,7 +271,7 @@ fn local_no_tool_role_in_any_message() {
 
 #[test]
 fn local_always_ends_with_user() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     // Turns ending with assistant — local must append a continuation
     let turns = vec![
         Turn::User { content: "hi".into(), media: vec![] },
@@ -283,14 +283,14 @@ fn local_always_ends_with_user() {
 
 #[test]
 fn local_tool_calling_sequence_ends_with_user() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     let wire = protocol.render("sys", &make_tool_calling_turns());
     assert_eq!(wire.last().unwrap()["role"], "user");
 }
 
 #[test]
 fn local_no_mid_thread_system_messages() {
-    let protocol = LocalProtocol;
+    let protocol = LocalProtocol::default();
     // A System turn that's not the first — must become a user message
     let turns = vec![
         Turn::User { content: "hi".into(), media: vec![] },
@@ -309,9 +309,9 @@ fn local_no_mid_thread_system_messages() {
 }
 
 #[test]
-fn local_assistant_tool_calls_converted_to_text_summary() {
-    let protocol = LocalProtocol;
-    // Turn: assistant with tool_calls → must appear as assistant with text (no tool_calls field)
+fn local_assistant_preserves_tool_calls_for_lm_studio() {
+    let protocol = LocalProtocol::default();
+    // Turn: assistant with tool_calls → tool_calls field is preserved for LM Studio
     let turns = vec![
         Turn::User { content: "read file".into(), media: vec![] },
         Turn::Assistant {
@@ -328,15 +328,22 @@ fn local_assistant_tool_calls_converted_to_text_summary() {
     let assistant_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "assistant").collect();
     // At least one assistant message must exist
     assert!(!assistant_msgs.is_empty());
-    // None of them should have a tool_calls field
-    for msg in &assistant_msgs {
-        assert!(msg.get("tool_calls").is_none(), "local assistant messages must not have tool_calls");
-    }
-    // The assistant message should mention the tool name
-    let has_tool_mention = assistant_msgs
+    // LocalProtocol now PRESERVES tool_calls for native tool-calling support (LM Studio)
+    let has_tool_calls = assistant_msgs
         .iter()
-        .any(|m| m["content"].as_str().unwrap_or("").contains("read_file"));
-    assert!(has_tool_mention, "local assistant turn should include tool name reference");
+        .any(|m| m.get("tool_calls").is_some());
+    assert!(has_tool_calls, "local assistant should preserve tool_calls for LM Studio compatibility");
+    // Tool results are still converted to user messages
+    let tool_result_as_user = wire
+        .iter()
+        .any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("tool execution complete")
+        });
+    assert!(tool_result_as_user, "tool results should be converted to user messages");
 }
 
 // ---- CloudProtocol ----

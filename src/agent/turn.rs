@@ -87,6 +87,10 @@ pub enum Turn {
         /// Compaction level (1 = preserve_details, 2 = bullet_points, 3 = deterministic).
         level: u8,
     },
+
+    /// A clear marker appended by `/clear` command.
+    /// LCM rebuild ignores everything before the last clear marker.
+    Clear,
 }
 
 impl Turn {
@@ -103,6 +107,11 @@ impl Turn {
     /// Returns true if this is a summary turn (LCM compaction output).
     pub fn is_summary(&self) -> bool {
         matches!(self, Turn::Summary { .. })
+    }
+
+    /// Returns true if this is a clear marker (from `/clear` command).
+    pub fn is_clear(&self) -> bool {
+        matches!(self, Turn::Clear)
     }
 
     /// Returns the assistant text content, if any.
@@ -224,6 +233,10 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .map(|n| n as u8)
                 .unwrap_or(1);
             Some(Turn::Summary { text, source_ids, level })
+        }
+        "clear" => {
+            // Clear marker from /clear command.
+            Some(Turn::Clear)
         }
         _ => None,
     }

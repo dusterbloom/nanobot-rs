@@ -11,12 +11,17 @@ use tracing::{debug, info, instrument, warn};
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
 use crate::agent::context::ContextBuilder;
+use crate::agent::markers::{
+    TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_OUTPUT_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
+};
 use crate::agent::role_policy;
 use crate::agent::tool_runner::{self, Budget, ToolRunnerConfig};
 use crate::providers::base::{LLMResponse, ToolCallRequest};
 use std::sync::Arc;
 
 use super::agent_loop::TurnContext;
+
+const LARGE_TOOL_RESULT_TOKEN_THRESHOLD: usize = 500;
 
 /// Execute tool calls via the delegation (tool-runner) path.
 ///
@@ -261,11 +266,12 @@ pub(crate) async fn execute_tools_delegated(
 
         let injected = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
-            if full_tokens > 500 {
+            if full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD {
                 // Large data + good summary available: use the summary so compaction
                 // can never destroy the content by proportional truncation.
                 format!(
-                    "[Tool analysis summary]\n{}\n\n[Full output: {} chars, cached in context store]",
+                    "{}\n{}\n\n[Full output: {} chars, cached in context store]",
+                    TOOL_ANALYSIS_SUMMARY_PREFIX,
                     summary,
                     full_data.len()
                 )
@@ -273,7 +279,9 @@ pub(crate) async fn execute_tools_delegated(
                 // Small data — raw injection is safe; compaction won't truncate it.
                 ctx.content_gate.admit_simple(full_data).into_text()
             }
-        } else if ctx.core.specialist_provider.is_some() && full_tokens > 500 {
+        } else if ctx.core.specialist_provider.is_some()
+            && full_tokens > LARGE_TOOL_RESULT_TOKEN_THRESHOLD
+        {
             ctx.content_gate
                 .admit_with_specialist(
                     full_data,
@@ -325,9 +333,9 @@ pub(crate) async fn execute_tools_delegated(
         };
         if !summary_text.is_empty() {
             let prefix = if verbatim {
-                "[tool runner output]"
+                TOOL_RUNNER_OUTPUT_PREFIX
             } else {
-                "[tool runner summary]"
+                TOOL_RUNNER_SUMMARY_PREFIX
             };
             ctx.messages.push(json!({
                 "role": "user",
