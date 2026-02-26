@@ -58,6 +58,9 @@ impl AgentLoopShared {
             restrict_to_workspace: core.restrict_to_workspace,
             max_tool_result_chars: core.max_tool_result_chars,
             brave_api_key: core.brave_api_key.clone(),
+            exec_working_dir: std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string()),
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

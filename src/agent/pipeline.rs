@@ -257,12 +257,12 @@ async fn execute_step_with_tools(
         // Render messages through the correct protocol before LLM call.
         // Local models get strict user/assistant alternation; cloud models get
         // standard OpenAI function-calling format.
-        let protocol: &dyn crate::agent::protocol::ConversationProtocol = if is_local {
-            &crate::agent::protocol::LocalProtocol
+        let local_protocol = crate::agent::protocol::LocalProtocol::auto_for_model(model);
+        let wire_messages = if is_local {
+            crate::agent::protocol::render_to_wire(&local_protocol, &messages)
         } else {
-            &crate::agent::protocol::CloudProtocol
+            crate::agent::protocol::render_to_wire(&crate::agent::protocol::CloudProtocol, &messages)
         };
-        let wire_messages = crate::agent::protocol::render_to_wire(protocol, &messages);
 
         let response = match provider
             .chat(&wire_messages, tool_defs_opt, Some(model), 4096, 0.7, None, None)

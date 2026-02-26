@@ -276,6 +276,29 @@ impl AuditLog {
         use backon::BlockingRetryable;
 
         let lock_path = &self.lock_path;
+
+        // Stale lock detection: if the lock file is older than 5 seconds the
+        // process that held it has almost certainly crashed without running Drop.
+        // Remove it so the retry loop succeeds immediately instead of exhausting
+        // all 50 retries and logging a spurious warning.
+        const STALE_LOCK_SECS: u64 = 5;
+        if let Ok(meta) = fs::metadata(lock_path) {
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if age >= STALE_LOCK_SECS {
+                tracing::debug!(
+                    "Removing stale audit lock ({} s old): {}",
+                    age,
+                    lock_path.display()
+                );
+                let _ = fs::remove_file(lock_path);
+            }
+        }
+
         let result = (|| {
             fs::OpenOptions::new()
                 .write(true)

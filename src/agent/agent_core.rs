@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
+use tracing::debug;
 
 use crate::agent::agent_profiles;
 use crate::agent::compaction::ContextCompactor;
@@ -407,7 +408,16 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         (mem_provider, mem_model)
     };
 
-    let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+    // For local models, cap response reserve to 25% of context to avoid
+    // starving the message budget. With 4096 context and 2048 reserve,
+    // tool defs would leave only ~500 tokens for messages, triggering
+    // LCM compaction on the first prompt.
+    let effective_reserve = if is_local {
+        (max_tokens as usize).min(max_context_tokens / 4)
+    } else {
+        max_tokens as usize
+    };
+    let token_budget = TokenBudget::new(max_context_tokens, effective_reserve);
     let compaction_ctx_size = if memory_config.compaction_model_context_size > 0 {
         memory_config.compaction_model_context_size
     } else {
@@ -423,6 +433,11 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_config.compaction_threshold_tokens,
     )
     .with_max_merge_rounds(memory_config.compaction.max_merge_rounds);
+    debug!(
+        memory_model = %memory_model,
+        compaction_ctx_size = compaction_ctx_size,
+        "agent_core: compactor initialized"
+    );
     let learning = LearningStore::new(&workspace);
     let working_memory = WorkingMemoryStore::new(&workspace);
 

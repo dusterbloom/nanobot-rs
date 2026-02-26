@@ -267,8 +267,10 @@ fn default_max_concurrent_chats() -> usize {
     4
 }
 
+pub const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 10_000;
+
 fn default_max_tool_result_chars() -> usize {
-    10_000
+    DEFAULT_MAX_TOOL_RESULT_CHARS
 }
 
 fn default_lms_port() -> u16 {
@@ -1928,6 +1930,15 @@ mod tests {
         let json = r#"{}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.agents.defaults.local_max_context_tokens, 32768);
+    }
+
+    #[test]
+    fn test_max_tool_result_chars_default_constant() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.agents.defaults.max_tool_result_chars,
+            DEFAULT_MAX_TOOL_RESULT_CHARS
+        );
     }
 
     // -- ModelEndpoint + TrioConfig endpoint tests --

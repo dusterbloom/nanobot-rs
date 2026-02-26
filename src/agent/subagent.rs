@@ -858,7 +858,7 @@ impl SubagentManager {
 
         // Select conversation protocol based on whether we're talking to a local model.
         let protocol: std::sync::Arc<dyn crate::agent::protocol::ConversationProtocol> = if is_local {
-            std::sync::Arc::new(crate::agent::protocol::LocalProtocol)
+            std::sync::Arc::new(crate::agent::protocol::LocalProtocol::auto_for_model(&config.model))
         } else {
             std::sync::Arc::new(crate::agent::protocol::CloudProtocol)
         };

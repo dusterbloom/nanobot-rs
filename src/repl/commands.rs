@@ -813,8 +813,8 @@ impl ReplContext {
             .get_context(&self.session_id, 1)
             .is_empty();
         core.working_memory.clear(&self.session_id);
-        // Also clear conversation history so the next turn starts fresh.
         core.sessions.clear_history(&self.session_id).await;
+        self.agent_loop.clear_lcm_engine(&self.session_id).await;
         if had_content {
             println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
         } else {
@@ -1424,7 +1424,7 @@ impl ReplContext {
             if !model_name.is_empty() {
                 print!("  Reloading {} with {}K context... ", model_name, new_ctx / 1024);
                 io::stdout().flush().ok();
-                match crate::lms::load_model(lms_port, &model_name, Some(new_ctx)).await {
+                match crate::lms::reload_model_with_context(lms_port, &model_name, new_ctx).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
@@ -1562,6 +1562,108 @@ impl ReplContext {
 
             println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
             return;
+        }
+
+        // Remote local server (e.g. external LM Studio): try the API first.
+        if !self.config.agents.defaults.local_api_base.is_empty() {
+            let lms_port = self.config.agents.defaults.local_api_base
+                .split(':')
+                .last()
+                .and_then(|p| p.split('/').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(18080);
+            let available = crate::lms::list_available(lms_port).await;
+            let llm_models: Vec<&String> = available
+                .iter()
+                .filter(|m| !m.to_lowercase().contains("embedding"))
+                .collect();
+            if !llm_models.is_empty() {
+                let loaded = crate::lms::list_loaded(lms_port).await;
+                let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                    &self.config.agents.defaults.lms_main_model
+                } else {
+                    &self.config.agents.defaults.local_model
+                };
+
+                println!("\nModels (via {}):", self.config.agents.defaults.local_api_base);
+                for (i, name) in llm_models.iter().enumerate() {
+                    let is_loaded = loaded.iter().any(|l| l.contains(name.as_str()) || name.contains(l.as_str()));
+                    let is_active = crate::lms::is_model_available(std::slice::from_ref(*name), current_model);
+                    let marker = if is_active {
+                        " (active)"
+                    } else if is_loaded {
+                        " (loaded)"
+                    } else {
+                        ""
+                    };
+                    println!("  [{}] {}{}", i + 1, name, marker);
+                }
+
+                let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", llm_models.len());
+                let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
+                    Ok(line) => line,
+                    Err(_) => return,
+                };
+                let choice = choice.trim();
+                if choice.is_empty() {
+                    return;
+                }
+                let idx: usize = match choice.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= llm_models.len() => n - 1,
+                    _ => {
+                        println!("Invalid selection.\n");
+                        return;
+                    }
+                };
+
+                let selected = llm_models[idx].clone();
+                println!("\nSelected: {}", selected);
+
+                // For remote server, load the model via API
+                let prev_model = &self.config.agents.defaults.lms_main_model;
+                if !prev_model.is_empty() && prev_model != &selected {
+                    print!("  Unloading {}... ", prev_model);
+                    io::stdout().flush().ok();
+                    match crate::lms::unload_model(lms_port, prev_model).await {
+                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                        Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
+                    }
+                }
+
+                let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                print!("  Loading {}... ", selected);
+                io::stdout().flush().ok();
+                match crate::lms::load_model(lms_port, &selected, ctx).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                }
+
+                self.config.agents.defaults.local_model = selected.clone();
+                self.config.agents.defaults.lms_main_model = selected.clone();
+                self.current_model_path = PathBuf::from(&selected);
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_model = selected.clone();
+                disk_cfg.agents.defaults.lms_main_model = selected;
+                save_config(&disk_cfg, None);
+
+                self.apply_and_rebuild();
+
+                if self.config.trio.enabled {
+                    let budget = self.compute_current_vram_budget();
+                    if !budget.fits {
+                        println!(
+                            "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
+                            budget.total_vram_bytes as f64 / 1e9,
+                            budget.effective_limit_bytes as f64 / 1e9,
+                        );
+                        println!("  Use /trio budget for details.");
+                    }
+                }
+
+                println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
+                return;
+            }
+            // API returned no models — fall through to filesystem scan
         }
 
         // Fallback: scan ~/models/*.gguf (llama-server or no engine)

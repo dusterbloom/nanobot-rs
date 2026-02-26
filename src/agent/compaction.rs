@@ -991,10 +991,13 @@ impl ContextCompactor {
     }
 }
 
-/// Strip `<thinking>...</thinking>` blocks from model output.
+/// Strip leaked reasoning/template markers from model output.
 ///
-/// Small models (Qwen3-0.6B, 1.7B) sometimes leak chain-of-thought tags
-/// into their output. This prevents garbage from leaking into summaries.
+/// Small local models sometimes emit internal tags such as:
+/// - `<thinking>...</thinking>`
+/// - Qwen chat template tokens (`<|im_start|>`, `<|im_end|>`)
+///
+/// This helper removes those artifacts from both summaries and normal replies.
 pub fn strip_thinking_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
@@ -1008,7 +1011,29 @@ pub fn strip_thinking_tags(text: &str) -> String {
         }
     }
     result.push_str(remaining);
-    result.trim().to_string()
+
+    // Remove leaked chat-template markers used by some local models.
+    let mut cleaned = result;
+    for marker in [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|assistant|>",
+        "<|user|>",
+        "<|system|>",
+        "<|endoftext|>",
+    ] {
+        cleaned = cleaned.replace(marker, "");
+    }
+
+    // Normalise leftover whitespace after marker removal.
+    let cleaned = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    cleaned.trim().to_string()
 }
 
 fn format_message_for_transcript(msg: &Value) -> String {
@@ -1259,6 +1284,20 @@ mod tests {
         let result = compactor.compact(&messages, &budget, 500).await;
         assert_eq!(result.messages.len(), 2);
         assert!(result.observation.is_none());
+    }
+
+    #[test]
+    fn test_strip_thinking_tags_removes_qwen_template_tokens() {
+        let input = "<|im_start|><|im_start|>Need to answer\n<|im_end|>";
+        let out = strip_thinking_tags(input);
+        assert_eq!(out, "Need to answer");
+    }
+
+    #[test]
+    fn test_strip_thinking_tags_removes_thinking_block_and_markers() {
+        let input = "before <thinking>hidden</thinking> after <|assistant|>";
+        let out = strip_thinking_tags(input);
+        assert_eq!(out, "before  after");
     }
 
     #[tokio::test]

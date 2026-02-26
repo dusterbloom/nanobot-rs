@@ -1,7 +1,7 @@
 //! File system tools: read, write, edit, list.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -47,7 +47,7 @@ impl Tool for ReadFileTool {
             None => return "Error: 'path' parameter is required".to_string(),
         };
 
-        let file_path = expand_path(path);
+        let file_path = resolve_read_path(path);
 
         if !file_path.exists() {
             return format!("Error: File not found: {}. Hint: verify the path exists. Use list_dir to browse the directory.", path);
@@ -423,16 +423,54 @@ fn expand_path(path: &str) -> PathBuf {
         if p.is_absolute() {
             p
         } else {
-            // Resolve relative paths against the workspace directory.
+            // Resolve relative paths against the shell working directory first
+            // (matches exec/pwd behavior), then fall back to workspace for
+            // memory/bootstrap convenience.
+            let cwd = std::env::current_dir().ok();
             let workspace = crate::utils::helpers::get_workspace_path(None);
-            let resolved = workspace.join(&p);
-            if resolved.exists() {
-                resolved
-            } else {
-                p // fall back to CWD-relative (original behavior)
+            resolve_relative_path(&p, cwd.as_deref(), &workspace)
+        }
+    }
+}
+
+fn resolve_read_path(path: &str) -> PathBuf {
+    let expanded = expand_path(path);
+    if expanded.exists() {
+        return expanded;
+    }
+
+    // SLMs sometimes hallucinate an absolute path under ~/.nanobot/workspace
+    // even when CWD is a repository root. If that exact workspace-prefixed path
+    // does not exist, map the relative tail onto CWD for read-only resolution.
+    if expanded.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let workspace = crate::utils::helpers::get_workspace_path(None);
+            if let Ok(rel) = expanded.strip_prefix(&workspace) {
+                let cwd_candidate = cwd.join(rel);
+                if cwd_candidate.exists() {
+                    return cwd_candidate;
+                }
             }
         }
     }
+
+    expanded
+}
+
+fn resolve_relative_path(relative: &Path, cwd: Option<&Path>, workspace: &Path) -> PathBuf {
+    if let Some(cwd_path) = cwd {
+        let cwd_resolved = cwd_path.join(relative);
+        if cwd_resolved.exists() {
+            return cwd_resolved;
+        }
+    }
+
+    let workspace_resolved = workspace.join(relative);
+    if workspace_resolved.exists() {
+        return workspace_resolved;
+    }
+
+    relative.to_path_buf()
 }
 
 #[cfg(test)]
@@ -455,6 +493,53 @@ mod tests {
     fn test_expand_path_relative() {
         let result = expand_path("foo/bar.txt");
         assert_eq!(result, PathBuf::from("foo/bar.txt"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_prefers_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(cwd.join("note.txt"), "from-cwd").unwrap();
+        std::fs::write(ws.join("note.txt"), "from-workspace").unwrap();
+
+        let out = resolve_relative_path(Path::new("note.txt"), Some(&cwd), &ws);
+        assert_eq!(out, cwd.join("note.txt"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_falls_back_to_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("cwd");
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.txt"), "from-workspace").unwrap();
+
+        let out = resolve_relative_path(Path::new("note.txt"), Some(&cwd), &ws);
+        assert_eq!(out, ws.join("note.txt"));
+    }
+
+    #[test]
+    fn test_resolve_read_path_maps_missing_workspace_prefixed_file_to_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let name = "__unit_workspace_alias_resolution__.md";
+        std::fs::write(cwd.join(name), "repo-arch").unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let input = crate::utils::helpers::get_workspace_path(None).join(name);
+        let out = resolve_read_path(input.to_str().unwrap());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        let out_canon = std::fs::canonicalize(out).unwrap();
+        let expected_canon = std::fs::canonicalize(cwd.join(name)).unwrap();
+        assert_eq!(out_canon, expected_canon);
     }
 
     #[test]
