@@ -1444,7 +1444,7 @@ impl Default for LcmSchemaConfig {
 // ---------------------------------------------------------------------------
 
 fn default_cluster_scan_ports() -> Vec<u16> {
-    vec![52415, 1234, 8080]
+    vec![52415, 1234, 8080, 1337]
 }
 
 fn default_cluster_scan_interval() -> u64 {

@@ -13,6 +13,8 @@ pub enum PeerType {
     LMStudio,
     /// llama.cpp server.
     LlamaCpp,
+    /// JAN local inference server.
+    Jan,
     /// Unknown OpenAI-compatible server.
     Unknown,
 }
@@ -23,6 +25,7 @@ impl std::fmt::Display for PeerType {
             PeerType::Exo => write!(f, "exo"),
             PeerType::LMStudio => write!(f, "lmstudio"),
             PeerType::LlamaCpp => write!(f, "llamacpp"),
+            PeerType::Jan => write!(f, "jan"),
             PeerType::Unknown => write!(f, "unknown"),
         }
     }

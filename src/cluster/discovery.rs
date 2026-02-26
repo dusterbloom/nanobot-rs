@@ -80,17 +80,39 @@ impl ClusterDiscovery {
 
         // 1. Manually-configured endpoints — probe immediately so they are
         //    available before the (potentially slow) subnet scan runs.
+        //    If an endpoint has no explicit port, expand it across all scan_ports.
         let manual: Vec<String> = self
             .config
             .endpoints
             .iter()
-            .map(|ep| ep.trim_end_matches('/').to_string())
+            .flat_map(|ep| {
+                let ep = ep.trim_end_matches('/').to_string();
+                if extract_port(&ep).is_some() {
+                    vec![ep]
+                } else {
+                    self.config.scan_ports.iter()
+                        .map(|p| format!("{}:{}", ep, p))
+                        .collect()
+                }
+            })
             .collect();
 
         if !manual.is_empty() {
             tracing::debug!(count = manual.len(), "cluster_discovery_probing_manual_endpoints");
             self.probe_all(manual.clone()).await;
             probed.extend(manual);
+        }
+
+        // Probe localhost on all scan ports (local servers are excluded from subnet scan).
+        let localhost_endpoints: Vec<String> = self.config.scan_ports
+            .iter()
+            .map(|p| format!("http://127.0.0.1:{}", p))
+            .filter(|ep| !probed.contains(ep))
+            .collect();
+        if !localhost_endpoints.is_empty() {
+            tracing::debug!(count = localhost_endpoints.len(), "cluster_discovery_probing_localhost");
+            self.probe_all(localhost_endpoints.clone()).await;
+            probed.extend(localhost_endpoints);
         }
 
         if self.config.auto_discover {
@@ -411,6 +433,7 @@ pub fn detect_peer_type(
             52415 => return PeerType::Exo,
             1234 => return PeerType::LMStudio,
             8080 => return PeerType::LlamaCpp,
+            1337 => return PeerType::Jan,
             _ => {}
         }
     }
@@ -421,6 +444,9 @@ pub fn detect_peer_type(
     }
     if server_header.contains("llama") || server_header.contains("llama.cpp") {
         return PeerType::LlamaCpp;
+    }
+    if server_header.contains("jan") {
+        return PeerType::Jan;
     }
 
     // Model ID patterns: Exo uses shard notation like "llama-3-8b-4bit-q4_k_m".
@@ -781,6 +807,22 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_peer_type_jan_port() {
+        assert_eq!(
+            detect_peer_type(Some(1337), "", &[]),
+            PeerType::Jan
+        );
+    }
+
+    #[test]
+    fn test_detect_peer_type_jan_header() {
+        assert_eq!(
+            detect_peer_type(None, "jan/0.5.3", &[]),
+            PeerType::Jan
+        );
+    }
+
+    #[test]
     fn test_detect_peer_type_unknown() {
         assert_eq!(detect_peer_type(Some(9999), "nginx", &[]), PeerType::Unknown);
     }
@@ -1077,13 +1119,14 @@ eth0\t00000000\tC01AA8C0\t0003\n";
 
     #[tokio::test]
     async fn test_discover_once_no_auto_discover_no_endpoints() {
-        // With auto_discover=false and no endpoints, discover_once should
-        // complete without error and leave state empty.
+        // With auto_discover=false and no endpoints, discover_once probes
+        // localhost on scan_ports (which fail) and leaves state empty.
+        // Use unlikely ports to avoid hitting real local servers.
         let config = crate::config::schema::ClusterConfig {
             enabled: true,
             auto_discover: false,
             endpoints: vec![],
-            scan_ports: vec![52415, 1234],
+            scan_ports: vec![59999, 59998],
             scan_interval_secs: 60,
             prefer_cluster: true,
         };
@@ -1091,5 +1134,66 @@ eth0\t00000000\tC01AA8C0\t0003\n";
         let discovery = ClusterDiscovery::new(config, state.clone());
         discovery.discover_once().await;
         assert_eq!(state.peer_count().await, 0);
+    }
+
+    #[test]
+    fn test_manual_endpoint_without_port_expands_to_scan_ports() {
+        // When a manual endpoint has no port, it should be expanded
+        // across all scan_ports during discovery.
+        let config = crate::config::schema::ClusterConfig {
+            enabled: true,
+            auto_discover: false,
+            endpoints: vec!["http://192.168.1.22".to_string()],
+            scan_ports: vec![1234, 1337, 8080],
+            scan_interval_secs: 60,
+            prefer_cluster: true,
+        };
+        // Verify the expansion logic directly.
+        let expanded: Vec<String> = config
+            .endpoints
+            .iter()
+            .flat_map(|ep| {
+                let ep = ep.trim_end_matches('/').to_string();
+                if extract_port(&ep).is_some() {
+                    vec![ep]
+                } else {
+                    config.scan_ports.iter()
+                        .map(|p| format!("{}:{}", ep, p))
+                        .collect()
+                }
+            })
+            .collect();
+        assert_eq!(expanded, vec![
+            "http://192.168.1.22:1234",
+            "http://192.168.1.22:1337",
+            "http://192.168.1.22:8080",
+        ]);
+    }
+
+    #[test]
+    fn test_manual_endpoint_with_port_not_expanded() {
+        let config = crate::config::schema::ClusterConfig {
+            enabled: true,
+            auto_discover: false,
+            endpoints: vec!["http://192.168.1.22:5000".to_string()],
+            scan_ports: vec![1234, 1337],
+            scan_interval_secs: 60,
+            prefer_cluster: true,
+        };
+        let expanded: Vec<String> = config
+            .endpoints
+            .iter()
+            .flat_map(|ep| {
+                let ep = ep.trim_end_matches('/').to_string();
+                if extract_port(&ep).is_some() {
+                    vec![ep]
+                } else {
+                    config.scan_ports.iter()
+                        .map(|p| format!("{}:{}", ep, p))
+                        .collect()
+                }
+            })
+            .collect();
+        assert_eq!(expanded, vec!["http://192.168.1.22:5000"]);
     }
 }
