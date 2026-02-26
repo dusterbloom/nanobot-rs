@@ -375,11 +375,10 @@ impl AgentLoopShared {
             .get("detected_language")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let user_content = if core.main_no_think {
-            format!(" /no_think\n{}", msg.content)
-        } else {
-            msg.content.clone()
-        };
+        // /no_think is handled at the provider level (system prompt via native
+        // LMS API for Nemotron) — never inject it into user content where the
+        // model treats it as literal text and leaks it into tool arguments.
+        let user_content = msg.content.clone();
         let mut messages = core.context.build_messages(
             &history,
             &user_content,

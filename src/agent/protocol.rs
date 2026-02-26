@@ -125,7 +125,8 @@ impl ConversationProtocol for CloudProtocol {
 /// Invariants enforced:
 /// - No `role:tool` — tool results become user messages.
 /// - No `role:system` after index 0 — mid-thread system turns become user messages.
-/// - Assistant `tool_calls` are converted to a text summary `"(used tools: name1, name2)"`.
+/// - Assistant `tool_calls` are converted to a text summary with arguments so the model
+///   can verify results match: `"[I called: name(args)]"`.
 /// - Consecutive same-role messages are merged.
 /// - Output always ends with `role:user`.
 pub struct LocalProtocol;
@@ -147,13 +148,22 @@ impl ConversationProtocol for LocalProtocol {
                     json!({"role": "user", "content": content})
                 }
                 Turn::Assistant { text, tool_calls } => {
-                    // Convert tool_calls to a compact text summary; no tool_calls field.
+                    // Convert tool_calls to a text summary with arguments so the
+                    // model can verify that the subsequent tool results match what
+                    // was called.  Without arguments, small models re-call tools
+                    // because they cannot confirm the result is authoritative.
                     let tool_summary = if tool_calls.is_empty() {
                         String::new()
                     } else {
-                        let names: Vec<&str> =
-                            tool_calls.iter().map(|tc| tc.tool.as_str()).collect();
-                        format!("(used tools: {})", names.join(", "))
+                        let calls: Vec<String> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                let args_str = serde_json::to_string(&tc.args)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                format!("{}({})", tc.tool, args_str)
+                            })
+                            .collect();
+                        format!("[I called: {}]", calls.join(", "))
                     };
                     let content = match text.as_deref() {
                         Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
@@ -168,7 +178,7 @@ impl ConversationProtocol for LocalProtocol {
                 Turn::ToolResult { tool, call_id, result, .. } => {
                     json!({
                         "role": "user",
-                        "content": format!("[Tool result from {} ({})]: {}", tool, call_id, result),
+                        "content": format!("[System: tool execution complete — {}({}) returned]:\n{}", tool, call_id, result),
                     })
                 }
                 Turn::Summary { text, .. } => {
