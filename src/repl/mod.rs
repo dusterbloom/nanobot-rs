@@ -285,7 +285,7 @@ pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) ->
 pub(crate) fn print_help() {
     println!("\nCommands:");
     println!("  /local, /l      - Toggle between local and cloud mode");
-    println!("  /model, /m      - Select local model from ~/models/");
+    println!("  /model, /m [q]  - Pick model from all sources (LMS, cluster, ~/models/)");
     println!("  /trio           - Toggle trio mode (router + specialist)");
     println!("  /trio budget    - Show VRAM budget breakdown");
     println!("  /trio cap <GB>  - Set VRAM cap (e.g. /trio cap 12)");

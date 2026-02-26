@@ -62,6 +62,41 @@ pub(crate) struct ReplContext {
 }
 
 // ============================================================================
+// Unified model picker types
+// ============================================================================
+
+/// Where a model comes from in the unified picker.
+#[derive(Debug, Clone)]
+enum ModelSource {
+    /// Local LM Studio managed instance.
+    LocalLms { port: u16 },
+    /// Remote server (cluster peer or manual `local_api_base`).
+    Remote {
+        endpoint: String,
+        #[cfg(feature = "cluster")]
+        peer_type: crate::cluster::state::PeerType,
+        #[cfg(not(feature = "cluster"))]
+        #[allow(dead_code)]
+        peer_type: (),
+    },
+    /// Filesystem GGUF file.
+    File { path: PathBuf },
+}
+
+/// A model entry from any source, used by the unified model picker.
+#[derive(Debug, Clone)]
+struct ModelEntry {
+    /// Model identifier (name or path stem).
+    id: String,
+    /// Where it comes from.
+    source: ModelSource,
+    /// Currently selected model.
+    is_active: bool,
+    /// Currently loaded in memory (LMS only).
+    is_loaded: bool,
+}
+
+// ============================================================================
 // DRY helpers — replace 3–10x copy-paste patterns
 // ============================================================================
 
@@ -244,6 +279,125 @@ impl ReplContext {
         );
         self.rebuild_agent_loop();
     }
+
+    /// Extract port from an endpoint URL like "http://192.168.1.50:1234/v1".
+    fn extract_endpoint_port(endpoint: &str) -> Option<u16> {
+        endpoint
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.split('/').next())
+            .and_then(|p| p.parse::<u16>().ok())
+    }
+
+    /// Check if the current `local_api_base` points at a remote LM Studio peer.
+    #[cfg(feature = "cluster")]
+    async fn is_remote_lms_peer(&self) -> bool {
+        use crate::cluster::state::PeerType;
+        let base = &self.config.agents.defaults.local_api_base;
+        if base.is_empty() {
+            return false;
+        }
+        // Check cluster state for known peer type
+        if let Some(ref cs) = self.cluster_state {
+            let peers = cs.get_all_peers().await;
+            for peer in &peers {
+                if peer.endpoint == *base && peer.peer_type == PeerType::LMStudio {
+                    return true;
+                }
+            }
+        }
+        // Fallback: port 1234 is conventionally LM Studio
+        Self::extract_endpoint_port(base) == Some(1234)
+    }
+
+    /// Aggregate models from all available sources into a unified list.
+    async fn collect_all_models(&self) -> Vec<ModelEntry> {
+        let mut entries = Vec::new();
+        let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
+            self.config.agents.defaults.lms_main_model.clone()
+        } else {
+            self.config.agents.defaults.local_model.clone()
+        };
+        let current_base = &self.config.agents.defaults.local_api_base;
+
+        // 1. Local LMS (if lms_managed)
+        let mut covered_endpoint: Option<String> = None;
+        if self.srv.lms_managed {
+            let lms_port = self.config.agents.defaults.lms_port;
+            let available = crate::lms::list_available(lms_port).await;
+            let loaded = crate::lms::list_loaded(lms_port).await;
+            covered_endpoint = Some(format!("http://localhost:{}/v1", lms_port));
+            for name in &available {
+                if name.to_lowercase().contains("embedding") {
+                    continue;
+                }
+                let is_loaded = loaded.iter().any(|l| {
+                    l.contains(name.as_str()) || name.contains(l.as_str())
+                });
+                let is_active = crate::lms::is_model_available(
+                    std::slice::from_ref(name),
+                    &current_model,
+                );
+                entries.push(ModelEntry {
+                    id: name.clone(),
+                    source: ModelSource::LocalLms { port: lms_port },
+                    is_active,
+                    is_loaded,
+                });
+            }
+        }
+
+        // 2. Cluster peers (if cluster feature and state exists)
+        #[cfg(feature = "cluster")]
+        if let Some(ref cs) = self.cluster_state {
+            let peers = cs.get_healthy_peers().await;
+            for peer in &peers {
+                // Skip if this peer's endpoint was already covered by local LMS
+                if let Some(ref covered) = covered_endpoint {
+                    if peer.endpoint == *covered {
+                        continue;
+                    }
+                }
+                // Skip if endpoint matches current local_api_base AND we already
+                // added models from it via the remote-server branch in step 1
+                for model in &peer.models {
+                    let is_active = peer.endpoint == *current_base
+                        && crate::lms::is_model_available(
+                            &[model.id.clone()],
+                            &current_model,
+                        );
+                    entries.push(ModelEntry {
+                        id: model.id.clone(),
+                        source: ModelSource::Remote {
+                            endpoint: peer.endpoint.clone(),
+                            peer_type: peer.peer_type.clone(),
+                        },
+                        is_active,
+                        is_loaded: false,
+                    });
+                }
+            }
+        }
+
+        // 3. Filesystem GGUF fallback (only if no LMS and no cluster models)
+        if !self.srv.lms_managed && entries.is_empty() {
+            let models = crate::server::list_local_models();
+            for path in &models {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                let is_active = *path == self.current_model_path;
+                entries.push(ModelEntry {
+                    id: name,
+                    source: ModelSource::File { path: path.clone() },
+                    is_active,
+                    is_loaded: false,
+                });
+            }
+        }
+
+        entries
+    }
 }
 
 // ============================================================================
@@ -336,7 +490,7 @@ impl ReplContext {
                 self.cmd_ctx(arg).await;
             }
             "/model" => {
-                self.cmd_model().await;
+                self.cmd_model(arg).await;
             }
             "/local" => {
                 self.cmd_local().await;
@@ -1436,6 +1590,34 @@ impl ReplContext {
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
             }
+        } else if !self.config.agents.defaults.local_api_base.is_empty() {
+            // Remote LMS peer: reload model with new context on that server
+            #[cfg(feature = "cluster")]
+            let is_lms = self.is_remote_lms_peer().await;
+            #[cfg(not(feature = "cluster"))]
+            let is_lms = Self::extract_endpoint_port(
+                &self.config.agents.defaults.local_api_base,
+            ) == Some(1234);
+
+            if is_lms {
+                if let Some(port) = Self::extract_endpoint_port(
+                    &self.config.agents.defaults.local_api_base,
+                ) {
+                    let model_name = if !self.config.agents.defaults.lms_main_model.is_empty() {
+                        self.config.agents.defaults.lms_main_model.clone()
+                    } else {
+                        self.config.agents.defaults.local_model.clone()
+                    };
+                    if !model_name.is_empty() {
+                        print!("  Reloading {} with {}K context on remote LMS... ", model_name, new_ctx / 1024);
+                        io::stdout().flush().ok();
+                        match crate::lms::reload_model_with_context(port, &model_name, new_ctx).await {
+                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    }
+                }
+            }
         }
 
         // Warn if VRAM budget exceeded
@@ -1460,294 +1642,192 @@ impl ReplContext {
         );
     }
 
-    /// /model — select local model from ~/models/.
-    async fn cmd_model(&mut self) {
+    /// /model [filter] — unified model picker across all sources.
+    async fn cmd_model(&mut self, filter: &str) {
         if !self.core_handle.swappable().is_local {
             println!("\n  /model is only available in local mode. Use /local to switch.\n");
             return;
         }
 
-        // LMS-managed: list from LM Studio's downloaded models via HTTP API
-        if self.srv.lms_managed {
-            let lms_port = self.config.agents.defaults.lms_port;
-            let available = crate::lms::list_available(lms_port).await;
-            // Filter out embedding models (they contain "embedding" in the name)
-            let llm_models: Vec<&String> = available
-                .iter()
-                .filter(|m| !m.to_lowercase().contains("embedding"))
-                .collect();
-            if llm_models.is_empty() {
-                println!("\nNo models found in LM Studio.\n");
-                return;
-            }
+        let all = self.collect_all_models().await;
+        let filter_lower = filter.trim().to_lowercase();
+        let entries: Vec<&ModelEntry> = if filter_lower.is_empty() {
+            all.iter().collect()
+        } else {
+            all.iter()
+                .filter(|e| e.id.to_lowercase().contains(&filter_lower))
+                .collect()
+        };
 
-            let loaded = crate::lms::list_loaded(lms_port).await;
-            let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
-                &self.config.agents.defaults.lms_main_model
+        if entries.is_empty() {
+            if filter_lower.is_empty() {
+                println!("\n  No models found.\n");
             } else {
-                &self.config.agents.defaults.local_model
-            };
-
-            println!("\nLM Studio models:");
-            for (i, name) in llm_models.iter().enumerate() {
-                let is_loaded = loaded.iter().any(|l| l.contains(name.as_str()) || name.contains(l.as_str()));
-                let is_active = crate::lms::is_model_available(std::slice::from_ref(*name), current_model);
-                let marker = if is_active {
-                    " (active)"
-                } else if is_loaded {
-                    " (loaded)"
-                } else {
-                    ""
-                };
-                println!("  [{}] {}{}", i + 1, name, marker);
+                println!("\n  No models matching \"{}\".\n", filter);
             }
-
-            let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", llm_models.len());
-            let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
-                Ok(line) => line,
-                Err(_) => return,
-            };
-            let choice = choice.trim();
-            if choice.is_empty() {
-                return;
-            }
-            let idx: usize = match choice.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= llm_models.len() => n - 1,
-                _ => {
-                    println!("Invalid selection.\n");
-                    return;
-                }
-            };
-
-            let selected = llm_models[idx].clone();
-            println!("\nSelected: {}", selected);
-
-            // Unload the previous main model to free VRAM
-            let prev_model = &self.config.agents.defaults.lms_main_model;
-            if !prev_model.is_empty() && prev_model != &selected {
-                print!("  Unloading {}... ", prev_model);
-                io::stdout().flush().ok();
-                match crate::lms::unload_model(lms_port, prev_model).await {
-                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                    Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
-                }
-            }
-
-            // Load the model in LMS with context length
-            let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-            print!("  Loading {}... ", selected);
-            io::stdout().flush().ok();
-            match crate::lms::load_model(lms_port, &selected, ctx).await {
-                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-            }
-
-            // Persist selection and update current_model_path so rebuild_core
-            // sends the correct model identifier to LM Studio.
-            self.config.agents.defaults.local_model = selected.clone();
-            self.config.agents.defaults.lms_main_model = selected.clone();
-            self.current_model_path = PathBuf::from(&selected);
-            let mut disk_cfg = load_config(None);
-            disk_cfg.agents.defaults.local_model = selected.clone();
-            disk_cfg.agents.defaults.lms_main_model = selected;
-            save_config(&disk_cfg, None);
-
-            self.apply_and_rebuild();
-
-            // Warn if VRAM budget exceeded after model change
-            if self.config.trio.enabled {
-                let budget = self.compute_current_vram_budget();
-                if !budget.fits {
-                    println!(
-                        "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
-                        budget.total_vram_bytes as f64 / 1e9,
-                        budget.effective_limit_bytes as f64 / 1e9,
-                    );
-                    println!("  Use /trio budget for details.");
-                }
-            }
-
-            println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
             return;
         }
 
-        // Remote local server (e.g. external LM Studio): try the API first.
-        if !self.config.agents.defaults.local_api_base.is_empty() {
-            let lms_port = self.config.agents.defaults.local_api_base
-                .split(':')
-                .last()
-                .and_then(|p| p.split('/').next())
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(18080);
-            let available = crate::lms::list_available(lms_port).await;
-            let llm_models: Vec<&String> = available
-                .iter()
-                .filter(|m| !m.to_lowercase().contains("embedding"))
-                .collect();
-            if !llm_models.is_empty() {
-                let loaded = crate::lms::list_loaded(lms_port).await;
-                let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
-                    &self.config.agents.defaults.lms_main_model
-                } else {
-                    &self.config.agents.defaults.local_model
-                };
-
-                println!("\nModels (via {}):", self.config.agents.defaults.local_api_base);
-                for (i, name) in llm_models.iter().enumerate() {
-                    let is_loaded = loaded.iter().any(|l| l.contains(name.as_str()) || name.contains(l.as_str()));
-                    let is_active = crate::lms::is_model_available(std::slice::from_ref(*name), current_model);
-                    let marker = if is_active {
-                        " (active)"
-                    } else if is_loaded {
-                        " (loaded)"
-                    } else {
-                        ""
-                    };
-                    println!("  [{}] {}{}", i + 1, name, marker);
+        // Group entries by source label for display
+        println!();
+        let mut current_group = String::new();
+        for (i, entry) in entries.iter().enumerate() {
+            let group = match &entry.source {
+                ModelSource::LocalLms { port } => {
+                    format!("Local (LM Studio :{})", port)
                 }
-
-                let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", llm_models.len());
-                let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
-                    Ok(line) => line,
-                    Err(_) => return,
-                };
-                let choice = choice.trim();
-                if choice.is_empty() {
-                    return;
+                ModelSource::Remote { endpoint, peer_type } => {
+                    let short = endpoint
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split('/')
+                        .next()
+                        .unwrap_or(endpoint);
+                    #[cfg(feature = "cluster")]
+                    { format!("{} ({})", short, peer_type) }
+                    #[cfg(not(feature = "cluster"))]
+                    { let _ = peer_type; format!("{}", short) }
                 }
-                let idx: usize = match choice.parse::<usize>() {
-                    Ok(n) if n >= 1 && n <= llm_models.len() => n - 1,
-                    _ => {
-                        println!("Invalid selection.\n");
-                        return;
-                    }
-                };
-
-                let selected = llm_models[idx].clone();
-                println!("\nSelected: {}", selected);
-
-                // For remote server, load the model via API
-                let prev_model = &self.config.agents.defaults.lms_main_model;
-                if !prev_model.is_empty() && prev_model != &selected {
-                    print!("  Unloading {}... ", prev_model);
-                    io::stdout().flush().ok();
-                    match crate::lms::unload_model(lms_port, prev_model).await {
-                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                        Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
-                    }
-                }
-
-                let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
-                print!("  Loading {}... ", selected);
-                io::stdout().flush().ok();
-                match crate::lms::load_model(lms_port, &selected, ctx).await {
-                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                }
-
-                self.config.agents.defaults.local_model = selected.clone();
-                self.config.agents.defaults.lms_main_model = selected.clone();
-                self.current_model_path = PathBuf::from(&selected);
-                let mut disk_cfg = load_config(None);
-                disk_cfg.agents.defaults.local_model = selected.clone();
-                disk_cfg.agents.defaults.lms_main_model = selected;
-                save_config(&disk_cfg, None);
-
-                self.apply_and_rebuild();
-
-                if self.config.trio.enabled {
-                    let budget = self.compute_current_vram_budget();
-                    if !budget.fits {
-                        println!(
-                            "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
-                            budget.total_vram_bytes as f64 / 1e9,
-                            budget.effective_limit_bytes as f64 / 1e9,
-                        );
-                        println!("  Use /trio budget for details.");
-                    }
-                }
-
-                println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
-                return;
-            }
-            // API returned no models — fall through to filesystem scan
-        }
-
-        // Fallback: scan ~/models/*.gguf (llama-server or no engine)
-        let models = server::list_local_models();
-        if models.is_empty() {
-            println!("\nNo .gguf models found in ~/models/\n");
-            return;
-        }
-
-        println!("\nAvailable models:");
-        for (i, path) in models.iter().enumerate() {
-            let name = path.file_name().unwrap().to_string_lossy();
-            let size_mb = std::fs::metadata(path)
-                .map(|m| m.len() / 1_048_576)
-                .unwrap_or(0);
-            let marker = if *path == self.current_model_path {
-                " (active)"
-            } else {
-                ""
+                ModelSource::File { .. } => "~/models/".to_string(),
             };
-            println!("  [{}] {} ({} MB){}", i + 1, name, size_mb, marker);
+            if group != current_group {
+                if !current_group.is_empty() {
+                    println!();
+                }
+                println!("  {}{}{}:", tui::DIM, group, tui::RESET);
+                current_group = group;
+            }
+            let marker = if entry.is_active {
+                format!(" {}(active){}", tui::GREEN, tui::RESET)
+            } else if entry.is_loaded {
+                format!(" {}(loaded){}", tui::DIM, tui::RESET)
+            } else {
+                String::new()
+            };
+            // For file entries, show size
+            if let ModelSource::File { ref path } = entry.source {
+                let size_mb = std::fs::metadata(path)
+                    .map(|m| m.len() / 1_048_576)
+                    .unwrap_or(0);
+                println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
+            } else {
+                println!("    [{}] {}{}", i + 1, entry.id, marker);
+            }
         }
-        let model_prompt = format!("Select model [1-{}] or Enter to cancel: ", models.len());
-        let choice = match self.rl.as_mut().unwrap().readline(&model_prompt) {
+
+        // Prompt for selection
+        let prompt = format!("\nSelect model [1-{}] or Enter to cancel: ", entries.len());
+        let choice = match self.rl.as_mut().unwrap().readline(&prompt) {
             Ok(line) => line,
-            Err(_) => {
-                return;
-            }
+            Err(_) => return,
         };
         let choice = choice.trim();
         if choice.is_empty() {
             return;
         }
         let idx: usize = match choice.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= models.len() => n - 1,
+            Ok(n) if n >= 1 && n <= entries.len() => n - 1,
             _ => {
-                println!("Invalid selection.\n");
+                println!("  Invalid selection.\n");
                 return;
             }
         };
 
-        let selected = &models[idx];
-        self.current_model_path = selected.clone();
-        let name = selected.file_name().unwrap().to_string_lossy();
-        println!("\nSelected: {}", name);
+        let selected = entries[idx].clone();
+        println!("\n  Selected: {}", selected.id);
 
-        // Persist the selection to config (load fresh to avoid clobbering
-        // fields changed externally, e.g. localApiBase).
-        self.config.agents.defaults.local_model = name.to_string();
-        let mut disk_cfg = load_config(None);
-        disk_cfg.agents.defaults.local_model = name.to_string();
-        save_config(&disk_cfg, None);
-
-        // If local mode is active, apply the new model.
-        if self.core_handle.swappable().is_local {
-            self.apply_and_rebuild();
-
-            // Warn if VRAM budget exceeded after model change
-            if self.config.trio.enabled {
-                let budget = self.compute_current_vram_budget();
-                if !budget.fits {
-                    println!(
-                        "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
-                        budget.total_vram_bytes as f64 / 1e9,
-                        budget.effective_limit_bytes as f64 / 1e9,
-                    );
-                    println!("  Use /trio budget for details.");
+        // Dispatch based on source
+        match selected.source {
+            ModelSource::LocalLms { port } => {
+                // Unload previous model to free VRAM
+                let prev_model = self.config.agents.defaults.lms_main_model.clone();
+                if !prev_model.is_empty() && prev_model != selected.id {
+                    print!("  Unloading {}... ", prev_model);
+                    io::stdout().flush().ok();
+                    match crate::lms::unload_model(port, &prev_model).await {
+                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                        Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
+                    }
                 }
+                // Load model with context
+                let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                print!("  Loading {}... ", selected.id);
+                io::stdout().flush().ok();
+                match crate::lms::load_model(port, &selected.id, ctx).await {
+                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                }
+                // Persist
+                self.config.agents.defaults.local_model = selected.id.clone();
+                self.config.agents.defaults.lms_main_model = selected.id.clone();
+                self.current_model_path = PathBuf::from(&selected.id);
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_model = selected.id.clone();
+                disk_cfg.agents.defaults.lms_main_model = selected.id;
+                save_config(&disk_cfg, None);
+                self.apply_and_rebuild();
             }
+            ModelSource::Remote { ref endpoint, ref peer_type } => {
+                // Determine if this is an LM Studio peer that supports load/unload
+                #[cfg(feature = "cluster")]
+                let is_lms = *peer_type == crate::cluster::state::PeerType::LMStudio;
+                #[cfg(not(feature = "cluster"))]
+                let is_lms = false;
 
-            println!(
-                "  {}Model switched — server will load on next request.{}",
-                tui::DIM, tui::RESET
-            );
-        } else {
-            println!("Model will be used next time you toggle /local on.\n");
+                if is_lms {
+                    // LM Studio remote peer: do unload/load like local LMS
+                    if let Some(port) = Self::extract_endpoint_port(endpoint) {
+                        let prev_model = self.config.agents.defaults.lms_main_model.clone();
+                        if !prev_model.is_empty() && prev_model != selected.id {
+                            print!("  Unloading {}... ", prev_model);
+                            io::stdout().flush().ok();
+                            match crate::lms::unload_model(port, &prev_model).await {
+                                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                                Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
+                            }
+                        }
+                        let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
+                        print!("  Loading {}... ", selected.id);
+                        io::stdout().flush().ok();
+                        match crate::lms::load_model(port, &selected.id, ctx).await {
+                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
+                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
+                        }
+                    }
+                }
+                // Set endpoint + model (same as /cl use logic)
+                self.config.agents.defaults.local_api_base = endpoint.clone();
+                self.config.agents.defaults.lms_main_model = selected.id.clone();
+                self.config.agents.defaults.local_model = selected.id.clone();
+                self.current_model_path = PathBuf::from(&selected.id);
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
+            }
+            ModelSource::File { ref path } => {
+                self.current_model_path = path.clone();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                self.config.agents.defaults.local_model = name.clone();
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_model = name;
+                save_config(&disk_cfg, None);
+                self.apply_and_rebuild();
+            }
         }
+
+        // Warn if VRAM budget exceeded after model change
+        if self.config.trio.enabled {
+            let budget = self.compute_current_vram_budget();
+            if !budget.fits {
+                println!(
+                    "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
+                    budget.total_vram_bytes as f64 / 1e9,
+                    budget.effective_limit_bytes as f64 / 1e9,
+                );
+                println!("  Use /trio budget for details.");
+            }
+        }
+
+        println!("  {}Model switched.{}\n", tui::DIM, tui::RESET);
     }
 
     /// /trio — manage trio mode (router + specialist helpers).
