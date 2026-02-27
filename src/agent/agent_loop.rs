@@ -2054,6 +2054,12 @@ impl AgentLoop {
             core.restrict_to_workspace,
             core.is_local,
             core.max_tool_result_chars,
+        )
+        .with_search_config(
+            core.search_provider.clone(),
+            core.searxng_url.clone(),
+            core.search_max_results,
+            core.jina_api_key.clone(),
         );
         if let Some(pc) = providers_config {
             subagent_mgr = subagent_mgr.with_providers_config(pc);
@@ -2655,6 +2661,36 @@ impl AgentLoop {
 // requires owned `Box<dyn Tool>`), we create thin proxy wrappers that
 // implement `Tool` by delegating to the inner `Arc`.
 
+
+/// Proactive recall: search the knowledge store for context relevant to the user's message.
+/// Returns a formatted string of relevant snippets, or None if nothing useful was found.
+/// Silently returns None on any error (knowledge store missing, etc.).
+fn proactive_recall(user_message: &str) -> Option<String> {
+    // Skip very short messages (greetings, single words).
+    if user_message.len() < 15 {
+        return None;
+    }
+
+    let store = crate::agent::knowledge_store::KnowledgeStore::open_default().ok()?;
+    let hits = store.hybrid_search(user_message, 3).ok()?;
+
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    for hit in &hits {
+        // Truncate long snippets.
+        let snippet: String = if hit.snippet.len() > 300 {
+            hit.snippet.chars().take(300).collect::<String>() + "..."
+        } else {
+            hit.snippet.clone()
+        };
+        output.push_str(&format!("**{}** (chunk {}): {}\n", hit.source_name, hit.chunk_idx, snippet));
+    }
+
+    Some(output.trim_end().to_string())
+}
 
 // ============================================================================
 // Heuristic helpers

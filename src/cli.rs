@@ -712,6 +712,11 @@ pub(crate) fn build_core_handle(
     } else {
         Some(config.tools.web.search.api_key.clone())
     };
+    let jina_key = if config.tools.web.search.jina_api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.jina_api_key.clone())
+    };
 
     let max_iters = effective_max_iterations(
         config.agents.defaults.max_tool_iterations,
@@ -729,6 +734,10 @@ pub(crate) fn build_core_handle(
         temperature: config.agents.defaults.temperature,
         max_context_tokens,
         brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        jina_api_key: jina_key,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
         memory_config: config.memory.clone(),
@@ -785,6 +794,11 @@ pub(crate) fn rebuild_core(
     } else {
         Some(config.tools.web.search.api_key.clone())
     };
+    let jina_key = if config.tools.web.search.jina_api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.jina_api_key.clone())
+    };
 
     let max_iters = effective_max_iterations(
         config.agents.defaults.max_tool_iterations,
@@ -802,6 +816,10 @@ pub(crate) fn rebuild_core(
         temperature: config.agents.defaults.temperature,
         max_context_tokens,
         brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        jina_api_key: jina_key,
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
         memory_config: config.memory.clone(),

@@ -1,0 +1,18 @@
+# Minimal SearXNG setup for nanobot web search.
+# Usage: docker compose up -d
+# SearXNG will be available at http://localhost:8888
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nanobot-searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888
+    restart: unless-stopped
+
+volumes:
+  searxng-data:

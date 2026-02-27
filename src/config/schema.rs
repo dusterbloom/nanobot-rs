@@ -579,6 +579,9 @@ pub struct WebSearchConfig {
     pub provider: String,
     #[serde(default = "default_searxng_url")]
     pub searxng_url: String,
+    /// Jina AI API key for zero-config web search fallback.
+    #[serde(default)]
+    pub jina_api_key: String,
 }
 
 fn default_max_results() -> u32 {
@@ -600,6 +603,7 @@ impl Default for WebSearchConfig {
             max_results: default_max_results(),
             provider: default_search_provider(),
             searxng_url: default_searxng_url(),
+            jina_api_key: String::new(),
         }
     }
 }

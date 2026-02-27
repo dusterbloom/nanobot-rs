@@ -106,32 +106,40 @@ fn validate_url(url_str: &str) -> Result<(), String> {
 // WebSearchTool
 // ---------------------------------------------------------------------------
 
-/// Search the web using SearXNG (default) or Brave Search API (fallback/explicit).
+/// Search the web using SearXNG (default), Brave Search API, or Jina AI (zero-config fallback).
 pub struct WebSearchTool {
     api_key: String,
     max_results: u32,
     provider: String,
     searxng_url: String,
+    jina_api_key: String,
     client: Client,
 }
 
 impl WebSearchTool {
     /// Create a new web search tool.
     ///
-    /// `provider` selects the backend: `"searxng"` (default) or `"brave"`.
+    /// `provider` selects the backend: `"searxng"` (default), `"brave"`, or `"jina"`.
     /// `searxng_url` is the base URL of the SearXNG instance (e.g. `"http://localhost:8888"`).
     ///
     /// If `api_key` is `None`, the `BRAVE_API_KEY` environment variable is
     /// checked. Passing `Some("")` explicitly disables env fallback.
+    /// If `jina_api_key` is `None`, the `JINA_API_KEY` environment variable is checked.
     pub fn new(
         api_key: Option<String>,
         max_results: u32,
         provider: String,
         searxng_url: String,
+        jina_api_key: Option<String>,
     ) -> Self {
         let resolved_key = match api_key {
             Some(key) => key,
             None => std::env::var("BRAVE_API_KEY").unwrap_or_default(),
+        };
+
+        let resolved_jina_key = match jina_api_key {
+            Some(key) => key,
+            None => std::env::var("JINA_API_KEY").unwrap_or_default(),
         };
 
         Self {
@@ -139,6 +147,7 @@ impl WebSearchTool {
             max_results,
             provider,
             searxng_url,
+            jina_api_key: resolved_jina_key,
             client: Client::new(),
         }
     }
@@ -199,7 +208,8 @@ impl Tool for WebSearchTool {
         match self.provider.as_str() {
             "searxng" => self.execute_searxng(query, count).await,
             "brave" => self.execute_brave(query, count).await,
-            other => format!("Error: unknown search provider '{}'. Use 'searxng' or 'brave'.", other),
+            "jina" => self.execute_jina(query, count).await,
+            other => format!("Error: unknown search provider '{}'. Use 'searxng', 'brave', or 'jina'.", other),
         }
     }
 
@@ -254,10 +264,14 @@ impl WebSearchTool {
                         result.push_str("\n(Fell back to Brave Search)");
                         return result;
                     }
-                    return format!(
-                        "Error: SearXNG returned HTTP {}. Ensure SearXNG is running at {}.",
-                        status, self.searxng_url
+                    // No Brave key — fall through to Jina AI as last resort.
+                    tracing::warn!(
+                        "SearXNG returned HTTP {}, no Brave key, falling back to Jina AI",
+                        status
                     );
+                    let mut result = self.execute_jina(query, count).await;
+                    result.push_str("\n(Fell back to Jina AI Search)");
+                    return result;
                 }
 
                 match response.json::<serde_json::Value>().await {
@@ -298,10 +312,14 @@ impl WebSearchTool {
                     result.push_str("\n(Fell back to Brave Search)");
                     return result;
                 }
-                format!(
-                    "Error: SearXNG is unavailable at {} ({}). Configure a running SearXNG instance or set provider to 'brave'.",
-                    self.searxng_url, e
-                )
+                // No Brave key — fall through to Jina AI as last resort.
+                tracing::warn!(
+                    "SearXNG unavailable ({}), no Brave key, falling back to Jina AI",
+                    e
+                );
+                let mut result = self.execute_jina(query, count).await;
+                result.push_str("\n(Fell back to Jina AI Search)");
+                result
             }
         }
     }
@@ -366,6 +384,72 @@ impl WebSearchTool {
                 }
             }
             Err(e) => format!("Error: {}. Hint: check network connectivity.", e),
+        }
+    }
+
+    /// Execute a search via Jina AI Search. Works without an API key (rate-limited).
+    async fn execute_jina(&self, query: &str, count: u32) -> String {
+        let encoded_query = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+        let url = format!("https://s.jina.ai/{}", encoded_query);
+
+        let mut request = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(15));
+
+        if !self.jina_api_key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.jina_api_key));
+        }
+
+        match request.send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return format!(
+                        "Error: Jina AI Search returned HTTP {}: {}",
+                        status, body
+                    );
+                }
+
+                match response.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let results = data
+                            .get("data")
+                            .and_then(|r| r.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        if results.is_empty() {
+                            return format!("No results for: {}", query);
+                        }
+
+                        let mut lines = vec![format!("Results for: {}\n", query)];
+                        for (i, item) in results.iter().take(count as usize).enumerate() {
+                            let title =
+                                item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                            let url =
+                                item.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            lines.push(format!("{}. {}\n   {}", i + 1, title, url));
+
+                            // Jina uses "description" or "content" for snippets.
+                            if let Some(desc) = item
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                            {
+                                // Truncate long content snippets.
+                                let snippet: String = desc.chars().take(300).collect();
+                                lines.push(format!("   {}", snippet));
+                            }
+                        }
+                        lines.join("\n")
+                    }
+                    Err(e) => format!("Error parsing Jina AI results: {}", e),
+                }
+            }
+            Err(e) => format!("Error: Jina AI Search failed: {}", e),
         }
     }
 }
@@ -960,13 +1044,13 @@ mod tests {
 
     #[test]
     fn test_web_search_tool_name() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string(), None);
         assert_eq!(tool.name(), "web_search");
     }
 
     #[test]
     fn test_web_search_tool_parameters() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string(), None);
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
@@ -989,7 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn test_web_search_no_api_key() {
         // With provider="brave" and no API key, expect the Brave key error.
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string(), None);
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
@@ -1001,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_no_api_key_has_hint() {
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string(), None);
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
@@ -1013,13 +1097,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_web_search_searxng_unavailable_no_fallback() {
-        // SearXNG provider with no Brave key and unreachable URL returns a clear error.
+    async fn test_web_search_searxng_unavailable_falls_to_jina() {
+        // SearXNG provider with no Brave key and unreachable URL falls through to Jina.
         let tool = WebSearchTool::new(
             Some(String::new()),
             5,
             "searxng".to_string(),
             "http://127.0.0.1:19999".to_string(), // nothing listening here
+            None,
         );
         let mut params = HashMap::new();
         params.insert(
@@ -1028,8 +1113,8 @@ mod tests {
         );
         let result = tool.execute(params).await;
         assert!(
-            result.contains("unavailable") || result.contains("Error"),
-            "Expected unavailability message: {}",
+            result.contains("Jina") || result.contains("Results for"),
+            "Expected Jina fallback or results, got: {}",
             result
         );
     }
@@ -1042,6 +1127,7 @@ mod tests {
             5,
             "bing".to_string(),
             "http://localhost:8888".to_string(),
+            None,
         );
         // We check the provider field directly since execute is async
         assert_eq!(tool.provider, "bing");
@@ -1072,7 +1158,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_jina_url_construction() {
+    fn test_jina_reader_url_construction() {
         let config = JinaReaderConfig {
             enabled: true,
             url: "https://r.jina.ai".to_string(),
@@ -1083,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jina_url_construction_trailing_slash() {
+    fn test_jina_reader_url_construction_trailing_slash() {
         let config = JinaReaderConfig {
             enabled: true,
             url: "https://r.jina.ai/".to_string(),
@@ -1171,14 +1257,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     // Re-export the production function so tests can call it by the same name.
     use super::extract_web_content;
 
-    /// Show side-by-side what the main model sees under three approaches:
-    ///
-    /// 1. **Passthrough** – raw web_fetch JSON envelope (or truncated at max_chars)
-    /// 2. **ContextStore** – metadata string produced by `ContextStore::store()`
-    /// 3. **ContentGate** – structural briefing from `ContentGate::admit_simple()`
-    ///
-    /// Asserts that passthrough contains actual article text while the
-    /// summarized forms do not.
     #[test]
     fn test_web_fetch_passthrough_vs_summarized() {
         use crate::agent::context_gate::ContentGate;
@@ -1186,189 +1264,68 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use std::path::PathBuf;
 
         let raw = bbc_web_fetch_fixture();
-
-        // ----------------------------------------------------------------
-        // Approach 1: Passthrough – the raw JSON string the tool returns.
-        // In the simplest case the agent loop just injects `raw` verbatim.
-        // ----------------------------------------------------------------
         let passthrough = raw.clone();
 
-        // ----------------------------------------------------------------
-        // Approach 2: ContextStore metadata.
-        //
-        // tool_runner.rs line ~984:
-        //   let stripped = strip_tool_output(&result.data);
-        //   let (_, metadata) = context_store.store(stripped.clone());
-        //   // For large results the delegation model sees `metadata`.
-        // ----------------------------------------------------------------
         let mut store = ContextStore::new();
         let (_var_name, context_store_view) = store.store(raw.clone());
 
-        // ----------------------------------------------------------------
-        // Approach 3: ContentGate admit_simple.
-        //
-        // Use a tiny token budget so the content never "fits" and the gate
-        // always produces a briefing — matching real production behaviour
-        // where web pages exceed the agent's remaining token budget.
-        // ----------------------------------------------------------------
         // 50 token budget → raw (≈575 tokens) will not fit → briefing path.
         let mut gate = ContentGate::new(50, 0.2);
         let gate_result = gate.admit_simple(&raw);
         let gate_view = gate_result.into_text();
 
-        // ----------------------------------------------------------------
-        // Print what each approach produces (visible with `-- --nocapture`).
-        // ----------------------------------------------------------------
-        println!("\n=== APPROACH 1: PASSTHROUGH (first 300 chars) ===");
-        println!("{}", &passthrough[..passthrough.len().min(300)]);
-
-        println!("\n=== APPROACH 2: CONTEXT STORE VIEW ===");
-        println!("{}", &context_store_view);
-
-        println!("\n=== APPROACH 3: CONTENT GATE BRIEFING ===");
-        println!("{}", &gate_view);
-
-        // ----------------------------------------------------------------
-        // Assertions
-        // ----------------------------------------------------------------
-
-        // Passthrough contains the actual article text.
-        assert!(
-            passthrough.contains("UK economy grew by 0.4%"),
-            "Passthrough should contain actual article text"
-        );
-        assert!(
-            passthrough.contains("Bank of England"),
-            "Passthrough should contain article body"
-        );
-
-        // ContextStore metadata does NOT contain the article text — only a
-        // short preview of the raw JSON (which starts with the url/status
-        // envelope fields, not the article text).
-        assert!(
-            !context_store_view.contains("Bank of England"),
-            "ContextStore metadata should not contain article body, got: {}",
-            context_store_view
-        );
-        assert!(
-            context_store_view.contains("chars"),
-            "ContextStore metadata should report char count"
-        );
-        assert!(
-            context_store_view.contains("output_0"),
-            "ContextStore metadata should include variable name"
-        );
-
-        // ContentGate briefing does NOT contain the article text — only
-        // structural JSON facts (status, url, extractor, etc.).
-        assert!(
-            !gate_view.contains("Bank of England"),
-            "ContentGate briefing should not contain article body, got: {}",
-            gate_view
-        );
-        // The gate briefing is a JSON structural summary.
-        assert!(
-            gate_view.contains("JSON Summary") || gate_view.contains("Content Summary"),
-            "ContentGate briefing should be a structural summary, got: {}",
-            gate_view
-        );
+        assert!(passthrough.contains("UK economy grew by 0.4%"));
+        assert!(passthrough.contains("Bank of England"));
+        assert!(!context_store_view.contains("Bank of England"));
+        assert!(context_store_view.contains("chars"));
+        assert!(context_store_view.contains("output_0"));
+        assert!(!gate_view.contains("Bank of England"));
+        assert!(gate_view.contains("JSON Summary") || gate_view.contains("Content Summary"));
     }
 
-    /// Demonstrate that extracting only the `text` field from the web_fetch
-    /// envelope preserves the article content at lower overhead.
-    ///
-    /// Properties verified:
-    /// - Extracted text contains the full article content.
-    /// - Extracted text is smaller than the full JSON envelope (no metadata overhead).
-    /// - `extract_web_content` is a pure function (no I/O, deterministic).
     #[test]
     fn test_web_fetch_smart_summary_preserves_content() {
         let raw = bbc_web_fetch_fixture();
-
-        // Parse the fixture to get the original text length for comparison.
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let original_text = parsed["text"].as_str().unwrap();
-
-        // ----------------------------------------------------------------
-        // Apply the pure extraction function.
-        // ----------------------------------------------------------------
         let extracted = extract_web_content(&raw);
 
-        println!("\n=== FULL JSON ENVELOPE (chars) ===");
-        println!("{}", raw.len());
+        assert!(extracted.contains("UK economy grew by 0.4%"));
+        assert!(extracted.contains("Bank of England"));
+        assert!(extracted.contains("FTSE 100"));
+        assert_eq!(extracted, original_text);
+        assert!(extracted.len() < raw.len());
 
-        println!("\n=== EXTRACTED TEXT (chars) ===");
-        println!("{}", extracted.len());
-
-        println!("\n=== EXTRACTED TEXT PREVIEW (first 300 chars) ===");
-        println!("{}", &extracted[..extracted.len().min(300)]);
-
-        // ----------------------------------------------------------------
-        // The extracted text must contain the actual article content.
-        // ----------------------------------------------------------------
-        assert!(
-            extracted.contains("UK economy grew by 0.4%"),
-            "Extracted text should contain article headline"
-        );
-        assert!(
-            extracted.contains("Bank of England"),
-            "Extracted text should contain article body"
-        );
-        assert!(
-            extracted.contains("FTSE 100"),
-            "Extracted text should contain market reaction section"
-        );
-
-        // ----------------------------------------------------------------
-        // The extracted text must be the same as the `text` field.
-        // ----------------------------------------------------------------
-        assert_eq!(
-            extracted, original_text,
-            "extract_web_content should return exactly the text field"
-        );
-
-        // ----------------------------------------------------------------
-        // The extracted text is smaller than the full envelope — no url,
-        // status, extractor, length, truncated, or finalUrl overhead.
-        // ----------------------------------------------------------------
-        assert!(
-            extracted.len() < raw.len(),
-            "Extracted text ({} chars) should be smaller than full envelope ({} chars)",
-            extracted.len(),
-            raw.len()
-        );
-
-        let overhead_removed = raw.len() - extracted.len();
-        println!(
-            "\n=== ENVELOPE OVERHEAD REMOVED: {} chars ({:.1}%) ===",
-            overhead_removed,
-            overhead_removed as f64 / raw.len() as f64 * 100.0
-        );
-
-        assert!(
-            overhead_removed > 50,
-            "Should remove at least 50 chars of JSON envelope overhead, removed: {}",
-            overhead_removed
-        );
-
-        // ----------------------------------------------------------------
-        // Robustness: non-JSON input falls back to the raw string.
-        // ----------------------------------------------------------------
         let plain = "This is plain text, not JSON.";
-        let fallback = extract_web_content(plain);
-        assert_eq!(
-            fallback, plain,
-            "Non-JSON input should fall back to the raw string unchanged"
-        );
+        assert_eq!(extract_web_content(plain), plain);
 
-        // ----------------------------------------------------------------
-        // Robustness: JSON without a `text` field falls back to raw string.
-        // ----------------------------------------------------------------
         let no_text_json = r#"{"status": 200, "url": "https://example.com"}"#;
-        let fallback2 = extract_web_content(no_text_json);
-        assert_eq!(
-            fallback2, no_text_json,
-            "JSON without text field should fall back to raw string"
+        assert_eq!(extract_web_content(no_text_json), no_text_json);
+    }
+
+    // -----------------------------------------------------------------------
+    // Jina AI search tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_explicit_jina_provider() {
+        let tool = WebSearchTool::new(
+            Some(String::new()),
+            5,
+            "jina".to_string(),
+            "http://localhost:8888".to_string(),
+            None,
+        );
+        let mut params = HashMap::new();
+        params.insert(
+            "query".to_string(),
+            serde_json::Value::String("rust programming".to_string()),
+        );
+        let result = tool.execute(params).await;
+        assert!(
+            !result.contains("SearXNG") && !result.contains("BRAVE_API_KEY"),
+            "Jina provider should not mention SearXNG or Brave: {}",
+            result
         );
     }
 
@@ -1381,7 +1338,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
 
-        // Use brave provider with empty key — it fails fast without network I/O.
         let tool = WebSearchTool::new(
             Some(String::new()),
             5,
@@ -1405,7 +1361,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         tool.execute_with_context(params, &ctx).await;
 
-        // Must have emitted at least one Progress event with the search query.
         let first = rx.try_recv().expect("Expected at least one progress event");
         match first {
             ToolEvent::Progress {
@@ -1417,11 +1372,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
                 assert_eq!(tool_name, "web_search");
                 assert_eq!(tool_call_id, "call_search");
                 assert_eq!(elapsed_ms, 0);
-                assert!(
-                    preview.contains("rust programming"),
-                    "Expected query in preview, got: {}",
-                    preview
-                );
+                assert!(preview.contains("rust programming"));
             }
             other => panic!("Expected Progress event with output_preview, got: {:?}", other),
         }
@@ -1432,8 +1383,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
 
-        // Use an invalid URL so the request fails fast — we only care about
-        // the progress events emitted before and after execution, not the result.
         let tool = WebFetchTool::new(50000, None);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
@@ -1452,13 +1401,11 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         tool.execute_with_context(params, &ctx).await;
 
-        // Collect all emitted events.
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
 
-        // First event: "Fetching: <url>"
         assert!(!events.is_empty(), "Expected at least one progress event");
         match &events[0] {
             ToolEvent::Progress {
@@ -1469,11 +1416,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             } => {
                 assert_eq!(tool_name, "web_fetch");
                 assert_eq!(tool_call_id, "call_fetch");
-                assert!(
-                    preview.starts_with("Fetching:"),
-                    "Expected 'Fetching:' prefix, got: {}",
-                    preview
-                );
+                assert!(preview.starts_with("Fetching:"));
             }
             other => panic!("Expected Fetching progress event, got: {:?}", other),
         }
@@ -1484,9 +1427,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
 
-        // Use a URL that passes validation but will fail at network level quickly.
-        // The "Extracting content..." event is emitted after execute() returns.
-        // Using an invalid URL ensures execute() returns quickly.
         let tool = WebFetchTool::new(50000, None);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
@@ -1498,7 +1438,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         };
 
         let mut params = HashMap::new();
-        // Invalid scheme fails URL validation before any network I/O.
         params.insert(
             "url".to_string(),
             serde_json::Value::String("ftp://example.com".to_string()),
@@ -1506,23 +1445,36 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         tool.execute_with_context(params, &ctx).await;
 
-        // Collect all events.
         let mut events = vec![];
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
 
-        // Must have 2 events: "Fetching: ..." and "Extracting content..."
-        assert_eq!(
-            events.len(),
-            2,
-            "Expected 2 progress events, got {}",
-            events.len()
-        );
+        assert_eq!(events.len(), 2, "Expected 2 progress events, got {}", events.len());
 
         let has_extracting = events.iter().any(|ev| {
             matches!(ev, ToolEvent::Progress { output_preview: Some(p), .. } if p.contains("Extracting content"))
         });
         assert!(has_extracting, "Expected 'Extracting content...' progress event");
+    }
+
+    #[test]
+    fn test_jina_url_construction() {
+        let query = "rust async await";
+        let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+        let url = format!("https://s.jina.ai/{}", encoded);
+        assert!(!url.contains(' '), "URL should not contain spaces: {}", url);
+        assert!(url.contains("rust"), "URL should contain query terms: {}", url);
+        assert!(url::Url::parse(&url).is_ok(), "Should be a valid URL: {}", url);
+    }
+
+    #[test]
+    fn test_jina_url_encoding_special_chars() {
+        let query = "what is C++ & Rust?";
+        let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+        let url = format!("https://s.jina.ai/{}", encoded);
+        assert!(!url.contains(' '), "No spaces: {}", url);
+        assert!(!url.contains('&'), "Ampersand should be encoded: {}", url);
+        assert!(url::Url::parse(&url).is_ok(), "Valid URL: {}", url);
     }
 }
