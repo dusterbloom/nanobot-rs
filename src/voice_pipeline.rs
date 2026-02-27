@@ -10,6 +10,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::config::schema::TtsEngineConfig;
 use crate::voice::{detect_language, split_tts_sentences};
 use jack_voice::{
     models::{self, ModelProgressCallback},
@@ -23,24 +24,38 @@ use tracing::{debug, info};
 /// held across `spawn_blocking` boundaries. Wrapped in `Arc` so they can
 /// be moved into the blocking closure.
 ///
-/// Holds two TTS engines: Pocket (fast English) and Kokoro (multilingual).
-/// Each synthesis call is routed to the appropriate engine based on the
-/// detected language of the text.
+/// Holds TTS engines based on configuration:
+/// - Pocket (fast English-only, CPU inference)
+/// - Kokoro (multilingual, CPU inference)
+/// - Qwen/QwenLarge (multilingual with voice cloning, requires GPU)
 pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
-    /// Pocket TTS engine (fast, English-only). `None` if init failed.
+    /// Pocket TTS engine (fast, English-only). `None` if not configured or init failed.
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
-    /// Kokoro TTS engine (multilingual). `None` if init failed.
+    /// Kokoro TTS engine (multilingual). `None` if not configured or init failed.
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
+    /// Qwen TTS engine (multilingual with GPU). `None` if not configured or init failed.
+    tts_qwen: Option<Arc<Mutex<TextToSpeech>>>,
+    /// Selected TTS engine config.
+    engine_config: TtsEngineConfig,
+    /// Qwen voice name (for Qwen/QwenLarge engines).
+    qwen_voice: String,
 }
 
 impl VoicePipeline {
-    /// Create a new voice pipeline, downloading models if needed.
+    /// Create a new voice pipeline with default engines (Pocket + Kokoro).
     ///
     /// Initializes both Pocket (English) and Kokoro (multilingual) TTS
     /// engines. If one fails, the other is used as fallback.
     pub async fn new() -> Result<Self, String> {
-        info!("Initializing voice pipeline for channels...");
+        Self::with_engine(TtsEngineConfig::Pocket).await
+    }
+
+    /// Create a voice pipeline with a specific TTS engine.
+    ///
+    /// This allows selecting Qwen/QwenLarge engines which require GPU.
+    pub async fn with_engine(engine: TtsEngineConfig) -> Result<Self, String> {
+        info!("Initializing voice pipeline for channels ({:?})...", engine);
 
         let progress = &LogProgress;
         for bundle in models::MODEL_BUNDLES {
@@ -57,45 +72,83 @@ impl VoicePipeline {
                 progress.on_download_complete(bundle.name);
             }
         }
-        models::ensure_kokoro_model(progress)
-            .await
-            .map_err(|e| format!("Model download failed: {e}"))?;
 
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
-        // Init Pocket (English TTS)
-        let tts_en =
-            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
-            {
-                Ok(tts) => {
-                    info!("Pocket TTS ready (English)");
-                    Some(tts)
-                }
-                Err(e) => {
-                    info!("Pocket TTS not available, English will use Kokoro: {e}");
-                    None
-                }
-            };
+        let (tts_en, tts_multi, tts_qwen) = match engine {
+            TtsEngineConfig::Pocket => {
+                // Also load Kokoro as fallback for non-English
+                models::ensure_kokoro_model(progress)
+                    .await
+                    .map_err(|e| format!("Model download failed: {e}"))?;
 
-        // Init Kokoro (multilingual TTS)
-        let tts_multi =
-            match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                .await
-                .map_err(|e| format!("spawn_blocking join error: {e}"))?
-            {
-                Ok(tts) => {
-                    info!("Kokoro TTS ready (multilingual)");
-                    Some(tts)
-                }
-                Err(e) => {
-                    info!("Kokoro TTS not available: {e}");
-                    None
-                }
-            };
+                let tts_en = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                {
+                    Ok(tts) => {
+                        info!("Pocket TTS ready (English)");
+                        Some(Arc::new(Mutex::new(tts)))
+                    }
+                    Err(e) => {
+                        info!("Pocket TTS not available: {e}");
+                        None
+                    }
+                };
 
-        if tts_en.is_none() && tts_multi.is_none() {
+                let tts_multi = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                {
+                    Ok(tts) => {
+                        info!("Kokoro TTS ready (multilingual fallback)");
+                        Some(Arc::new(Mutex::new(tts)))
+                    }
+                    Err(e) => {
+                        info!("Kokoro TTS not available: {e}");
+                        None
+                    }
+                };
+
+                (tts_en, tts_multi, None)
+            }
+            TtsEngineConfig::Kokoro => {
+                models::ensure_kokoro_model(progress)
+                    .await
+                    .map_err(|e| format!("Model download failed: {e}"))?;
+
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
+                info!("Kokoro TTS ready (multilingual)");
+                (None, Some(Arc::new(Mutex::new(tts))), None)
+            }
+            TtsEngineConfig::Qwen => {
+                if !TextToSpeech::can_run_qwen() {
+                    return Err("Qwen TTS requires GPU (CUDA). No GPU detected.".to_string());
+                }
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::Qwen))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("Qwen TTS init failed: {e}"))?;
+                info!("Qwen TTS ready");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
+            TtsEngineConfig::QwenLarge => {
+                if !TextToSpeech::can_run_qwen() {
+                    return Err("QwenLarge TTS requires GPU (CUDA). No GPU detected.".to_string());
+                }
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::QwenLarge))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("QwenLarge TTS init failed: {e}"))?;
+                info!("QwenLarge TTS ready (voice cloning enabled)");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
+        };
+
+        if tts_en.is_none() && tts_multi.is_none() && tts_qwen.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
 
@@ -103,9 +156,22 @@ impl VoicePipeline {
 
         Ok(Self {
             stt: Arc::new(Mutex::new(stt)),
-            tts_en: tts_en.map(|t| Arc::new(Mutex::new(t))),
-            tts_multi: tts_multi.map(|t| Arc::new(Mutex::new(t))),
+            tts_en,
+            tts_multi,
+            tts_qwen,
+            engine_config: engine,
+            qwen_voice: "ryan".to_string(),
         })
+    }
+
+    /// Set the Qwen voice name for Qwen/QwenLarge engines.
+    pub fn set_qwen_voice(&mut self, voice: &str) {
+        self.qwen_voice = voice.to_string();
+    }
+
+    /// Get the current TTS engine config.
+    pub fn engine_config(&self) -> TtsEngineConfig {
+        self.engine_config
     }
 
     /// Transcribe an audio file (e.g. `.ogg`) to text.
@@ -151,31 +217,45 @@ impl VoicePipeline {
     /// Synthesize text to an `.ogg` opus file.
     ///
     /// `lang` is an ISO 639-1 code (e.g. "en", "es", "fr") used to route
-    /// to the appropriate TTS engine: Pocket for English, Kokoro for others.
+    /// to the appropriate TTS engine based on configuration.
     /// Returns the path to the generated file in `~/.nanobot/media/`.
     pub async fn synthesize_to_file(&self, text: &str, lang: &str) -> Result<String, String> {
         let text = text.to_string();
         let lang = lang.to_string();
         let lang_for_log = lang.clone();
+        let qwen_voice = self.qwen_voice.clone();
 
-        // Route to appropriate engine based on language.
-        let is_english = matches!(lang.as_str(), "en" | "en-us" | "en-gb");
-        let tts = if is_english {
-            self.tts_en.as_ref().or(self.tts_multi.as_ref())
+        // If Qwen engine is configured and available, use it
+        let tts = if let Some(ref tts) = self.tts_qwen {
+            tts.clone()
         } else {
-            self.tts_multi.as_ref().or(self.tts_en.as_ref())
-        }
-        .ok_or("No TTS engine available")?
-        .clone();
+            // Route to appropriate engine based on language.
+            let is_english = matches!(lang.as_str(), "en" | "en-us" | "en-gb");
+            if is_english {
+                self.tts_en.as_ref().or(self.tts_multi.as_ref())
+            } else {
+                self.tts_multi.as_ref().or(self.tts_en.as_ref())
+            }
+            .ok_or("No TTS engine available")?
+            .clone()
+        };
+
+        let is_qwen = self.tts_qwen.is_some();
 
         let (all_samples, sample_rate) = tokio::task::spawn_blocking(move || {
             let mut guard = tts.lock().map_err(|e| format!("TTS lock poisoned: {e}"))?;
 
-            let is_pocket = guard.engine_type() == "pocket";
-            if is_pocket {
+            let engine_type = guard.engine_type().to_string();
+
+            if is_qwen || engine_type == "qwen" || engine_type == "qwen-large" {
+                // Qwen engine - use configured voice
+                guard
+                    .set_speaker(&qwen_voice)
+                    .map_err(|e| format!("Qwen voice switch failed: {e}"))?;
+            } else if engine_type == "pocket" {
                 // Pocket is English-only; already initialized with default voice
             } else {
-                // Switch to the language-appropriate Kokoro voice.
+                // Kokoro - switch to language-appropriate voice
                 let (voice_id, _kokoro_lang) = language_to_kokoro_voice(&lang);
                 guard
                     .set_speaker(voice_id)
