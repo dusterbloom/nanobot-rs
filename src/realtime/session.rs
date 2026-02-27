@@ -151,6 +151,20 @@ impl RealtimeSession {
                     .map_err(|e| format!("QwenLarge TTS init failed: {}", e))?;
                 Some(Arc::new(Mutex::new(tts)))
             }
+            TtsEngineConfig::QwenOnnx => {
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnx))
+                    .await
+                    .map_err(|e| format!("TTS spawn error: {}", e))?
+                    .map_err(|e| format!("QwenOnnx TTS init failed: {}", e))?;
+                Some(Arc::new(Mutex::new(tts)))
+            }
+            TtsEngineConfig::QwenOnnxInt8 => {
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnxInt8))
+                    .await
+                    .map_err(|e| format!("TTS spawn error: {}", e))?
+                    .map_err(|e| format!("QwenOnnxInt8 TTS init failed: {}", e))?;
+                Some(Arc::new(Mutex::new(tts)))
+            }
         };
         tracing::info!("TTS ready ({:?})", config.tts_engine);
 
