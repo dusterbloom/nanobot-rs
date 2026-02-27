@@ -23,7 +23,7 @@ use crate::agent::agent_loop::SharedCoreHandle;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
 use crate::cli;
-use crate::config::loader::{get_data_dir, load_config};
+use crate::config::loader::{get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
 use crate::cron::service::CronService;
 use crate::heartbeat::service::{
@@ -1116,7 +1116,93 @@ pub(crate) fn cmd_agent(
         }
 
         // Recompute has_remote_local after potential lms setup
-        let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+        let mut has_remote_local = !config.agents.defaults.local_api_base.is_empty();
+
+        // --- Offline cluster peer fallback ---
+        // If the saved endpoint is a remote peer we didn't start, probe it.
+        // On failure: try starting local LMS, or clear the dead endpoint.
+        if is_local && has_remote_local && !srv.lms_managed {
+            let peer_port = config
+                .agents
+                .defaults
+                .local_api_base
+                .split(':')
+                .last()
+                .and_then(|p| p.split('/').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(18080);
+
+            let probe = crate::lms::list_available(peer_port).await;
+            if probe.is_empty() {
+                let dead_url = config.agents.defaults.local_api_base.clone();
+                println!(
+                    "  {}{}Saved endpoint {} is unreachable.{}",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    dead_url,
+                    tui::RESET,
+                );
+
+                let preference = &config.agents.defaults.inference_engine;
+                let mut fell_back = false;
+                if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
+                    let lms_port = config.agents.defaults.lms_port;
+                    println!(
+                        "  Attempting local LM Studio fallback on port {}...",
+                        lms_port
+                    );
+                    if let Ok(()) = crate::lms::server_start(&bin, lms_port).await {
+                        let available = crate::lms::list_available(lms_port).await;
+                        if !available.is_empty() {
+                            let model = if !config.agents.defaults.lms_main_model.is_empty() {
+                                config.agents.defaults.lms_main_model.clone()
+                            } else {
+                                let hint = cli::strip_gguf_suffix(&local_model_name);
+                                crate::lms::resolve_model_name(&available, hint)
+                            };
+                            let ctx =
+                                Some(config.agents.defaults.local_max_context_tokens);
+                            print!("  Loading {}... ", model);
+                            io::stdout().flush().ok();
+                            match crate::lms::load_model(lms_port, &model, ctx).await {
+                                Ok(()) => {
+                                    println!("{}OK{}", tui::GREEN, tui::RESET);
+                                    local_model_name = model;
+                                    srv.lms_managed = true;
+                                    srv.lms_binary = Some(bin);
+                                    srv.local_port = lms_port.to_string();
+                                    let lms_host = crate::lms::api_host();
+                                    config.agents.defaults.local_api_base =
+                                        format!("http://{}:{}/v1", lms_host, lms_port);
+                                    config.agents.defaults.skip_jit_gate = true;
+                                    fell_back = true;
+                                    println!(
+                                        "  {}Fell back to local LM Studio.{}",
+                                        tui::GREEN, tui::RESET
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !fell_back {
+                    // Clear the dead endpoint so the user isn't stuck
+                    config.agents.defaults.local_api_base.clear();
+                    let mut disk_cfg = load_config(None);
+                    disk_cfg.agents.defaults.local_api_base.clear();
+                    save_config(&disk_cfg, None);
+                    has_remote_local = false;
+                    println!(
+                        "  Cleared dead endpoint. Use {}/m{} to pick a model when a peer comes online.",
+                        tui::BOLD, tui::RESET,
+                    );
+                }
+            }
+        }
 
         // Remote LM Studio base: proactively prewarm main/router/specialist models
         // to avoid first-turn latency spikes from JIT loading.
