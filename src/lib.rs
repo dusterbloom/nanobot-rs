@@ -10,6 +10,8 @@ pub mod cron;
 pub mod errors;
 pub mod heartbeat;
 pub mod lms;
+#[cfg(feature = "voice")]
+pub mod realtime;
 pub mod providers;
 pub mod server;
 pub mod session;
