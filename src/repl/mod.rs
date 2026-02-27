@@ -196,19 +196,58 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         }
     }
 
-    // Fetch already-loaded models so we can skip them.
-    let loaded_ids = fetch_lms_loaded_models(native).await;
+    // Query already-loaded models so we can skip redundant loads
+    let models_url = format!("{}/api/v1/models", native);
+    let client = reqwest::Client::new();
+    let loaded_map: std::collections::HashMap<String, Option<usize>> = match client
+        .get(&models_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await.unwrap_or_default();
+            json.get("models")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let key = m.get("key")?.as_str()?.to_string();
+                            let instances = m.get("loaded_instances")?.as_array()?;
+                            if instances.is_empty() {
+                                return None;
+                            }
+                            let ctx = instances.first()
+                                .and_then(|inst| inst.get("config"))
+                                .and_then(|c| c.get("context_length"))
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as usize);
+                            Some((key, ctx))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        _ => std::collections::HashMap::new(),
+    };
 
     let mut seen = BTreeSet::new();
-    let client = reqwest::Client::new();
     for (model, ctx) in models {
         if !seen.insert(model.clone()) {
             continue;
         }
-        // Skip models that are already loaded (fuzzy: either ID contains the other).
-        if loaded_ids.iter().any(|id| lms_model_matches(id, &model)) {
-            info!(model = %model, "remote_lms_prewarm_skipped (already loaded)");
-            continue;
+        // Skip if model is already loaded with matching context
+        if let Some(loaded_ctx) = loaded_map.iter().find_map(|(k, lc)| {
+            if crate::lms::model_matches(k, &model) { Some(lc) } else { None }
+        }) {
+            let skip = match ctx {
+                None => true,
+                Some(requested) => *loaded_ctx == Some(requested),
+            };
+            if skip {
+                info!(model = %model, "remote_lms_prewarm_already_loaded");
+                continue;
+            }
         }
         let mut body = serde_json::json!({ "model": model });
         if let Some(c) = ctx {

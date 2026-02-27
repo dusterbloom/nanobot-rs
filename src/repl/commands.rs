@@ -599,6 +599,9 @@ impl ReplContext {
             "/cluster" => {
                 self.cmd_cluster(arg).await;
             }
+            "/adapt" => {
+                self.cmd_adapt(arg).await;
+            }
             _ => {
                 return false;
             }
@@ -2338,6 +2341,7 @@ impl ReplContext {
         disk_cfg.agents.defaults.skip_jit_gate = self.config.agents.defaults.skip_jit_gate;
         disk_cfg.agents.defaults.lms_port = self.config.agents.defaults.lms_port;
         disk_cfg.agents.defaults.lms_main_model = self.config.agents.defaults.lms_main_model.clone();
+        disk_cfg.agents.defaults.local_model = self.config.agents.defaults.local_model.clone();
         save_config(&disk_cfg, None);
     }
 
@@ -2823,6 +2827,91 @@ impl ReplContext {
                     query
                 );
                 println!("  Use /cluster models to see available models.\n");
+            }
+        }
+    }
+
+    /// /adapt — LoRA adapter generation and management.
+    async fn cmd_adapt(&mut self, arg: &str) {
+        use crate::agent::lora_bridge;
+
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            [] | ["status"] => {
+                // Show adapter status.
+                let dir = lora_bridge::adapters_dir();
+                let d2l = dir.join("personality.gguf");
+                let t2l = dir.join("behavior.gguf");
+                println!("\n  Adapter Status:");
+                println!("    D2L (knowledge):  {}", if d2l.exists() { "ready" } else { "not generated" });
+                println!("    T2L (behavioral): {}", if t2l.exists() { "ready" } else { "not generated" });
+                println!("    Directory: {}", dir.display());
+
+                if let Ok(buf) = lora_bridge::ExperienceBuffer::open_default() {
+                    if let Ok(stats) = buf.stats() {
+                        println!("    Experiences: {} total, {} pending", stats.total, stats.unexported);
+                    }
+                }
+                println!();
+            }
+            ["run"] => {
+                println!("\n  Generating adapters...");
+                let server_url = &self.config.agents.defaults.local_api_base;
+                let workspace = self.core_handle.swappable().workspace.clone();
+                match lora_bridge::regenerate_adapters(&workspace, server_url, 0.5).await {
+                    Ok(r) => {
+                        println!("  D2L: {} ({} chars input)",
+                            r.d2l_path.as_ref().map(|p| p.display().to_string()).unwrap_or("skipped".into()),
+                            r.d2l_doc_chars);
+                        println!("  T2L: {} ({} chars input)",
+                            r.t2l_path.as_ref().map(|p| p.display().to_string()).unwrap_or("skipped".into()),
+                            r.t2l_desc_chars);
+                        println!("  {}\n", r.message);
+                    }
+                    Err(e) => println!("  Error: {}\n", e),
+                }
+            }
+            ["scale", val] => {
+                match val.parse::<f64>() {
+                    Ok(s) if (0.0..=1.0).contains(&s) => {
+                        let dir = lora_bridge::adapters_dir();
+                        let server_url = &self.config.agents.defaults.local_api_base;
+                        let d2l = dir.join("personality.gguf");
+                        let t2l = dir.join("behavior.gguf");
+                        let mut applied = false;
+                        for path in [&d2l, &t2l] {
+                            if path.exists() {
+                                let config = lora_bridge::LoraConfig {
+                                    server_url: server_url.clone(),
+                                    adapter_path: Some(path.clone()),
+                                    scale: s,
+                                };
+                                match lora_bridge::apply_lora_adapter(&config).await {
+                                    Ok(r) if r.success => {
+                                        println!("  Applied {} at scale {}", path.display(), s);
+                                        applied = true;
+                                    }
+                                    Ok(r) => println!("  Failed: {}", r.message),
+                                    Err(e) => println!("  Error: {}", e),
+                                }
+                            }
+                        }
+                        if !applied {
+                            println!("\n  No adapters found. Run /adapt run first.\n");
+                        } else {
+                            println!();
+                        }
+                    }
+                    _ => println!("\n  Usage: /adapt scale <0.0-1.0>\n"),
+                }
+            }
+            _ => {
+                println!("
+  Usage: /adapt [subcommand]
+    /adapt              Show adapter status
+    /adapt run          Generate D2L + T2L adapters
+    /adapt scale <f>    Set adapter scale (0.0-1.0)
+");
             }
         }
     }

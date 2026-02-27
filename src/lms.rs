@@ -168,9 +168,10 @@ pub(crate) async fn load_model(
     context_length: Option<usize>,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    // Check if already loaded
-    let loaded = list_loaded(host, port).await;
-    if should_skip_load(&loaded, model, context_length) {
+    // Check if already loaded with matching context
+    let models = list_models_full(host, port).await;
+    if should_skip_load(&models, model, context_length) {
+        tracing::debug!("lms skip load: model={} already loaded with matching context", model);
         return Ok(());
     }
 
@@ -192,8 +193,12 @@ pub(crate) async fn reload_model_with_context(
     load_timeout_secs: u64,
     unload_timeout_secs: u64,
 ) -> Result<(), String> {
-    let loaded = list_loaded(host, port).await;
-    for loaded_model in loaded.iter().filter(|m| model_matches(m, model)) {
+    let models = list_models_full(host, port).await;
+    let loaded_keys: Vec<String> = models.iter()
+        .filter(|m| m.loaded && model_matches(&m.key, model))
+        .map(|m| m.key.clone())
+        .collect();
+    for loaded_model in &loaded_keys {
         if let Err(e) = unload_model(host, port, loaded_model, unload_timeout_secs).await {
             tracing::warn!(
                 "lms unload before reload failed: model={} loaded_model={} error={}",
@@ -207,12 +212,21 @@ pub(crate) async fn reload_model_with_context(
     post_load_model(host, port, model, Some(context_length), load_timeout_secs).await
 }
 
-fn model_matches(loaded: &str, model: &str) -> bool {
+pub(crate) fn model_matches(loaded: &str, model: &str) -> bool {
     loaded == model || loaded.contains(model) || model.contains(loaded)
 }
 
-fn should_skip_load(loaded: &[String], model: &str, _context_length: Option<usize>) -> bool {
-    loaded.iter().any(|m| model_matches(m, model))
+fn should_skip_load(models: &[ModelInfo], model: &str, context_length: Option<usize>) -> bool {
+    let found = models.iter().find(|m| m.loaded && model_matches(&m.key, model));
+    match found {
+        None => false,
+        Some(info) => match context_length {
+            // No specific context requested — already loaded is fine
+            None => true,
+            // Context requested — skip only if it matches what's already loaded
+            Some(requested) => info.loaded_context == Some(requested),
+        },
+    }
 }
 
 async fn post_load_model(
@@ -261,7 +275,7 @@ async fn post_load_model(
 /// default resolved via `api_host()`.
 pub(crate) async fn unload_model(host: &str, port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
     let url = format!("{}/api/v1/models/unload", rest_base(host, port));
-    let body = serde_json::json!({ "instance_id": model });
+    let body = serde_json::json!({ "identifier": model });
 
     let client = reqwest::Client::new();
     let resp = client
@@ -298,6 +312,8 @@ pub(crate) struct ModelInfo {
     pub key: String,
     pub model_type: String,
     pub loaded: bool,
+    /// Context length of the first loaded instance, if any.
+    pub loaded_context: Option<usize>,
 }
 
 /// List all models via `GET /api/v1/models`, returning full info.
@@ -323,11 +339,16 @@ async fn list_models_full(host: &str, port: u16) -> Vec<ModelInfo> {
         .filter_map(|m| {
             let key = m.get("key")?.as_str()?.to_string();
             let model_type = m.get("type")?.as_str()?.to_string();
-            let loaded = m.get("loaded_instances")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            Some(ModelInfo { key, model_type, loaded })
+            let instances = m.get("loaded_instances")
+                .and_then(|v| v.as_array());
+            let loaded = instances.map(|a| !a.is_empty()).unwrap_or(false);
+            let loaded_context = instances
+                .and_then(|arr| arr.first())
+                .and_then(|inst| inst.get("config"))
+                .and_then(|c| c.get("context_length"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            Some(ModelInfo { key, model_type, loaded, loaded_context })
         })
         .collect()
 }
@@ -681,25 +702,52 @@ mod tests {
         assert_eq!(strip_match_suffixes("plain-model"), "plain-model");
     }
 
+    fn make_model_info(key: &str, loaded: bool, loaded_context: Option<usize>) -> ModelInfo {
+        ModelInfo {
+            key: key.to_string(),
+            model_type: "llm".to_string(),
+            loaded,
+            loaded_context,
+        }
+    }
+
     #[test]
     fn test_should_skip_load_when_loaded_and_no_context_requested() {
-        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
+        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(4096))];
         assert!(should_skip_load(
-            &loaded,
+            &models,
             "qwen2.5-coder-7b-instruct-mlx",
             None
         ));
     }
 
     #[test]
-    fn test_should_skip_load_when_loaded_and_context_requested() {
-        // If the model is already loaded, skip regardless of context_length.
-        // Callers that need a forced reload must use reload_model_with_context().
-        let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
+    fn test_should_skip_load_when_context_matches() {
+        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(6144))];
         assert!(should_skip_load(
-            &loaded,
+            &models,
             "qwen2.5-coder-7b-instruct-mlx",
             Some(6144)
+        ));
+    }
+
+    #[test]
+    fn test_should_not_skip_load_when_context_differs() {
+        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(4096))];
+        assert!(!should_skip_load(
+            &models,
+            "qwen2.5-coder-7b-instruct-mlx",
+            Some(6144)
+        ));
+    }
+
+    #[test]
+    fn test_should_not_skip_load_when_not_loaded() {
+        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", false, None)];
+        assert!(!should_skip_load(
+            &models,
+            "qwen2.5-coder-7b-instruct-mlx",
+            None
         ));
     }
 
