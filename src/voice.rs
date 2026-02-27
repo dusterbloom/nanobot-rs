@@ -605,6 +605,28 @@ impl VoiceSession {
                 tracing::info!("QwenLarge TTS ready (voice cloning enabled)");
                 (None, None, Some(Arc::new(Mutex::new(tts))))
             }
+            TtsEngineConfig::QwenOnnx => {
+                models::ensure_qwen_onnx_model(false, progress)
+                    .await
+                    .map_err(|e| format!("ONNX model download failed: {e}"))?;
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnx))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("QwenOnnx TTS init failed: {e}"))?;
+                tracing::info!("QwenOnnx TTS ready (ONNX Runtime)");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
+            TtsEngineConfig::QwenOnnxInt8 => {
+                models::ensure_qwen_onnx_model(true, progress)
+                    .await
+                    .map_err(|e| format!("ONNX INT8 model download failed: {e}"))?;
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnxInt8))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("QwenOnnxInt8 TTS init failed: {e}"))?;
+                tracing::info!("QwenOnnxInt8 TTS ready (ONNX Runtime, quantized)");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
         };
 
         if tts_en.is_none() && tts_multi.is_none() && tts_qwen.is_none() {
