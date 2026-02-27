@@ -1363,13 +1363,58 @@ impl Default for ProprioceptionConfig {
 // Voice config
 // ---------------------------------------------------------------------------
 
+/// TTS engine selection for voice mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TtsEngineConfig {
+    #[default]
+    Pocket,
+    Kokoro,
+    Qwen,
+    QwenLarge,
+}
+
+/// Voice clone reference for QwenLarge TTS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCloneRef {
+    /// Path to reference audio file (.wav).
+    pub audio_path: String,
+    /// Optional transcript of the reference audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+}
+
 /// Configuration for voice mode TTS/STT.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceConfig {
     /// Default language for TTS. "en" = Pocket only (fast), "auto" or None = both engines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// TTS engine selection. Default: "pocket" (fast English).
+    #[serde(default)]
+    pub tts_engine: TtsEngineConfig,
+    /// Voice ID for the selected TTS engine.
+    /// - Pocket: "alba", "marius", "javert", etc.
+    /// - Kokoro: numeric string "0"-"10"
+    /// - Qwen: "ryan", "serena", "vivian", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_voice: Option<String>,
+    /// Voice clone reference (only for QwenLarge engine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_clone_ref: Option<VoiceCloneRef>,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            tts_engine: TtsEngineConfig::default(),
+            tts_voice: None,
+            voice_clone_ref: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,7 +1566,8 @@ pub struct Config {
     #[serde(default)]
     pub lcm: LcmSchemaConfig,
     #[serde(default)]
-    pub model_capabilities: HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
+    pub model_capabilities:
+        HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
 }
 
 impl Config {
@@ -1942,6 +1988,128 @@ mod tests {
         assert!(cfg.voice.language.is_none());
     }
 
+    // -- Qwen TTS config tests (RED phase) --
+
+    #[test]
+    fn test_voice_config_tts_engine_default_is_pocket() {
+        let vc = VoiceConfig::default();
+        assert_eq!(vc.tts_engine, TtsEngineConfig::Pocket);
+    }
+
+    #[test]
+    fn test_voice_config_tts_engine_qwen_from_json() {
+        let json = r#"{"voice": {"ttsEngine": "qwen", "ttsVoice": "ryan"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::Qwen);
+        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("ryan"));
+    }
+
+    #[test]
+    fn test_voice_config_tts_engine_qwen_large_from_json() {
+        let json = r#"{"voice": {"ttsEngine": "qwenLarge"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenLarge);
+    }
+
+    #[test]
+    fn test_voice_config_tts_engine_kokoro_from_json() {
+        let json = r#"{"voice": {"ttsEngine": "kokoro", "ttsVoice": "3"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::Kokoro);
+        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn test_voice_config_tts_voice_default_is_none() {
+        let vc = VoiceConfig::default();
+        assert!(vc.tts_voice.is_none());
+    }
+
+    #[test]
+    fn test_voice_config_voice_clone_ref_absent_by_default() {
+        let vc = VoiceConfig::default();
+        assert!(vc.voice_clone_ref.is_none());
+    }
+
+    #[test]
+    fn test_voice_config_voice_clone_ref_from_json() {
+        let json = r#"{
+            "voice": {
+                "ttsEngine": "qwenLarge",
+                "voiceCloneRef": {
+                    "audioPath": "~/.nanobot/voice_ref.wav",
+                    "transcript": "Hello, this is a test."
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let ref_ = cfg.voice.voice_clone_ref.as_ref().unwrap();
+        assert!(ref_.audio_path.ends_with("voice_ref.wav"));
+        assert_eq!(ref_.transcript.as_deref(), Some("Hello, this is a test."));
+    }
+
+    #[test]
+    fn test_voice_config_voice_clone_ref_without_transcript() {
+        let json = r#"{
+            "voice": {
+                "ttsEngine": "qwenLarge",
+                "voiceCloneRef": {
+                    "audioPath": "/path/to/ref.wav"
+                }
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let ref_ = cfg.voice.voice_clone_ref.as_ref().unwrap();
+        assert!(ref_.transcript.is_none());
+    }
+
+    #[test]
+    fn test_voice_config_roundtrip() {
+        let vc = VoiceConfig {
+            language: Some("en".to_string()),
+            tts_engine: TtsEngineConfig::Qwen,
+            tts_voice: Some("serena".to_string()),
+            voice_clone_ref: None,
+        };
+        let json = serde_json::to_string(&vc).unwrap();
+        let vc2: VoiceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(vc2.language.as_deref(), Some("en"));
+        assert_eq!(vc2.tts_engine, TtsEngineConfig::Qwen);
+        assert_eq!(vc2.tts_voice.as_deref(), Some("serena"));
+    }
+
+    #[test]
+    fn test_tts_engine_config_serialization() {
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::Pocket).unwrap(),
+            r#""pocket""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::Kokoro).unwrap(),
+            r#""kokoro""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::Qwen).unwrap(),
+            r#""qwen""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::QwenLarge).unwrap(),
+            r#""qwenLarge""#
+        );
+    }
+
+    #[test]
+    fn test_tts_engine_config_deserialization() {
+        let pocket: TtsEngineConfig = serde_json::from_str(r#""pocket""#).unwrap();
+        let kokoro: TtsEngineConfig = serde_json::from_str(r#""kokoro""#).unwrap();
+        let qwen: TtsEngineConfig = serde_json::from_str(r#""qwen""#).unwrap();
+        let qwen_large: TtsEngineConfig = serde_json::from_str(r#""qwenLarge""#).unwrap();
+        assert_eq!(pocket, TtsEngineConfig::Pocket);
+        assert_eq!(kokoro, TtsEngineConfig::Kokoro);
+        assert_eq!(qwen, TtsEngineConfig::Qwen);
+        assert_eq!(qwen_large, TtsEngineConfig::QwenLarge);
+    }
+
     #[test]
     fn test_auto_local_roundtrip_preserves_value() {
         let td = ToolDelegationConfig {
@@ -1961,7 +2129,10 @@ mod tests {
     fn test_local_api_base_deserialization() {
         let json = r#"{"agents": {"defaults": {"localApiBase": "http://192.168.1.22:1234/v1"}}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.agents.defaults.local_api_base, "http://192.168.1.22:1234/v1");
+        assert_eq!(
+            cfg.agents.defaults.local_api_base,
+            "http://192.168.1.22:1234/v1"
+        );
         assert!(!cfg.agents.defaults.local_api_base.is_empty());
     }
 
@@ -2068,7 +2239,10 @@ mod tests {
         assert!(cfg.trio.enabled);
         assert_eq!(cfg.trio.router_model, "nemotron-orchestrator");
         assert_eq!(cfg.trio.router_port, 8094);
-        assert!(cfg.trio.router_endpoint.is_none(), "endpoint should be absent when not set");
+        assert!(
+            cfg.trio.router_endpoint.is_none(),
+            "endpoint should be absent when not set"
+        );
     }
 
     #[test]
@@ -2120,8 +2294,14 @@ mod tests {
     fn test_trio_config_endpoint_not_serialized_when_none() {
         let trio = TrioConfig::default();
         let json = serde_json::to_string(&trio).unwrap();
-        assert!(!json.contains("routerEndpoint"), "None endpoints should be skipped");
-        assert!(!json.contains("specialistEndpoint"), "None endpoints should be skipped");
+        assert!(
+            !json.contains("routerEndpoint"),
+            "None endpoints should be skipped"
+        );
+        assert!(
+            !json.contains("specialistEndpoint"),
+            "None endpoints should be skipped"
+        );
     }
 
     #[test]
