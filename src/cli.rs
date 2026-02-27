@@ -2388,6 +2388,8 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
         "kokoro" => TtsEngineConfig::Kokoro,
         "qwen" => TtsEngineConfig::Qwen,
         "qwenlarge" | "qwen_large" => TtsEngineConfig::QwenLarge,
+        "qwenonnx" | "qwen_onnx" | "onnx" => TtsEngineConfig::QwenOnnx,
+        "qwenonnxint8" | "qwen_onnx_int8" | "onnx-int8" | "int8" => TtsEngineConfig::QwenOnnxInt8,
         _ => {
             eprintln!("Unknown TTS engine: {}. Using pocket.", engine);
             TtsEngineConfig::Pocket
@@ -2564,6 +2566,27 @@ pub(crate) fn cmd_voice_list(engine: String) {
             println!("Voice cloning (QwenLarge only):");
             println!("  Clone from audio: nanobot voice clone myvoice audio.wav");
         }
+        "qwenonnx" | "qwen_onnx" | "onnx" => {
+            println!("Qwen ONNX TTS Voices (use with --engine qwenOnnx):\n");
+            let voices = jack_voice::QWEN_LITE_VOICES;
+            for (id, name) in voices {
+                println!("  {:15} {}", id, name);
+            }
+            println!();
+            println!("  Model size: ~3 GB (FP16)");
+            println!("  Supports: CoreML (macOS), CUDA, CPU");
+        }
+        "qwenonnxint8" | "qwen_onnx_int8" | "onnx-int8" | "int8" => {
+            println!("Qwen ONNX INT8 TTS Voices (use with --engine qwenOnnxInt8):\n");
+            let voices = jack_voice::QWEN_LITE_VOICES;
+            for (id, name) in voices {
+                println!("  {:15} {}", id, name);
+            }
+            println!();
+            println!("  Model size: ~1.6 GB (INT8 quantized)");
+            println!("  Optimized for: Edge devices, low memory, realtime");
+            println!("  Supports: CoreML (macOS), CUDA, CPU");
+        }
         "kokoro" => {
             println!("Kokoro TTS Voices (use with --engine kokoro):\n");
             println!("  Voice IDs: 0-10 (numeric)");
@@ -2575,7 +2598,7 @@ pub(crate) fn cmd_voice_list(engine: String) {
         }
         _ => {
             eprintln!("Unknown TTS engine: {}", engine);
-            eprintln!("Valid engines: pocket, kokoro, qwen, qwenLarge");
+            eprintln!("Valid engines: pocket, kokoro, qwen, qwenLarge, qwenOnnx, qwenOnnxInt8");
         }
     }
 }

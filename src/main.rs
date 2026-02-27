@@ -154,7 +154,7 @@ enum Commands {
     /// Start realtime voice session with LLM agent.
     #[cfg(feature = "voice")]
     Realtime {
-        /// TTS engine: pocket, kokoro, qwen, qwenLarge.
+        /// TTS engine: pocket, kokoro, qwen, qwenLarge, qwenOnnx, qwenOnnxInt8.
         #[arg(long, default_value = "pocket")]
         engine: String,
         /// Voice name for Qwen engines (e.g., ryan, serena).
