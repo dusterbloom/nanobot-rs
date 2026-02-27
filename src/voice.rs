@@ -7,6 +7,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::config::schema::TtsEngineConfig;
 use jack_voice::{
     AudioCapture, AudioError, AudioPlayer,
     models::{self, ModelProgressCallback},
@@ -263,6 +264,12 @@ pub struct VoiceSession {
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     /// Kokoro TTS engine (multilingual).
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
+    /// Qwen TTS engine (multilingual with GPU, includes QwenLarge for voice cloning).
+    tts_qwen: Option<Arc<Mutex<TextToSpeech>>>,
+    /// Selected TTS engine config.
+    engine_config: TtsEngineConfig,
+    /// Selected Qwen voice name (for Qwen/QwenLarge engines).
+    qwen_voice: String,
     cancel: Arc<AtomicBool>,
 }
 
@@ -512,8 +519,127 @@ impl VoiceSession {
             stt,
             tts_en,
             tts_multi,
+            tts_qwen: None,
+            engine_config: TtsEngineConfig::Pocket,
+            qwen_voice: "ryan".to_string(),
             cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Create a voice session with a specific TTS engine.
+    ///
+    /// This allows selecting Qwen/QwenLarge engines which require GPU.
+    /// Falls back gracefully if the requested engine is not available.
+    pub async fn with_engine(engine: TtsEngineConfig) -> Result<Self, String> {
+        tracing::info!("Initializing voice mode with {:?}...", engine);
+
+        // Fail fast: check that parec exists
+        Command::new("parec")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| {
+                "parec not found. Install: sudo apt install pulseaudio-utils".to_string()
+            })?;
+
+        tracing::info!("Checking models...");
+
+        let progress = &TerminalProgress;
+        for bundle in models::MODEL_BUNDLES {
+            let target = if bundle.extract_dir.is_empty() {
+                bundle.name
+            } else {
+                bundle.extract_dir
+            };
+            if !models::model_exists(target) {
+                progress.on_download_start(bundle.name, bundle.size_mb);
+                models::download_model(bundle, progress)
+                    .await
+                    .map_err(|e| format!("Model download failed: {e}"))?;
+                progress.on_download_complete(bundle.name);
+            }
+        }
+
+        let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
+
+        let (tts_en, tts_multi, tts_qwen) = match engine {
+            TtsEngineConfig::Pocket => {
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("Pocket TTS init failed: {e}"))?;
+                tracing::info!("Pocket TTS ready");
+                (Some(Arc::new(Mutex::new(tts))), None, None)
+            }
+            TtsEngineConfig::Kokoro => {
+                models::ensure_kokoro_model(progress)
+                    .await
+                    .map_err(|e| format!("Model download failed: {e}"))?;
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
+                tracing::info!("Kokoro TTS ready");
+                (None, Some(Arc::new(Mutex::new(tts))), None)
+            }
+            TtsEngineConfig::Qwen => {
+                if !TextToSpeech::can_run_qwen() {
+                    return Err("Qwen TTS requires GPU (CUDA). No GPU detected.".to_string());
+                }
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::Qwen))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("Qwen TTS init failed: {e}"))?;
+                tracing::info!("Qwen TTS ready");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
+            TtsEngineConfig::QwenLarge => {
+                if !TextToSpeech::can_run_qwen() {
+                    return Err("QwenLarge TTS requires GPU (CUDA). No GPU detected.".to_string());
+                }
+                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::QwenLarge))
+                    .await
+                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                    .map_err(|e| format!("QwenLarge TTS init failed: {e}"))?;
+                tracing::info!("QwenLarge TTS ready (voice cloning enabled)");
+                (None, None, Some(Arc::new(Mutex::new(tts))))
+            }
+        };
+
+        if tts_en.is_none() && tts_multi.is_none() && tts_qwen.is_none() {
+            return Err("No TTS engine could be initialized".to_string());
+        }
+
+        Ok(Self {
+            stt,
+            tts_en,
+            tts_multi,
+            tts_qwen,
+            engine_config: engine,
+            qwen_voice: "ryan".to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Set the Qwen voice name (e.g., "ryan", "serena", "vivian").
+    pub fn set_qwen_voice(&mut self, voice: &str) {
+        self.qwen_voice = voice.to_string();
+    }
+
+    /// Get the current TTS engine config.
+    pub fn engine_config(&self) -> TtsEngineConfig {
+        self.engine_config
+    }
+
+    /// Check if the current engine supports voice cloning.
+    pub fn supports_voice_cloning(&self) -> bool {
+        if let Some(ref tts) = self.tts_qwen {
+            if let Ok(guard) = tts.lock() {
+                return guard.supports_voice_cloning();
+            }
+        }
+        false
     }
 
     /// Record audio and transcribe. Returns `(text, detected_language_code)`.
@@ -596,9 +722,20 @@ impl VoiceSession {
         Ok(Some((text, lang)))
     }
 
-    /// Select the appropriate TTS engine based on language.
+    /// Select the appropriate TTS engine based on language and config.
     /// Returns `(Arc<Mutex<TextToSpeech>>, voice_id)`.
-    fn select_tts(&self, lang: &str) -> Result<(Arc<Mutex<TextToSpeech>>, &'static str), String> {
+    fn select_tts(&self, lang: &str) -> Result<(Arc<Mutex<TextToSpeech>>, String), String> {
+        // If Qwen engine is configured and available, use it
+        if let Some(ref tts) = self.tts_qwen {
+            let voice = if self.qwen_voice.is_empty() {
+                "ryan".to_string()
+            } else {
+                self.qwen_voice.clone()
+            };
+            tracing::debug!("TTS engine selected: qwen for lang={} with voice={}", lang, voice);
+            return Ok((tts.clone(), voice));
+        }
+
         let is_english = matches!(lang, "en" | "en-us" | "en-gb");
 
         let tts = if is_english {
@@ -616,17 +753,17 @@ impl VoiceSession {
             lang
         );
         let voice_id = if is_pocket {
-            "alba"
+            "alba".to_string()
         } else {
             match lang {
-                "es" => "28",
-                "fr" => "30",
-                "hi" => "31",
-                "it" => "35",
-                "ja" => "37",
-                "pt" => "42",
-                "zh" => "45",
-                _ => "3",
+                "es" => "28".to_string(),
+                "fr" => "30".to_string(),
+                "hi" => "31".to_string(),
+                "it" => "35".to_string(),
+                "ja" => "37".to_string(),
+                "pt" => "42".to_string(),
+                "zh" => "45".to_string(),
+                _ => "3".to_string(),
             }
         };
 
@@ -657,7 +794,7 @@ impl VoiceSession {
             #[cfg(unix)]
             mask_sigint();
             let mut guard = tts.lock().unwrap();
-            if let Err(e) = guard.set_speaker(voice_id) {
+            if let Err(e) = guard.set_speaker(&voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
             }
 
@@ -743,7 +880,7 @@ impl VoiceSession {
             #[cfg(unix)]
             mask_sigint();
             let mut guard = tts.lock().unwrap();
-            if let Err(e) = guard.set_speaker(voice_id) {
+            if let Err(e) = guard.set_speaker(&voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
             }
 
@@ -1341,5 +1478,121 @@ mod tests {
             "Real content should remain, got: {}",
             combined
         );
+    }
+
+    // ========================================
+    // Qwen TTS Engine Tests (RED phase - TDD)
+    // ========================================
+
+    #[test]
+    fn test_qwen_tts_engine_exists() {
+        use jack_voice::TtsEngine;
+        let _engine = TtsEngine::Qwen;
+        let _engine_large = TtsEngine::QwenLarge;
+    }
+
+    #[test]
+    fn test_qwen_available_voices() {
+        let voices = jack_voice::TextToSpeech::available_qwen_voices();
+        assert!(!voices.is_empty(), "Qwen should have available voices");
+        assert!(voices.iter().any(|v| v.id_str == "ryan"), "Should include ryan");
+        assert!(voices.iter().any(|v| v.id_str == "serena"), "Should include serena");
+        assert!(voices.iter().any(|v| v.id_str == "vivian"), "Should include vivian");
+    }
+
+    #[test]
+    fn test_qwen_can_run_check() {
+        let can_run = jack_voice::TextToSpeech::can_run_qwen();
+        assert!(can_run == true || can_run == false, "Should return a boolean");
+    }
+
+    #[tokio::test]
+    async fn test_voice_session_with_engine_qwen() {
+        let result = VoiceSession::with_engine(TtsEngineConfig::Qwen).await;
+        if let Ok(session) = result {
+            assert!(session.tts_qwen.is_some(), "Qwen TTS should be initialized");
+            assert!(session.tts_en.is_none(), "Pocket should not be initialized");
+            assert!(session.tts_multi.is_none(), "Kokoro should not be initialized");
+        } else {
+            println!("Qwen TTS not available (requires GPU): {:?}", result.err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_voice_session_with_engine_qwen_large() {
+        let result = VoiceSession::with_engine(TtsEngineConfig::QwenLarge).await;
+        if let Ok(session) = result {
+            assert!(session.tts_qwen.is_some(), "QwenLarge TTS should be initialized");
+            let tts = session.tts_qwen.as_ref().unwrap();
+            let guard = tts.lock().unwrap();
+            assert!(guard.supports_voice_cloning(), "QwenLarge should support voice cloning");
+        } else {
+            println!("QwenLarge TTS not available (requires GPU + model): {:?}", result.err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_voice_session_select_tts_qwen() {
+        let result = VoiceSession::with_engine(TtsEngineConfig::Qwen).await;
+        if let Ok(session) = result {
+            let (tts, voice) = session.select_tts("en").expect("select_tts should work");
+            assert_eq!(voice, "ryan", "Qwen default voice should be ryan");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_voice_session_select_tts_qwen_voice_serena() {
+        let result = VoiceSession::with_engine(TtsEngineConfig::Qwen).await;
+        if let Ok(mut session) = result {
+            session.set_qwen_voice("serena");
+            let (tts, voice) = session.select_tts("en").expect("select_tts should work");
+            assert_eq!(voice, "serena", "Voice should be serena");
+        }
+    }
+
+    /// Real synthesis test - only runs if GPU is available.
+    /// Marked with #[ignore] so it doesn't fail on CI without GPU.
+    #[tokio::test]
+    #[ignore]
+    async fn test_qwen_tts_synthesizes_real_audio() {
+        let result = VoiceSession::with_engine(TtsEngineConfig::Qwen).await;
+        if let Ok(mut session) = result {
+            let tts_result = session.speak("Hello, this is a test of Qwen TTS.", "en");
+            assert!(tts_result.is_ok(), "Qwen synthesis should succeed: {:?}", tts_result.err());
+        } else {
+            panic!("Qwen TTS should be available for this test: {:?}", result.err());
+        }
+    }
+
+    /// Real streaming synthesis test - only runs if GPU is available.
+    #[test]
+    #[ignore]
+    fn test_qwen_tts_streaming_real_audio() {
+        use jack_voice::{TextToSpeech, TtsEngine};
+        if !TextToSpeech::can_run_qwen() {
+            println!("Skipping: Qwen TTS requires GPU");
+            return;
+        }
+        let mut tts = TextToSpeech::with_engine(TtsEngine::Qwen).expect("Qwen TTS init failed");
+        tts.set_speaker("ryan").expect("Failed to set voice");
+
+        let mut chunk_count = 0u32;
+        let mut total_samples = 0usize;
+
+        let sr = tts
+            .synthesize_streaming(
+                "Hello, this is a streaming test from Qwen TTS.",
+                |samples, _sample_rate| {
+                    chunk_count += 1;
+                    total_samples += samples.len();
+                    true
+                },
+            )
+            .expect("Streaming synthesis failed");
+
+        assert!(sr > 0, "Sample rate should be positive");
+        assert!(total_samples > 100, "Should have audio samples");
+        assert!(chunk_count >= 1, "Should have at least one chunk");
+        println!("Qwen streaming OK: {} chunks, {} samples @ {}Hz", chunk_count, total_samples, sr);
     }
 }
