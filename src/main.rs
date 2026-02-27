@@ -14,6 +14,8 @@ mod cron;
 mod errors;
 mod heartbeat;
 mod lms;
+#[cfg(feature = "voice")]
+mod realtime;
 mod providers;
 mod repl;
 mod server;
@@ -149,6 +151,68 @@ enum Commands {
         #[command(subcommand)]
         action: EvalAction,
     },
+    /// Start realtime voice session with LLM agent.
+    #[cfg(feature = "voice")]
+    Realtime {
+        /// TTS engine: pocket, kokoro, qwen, qwenLarge.
+        #[arg(long, default_value = "pocket")]
+        engine: String,
+        /// Voice name for Qwen engines (e.g., ryan, serena).
+        #[arg(long, default_value = "ryan")]
+        voice: String,
+        /// Session ID.
+        #[arg(short, long, default_value = "realtime:default")]
+        session: String,
+        /// Use local LLM instead of cloud API.
+        #[arg(short, long)]
+        local: bool,
+    },
+    /// Start WebSocket server for OpenAI-compatible realtime API.
+    #[cfg(feature = "voice")]
+    #[command(name = "realtime-server")]
+    RealtimeServer {
+        /// Port to listen on.
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+        /// TTS engine: pocket, kokoro, qwen, qwenLarge.
+        #[arg(long, default_value = "pocket")]
+        engine: String,
+        /// Voice name for TTS.
+        #[arg(long, default_value = "ryan")]
+        voice: String,
+        /// Host to bind to.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// Manage voice profiles and voice cloning.
+    #[cfg(feature = "voice")]
+    Voice {
+        #[command(subcommand)]
+        action: VoiceAction,
+    },
+}
+
+#[cfg(feature = "voice")]
+#[derive(Subcommand)]
+enum VoiceAction {
+    /// List available voices for the specified TTS engine.
+    List {
+        /// TTS engine: pocket, kokoro, qwen, qwenLarge.
+        #[arg(long, default_value = "qwen")]
+        engine: String,
+    },
+    /// Clone a voice from a reference audio file (requires QwenLarge).
+    Clone {
+        /// Name for the cloned voice profile.
+        name: String,
+        /// Path to reference audio file (.wav).
+        audio: String,
+        /// Optional transcript of the reference audio.
+        #[arg(short, long)]
+        transcript: Option<String>,
+    },
+    /// Show voice configuration help.
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -567,6 +631,28 @@ fn main() {
                     indexed, skipped, errors
                 );
             }
+        },
+        #[cfg(feature = "voice")]
+        Commands::Realtime {
+            engine,
+            voice,
+            session,
+            local,
+        } => cli::cmd_realtime(engine, voice, session, local),
+        #[cfg(feature = "voice")]
+        Commands::RealtimeServer {
+            port,
+            engine,
+            voice,
+            host,
+        } => cli::cmd_realtime_server(port, engine, voice, host),
+        #[cfg(feature = "voice")]
+        Commands::Voice { action } => match action {
+            VoiceAction::List { engine } => cli::cmd_voice_list(engine),
+            VoiceAction::Clone { name, audio, transcript } => {
+                cli::cmd_voice_clone(name, audio, transcript)
+            }
+            VoiceAction::Config => cli::cmd_voice_config(),
         },
     }
 }
