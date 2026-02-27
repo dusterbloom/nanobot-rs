@@ -1372,6 +1372,10 @@ pub enum TtsEngineConfig {
     Kokoro,
     Qwen,
     QwenLarge,
+    /// Qwen3 TTS via ONNX Runtime (FP16, ~3GB)
+    QwenOnnx,
+    /// Qwen3 TTS via ONNX Runtime (INT8 quantized, ~1.6GB)
+    QwenOnnxInt8,
 }
 
 /// Voice clone reference for QwenLarge TTS.
@@ -2096,6 +2100,14 @@ mod tests {
             serde_json::to_string(&TtsEngineConfig::QwenLarge).unwrap(),
             r#""qwenLarge""#
         );
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::QwenOnnx).unwrap(),
+            r#""qwenOnnx""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TtsEngineConfig::QwenOnnxInt8).unwrap(),
+            r#""qwenOnnxInt8""#
+        );
     }
 
     #[test]
@@ -2104,10 +2116,30 @@ mod tests {
         let kokoro: TtsEngineConfig = serde_json::from_str(r#""kokoro""#).unwrap();
         let qwen: TtsEngineConfig = serde_json::from_str(r#""qwen""#).unwrap();
         let qwen_large: TtsEngineConfig = serde_json::from_str(r#""qwenLarge""#).unwrap();
+        let qwen_onnx: TtsEngineConfig = serde_json::from_str(r#""qwenOnnx""#).unwrap();
+        let qwen_onnx_int8: TtsEngineConfig = serde_json::from_str(r#""qwenOnnxInt8""#).unwrap();
         assert_eq!(pocket, TtsEngineConfig::Pocket);
         assert_eq!(kokoro, TtsEngineConfig::Kokoro);
         assert_eq!(qwen, TtsEngineConfig::Qwen);
         assert_eq!(qwen_large, TtsEngineConfig::QwenLarge);
+        assert_eq!(qwen_onnx, TtsEngineConfig::QwenOnnx);
+        assert_eq!(qwen_onnx_int8, TtsEngineConfig::QwenOnnxInt8);
+    }
+
+    #[test]
+    fn test_voice_config_qwen_onnx_from_json() {
+        let json = r#"{"voice": {"ttsEngine": "qwenOnnx", "ttsVoice": "serena"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenOnnx);
+        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("serena"));
+    }
+
+    #[test]
+    fn test_voice_config_qwen_onnx_int8_from_json() {
+        let json = r#"{"voice": {"ttsEngine": "qwenOnnxInt8", "ttsVoice": "ryan"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenOnnxInt8);
+        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("ryan"));
     }
 
     #[test]
