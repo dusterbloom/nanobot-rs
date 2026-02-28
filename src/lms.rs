@@ -196,13 +196,7 @@ fn model_matches(loaded: &str, model: &str) -> bool {
     loaded == model || loaded.contains(model) || model.contains(loaded)
 }
 
-fn should_skip_load(loaded: &[String], model: &str, context_length: Option<usize>) -> bool {
-    // If caller requests a specific context length, we must NOT skip because
-    // context changes require an explicit reload.
-    if context_length.is_some() {
-        return false;
-    }
-
+fn should_skip_load(loaded: &[String], model: &str, _context_length: Option<usize>) -> bool {
     loaded.iter().any(|m| model_matches(m, model))
 }
 
@@ -660,9 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_skip_load_when_context_requested() {
+    fn test_should_skip_load_when_loaded_and_context_requested() {
+        // If the model is already loaded, skip regardless of context_length.
+        // Callers that need a forced reload must use reload_model_with_context().
         let loaded = vec!["qwen2.5-coder-7b-instruct-mlx".to_string()];
-        assert!(!should_skip_load(
+        assert!(should_skip_load(
             &loaded,
             "qwen2.5-coder-7b-instruct-mlx",
             Some(6144)

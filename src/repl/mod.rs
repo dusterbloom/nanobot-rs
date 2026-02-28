@@ -1720,6 +1720,30 @@ pub(crate) fn cmd_agent(
             // Cleanup: stop heartbeat, save readline history, kill servers
             heartbeat.stop().await;
             let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
+
+            // Unload trio models so LM Studio returns to just the main model.
+            // Run when trio is enabled and we have any LMS connection (managed or
+            // user-started via localApiBase) — not only when nanobot started the server.
+            if ctx.config.trio.enabled && (ctx.srv.lms_managed || has_remote_local) {
+                let lms_port = if ctx.srv.lms_managed {
+                    ctx.config.agents.defaults.lms_port
+                } else {
+                    // Extract port from localApiBase (e.g. "http://localhost:18080/v1")
+                    ctx.config.agents.defaults.local_api_base
+                        .split(':')
+                        .last()
+                        .and_then(|p| p.split('/').next())
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(ctx.config.agents.defaults.lms_port)
+                };
+                if !ctx.config.trio.router_model.is_empty() {
+                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.router_model).await;
+                }
+                if !ctx.config.trio.specialist_model.is_empty() {
+                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.specialist_model).await;
+                }
+            }
+
             ctx.srv.shutdown();
 
             // Re-index qmd sessions collection so the latest conversation is
