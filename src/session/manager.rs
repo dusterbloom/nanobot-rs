@@ -121,6 +121,8 @@ impl Session {
                 !m.get("_synthetic").and_then(|v| v.as_bool()).unwrap_or(false)
                     // Skip clear markers in the runtime wire history.
                     && m.get("role").and_then(|v| v.as_str()) != Some("clear")
+                    // Skip internal LCM summary entries — not valid wire format.
+                    && m.get("role").and_then(|r| r.as_str()) != Some("summary")
             })
             .map(|m| {
                 let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -139,6 +141,10 @@ impl Session {
                 // Preserve name on tool result messages.
                 if let Some(name) = m.get("name") {
                     msg["name"] = name.clone();
+                }
+                // Preserve _turn field (used by age-based eviction).
+                if let Some(turn) = m.get("_turn") {
+                    msg["_turn"] = turn.clone();
                 }
                 msg
             })
@@ -278,14 +284,17 @@ impl SessionManager {
 
     /// Get all raw messages for a session (for LCM rebuild).
     ///
-    /// Returns the full message array without filtering.
+    /// Returns the full message array without filtering. Loads from disk on cache miss.
     pub async fn get_all_messages(&self, key: &str) -> Vec<Value> {
-        let cache = self.cache.lock().await;
-        if let Some(session) = cache.get(key) {
-            session.messages.clone()
-        } else {
-            Vec::new()
-        }
+        let mut cache = self.cache.lock().await;
+        let session = Self::get_or_create_inner(
+            &mut cache,
+            key,
+            &self.sessions_dir,
+            self.rotation_size_bytes,
+            self.rotation_carry_messages,
+        );
+        session.messages.clone()
     }
 
     /// Persist a session to disk as JSONL.
@@ -913,6 +922,116 @@ mod tests {
         assert_eq!(history[1]["content"], "real answer");
         assert_eq!(history[2]["content"], "follow up");
         assert_eq!(history[3]["content"], "follow up answer");
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 2: get_history must preserve _turn field
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_get_history_preserves_turn_tag() {
+        let mut session = Session::new("test_turn_tag");
+        // Push messages that carry a _turn field (used by age-based eviction).
+        session.messages.push(json!({
+            "role": "user",
+            "content": "hello",
+            "_turn": 1,
+        }));
+        session.messages.push(json!({
+            "role": "assistant",
+            "content": "hi",
+            "_turn": 1,
+        }));
+
+        let history = session.get_history(100, 0);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0].get("_turn").and_then(|v| v.as_u64()),
+            Some(1),
+            "_turn must be preserved on user message"
+        );
+        assert_eq!(
+            history[1].get("_turn").and_then(|v| v.as_u64()),
+            Some(1),
+            "_turn must be preserved on assistant message"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 6: get_history must filter out role:"summary" entries
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_get_history_filters_summary_entries() {
+        let mut session = Session::new("test_summary_filter");
+        session.messages.push(json!({"role": "user", "content": "question"}));
+        session.messages.push(json!({
+            "role": "summary",
+            "content": "This is an internal LCM summary.",
+        }));
+        session.messages.push(json!({"role": "assistant", "content": "answer"}));
+
+        let history = session.get_history(100, 0);
+        // The summary entry must not appear in the wire history.
+        assert!(
+            history.iter().all(|m| {
+                m.get("role").and_then(|r| r.as_str()) != Some("summary")
+            }),
+            "role:summary entries must be filtered from get_history"
+        );
+        assert_eq!(history.len(), 2, "only user + assistant should remain");
+    }
+
+    // ------------------------------------------------------------------
+    // Bug 7: get_all_messages must load from disk on cache miss
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_get_all_messages_loads_from_disk() {
+        let tmp = std::env::temp_dir().join(format!(
+            "nanobot_test_get_all_from_disk_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let sessions_dir = tmp.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Build the JSONL file manually using the same path scheme as
+        // SessionManager::session_path() — key "disk:session", dated today.
+        let safe_key = "disk_session"; // ':' -> '_'
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let file_name = format!("{}_{}.jsonl", safe_key, today);
+        let file_path = sessions_dir.join(&file_name);
+
+        let metadata_line = json!({
+            "_type": "metadata",
+            "created_at": Local::now().to_rfc3339(),
+            "updated_at": Local::now().to_rfc3339(),
+            "metadata": {},
+        });
+        let msg1 = json!({"role": "user", "content": "persisted message", "timestamp": Local::now().to_rfc3339()});
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&metadata_line).unwrap(),
+            serde_json::to_string(&msg1).unwrap(),
+        );
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Create a fresh SessionManager with an empty cache pointing at `sessions_dir`.
+        // We need to reach the internal sessions_dir, so we use `with_tuning` and
+        // then override sessions_dir via a helper. Since sessions_dir is pub, just
+        // build the struct via new() and replace sessions_dir manually.
+        let mut mgr = SessionManager::new(&tmp);
+        mgr.sessions_dir = sessions_dir;
+
+        // Call get_all_messages WITHOUT any prior get_history — cache is cold.
+        let messages = mgr.get_all_messages("disk:session").await;
+        assert!(
+            !messages.is_empty(),
+            "get_all_messages should load from disk on cache miss, got empty vec"
+        );
+        assert_eq!(
+            messages[0].get("content").and_then(|v| v.as_str()),
+            Some("persisted message"),
+        );
     }
 
     #[test]

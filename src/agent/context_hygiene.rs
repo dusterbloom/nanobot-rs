@@ -101,10 +101,14 @@ pub fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
                 let prev_content = get_content(prev);
                 let msg_content = get_content(&message);
                 let combined = format!("{}\n{}", prev_content, msg_content);
+                let turn_tag = prev.get("_turn").cloned();
                 *prev = json!({
                     "role": get_role(&message),
                     "content": combined
                 });
+                if let Some(turn) = turn_tag {
+                    prev["_turn"] = turn;
+                }
                 if let Some(tc) = message.get("tool_calls") {
                     prev["tool_calls"] = tc.clone();
                 }
@@ -569,6 +573,39 @@ mod tests {
 
         let tool_calls = messages[0].get("tool_calls").and_then(|tc| tc.as_array());
         assert!(tool_calls.is_some() && !tool_calls.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_preserves_turn_tag() {
+        // Two consecutive user messages; the first carries _turn: 5.
+        // After merging, the resulting message must still have _turn: 5.
+        let mut messages = vec![
+            json!({
+                "role": "user",
+                "content": "first message",
+                "_turn": 5
+            }),
+            json!({
+                "role": "user",
+                "content": "second message"
+            }),
+        ];
+        merge_consecutive_same_role(&mut messages);
+
+        assert_eq!(messages.len(), 1, "two consecutive user messages should be merged into one");
+        assert!(
+            messages[0]["content"].as_str().unwrap().contains("first message"),
+            "merged content must include first message"
+        );
+        assert!(
+            messages[0]["content"].as_str().unwrap().contains("second message"),
+            "merged content must include second message"
+        );
+        assert_eq!(
+            messages[0].get("_turn").and_then(|v| v.as_u64()),
+            Some(5),
+            "_turn metadata from the first message must be preserved after merge"
+        );
     }
 
     #[test]

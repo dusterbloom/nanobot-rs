@@ -143,6 +143,11 @@ pub(crate) struct TurnContext {
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
+    /// Bug 5 fix: after a compaction swap, ctx.messages shrinks but the LCM
+    /// engine's store_len still reflects the pre-compaction count. This field
+    /// overrides the skip offset used in step_pre_call's ingestion loop so
+    /// that messages are re-ingested from the correct position after a swap.
+    pub(crate) lcm_synced_to: Option<usize>,
 
     // --- Observability ---
     pub(crate) counters: Arc<RuntimeCounters>,
@@ -259,6 +264,18 @@ impl AgentLoopShared {
         drop(core);
 
         let mut ctx = self.prepare_context(msg, text_delta_tx, tool_event_tx, cancellation_token, priority_rx).await;
+
+        // Bug 3 fix: eagerly persist the user message before the LLM call so
+        // it is not lost if the agent crashes mid-turn. Bump new_start so
+        // finalize_response does not double-persist it.
+        if ctx.new_start < ctx.messages.len() {
+            let user_msg = ctx.messages[ctx.new_start].clone();
+            ctx.core.sessions
+                .add_message_raw(&ctx.session_key, &user_msg)
+                .await;
+            ctx.new_start += 1;
+        }
+
         self.run_agent_loop(&mut ctx).await;
         self.finalize_response(ctx).await
     }
@@ -327,19 +344,21 @@ impl AgentLoopShared {
         let mut tools = self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
         // Register lcm_expand tool when LCM is enabled.
+        // Bug 4 fix: do NOT insert a fresh engine here. Only look up an
+        // existing engine so that step_pre_call's rebuild_from_turns path
+        // is not bypassed on session restart. If no engine exists yet, skip
+        // registration — step_pre_call will create/rebuild the engine on the
+        // first iteration and the tool will be available from the next turn.
         if self.lcm_config.enabled {
             let lcm_engine = {
-                let mut engines = self.lcm_engines.lock().await;
-                engines
-                    .entry(session_key.clone())
-                    .or_insert_with(|| {
-                        let config = LcmConfig::from(&self.lcm_config);
-                        Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
-                    })
-                    .clone()
+                let engines = self.lcm_engines.lock().await;
+                engines.get(&session_key).cloned()
             };
-            use crate::agent::lcm::LcmExpandTool;
-            tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
+            if let Some(engine) = lcm_engine {
+                use crate::agent::lcm::LcmExpandTool;
+                tools.register(Box::new(LcmExpandTool::new(engine)));
+            }
+            // Engine will be created/rebuilt in step_pre_call if needed.
         }
 
         // Get session history. Track count so we know where new messages start.
@@ -527,6 +546,7 @@ impl AgentLoopShared {
                 in_flight: compaction_in_flight,
             },
             content_gate,
+            lcm_synced_to: None,
             counters: self.core_handle.counters.clone(),
             flow: FlowControl {
                 force_response: false,
@@ -723,6 +743,12 @@ impl AgentLoopShared {
                 // the perspective of persistence (the session file was rebuilt).
                 ctx.new_start = ctx.messages.len();
                 ctx.flow.iterations_since_compaction = 0;
+                // Bug 5 fix: after compaction ctx.messages shrinks but the LCM
+                // engine's store_len reflects the old count. Override the
+                // skip offset so step_pre_call ingests from index 0 (i.e. all
+                // messages in the new shorter array) instead of skipping past
+                // the end.
+                ctx.lcm_synced_to = Some(0);
             }
         }
 
@@ -895,10 +921,18 @@ impl AgentLoopShared {
             };
 
             // Feed messages into the LCM engine's store (idempotent by index).
+            // Bug 5 fix: after a compaction swap ctx.messages shrinks but
+            // store_len still reflects the pre-compaction count, causing the
+            // loop to skip everything. Use lcm_synced_to (set to 0 after swap)
+            // as the skip offset when it is present.
             {
                 let mut engine = lcm_engine.lock().await;
                 let store_len = engine.store_len();
-                for msg in ctx.messages.iter().skip(store_len) {
+                let skip = ctx.lcm_synced_to.unwrap_or(store_len);
+                // After using the override, reset it so future iterations use
+                // the normal store_len path.
+                ctx.lcm_synced_to = None;
+                for msg in ctx.messages.iter().skip(skip) {
                     engine.ingest(msg.clone());
                 }
             }
@@ -1848,8 +1882,22 @@ impl AgentLoopShared {
 
         // Ensure the final text response is in the messages array for persistence.
         // Without this, text-only responses (no tool calls) would be lost.
+        // Bug 1 fix: if strip_dangling_tool_calls already converted a tool-call
+        // assistant message into a plain text assistant message, merging here
+        // prevents two consecutive assistant messages from being persisted.
         if !ctx.final_content.is_empty() {
-            ctx.messages.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
+            let last_is_assistant = ctx.messages.last()
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                .map(|r| r == "assistant")
+                .unwrap_or(false);
+            if last_is_assistant {
+                if let Some(last) = ctx.messages.last_mut() {
+                    let existing = last.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    last["content"] = json!(format!("{}\n\n{}", existing, ctx.final_content));
+                }
+            } else {
+                ctx.messages.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
+            }
         }
 
         // Update session history — persist full message array including tool calls.

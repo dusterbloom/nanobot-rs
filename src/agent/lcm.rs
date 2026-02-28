@@ -241,7 +241,6 @@ impl LcmEngine {
         
         // Track which raw message IDs have been summarized
         let mut summarized_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
-        let mut last_summary_end: Option<MessageId> = None;
         
         // First pass: ingest all raw messages into store, track summaries
         for turn in turns_to_process {
@@ -290,8 +289,7 @@ impl LcmEngine {
                     for &id in source_ids {
                         summarized_ids.insert(id);
                     }
-                    last_summary_end = Some(*source_ids.last().unwrap_or(&0));
-                    
+
                     // Summaries are NOT added to store - they reference store entries
                 }
                 Turn::Clear => {
@@ -330,9 +328,11 @@ impl LcmEngine {
             });
         }
         
-        // Add raw messages that aren't covered by summaries (after last summary)
-        let start_raw = last_summary_end.map(|id| id + 1).unwrap_or(0);
-        for msg_id in start_raw..engine.store.len() {
+        // Add raw messages that aren't covered by any summary.
+        // Iterate over the full store so that messages with IDs lower than
+        // last_summary_end but not included in any summary (e.g. user messages
+        // when only assistant messages were summarized) are not orphaned.
+        for msg_id in 0..engine.store.len() {
             if !summarized_ids.contains(&msg_id) {
                 let message = engine.store[msg_id].clone();
                 engine.active.push(ContextEntry::Raw { msg_id, message });
@@ -1621,5 +1621,113 @@ mod tests {
             successful,
             models.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug 8: rebuild_from_turns orphans non-contiguous messages
+    //
+    // When a summary covers only non-contiguous source_ids (e.g. [1, 3, 5]),
+    // last_summary_end is set to 5 so start_raw becomes 6.  Messages at IDs
+    // 0, 2, 4 — which are not covered by any summary but sit before
+    // last_summary_end — were silently dropped from the active context.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rebuild_non_contiguous_source_ids() {
+        use crate::agent::protocol::CloudProtocol;
+
+        // Build 8 turns: user0, asst1, user2, asst3, user4, asst5, user6, asst7
+        let turns = vec![
+            Turn::User { content: "user0".into(), media: vec![] },
+            Turn::Assistant { text: Some("asst1".into()), tool_calls: vec![] },
+            Turn::User { content: "user2".into(), media: vec![] },
+            Turn::Assistant { text: Some("asst3".into()), tool_calls: vec![] },
+            Turn::User { content: "user4".into(), media: vec![] },
+            Turn::Assistant { text: Some("asst5".into()), tool_calls: vec![] },
+            Turn::User { content: "user6".into(), media: vec![] },
+            Turn::Assistant { text: Some("asst7".into()), tool_calls: vec![] },
+            // Summary covers only the assistant messages (non-contiguous IDs 1, 3, 5)
+            Turn::Summary {
+                text: "Summary of assistant messages.".into(),
+                source_ids: vec![1, 3, 5],
+                level: 1,
+            },
+        ];
+
+        let protocol = CloudProtocol;
+        let engine = LcmEngine::rebuild_from_turns(
+            &turns,
+            LcmConfig::default(),
+            &protocol,
+            "system prompt",
+        );
+
+        // Collect the msg_ids of all Raw entries in the active context.
+        let raw_ids: Vec<usize> = engine
+            .active
+            .iter()
+            .filter_map(|e| {
+                if let ContextEntry::Raw { msg_id, .. } = e {
+                    Some(*msg_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // IDs 0, 2, 4 are user messages not covered by any summary.
+        // They must appear in active — not orphaned.
+        assert!(
+            raw_ids.contains(&0),
+            "msg_id 0 (user0) must be in active context, got: {:?}",
+            raw_ids
+        );
+        assert!(
+            raw_ids.contains(&2),
+            "msg_id 2 (user2) must be in active context, got: {:?}",
+            raw_ids
+        );
+        assert!(
+            raw_ids.contains(&4),
+            "msg_id 4 (user4) must be in active context, got: {:?}",
+            raw_ids
+        );
+
+        // IDs 6, 7 (after the last summarized ID) must also be in active.
+        assert!(
+            raw_ids.contains(&6),
+            "msg_id 6 (user6) must be in active context, got: {:?}",
+            raw_ids
+        );
+        assert!(
+            raw_ids.contains(&7),
+            "msg_id 7 (asst7) must be in active context, got: {:?}",
+            raw_ids
+        );
+
+        // Summarized IDs (1, 3, 5) must NOT be in active as raw messages.
+        assert!(
+            !raw_ids.contains(&1),
+            "msg_id 1 is summarized — must not appear as Raw, got: {:?}",
+            raw_ids
+        );
+        assert!(
+            !raw_ids.contains(&3),
+            "msg_id 3 is summarized — must not appear as Raw, got: {:?}",
+            raw_ids
+        );
+        assert!(
+            !raw_ids.contains(&5),
+            "msg_id 5 is summarized — must not appear as Raw, got: {:?}",
+            raw_ids
+        );
+
+        // There must be exactly one Summary entry in active.
+        let summary_count = engine
+            .active
+            .iter()
+            .filter(|e| matches!(e, ContextEntry::Summary { .. }))
+            .count();
+        assert_eq!(summary_count, 1, "Expected exactly 1 Summary entry in active");
     }
 }
