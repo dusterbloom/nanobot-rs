@@ -175,10 +175,18 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         }
     }
 
+    // Fetch already-loaded models so we can skip them.
+    let loaded_ids = fetch_lms_loaded_models(native).await;
+
     let mut seen = BTreeSet::new();
     let client = reqwest::Client::new();
     for (model, ctx) in models {
         if !seen.insert(model.clone()) {
+            continue;
+        }
+        // Skip models that are already loaded (fuzzy: either ID contains the other).
+        if loaded_ids.iter().any(|id| lms_model_matches(id, &model)) {
+            info!(model = %model, "remote_lms_prewarm_skipped (already loaded)");
             continue;
         }
         let mut body = serde_json::json!({ "model": model });
@@ -199,6 +207,45 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
             }
         }
     }
+}
+
+/// Fetch the list of currently-loaded model IDs from an LM Studio server.
+///
+/// `native_base` must be the root URL without a trailing slash and without `/v1`
+/// (e.g. `http://host:1234`). Returns an empty vec on any error.
+async fn fetch_lms_loaded_models(native_base: &str) -> Vec<String> {
+    let list_url = format!("{}/api/v1/models", native_base);
+    let resp = match reqwest::get(&list_url).await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let models = match json.get("models").and_then(|m| m.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            let key = m.get("key")?.as_str()?.to_string();
+            let loaded = m
+                .get("loaded_instances")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if loaded { Some(key) } else { None }
+        })
+        .collect()
+}
+
+/// Fuzzy model identity check: matches if either ID contains the other.
+///
+/// Mirrors `lms::model_matches` without depending on the private function.
+fn lms_model_matches(loaded: &str, model: &str) -> bool {
+    loaded == model || loaded.contains(model) || model.contains(loaded)
 }
 
 /// Parse a `/ctx` argument into a byte count.

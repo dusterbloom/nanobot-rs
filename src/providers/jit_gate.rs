@@ -61,7 +61,17 @@ pub async fn warmup_jit_models(base_url: &str, api_key: &str, models: &[&str]) {
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", base_url);
 
+    // Derive the native (non-versioned) base so we can query loaded models.
+    // base_url typically ends with "/v1"; strip it to reach the LMS root.
+    let native_base = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let loaded_ids = fetch_jit_loaded_models(native_base).await;
+
     for model in models {
+        // Skip if already loaded — fuzzy match (either ID contains the other).
+        if loaded_ids.iter().any(|id| jit_model_matches(id, model)) {
+            info!("JIT warmup: '{}' already loaded, skipping", model);
+            continue;
+        }
         info!("JIT warmup: loading model '{}'", model);
         let body = serde_json::json!({
             "model": model,
@@ -99,6 +109,43 @@ pub async fn warmup_jit_models(base_url: &str, api_key: &str, models: &[&str]) {
             }
         }
     }
+}
+
+/// Fetch currently-loaded model IDs from an LM Studio native API endpoint.
+///
+/// `native_base` is the root URL without trailing slash and without `/v1`
+/// (e.g. `http://host:1234`). Returns an empty vec on any error.
+async fn fetch_jit_loaded_models(native_base: &str) -> Vec<String> {
+    let list_url = format!("{}/api/v1/models", native_base);
+    let resp = match reqwest::get(&list_url).await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let models = match json.get("models").and_then(|m| m.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            let key = m.get("key")?.as_str()?.to_string();
+            let loaded = m
+                .get("loaded_instances")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if loaded { Some(key) } else { None }
+        })
+        .collect()
+}
+
+/// Fuzzy model identity check: matches if either ID contains the other.
+fn jit_model_matches(loaded: &str, model: &str) -> bool {
+    loaded == model || loaded.contains(model) || model.contains(loaded)
 }
 
 #[cfg(test)]
