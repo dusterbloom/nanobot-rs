@@ -791,10 +791,7 @@ impl AgentLoopShared {
             };
             ctx.messages.push(json!({
                 "role": "user",
-                "content": format!(
-                    "[system] You just executed a tool that modifies files or runs commands. \
-                     Report the result to the user before making additional tool calls.{budget_note}"
-                )
+                "content": format!("[system] Acknowledged.{budget_note}")
             }));
             ctx.flow.force_response = false;
         }
@@ -1904,13 +1901,12 @@ impl AgentLoopShared {
         // Skip system prompt (index 0) and pre-existing history.
         let new_messages: Vec<Value> = if ctx.new_start < ctx.messages.len() {
             ctx.messages[ctx.new_start..].to_vec()
+        } else if !ctx.final_content.is_empty() {
+            // User message already eagerly persisted (Bug 3 fix, line 274).
+            // Only persist assistant response if present.
+            vec![json!({"role": "assistant", "content": ctx.final_content.clone()})]
         } else {
-            // Fallback: save at least user + assistant text.
-            let mut fallback = vec![json!({"role": "user", "content": ctx.user_content.clone()})];
-            if !ctx.final_content.is_empty() {
-                fallback.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
-            }
-            fallback
+            vec![]
         };
         if !new_messages.is_empty() {
             ctx.core.sessions

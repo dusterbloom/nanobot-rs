@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 /// Read-only tools that benefit from higher repeat limits.
-const READ_TOOL_LIMIT: u32 = 5;
+const READ_TOOL_LIMIT: u32 = 2;
 const READ_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
@@ -113,11 +113,11 @@ mod tests {
     fn test_read_tool_higher_limit() {
         let mut guard = ToolGuard::new(1);
         let a = args(&[("path", "/tmp/a.txt")]);
-        // read_file should allow up to 5 identical calls
-        for _ in 0..5 {
+        // read_file allows 2 identical calls (original + one re-read after modification).
+        for _ in 0..2 {
             assert!(guard.allow("read_file", &a).is_ok());
         }
-        // 6th should be blocked
+        // 3rd identical call is blocked (cache replay handles it).
         assert!(guard.allow("read_file", &a).is_err());
     }
 
@@ -144,7 +144,7 @@ mod tests {
     fn test_list_dir_higher_limit() {
         let mut guard = ToolGuard::new(1);
         let a = args(&[("path", "/tmp")]);
-        for _ in 0..5 {
+        for _ in 0..2 {
             assert!(guard.allow("list_dir", &a).is_ok());
         }
         assert!(guard.allow("list_dir", &a).is_err());
@@ -154,10 +154,20 @@ mod tests {
     fn test_recall_higher_limit() {
         let mut guard = ToolGuard::new(1);
         let a = args(&[("query", "test")]);
-        for _ in 0..5 {
+        for _ in 0..2 {
             assert!(guard.allow("recall", &a).is_ok());
         }
         assert!(guard.allow("recall", &a).is_err());
+    }
+
+    #[test]
+    fn test_read_tool_different_args_unlimited() {
+        let mut guard = ToolGuard::new(1);
+        // Different paths should each get their own counter.
+        for i in 0..10 {
+            let a = args(&[("path", &format!("/tmp/file_{}.txt", i))]);
+            assert!(guard.allow("read_file", &a).is_ok());
+        }
     }
 
     #[test]

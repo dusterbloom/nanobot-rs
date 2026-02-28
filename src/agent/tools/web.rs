@@ -150,7 +150,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web. Returns titles, URLs, and snippets."
+        "Search the web. Returns titles, URLs, and snippets. Use web_fetch to read full content from URLs."
     }
 
     fn parameters(&self) -> serde_json::Value {

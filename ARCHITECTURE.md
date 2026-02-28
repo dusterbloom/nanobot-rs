@@ -116,7 +116,7 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `agent_core.rs` | SwappableCore, RuntimeCounters, AgentHandle structs; core build helpers |
 | `tool_engine.rs` | Tool execution engine (delegated + inline paths) |
 | `tool_runner.rs` | Dedicated tool execution with separate LLM provider |
-| `tool_guard.rs` | Tool dedup/blocking guard — prevents repeated identical tool calls (B9) |
+| `tool_guard.rs` | Tool dedup/blocking guard — prevents repeated identical tool calls; read tools limited to 2 identical calls per turn (B9) |
 | `tool_wiring.rs` | Dynamic per-phase tool registry assembly |
 | `toolplan.rs` | `ToolPlan` / `ToolPlanAction` types for router output |
 | `worker_tools.rs` | Worker-only tools: `verify`, `python_eval`, `diff_apply`, `fmt_convert` |
@@ -691,7 +691,7 @@ Applied to live conversation
 - `tool_engine.rs` — Tool execution engine (delegated + inline paths)
 - `router.rs` — Trio router preflight and dispatch
 - `router_fallback.rs` — Deterministic fallback patterns (9 patterns)
-- `tool_guard.rs` — Tool dedup/blocking guard
+- `tool_guard.rs` — Tool dedup/blocking guard (read-tool limit tightened from 5 to 2)
 - `tool_wiring.rs` — Dynamic per-phase tool registry assembly
 
 **Remaining recommendation:**
