@@ -980,7 +980,14 @@ pub async fn run_tool_loop(
                 } else {
                     tools.execute(&tc.name, tc.arguments.clone()).await
                 };
-                let stripped = strip_tool_output(&result.data);
+                // For web_fetch/web_search: unwrap the JSON envelope so the model
+                // sees clean article text rather than a JSON metadata summary.
+                let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
+                    crate::agent::tools::web::extract_web_content(&result.data)
+                } else {
+                    result.data.clone()
+                };
+                let stripped = strip_tool_output(&raw_data);
                 let (_, metadata) = context_store.store(stripped.clone());
                 let delegation_data = if stripped.len() > config.max_tool_result_chars {
                     // Large result: model sees metadata, uses micro-tools to dig in.

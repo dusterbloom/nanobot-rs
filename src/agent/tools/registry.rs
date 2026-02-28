@@ -12,6 +12,7 @@ use super::{
     WebSearchTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
+use crate::config::schema::JinaReaderConfig;
 
 /// Configuration for building a standard tool registry.
 ///
@@ -33,6 +34,8 @@ pub struct ToolConfig {
     pub search_provider: String,
     /// Base URL of the SearXNG instance (default: "http://localhost:8888").
     pub searxng_url: String,
+    /// Optional Jina Reader config for AI-powered web content extraction.
+    pub jina_config: Option<JinaReaderConfig>,
 }
 
 impl ToolConfig {
@@ -49,6 +52,7 @@ impl ToolConfig {
             exec_working_dir: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
+            jina_config: None,
         }
     }
 }
@@ -289,7 +293,7 @@ impl ToolRegistry {
             )));
         }
         if should_include("web_fetch") {
-            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
+            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars, config.jina_config.clone())));
         }
         if should_include("recall") {
             self.register(Box::new(RecallTool::new(&config.workspace)));

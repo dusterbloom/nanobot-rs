@@ -9,6 +9,7 @@ use reqwest::Client;
 use url::Url;
 
 use super::base::Tool;
+use crate::config::schema::JinaReaderConfig;
 
 /// Shared user-agent string.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
@@ -42,6 +43,20 @@ fn normalize_whitespace(text: &str) -> String {
     let text = re_spaces.replace_all(text, " ");
     let re_newlines = Regex::new(r"\n{3,}").unwrap();
     re_newlines.replace_all(&text, "\n\n").trim().to_string()
+}
+
+/// Extract the `text` field from a web_fetch JSON envelope, falling back to raw input.
+///
+/// This unwraps the JSON overhead so the model sees clean article text instead of
+/// a JSON structure summary. Non-JSON input and JSON without a `text` field are
+/// returned unchanged.
+pub fn extract_web_content(raw: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(text) = parsed.get("text").and_then(|t| t.as_str()) {
+            return text.to_string();
+        }
+    }
+    raw.to_string()
 }
 
 /// Validate a URL: must be http(s) with a valid, non-private domain.
@@ -331,11 +346,12 @@ impl WebSearchTool {
 pub struct WebFetchTool {
     max_chars: usize,
     client: Client,
+    jina_config: Option<JinaReaderConfig>,
 }
 
 impl WebFetchTool {
     /// Create a new web fetch tool.
-    pub fn new(max_chars: usize) -> Self {
+    pub fn new(max_chars: usize, jina_config: Option<JinaReaderConfig>) -> Self {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .user_agent(USER_AGENT)
@@ -343,7 +359,25 @@ impl WebFetchTool {
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Self { max_chars, client }
+        Self { max_chars, client, jina_config }
+    }
+
+    /// Fetch content via Jina Reader and return (markdown_body, jina_url).
+    async fn fetch_via_jina(&self, url: &str, config: &JinaReaderConfig) -> Result<(String, String), String> {
+        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), url);
+        let mut req = self.client.get(&jina_url)
+            .header("Accept", "text/markdown")
+            .header("X-No-Cache", "true");
+        if let Some(key) = &config.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        let resp = req.send().await.map_err(|e| format!("Jina request failed: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("Jina returned {}", status));
+        }
+        let body = resp.text().await.map_err(|e| format!("Jina body read failed: {}", e))?;
+        Ok((body, jina_url))
     }
 }
 
@@ -403,6 +437,40 @@ impl Tool for WebFetchTool {
                 "url": url
             })
             .to_string();
+        }
+
+        // Try Jina Reader first if configured and enabled.
+        if let Some(jina_cfg) = &self.jina_config {
+            if jina_cfg.enabled {
+                match self.fetch_via_jina(url, jina_cfg).await {
+                    Ok((body, jina_url)) => {
+                        let text = normalize_whitespace(&body);
+                        let truncated = text.len() > max_chars;
+                        let final_text = if truncated {
+                            let mut end = max_chars;
+                            while !text.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            text[..end].to_string()
+                        } else {
+                            text
+                        };
+                        return serde_json::json!({
+                            "url": url,
+                            "finalUrl": jina_url,
+                            "status": 200,
+                            "extractor": "jina-reader",
+                            "truncated": truncated,
+                            "length": final_text.len(),
+                            "text": final_text
+                        })
+                        .to_string();
+                    }
+                    Err(e) => {
+                        tracing::warn!("Jina Reader failed for {}: {}. Falling back to direct fetch.", url, e);
+                    }
+                }
+            }
         }
 
         match self.client.get(url).send().await {
@@ -845,13 +913,13 @@ mod tests {
 
     #[test]
     fn test_web_fetch_tool_name() {
-        let tool = WebFetchTool::new(50000);
+        let tool = WebFetchTool::new(50000, None);
         assert_eq!(tool.name(), "web_fetch");
     }
 
     #[test]
     fn test_web_fetch_tool_parameters() {
-        let tool = WebFetchTool::new(50000);
+        let tool = WebFetchTool::new(50000, None);
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["url"].is_object());
@@ -920,7 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_invalid_url() {
-        let tool = WebFetchTool::new(50000);
+        let tool = WebFetchTool::new(50000, None);
         let mut params = HashMap::new();
         params.insert(
             "url".to_string(),
@@ -932,9 +1000,319 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_missing_url() {
-        let tool = WebFetchTool::new(50000);
+        let tool = WebFetchTool::new(50000, None);
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert!(result.contains("url parameter is required"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Jina Reader tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_jina_url_construction() {
+        let config = JinaReaderConfig {
+            enabled: true,
+            url: "https://r.jina.ai".to_string(),
+            api_key: None,
+        };
+        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), "https://www.bbc.com/news");
+        assert_eq!(jina_url, "https://r.jina.ai/https://www.bbc.com/news");
+    }
+
+    #[test]
+    fn test_jina_url_construction_trailing_slash() {
+        let config = JinaReaderConfig {
+            enabled: true,
+            url: "https://r.jina.ai/".to_string(),
+            api_key: None,
+        };
+        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), "https://example.com");
+        assert_eq!(jina_url, "https://r.jina.ai/https://example.com");
+    }
+
+    #[test]
+    fn test_jina_config_defaults() {
+        let json = r#"{}"#;
+        let config: JinaReaderConfig = serde_json::from_str(json).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.url, "https://r.jina.ai");
+        assert!(config.api_key.is_none());
+    }
+
+    #[test]
+    fn test_web_fetch_without_jina() {
+        // WebFetchTool with None jina_config should work (backward compat)
+        let tool = WebFetchTool::new(10000, None);
+        assert_eq!(tool.name(), "web_fetch");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline tests: what the main model sees after processing
+    // -----------------------------------------------------------------------
+
+    /// Realistic BBC-like web_fetch result fixture (~2300 chars of article text).
+    fn bbc_web_fetch_fixture() -> String {
+        let article_text = r#"# UK Economy Grows Faster Than Expected
+
+The UK economy grew by 0.4% in the last quarter, beating analyst forecasts of 0.2%.
+
+## Key Figures
+
+- GDP growth: 0.4% quarter-on-quarter
+- Services sector: +0.6%
+- Manufacturing: +0.1%
+- Construction: -0.2%
+
+## Analysis
+
+The stronger-than-expected growth was driven primarily by the services sector, which accounts
+for around 80% of the UK economy. Consumer spending rose 0.5% as real wages increased for the
+sixth consecutive month.
+
+The Bank of England is expected to hold interest rates at their current level at next month's
+meeting, though some economists are now pricing in a cut before year-end.
+
+Finance Minister Sarah Johnson welcomed the figures: "Today's data shows that the UK economy
+is resilient and growing. We are seeing the results of our long-term economic plan."
+
+Opposition economists noted that growth remains below the G7 average and cautioned against
+over-optimism given global trade uncertainty and elevated energy costs.
+
+## Market Reaction
+
+The pound rose 0.3% against the dollar to 1.2850 following the data release. The FTSE 100
+gained 0.4%, with banking stocks leading the advance.
+
+Ten-year gilt yields fell slightly to 4.12% as traders revised down expectations for further
+rate rises.
+
+## What Comes Next
+
+The ONS will release revised figures in six weeks. Analysts expect the Q1 revision to show
+growth of 0.3-0.5%, broadly in line with today's preliminary estimate.
+
+The next GDP release, covering Q2, is scheduled for August 14th."#;
+
+        serde_json::json!({
+            "url": "https://www.bbc.com/news/business/uk-economy-q1",
+            "finalUrl": "https://www.bbc.com/news/business/uk-economy-q1",
+            "status": 200,
+            "extractor": "readability",
+            "truncated": false,
+            "length": article_text.len(),
+            "text": article_text
+        })
+        .to_string()
+    }
+
+    // Re-export the production function so tests can call it by the same name.
+    use super::extract_web_content;
+
+    /// Show side-by-side what the main model sees under three approaches:
+    ///
+    /// 1. **Passthrough** – raw web_fetch JSON envelope (or truncated at max_chars)
+    /// 2. **ContextStore** – metadata string produced by `ContextStore::store()`
+    /// 3. **ContentGate** – structural briefing from `ContentGate::admit_simple()`
+    ///
+    /// Asserts that passthrough contains actual article text while the
+    /// summarized forms do not.
+    #[test]
+    fn test_web_fetch_passthrough_vs_summarized() {
+        use crate::agent::context_gate::ContentGate;
+        use crate::agent::context_store::ContextStore;
+        use std::path::PathBuf;
+
+        let raw = bbc_web_fetch_fixture();
+
+        // ----------------------------------------------------------------
+        // Approach 1: Passthrough – the raw JSON string the tool returns.
+        // In the simplest case the agent loop just injects `raw` verbatim.
+        // ----------------------------------------------------------------
+        let passthrough = raw.clone();
+
+        // ----------------------------------------------------------------
+        // Approach 2: ContextStore metadata.
+        //
+        // tool_runner.rs line ~984:
+        //   let stripped = strip_tool_output(&result.data);
+        //   let (_, metadata) = context_store.store(stripped.clone());
+        //   // For large results the delegation model sees `metadata`.
+        // ----------------------------------------------------------------
+        let mut store = ContextStore::new();
+        let (_var_name, context_store_view) = store.store(raw.clone());
+
+        // ----------------------------------------------------------------
+        // Approach 3: ContentGate admit_simple.
+        //
+        // Use a tiny token budget so the content never "fits" and the gate
+        // always produces a briefing — matching real production behaviour
+        // where web pages exceed the agent's remaining token budget.
+        // ----------------------------------------------------------------
+        let cache_dir = PathBuf::from(std::env::temp_dir()).join("nanobot_test_gate");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        // 50 token budget → raw (≈575 tokens) will not fit → briefing path.
+        let mut gate = ContentGate::new(50, 0.2, cache_dir.clone());
+        let gate_result = gate.admit_simple(&raw);
+        let gate_view = gate_result.into_text();
+
+        // Clean up temp dir (best-effort).
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        // ----------------------------------------------------------------
+        // Print what each approach produces (visible with `-- --nocapture`).
+        // ----------------------------------------------------------------
+        println!("\n=== APPROACH 1: PASSTHROUGH (first 300 chars) ===");
+        println!("{}", &passthrough[..passthrough.len().min(300)]);
+
+        println!("\n=== APPROACH 2: CONTEXT STORE VIEW ===");
+        println!("{}", &context_store_view);
+
+        println!("\n=== APPROACH 3: CONTENT GATE BRIEFING ===");
+        println!("{}", &gate_view);
+
+        // ----------------------------------------------------------------
+        // Assertions
+        // ----------------------------------------------------------------
+
+        // Passthrough contains the actual article text.
+        assert!(
+            passthrough.contains("UK economy grew by 0.4%"),
+            "Passthrough should contain actual article text"
+        );
+        assert!(
+            passthrough.contains("Bank of England"),
+            "Passthrough should contain article body"
+        );
+
+        // ContextStore metadata does NOT contain the article text — only a
+        // short preview of the raw JSON (which starts with the url/status
+        // envelope fields, not the article text).
+        assert!(
+            !context_store_view.contains("Bank of England"),
+            "ContextStore metadata should not contain article body, got: {}",
+            context_store_view
+        );
+        assert!(
+            context_store_view.contains("chars"),
+            "ContextStore metadata should report char count"
+        );
+        assert!(
+            context_store_view.contains("output_0"),
+            "ContextStore metadata should include variable name"
+        );
+
+        // ContentGate briefing does NOT contain the article text — only
+        // structural JSON facts (status, url, extractor, etc.).
+        assert!(
+            !gate_view.contains("Bank of England"),
+            "ContentGate briefing should not contain article body, got: {}",
+            gate_view
+        );
+        // The gate briefing is a JSON structural summary.
+        assert!(
+            gate_view.contains("JSON Summary") || gate_view.contains("Content Summary"),
+            "ContentGate briefing should be a structural summary, got: {}",
+            gate_view
+        );
+    }
+
+    /// Demonstrate that extracting only the `text` field from the web_fetch
+    /// envelope preserves the article content at lower overhead.
+    ///
+    /// Properties verified:
+    /// - Extracted text contains the full article content.
+    /// - Extracted text is smaller than the full JSON envelope (no metadata overhead).
+    /// - `extract_web_content` is a pure function (no I/O, deterministic).
+    #[test]
+    fn test_web_fetch_smart_summary_preserves_content() {
+        let raw = bbc_web_fetch_fixture();
+
+        // Parse the fixture to get the original text length for comparison.
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let original_text = parsed["text"].as_str().unwrap();
+
+        // ----------------------------------------------------------------
+        // Apply the pure extraction function.
+        // ----------------------------------------------------------------
+        let extracted = extract_web_content(&raw);
+
+        println!("\n=== FULL JSON ENVELOPE (chars) ===");
+        println!("{}", raw.len());
+
+        println!("\n=== EXTRACTED TEXT (chars) ===");
+        println!("{}", extracted.len());
+
+        println!("\n=== EXTRACTED TEXT PREVIEW (first 300 chars) ===");
+        println!("{}", &extracted[..extracted.len().min(300)]);
+
+        // ----------------------------------------------------------------
+        // The extracted text must contain the actual article content.
+        // ----------------------------------------------------------------
+        assert!(
+            extracted.contains("UK economy grew by 0.4%"),
+            "Extracted text should contain article headline"
+        );
+        assert!(
+            extracted.contains("Bank of England"),
+            "Extracted text should contain article body"
+        );
+        assert!(
+            extracted.contains("FTSE 100"),
+            "Extracted text should contain market reaction section"
+        );
+
+        // ----------------------------------------------------------------
+        // The extracted text must be the same as the `text` field.
+        // ----------------------------------------------------------------
+        assert_eq!(
+            extracted, original_text,
+            "extract_web_content should return exactly the text field"
+        );
+
+        // ----------------------------------------------------------------
+        // The extracted text is smaller than the full envelope — no url,
+        // status, extractor, length, truncated, or finalUrl overhead.
+        // ----------------------------------------------------------------
+        assert!(
+            extracted.len() < raw.len(),
+            "Extracted text ({} chars) should be smaller than full envelope ({} chars)",
+            extracted.len(),
+            raw.len()
+        );
+
+        let overhead_removed = raw.len() - extracted.len();
+        println!(
+            "\n=== ENVELOPE OVERHEAD REMOVED: {} chars ({:.1}%) ===",
+            overhead_removed,
+            overhead_removed as f64 / raw.len() as f64 * 100.0
+        );
+
+        assert!(
+            overhead_removed > 50,
+            "Should remove at least 50 chars of JSON envelope overhead, removed: {}",
+            overhead_removed
+        );
+
+        // ----------------------------------------------------------------
+        // Robustness: non-JSON input falls back to the raw string.
+        // ----------------------------------------------------------------
+        let plain = "This is plain text, not JSON.";
+        let fallback = extract_web_content(plain);
+        assert_eq!(
+            fallback, plain,
+            "Non-JSON input should fall back to the raw string unchanged"
+        );
+
+        // ----------------------------------------------------------------
+        // Robustness: JSON without a `text` field falls back to raw string.
+        // ----------------------------------------------------------------
+        let no_text_json = r#"{"status": 200, "url": "https://example.com"}"#;
+        let fallback2 = extract_web_content(no_text_json);
+        assert_eq!(
+            fallback2, no_text_json,
+            "JSON without text field should fall back to raw string"
+        );
     }
 }

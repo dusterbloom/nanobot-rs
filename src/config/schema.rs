@@ -479,6 +479,32 @@ impl Default for WebSearchConfig {
     }
 }
 
+fn default_jina_url() -> String {
+    "https://r.jina.ai".to_string()
+}
+
+/// Jina Reader configuration for AI-powered web content extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JinaReaderConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_jina_url")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl Default for JinaReaderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            url: default_jina_url(),
+            api_key: None,
+        }
+    }
+}
+
 /// Web tools configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1569,6 +1595,8 @@ pub struct Config {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub lcm: LcmSchemaConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jina_reader: Option<JinaReaderConfig>,
     #[serde(default)]
     pub model_capabilities:
         HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,

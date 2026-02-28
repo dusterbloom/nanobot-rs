@@ -510,20 +510,27 @@ pub(crate) async fn execute_tools_inline(
             result.ok,
             duration_ms
         );
+        // For web_fetch/web_search: unwrap the JSON envelope so the model
+        // sees clean article text rather than a JSON metadata summary.
+        let result_data = if tc.name == "web_fetch" || tc.name == "web_search" {
+            crate::agent::tools::web::extract_web_content(&result.data)
+        } else {
+            result.data.clone()
+        };
         // Gate tool result through context budget.
         let data = if ctx.core.specialist_provider.is_some()
-            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result.data) > 500
+            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > 500
         {
             ctx.content_gate
                 .admit_with_specialist(
-                    &result.data,
+                    &result_data,
                     ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
                     ctx.core.specialist_model.as_deref().unwrap_or(""),
                 )
                 .await
                 .into_text()
         } else {
-            ctx.content_gate.admit_simple(&result.data).into_text()
+            ctx.content_gate.admit_simple(&result_data).into_text()
         };
         if ctx.core.provenance_config.enabled {
             ContextBuilder::add_tool_result_immutable(
