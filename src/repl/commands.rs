@@ -1515,10 +1515,12 @@ impl ReplContext {
                     }
                 }
 
-                // Update URL in case host/port changed
-                let lms_host = crate::lms::api_host();
-                self.config.agents.defaults.local_api_base =
-                    format!("http://{}:{}/v1", lms_host, lms_port);
+                // Update URL in case host/port changed (only if user has not set an explicit base)
+                if self.config.agents.defaults.local_api_base.is_empty() {
+                    let lms_host = crate::lms::api_host();
+                    self.config.agents.defaults.local_api_base =
+                        format!("http://{}:{}/v1", lms_host, lms_port);
+                }
             }
         }
 
@@ -2311,8 +2313,10 @@ impl ReplContext {
                             self.srv.lms_binary = Some(bin);
                             self.srv.engine = super::InferenceEngine::Lms;
                             self.srv.local_port = lms_port.to_string();
-                            self.config.agents.defaults.local_api_base =
-                                format!("http://{}:{}/v1", crate::lms::api_host(), lms_port);
+                            if self.config.agents.defaults.local_api_base.is_empty() {
+                                self.config.agents.defaults.local_api_base =
+                                    format!("http://{}:{}/v1", crate::lms::api_host(), lms_port);
+                            }
                             self.config.agents.defaults.skip_jit_gate = true;
                         }
                         Err(e) => {

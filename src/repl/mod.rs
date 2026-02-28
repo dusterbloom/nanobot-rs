@@ -993,9 +993,11 @@ pub(crate) fn cmd_agent(
                             srv.lms_managed = true;
                             srv.lms_binary = Some(bin);
                             srv.local_port = lms_port.to_string();
-                            let lms_host = crate::lms::api_host();
-                            config.agents.defaults.local_api_base =
-                                format!("http://{}:{}/v1", lms_host, lms_port);
+                            if config.agents.defaults.local_api_base.is_empty() {
+                                let lms_host = crate::lms::api_host();
+                                config.agents.defaults.local_api_base =
+                                    format!("http://{}:{}/v1", lms_host, lms_port);
+                            }
                             config.agents.defaults.skip_jit_gate = true;
                         }
 
@@ -1139,9 +1141,11 @@ pub(crate) fn cmd_agent(
                         srv.lms_managed = true;
                         srv.lms_binary = Some(bin);
                         srv.local_port = lms_port.to_string();
-                        let lms_host = crate::lms::api_host();
-                        config.agents.defaults.local_api_base =
-                            format!("http://{}:{}/v1", lms_host, lms_port);
+                        if config.agents.defaults.local_api_base.is_empty() {
+                            let lms_host = crate::lms::api_host();
+                            config.agents.defaults.local_api_base =
+                                format!("http://{}:{}/v1", lms_host, lms_port);
+                        }
                         config.agents.defaults.skip_jit_gate = true;
                     }
                     Err(e) => {
@@ -1210,9 +1214,11 @@ pub(crate) fn cmd_agent(
                                     srv.lms_managed = true;
                                     srv.lms_binary = Some(bin);
                                     srv.local_port = lms_port.to_string();
-                                    let lms_host = crate::lms::api_host();
-                                    config.agents.defaults.local_api_base =
-                                        format!("http://{}:{}/v1", lms_host, lms_port);
+                                    if config.agents.defaults.local_api_base.is_empty() {
+                                        let lms_host = crate::lms::api_host();
+                                        config.agents.defaults.local_api_base =
+                                            format!("http://{}:{}/v1", lms_host, lms_port);
+                                    }
                                     config.agents.defaults.skip_jit_gate = true;
                                     fell_back = true;
                                     println!(
