@@ -150,15 +150,7 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         ));
     }
 
-    let role_models_enabled = config.trio.enabled
-        || commands::should_auto_activate_trio(
-            true,
-            &config.trio.router_model,
-            &config.trio.specialist_model,
-            config.trio.router_endpoint.is_some(),
-            config.trio.specialist_endpoint.is_some(),
-            &config.tool_delegation.mode,
-        );
+    let role_models_enabled = config.trio.enabled;
 
     if role_models_enabled {
         if !config.trio.router_model.trim().is_empty() {

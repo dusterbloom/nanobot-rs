@@ -630,19 +630,27 @@ fn make_local_providers(
         })
     };
 
-    let delegation = make_role_provider(
-        "local-delegation",
-        &config.trio.router_endpoint,
-        &config.trio.router_model,
-        delegation_port,
-    );
+    let delegation = if config.tool_delegation.enabled || config.trio.enabled {
+        make_role_provider(
+            "local-delegation",
+            &config.trio.router_endpoint,
+            &config.trio.router_model,
+            delegation_port,
+        )
+    } else {
+        None
+    };
 
-    let specialist = make_role_provider(
-        "local-specialist",
-        &config.trio.specialist_endpoint,
-        &config.trio.specialist_model,
-        specialist_port,
-    );
+    let specialist = if config.trio.enabled {
+        make_role_provider(
+            "local-specialist",
+            &config.trio.specialist_endpoint,
+            &config.trio.specialist_model,
+            specialist_port,
+        )
+    } else {
+        None
+    };
 
     LocalProviders {
         main,

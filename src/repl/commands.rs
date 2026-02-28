@@ -2811,7 +2811,8 @@ pub(crate) fn pick_trio_models(
 /// Returns `true` when all conditions hold:
 /// - Running in local mode (`is_local`)
 /// - Both router and specialist are configured (non-empty model name OR explicit endpoint)
-/// - Not already in `DelegationMode::Trio`
+/// - Currently in the default `DelegationMode::Delegated` state (i.e. the user has not
+///   explicitly opted in to `Trio` or opted out via `Inline`)
 pub(crate) fn should_auto_activate_trio(
     is_local: bool,
     router_model: &str,
@@ -2824,7 +2825,9 @@ pub(crate) fn should_auto_activate_trio(
 
     let has_router = !router_model.is_empty() || has_router_endpoint;
     let has_specialist = !specialist_model.is_empty() || has_specialist_endpoint;
-    is_local && has_router && has_specialist && *current_mode != DelegationMode::Trio
+    // Only auto-activate from the default Delegated mode.
+    // If the user explicitly set Inline or Trio, respect their choice.
+    is_local && has_router && has_specialist && *current_mode == DelegationMode::Delegated
 }
 
 /// Disable trio mode on a Config, switching to inline (single model).
@@ -3583,6 +3586,20 @@ mod tests {
             false,
             false,
             &DelegationMode::Trio,
+        ));
+    }
+
+    #[test]
+    fn test_should_auto_activate_trio_explicit_inline_opt_out() {
+        use crate::config::schema::DelegationMode;
+        // User explicitly set mode: "inline" — must never be overridden by auto-activation.
+        assert!(!should_auto_activate_trio(
+            true,
+            "qwen3-1.7b",
+            "ministral-3-8b",
+            false,
+            false,
+            &DelegationMode::Inline,
         ));
     }
 
