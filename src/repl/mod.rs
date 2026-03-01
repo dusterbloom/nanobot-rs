@@ -1809,6 +1809,27 @@ pub(crate) fn cmd_agent(
 /// errors are logged but never block shutdown.
 fn index_sessions_background() {
     use std::process::Command;
+
+    // Sanitize new/changed JSONL sessions before qmd re-indexes.
+    let script = dirs::home_dir()
+        .map(|h| h.join("Dev/nanobot/scripts/sanitize-sessions.sh"));
+    if let Some(ref path) = script {
+        if path.exists() {
+            match Command::new("bash").arg(path).output() {
+                Ok(out) if out.status.success() => {
+                    debug!("session sanitizer completed");
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warn!("session sanitizer exited with {}: {}", out.status, stderr.trim());
+                }
+                Err(e) => {
+                    warn!("session sanitizer failed: {}", e);
+                }
+            }
+        }
+    }
+
     match Command::new("qmd").args(["update"]).output() {
         Ok(out) if out.status.success() => {
             debug!("qmd update completed (sessions re-indexed)");

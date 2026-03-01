@@ -40,6 +40,16 @@ pub fn search_order(mode: &str) -> Vec<SearchStep> {
     }
 }
 
+/// Split a query into lowercase words suitable for grep matching.
+/// Words shorter than 3 characters are excluded to reduce noise.
+pub fn query_words(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 3)
+        .collect()
+}
+
 /// Tool that searches across all nanobot memory layers.
 pub struct RecallTool {
     workspace: PathBuf,
@@ -103,10 +113,13 @@ impl RecallTool {
 
         if memory_file.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&memory_file).await {
-                let lower_query = query.to_lowercase();
+                let words = query_words(query);
                 let matching_lines: Vec<&str> = content
                     .lines()
-                    .filter(|line| line.to_lowercase().contains(&lower_query))
+                    .filter(|line| {
+                        let lower = line.to_lowercase();
+                        words.iter().any(|w| lower.contains(w.as_str()))
+                    })
                     .collect();
                 if !matching_lines.is_empty() {
                     results.push(format!("## MEMORY.md\n{}", matching_lines.join("\n")));
@@ -131,16 +144,22 @@ impl RecallTool {
                         continue;
                     }
                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        let lower_query = query.to_lowercase();
-                        if content.to_lowercase().contains(&lower_query) {
+                        let words = query_words(query);
+                        if words.is_empty() {
+                            continue;
+                        }
+                        let lower_content = content.to_lowercase();
+                        if words.iter().any(|w| lower_content.contains(w.as_str())) {
                             let filename = path
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("unknown");
-                            // Extract a relevant snippet (lines containing the query).
                             let snippet: Vec<&str> = content
                                 .lines()
-                                .filter(|line| line.to_lowercase().contains(&lower_query))
+                                .filter(|line| {
+                                    let lower = line.to_lowercase();
+                                    words.iter().any(|w| lower.contains(w.as_str()))
+                                })
                                 .take(5)
                                 .collect();
                             results.push(format!("## {}\n{}", filename, snippet.join("\n")));
@@ -420,5 +439,41 @@ mod tests {
                 mode
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // query_words tests (pure function, no IO)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_query_words_splits_and_lowercases() {
+        let words = query_words("ZeroClaw Adoption Plan");
+        assert_eq!(words, vec!["zeroclaw", "adoption", "plan"]);
+    }
+
+    #[test]
+    fn test_query_words_filters_short_words() {
+        let words = query_words("a is the ZeroClaw");
+        assert_eq!(words, vec!["the", "zeroclaw"]);
+    }
+
+    #[test]
+    fn test_query_words_empty_query() {
+        let words = query_words("");
+        assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recall_grep_word_splitting() {
+        let (tmp, tool) = make_tool();
+        std::fs::write(
+            tmp.path().join("memory").join("MEMORY.md"),
+            "- Discussed ZeroClaw features\n- Compared with OpenFang\n- Unrelated line about weather",
+        )
+        .unwrap();
+
+        let result = tool.grep_memory("zeroclaw adoption features", 5).await;
+        assert!(result.contains("ZeroClaw"), "Should find line with 'zeroclaw': {}", result);
+        assert!(!result.contains("weather"), "Should not match unrelated line: {}", result);
     }
 }
