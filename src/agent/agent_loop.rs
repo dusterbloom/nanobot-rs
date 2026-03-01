@@ -196,6 +196,8 @@ pub(crate) struct FlowControl {
     /// Whether the agent-level retry for transient LLM errors has already been used
     /// in this turn. Limits retries to one per iteration to avoid infinite loops.
     pub(crate) agent_retry_attempted: bool,
+    /// Number of auto-continuations used this turn for truncated responses.
+    pub(crate) continuations_used: u32,
 }
 
 /// Shared handles for background compaction coordination.
@@ -1394,6 +1396,88 @@ impl AgentLoopShared {
                 }
             }
             counters.inference_active.store(false, Ordering::Relaxed);
+        }
+
+        // --- Auto-continue: stitch truncated non-empty responses ---
+        let max_cont = ctx.core.max_continuations;
+        while !response.has_tool_calls()
+            && response
+                .content
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            && response.finish_reason == "length"
+            && ctx.flow.continuations_used < max_cont
+        {
+            ctx.flow.continuations_used += 1;
+            info!(
+                "auto_continue: continuation {}/{} — finish_reason was 'length'",
+                ctx.flow.continuations_used, max_cont
+            );
+
+            // Streaming indicator
+            if let Some(ref tx) = ctx.text_delta_tx {
+                let _ = tx.send("\x1b[2m [continuing...]\x1b[0m".to_string());
+            }
+
+            // Build continuation messages: original context + partial as assistant + "Continue."
+            let mut cont_messages = ctx.messages.clone();
+            cont_messages.push(json!({
+                "role": "assistant",
+                "content": response.content.as_deref().unwrap_or("")
+            }));
+            cont_messages.push(json!({
+                "role": "user",
+                "content": "Continue."
+            }));
+
+            // Check cancellation before LLM call
+            if ctx.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                break;
+            }
+
+            counters.inference_active.store(true, Ordering::Relaxed);
+            let cont_result = ctx.core
+                .provider
+                .chat(
+                    &cont_messages,
+                    None,           // no tools during continuation
+                    Some(&ctx.core.model),
+                    ctx.core.max_tokens,
+                    ctx.core.temperature,
+                    None,           // no thinking budget
+                    None,
+                )
+                .await;
+            counters.inference_active.store(false, Ordering::Relaxed);
+
+            match cont_result {
+                Ok(cont_response) => {
+                    // Stream continuation content
+                    if let Some(ref new_text) = cont_response.content {
+                        if let Some(ref tx) = ctx.text_delta_tx {
+                            let _ = tx.send(new_text.clone());
+                        }
+                    }
+
+                    // Stitch content
+                    let original = response.content.take().unwrap_or_default();
+                    let continuation = cont_response.content.unwrap_or_default();
+                    response.content = Some(format!("{}{}", original, continuation));
+
+                    // Update finish_reason (enables next iteration if still "length")
+                    response.finish_reason = cont_response.finish_reason;
+
+                    // Merge usage
+                    for (key, val) in cont_response.usage {
+                        *response.usage.entry(key).or_insert(0) += val;
+                    }
+                }
+                Err(e) => {
+                    warn!("auto_continue: continuation call failed: {}", e);
+                    break;
+                }
+            }
         }
 
         // --- Anti-Drift post-completion: collapse babble ---

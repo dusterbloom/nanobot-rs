@@ -233,6 +233,11 @@ pub struct AgentDefaults {
     /// Not serialized to config.json.
     #[serde(skip)]
     pub skip_jit_gate: bool,
+    /// Maximum number of continuation turns the agent may take after an
+    /// initial response (default: 2). Prevents runaway loops when the model
+    /// keeps appending rather than finishing.
+    #[serde(default = "default_max_continuations")]
+    pub max_continuations: u32,
 }
 
 fn default_workspace() -> String {
@@ -273,6 +278,10 @@ fn default_max_tool_result_chars() -> usize {
     DEFAULT_MAX_TOOL_RESULT_CHARS
 }
 
+fn default_max_continuations() -> u32 {
+    2
+}
+
 fn default_lms_port() -> u16 {
     1234
 }
@@ -295,6 +304,7 @@ impl Default for AgentDefaults {
             max_context_tokens: default_max_context_tokens(),
             max_concurrent_chats: default_max_concurrent_chats(),
             max_tool_result_chars: default_max_tool_result_chars(),
+            max_continuations: default_max_continuations(),
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
             inference_engine: default_inference_engine(),
