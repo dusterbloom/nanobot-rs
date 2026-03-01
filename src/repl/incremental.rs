@@ -12,7 +12,7 @@ use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::util::as_24_bit_terminal_escaped;
 
-use crate::syntax::{SYNTAX_SET, THEME_SET};
+use crate::syntax::{SKIN, SYNTAX_SET, THEME_SET};
 
 /// Streaming state machine for classifying incoming lines.
 enum StreamState {
@@ -43,6 +43,9 @@ pub struct IncrementalRenderer {
     has_partial: bool,
     /// Number of terminal rows the current partial occupies (for multi-row erase).
     partial_rows: usize,
+    /// Buffered table rows (lines starting and ending with `|`) waiting to be
+    /// rendered together through termimad once the table ends.
+    table_buffer: Vec<String>,
 }
 
 // SAFETY: IncrementalRenderer is only ever created, used, and dropped within
@@ -60,6 +63,7 @@ impl IncrementalRenderer {
             first_line: true,
             has_partial: false,
             partial_rows: 0,
+            table_buffer: Vec::new(),
         }
     }
 
@@ -182,10 +186,41 @@ impl IncrementalRenderer {
         }
     }
 
+    /// Flush the buffered table lines through termimad and print them.
+    fn flush_table(&mut self) {
+        if self.table_buffer.is_empty() {
+            return;
+        }
+        if self.first_line {
+            print!("\r\x1b[1m\x1b[97mИ\x1b[0m\n");
+            std::io::stdout().flush().ok();
+        }
+        let mut table_text = self.table_buffer.join("\n");
+        table_text.push('\n');
+        self.table_buffer.clear();
+        let rendered = SKIN.term_text(&table_text).to_string();
+        for line in rendered.lines() {
+            println!("\r  {}", line);
+        }
+        std::io::stdout().flush().ok();
+        self.first_line = false;
+    }
+
     /// Render a single completed line based on current state.
     fn render_line(&mut self, line: &str) {
         // Count words for stats
         self.total_words += line.split_whitespace().count();
+
+        // Table buffering: collect table lines and render via termimad
+        if matches!(self.state, StreamState::Prose) {
+            let trimmed_t = line.trim();
+            if trimmed_t.starts_with('|') && trimmed_t.ends_with('|') {
+                self.table_buffer.push(line.to_string());
+                return;
+            } else if !self.table_buffer.is_empty() {
+                self.flush_table();
+            }
+        }
 
         // Check for code fence transitions
         let trimmed = line.trim_start();
@@ -287,6 +322,9 @@ impl IncrementalRenderer {
             println!("\r\x1b[38;5;240m{}\x1b[0m", "─".repeat(40));
             self.state = StreamState::Prose;
         }
+
+        // Flush any buffered table rows
+        self.flush_table();
 
         // Print stats footer
         let elapsed = self.start_time.elapsed().as_secs_f32();

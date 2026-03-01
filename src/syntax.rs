@@ -17,7 +17,7 @@ pub(crate) static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_def
 pub(crate) static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 /// Shared termimad skin for prose rendering.
-static SKIN: Lazy<MadSkin> = Lazy::new(|| {
+pub(crate) static SKIN: Lazy<MadSkin> = Lazy::new(|| {
     let mut skin = MadSkin::default_dark();
     skin.headers[0].set_fg(Color::Cyan);
     skin.headers[1].set_fg(Color::Cyan);
