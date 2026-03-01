@@ -45,12 +45,15 @@ impl AgentLoopShared {
     ///
     /// Takes a snapshot of `SwappableCore` so the registry is consistent for the
     /// entire message processing.
+    ///
+    /// Returns `(ToolRegistry, SharedEngine)` so the caller can wire the engine
+    /// into [`TurnContext`] for agent-loop-level plan guidance and backtracking.
     pub(crate) async fn build_tools(
         &self,
         core: &SwappableCore,
         channel: &str,
         chat_id: &str,
-    ) -> ToolRegistry {
+    ) -> (ToolRegistry, crate::agent::tools::reasoning_tools::SharedEngine) {
         // Standard stateless tools via unified ToolConfig.
         let tool_config = ToolConfig {
             workspace: core.workspace.clone(),
@@ -296,6 +299,27 @@ impl AgentLoopShared {
             tools.register(Box::new(SendEmailTool::new(email_cfg.clone())));
         }
 
-        tools
+        // Reasoning tools — checkpoint, backtrack, plan (share the engine).
+        // Only registered when reasoning is enabled in config.
+        use crate::agent::reasoning::ReasoningEngine;
+        use crate::agent::tools::reasoning_tools::{
+            BacktrackTool, CheckpointTool, PlanTool, SharedEngine,
+        };
+        let reasoning_engine: SharedEngine =
+            Arc::new(std::sync::Mutex::new(ReasoningEngine::new()));
+        {
+            let mut eng = reasoning_engine.lock().unwrap();
+            eng.set_max_checkpoints(core.reasoning_config.max_checkpoints);
+        }
+        if core.reasoning_config.enabled {
+            let checkpoint_tool = Arc::new(CheckpointTool::new(reasoning_engine.clone()));
+            let backtrack_tool = Arc::new(BacktrackTool::new(reasoning_engine.clone()));
+            let plan_tool = Arc::new(PlanTool::new(reasoning_engine.clone()));
+            tools.register(Box::new(ArcToolProxy(checkpoint_tool)));
+            tools.register(Box::new(ArcToolProxy(backtrack_tool)));
+            tools.register(Box::new(ArcToolProxy(plan_tool)));
+        }
+
+        (tools, reasoning_engine)
     }
 }

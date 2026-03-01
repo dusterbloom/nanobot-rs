@@ -80,6 +80,7 @@ pub struct SwappableCore {
     /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
     pub specialist_output_schema: bool,
     pub trace_log: bool,
+    pub reasoning_config: crate::config::schema::ReasoningConfig,
 }
 
 impl SwappableCore {
@@ -312,6 +313,7 @@ pub struct SwappableCoreConfig {
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub trio_config: TrioConfig,
     pub model_capabilities_overrides: std::collections::HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
+    pub reasoning_config: crate::config::schema::ReasoningConfig,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -340,6 +342,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         specialist_provider,
         trio_config,
         model_capabilities_overrides,
+        reasoning_config,
     } = cfg;
     let model_capabilities = crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
     let router_provider = delegation_provider.clone();
@@ -550,6 +553,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         hygiene_keep_last_messages: memory_config.hygiene.keep_last_messages,
         specialist_output_schema: trio_config.specialist_output_schema,
         trace_log: trio_config.trace_log,
+        reasoning_config,
     }
 }
 

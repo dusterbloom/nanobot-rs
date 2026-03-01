@@ -707,7 +707,7 @@ pub struct AntiDriftConfig {
     /// Pollution score threshold to evict a turn (default: 0.6, requires 2+ signals).
     #[serde(default = "default_pollution_threshold")]
     pub pollution_threshold: f32,
-    /// Max word count before babble collapse fires (default: 200).
+    /// Max word count before babble collapse fires (default: 500).
     #[serde(default = "default_babble_max_tokens")]
     pub babble_max_tokens: usize,
     /// Minimum consecutive identical fingerprints to trigger collapse (default: 3).
@@ -724,7 +724,7 @@ fn default_pollution_threshold() -> f32 {
 }
 
 fn default_babble_max_tokens() -> usize {
-    200
+    500
 }
 
 fn default_repetition_min_count() -> usize {
@@ -1565,6 +1565,51 @@ impl Default for ClusterConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Reasoning engine config
+// ---------------------------------------------------------------------------
+
+/// Configuration for the branching reasoning engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningConfig {
+    /// Enable the reasoning engine (checkpoint/backtrack/plan tools).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Auto-decompose complex tasks for non-thinking models.
+    #[serde(default)]
+    pub auto_decompose: bool,
+
+    /// Maximum number of checkpoints on the stack.
+    #[serde(default = "default_max_checkpoints")]
+    pub max_checkpoints: usize,
+
+    /// Max iterations per plan step before marking it failed.
+    #[serde(default = "default_step_budget")]
+    pub step_budget: u32,
+
+    /// Automatically checkpoint before exec/write_file tools.
+    #[serde(default = "default_auto_checkpoint_before_exec")]
+    pub auto_checkpoint_before_exec: bool,
+}
+
+fn default_max_checkpoints() -> usize { 5 }
+fn default_step_budget() -> u32 { 5 }
+fn default_auto_checkpoint_before_exec() -> bool { true }
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_decompose: false,
+            max_checkpoints: default_max_checkpoints(),
+            step_budget: default_step_budget(),
+            auto_checkpoint_before_exec: default_auto_checkpoint_before_exec(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -1605,6 +1650,8 @@ pub struct Config {
     #[serde(default)]
     pub model_capabilities:
         HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
+    #[serde(default)]
+    pub reasoning: ReasoningConfig,
 }
 
 impl Config {

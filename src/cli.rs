@@ -716,6 +716,7 @@ pub(crate) fn build_core_handle(
         specialist_provider: sp,
         trio_config: config.trio.clone(),
         model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
     });
     let counters = Arc::new(RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker));
     // When main_no_think is enabled, also suppress thinking display from the start
@@ -784,6 +785,7 @@ pub(crate) fn rebuild_core(
         specialist_provider: sp,
         trio_config: config.trio.clone(),
         model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
     });
     // Swap only the core; counters survive.
     handle.swap_core(new_core);

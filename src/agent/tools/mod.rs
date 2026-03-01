@@ -6,6 +6,7 @@ pub mod email;
 pub mod filesystem;
 pub mod message;
 pub mod read_skill;
+pub mod reasoning_tools;
 pub mod recall;
 pub mod registry;
 pub mod shell;

@@ -116,6 +116,9 @@ tiktoken-rs = "0.6"
 # SQLite with FTS5 (context store, budget calibrator, experience buffer)
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Directed Acyclic Graph for reasoning plan decomposition
+daggy = "0.8"
+
 # Email channel (IMAP + SMTP)
 async-imap = "0.10"
 async-native-tls = "0.5"
