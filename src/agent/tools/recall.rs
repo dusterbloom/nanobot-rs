@@ -12,6 +12,34 @@ use tokio::process::Command;
 
 use super::base::Tool;
 
+/// A step in the recall search pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchStep {
+    /// BM25 keyword search via `qmd search`
+    QmdKeyword,
+    /// Vector/semantic search via `qmd vsearch`
+    QmdVsearch,
+    /// Direct grep over MEMORY.md and session files
+    GrepFallback,
+}
+
+/// Returns the ordered list of search steps for the given mode.
+///
+/// In "auto" mode the order is: keyword (BM25) first, then semantic (vsearch),
+/// with grep as the final fallback.  Keyword search works without embeddings
+/// and covers all indexed sessions, so it should be attempted before vsearch.
+pub fn search_order(mode: &str) -> Vec<SearchStep> {
+    match mode {
+        "semantic" => vec![SearchStep::QmdVsearch, SearchStep::GrepFallback],
+        "keyword" => vec![SearchStep::QmdKeyword, SearchStep::GrepFallback],
+        _ => vec![
+            SearchStep::QmdKeyword,
+            SearchStep::QmdVsearch,
+            SearchStep::GrepFallback,
+        ],
+    }
+}
+
 /// Tool that searches across all nanobot memory layers.
 pub struct RecallTool {
     workspace: PathBuf,
@@ -153,7 +181,7 @@ impl Tool for RecallTool {
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "keyword", "semantic"],
-                    "description": "Search mode: 'auto' tries semantic then keyword (default), \
+                    "description": "Search mode: 'auto' tries keyword then semantic (default), \
                                    'keyword' for exact matches, 'semantic' for meaning-based search"
                 }
             },
@@ -174,39 +202,28 @@ impl Tool for RecallTool {
 
         let n = 5;
         let mut sections: Vec<String> = Vec::new();
+        let steps = search_order(mode);
 
-        match mode {
-            "semantic" => {
-                if let Some(results) = self.qmd_vsearch(query, n).await {
-                    sections.push(format!("## Semantic Search Results\n{}", results));
-                } else {
-                    // Fallback to grep.
-                    sections.push(self.grep_memory(query, n).await);
-                }
-            }
-            "keyword" => {
-                if let Some(results) = self.qmd_search(query, n).await {
-                    sections.push(format!("## Keyword Search Results\n{}", results));
-                } else {
-                    sections.push(self.grep_memory(query, n).await);
-                }
-            }
-            _ => {
-                // Auto mode: try semantic first, then keyword, fallback to grep.
-                let mut found = false;
+        let mut found = false;
 
-                if let Some(results) = self.qmd_vsearch(query, n).await {
-                    sections.push(format!("## Semantic Search Results\n{}", results));
-                    found = true;
+        for step in &steps {
+            match step {
+                SearchStep::QmdKeyword => {
+                    if let Some(results) = self.qmd_search(query, n).await {
+                        sections.push(format!("## Keyword Search Results\n{}", results));
+                        found = true;
+                    }
                 }
-
-                if let Some(results) = self.qmd_search(query, n).await {
-                    sections.push(format!("## Keyword Search Results\n{}", results));
-                    found = true;
+                SearchStep::QmdVsearch => {
+                    if let Some(results) = self.qmd_vsearch(query, n).await {
+                        sections.push(format!("## Semantic Search Results\n{}", results));
+                        found = true;
+                    }
                 }
-
-                if !found {
-                    sections.push(self.grep_memory(query, n).await);
+                SearchStep::GrepFallback => {
+                    if !found {
+                        sections.push(self.grep_memory(query, n).await);
+                    }
                 }
             }
         }
@@ -356,5 +373,52 @@ mod tests {
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert!(result.contains("Error"));
+    }
+
+    // ---------------------------------------------------------------
+    // search_order priority tests (pure function, no IO)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_auto_mode_tries_keyword_before_vsearch() {
+        let steps = search_order("auto");
+        let kw_pos = steps.iter().position(|s| *s == SearchStep::QmdKeyword);
+        let vs_pos = steps.iter().position(|s| *s == SearchStep::QmdVsearch);
+        assert!(kw_pos.is_some(), "auto mode must include QmdKeyword");
+        assert!(vs_pos.is_some(), "auto mode must include QmdVsearch");
+        assert!(
+            kw_pos.unwrap() < vs_pos.unwrap(),
+            "In auto mode, keyword (BM25) must be tried BEFORE vsearch (semantic)"
+        );
+    }
+
+    #[test]
+    fn test_auto_mode_pipeline_order() {
+        let steps = search_order("auto");
+        assert_eq!(
+            steps,
+            vec![SearchStep::QmdKeyword, SearchStep::QmdVsearch, SearchStep::GrepFallback],
+            "auto mode pipeline must be: keyword -> vsearch -> grep"
+        );
+    }
+
+    #[test]
+    fn test_keyword_mode_skips_vsearch() {
+        let steps = search_order("keyword");
+        assert!(!steps.contains(&SearchStep::QmdVsearch), "keyword mode must NOT include QmdVsearch");
+        assert_eq!(steps, vec![SearchStep::QmdKeyword, SearchStep::GrepFallback]);
+    }
+
+    #[test]
+    fn test_all_modes_end_with_grep_fallback() {
+        for mode in &["auto", "keyword", "semantic"] {
+            let steps = search_order(mode);
+            assert_eq!(
+                steps.last(),
+                Some(&SearchStep::GrepFallback),
+                "mode '{}' must end with GrepFallback",
+                mode
+            );
+        }
     }
 }
