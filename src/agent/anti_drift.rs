@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn test_collapse_babble_short_passes_through() {
         let mut content = "Short response.".to_string();
-        collapse_babble(&mut content, 200);
+        collapse_babble(&mut content, 500);
         assert_eq!(content, "Short response.");
     }
 
@@ -672,13 +672,13 @@ mod tests {
     fn test_e2e_babble_collapse_two_long_sentences() {
         // Two extremely long sentences that exceed babble_max_tokens.
         // The function should still condense when only 2 sentences exist but they're huge.
-        let long_sentence_a = format!("This is the first sentence with {} padding words.", "very ".repeat(120));
-        let long_sentence_b = format!("And this is the second sentence with {} more padding.", "extra ".repeat(120));
+        let long_sentence_a = format!("This is the first sentence with {} padding words.", "very ".repeat(300));
+        let long_sentence_b = format!("And this is the second sentence with {} more padding.", "extra ".repeat(300));
         let mut content = format!("{} {}", long_sentence_a, long_sentence_b);
         let word_count = content.split_whitespace().count();
-        assert!(word_count > 200, "Test setup: need >200 words, got {}", word_count);
+        assert!(word_count > 500, "Test setup: need >500 words, got {}", word_count);
 
-        collapse_babble(&mut content, 200);
+        collapse_babble(&mut content, 500);
 
         // Should be condensed even with just 2 sentences, since total exceeds max
         assert!(content.len() < long_sentence_a.len() + long_sentence_b.len(),
@@ -702,7 +702,7 @@ mod tests {
         let config = AntiDriftConfig::default();
         post_completion_pipeline(&mut content, &[], &config);
 
-        // After stripping thinking, "Short answer." is < 200 words → no babble collapse
+        // After stripping thinking, "Short answer." is < 500 words → no babble collapse
         assert_eq!(content, "Short answer.",
             "After stripping thinking, short content should pass through unchanged");
     }
@@ -712,7 +712,7 @@ mod tests {
         // When content AFTER thinking strip is still long, babble should fire
         let long_text = format!(
             "First sentence here. Second sentence here. {}",
-            "And then more and more words follow in the third fourth fifth sentences. ".repeat(20)
+            "And then more and more words follow in the third fourth fifth sentences. ".repeat(40)
         );
         let mut content = format!(
             "<thinking>Some thought</thinking>{}",
@@ -721,8 +721,8 @@ mod tests {
 
         // Step 1: strip thinking tags
         content = crate::agent::compaction::strip_thinking_tags(&content);
-        assert!(content.split_whitespace().count() > 200,
-            "Setup: content after strip should exceed 200 words, got {}",
+        assert!(content.split_whitespace().count() > 500,
+            "Setup: content after strip should exceed 500 words, got {}",
             content.split_whitespace().count());
 
         // Step 2: post-completion pipeline
@@ -845,7 +845,7 @@ mod tests {
         assert!(cfg.trio.anti_drift.enabled);
         assert_eq!(cfg.trio.anti_drift.anchor_interval, 3);
         assert!((cfg.trio.anti_drift.pollution_threshold - 0.6).abs() < f32::EPSILON);
-        assert_eq!(cfg.trio.anti_drift.babble_max_tokens, 200);
+        assert_eq!(cfg.trio.anti_drift.babble_max_tokens, 500);
         assert_eq!(cfg.trio.anti_drift.repetition_min_count, 3);
     }
 }
