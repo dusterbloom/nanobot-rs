@@ -21,6 +21,56 @@ use crate::config::schema::TelegramConfig;
 #[cfg(feature = "voice")]
 use crate::voice_pipeline::VoicePipeline;
 
+/// Send "typing..." indicator to a Telegram chat.
+pub async fn tg_send_typing_action(client: &reqwest::Client, token: &str, chat_id: i64) {
+    let url = format!("https://api.telegram.org/bot{}/sendChatAction", token);
+    let _ = client
+        .post(&url)
+        .json(&json!({ "chat_id": chat_id, "action": "typing" }))
+        .send()
+        .await;
+}
+
+/// Send a placeholder "..." message; returns the message_id on success.
+pub async fn tg_send_placeholder(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+) -> Option<i64> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let resp = client
+        .post(&url)
+        .json(&json!({ "chat_id": chat_id, "text": "..." }))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body["result"]["message_id"].as_i64()
+}
+
+/// Edit an existing Telegram message with new text.
+pub async fn tg_edit_message(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let url = format!(
+        "https://api.telegram.org/bot{}/editMessageText",
+        token
+    );
+    let _ = client
+        .post(&url)
+        .json(&json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }))
+        .send()
+        .await;
+}
+
 /// Telegram channel using long-polling.
 pub struct TelegramChannel {
     config: TelegramConfig,
@@ -225,6 +275,8 @@ impl TelegramChannel {
         msg.metadata.insert("user_id".to_string(), json!(user_id));
         msg.metadata.insert("username".to_string(), json!(username));
         msg.metadata.insert("is_group".to_string(), json!(is_group));
+        msg.metadata
+            .insert("bot_token".to_string(), json!(token));
 
         if is_voice_message {
             msg.metadata
@@ -389,6 +441,17 @@ impl Channel for TelegramChannel {
             return Err(anyhow::anyhow!("Telegram bot token not configured"));
         }
 
+        // If streaming already delivered the message, skip the duplicate send.
+        let streaming_handled = msg
+            .metadata
+            .get("streaming_handled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if streaming_handled {
+            debug!("Telegram send: skipping — message already delivered via streaming");
+            return Ok(());
+        }
+
         let chat_id: i64 = msg
             .chat_id
             .parse()
@@ -467,7 +530,7 @@ impl Channel for TelegramChannel {
             Ok(_) => {
                 // Fallback to plain text if HTML fails.
                 warn!("HTML parse failed, falling back to plain text");
-                let _ = self
+                let fallback = self
                     .client
                     .post(&url)
                     .json(&json!({
@@ -476,6 +539,9 @@ impl Channel for TelegramChannel {
                     }))
                     .send()
                     .await;
+                if let Err(e) = fallback {
+                    warn!("Plain-text fallback also failed: {}", e);
+                }
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!("Failed to send Telegram message: {}", e)),

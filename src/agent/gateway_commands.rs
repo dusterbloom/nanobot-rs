@@ -98,6 +98,9 @@ async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     let core = shared.core_handle.swappable();
     core.working_memory.clear(session_key);
     core.sessions.clear_history(session_key).await;
+    let mut engines = shared.lcm_engines.lock().await;
+    engines.remove(session_key);
+    drop(engines);
     "Working memory and history cleared.".to_string()
 }
 

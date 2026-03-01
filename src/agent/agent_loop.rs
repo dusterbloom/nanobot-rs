@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::agent::audit::{AuditLog, ToolEvent};
+use crate::errors::is_retryable_provider_error;
 use crate::agent::anti_drift;
 use crate::agent::context_hygiene;
 use crate::agent::policy;
@@ -186,6 +187,9 @@ pub(crate) struct FlowControl {
     pub(crate) consecutive_all_blocked: u32,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
+    /// Whether the agent-level retry for transient LLM errors has already been used
+    /// in this turn. Limits retries to one per iteration to avoid infinite loops.
+    pub(crate) agent_retry_attempted: bool,
 }
 
 /// Shared handles for background compaction coordination.
@@ -559,6 +563,7 @@ impl AgentLoopShared {
                 content_was_streamed: false,
                 consecutive_all_blocked: 0,
                 llm_call_start: None,
+                agent_retry_attempted: false,
             },
             health_registry: self.health_registry.clone(),
             taint_state: crate::agent::taint::TaintState::new(),
@@ -1311,6 +1316,12 @@ impl AgentLoopShared {
             {
                 Ok(s) => s,
                 Err(e) => {
+                    if !ctx.flow.agent_retry_attempted && is_retryable_provider_error(&e) {
+                        ctx.flow.agent_retry_attempted = true;
+                        warn!(model = %ctx.core.model, error = %e, "llm_stream_call_failed_retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        return StepResult::Done(IterationOutcome::Continue);
+                    }
                     counters.inference_active.store(false, Ordering::Relaxed);
                     error!(model = %ctx.core.model, error = %e, "llm_stream_call_failed");
                     return StepResult::Done(IterationOutcome::Error(
@@ -1406,6 +1417,12 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    if !ctx.flow.agent_retry_attempted && is_retryable_provider_error(&e) {
+                        ctx.flow.agent_retry_attempted = true;
+                        warn!(model = %ctx.core.model, error = %e, "llm_call_failed_retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        return StepResult::Done(IterationOutcome::Continue);
+                    }
                     counters.inference_active.store(false, Ordering::Relaxed);
                     error!(model = %ctx.core.model, error = %e, "llm_call_failed");
                     return StepResult::Done(IterationOutcome::Error(
@@ -2539,26 +2556,135 @@ impl AgentLoop {
                     ));
                 }
 
-                let response = shared.process_message(&msg, None, None, None, None).await;
+                // For Telegram: set up streaming with typing indicator + progressive edits.
+                let (stream_tx, stream_is_telegram) = if msg.channel == "telegram" {
+                    let bot_token = msg
+                        .metadata
+                        .get("bot_token")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let chat_id_str = msg.chat_id.clone();
+                    if !bot_token.is_empty() {
+                        let chat_id_num: i64 = chat_id_str.parse().unwrap_or(0);
+                        let (delta_tx, mut delta_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
+                        let stream_client = reqwest::Client::new();
+                        let stream_token = bot_token.clone();
+                        tokio::spawn(async move {
+                            crate::channels::telegram::tg_send_typing_action(
+                                &stream_client,
+                                &stream_token,
+                                chat_id_num,
+                            )
+                            .await;
+                            let msg_id = crate::channels::telegram::tg_send_placeholder(
+                                &stream_client,
+                                &stream_token,
+                                chat_id_num,
+                            )
+                            .await;
+                            let Some(message_id) = msg_id else {
+                                while delta_rx.recv().await.is_some() {}
+                                return;
+                            };
+                            let mut accumulated = String::new();
+                            let mut dirty = false;
+                            let mut interval =
+                                tokio::time::interval(std::time::Duration::from_millis(500));
+                            interval.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                            loop {
+                                tokio::select! {
+                                    delta = delta_rx.recv() => {
+                                        match delta {
+                                            Some(chunk) => {
+                                                accumulated.push_str(&chunk);
+                                                dirty = true;
+                                            }
+                                            None => {
+                                                if dirty && !accumulated.is_empty() {
+                                                    crate::channels::telegram::tg_edit_message(
+                                                        &stream_client,
+                                                        &stream_token,
+                                                        chat_id_num,
+                                                        message_id,
+                                                        &accumulated,
+                                                    )
+                                                    .await;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ = interval.tick() => {
+                                        if dirty && !accumulated.is_empty() {
+                                            crate::channels::telegram::tg_edit_message(
+                                                &stream_client,
+                                                &stream_token,
+                                                chat_id_num,
+                                                message_id,
+                                                &accumulated,
+                                            )
+                                            .await;
+                                            dirty = false;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        (Some(delta_tx), true)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    (None, false)
+                };
 
-                if let Some(outbound) = response {
-                    // Notify REPL about outbound response.
-                    if let Some(ref dtx) = display_tx {
-                        let preview = if outbound.content.len() > 120 {
-                            let end =
-                                crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
-                            format!("{}...", &outbound.content[..end])
-                        } else {
-                            outbound.content.clone()
-                        };
-                        let _ = dtx.send(format!(
-                            "\x1b[2m[{}]\x1b[0m \x1b[33mbot\x1b[0m: {}",
-                            outbound.channel, preview
-                        ));
+                let response =
+                    shared.process_message(&msg, stream_tx, None, None, None).await;
+
+                let outbound = match response {
+                    Some(mut outbound) => {
+                        if stream_is_telegram {
+                            outbound.metadata.insert(
+                                "streaming_handled".to_string(),
+                                serde_json::json!(true),
+                            );
+                        }
+                        outbound
                     }
-                    if let Err(e) = outbound_tx.send(outbound) {
-                        error!("Failed to publish outbound message: {}", e);
+                    None => {
+                        error!(
+                            channel = %msg.channel,
+                            chat_id = %msg.chat_id,
+                            "process_message returned None; sending error feedback to user"
+                        );
+                        crate::bus::events::OutboundMessage::new(
+                            &msg.channel,
+                            &msg.chat_id,
+                            "[nanobot] Sorry, I encountered an error processing your message. Please try again.",
+                        )
                     }
+                };
+
+                // Notify REPL about outbound response.
+                if let Some(ref dtx) = display_tx {
+                    let preview = if outbound.content.len() > 120 {
+                        let end =
+                            crate::utils::helpers::floor_char_boundary(&outbound.content, 120);
+                        format!("{}...", &outbound.content[..end])
+                    } else {
+                        outbound.content.clone()
+                    };
+                    let _ = dtx.send(format!(
+                        "\x1b[2m[{}]\x1b[0m \x1b[33mbot\x1b[0m: {}",
+                        outbound.channel, preview
+                    ));
+                }
+                if let Err(e) = outbound_tx.send(outbound) {
+                    error!("Failed to publish outbound message: {}", e);
                 }
 
                 drop(permit); // release concurrency slot

@@ -500,23 +500,12 @@ impl SessionManager {
         }
     }
 
-    /// Load a session from its JSONL file on disk.
-    ///
-    /// Tries today's dated file first, then falls back to the legacy
-    /// (undated) file for migration.
+    /// Load a session from today's dated JSONL file on disk.
     fn load_from_disk(key: &str, sessions_dir: &Path) -> Option<Session> {
         let path = Self::session_path(key, sessions_dir);
-        let path = if path.exists() {
-            path
-        } else {
-            // Fall back to legacy undated path for migration.
-            let legacy = Self::legacy_session_path(key, sessions_dir);
-            if legacy.exists() {
-                legacy
-            } else {
-                return None;
-            }
-        };
+        if !path.exists() {
+            return None;
+        }
 
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
@@ -582,7 +571,8 @@ impl SessionManager {
         sessions_dir.join(format!("{}_{}.jsonl", safe_key, date))
     }
 
-    /// Legacy path without date suffix (for migration).
+    /// Legacy path without date suffix (kept for tests).
+    #[allow(dead_code)]
     fn legacy_session_path(key: &str, sessions_dir: &Path) -> PathBuf {
         let safe_key = safe_filename(&key.replace(':', "_"));
         sessions_dir.join(format!("{}.jsonl", safe_key))
