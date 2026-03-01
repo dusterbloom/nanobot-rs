@@ -960,7 +960,11 @@ pub(crate) fn cmd_agent(
     runtime.block_on(async {
         // Create shared core and initial agent loop.
         // Use persisted local model name if available, else hardcoded default.
-        let mut local_model_name: String = if config.agents.defaults.local_model.is_empty() {
+        // Prefer lms_main_model (clean identifier like "nanbeige4.1-3b") over
+        // local_model which may hold a GGUF filename (e.g. "GLM-4.7-Flash-Q4_K_S.gguf").
+        let mut local_model_name: String = if !config.agents.defaults.lms_main_model.is_empty() {
+            config.agents.defaults.lms_main_model.clone()
+        } else if config.agents.defaults.local_model.is_empty() {
             server::DEFAULT_LOCAL_MODEL.to_string()
         } else {
             config.agents.defaults.local_model.clone()
@@ -1176,6 +1180,13 @@ pub(crate) fn cmd_agent(
                 .unwrap_or(18080);
 
             let probe = crate::lms::list_available(peer_port).await;
+            if !probe.is_empty() && config.agents.defaults.lms_main_model.is_empty() {
+                // Remote is alive but lms_main_model is not configured: use the
+                // first loaded model reported by the remote instead of the stale
+                // local_model config value (which may be a GGUF filename like
+                // "GLM-4.7-Flash-Q4_K_S.gguf" that refers to a different model).
+                local_model_name = probe[0].clone();
+            }
             if probe.is_empty() {
                 let dead_url = config.agents.defaults.local_api_base.clone();
                 println!(
