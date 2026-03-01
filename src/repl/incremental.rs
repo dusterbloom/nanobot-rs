@@ -171,8 +171,8 @@ impl IncrementalRenderer {
         // Show partial line (content after last \n) as overwritable.
         // Erase previous partial first — it may span multiple wrapped rows.
         if !self.line_buffer.is_empty() {
-            if self.has_partial && self.partial_rows > 0 {
-                self.erase_n_rows(self.partial_rows);
+            if self.has_partial {
+                self.erase_partial_rows();
             }
             let partial = if matches!(self.state, StreamState::CodeBlock { .. }) {
                 format!("  \x1b[2m{}\x1b[0m", &self.line_buffer)
@@ -437,12 +437,26 @@ impl IncrementalRenderer {
 
     /// Erase all terminal rows occupied by the current partial line.
     fn erase_partial_rows(&self) {
-        let rows = if self.partial_rows > 0 {
-            self.partial_rows
-        } else {
+        let rows = if crate::tui::RESIZE_PENDING.load(std::sync::atomic::Ordering::Relaxed) || self.partial_rows == 0 {
             self.compute_partial_rows()
+        } else {
+            self.partial_rows
         };
         self.erase_n_rows(rows);
+    }
+
+    pub fn notify_resize(&mut self) {
+        if self.has_partial && !self.line_buffer.is_empty() {
+            self.erase_partial_rows();
+            let partial = if matches!(self.state, StreamState::CodeBlock { .. }) {
+                format!("  \x1b[2m{}\x1b[0m", &self.line_buffer)
+            } else {
+                format!("\x1b[2m{}\x1b[0m", &self.line_buffer)
+            };
+            print!("\r\x1b[K{}", partial);
+            std::io::stdout().flush().ok();
+            self.partial_rows = self.compute_partial_rows();
+        }
     }
 
     /// Internal helper to clear partial without borrow issues.

@@ -703,8 +703,12 @@ async fn stream_and_render_inner(
                         None => tool_done = true,
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(1)), if !delta_done => {
+                _ = tokio::time::sleep(Duration::from_millis(100)), if !delta_done => {
                     renderer.tick();
+                    if crate::tui::take_resize_pending() {
+                        crate::tui::reset_scroll_region();
+                        renderer.notify_resize();
+                    }
                 }
             }
         }
@@ -1550,6 +1554,9 @@ pub(crate) fn cmd_agent(
                     .iter()
                     .map(|c| short_channel_name(&c.name))
                     .collect();
+                if tui::take_resize_pending() {
+                    tui::reset_scroll_region();
+                }
                 tui::render_input_bar(&ctx.core_handle, &ch_names, sa_count, bar_needs_push);
                 bar_needs_push = false;
 

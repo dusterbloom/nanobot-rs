@@ -94,6 +94,7 @@ pub fn terminal_writer() -> &'static TerminalWriter {
 /// Prevents double-enter races across the 4 raw mode entry points
 /// (spawn_input_watcher, spawn_interrupt_watcher, voice_read_input, voice recording).
 pub(crate) static RAW_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(crate) static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Enter raw mode if not already active. Returns true if this call entered raw mode.
 pub fn enter_raw_mode() -> bool {
@@ -150,12 +151,18 @@ pub fn register_resize_handler() {
 extern "C" fn sigwinch_handler(_sig: libc::c_int) {
     CACHED_WIDTH.store(0, Ordering::Relaxed);
     CACHED_HEIGHT.store(0, Ordering::Relaxed);
+    RESIZE_PENDING.store(true, Ordering::Relaxed);
 }
 
 /// Invalidate cached terminal dimensions (e.g. after scroll region changes).
 pub fn invalidate_terminal_size() {
     CACHED_WIDTH.store(0, Ordering::Relaxed);
     CACHED_HEIGHT.store(0, Ordering::Relaxed);
+    RESIZE_PENDING.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn take_resize_pending() -> bool {
+    RESIZE_PENDING.swap(false, Ordering::AcqRel)
 }
 
 /// Print the nanobot demoscene-style ASCII logo.
