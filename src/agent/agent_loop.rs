@@ -1456,13 +1456,13 @@ impl AgentLoopShared {
             })
             .collect();
 
-        if let Err(validation_err) = validation::validate_response(content_str, &tool_calls_as_maps) {
-            warn!(
-                model = %ctx.core.model,
-                validation = %format!("{:?}", validation_err),
-                "response_validation_failed"
-            );
-            if !response.has_tool_calls() {
+        match validation::validate_response(content_str, &tool_calls_as_maps) {
+            validation::ValidationOutcome::Error(validation_err) => {
+                warn!(
+                    model = %ctx.core.model,
+                    validation = %format!("{:?}", validation_err),
+                    "response_validation_failed"
+                );
                 let hint = validation::generate_retry_prompt(&validation_err, 1);
                 ctx.messages.push(json!({
                     "role": "assistant",
@@ -1475,6 +1475,13 @@ impl AgentLoopShared {
                 debug!("Injected validation retry hint");
                 return StepResult::Done(IterationOutcome::Continue);
             }
+            validation::ValidationOutcome::StripHallucination => {
+                debug!("Stripping hallucinated tool-call text from response");
+                if let Some(ref mut content) = response.content {
+                    *content = validation::strip_hallucinated_text(content);
+                }
+            }
+            validation::ValidationOutcome::Ok => {}
         }
 
         // --- Strip thinking tags leaked by small models (Qwen3, etc.) ---
