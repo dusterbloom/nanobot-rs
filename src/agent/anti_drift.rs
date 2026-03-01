@@ -104,6 +104,12 @@ pub fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionSc
         signals.push("hallucination_marker");
     }
 
+    // Signal 5: condensed response markers from previous babble collapse
+    if content.contains("[response condensed]") {
+        score += 0.4;
+        signals.push("condensed_marker");
+    }
+
     PollutionScore {
         score: score.min(1.0),
         signals,
@@ -474,6 +480,14 @@ mod tests {
         let msg = json!({"role": "assistant", "content": "Certainly! Absolutely! Of course! I'd be happy to help! Well, basically, essentially, honestly, thank you for asking!"});
         let score = score_message(&msg, &[]);
         assert!(score.signals.contains(&"filler_heavy"), "Expected filler_heavy signal");
+    }
+
+    #[test]
+    fn test_score_message_condensed_marker() {
+        let msg = json!({"role": "assistant", "content": "First sentence. [response condensed]"});
+        let score = score_message(&msg, &[]);
+        assert!(score.score >= 0.4, "Condensed marker message scored {}", score.score);
+        assert!(score.signals.contains(&"condensed_marker"), "Expected condensed_marker signal");
     }
 
     #[test]
