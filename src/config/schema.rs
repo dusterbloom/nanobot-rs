@@ -1601,7 +1601,7 @@ impl Default for ReasoningConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            auto_decompose: false,
+            auto_decompose: true,
             max_checkpoints: default_max_checkpoints(),
             step_budget: default_step_budget(),
             auto_checkpoint_before_exec: default_auto_checkpoint_before_exec(),

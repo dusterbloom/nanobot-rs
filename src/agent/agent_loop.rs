@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::reasoning::{BranchAttempt, ReasoningMode, StepStatus};
+use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::tools::reasoning_tools::SharedEngine;
 use crate::errors::is_retryable_provider_error;
 use crate::agent::anti_drift;
@@ -303,6 +303,29 @@ impl AgentLoopShared {
         streaming = ctx.streaming,
     ))]
     async fn run_agent_loop(&self, ctx: &mut TurnContext) {
+        // Auto-decompose: detect numbered steps in user message and build a plan.
+        // This helps small models that can't call the plan tool themselves.
+        if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
+            if let Ok(engine) = ctx.reasoning.lock() {
+                // Only auto-decompose if no plan exists yet (Linear mode).
+                if *engine.mode() == ReasoningMode::Linear {
+                    drop(engine); // Release lock before re-acquiring mutably
+                    if let Some(steps) = crate::agent::reasoning::parse_numbered_steps(&ctx.user_content) {
+                        let step_budget = ctx.core.reasoning_config.step_budget;
+                        let new_engine = ReasoningEngine::from_goals(&steps, step_budget);
+                        if let Ok(mut engine) = ctx.reasoning.lock() {
+                            *engine = new_engine;
+                            info!(
+                                steps = steps.len(),
+                                first = %steps[0],
+                                "auto_decompose: parsed numbered steps from user message"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         for iteration in 0..ctx.core.max_iterations {
             // Plan-guided: inject current step instruction into conversation.
             {

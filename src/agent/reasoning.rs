@@ -134,6 +134,28 @@ impl ReasoningEngine {
         }
     }
 
+    /// Create a plan-guided engine from a simple list of goal strings.
+    /// Builds a linear dependency chain: step 0 → step 1 → step 2 → ...
+    pub fn from_goals(goals: &[String], step_budget: u32) -> Self {
+        let mut dag: Dag<PlanStep, EdgeType> = Dag::new();
+        let mut prev_idx = None;
+        for (id, goal) in goals.iter().enumerate() {
+            let idx = dag.add_node(PlanStep {
+                id,
+                goal: goal.clone(),
+                status: StepStatus::Pending,
+                result: None,
+                max_iterations: step_budget,
+                iterations_used: 0,
+            });
+            if let Some(prev) = prev_idx {
+                let _ = dag.add_edge(prev, idx, EdgeType::Dependency);
+            }
+            prev_idx = Some(idx);
+        }
+        Self::new_with_plan(dag, step_budget)
+    }
+
     // Checkpoint management
 
     pub fn save_checkpoint(&mut self, label: &str, messages: &[Value], iteration: u32) {
@@ -365,6 +387,48 @@ impl ReasoningEngine {
     }
 }
 
+/// Extract numbered steps from user text.
+///
+/// Recognizes patterns like:
+///   1. Do something
+///   2. Do another thing
+///   3) Third thing
+///
+/// Returns None if fewer than 2 steps found.
+pub fn parse_numbered_steps(text: &str) -> Option<Vec<String>> {
+    let mut steps = Vec::new();
+    let mut expected_num = 1u32;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Match "N. text" or "N) text" or "N: text"
+        let rest = try_strip_number_prefix(trimmed, expected_num);
+        if let Some(goal) = rest {
+            let goal = goal.trim().to_string();
+            if !goal.is_empty() {
+                steps.push(goal);
+                expected_num += 1;
+            }
+        }
+    }
+
+    if steps.len() >= 2 {
+        Some(steps)
+    } else {
+        None
+    }
+}
+
+fn try_strip_number_prefix(line: &str, expected: u32) -> Option<&str> {
+    let num_str = expected.to_string();
+    let stripped = line.strip_prefix(&num_str)?;
+    // After the number, expect '.', ')', or ':'
+    let rest = stripped.strip_prefix('.')
+        .or_else(|| stripped.strip_prefix(')'))
+        .or_else(|| stripped.strip_prefix(':'))?;
+    Some(rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +656,75 @@ mod tests {
         let cp = engine.pop_checkpoint().unwrap();
         assert_eq!(cp.messages.len(), 1); // restored to v1
         assert_eq!(cp.messages[0]["content"], "v1");
+    }
+
+    // --- from_goals tests ---
+
+    #[test]
+    fn test_from_goals_builds_linear_plan() {
+        let goals = vec![
+            "Read the config".to_string(),
+            "Save a checkpoint".to_string(),
+            "Write the summary".to_string(),
+        ];
+        let mut engine = ReasoningEngine::from_goals(&goals, 5);
+        assert_eq!(*engine.mode(), ReasoningMode::PlanGuided);
+
+        let step = engine.current_step().unwrap();
+        assert_eq!(step.goal, "Read the config");
+        assert_eq!(step.id, 0);
+
+        engine.mark_current_completed(None);
+        let next = engine.advance().unwrap();
+        assert_eq!(next.goal, "Save a checkpoint");
+
+        engine.mark_current_completed(None);
+        let next = engine.advance().unwrap();
+        assert_eq!(next.goal, "Write the summary");
+
+        engine.mark_current_completed(None);
+        assert!(engine.is_complete());
+    }
+
+    // --- parse_numbered_steps tests ---
+
+    #[test]
+    fn test_parse_numbered_steps_dot() {
+        let text = "Do this task:\n1. Read the file\n2. Write a summary\n3. Verify output";
+        let steps = parse_numbered_steps(text).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], "Read the file");
+        assert_eq!(steps[1], "Write a summary");
+        assert_eq!(steps[2], "Verify output");
+    }
+
+    #[test]
+    fn test_parse_numbered_steps_paren() {
+        let text = "1) First step\n2) Second step";
+        let steps = parse_numbered_steps(text).unwrap();
+        assert_eq!(steps.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_numbered_steps_too_few() {
+        let text = "Just do one thing";
+        assert!(parse_numbered_steps(text).is_none());
+    }
+
+    #[test]
+    fn test_parse_numbered_steps_with_preamble() {
+        let text = "Break this into steps:\n\n1. Read config\n2. Write file\nSome trailing text";
+        let steps = parse_numbered_steps(text).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], "Read config");
+        assert_eq!(steps[1], "Write file");
+    }
+
+    #[test]
+    fn test_parse_numbered_steps_non_sequential() {
+        // Gaps in numbering should stop parsing
+        let text = "1. First\n3. Third";
+        // Only "1. First" matches expected=1, then expected becomes 2, "3. Third" doesn't match expected=2
+        assert!(parse_numbered_steps(text).is_none());
     }
 }
