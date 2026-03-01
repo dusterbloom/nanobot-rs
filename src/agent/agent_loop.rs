@@ -2414,6 +2414,11 @@ impl AgentLoop {
         }
     }
 
+    /// Clear the bulletin cache (e.g. on /clear command).
+    pub fn clear_bulletin_cache(&self) {
+        self.shared.bulletin_cache.store(Arc::new(String::new()));
+    }
+
     /// Signal the agent loop to stop.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);

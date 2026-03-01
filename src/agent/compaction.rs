@@ -90,6 +90,7 @@ Rules:
 4. Numbers exact, no approximations
 5. No abbreviations, no meta-commentary
 6. Max 10 items per section
+7. TASK must reflect ONLY the most recent user request. Drop earlier topics unless they produced artifacts still needed.
 
 TASK: [full sentence describing goal]
 DECIDED: [key=value for each decision]
@@ -107,7 +108,8 @@ Rules:
 2. Use 'see turn N' pointers instead of repeating content
 3. Max 5 bullets total
 4. No template, no headers — just the bullets
-5. Skip errors unless unresolved";
+5. Skip errors unless unresolved
+6. Focus on the most recent topic. Drop earlier topics unless they produced carry-forward artifacts.";
 
 // ---------------------------------------------------------------------------
 // Gradient Memory (Proprioception Phase 5)
@@ -214,6 +216,7 @@ Rules:
 4. No meta-commentary (no 'I should...', 'Let me...')
 5. Completed tasks: include ONLY if they produced artifacts or facts still needed
 6. ONLY output the filled template, nothing else
+7. RECENCY BIAS: the most recent messages define the Current Task. Earlier topics belong in Completed Tasks (if still relevant) or should be dropped.
 
 ## Completed Tasks
 [Tasks that are finished - include only facts/artifacts still relevant to current work. Omit if nothing carries forward.]

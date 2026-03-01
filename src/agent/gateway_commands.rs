@@ -101,6 +101,7 @@ async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     let mut engines = shared.lcm_engines.lock().await;
     engines.remove(session_key);
     drop(engines);
+    shared.bulletin_cache.store(std::sync::Arc::new(String::new()));
     "Working memory and history cleared.".to_string()
 }
 

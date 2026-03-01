@@ -61,6 +61,11 @@ impl BulletinCache {
         self.cached.store(Arc::new(content));
     }
 
+    /// Clear the cached bulletin (e.g. on /clear command).
+    pub fn clear(&self) {
+        self.cached.store(Arc::new(String::new()));
+    }
+
     /// Get a cloneable handle for sharing across tasks.
     pub fn handle(&self) -> Arc<ArcSwap<String>> {
         self.cached.clone()

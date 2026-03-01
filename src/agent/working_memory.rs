@@ -2,8 +2,7 @@
 //!
 //! Each session gets a file at `{workspace}/memory/sessions/SESSION_{hash}.md`
 //! containing YAML frontmatter + markdown body. Compaction overwrites session
-//! content with a structured template (CONTEXT.md protocol) and also writes
-//! to `{workspace}/CONTEXT-{channel}.md` for direct system prompt injection.
+//! content with a complete snapshot — overwrite, not append.
 //!
 //! Completed sessions can be archived for later reflection by the reflector.
 
@@ -61,7 +60,6 @@ pub struct WorkingSession {
 
 /// Persistent store for per-session working memory files.
 pub struct WorkingMemoryStore {
-    workspace: PathBuf,
     sessions_dir: PathBuf,
     archived_dir: PathBuf,
 }
@@ -72,7 +70,6 @@ impl WorkingMemoryStore {
         let sessions_dir = ensure_dir(workspace.join("memory").join("sessions"));
         let archived_dir = sessions_dir.join("archived");
         Self {
-            workspace: workspace.to_path_buf(),
             sessions_dir,
             archived_dir,
         }
@@ -178,7 +175,6 @@ impl WorkingMemoryStore {
     ///
     /// Overwrites instead of appending — the structured template output
     /// from each compaction is a complete snapshot, not an increment.
-    /// Also writes to `{workspace}/CONTEXT-{channel}.md` for system prompt injection.
     pub fn update_from_compaction(&self, session_key: &str, summary: &str, turn: u64) {
         let mut session = self.get_or_create(session_key);
 
@@ -187,16 +183,6 @@ impl WorkingMemoryStore {
         session.updated = Utc::now();
         session.last_updated_turn = turn;
         self.save(&session);
-
-        // Write per-channel context file for system prompt injection.
-        // Each channel gets its own file (CONTEXT-cli.md, CONTEXT-telegram.md)
-        // so concurrent sessions don't clobber each other.
-        let channel = session_key.split(':').next().unwrap_or("default");
-        let context_filename = format!("CONTEXT-{}.md", channel);
-        let context_path = self.workspace.join(&context_filename);
-        if let Err(e) = std::fs::write(&context_path, summary.trim()) {
-            warn!("Failed to write {}: {}", context_filename, e);
-        }
     }
 
     /// Mark a session as completed.
@@ -222,26 +208,11 @@ impl WorkingMemoryStore {
     }
 
     /// Clear working memory for a session (reset content, keep session file).
-    ///
-    /// Also removes the corresponding `CONTEXT-{channel}.md` file so stale
-    /// compaction summaries are not re-injected into the next system prompt.
     pub fn clear(&self, session_key: &str) {
         let mut session = self.get_or_create(session_key);
         session.content = String::new();
         session.updated = Utc::now();
         self.save(&session);
-
-        // Remove the CONTEXT file written by update_from_compaction().
-        let channel = session_key.split(':').next().unwrap_or("default");
-        let per_channel = self.workspace.join(format!("CONTEXT-{}.md", channel));
-        if per_channel.exists() {
-            let _ = fs::remove_file(&per_channel);
-        }
-        // Also remove legacy fallback if it exists.
-        let legacy = self.workspace.join("CONTEXT.md");
-        if legacy.exists() {
-            let _ = fs::remove_file(&legacy);
-        }
     }
 
     /// List all active sessions.
@@ -521,7 +492,6 @@ mod tests {
     fn test_integration_compaction_to_working_memory_to_context() {
         // Full pipeline: compaction overwrites summary → working memory stores it →
         // get_context returns it for system prompt injection.
-        // Also writes per-channel CONTEXT-{channel}.md to workspace root.
         let tmp = TempDir::new().unwrap();
         let wm = WorkingMemoryStore::new(tmp.path());
 
@@ -546,15 +516,6 @@ mod tests {
             .join("sessions")
             .join(format!("SESSION_{}.md", hash));
         assert!(session_file.exists(), "Session file should exist on disk");
-
-        // Verify per-channel CONTEXT-cli.md was written (channel extracted from session key).
-        let context_file = tmp.path().join("CONTEXT-cli.md");
-        assert!(context_file.exists(), "CONTEXT-cli.md should exist");
-        let context_content = std::fs::read_to_string(&context_file).unwrap();
-        assert!(
-            context_content.contains("async next"),
-            "CONTEXT-cli.md should have latest snapshot"
-        );
     }
 
     #[test]
@@ -646,30 +607,6 @@ mod tests {
         assert!(store.get_context("cli:default", 5000).is_empty());
         let session = store.get_or_create("cli:default");
         assert_eq!(session.status, SessionStatus::Active);
-    }
-
-    #[test]
-    fn test_clear_removes_context_file() {
-        let (tmp, store) = make_store();
-        store.update_from_compaction("cli:default", "Stale task context.", 3);
-
-        let context_file = tmp.path().join("CONTEXT-cli.md");
-        assert!(context_file.exists(), "CONTEXT-cli.md should exist after compaction");
-
-        store.clear("cli:default");
-
-        assert!(!context_file.exists(), "CONTEXT-cli.md should be removed after clear()");
-    }
-
-    #[test]
-    fn test_clear_removes_legacy_context_file() {
-        let (tmp, store) = make_store();
-        let legacy = tmp.path().join("CONTEXT.md");
-        std::fs::write(&legacy, "Legacy stale context.").unwrap();
-
-        store.clear("cli:default");
-
-        assert!(!legacy.exists(), "CONTEXT.md should be removed after clear()");
     }
 
     #[test]

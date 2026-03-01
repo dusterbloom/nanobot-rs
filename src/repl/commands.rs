@@ -1052,6 +1052,7 @@ impl ReplContext {
         core.working_memory.clear(&self.session_id);
         core.sessions.clear_history(&self.session_id).await;
         self.agent_loop.clear_lcm_engine(&self.session_id).await;
+        self.agent_loop.clear_bulletin_cache();
         if had_content {
             println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
         } else {

@@ -201,38 +201,17 @@ impl ContextBuilder {
 
     /// Build the injected context section for the `developer` role message.
     ///
-    /// Contains session context, long-term memory, skills, and subagent
-    /// profiles. Returns an empty string when there is nothing to inject.
+    /// Contains long-term memory, skills, and subagent profiles. Returns an
+    /// empty string when there is nothing to inject. Session context (compaction
+    /// summaries) is injected separately by prepare_context, not here.
     /// On cloud APIs this is emitted as a separate `developer` role message;
     /// on local models it is folded back into the `system` message.
     pub fn build_developer_context(
         &self,
         skill_names: Option<&[String]>,
-        channel: Option<&str>,
+        _channel: Option<&str>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
-
-        // Session context — structured snapshot from last compaction.
-        // Per-channel file (CONTEXT-cli.md, CONTEXT-telegram.md) prevents
-        // concurrent sessions from clobbering each other. Falls back to
-        // legacy CONTEXT.md for backwards compatibility.
-        let context_path = if let Some(ch) = channel {
-            let per_channel = self.workspace.join(format!("CONTEXT-{}.md", ch));
-            if per_channel.exists() {
-                per_channel
-            } else {
-                self.workspace.join("CONTEXT.md")
-            }
-        } else {
-            self.workspace.join("CONTEXT.md")
-        };
-        if context_path.exists() {
-            if let Ok(ctx) = fs::read_to_string(&context_path) {
-                if !ctx.trim().is_empty() {
-                    parts.push(format!("# Session Context\n\n{}", ctx.trim()));
-                }
-            }
-        }
 
         // Memory context (long-term facts only — observations, daily notes, and
         // learnings have been moved out of the system prompt).
@@ -333,8 +312,8 @@ impl ContextBuilder {
     /// developer context). Used by local models and as a convenience method
     /// where a single string is needed.
     ///
-    /// When `channel` is provided, reads `CONTEXT-{channel}.md` for per-channel
-    /// session context (falls back to `CONTEXT.md` for backwards compatibility).
+    /// The `channel` parameter is forwarded to `build_developer_context` for
+    /// API compatibility; session context is injected by prepare_context.
     pub fn build_system_prompt(
         &self,
         skill_names: Option<&[String]>,
