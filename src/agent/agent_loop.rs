@@ -91,6 +91,8 @@ pub(crate) struct AgentLoopShared {
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
+    /// Knowledge store for proactive grounding retrieval.
+    pub(crate) knowledge_store: Option<Arc<std::sync::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -1111,6 +1113,38 @@ impl AgentLoopShared {
             });
         }
 
+        // Proactive grounding: inject relevant knowledge before LLM call.
+        if self.proprioception_config.proactive_retrieval && iteration == 0 {
+            if let Some(user_text) = last_user_message(&ctx.messages) {
+                if !user_text.is_empty() {
+                    let intent = crate::agent::proactive::extract_intent(&user_text);
+                    if intent.confidence >= 0.2 {
+                        let budget = (ctx.core.token_budget.max_context() / 20).min(500);
+                        let learning_context = ctx.core.learning.get_learning_context();
+                        let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock().unwrap());
+                        let ks_ref = ks_guard.as_deref();
+                        let payload = crate::agent::proactive::retrieve_grounding(
+                            &intent, ks_ref, &learning_context, budget,
+                        );
+                        if let Some(text) = crate::agent::proactive::format_grounding_message(&payload) {
+                            debug!(
+                                category = ?intent.category,
+                                confidence = intent.confidence,
+                                snippets = payload.knowledge_snippets.len(),
+                                estimated_tokens = payload.estimated_tokens,
+                                "proactive_grounding_injected"
+                            );
+                            ctx.messages.push(serde_json::json!({
+                                "role": if ctx.core.is_local { "user" } else { "system" },
+                                "content": text,
+                                "_synthetic": true,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
         // Render protocol-correct wire format for the LLM call.
         // `ctx.messages` retains raw format (with metadata) for trimming/LCM.
         // `ctx.rendered_messages` is what gets sent to the provider.
@@ -2009,6 +2043,13 @@ impl AgentLoopShared {
 ///   the `system` argument to `protocol.render()`.
 /// - Any `_turn` / `_synthetic` metadata tags on raw messages are not forwarded
 ///   to the wire output (they are internal-only fields used for trimming).
+fn last_user_message(messages: &[serde_json::Value]) -> Option<String> {
+    messages.iter().rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(|s| s.to_string())
+}
+
 fn render_via_protocol(protocol: &dyn ConversationProtocol, messages: &[Value]) -> Vec<Value> {
     // Extract system prompt from the leading system message (if present).
     let system = messages
@@ -2240,6 +2281,8 @@ impl AgentLoop {
             },
             #[cfg(feature = "cluster")]
             cluster_router: None,
+            knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default().ok()
+                .map(|ks| Arc::new(std::sync::Mutex::new(ks))),
         });
 
         Self {

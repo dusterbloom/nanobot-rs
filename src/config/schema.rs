@@ -1368,6 +1368,10 @@ pub struct ProprioceptionConfig {
     /// Enable the aha channel for priority interrupts (default: true).
     #[serde(default = "default_true")]
     pub aha_channel: bool,
+
+    /// Enable proactive information retrieval before tool calls (default: true).
+    #[serde(default = "default_true")]
+    pub proactive_retrieval: bool,
 }
 
 impl Default for ProprioceptionConfig {
@@ -1381,6 +1385,7 @@ impl Default for ProprioceptionConfig {
             raw_window: default_raw_window(),
             light_window: default_light_window(),
             aha_channel: true,
+            proactive_retrieval: true,
         }
     }
 }
