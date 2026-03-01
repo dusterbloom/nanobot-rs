@@ -381,6 +381,82 @@ impl ReplContext {
             }
         }
 
+        // 2.5. Configured local_api_base remote endpoint (when not covered above)
+        //
+        // When the user points `local_api_base` at a remote server (e.g. LM Studio
+        // on another machine), the cluster peer list may not include it.
+        {
+            let base = current_base.trim().to_string();
+            let already_covered = covered_endpoint
+                .as_deref()
+                .map(|c| c == base)
+                .unwrap_or(false);
+
+            #[cfg(feature = "cluster")]
+            let covered_by_cluster = if !already_covered {
+                if let Some(ref cs) = self.cluster_state {
+                    let peers = cs.get_healthy_peers().await;
+                    peers.iter().any(|p| p.endpoint == base)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            #[cfg(not(feature = "cluster"))]
+            let covered_by_cluster = false;
+
+            if !base.is_empty() && !already_covered && !covered_by_cluster {
+                let models_url = {
+                    let b = base.trim_end_matches('/');
+                    if b.ends_with("/v1") {
+                        format!("{}/models", b)
+                    } else {
+                        format!("{}/v1/models", b)
+                    }
+                };
+
+                let client = reqwest::Client::new();
+                if let Ok(resp) = client
+                    .get(&models_url)
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                            for item in data {
+                                let id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if id.is_empty() || id.to_lowercase().contains("embedding") {
+                                    continue;
+                                }
+                                let is_active = crate::lms::is_model_available(
+                                    &[id.clone()],
+                                    &current_model,
+                                );
+                                entries.push(ModelEntry {
+                                    id,
+                                    source: ModelSource::Remote {
+                                        endpoint: base.clone(),
+                                        #[cfg(feature = "cluster")]
+                                        peer_type: crate::cluster::state::PeerType::Unknown,
+                                        #[cfg(not(feature = "cluster"))]
+                                        peer_type: (),
+                                    },
+                                    is_active,
+                                    is_loaded: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. Filesystem GGUF fallback (only if no LMS and no cluster models)
         if !self.srv.lms_managed && entries.is_empty() {
             let models = crate::server::list_local_models();
