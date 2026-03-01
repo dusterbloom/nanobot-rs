@@ -6,8 +6,8 @@
 
 Nanobot-rs is 87,451 lines of Rust (52K in the agent module alone), built in 8 days, with 1,633 tests. It has **three genuine moats** that no competitor combines:
 
-1. **Voice pipeline** — your own `jack-voice` crate (Whisper STT + Pocket/Kokoro/Qwen TTS + VAD + turn detection), integrated into Telegram voice messages and a realtime voice agent. Nobody in the Rust agent space has this.
-2. **Local-first with real engineering** — JIT gating, Trio mode (router + specialist + main), model capability registry, strict protocol handling, adaptive budget calibration. Not "just point at localhost."
+1. **Voice pipeline** — your own `jack-voice` crate (Whisper STT + Pocket/Kokoro/Qwen TTS + VAD + turn detection), integrated into Telegram voice messages and a realtime full-duplex voice agent via WebSocket server. Nobody in the Rust agent space has this.
+2. **Local-first with real engineering** — JIT gating, Trio mode (router + specialist + main), model capability registry, strict protocol handling, adaptive budget calibration, **LAN cluster discovery** (mDNS + HTTP probe finds Exo/LM Studio/llama.cpp/Jan peers on your home network). Not "just point at localhost."
 3. **Agent intelligence density** — LCM, anti-drift, thread repair, provenance, confidence gating, step voting, context compaction. Research-grade subsystems competitors don't have.
 
 The competition has more channels (OpenFang: 40), more community (Hermes: Nous Research), more footprint efficiency (NullClaw: 678KB), or more corporate backing (Goose: Block/Square). But **nobody has voice + local + agentic for everyday people.** That's the gap.
@@ -37,6 +37,7 @@ The local model support goes far beyond "set API base to localhost":
 - **Model capability registry** (348 LOC) — knows tool_calling support, max output, strict alternation needs for dozens of models
 - **Protocol abstraction** — CloudProtocol vs LocalProtocol with automatic selection
 - **Warmup** — pre-loads models with max_tokens=1 to avoid cold-start on first real use
+- **LAN Cluster** (1,870 LOC) — mDNS browse for Exo nodes + HTTP /24 subnet probe finds LM Studio, llama.cpp, Jan, and Exo peers automatically. `ClusterRouter` does smart Cluster → Local → Cloud fallback. Desktop GPU + laptop + NAS = home inference cluster with zero manual config.
 
 **Known gaps** (all fixable, ~20-30 hours total):
 - LCM compaction ordering broken for small models (trim before ingest — needs inverting)
@@ -153,8 +154,12 @@ Combine cron + voice + web tools:
 
 This is "podcast for one" — personalized, agentic, voice-delivered. Nobody does this.
 
-#### O5. Hardware Appliance Story
+#### O5. Hardware Appliance + Home Cluster Story
 Raspberry Pi 5 + local 3B model + Telegram + voice = a $100 personal AI butler appliance. Pre-flash an SD card image with nanobot pre-configured. The self-hosted community would eat this up.
+
+But it gets better: that Pi auto-discovers the desktop GPU in the office and the Mac Mini in the living room via mDNS. Suddenly the "toy 3B model" can delegate to a 72B model running on Exo across two machines. The cluster makes the Pi the **brain** and the GPUs the **muscle**. No manual config — it just finds them.
+
+This is the story: buy a Pi, plug it in, it finds your GPUs, connects to Telegram, and starts talking to you. $100 entry point, scales to your whole home network.
 
 ---
 
@@ -192,18 +197,21 @@ Telegram is the primary channel. If Telegram restricts bot API (rate limits, voi
 ### Identity: "The open-source voice AI butler that runs on your hardware"
 
 ### Keep (your edge)
-- **Voice pipeline** — `jack-voice` + Telegram voice + realtime mode. THIS is what nobody else has. Make it flawless.
-- **Local-first** — JIT gating, Trio mode, model capability registry, protocol handling. Make it effortless.
+- **Voice pipeline** — `jack-voice` + Telegram voice + WS realtime full-duplex. THIS is what nobody else has. Make it flawless.
+- **Local-first + home cluster** — JIT gating, Trio mode, model capability registry, protocol handling, **LAN discovery** (mDNS + subnet probe finds every GPU in your house). Make it effortless.
 - **Agent intelligence** — LCM, anti-drift, router, budget calibration. This is what makes 3B models usable. Keep it, improve it.
-- **Telegram + Email** — two channels, done right. Telegram for real-time, Email for async.
+- **Telegram + Email** — two channels, done right. Telegram for real-time + voice, Email for async.
 - **Cron scheduling** — the "always-on" glue. Morning briefings, periodic checks, reminders.
 - **Session persistence** — memory is what makes a personal agent personal.
+- **WS realtime server** — the bridge from "Telegram bot" to "talk from any device." OpenAI-compatible protocol means existing realtime clients work for free.
 
 ### Drop
 - **Feishu** — agreed, niche channel with incomplete implementation
 - **WhatsApp** — agreed, reverse-engineered bridge is a liability
-- **Cluster mode** (1,870 LOC) — premature. A personal agent runs on one machine.
-- **WebSocket realtime server for external clients** — keep the internal voice agent, drop the server. You're not competing with OpenAI's realtime API.
+
+### Keep & Polish (revised)
+- **Cluster mode** (1,870 LOC) — NOT premature. Many people have multiple devices at home (desktop GPU + laptop + NAS + Pi). LAN cluster discovery via mDNS + HTTP probe finds Exo/LM Studio/llama.cpp/Jan peers automatically. This IS the "local-first for real people" story — your home IS the data center. Polish: add `nanobot cluster status`, health dashboard, automatic model placement recommendations.
+- **WebSocket realtime server** — this IS the full-duplex voice transport. Without it, voice is limited to async Telegram voice messages and CLI microphone. The WS server enables "talk to nanobot from your phone's browser / a web app / a mobile client." It speaks OpenAI-compatible realtime protocol, so any client built for OpenAI's realtime API works with nanobot too. Polish: complete the audio processing pipeline (currently TODO in handler), add auth, wire up the agent loop.
 
 ### Steal Like an Artist
 
@@ -263,11 +271,17 @@ Telegram is the primary channel. If Telegram restricts bot API (rate limits, voi
 |---------|-----|--------|--------|
 | Feishu channel | ~400 | Delete | Agreed — incomplete, niche |
 | WhatsApp channel | ~800 | Delete | Agreed — fragile reverse-engineered bridge |
-| Cluster/mDNS | 1,870 | Feature-gate, deprioritize | Premature for personal agent |
-| WS realtime server | ~600 | Keep voice_agent, drop ws_server | Not competing with OpenAI |
-| LoRA bridge | 737 | Feature-gate | Cool but not core |
+| LoRA bridge | 737 | Feature-gate | Cool but not core to MVP |
 
-**Reclaimed focus:** ~4,400 LOC of maintenance burden removed, freeing attention for voice + MCP + onboarding.
+**Reclaimed focus:** ~1,900 LOC of maintenance burden removed. Cluster mode and WS realtime server stay — they're core to the "voice + local + multi-device" identity.
+
+### Invest More
+
+| Feature | Current State | Action | Reason |
+|---------|--------------|--------|--------|
+| Cluster mode | 1,870 LOC, discovery + routing works | Add `nanobot cluster status`, auto model placement, health probes | "Your home is the data center" story |
+| WS realtime server | 263 LOC, scaffolding + OpenAI-compat protocol | Wire audio→VAD→STT→agent→TTS→audio pipeline | This is the voice UX for browsers/mobile |
+| Voice pipeline | 2,063 LOC, Telegram voice E2E works | Add wake word, streaming STT, interruption (barge-in) | Polish to compete with Siri/Alexa perception |
 
 ---
 
@@ -276,13 +290,13 @@ Telegram is the primary channel. If Telegram restricts bot API (rate limits, voi
 | Month | Focus | Milestone |
 |-------|-------|-----------|
 | **1** | MCP client + drop Feishu/WhatsApp + CI | nanobot speaks MCP, tests run on every push |
-| **2** | `nanobot setup` wizard + hardware detection | Non-technical user can go 0→working in 10 min |
-| **3** | Wake word + voice pipeline polish | "Hey Nano" works, Telegram voice round-trip <2s |
-| **4** | Agentic Briefings + tool sandbox | Morning briefing demo, Landlock isolation |
-| **5** | Fix local-first gaps (LCM, system prompt, escalation) | Trio mode reliable on 3B models |
-| **6** | Community launch | r/selfhosted post, Docker image, "Getting Started" guide |
+| **2** | `nanobot setup` wizard + hardware detection + cluster status | Non-technical user can go 0→working in 10 min. `nanobot cluster status` shows all GPUs on LAN. |
+| **3** | Wake word + WS realtime voice pipeline completion | "Hey Nano" works. Browser-based full-duplex voice via WS server. Telegram voice round-trip <2s. |
+| **4** | Agentic Briefings + tool sandbox | Morning briefing demo (cron → voice note to Telegram). Landlock isolation for shell tool. |
+| **5** | Fix local-first gaps (LCM, system prompt, escalation) + cluster polish | Trio mode reliable on 3B models. Cluster auto-discovers and routes transparently. Local→cloud escalation on low confidence. |
+| **6** | Community launch | r/selfhosted post, Docker image, Pi SD card image, "Getting Started" guide, demo video ("talk to your AI butler from your phone") |
 
-**Post-6-month:** Skills marketplace, Matrix/Signal channels, streaming STT, voice cloning for personality, Extract `nanobot-lcm` and `nanobot-eval` as standalone crates.
+**Post-6-month:** Skills marketplace, Matrix/Signal channels, streaming STT, voice cloning for personality, cluster model placement optimizer, extract `nanobot-lcm` and `nanobot-eval` as standalone crates.
 
 ---
 
@@ -290,15 +304,16 @@ Telegram is the primary channel. If Telegram restricts bot API (rate limits, voi
 
 > **nanobot** — Your open-source voice AI butler.
 >
-> Runs on your hardware. Speaks to you on Telegram. Remembers everything. Runs tasks on schedule. Never sends your data to the cloud.
+> Runs on your hardware. Speaks to you on Telegram. Talks to you in real-time from any browser. Finds every GPU in your house and uses them all. Remembers everything. Runs tasks on schedule. Never sends your data to the cloud.
 >
-> - Send a voice message: "Remind me to call mom at 5"
+> - Send a voice message on Telegram: "Remind me to call mom at 5"
 > - Get a voice reply: "Got it, I'll remind you at 5pm"
 > - At 5pm, get a voice note: "Time to call mom!"
+> - Open your browser, say "Hey Nano, what's on my calendar tomorrow?" — full-duplex voice, no cloud.
+> - Desktop GPU running LM Studio + laptop with Ollama + Raspberry Pi = your home AI cluster, auto-discovered.
 >
-> Powered by local LLMs (LM Studio, Ollama) or cloud (OpenAI, Anthropic, etc.)
-> Single Rust binary. Deploys to a Raspberry Pi.
-> Open source. MIT licensed.
+> Powered by local LLMs (LM Studio, Ollama, Exo cluster) or cloud (OpenAI, Anthropic, etc.)
+> Single Rust binary. Deploys anywhere. MIT licensed.
 
 Test this on r/selfhosted and r/LocalLLaMA. If it resonates, you have product-market fit for the "always-on voice AI butler" niche — a space nobody owns.
 
@@ -312,4 +327,4 @@ Test this on r/selfhosted and r/LocalLLaMA. If it resonates, you have product-ma
 
 **Don't compete on footprint.** NullClaw ships at 678KB. You ship at whatever `cargo build --release` gives you. That's fine — you have voice, they don't.
 
-**Compete on the intersection nobody occupies:** Voice + Local + Agentic + Always-On + For Real People. That's your space. Own it. Steal the best infrastructure ideas (MCP, sandbox, setup UX) from everyone else, but keep the soul: **an AI that talks to you, runs on your hardware, and works for you around the clock.**
+**Compete on the intersection nobody occupies:** Voice + Local + Multi-Device + Agentic + Always-On + For Real People. That's your space. Own it. Steal the best infrastructure ideas (MCP, sandbox, setup UX, wake word) from everyone else, but keep the soul: **an AI that talks to you, uses every GPU in your house, and works for you around the clock — with zero data leaving your network.**
