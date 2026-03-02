@@ -191,8 +191,7 @@ pub struct AgentDefaults {
     #[serde(default = "default_model")]
     pub model: String,
     /// Preferred local GGUF model filename (e.g. "Qwen3-8B-Q4_K_M.gguf").
-    /// Empty = use hardcoded DEFAULT_LOCAL_MODEL fallback.
-    #[serde(default)]
+    #[serde(default = "default_local_model")]
     pub local_model: String,
     /// Custom API base for local inference (e.g. "http://192.168.1.22:1234/v1").
     /// When set, local mode uses this instead of LM Studio on localhost.
@@ -315,6 +314,10 @@ fn default_lms_port() -> u16 {
     1234
 }
 
+fn default_local_model() -> String {
+    "gemma-3n-e4b-it-Q4_K_M.gguf".to_string()
+}
+
 fn default_inference_engine() -> String {
     "auto".to_string()
 }
@@ -356,7 +359,7 @@ impl Default for AgentDefaults {
         Self {
             workspace: default_workspace(),
             model: default_model(),
-            local_model: String::new(),
+            local_model: default_local_model(),
             local_api_base: String::new(),
             local_max_context_tokens: default_local_max_context_tokens(),
             max_tokens: default_max_tokens(),

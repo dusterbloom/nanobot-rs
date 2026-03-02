@@ -2361,7 +2361,7 @@ impl ReplContext {
                                 let mn = self.current_model_path
                                     .file_name()
                                     .and_then(|n| n.to_str())
-                                    .unwrap_or(server::DEFAULT_LOCAL_MODEL);
+                                    .unwrap_or(&self.config.agents.defaults.local_model);
                                 cli::strip_gguf_suffix(mn).to_string()
                             };
                             let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);

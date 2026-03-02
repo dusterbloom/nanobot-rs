@@ -973,8 +973,6 @@ pub(crate) fn cmd_agent(
         // local_model which may hold a GGUF filename (e.g. "GLM-4.7-Flash-Q4_K_S.gguf").
         let mut local_model_name: String = if !config.agents.defaults.lms_main_model.is_empty() {
             config.agents.defaults.lms_main_model.clone()
-        } else if config.agents.defaults.local_model.is_empty() {
-            server::DEFAULT_LOCAL_MODEL.to_string()
         } else {
             config.agents.defaults.local_model.clone()
         };
@@ -1402,19 +1400,15 @@ pub(crate) fn cmd_agent(
                 tui::print_startup_splash(&local_port, is_local);
             }
 
-            // Load persisted local model preference, falling back to hardcoded default.
+            // Load persisted local model preference.
             let default_model = {
                 let models_dir = dirs::home_dir().unwrap().join("models");
                 let saved = &config.agents.defaults.local_model;
-                if !saved.is_empty() {
-                    let saved_path = models_dir.join(saved);
-                    if saved_path.exists() {
-                        saved_path
-                    } else {
-                        models_dir.join(server::DEFAULT_LOCAL_MODEL)
-                    }
+                let saved_path = models_dir.join(saved);
+                if saved_path.exists() {
+                    saved_path
                 } else {
-                    models_dir.join(server::DEFAULT_LOCAL_MODEL)
+                    models_dir.join(saved)
                 }
             };
 
@@ -1467,11 +1461,7 @@ pub(crate) fn cmd_agent(
                 let mut models_to_warm: Vec<&str> = Vec::new();
 
                 // Main model — always warm so first message is fast.
-                let main_model_ref = if ctx.config.agents.defaults.local_model.is_empty() {
-                    server::DEFAULT_LOCAL_MODEL
-                } else {
-                    &ctx.config.agents.defaults.local_model
-                };
+                let main_model_ref = &ctx.config.agents.defaults.local_model;
                 let main_id = cli::strip_gguf_suffix(main_model_ref);
                 models_to_warm.push(main_id);
 
