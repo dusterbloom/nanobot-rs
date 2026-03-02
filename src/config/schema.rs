@@ -645,6 +645,19 @@ impl Default for ExecToolConfig {
     }
 }
 
+/// Named toolset groupings that can be referenced by channel configs.
+///
+/// Each key is a set name; each value is a list of tool names or `@other_set`
+/// references that expand to the contents of another set (built-in or custom).
+///
+/// Built-in set names: `core`, `web`, `memory`, `read_only`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsetsConfig {
+    #[serde(default)]
+    pub sets: HashMap<String, Vec<String>>,
+}
+
 /// Tools configuration.
 ///
 /// Note: the `exec` field from Python is renamed to `exec_` in Rust to avoid
@@ -656,6 +669,9 @@ pub struct ToolsConfig {
     pub web: WebToolsConfig,
     #[serde(default, rename = "exec")]
     pub exec_: ExecToolConfig,
+    /// Named toolset groupings available to channel configs.
+    #[serde(default)]
+    pub toolsets: Option<ToolsetsConfig>,
 }
 
 // ---------------------------------------------------------------------------
