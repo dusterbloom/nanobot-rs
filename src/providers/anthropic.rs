@@ -41,6 +41,10 @@ pub struct AnthropicProvider {
     api_key: String,
     default_model: String,
     client: Client,
+    /// Minimum backoff delay for provider retries (default: 1s).
+    retry_min_secs: u64,
+    /// Maximum backoff delay for provider retries (default: 30s).
+    retry_max_secs: u64,
 }
 
 impl AnthropicProvider {
@@ -54,7 +58,16 @@ impl AnthropicProvider {
             api_key: api_key.to_string(),
             default_model: model,
             client: Client::new(),
+            retry_min_secs: 1,
+            retry_max_secs: 30,
         }
+    }
+
+    /// Override the retry backoff parameters.
+    pub fn with_retry_config(mut self, min_secs: u64, max_secs: u64) -> Self {
+        self.retry_min_secs = min_secs;
+        self.retry_max_secs = max_secs;
+        self
     }
 }
 

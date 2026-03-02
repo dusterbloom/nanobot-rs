@@ -18,12 +18,14 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::TelegramConfig;
 
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
 #[cfg(feature = "voice")]
 use crate::voice_pipeline::VoicePipeline;
 
 /// Send "typing..." indicator to a Telegram chat.
 pub async fn tg_send_typing_action(client: &reqwest::Client, token: &str, chat_id: i64) {
-    let url = format!("https://api.telegram.org/bot{}/sendChatAction", token);
+    let url = format!("{}/bot{}/sendChatAction", TELEGRAM_API_BASE, token);
     let _ = client
         .post(&url)
         .json(&json!({ "chat_id": chat_id, "action": "typing" }))
@@ -37,7 +39,7 @@ pub async fn tg_send_placeholder(
     token: &str,
     chat_id: i64,
 ) -> Option<i64> {
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let url = format!("{}/bot{}/sendMessage", TELEGRAM_API_BASE, token);
     let resp = client
         .post(&url)
         .json(&json!({ "chat_id": chat_id, "text": "..." }))
@@ -56,10 +58,7 @@ pub async fn tg_edit_message(
     message_id: i64,
     text: &str,
 ) {
-    let url = format!(
-        "https://api.telegram.org/bot{}/editMessageText",
-        token
-    );
+    let url = format!("{}/bot{}/editMessageText", TELEGRAM_API_BASE, token);
     let _ = client
         .post(&url)
         .json(&json!({
@@ -302,10 +301,7 @@ impl TelegramChannel {
         ext: &str,
     ) -> Option<String> {
         // Step 1: getFile
-        let url = format!(
-            "https://api.telegram.org/bot{}/getFile?file_id={}",
-            token, file_id
-        );
+        let url = format!("{}/bot{}/getFile?file_id={}", TELEGRAM_API_BASE, token, file_id);
         let resp = client.get(&url).send().await.ok()?;
         let data: Value = resp.json().await.ok()?;
         let file_path = data
@@ -314,7 +310,7 @@ impl TelegramChannel {
             .and_then(|v| v.as_str())?;
 
         // Step 2: download
-        let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+        let download_url = format!("{}/file/bot{}/{}", TELEGRAM_API_BASE, token, file_path);
         let bytes = client
             .get(&download_url)
             .send()
@@ -372,7 +368,7 @@ impl Channel for TelegramChannel {
         // Spawn the long-polling loop.
         tokio::spawn(async move {
             let mut offset: i64 = 0;
-            let base_url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+            let base_url = format!("{}/bot{}/getUpdates", TELEGRAM_API_BASE, token);
 
             while running.load(Ordering::SeqCst) {
                 let body = json!({
@@ -441,23 +437,13 @@ impl Channel for TelegramChannel {
             return Err(anyhow::anyhow!("Telegram bot token not configured"));
         }
 
-        // If streaming already delivered the message, skip the duplicate send.
-        let streaming_handled = msg
-            .metadata
-            .get("streaming_handled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if streaming_handled {
-            debug!("Telegram send: skipping — message already delivered via streaming");
-            return Ok(());
-        }
-
         let chat_id: i64 = msg
             .chat_id
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid chat_id: {}", msg.chat_id))?;
 
-        // If this is a reply to a voice message, try to send a voice note.
+        // Voice TTS: send voice note BEFORE streaming check (voice first, text second).
+        // This ensures voice responses even when streaming is active.
         #[cfg(feature = "voice")]
         {
             let is_voice = msg
@@ -476,31 +462,18 @@ impl Channel for TelegramChannel {
                     if !tts_text.is_empty() {
                         match pipeline.synthesize_to_file(&tts_text, lang).await {
                             Ok(ogg_path) => {
-                                let caption = if msg.content.len() > 1024 {
-                                    let end = crate::utils::helpers::floor_char_boundary(
-                                        &msg.content,
-                                        1024,
-                                    );
-                                    &msg.content[..end]
-                                } else {
-                                    &msg.content
-                                };
-                                match self._send_voice(chat_id, &ogg_path, caption).await {
+                                match self._send_voice(chat_id, &ogg_path).await {
                                     Ok(()) => {
-                                        // Clean up temp file
                                         let _ = std::fs::remove_file(&ogg_path);
-                                        return Ok(());
                                     }
                                     Err(e) => {
                                         warn!("Failed to send voice, falling back to text: {}", e);
                                         let _ = std::fs::remove_file(&ogg_path);
-                                        // Fall through to text send
                                     }
                                 }
                             }
                             Err(e) => {
                                 warn!("TTS synthesis failed, sending text only: {}", e);
-                                // Fall through to text send
                             }
                         }
                     }
@@ -508,11 +481,19 @@ impl Channel for TelegramChannel {
             }
         }
 
+        // If streaming already delivered the text, skip the duplicate send.
+        let streaming_handled = msg
+            .metadata
+            .get("streaming_handled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if streaming_handled {
+            debug!("Telegram send: skipping text — already delivered via streaming");
+            return Ok(());
+        }
+
         let html_content = markdown_to_telegram_html(&msg.content);
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.config.token
-        );
+        let url = format!("{}/bot{}/sendMessage", TELEGRAM_API_BASE, self.config.token);
 
         let resp = self
             .client
@@ -555,12 +536,9 @@ impl Channel for TelegramChannel {
 
 #[cfg(feature = "voice")]
 impl TelegramChannel {
-    /// Send a voice note via Telegram sendVoice API.
-    async fn _send_voice(&self, chat_id: i64, ogg_path: &str, caption: &str) -> Result<()> {
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendVoice",
-            self.config.token
-        );
+    /// Send a voice note via Telegram sendVoice API (no caption).
+    async fn _send_voice(&self, chat_id: i64, ogg_path: &str) -> Result<()> {
+        let url = format!("{}/bot{}/sendVoice", TELEGRAM_API_BASE, self.config.token);
 
         let file_bytes = std::fs::read(ogg_path)
             .map_err(|e| anyhow::anyhow!("Failed to read voice file: {}", e))?;
@@ -571,8 +549,7 @@ impl TelegramChannel {
 
         let form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
-            .part("voice", part)
-            .text("caption", caption.to_string());
+            .part("voice", part);
 
         let resp = self.client.post(&url).multipart(form).send().await?;
 

@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod base;
+pub mod constants;
 pub mod factory;
 pub mod jit_gate;
 pub mod oauth;

@@ -573,6 +573,7 @@ async fn main() {
                     sweep.router_temp,
                     config.trio.router_top_p,
                     tool_names,
+                    config.tool_delegation.router_tuning.max_tokens,
                 )
                 .await;
                 let router_ms = t_router.elapsed().as_millis() as u64;

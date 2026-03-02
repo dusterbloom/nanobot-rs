@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::providers::constants::{
+    ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GEMINI_API_BASE, GROQ_API_BASE, HUGGINGFACE_API_BASE,
+    OPENAI_API_BASE, OPENROUTER_API_BASE, ZHIPU_API_BASE, ZHIPU_CODING_API_BASE,
+};
+
 // ---------------------------------------------------------------------------
 // Channel configs
 // ---------------------------------------------------------------------------
@@ -238,6 +243,30 @@ pub struct AgentDefaults {
     /// keeps appending rather than finishing.
     #[serde(default = "default_max_continuations")]
     pub max_continuations: u32,
+    /// Tokens reserved from completion budget for thinking overhead on local models (default: 512).
+    #[serde(default = "default_local_thinking_reserve_tokens")]
+    pub local_thinking_reserve_tokens: u32,
+    /// Minimum completion tokens guaranteed after thinking reserve is subtracted on local models (default: 256).
+    #[serde(default = "default_local_thinking_min_completion_tokens")]
+    pub local_thinking_min_completion_tokens: u32,
+    /// Hard cap on thinking budget tokens for small local models (default: 256).
+    #[serde(default = "default_local_thinking_small_model_cap")]
+    pub local_thinking_small_model_cap: u32,
+    /// Minimum max_tokens when long-mode is active (default: 8192).
+    #[serde(default = "default_adaptive_long_mode_min_tokens")]
+    pub adaptive_long_mode_min_tokens: u32,
+    /// Minimum max_tokens for long-form prompts (default: 4096).
+    #[serde(default = "default_adaptive_long_form_min_tokens")]
+    pub adaptive_long_form_min_tokens: u32,
+    /// Character length threshold above which a prompt is considered long-form (default: 500).
+    #[serde(default = "default_adaptive_long_form_trigger_chars")]
+    pub adaptive_long_form_trigger_chars: u32,
+    /// Maximum max_tokens cap when recent tool calls are heavy (default: 1024).
+    #[serde(default = "default_adaptive_tool_heavy_max_tokens")]
+    pub adaptive_tool_heavy_max_tokens: u32,
+    /// Minimum max_tokens floor when recent tool calls are heavy (default: 512).
+    #[serde(default = "default_adaptive_tool_heavy_min_tokens")]
+    pub adaptive_tool_heavy_min_tokens: u32,
 }
 
 fn default_workspace() -> String {
@@ -290,6 +319,38 @@ fn default_inference_engine() -> String {
     "auto".to_string()
 }
 
+fn default_local_thinking_reserve_tokens() -> u32 {
+    512
+}
+
+fn default_local_thinking_min_completion_tokens() -> u32 {
+    256
+}
+
+fn default_local_thinking_small_model_cap() -> u32 {
+    256
+}
+
+fn default_adaptive_long_mode_min_tokens() -> u32 {
+    8192
+}
+
+fn default_adaptive_long_form_min_tokens() -> u32 {
+    4096
+}
+
+fn default_adaptive_long_form_trigger_chars() -> u32 {
+    500
+}
+
+fn default_adaptive_tool_heavy_max_tokens() -> u32 {
+    1024
+}
+
+fn default_adaptive_tool_heavy_min_tokens() -> u32 {
+    512
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -310,6 +371,14 @@ impl Default for AgentDefaults {
             inference_engine: default_inference_engine(),
             instructions_path: None,
             skip_jit_gate: false,
+            local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),
+            local_thinking_min_completion_tokens: default_local_thinking_min_completion_tokens(),
+            local_thinking_small_model_cap: default_local_thinking_small_model_cap(),
+            adaptive_long_mode_min_tokens: default_adaptive_long_mode_min_tokens(),
+            adaptive_long_form_min_tokens: default_adaptive_long_form_min_tokens(),
+            adaptive_long_form_trigger_chars: default_adaptive_long_form_trigger_chars(),
+            adaptive_tool_heavy_max_tokens: default_adaptive_tool_heavy_max_tokens(),
+            adaptive_tool_heavy_min_tokens: default_adaptive_tool_heavy_min_tokens(),
         }
     }
 }
@@ -320,6 +389,53 @@ impl Default for AgentDefaults {
 pub struct AgentsConfig {
     #[serde(default)]
     pub defaults: AgentDefaults,
+}
+
+/// Token budget tuning for adaptive max_tokens and local-thinking behaviour.
+///
+/// Extracted from `AgentDefaults` so it can be carried through `SwappableCoreConfig`
+/// as a single field without requiring callers to populate 8 separate fields.
+#[derive(Debug, Clone)]
+pub struct AdaptiveTokenConfig {
+    pub local_thinking_reserve_tokens: u32,
+    pub local_thinking_min_completion_tokens: u32,
+    pub local_thinking_small_model_cap: u32,
+    pub adaptive_long_mode_min_tokens: u32,
+    pub adaptive_long_form_min_tokens: u32,
+    pub adaptive_long_form_trigger_chars: u32,
+    pub adaptive_tool_heavy_max_tokens: u32,
+    pub adaptive_tool_heavy_min_tokens: u32,
+}
+
+impl Default for AdaptiveTokenConfig {
+    fn default() -> Self {
+        Self {
+            local_thinking_reserve_tokens: 512,
+            local_thinking_min_completion_tokens: 256,
+            local_thinking_small_model_cap: 256,
+            adaptive_long_mode_min_tokens: 8192,
+            adaptive_long_form_min_tokens: 4096,
+            adaptive_long_form_trigger_chars: 500,
+            adaptive_tool_heavy_max_tokens: 1024,
+            adaptive_tool_heavy_min_tokens: 512,
+        }
+    }
+}
+
+impl AdaptiveTokenConfig {
+    /// Build from `AgentDefaults`, keeping all values in sync.
+    pub fn from_defaults(d: &AgentDefaults) -> Self {
+        Self {
+            local_thinking_reserve_tokens: d.local_thinking_reserve_tokens,
+            local_thinking_min_completion_tokens: d.local_thinking_min_completion_tokens,
+            local_thinking_small_model_cap: d.local_thinking_small_model_cap,
+            adaptive_long_mode_min_tokens: d.adaptive_long_mode_min_tokens,
+            adaptive_long_form_min_tokens: d.adaptive_long_form_min_tokens,
+            adaptive_long_form_trigger_chars: d.adaptive_long_form_trigger_chars,
+            adaptive_tool_heavy_max_tokens: d.adaptive_tool_heavy_max_tokens,
+            adaptive_tool_heavy_min_tokens: d.adaptive_tool_heavy_min_tokens,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,35 +483,15 @@ pub struct ProvidersConfig {
 /// Single source of truth used by both `Config::resolve_provider_for_model`
 /// and `SubagentManager::resolve_provider_for_model`.
 pub const PROVIDER_PREFIXES: &[(&str, fn(&ProvidersConfig) -> &ProviderConfig, &str)] = &[
-    ("groq/", |p| &p.groq, "https://api.groq.com/openai/v1"),
-    (
-        "gemini/",
-        |p| &p.gemini,
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-    ),
-    ("openai/", |p| &p.openai, "https://api.openai.com/v1"),
-    (
-        "anthropic/",
-        |p| &p.anthropic,
-        "https://api.anthropic.com/v1",
-    ),
-    ("deepseek/", |p| &p.deepseek, "https://api.deepseek.com"),
-    (
-        "huggingface/",
-        |p| &p.huggingface,
-        "https://router.huggingface.co/v1",
-    ),
-    (
-        "zhipu-coding/",
-        |p| &p.zhipu_coding,
-        "https://api.z.ai/api/coding/paas/v4",
-    ),
-    ("zhipu/", |p| &p.zhipu, "https://api.z.ai/api/paas/v4"),
-    (
-        "openrouter/",
-        |p| &p.openrouter,
-        "https://openrouter.ai/api/v1",
-    ),
+    ("groq/", |p| &p.groq, GROQ_API_BASE),
+    ("gemini/", |p| &p.gemini, GEMINI_API_BASE),
+    ("openai/", |p| &p.openai, OPENAI_API_BASE),
+    ("anthropic/", |p| &p.anthropic, ANTHROPIC_API_BASE),
+    ("deepseek/", |p| &p.deepseek, DEEPSEEK_API_BASE),
+    ("huggingface/", |p| &p.huggingface, HUGGINGFACE_API_BASE),
+    ("zhipu-coding/", |p| &p.zhipu_coding, ZHIPU_CODING_API_BASE),
+    ("zhipu/", |p| &p.zhipu, ZHIPU_API_BASE),
+    ("openrouter/", |p| &p.openrouter, OPENROUTER_API_BASE),
 ];
 
 impl ProvidersConfig {
@@ -1082,6 +1178,51 @@ impl Default for SubagentTuning {
 }
 
 // ---------------------------------------------------------------------------
+// Router tuning config
+// ---------------------------------------------------------------------------
+
+/// Tuning knobs for the LLM-based router decisions and tool result truncation.
+/// Nested under `toolDelegation.routerTuning`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RouterTuningConfig {
+    /// Max tokens for a single router LLM call (default: 256).
+    pub max_tokens: u32,
+    /// Max characters kept from a tool result before injection into the router
+    /// context (default: 12000).
+    pub max_tool_result_chars: usize,
+    /// Max characters per message in the conversation tail passed to the
+    /// router (default: 200).
+    pub tail_max_msg_chars: usize,
+    /// Max total characters for the whole conversation tail (default: 800).
+    pub tail_max_chars: usize,
+}
+
+fn default_router_max_tokens() -> u32 {
+    256
+}
+fn default_router_max_tool_result_chars() -> usize {
+    12000
+}
+fn default_router_tail_max_msg_chars() -> usize {
+    200
+}
+fn default_router_tail_max_chars() -> usize {
+    800
+}
+
+impl Default for RouterTuningConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_router_max_tokens(),
+            max_tool_result_chars: default_router_max_tool_result_chars(),
+            tail_max_msg_chars: default_router_tail_max_msg_chars(),
+            tail_max_chars: default_router_tail_max_chars(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool delegation config
 // ---------------------------------------------------------------------------
 
@@ -1205,6 +1346,10 @@ pub struct ToolDelegationConfig {
     #[serde(default)]
     pub subagent: SubagentTuning,
 
+    /// Tuning knobs for the LLM-based router (token budgets, context limits).
+    #[serde(default)]
+    pub router_tuning: RouterTuningConfig,
+
     /// When true (default), the specialist response is injected into messages
     /// and the main model synthesizes it in its own voice (Continue).
     /// When false, the specialist response goes directly to the user (Break).
@@ -1246,6 +1391,7 @@ impl Default for ToolDelegationConfig {
             deterministic_router_fallback: true,
             max_same_tool_call_per_turn: default_td_max_same_tool_call(),
             subagent: SubagentTuning::default(),
+            router_tuning: RouterTuningConfig::default(),
             specialist_synthesis: true,
         }
     }
@@ -1620,6 +1766,132 @@ impl Default for ReasoningConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Timeouts config
+// ---------------------------------------------------------------------------
+
+/// Timeout settings for various provider and tool operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeoutsConfig {
+    /// HTTP timeout for LLM chat completion requests (default: 120s).
+    #[serde(default = "default_provider_http_secs")]
+    pub provider_http_secs: u64,
+    /// Probe timeout for LM Studio native API endpoint (default: 2s).
+    #[serde(default = "default_lms_native_probe_secs")]
+    pub lms_native_probe_secs: u64,
+    /// Timeout for loading a model via LM Studio REST API (default: 120s).
+    #[serde(default = "default_lms_load_secs")]
+    pub lms_load_secs: u64,
+    /// Timeout for unloading a model via LM Studio REST API (default: 30s).
+    #[serde(default = "default_lms_unload_secs")]
+    pub lms_unload_secs: u64,
+}
+
+fn default_provider_http_secs() -> u64 { 120 }
+fn default_lms_native_probe_secs() -> u64 { 2 }
+fn default_lms_load_secs() -> u64 { 120 }
+fn default_lms_unload_secs() -> u64 { 30 }
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            provider_http_secs: default_provider_http_secs(),
+            lms_native_probe_secs: default_lms_native_probe_secs(),
+            lms_load_secs: default_lms_load_secs(),
+            lms_unload_secs: default_lms_unload_secs(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry config
+// ---------------------------------------------------------------------------
+
+/// Retry backoff settings for provider and JIT operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfig {
+    /// Minimum backoff delay for cloud provider retries (default: 1s).
+    #[serde(default = "default_provider_retry_min_secs")]
+    pub provider_min_secs: u64,
+    /// Maximum backoff delay for cloud provider retries (default: 30s).
+    #[serde(default = "default_provider_retry_max_secs")]
+    pub provider_max_secs: u64,
+    /// Minimum backoff delay for JIT model loading retries (default: 2s).
+    #[serde(default = "default_jit_retry_min_secs")]
+    pub jit_min_secs: u64,
+    /// Maximum backoff delay for JIT model loading retries (default: 8s).
+    #[serde(default = "default_jit_retry_max_secs")]
+    pub jit_max_secs: u64,
+}
+
+fn default_provider_retry_min_secs() -> u64 { 1 }
+fn default_provider_retry_max_secs() -> u64 { 30 }
+fn default_jit_retry_min_secs() -> u64 { 2 }
+fn default_jit_retry_max_secs() -> u64 { 8 }
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            provider_min_secs: default_provider_retry_min_secs(),
+            provider_max_secs: default_provider_retry_max_secs(),
+            jit_min_secs: default_jit_retry_min_secs(),
+            jit_max_secs: default_jit_retry_max_secs(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monitoring config
+// ---------------------------------------------------------------------------
+
+/// Configuration for health/heartbeat monitoring parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringConfig {
+    /// Number of consecutive health-check failures before a probe is marked
+    /// degraded (default: 3).
+    #[serde(default = "default_degraded_threshold")]
+    pub degraded_threshold: u32,
+    /// Timeout in seconds for a single health-check HTTP request (default: 2).
+    #[serde(default = "default_health_check_timeout_secs")]
+    pub health_check_timeout_secs: u64,
+    /// Seconds between health-poll cycles in the watchdog loop (default: 30).
+    #[serde(default = "default_health_poll_interval_secs")]
+    pub health_poll_interval_secs: u64,
+    /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
+    #[serde(default = "default_tool_heartbeat_secs")]
+    pub tool_heartbeat_secs: u64,
+}
+
+fn default_degraded_threshold() -> u32 {
+    3
+}
+
+fn default_health_check_timeout_secs() -> u64 {
+    2
+}
+
+fn default_health_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_tool_heartbeat_secs() -> u64 {
+    2
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            degraded_threshold: default_degraded_threshold(),
+            health_check_timeout_secs: default_health_check_timeout_secs(),
+            health_poll_interval_secs: default_health_poll_interval_secs(),
+            tool_heartbeat_secs: default_tool_heartbeat_secs(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
@@ -1662,6 +1934,12 @@ pub struct Config {
         HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
 }
 
 impl Config {
@@ -1715,20 +1993,20 @@ impl Config {
                     .openrouter
                     .api_base
                     .clone()
-                    .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
+                    .unwrap_or_else(|| OPENROUTER_API_BASE.to_string()),
             );
         }
         if Self::is_provider_key_enabled(&self.providers.deepseek.api_key) {
-            return Some("https://api.deepseek.com".to_string());
+            return Some(DEEPSEEK_API_BASE.to_string());
         }
         if Self::is_provider_key_enabled(&self.providers.anthropic.api_key) {
-            return Some("https://api.anthropic.com/v1".to_string());
+            return Some(ANTHROPIC_API_BASE.to_string());
         }
         if Self::is_provider_key_enabled(&self.providers.openai.api_key) {
-            return Some("https://api.openai.com/v1".to_string());
+            return Some(OPENAI_API_BASE.to_string());
         }
         if Self::is_provider_key_enabled(&self.providers.gemini.api_key) {
-            return Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+            return Some(GEMINI_API_BASE.to_string());
         }
         if Self::is_provider_key_enabled(&self.providers.zhipu.api_key) {
             return Some(
@@ -1736,7 +2014,7 @@ impl Config {
                     .zhipu
                     .api_base
                     .clone()
-                    .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string()),
+                    .unwrap_or_else(|| ZHIPU_API_BASE.to_string()),
             );
         }
         if Self::is_provider_key_enabled(&self.providers.zhipu_coding.api_key) {
@@ -1745,7 +2023,7 @@ impl Config {
                     .zhipu_coding
                     .api_base
                     .clone()
-                    .unwrap_or_else(|| "https://api.z.ai/api/coding/paas/v4".to_string()),
+                    .unwrap_or_else(|| ZHIPU_CODING_API_BASE.to_string()),
             );
         }
         if Self::is_provider_key_enabled(&self.providers.groq.api_key) {
@@ -1754,7 +2032,7 @@ impl Config {
                     .groq
                     .api_base
                     .clone()
-                    .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
+                    .unwrap_or_else(|| GROQ_API_BASE.to_string()),
             );
         }
         if self.providers.vllm.api_base.is_some() {
@@ -1809,7 +2087,7 @@ mod tests {
         cfg.providers.openrouter.api_key = "key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://openrouter.ai/api/v1".to_string())
+            Some(OPENROUTER_API_BASE.to_string())
         );
     }
 
@@ -1834,7 +2112,7 @@ mod tests {
         cfg.providers.anthropic.api_key = "sk-ant-key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://api.anthropic.com/v1".to_string())
+            Some(ANTHROPIC_API_BASE.to_string())
         );
     }
 
@@ -1844,7 +2122,7 @@ mod tests {
         cfg.providers.openai.api_key = "sk-key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://api.openai.com/v1".to_string())
+            Some(OPENAI_API_BASE.to_string())
         );
     }
 
@@ -1854,7 +2132,7 @@ mod tests {
         cfg.providers.groq.api_key = "gsk_key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://api.groq.com/openai/v1".to_string())
+            Some(GROQ_API_BASE.to_string())
         );
     }
 
@@ -1864,7 +2142,7 @@ mod tests {
         cfg.providers.deepseek.api_key = "sk-ds-key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://api.deepseek.com".to_string())
+            Some(DEEPSEEK_API_BASE.to_string())
         );
     }
 
@@ -1937,6 +2215,7 @@ mod tests {
             specialist_synthesis: true,
             mode: DelegationMode::Trio,
             subagent: SubagentTuning::default(),
+            router_tuning: RouterTuningConfig::default(),
         };
         let json = serde_json::to_string(&td).unwrap();
         let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
@@ -1974,7 +2253,7 @@ mod tests {
         cfg.providers.anthropic.api_key = "ant-key".to_string();
         assert_eq!(
             cfg.get_api_base(),
-            Some("https://openrouter.ai/api/v1".to_string())
+            Some(OPENROUTER_API_BASE.to_string())
         );
     }
 

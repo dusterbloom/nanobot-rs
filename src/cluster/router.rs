@@ -126,6 +126,9 @@ impl ClusterRouter {
                     api_base: Some(endpoint.clone()),
                     model: Some(model.clone()),
                     jit_gate: None,
+                    retry: crate::config::schema::RetryConfig::default(),
+                    timeout_secs: 120,
+                    lms_native_probe_secs: 2,
                 };
                 let provider = factory::create_openai_compat(spec);
                 tracing::info!(

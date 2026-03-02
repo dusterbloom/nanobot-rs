@@ -134,6 +134,9 @@ impl ReplContext {
             self.display_tx.clone(),
             self.restart_tx.clone(),
             Arc::clone(&self.core_handle.counters.inference_active),
+            self.config.monitoring.health_poll_interval_secs,
+            self.config.monitoring.degraded_threshold,
+            self.config.monitoring.health_check_timeout_secs,
         ));
     }
 
@@ -755,7 +758,7 @@ impl ReplContext {
             if is_local {
                 if has_remote_local {
                     // Remote local server (e.g. LM Studio): check the remote URL.
-                    let health = crate::server::check_health(remote_base).await;
+                    let health = crate::server::check_health(remote_base, self.config.monitoring.health_check_timeout_secs).await;
                     let (color, label) = if health {
                         (tui::GREEN, "healthy")
                     } else {
@@ -769,7 +772,7 @@ impl ReplContext {
                     let main_health = crate::server::check_health(&format!(
                         "http://localhost:{}/v1",
                         self.srv.local_port
-                    ))
+                    ), self.config.monitoring.health_check_timeout_secs)
                     .await;
                     let (color, label) = if main_health {
                         (tui::GREEN, "healthy")
@@ -1567,7 +1570,7 @@ impl ReplContext {
                 let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);
                 print!("  Loading {}... ", main_model);
                 io::stdout().flush().ok();
-                match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                match crate::lms::load_model(lms_port, &main_model, main_ctx, self.config.timeouts.lms_load_secs).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
@@ -1577,7 +1580,7 @@ impl ReplContext {
                     if !self.config.trio.router_model.is_empty() {
                         print!("  Loading {}... ", self.config.trio.router_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                        match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens), self.config.timeouts.lms_load_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1585,7 +1588,7 @@ impl ReplContext {
                     if !self.config.trio.specialist_model.is_empty() {
                         print!("  Loading {}... ", self.config.trio.specialist_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await {
+                        match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens), self.config.timeouts.lms_load_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1664,7 +1667,7 @@ impl ReplContext {
             if !model_name.is_empty() {
                 print!("  Reloading {} with {}K context... ", model_name, new_ctx / 1024);
                 io::stdout().flush().ok();
-                match crate::lms::reload_model_with_context(lms_port, &model_name, new_ctx).await {
+                match crate::lms::reload_model_with_context(lms_port, &model_name, new_ctx, self.config.timeouts.lms_load_secs, self.config.timeouts.lms_unload_secs).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
@@ -1690,7 +1693,7 @@ impl ReplContext {
                     if !model_name.is_empty() {
                         print!("  Reloading {} with {}K context on remote LMS... ", model_name, new_ctx / 1024);
                         io::stdout().flush().ok();
-                        match crate::lms::reload_model_with_context(port, &model_name, new_ctx).await {
+                        match crate::lms::reload_model_with_context(port, &model_name, new_ctx, self.config.timeouts.lms_load_secs, self.config.timeouts.lms_unload_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1823,7 +1826,7 @@ impl ReplContext {
                 if !prev_model.is_empty() && prev_model != selected.id {
                     print!("  Unloading {}... ", prev_model);
                     io::stdout().flush().ok();
-                    match crate::lms::unload_model(port, &prev_model).await {
+                    match crate::lms::unload_model(port, &prev_model, self.config.timeouts.lms_unload_secs).await {
                         Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                         Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
                     }
@@ -1832,7 +1835,7 @@ impl ReplContext {
                 let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
                 print!("  Loading {}... ", selected.id);
                 io::stdout().flush().ok();
-                match crate::lms::load_model(port, &selected.id, ctx).await {
+                match crate::lms::load_model(port, &selected.id, ctx, self.config.timeouts.lms_load_secs).await {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
@@ -1860,7 +1863,7 @@ impl ReplContext {
                         if !prev_model.is_empty() && prev_model != selected.id {
                             print!("  Unloading {}... ", prev_model);
                             io::stdout().flush().ok();
-                            match crate::lms::unload_model(port, &prev_model).await {
+                            match crate::lms::unload_model(port, &prev_model, self.config.timeouts.lms_unload_secs).await {
                                 Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                 Err(e) => println!("{}warn: {}{}", tui::YELLOW, e, tui::RESET),
                             }
@@ -1868,7 +1871,7 @@ impl ReplContext {
                         let ctx = Some(self.config.agents.defaults.local_max_context_tokens);
                         print!("  Loading {}... ", selected.id);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(port, &selected.id, ctx).await {
+                        match crate::lms::load_model(port, &selected.id, ctx, self.config.timeouts.lms_load_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -2004,10 +2007,10 @@ impl ReplContext {
             if self.srv.lms_managed {
                 let lms_port = self.config.agents.defaults.lms_port;
                 if !self.config.trio.router_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.router_model).await;
+                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.router_model, self.config.timeouts.lms_unload_secs).await;
                 }
                 if !self.config.trio.specialist_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.specialist_model).await;
+                    let _ = crate::lms::unload_model(lms_port, &self.config.trio.specialist_model, self.config.timeouts.lms_unload_secs).await;
                 }
             }
 
@@ -2065,7 +2068,7 @@ impl ReplContext {
                         self.config.trio.router_model
                     );
                     io::stdout().flush().ok();
-                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens), self.config.timeouts.lms_load_secs).await {
                         Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                         Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                     }
@@ -2076,7 +2079,7 @@ impl ReplContext {
                         self.config.trio.specialist_model
                     );
                     io::stdout().flush().ok();
-                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await
+                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens), self.config.timeouts.lms_load_secs).await
                     {
                         Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                         Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
@@ -2283,7 +2286,7 @@ impl ReplContext {
             };
             print!("  Loading {}... ", model);
             io::stdout().flush().ok();
-            match crate::lms::load_model(lms_port, model, ctx).await {
+            match crate::lms::load_model(lms_port, model, ctx, self.config.timeouts.lms_load_secs).await {
                 Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                 Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
             }
@@ -2364,7 +2367,7 @@ impl ReplContext {
                             let main_ctx = Some(self.config.agents.defaults.local_max_context_tokens);
                             print!("  Loading {}... ", main_model);
                             io::stdout().flush().ok();
-                            match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                            match crate::lms::load_model(lms_port, &main_model, main_ctx, self.config.timeouts.lms_load_secs).await {
                                 Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                 Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                             }
@@ -2372,7 +2375,7 @@ impl ReplContext {
                                 if !self.config.trio.router_model.is_empty() {
                                     print!("  Loading {}... ", self.config.trio.router_model);
                                     io::stdout().flush().ok();
-                                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens)).await {
+                                    match crate::lms::load_model(lms_port, &self.config.trio.router_model, Some(self.config.trio.router_ctx_tokens), self.config.timeouts.lms_load_secs).await {
                                         Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                         Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                     }
@@ -2380,7 +2383,7 @@ impl ReplContext {
                                 if !self.config.trio.specialist_model.is_empty() {
                                     print!("  Loading {}... ", self.config.trio.specialist_model);
                                     io::stdout().flush().ok();
-                                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens)).await {
+                                    match crate::lms::load_model(lms_port, &self.config.trio.specialist_model, Some(self.config.trio.specialist_ctx_tokens), self.config.timeouts.lms_load_secs).await {
                                         Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                         Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                     }
@@ -2440,7 +2443,7 @@ impl ReplContext {
             // Toggle OFF
             if self.srv.lms_managed {
                 let lms_port = self.config.agents.defaults.lms_port;
-                crate::lms::unload_all(lms_port).await.ok();
+                crate::lms::unload_all(lms_port, self.config.timeouts.lms_unload_secs).await.ok();
                 self.srv.lms_managed = false;
                 self.srv.lms_binary = None;
                 self.config.agents.defaults.local_api_base.clear();

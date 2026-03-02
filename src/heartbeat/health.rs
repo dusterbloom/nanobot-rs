@@ -33,10 +33,16 @@ pub struct ProbeState {
     pub last_result: Option<ProbeResult>,
     pub last_checked: Option<Instant>,
     pub last_healthy: Option<Instant>,
+    /// Consecutive failures required before transitioning to Degraded.
+    pub degraded_threshold: u32,
 }
 
 impl ProbeState {
     pub fn new(name: String) -> Self {
+        Self::new_with_threshold(name, DEGRADED_THRESHOLD)
+    }
+
+    pub fn new_with_threshold(name: String, degraded_threshold: u32) -> Self {
         Self {
             name,
             status: ProbeStatus::Unknown,
@@ -44,11 +50,12 @@ impl ProbeState {
             last_result: None,
             last_checked: None,
             last_healthy: None,
+            degraded_threshold,
         }
     }
 
     /// Pure state machine: record a probe result and update status.
-    /// Healthy -> Degraded after DEGRADED_THRESHOLD consecutive failures.
+    /// Healthy -> Degraded after `degraded_threshold` consecutive failures.
     /// Degraded -> Healthy on first success.
     pub fn record_result(&mut self, result: ProbeResult) {
         let now = Instant::now();
@@ -60,7 +67,7 @@ impl ProbeState {
             self.last_healthy = Some(now);
         } else {
             self.consecutive_failures += 1;
-            if self.consecutive_failures >= DEGRADED_THRESHOLD {
+            if self.consecutive_failures >= self.degraded_threshold {
                 self.status = ProbeStatus::Degraded;
             }
         }
@@ -83,13 +90,20 @@ pub trait HealthProbe: Send + Sync {
 pub struct HealthRegistry {
     probes: Vec<Box<dyn HealthProbe>>,
     states: RwLock<HashMap<String, ProbeState>>,
+    /// Consecutive failures required before marking a probe Degraded.
+    degraded_threshold: u32,
 }
 
 impl HealthRegistry {
     pub fn new() -> Self {
+        Self::new_with_threshold(DEGRADED_THRESHOLD)
+    }
+
+    pub fn new_with_threshold(degraded_threshold: u32) -> Self {
         Self {
             probes: Vec::new(),
             states: RwLock::new(HashMap::new()),
+            degraded_threshold,
         }
     }
 
@@ -98,7 +112,7 @@ impl HealthRegistry {
         self.states
             .write()
             .unwrap()
-            .insert(name.clone(), ProbeState::new(name));
+            .insert(name.clone(), ProbeState::new_with_threshold(name, self.degraded_threshold));
         self.probes.push(probe);
     }
 
@@ -313,7 +327,7 @@ impl HealthProbe for TrioEndpointProbe {
 // --- Config-driven factory ---
 
 pub fn build_registry(config: &crate::config::schema::Config) -> HealthRegistry {
-    let mut reg = HealthRegistry::new();
+    let mut reg = HealthRegistry::new_with_threshold(config.monitoring.degraded_threshold);
     if config.lcm.enabled {
         if let Some(ref ep) = config.lcm.compaction_endpoint {
             reg.register(Box::new(LcmCompactionProbe::new(&ep.url)));

@@ -18,7 +18,7 @@ use crate::agent::tuning::{score_feasible_profiles, select_optimal_from_input, O
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::manager::ChannelManager;
 use crate::config::loader::{get_config_path, get_data_dir, load_config, save_config};
-use crate::config::schema::Config;
+use crate::config::schema::{AdaptiveTokenConfig, Config};
 use crate::cron::service::CronService;
 use crate::cron::types::CronSchedule;
 use crate::heartbeat::service::{
@@ -574,7 +574,9 @@ fn make_local_providers(
 
     let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
         factory::ProviderSpec::local(&base_url, Some(&model_id))
-            .with_jit_gate_opt(jit_gate.clone()),
+            .with_jit_gate_opt(jit_gate.clone())
+            .with_timeout_config(&config.timeouts)
+            .with_retry(config.retry.clone()),
     );
 
     // Auto-detect context size from local server; fall back to config default.
@@ -589,7 +591,9 @@ fn make_local_providers(
     let compaction: Option<Arc<dyn LLMProvider>> = compaction_port.map(|p| -> Arc<dyn LLMProvider> {
         factory::create_openai_compat(
             factory::ProviderSpec::local(&local_base_url(config, p), None)
-                .with_jit_gate_opt(jit_gate.clone()),
+                .with_jit_gate_opt(jit_gate.clone())
+                .with_timeout_config(&config.timeouts)
+                .with_retry(config.retry.clone()),
         )
     });
 
@@ -609,6 +613,9 @@ fn make_local_providers(
                     api_base: Some(ep.url.clone()),
                     model: Some(ep.model.clone()),
                     jit_gate: gate,
+                    retry: config.retry.clone(),
+                    timeout_secs: config.timeouts.provider_http_secs,
+                    lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
                 },
             ));
         }
@@ -618,14 +625,18 @@ fn make_local_providers(
             let model = if !trio_model.is_empty() { trio_model } else { role_name };
             return Some(factory::create_openai_compat(
                 factory::ProviderSpec::local(&base_url, Some(model))
-                    .with_jit_gate_opt(jit_gate.clone()),
+                    .with_jit_gate_opt(jit_gate.clone())
+                    .with_timeout_config(&config.timeouts)
+                    .with_retry(config.retry.clone()),
             ));
         }
 
         // Priority 3: separate port fallback
         fallback_port.map(|p| -> Arc<dyn LLMProvider> {
             factory::create_openai_compat(
-                factory::ProviderSpec::local(&local_base_url(config, p), Some(role_name)),
+                factory::ProviderSpec::local(&local_base_url(config, p), Some(role_name))
+                    .with_timeout_config(&config.timeouts)
+                    .with_retry(config.retry.clone()),
             )
         })
     };
@@ -718,6 +729,9 @@ pub(crate) fn build_core_handle(
         trio_config: config.trio.clone(),
         model_capabilities_overrides: config.model_capabilities.clone(),
         reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
     });
     let counters = Arc::new(RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker));
     // When main_no_think is enabled, also suppress thinking display from the start
@@ -788,6 +802,9 @@ pub(crate) fn rebuild_core(
         trio_config: config.trio.clone(),
         model_capabilities_overrides: config.model_capabilities.clone(),
         reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
     });
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
@@ -1747,6 +1764,9 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             api_base: Some(api_base),
             model: Some(stripped_model),
             jit_gate: None,
+            retry: config.retry.clone(),
+            timeout_secs: config.timeouts.provider_http_secs,
+            lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
         });
     }
 
@@ -1776,6 +1796,9 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         api_base,
         model: Some(model.to_string()),
         jit_gate: None,
+        retry: config.retry.clone(),
+        timeout_secs: config.timeouts.provider_http_secs,
+        lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
     })
 }
 

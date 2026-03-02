@@ -38,7 +38,7 @@ use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::validation;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
-use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
+use crate::config::schema::{AdaptiveTokenConfig, EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
 
@@ -1076,6 +1076,7 @@ impl AgentLoopShared {
                 recent_tool_calls,
                 ctx.core.is_local,
                 thinking_budget,
+                &ctx.core.adaptive_tokens,
             )
         };
 
@@ -1119,7 +1120,7 @@ impl AgentLoopShared {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.
                 if ctx.core.is_local && ctx.core.model_capabilities.size_class == crate::agent::model_capabilities::ModelSizeClass::Small {
-                    Some(stored.min(LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS))
+                    Some(stored.min(ctx.core.adaptive_tokens.local_thinking_small_model_cap))
                 } else {
                     Some(stored)
                 }
@@ -1500,7 +1501,7 @@ impl AgentLoopShared {
             // In local mode, check if the server is still alive.
             if ctx.core.is_local {
                 if let Some(base) = ctx.core.provider.get_api_base() {
-                    if !crate::server::check_health(base).await {
+                    if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await {
                         error!("Local LLM server is down!");
                         return StepResult::Done(IterationOutcome::Error(
                             "[LLM Error] Local server crashed. Use /restart or /local to recover.".into(),
@@ -1834,15 +1835,7 @@ fn should_strip_tools_for_trio(
     result
 }
 
-const LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS: u32 = 512;
-const LOCAL_THINKING_MIN_COMPLETION_TOKENS: u32 = 256;
-const LOCAL_SMALL_MODEL_THINKING_CAP_TOKENS: u32 = 256;
-const ADAPTIVE_LONG_MODE_MIN_TOKENS: u32 = 8192;
-const ADAPTIVE_LONG_FORM_MIN_TOKENS: u32 = 4096;
 const ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD: usize = 3;
-const ADAPTIVE_TOOL_HEAVY_MAX_TOKENS: u32 = 1024;
-const ADAPTIVE_TOOL_HEAVY_MIN_TOKENS: u32 = 512;
-const ADAPTIVE_LONG_FORM_TRIGGER_CHARS: usize = 500;
 
 fn adaptive_max_tokens(
     base: u32,
@@ -1851,9 +1844,10 @@ fn adaptive_max_tokens(
     recent_tool_calls: usize,
     is_local: bool,
     thinking_budget: Option<u32>,
+    cfg: &AdaptiveTokenConfig,
 ) -> u32 {
     let mut effective = if had_long {
-        base.max(ADAPTIVE_LONG_MODE_MIN_TOKENS)
+        base.max(cfg.adaptive_long_mode_min_tokens)
     } else {
         let lower = user_text.to_lowercase();
         let is_long_form = lower.contains("explain in detail")
@@ -1863,13 +1857,13 @@ fn adaptive_max_tokens(
             || lower.contains("implement ")
             || lower.contains("full example")
             || lower.starts_with("write ")
-            || user_text.len() > ADAPTIVE_LONG_FORM_TRIGGER_CHARS;
+            || user_text.len() > cfg.adaptive_long_form_trigger_chars as usize;
 
         if is_long_form {
-            base.max(ADAPTIVE_LONG_FORM_MIN_TOKENS)
+            base.max(cfg.adaptive_long_form_min_tokens)
         } else if recent_tool_calls > ADAPTIVE_TOOL_HEAVY_WINDOW_THRESHOLD {
-            base.min(ADAPTIVE_TOOL_HEAVY_MAX_TOKENS)
-                .max(ADAPTIVE_TOOL_HEAVY_MIN_TOKENS)
+            base.min(cfg.adaptive_tool_heavy_max_tokens)
+                .max(cfg.adaptive_tool_heavy_min_tokens)
         } else {
             base
         }
@@ -1877,8 +1871,8 @@ fn adaptive_max_tokens(
 
     if is_local && thinking_budget.is_some() {
         effective = effective
-            .saturating_sub(LOCAL_THINKING_TOOLCALL_RESERVE_TOKENS)
-            .max(LOCAL_THINKING_MIN_COMPLETION_TOKENS);
+            .saturating_sub(cfg.local_thinking_reserve_tokens)
+            .max(cfg.local_thinking_min_completion_tokens);
     }
 
     effective
@@ -1983,6 +1977,9 @@ impl AgentLoop {
                         api_base: Some(ep.url.clone()),
                         model: Some(ep.model.clone()),
                         jit_gate: None,
+                        retry: crate::config::schema::RetryConfig::default(),
+                        timeout_secs: 120,
+                        lms_native_probe_secs: 2,
                     },
                 );
             Arc::new(ContextCompactor::new(

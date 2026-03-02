@@ -158,6 +158,7 @@ pub(crate) async fn load_model(
     port: u16,
     model: &str,
     context_length: Option<usize>,
+    timeout_secs: u64,
 ) -> Result<(), String> {
     // Check if already loaded
     let loaded = list_loaded(port).await;
@@ -165,7 +166,7 @@ pub(crate) async fn load_model(
         return Ok(());
     }
 
-    post_load_model(port, model, context_length).await
+    post_load_model(port, model, context_length, timeout_secs).await
 }
 
 /// Reload a model with a specific context length.
@@ -176,10 +177,12 @@ pub(crate) async fn reload_model_with_context(
     port: u16,
     model: &str,
     context_length: usize,
+    load_timeout_secs: u64,
+    unload_timeout_secs: u64,
 ) -> Result<(), String> {
     let loaded = list_loaded(port).await;
     for loaded_model in loaded.iter().filter(|m| model_matches(m, model)) {
-        if let Err(e) = unload_model(port, loaded_model).await {
+        if let Err(e) = unload_model(port, loaded_model, unload_timeout_secs).await {
             tracing::warn!(
                 "lms unload before reload failed: model={} loaded_model={} error={}",
                 model,
@@ -189,7 +192,7 @@ pub(crate) async fn reload_model_with_context(
         }
     }
 
-    post_load_model(port, model, Some(context_length)).await
+    post_load_model(port, model, Some(context_length), load_timeout_secs).await
 }
 
 fn model_matches(loaded: &str, model: &str) -> bool {
@@ -204,6 +207,7 @@ async fn post_load_model(
     port: u16,
     model: &str,
     context_length: Option<usize>,
+    timeout_secs: u64,
 ) -> Result<(), String> {
 
     let url = format!("{}/api/v1/models/load", rest_base(port));
@@ -218,7 +222,7 @@ async fn post_load_model(
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| format!("HTTP load request failed: {}", e))?;
@@ -239,7 +243,7 @@ async fn post_load_model(
 }
 
 /// Unload a single model via the LM Studio REST API.
-pub(crate) async fn unload_model(port: u16, model: &str) -> Result<(), String> {
+pub(crate) async fn unload_model(port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
     let url = format!("{}/api/v1/models/unload", rest_base(port));
     let body = serde_json::json!({ "instance_id": model });
 
@@ -247,7 +251,7 @@ pub(crate) async fn unload_model(port: u16, model: &str) -> Result<(), String> {
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| format!("HTTP unload request failed: {}", e))?;
@@ -262,10 +266,10 @@ pub(crate) async fn unload_model(port: u16, model: &str) -> Result<(), String> {
 }
 
 /// Unload all models by querying loaded models and unloading each.
-pub(crate) async fn unload_all(port: u16) -> Result<(), String> {
+pub(crate) async fn unload_all(port: u16, timeout_secs: u64) -> Result<(), String> {
     let loaded = list_loaded(port).await;
     for model in &loaded {
-        unload_model(port, model).await?;
+        unload_model(port, model, timeout_secs).await?;
     }
     Ok(())
 }
@@ -695,7 +699,7 @@ mod tests {
         let target_b = 6144.min(max_ctx).max(2048);
         let original = fetch_loaded_context_length(port, &model).await;
 
-        reload_model_with_context(port, &model, target_a)
+        reload_model_with_context(port, &model, target_a, 120, 30)
             .await
             .expect("failed to reload model at target_a context");
         let observed_a = fetch_loaded_context_length(port, &model)
@@ -707,7 +711,7 @@ mod tests {
         );
 
         if target_b != target_a {
-            reload_model_with_context(port, &model, target_b)
+            reload_model_with_context(port, &model, target_b, 120, 30)
                 .await
                 .expect("failed to reload model at target_b context");
             let observed_b = fetch_loaded_context_length(port, &model)
@@ -720,7 +724,7 @@ mod tests {
         }
 
         if let Some(orig_ctx) = original {
-            let _ = reload_model_with_context(port, &model, orig_ctx).await;
+            let _ = reload_model_with_context(port, &model, orig_ctx, 120, 30).await;
         }
     }
 }

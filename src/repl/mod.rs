@@ -852,9 +852,9 @@ impl ServerState {
     }
 
     /// Unload models from the current LMS-managed server.
-    pub async fn kill_current(&mut self, lms_port: u16) {
+    pub async fn kill_current(&mut self, lms_port: u16, unload_timeout_secs: u64) {
         if self.lms_managed {
-            crate::lms::unload_all(lms_port).await.ok();
+            crate::lms::unload_all(lms_port, unload_timeout_secs).await.ok();
         }
         self.engine = InferenceEngine::None;
     }
@@ -999,7 +999,7 @@ pub(crate) fn cmd_agent(
                             crate::lms::resolve_model_name(&available, hint)
                         };
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
-                        if let Err(e) = crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                        if let Err(e) = crate::lms::load_model(lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
                             eprintln!("Warning: lms load failed: {}", e);
                         } else {
                             local_model_name = main_model;
@@ -1043,6 +1043,7 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.router_model,
                                     Some(config.trio.router_ctx_tokens),
+                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1052,6 +1053,7 @@ pub(crate) fn cmd_agent(
                                     lms_port,
                                     &config.trio.specialist_model,
                                     Some(config.trio.specialist_ctx_tokens),
+                                    config.timeouts.lms_load_secs,
                                 )
                                 .await;
                             }
@@ -1098,7 +1100,7 @@ pub(crate) fn cmd_agent(
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
                         print!("  Loading {}... ", main_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(lms_port, &main_model, main_ctx).await {
+                        match crate::lms::load_model(lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1123,7 +1125,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.router_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.router_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens)).await {
+                                match crate::lms::load_model(lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1131,7 +1133,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.specialist_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.specialist_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens)).await {
+                                match crate::lms::load_model(lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1143,7 +1145,7 @@ pub(crate) fn cmd_agent(
                             if let Some(ref ep) = config.lcm.compaction_endpoint {
                                 print!("  Loading {} (LCM compactor)... ", ep.model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &ep.model, Some(config.lcm.compaction_context_size)).await {
+                                match crate::lms::load_model(lms_port, &ep.model, Some(config.lcm.compaction_context_size), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1227,7 +1229,7 @@ pub(crate) fn cmd_agent(
                                 Some(config.agents.defaults.local_max_context_tokens);
                             print!("  Loading {}... ", model);
                             io::stdout().flush().ok();
-                            match crate::lms::load_model(lms_port, &model, ctx).await {
+                            match crate::lms::load_model(lms_port, &model, ctx, config.timeouts.lms_load_secs).await {
                                 Ok(()) => {
                                     println!("{}OK{}", tui::GREEN, tui::RESET);
                                     local_model_name = model;
@@ -1805,10 +1807,10 @@ pub(crate) fn cmd_agent(
                         .unwrap_or(ctx.config.agents.defaults.lms_port)
                 };
                 if !ctx.config.trio.router_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.router_model).await;
+                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.router_model, ctx.config.timeouts.lms_unload_secs).await;
                 }
                 if !ctx.config.trio.specialist_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.specialist_model).await;
+                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.specialist_model, ctx.config.timeouts.lms_unload_secs).await;
                 }
             }
 
@@ -1979,7 +1981,7 @@ mod tests {
     async fn test_server_state_kill_current_when_empty() {
         // Should not panic when there's no process to kill
         let mut state = ServerState::new("8080".to_string());
-        state.kill_current(1234).await;
+        state.kill_current(1234, 30).await;
         assert_eq!(state.engine, InferenceEngine::None);
     }
 

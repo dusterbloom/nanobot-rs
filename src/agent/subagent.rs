@@ -832,6 +832,9 @@ impl SubagentManager {
                             api_base: Some(base),
                             model: Some(rest.clone()),
                             jit_gate: None,
+                            retry: crate::config::schema::RetryConfig::default(),
+                            timeout_secs: 120,
+                            lms_native_probe_secs: 2,
                         },
                     );
                 return (provider, rest, targets_local);

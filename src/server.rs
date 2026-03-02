@@ -666,15 +666,15 @@ pub(crate) fn estimate_model_profile_from_name(name: &str) -> ModelProfile {
 
 /// Quick health check: is the local server at the given base URL alive?
 ///
-/// Sends a GET to `/health` with a 2-second timeout.
-pub(crate) async fn check_health(api_base: &str) -> bool {
+/// Sends a GET to `/health` with the specified timeout.
+pub(crate) async fn check_health(api_base: &str, timeout_secs: u64) -> bool {
     let base = api_base
         .trim_end_matches('/')
         .trim_end_matches("/v1")
         .trim_end_matches('/');
     let url = format!("{}/health", base);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .unwrap_or_default();
     match client.get(&url).send().await {
@@ -800,17 +800,21 @@ pub struct RestartRequest {
 
 /// Background health watchdog with auto-repair for local server processes.
 ///
-/// Pings `/health` every 30 seconds on all active server ports. When a server
-/// fails 3 consecutive health checks, sends a restart request through `restart_tx`.
+/// Pings `/health` every `poll_interval_secs` on all active server ports. When a server
+/// fails `degraded_threshold` consecutive health checks, sends a restart request through
+/// `restart_tx`.
 pub(crate) fn start_health_watchdog_with_autorepair(
     ports: Vec<(String, String)>, // (role, port)
     alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
     restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
     inference_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    poll_interval_secs: u64,
+    degraded_threshold: u32,
+    health_check_timeout_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(health_check_timeout_secs))
             .build()
             .unwrap_or_default();
 
@@ -821,7 +825,7 @@ pub(crate) fn start_health_watchdog_with_autorepair(
             ports.iter().map(|(role, _)| (role.clone(), 0)).collect();
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
 
             if inference_active.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
@@ -844,13 +848,13 @@ pub(crate) fn start_health_watchdog_with_autorepair(
                     *consecutive_failures.get_mut(role).unwrap() += 1;
                     let failures = consecutive_failures[role];
 
-                    if failures < 3 && prev {
+                    if failures < degraded_threshold && prev {
                         let msg = format!(
-                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt {}/3)\n",
-                            role, port, failures
+                            "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m (port {}) \x1b[33munhealthy\x1b[0m (attempt {}/{})\n",
+                            role, port, failures, degraded_threshold
                         );
                         let _ = alert_tx.send(msg);
-                    } else if failures >= 3 {
+                    } else if failures >= degraded_threshold {
                         let msg = format!(
                             "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m \x1b[1m{} server\x1b[0m auto-restarting...\n",
                             role

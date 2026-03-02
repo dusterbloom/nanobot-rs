@@ -18,7 +18,7 @@ use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::agent::circuit_breaker::CircuitBreaker;
-use crate::config::schema::{AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
+use crate::config::schema::{AdaptiveTokenConfig, AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
 use crate::session::manager::SessionManager;
 
@@ -82,6 +82,12 @@ pub struct SwappableCore {
     pub specialist_output_schema: bool,
     pub trace_log: bool,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
+    /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
+    pub tool_heartbeat_secs: u64,
+    /// Timeout in seconds for a single health-check HTTP request (default: 2).
+    pub health_check_timeout_secs: u64,
+    /// Adaptive token budget tuning (formerly hardcoded constants in agent_loop.rs).
+    pub adaptive_tokens: AdaptiveTokenConfig,
 }
 
 impl SwappableCore {
@@ -316,6 +322,12 @@ pub struct SwappableCoreConfig {
     pub trio_config: TrioConfig,
     pub model_capabilities_overrides: std::collections::HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
+    /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
+    pub tool_heartbeat_secs: u64,
+    /// Timeout in seconds for a single health-check HTTP request (default: 2).
+    pub health_check_timeout_secs: u64,
+    /// Adaptive token budget tuning (formerly hardcoded constants in agent_loop.rs).
+    pub adaptive_tokens: AdaptiveTokenConfig,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -346,6 +358,9 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         trio_config,
         model_capabilities_overrides,
         reasoning_config,
+        tool_heartbeat_secs,
+        health_check_timeout_secs,
+        adaptive_tokens,
     } = cfg;
     let model_capabilities = crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
     let router_provider = delegation_provider.clone();
@@ -558,6 +573,9 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         specialist_output_schema: trio_config.specialist_output_schema,
         trace_log: trio_config.trace_log,
         reasoning_config,
+        tool_heartbeat_secs,
+        health_check_timeout_secs,
+        adaptive_tokens,
     }
 }
 

@@ -24,13 +24,10 @@ use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
 use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
 
-const ROUTER_MAX_TOKENS: u32 = 256;
 const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
 const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
 const ROUTER_USER_MSG_TRACE_PREVIEW_CHARS: usize = 80;
 const ROUTER_TAIL_MAX_PAIRS: usize = 5;
-const ROUTER_TAIL_MAX_MSG_CHARS: usize = 200;
-const ROUTER_TAIL_MAX_CHARS: usize = 800;
 const SCRATCH_PAD_LOOKBACK_MESSAGES: usize = 10;
 
 /// Per-domain ring buffer for specialist multi-turn memory.
@@ -191,21 +188,13 @@ pub fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_cha
     out
 }
 
-/// Maximum characters allowed in a router-injected tool result.
-///
-/// Small local models have limited context windows. Capping tool results
-/// prevents a single web fetch or file read from filling the entire context
-/// and burying the user's original intent.
-const MAX_TOOL_RESULT_CHARS: usize = 12000;
-
 /// Truncate a tool result to fit in small model context windows.
 ///
-/// If `data` exceeds `MAX_TOOL_RESULT_CHARS`, it is cut to that length and
-/// an annotation indicating the total size is appended. Short data is
-/// returned unchanged.
-pub(crate) fn truncate_tool_result(data: &str) -> String {
-    if data.len() > MAX_TOOL_RESULT_CHARS {
-        let truncated: String = data.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+/// If `data` exceeds `max_chars`, it is cut to that length and an annotation
+/// indicating the total size is appended. Short data is returned unchanged.
+pub(crate) fn truncate_tool_result(data: &str, max_chars: usize) -> String {
+    if data.len() > max_chars {
+        let truncated: String = data.chars().take(max_chars).collect();
         format!("{}... [truncated, {} total chars]", truncated, data.chars().count())
     } else {
         data.to_string()
@@ -376,6 +365,7 @@ pub async fn request_strict_router_decision(
     temperature: f64,
     top_p: f64,
     tool_names: &str,
+    max_tokens: u32,
 ) -> Result<role_policy::RouterDecision, String> {
     info!(role = "router", model = %model, "router_decision_start");
     fn parse_router_directive_pack(pack: &str) -> Option<role_policy::RouterDecision> {
@@ -485,7 +475,7 @@ pub async fn request_strict_router_decision(
             &tool_messages,
             Some(&tool_defs),
             Some(model),
-            ROUTER_MAX_TOKENS,
+            max_tokens,
             temperature,
             None,
             Some(top_p),
@@ -540,7 +530,7 @@ pub async fn request_strict_router_decision(
             &router_messages,
             None,
             Some(model),
-            ROUTER_MAX_TOKENS,
+            max_tokens,
             temperature,
             None,
             Some(top_p),
@@ -646,8 +636,8 @@ pub(crate) async fn dispatch_specialist(
     let conv_tail = build_conversation_tail(
         messages,
         ROUTER_TAIL_MAX_PAIRS,
-        ROUTER_TAIL_MAX_MSG_CHARS,
-        ROUTER_TAIL_MAX_CHARS,
+        core.tool_delegation_config.router_tuning.tail_max_msg_chars,
+        core.tool_delegation_config.router_tuning.tail_max_chars,
     );
     let specialist_pack = if core.tool_delegation_config.role_scoped_context_packs {
         role_policy::build_context_pack(
@@ -883,8 +873,8 @@ pub(crate) async fn router_preflight(
     let conv_tail = build_conversation_tail(
         &ctx.messages,
         ROUTER_TAIL_MAX_PAIRS,
-        ROUTER_TAIL_MAX_MSG_CHARS,
-        ROUTER_TAIL_MAX_CHARS,
+        ctx.core.tool_delegation_config.router_tuning.tail_max_msg_chars,
+        ctx.core.tool_delegation_config.router_tuning.tail_max_chars,
     );
     let task_state = if conv_tail.is_empty() {
         format!("Strict preflight.\nUser message: {}", ctx.user_content)
@@ -916,6 +906,7 @@ pub(crate) async fn router_preflight(
         ctx.core.router_temperature,
         ctx.core.router_top_p,
         &tool_list.join(", "),
+        ctx.core.tool_delegation_config.router_tuning.max_tokens,
     )
     .await
     {
@@ -1069,7 +1060,7 @@ pub(crate) async fn router_preflight(
                 append_router_decision_trace(&trace);
             }
             let content = extract_tool_content(&tr.data);
-            let truncated = truncate_tool_result(&content);
+            let truncated = truncate_tool_result(&content, ctx.core.tool_delegation_config.router_tuning.max_tool_result_chars);
             ctx.messages.push(json!({
                 "role":"user",
                 "content": format!(
@@ -1168,8 +1159,8 @@ pub(crate) async fn route_tool_calls(
         let conv_tail = build_conversation_tail(
             &ctx.messages,
             ROUTER_TAIL_MAX_PAIRS,
-            ROUTER_TAIL_MAX_MSG_CHARS,
-            ROUTER_TAIL_MAX_CHARS,
+            ctx.core.tool_delegation_config.router_tuning.tail_max_msg_chars,
+            ctx.core.tool_delegation_config.router_tuning.tail_max_chars,
         );
         let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
             role_policy::build_context_pack(
@@ -1196,6 +1187,7 @@ pub(crate) async fn route_tool_calls(
                 ctx.core.router_temperature,
                 ctx.core.router_top_p,
                 &available_tools.join(", "),
+                ctx.core.tool_delegation_config.router_tuning.max_tokens,
             )
             .await
             {
@@ -1968,11 +1960,12 @@ mod tests {
 
     // ── Tool result truncation ─────────────────────────────────────────────────
 
-    // RED: truncate_tool_result must cap long results to MAX_TOOL_RESULT_CHARS
+    // RED: truncate_tool_result must cap long results to the provided max_chars limit.
+    // Use the default value (12000) which matches MAX_TOOL_RESULT_CHARS.
     #[test]
     fn test_tool_result_truncation() {
         let long_input: String = "x".repeat(20_000);
-        let result = truncate_tool_result(&long_input);
+        let result = truncate_tool_result(&long_input, 12000);
         assert!(
             result.len() <= 12100,
             "truncated result must be at most ~12100 chars (12000 + annotation), got {}",
@@ -1992,8 +1985,21 @@ mod tests {
     #[test]
     fn test_tool_result_no_truncation_when_short() {
         let short_input = "short result";
-        let result = truncate_tool_result(short_input);
+        let result = truncate_tool_result(short_input, 12000);
         assert_eq!(result, short_input, "short input must be returned unchanged");
+    }
+
+    #[test]
+    fn test_tool_result_truncation_custom_limit() {
+        let input: String = "a".repeat(500);
+        let result = truncate_tool_result(&input, 100);
+        assert!(
+            result.len() <= 200,
+            "truncated result must be at most ~200 chars (100 + annotation), got {}",
+            result.len()
+        );
+        assert!(result.contains("truncated"), "must contain 'truncated'");
+        assert!(result.contains("500 total chars"), "must report original size");
     }
 
     // ── Turn isolation: preflight arms must return Break, not Continue ─────────

@@ -17,6 +17,9 @@ use tracing::{debug, info, instrument, warn};
 use backon::Retryable;
 
 use super::base::{LLMProvider, LLMResponse, StreamChunk, StreamHandle, ToolCallRequest};
+use super::constants::{
+    ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GROQ_API_BASE, OPENAI_API_BASE, OPENROUTER_API_BASE,
+};
 use super::jit_gate::JitGate;
 use super::retry;
 
@@ -42,6 +45,16 @@ pub struct OpenAICompatProvider {
     client: Client,
     /// Optional JIT gate for serialising requests to JIT-loading servers (e.g. LM Studio).
     jit_gate: Option<Arc<JitGate>>,
+    /// Minimum backoff delay for cloud provider retries (default: 1s).
+    retry_provider_min_secs: u64,
+    /// Maximum backoff delay for cloud provider retries (default: 30s).
+    retry_provider_max_secs: u64,
+    /// Minimum backoff delay for JIT model loading retries (default: 2s).
+    retry_jit_min_secs: u64,
+    /// Maximum backoff delay for JIT model loading retries (default: 8s).
+    retry_jit_max_secs: u64,
+    /// Timeout for native LMS probe requests in seconds (default: 2).
+    lms_native_probe_secs: u64,
 }
 
 /// Normalize Claude model short-names so the API always gets the canonical ID.
@@ -100,19 +113,19 @@ impl OpenAICompatProvider {
             // Use whatever was explicitly provided.
             base.trim_end_matches('/').to_string()
         } else if api_key.starts_with("sk-or-") {
-            "https://openrouter.ai/api/v1".to_string()
+            OPENROUTER_API_BASE.to_string()
         } else if api_key.starts_with("sk-ant-") {
-            "https://api.anthropic.com/v1".to_string()
+            ANTHROPIC_API_BASE.to_string()
         } else if default_model.contains("deepseek") {
-            "https://api.deepseek.com".to_string()
+            DEEPSEEK_API_BASE.to_string()
         } else if api_key.starts_with("gsk_") || default_model.contains("groq") {
-            "https://api.groq.com/openai/v1".to_string()
+            GROQ_API_BASE.to_string()
         } else if api_key.starts_with("sk-") && !default_model.contains('/') {
             // Bare "sk-" prefix with a non-routed model name -> likely OpenAI direct.
-            "https://api.openai.com/v1".to_string()
+            OPENAI_API_BASE.to_string()
         } else {
             // Fallback: OpenRouter (supports routed model names like "anthropic/claude-...").
-            "https://openrouter.ai/api/v1".to_string()
+            OPENROUTER_API_BASE.to_string()
         };
 
         // 120s timeout prevents a non-responsive local server (e.g. LM Studio's
@@ -130,7 +143,29 @@ impl OpenAICompatProvider {
             default_model,
             client,
             jit_gate: None,
+            retry_provider_min_secs: 1,
+            retry_provider_max_secs: 30,
+            retry_jit_min_secs: 2,
+            retry_jit_max_secs: 8,
+            lms_native_probe_secs: 2,
         }
+    }
+
+    /// Override the HTTP client timeout.
+    ///
+    /// Replaces the default 120s timeout with the given value.
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        self
+    }
+
+    /// Override the native LMS probe timeout.
+    pub fn with_lms_native_probe_secs(mut self, secs: u64) -> Self {
+        self.lms_native_probe_secs = secs;
+        self
     }
 
     /// Attach a JIT gate for serialised access to a JIT-loading server.
@@ -140,6 +175,23 @@ impl OpenAICompatProvider {
     /// permit for the entire stream duration to prevent model switches mid-stream.
     pub fn with_jit_gate(mut self, gate: Arc<JitGate>) -> Self {
         self.jit_gate = Some(gate);
+        self
+    }
+
+    /// Override the retry backoff parameters.
+    ///
+    /// Values come from `config.retry`; defaults match the original hardcoded values.
+    pub fn with_retry_config(
+        mut self,
+        provider_min_secs: u64,
+        provider_max_secs: u64,
+        jit_min_secs: u64,
+        jit_max_secs: u64,
+    ) -> Self {
+        self.retry_provider_min_secs = provider_min_secs;
+        self.retry_provider_max_secs = provider_max_secs;
+        self.retry_jit_min_secs = jit_min_secs;
+        self.retry_jit_max_secs = jit_max_secs;
         self
     }
 }
@@ -1829,7 +1881,7 @@ mod tests {
     #[test]
     fn test_new_openrouter_by_key_prefix() {
         let provider = OpenAICompatProvider::new("sk-or-my-key", None, None);
-        assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
+        assert_eq!(provider.api_base, OPENROUTER_API_BASE);
         assert_eq!(provider.default_model, "anthropic/claude-opus-4-5");
     }
 
@@ -1837,24 +1889,24 @@ mod tests {
     fn test_new_openrouter_by_api_base() {
         let provider = OpenAICompatProvider::new(
             "some-key",
-            Some("https://openrouter.ai/api/v1"),
+            Some(OPENROUTER_API_BASE),
             Some("meta-llama/llama-3-70b"),
         );
-        assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
+        assert_eq!(provider.api_base, OPENROUTER_API_BASE);
         assert_eq!(provider.default_model, "meta-llama/llama-3-70b");
     }
 
     #[test]
     fn test_new_deepseek_detection() {
         let provider = OpenAICompatProvider::new("sk-something", None, Some("deepseek-chat"));
-        assert_eq!(provider.api_base, "https://api.deepseek.com");
+        assert_eq!(provider.api_base, DEEPSEEK_API_BASE);
         assert_eq!(provider.default_model, "deepseek-chat");
     }
 
     #[test]
     fn test_new_groq_detection() {
         let provider = OpenAICompatProvider::new("gsk_something", None, Some("groq/llama3"));
-        assert_eq!(provider.api_base, "https://api.groq.com/openai/v1");
+        assert_eq!(provider.api_base, GROQ_API_BASE);
         assert_eq!(provider.default_model, "groq/llama3");
     }
 
@@ -1875,21 +1927,21 @@ mod tests {
         // Unknown key prefix + no api_base + routed model name -> OpenRouter.
         let provider =
             OpenAICompatProvider::new("random-key", None, Some("anthropic/claude-opus-4-5"));
-        assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
+        assert_eq!(provider.api_base, OPENROUTER_API_BASE);
     }
 
     #[test]
     fn test_new_anthropic_key_detection() {
         let provider =
             OpenAICompatProvider::new("sk-ant-abc123", None, Some("claude-sonnet-4-5-20250929"));
-        assert_eq!(provider.api_base, "https://api.anthropic.com/v1");
+        assert_eq!(provider.api_base, ANTHROPIC_API_BASE);
     }
 
     #[test]
     fn test_new_openai_key_with_bare_model() {
         // sk- prefix with a non-routed model -> OpenAI direct.
         let provider = OpenAICompatProvider::new("sk-abc123", None, Some("gpt-4o"));
-        assert_eq!(provider.api_base, "https://api.openai.com/v1");
+        assert_eq!(provider.api_base, OPENAI_API_BASE);
     }
 
     #[test]
@@ -1897,7 +1949,7 @@ mod tests {
         // sk- prefix but model has "/" -> OpenRouter.
         let provider =
             OpenAICompatProvider::new("sk-abc123", None, Some("anthropic/claude-opus-4-5"));
-        assert_eq!(provider.api_base, "https://openrouter.ai/api/v1");
+        assert_eq!(provider.api_base, OPENROUTER_API_BASE);
     }
 
     #[test]

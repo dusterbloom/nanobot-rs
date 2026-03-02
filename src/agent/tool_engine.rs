@@ -401,7 +401,256 @@ pub(crate) async fn execute_tools_delegated(
     true
 }
 
+/// Returns `true` if a tool is safe to execute in parallel with other
+/// parallel-safe tools. These are read-only operations that do not mutate
+/// any shared state and can safely race each other.
+fn is_parallel_safe(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "list_dir" | "web_fetch" | "web_search" | "read_skill"
+    )
+}
+
+/// Collects everything produced by a single tool execution, ready for
+/// sequential post-processing by `inject_tool_result`.
+struct SingleToolResult {
+    tool_name: String,
+    tool_id: String,
+    arguments: std::collections::HashMap<String, serde_json::Value>,
+    result: crate::agent::tools::base::ToolExecutionResult,
+    duration_ms: u64,
+}
+
+/// Execute one tool call: emit CallStart, run heartbeat, call the tool,
+/// stop heartbeat, return `SingleToolResult`.
+///
+/// All fields needed for post-processing are included in the return value so
+/// that the caller can mutate `ctx` after the futures complete.
+async fn execute_single_tool(
+    tc: &ToolCallRequest,
+    tools: &crate::agent::tools::registry::ToolRegistry,
+    tool_event_tx: &Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
+    cancellation_token: &Option<tokio_util::sync::CancellationToken>,
+    tool_heartbeat_secs: u64,
+    taint_warning: Option<String>,
+) -> SingleToolResult {
+    let tool_span = tracing::info_span!(
+        "execute_tool_inline",
+        tool = %tc.name,
+        ok = tracing::field::Empty,
+    );
+    let _span_guard = tool_span.enter();
+
+    debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+
+    if let Some(summary) = taint_warning {
+        warn!(
+            "TAINT WARNING: Executing sensitive tool '{}' with tainted context from: {}",
+            tc.name, summary
+        );
+    }
+
+    // Emit CallStart.
+    if let Some(ref tx) = tool_event_tx {
+        let preview: String = serde_json::to_string(&tc.arguments)
+            .unwrap_or_default()
+            .chars()
+            .take(80)
+            .collect();
+        let _ = tx.send(ToolEvent::CallStart {
+            tool_name: tc.name.clone(),
+            tool_call_id: tc.id.clone(),
+            arguments_preview: preview,
+        });
+    }
+
+    let start = std::time::Instant::now();
+
+    // Spawn heartbeat that emits Progress ticks until the tool finishes.
+    let heartbeat = if let Some(ref tx) = tool_event_tx {
+        let hb_tx = tx.clone();
+        let hb_name = tc.name.clone();
+        let hb_id = tc.id.clone();
+        let hb_start = start;
+        let hb_interval = tool_heartbeat_secs;
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(hb_interval));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                let _ = hb_tx.send(ToolEvent::Progress {
+                    tool_name: hb_name.clone(),
+                    tool_call_id: hb_id.clone(),
+                    elapsed_ms: hb_start.elapsed().as_millis() as u64,
+                    output_preview: None,
+                });
+            }
+        }))
+    } else {
+        None
+    };
+
+    let result = if let Some(ref tx) = tool_event_tx {
+        use crate::agent::tools::base::ToolExecutionContext;
+        let exec_ctx = ToolExecutionContext {
+            event_tx: tx.clone(),
+            cancellation_token: cancellation_token
+                .as_ref()
+                .map(|t| t.child_token())
+                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+            tool_call_id: tc.id.clone(),
+        };
+        tools
+            .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
+            .await
+    } else {
+        tools.execute(&tc.name, tc.arguments.clone()).await
+    };
+
+    // Stop heartbeat.
+    if let Some(hb) = heartbeat {
+        hb.abort();
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    tool_span.record("ok", result.ok);
+    debug!(
+        "Tool {} result ({}B, ok={}, {}ms)",
+        tc.name,
+        result.data.len(),
+        result.ok,
+        duration_ms
+    );
+
+    SingleToolResult {
+        tool_name: tc.name.clone(),
+        tool_id: tc.id.clone(),
+        arguments: tc.arguments.clone(),
+        result,
+        duration_ms,
+    }
+}
+
+/// Post-process one completed tool result: gate content, inject into messages,
+/// emit CallEnd, audit, update taint/learning/force_response.
+///
+/// This function must run sequentially (one result at a time) because it
+/// mutates `ctx`.
+async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult) {
+    // For web_fetch/web_search: unwrap the JSON envelope so the model
+    // sees clean article text rather than a JSON metadata summary.
+    let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
+        crate::agent::tools::web::extract_web_content(&r.result.data)
+    } else {
+        r.result.data.clone()
+    };
+
+    // Gate tool result through context budget.
+    let data = if ctx.core.specialist_provider.is_some()
+        && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > 500
+    {
+        ctx.content_gate
+            .admit_with_specialist(
+                &result_data,
+                ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
+                ctx.core.specialist_model.as_deref().unwrap_or(""),
+            )
+            .await
+            .into_text()
+    } else {
+        ctx.content_gate.admit_simple(&result_data).into_text()
+    };
+
+    if ctx.core.provenance_config.enabled {
+        ContextBuilder::add_tool_result_immutable(
+            &mut ctx.messages,
+            &r.tool_id,
+            &r.tool_name,
+            &data,
+        );
+    } else {
+        ContextBuilder::add_tool_result(&mut ctx.messages, &r.tool_id, &r.tool_name, &data);
+    }
+    ctx.flow
+        .tool_guard
+        .record_result(&r.tool_name, &r.arguments, data.clone());
+
+    // Emit CallEnd.
+    if let Some(ref tx) = ctx.tool_event_tx {
+        let _ = tx.send(ToolEvent::CallEnd {
+            tool_name: r.tool_name.clone(),
+            tool_call_id: r.tool_id.clone(),
+            result_data: r.result.data.clone(),
+            ok: r.result.ok,
+            duration_ms: r.duration_ms,
+        });
+    }
+
+    // Audit log.
+    if let Some(ref audit) = ctx.audit {
+        let args_value = serde_json::to_value(&r.arguments).unwrap_or(json!({}));
+        let _ = audit.record(
+            &r.tool_name,
+            &r.tool_id,
+            &args_value,
+            &r.result.data,
+            r.result.ok,
+            r.duration_ms,
+            "inline",
+        );
+    }
+
+    // Track used tools.
+    ctx.used_tools.insert(r.tool_name.clone());
+
+    // Taint tracking.
+    let taint_detail = r
+        .arguments
+        .get("url")
+        .or_else(|| r.arguments.get("query"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().take(200).collect::<String>());
+    ctx.taint_state.mark_tainted(&r.tool_name, taint_detail);
+
+    // Turn audit summary.
+    ctx.turn_tool_entries
+        .push(crate::agent::audit::TurnToolEntry {
+            name: r.tool_name.clone(),
+            id: r.tool_id.clone(),
+            ok: r.result.ok,
+            duration_ms: r.duration_ms,
+            result_chars: r.result.data.len(),
+        });
+
+    // Learning.
+    let context_str: String = r
+        .arguments
+        .values()
+        .filter_map(|v| v.as_str())
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(100)
+        .collect();
+    ctx.core.learning.record(
+        &r.tool_name,
+        r.result.ok,
+        &context_str,
+        r.result.error.as_deref(),
+    );
+
+    // Response boundary flag.
+    if r.tool_name == "exec" || r.tool_name == "write_file" {
+        ctx.flow.force_response = true;
+    }
+}
+
 /// Execute tool calls via the inline (direct) path.
+///
+/// Parallel-safe tools (`read_file`, `list_dir`, `web_fetch`, `web_search`,
+/// `read_skill`) are executed concurrently via `join_all`. All other tools are
+/// executed sequentially. Post-processing always runs sequentially so that
+/// `ctx` mutations are safe.
 pub(crate) async fn execute_tools_inline(
     ctx: &mut TurnContext,
     routed_tool_calls: &[ToolCallRequest],
@@ -418,198 +667,152 @@ pub(crate) async fn execute_tools_inline(
         Some(&tc_json),
     );
 
-    // Execute each tool call.
-    for tc in routed_tool_calls {
-        let tool_span = tracing::info_span!(
-            "execute_tool_inline",
-            tool = %tc.name,
-            ok = tracing::field::Empty,
-        );
-        let _tool_guard = tool_span.enter();
+    // Partition into parallel-safe and sequential tool calls.
+    let (parallel, sequential): (Vec<_>, Vec<_>) = routed_tool_calls
+        .iter()
+        .partition(|tc| is_parallel_safe(&tc.name));
 
-        debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+    // Build taint warnings up-front (immutable borrow of ctx.taint_state).
+    let parallel_taints: Vec<Option<String>> = parallel
+        .iter()
+        .map(|tc| {
+            if ctx.taint_state.check_sensitive(&tc.name).is_some() {
+                Some(ctx.taint_state.taint_summary())
+            } else {
+                None
+            }
+        })
+        .collect();
 
-        // Taint check: warn if a sensitive tool is about to run while the
-        // context contains untrusted web content (prompt-injection guard).
-        if let Some(_spans) = ctx.taint_state.check_sensitive(&tc.name) {
-            warn!(
-                "TAINT WARNING: Executing sensitive tool '{}' with tainted context from: {}",
-                tc.name,
-                ctx.taint_state.taint_summary()
-            );
-        }
-
-        // Emit tool call start event.
-        if let Some(ref tx) = ctx.tool_event_tx {
-            let preview: String = serde_json::to_string(&tc.arguments)
-                .unwrap_or_default()
-                .chars()
-                .take(80)
-                .collect();
-            let _ = tx.send(ToolEvent::CallStart {
-                tool_name: tc.name.clone(),
-                tool_call_id: tc.id.clone(),
-                arguments_preview: preview,
+    // Execute the parallel-safe batch concurrently.
+    let parallel_results: Vec<SingleToolResult> = if !parallel.is_empty() {
+        let futs = parallel
+            .iter()
+            .zip(parallel_taints.into_iter())
+            .map(|(tc, taint)| {
+                execute_single_tool(
+                    tc,
+                    &ctx.tools,
+                    &ctx.tool_event_tx,
+                    &ctx.cancellation_token,
+                    ctx.core.tool_heartbeat_secs,
+                    taint,
+                )
             });
-        }
+        futures_util::future::join_all(futs).await
+    } else {
+        vec![]
+    };
 
-        let start = std::time::Instant::now();
+    // Post-process parallel results sequentially (ctx mutation is safe here).
+    for r in &parallel_results {
+        inject_tool_result(ctx, r).await;
+    }
 
-        // Spawn heartbeat that emits Progress every 2s for tools that
-        // don't emit their own (everything except exec).
-        let heartbeat = if let Some(ref tx) = ctx.tool_event_tx {
-            let hb_tx = tx.clone();
-            let hb_name = tc.name.clone();
-            let hb_id = tc.id.clone();
-            let hb_start = start;
-            Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(2));
-                interval.tick().await; // skip first immediate tick
-                loop {
-                    interval.tick().await;
-                    let _ = hb_tx.send(ToolEvent::Progress {
-                        tool_name: hb_name.clone(),
-                        tool_call_id: hb_id.clone(),
-                        elapsed_ms: hb_start.elapsed().as_millis() as u64,
-                        output_preview: None,
-                    });
-                }
-            }))
+    // Execute sequential tools one at a time.
+    for tc in &sequential {
+        let taint = if ctx.taint_state.check_sensitive(&tc.name).is_some() {
+            Some(ctx.taint_state.taint_summary())
         } else {
             None
         };
+        let r = execute_single_tool(
+            tc,
+            &ctx.tools,
+            &ctx.tool_event_tx,
+            &ctx.cancellation_token,
+            ctx.core.tool_heartbeat_secs,
+            taint,
+        )
+        .await;
+        inject_tool_result(ctx, &r).await;
+    }
+}
 
-        let result = if let Some(ref tx) = ctx.tool_event_tx {
-            use crate::agent::tools::base::ToolExecutionContext;
-            let exec_ctx = ToolExecutionContext {
-                event_tx: tx.clone(),
-                cancellation_token: ctx
-                    .cancellation_token
-                    .as_ref()
-                    .map(|t| t.child_token())
-                    .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-                tool_call_id: tc.id.clone(),
-            };
-            ctx.tools
-                .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
-                .await
-        } else {
-            ctx.tools.execute(&tc.name, tc.arguments.clone()).await
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
 
-        // Stop heartbeat when tool finishes.
-        if let Some(hb) = heartbeat {
-            hb.abort();
+    fn make_tc(name: &str, id: &str) -> ToolCallRequest {
+        ToolCallRequest {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: HashMap::new(),
         }
-        let duration_ms = start.elapsed().as_millis() as u64;
-        tool_span.record("ok", result.ok);
-        debug!(
-            "Tool {} result ({}B, ok={}, {}ms)",
-            tc.name,
-            result.data.len(),
-            result.ok,
-            duration_ms
-        );
-        // For web_fetch/web_search: unwrap the JSON envelope so the model
-        // sees clean article text rather than a JSON metadata summary.
-        let result_data = if tc.name == "web_fetch" || tc.name == "web_search" {
-            crate::agent::tools::web::extract_web_content(&result.data)
-        } else {
-            result.data.clone()
-        };
-        // Gate tool result through context budget.
-        let data = if ctx.core.specialist_provider.is_some()
-            && crate::agent::token_budget::TokenBudget::estimate_str_tokens(&result_data) > 500
-        {
-            ctx.content_gate
-                .admit_with_specialist(
-                    &result_data,
-                    ctx.core.specialist_provider.as_ref().unwrap().as_ref(),
-                    ctx.core.specialist_model.as_deref().unwrap_or(""),
-                )
-                .await
-                .into_text()
-        } else {
-            ctx.content_gate.admit_simple(&result_data).into_text()
-        };
-        if ctx.core.provenance_config.enabled {
-            ContextBuilder::add_tool_result_immutable(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                &data,
-            );
-        } else {
-            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &data);
-        }
-        ctx.flow.tool_guard.record_result(&tc.name, &tc.arguments, data.clone());
+    }
 
-        // Emit tool call end event.
-        if let Some(ref tx) = ctx.tool_event_tx {
-            let _ = tx.send(ToolEvent::CallEnd {
-                tool_name: tc.name.clone(),
-                tool_call_id: tc.id.clone(),
-                result_data: result.data.clone(),
-                ok: result.ok,
-                duration_ms,
-            });
-        }
+    #[test]
+    fn test_is_parallel_safe_classification() {
+        // Parallel-safe tools
+        assert!(is_parallel_safe("read_file"));
+        assert!(is_parallel_safe("list_dir"));
+        assert!(is_parallel_safe("web_fetch"));
+        assert!(is_parallel_safe("web_search"));
+        assert!(is_parallel_safe("read_skill"));
+        // Must serialize
+        assert!(!is_parallel_safe("exec"));
+        assert!(!is_parallel_safe("write_file"));
+        assert!(!is_parallel_safe("edit_file"));
+        assert!(!is_parallel_safe("spawn"));
+        // Unknown defaults to serial
+        assert!(!is_parallel_safe("unknown_tool"));
+    }
 
-        // Record in audit log.
-        if let Some(ref audit) = ctx.audit {
-            let args_value = serde_json::to_value(&tc.arguments).unwrap_or(json!({}));
-            let _ = audit.record(
-                &tc.name,
-                &tc.id,
-                &args_value,
-                &result.data,
-                result.ok,
-                duration_ms,
-                "inline",
-            );
-        }
+    #[test]
+    fn test_mixed_tools_partition_correctly() {
+        let calls = vec![
+            make_tc("read_file", "1"),
+            make_tc("exec", "2"),
+            make_tc("list_dir", "3"),
+            make_tc("write_file", "4"),
+        ];
+        let (par, seq): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        assert_eq!(par.len(), 2);
+        assert_eq!(seq.len(), 2);
+        assert_eq!(par[0].name, "read_file");
+        assert_eq!(par[1].name, "list_dir");
+        assert_eq!(seq[0].name, "exec");
+        assert_eq!(seq[1].name, "write_file");
+    }
 
-        // Track used tools.
-        ctx.used_tools.insert(tc.name.clone());
+    #[test]
+    fn test_all_parallel_safe_no_sequential() {
+        let calls = vec![
+            make_tc("read_file", "1"),
+            make_tc("list_dir", "2"),
+            make_tc("web_search", "3"),
+        ];
+        let (par, seq): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        assert_eq!(par.len(), 3);
+        assert!(seq.is_empty());
+    }
 
-        // Taint tracking: mark context as tainted after a web tool executes.
-        // Extract URL or query from arguments as the taint detail.
-        let taint_detail = tc.arguments.get("url")
-            .or_else(|| tc.arguments.get("query"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.chars().take(200).collect::<String>());
-        ctx.taint_state.mark_tainted(&tc.name, taint_detail);
+    #[test]
+    fn test_all_sequential_no_parallel() {
+        let calls = vec![make_tc("exec", "1"), make_tc("write_file", "2")];
+        let (par, seq): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        assert!(par.is_empty());
+        assert_eq!(seq.len(), 2);
+    }
 
-        // Collect for turn audit summary.
-        ctx.turn_tool_entries
-            .push(crate::agent::audit::TurnToolEntry {
-                name: tc.name.clone(),
-                id: tc.id.clone(),
-                ok: result.ok,
-                duration_ms,
-                result_chars: result.data.len(),
-            });
+    #[test]
+    fn test_single_tool_partitions_correctly() {
+        // Single parallel-safe tool
+        let calls = vec![make_tc("read_file", "1")];
+        let (par, seq): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        assert_eq!(par.len(), 1);
+        assert!(seq.is_empty());
 
-        // Record tool outcome for learning.
-        let context_str: String = tc
-            .arguments
-            .values()
-            .filter_map(|v| v.as_str())
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(100)
-            .collect();
-        ctx.core.learning.record(
-            &tc.name,
-            result.ok,
-            &context_str,
-            result.error.as_deref(),
-        );
-
-        // Set response boundary flag for exec/write_file.
-        if tc.name == "exec" || tc.name == "write_file" {
-            ctx.flow.force_response = true;
-        }
+        // Single serial tool
+        let calls = vec![make_tc("exec", "1")];
+        let (par, seq): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        assert!(par.is_empty());
+        assert_eq!(seq.len(), 1);
     }
 }

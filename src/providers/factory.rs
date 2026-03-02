@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::config::schema::ProviderConfig;
+use crate::config::schema::{ProviderConfig, RetryConfig};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::base::LLMProvider;
 use crate::providers::jit_gate::JitGate;
@@ -23,6 +23,12 @@ pub struct ProviderSpec {
     pub model: Option<String>,
     /// Optional JIT gate for serialised access to shared servers.
     pub jit_gate: Option<Arc<JitGate>>,
+    /// Retry backoff settings (default: provider 1-30s, JIT 2-8s).
+    pub retry: RetryConfig,
+    /// HTTP request timeout in seconds (default: 120).
+    pub timeout_secs: u64,
+    /// Timeout for LMS native probe requests in seconds (default: 2).
+    pub lms_native_probe_secs: u64,
 }
 
 impl ProviderSpec {
@@ -33,6 +39,9 @@ impl ProviderSpec {
             api_base: Some(base_url.to_string()),
             model: model.map(String::from),
             jit_gate: None,
+            retry: RetryConfig::default(),
+            timeout_secs: 120,
+            lms_native_probe_secs: 2,
         }
     }
 
@@ -47,12 +56,28 @@ impl ProviderSpec {
                 .or_else(|| default_base.map(String::from)),
             model: None,
             jit_gate: None,
+            retry: RetryConfig::default(),
+            timeout_secs: 120,
+            lms_native_probe_secs: 2,
         }
     }
 
     /// Conditionally attach a JIT gate.
     pub fn with_jit_gate_opt(mut self, gate: Option<Arc<JitGate>>) -> Self {
         self.jit_gate = gate;
+        self
+    }
+
+    /// Override HTTP timeout and LMS native probe timeout from `TimeoutsConfig`.
+    pub fn with_timeout_config(mut self, timeouts: &crate::config::schema::TimeoutsConfig) -> Self {
+        self.timeout_secs = timeouts.provider_http_secs;
+        self.lms_native_probe_secs = timeouts.lms_native_probe_secs;
+        self
+    }
+
+    /// Override retry backoff settings from `RetryConfig`.
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 }
@@ -64,10 +89,34 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
         spec.api_base.as_deref(),
         spec.model.as_deref(),
     );
+    if spec.timeout_secs != 120 {
+        prov = prov.with_timeout(spec.timeout_secs);
+    }
+    if spec.lms_native_probe_secs != 2 {
+        prov = prov.with_lms_native_probe_secs(spec.lms_native_probe_secs);
+    }
     if let Some(gate) = spec.jit_gate {
         prov = prov.with_jit_gate(gate);
     }
+    prov = prov.with_retry_config(
+        spec.retry.provider_min_secs,
+        spec.retry.provider_max_secs,
+        spec.retry.jit_min_secs,
+        spec.retry.jit_max_secs,
+    );
     Arc::new(prov)
+}
+
+/// Create an Anthropic native provider (for OAuth / direct API) with retry config.
+pub fn create_anthropic_with_retry(
+    token: &str,
+    model: Option<&str>,
+    retry: &RetryConfig,
+) -> Arc<dyn LLMProvider> {
+    Arc::new(
+        AnthropicProvider::new(token, model)
+            .with_retry_config(retry.provider_min_secs, retry.provider_max_secs),
+    )
 }
 
 /// Create an Anthropic native provider (for OAuth / direct API).
@@ -195,6 +244,9 @@ mod tests {
             api_base: Some("https://api.example.com/v1".to_string()),
             model: Some("gpt-4".to_string()),
             jit_gate: None,
+            retry: RetryConfig::default(),
+            timeout_secs: 120,
+            lms_native_probe_secs: 2,
         };
         let provider = create_openai_compat(spec);
         assert_eq!(provider.get_default_model(), "gpt-4");

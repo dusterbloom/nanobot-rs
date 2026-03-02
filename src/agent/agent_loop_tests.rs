@@ -7,7 +7,7 @@
 use super::*;
 use backon::BackoffBuilder;
 use crate::agent::router::{extract_json_object, parse_lenient_router_decision, request_strict_router_decision};
-use crate::config::schema::{MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig, TrioConfig};
+use crate::config::schema::{AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
@@ -127,6 +127,9 @@ fn build_test_core(
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     })
 }
 
@@ -181,6 +184,7 @@ async fn test_request_strict_router_decision_action_matrix() {
             0.6,
             1.0,
             "",
+            256,
         )
         .await
         .expect("valid strict router decision");
@@ -240,7 +244,7 @@ async fn test_real_providers_trio_probe() {
     ];
     for (expected_action, directive) in router_cases {
         let pack = format!("{}\nFollow schema strictly.", directive);
-        match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0, "").await {
+        match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0, "", 256).await {
             Ok(d) => {
                 if d.action != expected_action {
                     failures.push(format!(
@@ -449,6 +453,9 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
     assert_eq!(
         core.tool_runner_model.as_deref(),
@@ -506,6 +513,9 @@ fn test_delegation_with_is_local_true() {
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
 
     assert!(core.is_local);
@@ -556,6 +566,9 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
 
     // Compaction provider goes to memory_provider, delegation to tool_runner
@@ -644,6 +657,9 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(2048));
     let core_handle = AgentHandle::new(core, counters);
@@ -944,6 +960,9 @@ fn build_trio_e2e_harness(
         trio_config,
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -1311,6 +1330,9 @@ async fn test_trio_e2e_router_unreachable() {
         trio_config,
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
@@ -1411,6 +1433,9 @@ async fn test_trio_e2e_specialist_unreachable() {
         trio_config,
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
@@ -1547,25 +1572,25 @@ fn test_should_strip_tools_both_degraded() {
 
 #[test]
 fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, Some(512));
+    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, Some(512), &AdaptiveTokenConfig::default());
     assert_eq!(out, 3584);
 }
 
 #[test]
 fn test_adaptive_max_tokens_no_reserve_without_thinking() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, None);
+    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, None, &AdaptiveTokenConfig::default());
     assert_eq!(out, 4096);
 }
 
 #[test]
 fn test_adaptive_max_tokens_no_reserve_for_cloud() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, false, Some(512));
+    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, false, Some(512), &AdaptiveTokenConfig::default());
     assert_eq!(out, 4096);
 }
 
 #[test]
 fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
-    let out = adaptive_max_tokens(512, false, "short", 0, true, Some(128));
+    let out = adaptive_max_tokens(512, false, "short", 0, true, Some(128), &AdaptiveTokenConfig::default());
     assert_eq!(out, 256);
 }
 
@@ -1734,6 +1759,9 @@ fn build_trio_offline_harness(
         trio_config,
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
@@ -2102,6 +2130,9 @@ async fn test_trio_offline_e2e_health_gate() {
         trio_config,
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
     });
 
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
