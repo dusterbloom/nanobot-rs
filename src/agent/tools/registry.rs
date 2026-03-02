@@ -695,6 +695,93 @@ impl ToolRegistry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Toolset resolution (pure functions — no &self, no IO)
+// ---------------------------------------------------------------------------
+
+/// Built-in toolset definitions.
+fn builtin_toolsets() -> HashMap<&'static str, Vec<&'static str>> {
+    let mut m = HashMap::new();
+    m.insert(
+        "core",
+        vec!["read_file", "write_file", "edit_file", "list_dir", "exec"],
+    );
+    m.insert("web", vec!["web_search", "web_fetch"]);
+    m.insert(
+        "memory",
+        vec!["recall", "remember", "read_skill", "session_search"],
+    );
+    m.insert(
+        "read_only",
+        vec![
+            "read_file",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+            "recall",
+            "read_skill",
+            "session_search",
+        ],
+    );
+    m
+}
+
+/// Resolve a toolset name to a list of tool names.
+///
+/// Custom sets are in `custom_sets`. References starting with `@` expand to
+/// other sets (built-in or custom). `available_tools` is the list of all
+/// registered tool names (reserved for future validation).
+///
+/// Returns the resolved, deduplicated (order-preserving) list of tool names,
+/// or an error message if the set is unknown or a cycle is detected.
+pub fn resolve_toolset(
+    name: &str,
+    custom_sets: &HashMap<String, Vec<String>>,
+    available_tools: &[String],
+) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    resolve_toolset_inner(name, custom_sets, available_tools, &mut result, &mut visited)?;
+    // Dedup while preserving insertion order.
+    let mut seen = HashSet::new();
+    result.retain(|t| seen.insert(t.clone()));
+    Ok(result)
+}
+
+fn resolve_toolset_inner(
+    name: &str,
+    custom_sets: &HashMap<String, Vec<String>>,
+    available_tools: &[String],
+    result: &mut Vec<String>,
+    visited: &mut HashSet<String>,
+) -> Result<(), String> {
+    // Check for cycles before recursing.
+    if !visited.insert(name.to_string()) {
+        return Err(format!("Cycle detected in toolset resolution: {}", name));
+    }
+
+    let builtins = builtin_toolsets();
+
+    // Custom sets take precedence over built-ins.
+    let entries: Vec<&str> = if let Some(tools) = custom_sets.get(name) {
+        tools.iter().map(|s| s.as_str()).collect()
+    } else if let Some(tools) = builtins.get(name) {
+        tools.clone()
+    } else {
+        return Err(format!("Unknown toolset: {}", name));
+    };
+
+    for entry in entries {
+        if let Some(ref_name) = entry.strip_prefix('@') {
+            resolve_toolset_inner(ref_name, custom_sets, available_tools, result, visited)?;
+        } else {
+            result.push(entry.to_string());
+        }
+    }
+
+    Ok(())
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
