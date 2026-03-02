@@ -2253,3 +2253,42 @@ async fn test_trio_offline_e2e_parse_fallback_lenient() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+
+// ============================================================================
+// appears_incomplete heuristic tests
+// ============================================================================
+
+mod continuation_tests {
+    use super::appears_incomplete;
+
+    #[test]
+    fn test_unclosed_backtick_detected() {
+        assert!(appears_incomplete("The template to skip `"));
+        assert!(appears_incomplete("Thinking blocks (`"));
+    }
+
+    #[test]
+    fn test_complete_response_not_flagged() {
+        assert!(!appears_incomplete("This is a complete sentence."));
+        assert!(!appears_incomplete("Done!"));
+        assert!(!appears_incomplete("Use `code` here."));
+        assert!(!appears_incomplete("```\ncode\n```"));
+    }
+
+    #[test]
+    fn test_mid_sentence_detected() {
+        assert!(appears_incomplete("The quick brown fox jumped over the"));
+        assert!(appears_incomplete("Here are the steps to configure"));
+    }
+
+    #[test]
+    fn test_short_fragments_not_flagged() {
+        assert!(!appears_incomplete("OK"));
+        assert!(!appears_incomplete("Yes"));
+    }
+
+    #[test]
+    fn test_unclosed_paren_detected() {
+        assert!(appears_incomplete("The function signature is fn foo(bar"));
+    }
+}

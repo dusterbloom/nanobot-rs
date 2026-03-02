@@ -580,11 +580,16 @@ async fn stream_and_render_inner(
                 delta = delta_rx.recv(), if !delta_done => {
                     match delta {
                         Some(d) => {
-                            full_text.push_str(&d);
-                            renderer.push(&d);
-                            #[cfg(feature = "voice")]
-                            if let Some(ref mut acc) = tts_acc {
-                                acc.push(&d);
+                            // Detect finish_reason metadata message (not rendered text).
+                            if let Some(fr) = d.strip_prefix("\x00finish_reason:") {
+                                renderer.finish_reason = Some(fr.to_string());
+                            } else {
+                                full_text.push_str(&d);
+                                renderer.push(&d);
+                                #[cfg(feature = "voice")]
+                                if let Some(ref mut acc) = tts_acc {
+                                    acc.push(&d);
+                                }
                             }
                         }
                         None => {

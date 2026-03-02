@@ -1406,13 +1406,19 @@ impl AgentLoopShared {
                 .as_ref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false)
-            && response.finish_reason == "length"
+            && (response.finish_reason == "length"
+                || (response.finish_reason == "stop"
+                    && ctx.core.is_local
+                    && response.content.as_ref().map(|s| appears_incomplete(s)).unwrap_or(false)))
             && ctx.flow.continuations_used < max_cont
         {
             ctx.flow.continuations_used += 1;
+            if response.finish_reason == "stop" {
+                info!("auto_continue: heuristic detected incomplete response despite finish_reason='stop'");
+            }
             info!(
-                "auto_continue: continuation {}/{} — finish_reason was 'length'",
-                ctx.flow.continuations_used, max_cont
+                "auto_continue: continuation {}/{} — finish_reason was '{}'",
+                ctx.flow.continuations_used, max_cont, response.finish_reason
             );
 
             // Streaming indicator
@@ -1571,6 +1577,10 @@ impl AgentLoopShared {
                 );
                 content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
                     .to_string();
+            }
+            // Send finish_reason metadata to the REPL renderer before closing the channel.
+            if let Some(ref tx) = ctx.text_delta_tx {
+                let _ = tx.send(format!("\x00finish_reason:{}", response.finish_reason));
             }
             StepResult::Done(IterationOutcome::Finished(content))
         }
@@ -2521,6 +2531,43 @@ impl AgentLoop {
 // requires owned `Box<dyn Tool>`), we create thin proxy wrappers that
 // implement `Tool` by delegating to the inner `Arc`.
 
+
+// ============================================================================
+// Heuristic helpers
+// ============================================================================
+
+/// Detect responses that appear truncated despite finish_reason being "stop".
+///
+/// This catches cases where the model stops at special characters (e.g., backtick)
+/// due to tokenizer/stop-token issues in local model servers.
+pub(crate) fn appears_incomplete(content: &str) -> bool {
+    let trimmed = content.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Ends mid-sentence (no terminal punctuation, not a code block fence)
+    let last_char = trimmed.chars().last().unwrap();
+    let ends_mid_sentence = !matches!(last_char, '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']' | '}' | '`')
+        && !trimmed.ends_with("```");
+
+    // Has unclosed backtick (odd number of backticks on the last line).
+    // Exclude code fences (lines that are purely backticks, e.g. "```") —
+    // those are block delimiters, not inline code markers.
+    let last_line = trimmed.lines().last().unwrap_or("");
+    let last_line_trimmed = last_line.trim();
+    let is_code_fence = !last_line_trimmed.is_empty()
+        && last_line_trimmed.chars().all(|c| c == '`')
+        && last_line_trimmed.len() >= 3;
+    let backtick_count = last_line.chars().filter(|&c| c == '`').count();
+    let unclosed_backtick = !is_code_fence && backtick_count % 2 != 0;
+
+    // Has unclosed parenthesis/bracket on the last line
+    let unclosed_paren = last_line.chars().filter(|&c| c == '(').count()
+        > last_line.chars().filter(|&c| c == ')').count();
+
+    unclosed_backtick || (ends_mid_sentence && trimmed.len() > 20) || unclosed_paren
+}
 
 // ============================================================================
 // Tests

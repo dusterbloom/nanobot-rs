@@ -469,10 +469,20 @@ async fn try_native_lms_chat(
         }
     }
 
+    // Extract finish_reason from the native LMS response. The field may live
+    // at the top level as "finish_reason" or "stop_reason", or inside the
+    // matching output item. Fall back to "stop" only when absent.
+    let finish_reason = json
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("stop_reason").and_then(|v| v.as_str()))
+        .unwrap_or("stop")
+        .to_string();
+
     Some(LLMResponse {
         content,
         tool_calls: Vec::new(),
-        finish_reason: "stop".to_string(),
+        finish_reason,
         usage,
     })
 }
@@ -1287,6 +1297,7 @@ async fn parse_sse_stream(
     let mut full_reasoning = String::new();
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = String::from("stop");
+    let mut got_done = false;
     let mut usage: HashMap<String, i64> = HashMap::new();
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
@@ -1324,6 +1335,7 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
+                got_done = true;
                 let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
                 if !tail_reasoning.is_empty() {
                     full_reasoning.push_str(&tail_reasoning);
@@ -1482,6 +1494,11 @@ async fn parse_sse_stream(
     }
 
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
+    // Treat an abnormal termination during content generation as "length" so
+    // the auto-continue mechanism can detect and recover from it.
+    if !got_done && finish_reason == "stop" {
+        finish_reason = String::from("length");
+    }
     warn!(
         content_len = full_content.len(),
         reasoning_len = full_reasoning.len(),
@@ -2330,6 +2347,64 @@ mod tests {
         // Must have received a Done with assembled content.
         let resp = done_response.expect("should have received Done chunk despite no [DONE]");
         assert_eq!(resp.content.as_deref(), Some("Hello world"));
+        // Abnormal termination without [DONE] must report "length" so the
+        // auto-continue mechanism can detect truncation (Bug 2 regression guard).
+        assert_eq!(
+            resp.finish_reason, "length",
+            "stream ending without [DONE] must yield finish_reason=length"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_with_done_keeps_finish_reason_stop() {
+        // A well-formed stream that sends [DONE] should preserve the
+        // finish_reason received in the chunks (not override it with "length").
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done chunk");
+        assert_eq!(resp.finish_reason, "stop", "normal stream with [DONE] must keep finish_reason=stop");
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_with_done_keeps_finish_reason_length() {
+        // A stream that sends finish_reason=length and then [DONE] (model hit
+        // token limit gracefully) must preserve "length".
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"finish_reason\":\"length\",\"index\":0}]}",
+            "data: [DONE]",
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done chunk");
+        assert_eq!(resp.finish_reason, "length", "token-limit response must keep finish_reason=length");
     }
 
     #[tokio::test]

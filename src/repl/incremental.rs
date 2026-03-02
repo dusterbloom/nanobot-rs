@@ -46,6 +46,9 @@ pub struct IncrementalRenderer {
     /// Buffered table rows (lines starting and ending with `|`) waiting to be
     /// rendered together through termimad once the table ends.
     table_buffer: Vec<String>,
+    /// Finish reason from the LLM response. Set externally before calling `finish()`.
+    /// Shown in the timing footer for non-"stop" reasons (e.g. "length", "tool_calls").
+    pub finish_reason: Option<String>,
 }
 
 // SAFETY: IncrementalRenderer is only ever created, used, and dropped within
@@ -64,6 +67,7 @@ impl IncrementalRenderer {
             has_partial: false,
             partial_rows: 0,
             table_buffer: Vec::new(),
+            finish_reason: None,
         }
     }
 
@@ -333,9 +337,13 @@ impl IncrementalRenderer {
         } else {
             String::new()
         };
+        let reason_suffix = match self.finish_reason.as_deref() {
+            Some(fr) if fr != "stop" => format!("  [{}]", fr),
+            _ => String::new(),
+        };
         println!(
-            "\r\x1b[2m⧗ {:.1}s  {}w{}\x1b[0m",
-            elapsed, self.total_words, rate
+            "\r\x1b[2m⧗ {:.1}s  {}w{}{}\x1b[0m",
+            elapsed, self.total_words, rate, reason_suffix
         );
         std::io::stdout().flush().ok();
     }
