@@ -240,15 +240,32 @@ impl ExecTool {
                 Err(_) => PathBuf::from(cwd),
             };
 
-            // Extract absolute paths from the command.
-            let posix_re =
+            // Extract absolute paths from the command, including those inside
+            // single or double quotes (the previous regex stopped at quote
+            // boundaries, allowing `cat '/etc/secret'` to bypass the check).
+            let posix_unquoted =
                 Regex::new(r#"/[^\s"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
+            let posix_double_quoted =
+                Regex::new(r#""(/[^"]+)""#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
+            let posix_single_quoted =
+                Regex::new(r"'(/[^']+)'").unwrap_or_else(|_| Regex::new(r"^$").unwrap());
             let win_re =
-                Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
+                Regex::new(r#"[A-Za-z]:\\[^\s"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
 
             let mut paths: Vec<String> = Vec::new();
-            for m in posix_re.find_iter(cmd) {
+            for m in posix_unquoted.find_iter(cmd) {
                 paths.push(m.as_str().to_string());
+            }
+            // Capture group 1 extracts the path without surrounding quotes.
+            for cap in posix_double_quoted.captures_iter(cmd) {
+                if let Some(m) = cap.get(1) {
+                    paths.push(m.as_str().to_string());
+                }
+            }
+            for cap in posix_single_quoted.captures_iter(cmd) {
+                if let Some(m) = cap.get(1) {
+                    paths.push(m.as_str().to_string());
+                }
             }
             for m in win_re.find_iter(cmd) {
                 paths.push(m.as_str().to_string());
@@ -1247,5 +1264,27 @@ mod tests {
         );
         assert!(msg.contains("Hint:"));
         assert!(msg.contains("PATH"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Quoted absolute paths must be caught by workspace restriction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guard_blocks_single_quoted_absolute_path() {
+        let result = guard("cat '/etc/passwd'");
+        assert!(
+            result.is_some(),
+            "Single-quoted absolute path outside workspace should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_guard_blocks_double_quoted_absolute_path() {
+        let result = guard("cat \"/etc/passwd\"");
+        assert!(
+            result.is_some(),
+            "Double-quoted absolute path outside workspace should be blocked"
+        );
     }
 }

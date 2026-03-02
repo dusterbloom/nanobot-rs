@@ -181,6 +181,9 @@ pub fn should_rotate(session: &Session, rotation_size_bytes: usize) -> bool {
 /// Sessions are stored as JSONL files in `~/.nanobot/sessions`.
 /// Thread-safe: the cache is protected by a Mutex so multiple tasks can
 /// access sessions concurrently.
+/// Maximum number of sessions held in memory before LRU eviction kicks in.
+const DEFAULT_MAX_CACHED_SESSIONS: usize = 128;
+
 pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
@@ -189,6 +192,8 @@ pub struct SessionManager {
     rotation_size_bytes: usize,
     /// Number of recent messages to carry into a new session on rotation.
     rotation_carry_messages: usize,
+    /// Maximum number of sessions to hold in memory.
+    max_cached_sessions: usize,
 }
 
 impl SessionManager {
@@ -203,6 +208,7 @@ impl SessionManager {
             cache: Mutex::new(HashMap::new()),
             rotation_size_bytes: 1_000_000,
             rotation_carry_messages: 10,
+            max_cached_sessions: DEFAULT_MAX_CACHED_SESSIONS,
         }
     }
 
@@ -217,6 +223,7 @@ impl SessionManager {
             cache: Mutex::new(HashMap::new()),
             rotation_size_bytes,
             rotation_carry_messages,
+            max_cached_sessions: DEFAULT_MAX_CACHED_SESSIONS,
         }
     }
 
@@ -231,14 +238,14 @@ impl SessionManager {
         max_turns: usize,
     ) -> Vec<Value> {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages, self.max_cached_sessions);
         session.get_history(max_messages, max_turns)
     }
 
     /// Add a message to a session and persist it.
     pub async fn add_message_and_save(&self, key: &str, role: &str, content: &str) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages, self.max_cached_sessions);
         session.add_message(role, content);
         Self::save_session(session, &self.sessions_dir);
     }
@@ -246,7 +253,7 @@ impl SessionManager {
     /// Add multiple messages to a session and persist it.
     pub async fn add_messages_and_save(&self, key: &str, messages: &[(&str, &str)]) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages, self.max_cached_sessions);
         for &(role, content) in messages {
             session.add_message(role, content);
         }
@@ -256,7 +263,7 @@ impl SessionManager {
     /// Save a batch of raw JSON messages (preserving tool_calls, tool_call_id, etc.)
     pub async fn add_messages_raw(&self, key: &str, messages: &[Value]) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages, self.max_cached_sessions);
         for msg in messages {
             let mut m = msg.clone();
             // Add timestamp if not present.
@@ -272,7 +279,7 @@ impl SessionManager {
     /// Add a single raw JSON message (e.g., LCM summary turn) and persist.
     pub async fn add_message_raw(&self, key: &str, message: &Value) {
         let mut cache = self.cache.lock().await;
-        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages);
+        let session = Self::get_or_create_inner(&mut cache, key, &self.sessions_dir, self.rotation_size_bytes, self.rotation_carry_messages, self.max_cached_sessions);
         let mut m = message.clone();
         if m.get("timestamp").is_none() {
             m["timestamp"] = json!(Local::now().to_rfc3339());
@@ -293,6 +300,7 @@ impl SessionManager {
             &self.sessions_dir,
             self.rotation_size_bytes,
             self.rotation_carry_messages,
+            self.max_cached_sessions,
         );
         session.messages.clone()
     }
@@ -426,6 +434,7 @@ impl SessionManager {
         sessions_dir: &Path,
         rotation_size_bytes: usize,
         rotation_carry_messages: usize,
+        max_cached_sessions: usize,
     ) -> &'a mut Session {
         let today = Local::now().format("%Y-%m-%d").to_string();
         let mut carry_messages: Option<Vec<Value>> = None;
@@ -454,14 +463,29 @@ impl SessionManager {
         }
 
         if !cache.contains_key(key) {
+            // Evict the least-recently-updated session if cache is at capacity.
+            if cache.len() >= max_cached_sessions {
+                let oldest_key = cache
+                    .iter()
+                    .min_by_key(|(_, s)| s.updated_at)
+                    .map(|(k, _)| k.clone());
+                if let Some(evict_key) = oldest_key {
+                    if let Some(evicted) = cache.get(&evict_key) {
+                        Self::save_session(evicted, sessions_dir);
+                    }
+                    cache.remove(&evict_key);
+                    tracing::debug!("Session cache full ({}/{}), evicted {}", max_cached_sessions, max_cached_sessions, evict_key);
+                }
+            }
+
             let mut session =
                 Self::load_from_disk(key, sessions_dir).unwrap_or_else(|| Session::new(key));
-            
+
             if let Some(carried) = carry_messages {
                 session.messages = carried;
                 session.created_at = Local::now();
             }
-            
+
             cache.insert(key.to_string(), session);
         }
         cache.get_mut(key).expect("session must exist in cache")

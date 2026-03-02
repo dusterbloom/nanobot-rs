@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
@@ -33,7 +33,7 @@ impl ChannelManager {
     /// Create a new `ChannelManager`, initialising enabled channels.
     pub fn new(
         config: &Config,
-        bus_inbound_tx: UnboundedSender<InboundMessage>,
+        bus_inbound_tx: Sender<InboundMessage>,
         bus_outbound_rx: UnboundedReceiver<OutboundMessage>,
         #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
     ) -> Self {

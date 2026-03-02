@@ -16,12 +16,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
-use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::bus::events::{InboundMessage, MessageDedup, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::WhatsAppConfig;
 
@@ -35,7 +35,7 @@ const BRIDGE_PACKAGE_JSON: &str = include_str!("../../bridge/whatsapp/package.js
 /// WhatsApp channel that connects to a Node.js bridge via WebSocket.
 pub struct WhatsAppChannel {
     config: WhatsAppConfig,
-    bus_tx: UnboundedSender<InboundMessage>,
+    bus_tx: Sender<InboundMessage>,
     running: Arc<AtomicBool>,
     /// Sender for outgoing WebSocket messages (set once connected).
     ws_tx: Arc<TokioMutex<Option<UnboundedSender<String>>>>,
@@ -58,7 +58,7 @@ impl WhatsAppChannel {
     /// Create a new `WhatsAppChannel`.
     pub fn new(
         config: WhatsAppConfig,
-        bus_tx: UnboundedSender<InboundMessage>,
+        bus_tx: Sender<InboundMessage>,
         #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
     ) -> Self {
         Self {
@@ -142,8 +142,9 @@ impl WhatsAppChannel {
     /// Handle a JSON message from the bridge.
     async fn _handle_bridge_message(
         data: &Value,
-        bus_tx: &UnboundedSender<InboundMessage>,
+        bus_tx: &Sender<InboundMessage>,
         allow_from: &[String],
+        dedup: &MessageDedup,
         #[cfg(feature = "voice")] voice_pipeline: &Option<Arc<VoicePipeline>>,
     ) {
         let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -242,7 +243,16 @@ impl WhatsAppChannel {
                     }
                 }
 
-                let _ = bus_tx.send(msg);
+                // Deduplicate: reject messages we've already processed recently.
+                let fp = MessageDedup::fingerprint(chat_id, chat_id, &content);
+                if dedup.is_duplicate(fp) {
+                    debug!("WhatsApp: dropping duplicate message from {}", chat_id);
+                    return;
+                }
+
+                if let Err(e) = bus_tx.try_send(msg) {
+                    warn!("WhatsApp inbound queue full, dropping message: {}", e);
+                }
             }
             "status" => {
                 let status = data
@@ -296,6 +306,7 @@ impl Channel for WhatsAppChannel {
         info!("Connecting to WhatsApp bridge at {}...", bridge_url);
 
         tokio::spawn(async move {
+            let dedup = MessageDedup::new(512);
             while running.load(Ordering::SeqCst) {
                 match tokio_tungstenite::connect_async(&bridge_url).await {
                     Ok((ws_stream, _)) => {
@@ -339,6 +350,7 @@ impl Channel for WhatsAppChannel {
                                                 &data,
                                                 &bus_tx,
                                                 &allow_from,
+                                                &dedup,
                                                 #[cfg(feature = "voice")]
                                                 &voice_pipeline,
                                             )

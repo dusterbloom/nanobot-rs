@@ -1,6 +1,7 @@
 //! Event types for the message bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,53 @@ pub fn coalesce_messages(mut messages: Vec<InboundMessage>) -> InboundMessage {
     merged
 }
 
+/// Lightweight deduplication guard for channel adapters.
+///
+/// Tracks the last `capacity` message fingerprints and rejects duplicates.
+/// Thread-safe (interior `Mutex`).  Intended to be shared via `Arc`.
+pub struct MessageDedup {
+    seen: Mutex<VecDeque<u64>>,
+    capacity: usize,
+}
+
+impl MessageDedup {
+    /// Create a new dedup guard with the given capacity (number of recent
+    /// message fingerprints to remember).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    /// Return `true` if `fingerprint` has been seen recently (duplicate).
+    /// Otherwise record it and return `false`.
+    pub fn is_duplicate(&self, fingerprint: u64) -> bool {
+        let mut seen = self.seen.lock().unwrap();
+        if seen.contains(&fingerprint) {
+            return true;
+        }
+        if seen.len() >= self.capacity {
+            seen.pop_front();
+        }
+        seen.push_back(fingerprint);
+        false
+    }
+
+    /// Compute a fingerprint for a message from its core fields.
+    ///
+    /// Uses a simple hash combining sender, chat_id, and content so that
+    /// identical messages from the same sender produce the same fingerprint.
+    pub fn fingerprint(sender_id: &str, chat_id: &str, content: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sender_id.hash(&mut hasher);
+        chat_id.hash(&mut hasher);
+        content.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Returns true if this channel should bypass coalescing (single-user channels).
 pub fn should_coalesce(channel: &str) -> bool {
     // CLI and voice are single-user, no rapid-fire messages to coalesce.
@@ -259,5 +307,39 @@ mod tests {
     #[test]
     fn test_should_not_coalesce_cron() {
         assert!(!should_coalesce("cron"));
+    }
+
+    // ---------------------------------------------------------------
+    // MessageDedup tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_rejects_duplicate() {
+        let dedup = MessageDedup::new(8);
+        let fp = MessageDedup::fingerprint("user1", "chat1", "hello");
+        assert!(!dedup.is_duplicate(fp), "first should not be duplicate");
+        assert!(dedup.is_duplicate(fp), "second should be duplicate");
+    }
+
+    #[test]
+    fn test_dedup_allows_different_messages() {
+        let dedup = MessageDedup::new(8);
+        let fp1 = MessageDedup::fingerprint("user1", "chat1", "hello");
+        let fp2 = MessageDedup::fingerprint("user1", "chat1", "world");
+        assert!(!dedup.is_duplicate(fp1));
+        assert!(!dedup.is_duplicate(fp2));
+    }
+
+    #[test]
+    fn test_dedup_evicts_oldest() {
+        let dedup = MessageDedup::new(2);
+        let fp1 = MessageDedup::fingerprint("u", "c", "a");
+        let fp2 = MessageDedup::fingerprint("u", "c", "b");
+        let fp3 = MessageDedup::fingerprint("u", "c", "c");
+        assert!(!dedup.is_duplicate(fp1));
+        assert!(!dedup.is_duplicate(fp2));
+        // fp1 should be evicted after fp3 is inserted
+        assert!(!dedup.is_duplicate(fp3));
+        assert!(!dedup.is_duplicate(fp1), "fp1 should have been evicted");
     }
 }

@@ -11,10 +11,10 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
-use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::bus::events::{InboundMessage, MessageDedup, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::TelegramConfig;
 
@@ -74,7 +74,7 @@ pub async fn tg_edit_message(
 /// Telegram channel using long-polling.
 pub struct TelegramChannel {
     config: TelegramConfig,
-    bus_tx: UnboundedSender<InboundMessage>,
+    bus_tx: Sender<InboundMessage>,
     groq_api_key: String,
     running: Arc<AtomicBool>,
     client: reqwest::Client,
@@ -86,7 +86,7 @@ impl TelegramChannel {
     /// Create a new `TelegramChannel`.
     pub fn new(
         config: TelegramConfig,
-        bus_tx: UnboundedSender<InboundMessage>,
+        bus_tx: Sender<InboundMessage>,
         groq_api_key: String,
         #[cfg(feature = "voice")] voice_pipeline: Option<Arc<VoicePipeline>>,
     ) -> Self {
@@ -105,10 +105,11 @@ impl TelegramChannel {
     async fn _on_message(
         client: &reqwest::Client,
         token: &str,
-        bus_tx: &UnboundedSender<InboundMessage>,
+        bus_tx: &Sender<InboundMessage>,
         allow_from: &[String],
         update: &Value,
         _groq_api_key: &str,
+        dedup: &MessageDedup,
         #[cfg(feature = "voice")] voice_pipeline: &Option<Arc<VoicePipeline>>,
     ) {
         let message = match update.get("message") {
@@ -290,7 +291,16 @@ impl TelegramChannel {
             }
         }
 
-        let _ = bus_tx.send(msg);
+        // Deduplicate: reject messages we've already processed recently.
+        let fp = MessageDedup::fingerprint(&sender_id, &chat_id.to_string(), &content);
+        if dedup.is_duplicate(fp) {
+            debug!("Telegram: dropping duplicate message from {}", sender_id);
+            return;
+        }
+
+        if let Err(e) = bus_tx.try_send(msg) {
+            tracing::warn!("Telegram inbound queue full, dropping message: {}", e);
+        }
     }
 
     /// Download a file from Telegram using the getFile + download URL pattern.
@@ -373,6 +383,7 @@ impl Channel for TelegramChannel {
         tokio::spawn(async move {
             let mut offset: i64 = 0;
             let base_url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+            let dedup = MessageDedup::new(512);
 
             while running.load(Ordering::SeqCst) {
                 let body = json!({
@@ -404,6 +415,7 @@ impl Channel for TelegramChannel {
                                         &allow_from,
                                         update,
                                         &groq_api_key,
+                                        &dedup,
                                         #[cfg(feature = "voice")]
                                         &voice_pipeline,
                                     )

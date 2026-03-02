@@ -925,7 +925,20 @@ pub(crate) async fn run_gateway_async(
     use std::time::Duration;
     use tracing::info;
 
+    // Bounded inbound channel: channel adapters write into `gw_inbound_tx`
+    // (capacity 256).  A bridge task drains into the unbounded channel that
+    // AgentLoop expects, providing backpressure so fast producers cannot OOM.
+    const INBOUND_CAP: usize = 256;
+    let (gw_inbound_tx, mut gw_inbound_rx) = mpsc::channel::<InboundMessage>(INBOUND_CAP);
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
+    {
+        let inbound_tx = inbound_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = gw_inbound_rx.recv().await {
+                let _ = inbound_tx.send(msg);
+            }
+        });
+    }
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
     let cron_store_path = get_data_dir().join("cron").join("jobs.json");
@@ -1015,7 +1028,7 @@ pub(crate) async fn run_gateway_async(
 
     let channel_manager = ChannelManager::new(
         &config,
-        inbound_tx,
+        gw_inbound_tx,
         outbound_rx,
         #[cfg(feature = "voice")]
         voice_pipeline,

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
@@ -26,7 +26,7 @@ use crate::config::schema::FeishuConfig;
 /// Feishu HTTP API.
 pub struct FeishuChannel {
     config: FeishuConfig,
-    bus_tx: UnboundedSender<InboundMessage>,
+    bus_tx: Sender<InboundMessage>,
     running: Arc<AtomicBool>,
     client: reqwest::Client,
     /// Cached tenant access token.
@@ -35,7 +35,7 @@ pub struct FeishuChannel {
 
 impl FeishuChannel {
     /// Create a new `FeishuChannel`.
-    pub fn new(config: FeishuConfig, bus_tx: UnboundedSender<InboundMessage>) -> Self {
+    pub fn new(config: FeishuConfig, bus_tx: Sender<InboundMessage>) -> Self {
         Self {
             config,
             bus_tx,

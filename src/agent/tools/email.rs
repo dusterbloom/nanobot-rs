@@ -39,7 +39,7 @@ impl Tool for CheckInboxTool {
     }
 
     async fn execute(&self, _params: HashMap<String, Value>) -> String {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundMessage>(64);
 
         let use_api = self.email_config.imap_host.contains("agentmail.to");
         let result = if use_api {

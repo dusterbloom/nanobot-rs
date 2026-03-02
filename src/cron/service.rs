@@ -133,14 +133,27 @@ impl CronService {
     }
 
     /// Serialize the current store to disk.
+    ///
+    /// Uses atomic write (temp file + rename) so a crash mid-write never
+    /// corrupts the store file.
     fn persist(&self) {
         if let Some(parent) = self.store_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        if let Ok(json) = serde_json::to_string_pretty(&self.store) {
-            if let Err(e) = std::fs::write(&self.store_path, json) {
-                warn!("Failed to persist cron store: {}", e);
+        let json = match serde_json::to_string_pretty(&self.store) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize cron store: {}", e);
+                return;
             }
+        };
+        let tmp_path = self.store_path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            warn!("Failed to write temp cron store: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &self.store_path) {
+            warn!("Failed to rename cron store: {}", e);
         }
     }
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
 use crate::bus::events::{InboundMessage, OutboundMessage};
@@ -19,13 +19,13 @@ use crate::config::schema::EmailConfig;
 /// Email channel using IMAP polling for receiving and SMTP for sending.
 pub struct EmailChannel {
     config: EmailConfig,
-    bus_tx: UnboundedSender<InboundMessage>,
+    bus_tx: Sender<InboundMessage>,
     running: Arc<AtomicBool>,
 }
 
 impl EmailChannel {
     /// Create a new `EmailChannel`.
-    pub fn new(config: EmailConfig, bus_tx: UnboundedSender<InboundMessage>) -> Self {
+    pub fn new(config: EmailConfig, bus_tx: Sender<InboundMessage>) -> Self {
         Self {
             config,
             bus_tx,
@@ -106,7 +106,7 @@ impl Channel for EmailChannel {
 /// Connect to IMAP, fetch UNSEEN messages, parse them, and emit to the bus.
 pub async fn poll_inbox(
     config: &EmailConfig,
-    bus_tx: &UnboundedSender<InboundMessage>,
+    bus_tx: &Sender<InboundMessage>,
 ) -> Result<()> {
     use anyhow::Context;
     use async_native_tls::TlsConnector;
@@ -219,7 +219,9 @@ pub async fn poll_inbox(
 
                     debug!("Email from {}: {}", from, &content[..content.len().min(50)]);
 
-                    let _ = bus_tx.send(inbound);
+                    if let Err(e) = bus_tx.try_send(inbound) {
+                        tracing::warn!("Email inbound queue full, dropping message: {}", e);
+                    }
                 }
                 None => {
                     warn!("Email: failed to parse message body");
@@ -251,7 +253,7 @@ pub async fn poll_inbox(
 /// so we use their HTTP API instead. The password field is used as the API key.
 pub async fn poll_inbox_api(
     config: &EmailConfig,
-    bus_tx: &UnboundedSender<InboundMessage>,
+    bus_tx: &Sender<InboundMessage>,
 ) -> Result<()> {
     use anyhow::Context;
 
@@ -353,7 +355,9 @@ pub async fn poll_inbox_api(
             &content[..content.len().min(50)]
         );
 
-        let _ = bus_tx.send(inbound);
+        if let Err(e) = bus_tx.try_send(inbound) {
+            tracing::warn!("Email inbound queue full, dropping message: {}", e);
+        }
 
         // Mark message as read by removing "unread" label.
         mark_message_read(&client, api_key, inbox_id, &api_msg_id)
@@ -563,7 +567,7 @@ mod tests {
 
     /// Helper: poll inbox and collect all inbound messages.
     async fn poll_collect(config: &EmailConfig) -> Vec<InboundMessage> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, mut rx) = mpsc::channel::<InboundMessage>(64);
         poll_inbox(config, &tx).await.expect("IMAP poll failed");
         let mut msgs = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -581,7 +585,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let config = EmailConfig::default();
-            let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+            let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
             let mut channel = EmailChannel::new(config, tx);
             let result = channel.start().await;
             assert!(result.is_err());
@@ -600,7 +604,7 @@ mod tests {
         rt.block_on(async {
             let mut config = EmailConfig::default();
             config.imap_host = "imap.example.com".to_string();
-            let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+            let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
             let mut channel = EmailChannel::new(config, tx);
             let result = channel.start().await;
             assert!(result.is_err());
@@ -621,7 +625,7 @@ mod tests {
             config.imap_host = "imap.example.com".to_string();
             config.username = "user@example.com".to_string();
             // password is empty
-            let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+            let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
             let mut channel = EmailChannel::new(config, tx);
             let result = channel.start().await;
             assert!(result.is_err(), "Should fail with empty password");
@@ -645,7 +649,7 @@ mod tests {
     #[test]
     fn test_channel_name() {
         let config = EmailConfig::default();
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let channel = EmailChannel::new(config, tx);
         assert_eq!(channel.name(), "email");
     }
@@ -653,7 +657,7 @@ mod tests {
     #[test]
     fn test_channel_not_running_initially() {
         let config = EmailConfig::default();
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let channel = EmailChannel::new(config, tx);
         assert!(!channel.is_running());
     }
@@ -661,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn test_stop_is_idempotent() {
         let config = EmailConfig::default();
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let mut channel = EmailChannel::new(config, tx);
         // Stop on a never-started channel should succeed.
         channel.stop().await.expect("first stop failed");
@@ -682,7 +686,7 @@ mod tests {
             poll_interval_secs: 5,
             allow_from: Vec::new(),
         };
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let result = poll_inbox(&config, &tx).await;
         assert!(
             result.is_err(),
@@ -952,7 +956,7 @@ mod tests {
             }
         };
 
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let result = poll_inbox(&config, &tx).await;
         assert!(
             result.is_ok(),
@@ -1202,7 +1206,7 @@ mod tests {
             }
         };
 
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let mut channel = EmailChannel::new(config, tx);
 
         assert!(!channel.is_running());
@@ -1222,7 +1226,7 @@ mod tests {
             }
         };
 
-        let (tx, _rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, _rx) = mpsc::channel::<InboundMessage>(64);
         let mut channel = EmailChannel::new(config, tx);
 
         // Start → Stop → Start again should work.
@@ -1328,7 +1332,7 @@ mod tests {
             "Polling {}:{} as {}",
             config.imap_host, config.imap_port, config.username
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, mut rx) = mpsc::channel::<InboundMessage>(64);
         let result = poll_inbox(&config, &tx).await;
         match &result {
             Ok(()) => {
@@ -1426,7 +1430,7 @@ mod tests {
         };
 
         println!("Polling agentmail.to API as {}", config.username);
-        let (tx, mut rx) = mpsc::unbounded_channel::<InboundMessage>();
+        let (tx, mut rx) = mpsc::channel::<InboundMessage>(64);
         let result = poll_inbox_api(&config, &tx).await;
         match &result {
             Ok(()) => {

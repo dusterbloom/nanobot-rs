@@ -10,9 +10,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::bus::events::{InboundMessage, OutboundMessage};
 
@@ -23,17 +23,28 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 pub type OutboundCallback =
     Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Default capacity for bounded inbound channel.
+///
+/// Provides backpressure: channel adapters will block when the agent loop falls
+/// behind, preventing unbounded memory growth under sustained load.
+const INBOUND_CHANNEL_CAPACITY: usize = 256;
+
 /// Async message bus that decouples chat channels from the agent core.
 ///
 /// Channels push messages to the inbound queue, and the agent processes them
 /// and pushes responses to the outbound queue. The bus can be cloned cheaply
 /// because all internal state is behind `Arc`.
+///
+/// The inbound channel is **bounded** (capacity: [`INBOUND_CHANNEL_CAPACITY`])
+/// so that fast producers (e.g. Telegram polling) cannot exhaust memory when the
+/// agent loop is slow. The outbound channel remains unbounded because the agent
+/// is the sole producer and dispatch is fast.
 #[derive(Clone)]
 pub struct MessageBus {
-    /// Sender half for inbound messages.
-    inbound_tx: UnboundedSender<InboundMessage>,
+    /// Sender half for inbound messages (bounded for backpressure).
+    inbound_tx: Sender<InboundMessage>,
     /// Receiver half for inbound messages (shared so only one consumer drains).
-    inbound_rx: Arc<Mutex<UnboundedReceiver<InboundMessage>>>,
+    inbound_rx: Arc<Mutex<Receiver<InboundMessage>>>,
     /// Sender half for outbound messages.
     outbound_tx: UnboundedSender<OutboundMessage>,
     /// Receiver half for outbound messages (shared so only one consumer drains).
@@ -47,7 +58,7 @@ pub struct MessageBus {
 impl MessageBus {
     /// Create a new `MessageBus`.
     pub fn new() -> Self {
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         Self {
             inbound_tx,
@@ -60,8 +71,17 @@ impl MessageBus {
     }
 
     /// Publish a message from a channel to the agent (inbound).
+    ///
+    /// Uses `try_send` on the bounded channel. If the queue is full (agent loop
+    /// is backed up), the message is dropped and a warning is logged.  This
+    /// prevents unbounded memory growth under sustained load.
     pub fn publish_inbound(&self, msg: InboundMessage) {
-        let _ = self.inbound_tx.send(msg);
+        if let Err(e) = self.inbound_tx.try_send(msg) {
+            warn!(
+                "Inbound queue full (capacity {}), dropping message: {}",
+                INBOUND_CHANNEL_CAPACITY, e
+            );
+        }
     }
 
     /// Consume the next inbound message (blocks until available).
