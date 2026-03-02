@@ -20,7 +20,7 @@ use crate::agent::working_memory::WorkingMemoryStore;
 use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::config::schema::{AdaptiveTokenConfig, AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
 use crate::providers::base::LLMProvider;
-use crate::session::manager::SessionManager;
+use crate::session::db::SessionDb;
 
 // ---------------------------------------------------------------------------
 // Shared core (identical across all agents, swappable on /local toggle)
@@ -39,7 +39,7 @@ pub struct SwappableCore {
     pub max_tokens: u32,
     pub temperature: f64,
     pub context: ContextBuilder,
-    pub sessions: SessionManager,
+    pub sessions: SessionDb,
     pub token_budget: TokenBudget,
     pub compactor: ContextCompactor,
     pub learning: LearningStore,
@@ -387,11 +387,11 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // what agents exist and when to delegate instead of doing everything itself.
     let profiles = agent_profiles::load_profiles(&workspace);
     context.agent_profiles = agent_profiles::profiles_summary(&profiles);
-    let sessions = SessionManager::with_tuning(
-        &workspace,
-        memory_config.session.rotation_size_bytes,
-        memory_config.session.rotation_carry_messages,
-    );
+    let db_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nanobot")
+        .join("sessions.db");
+    let sessions = SessionDb::new(&db_path);
 
     // Resolve memory provider + model.
     //

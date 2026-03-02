@@ -111,6 +111,7 @@ pub(crate) struct TurnContext {
     pub(crate) core: Arc<SwappableCore>,
     pub(crate) request_id: String,
     pub(crate) session_key: String,
+    pub(crate) session_id: String,
     pub(crate) session_policy: policy::SessionPolicy,
     pub(crate) strict_local_only: bool,
     pub(crate) turn_count: u64,
@@ -296,7 +297,7 @@ impl AgentLoopShared {
         if ctx.new_start < ctx.messages.len() {
             let user_msg = ctx.messages[ctx.new_start].clone();
             ctx.core.sessions
-                .add_message_raw(&ctx.session_key, &user_msg)
+                .add_message(&ctx.session_id, &user_msg)
                 .await;
             ctx.new_start += 1;
         }
@@ -343,6 +344,12 @@ impl AgentLoopShared {
         // that format-correction retries don't eat into the main budget.
         let mut iteration: u32 = 0;
         while iteration < ctx.core.max_iterations {
+            // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
+            if ctx.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+                debug!("agent loop: cancelled before iteration {}", iteration);
+                break;
+            }
+
             // Plan-guided: inject current step instruction into conversation.
             {
                 if let Ok(engine) = ctx.reasoning.lock() {
@@ -858,6 +865,7 @@ impl AgentLoopShared {
                         let bg_messages = ctx.messages.clone();
                         let bg_core = ctx.core.clone();
                         let bg_session_key = ctx.session_key.clone();
+                        let bg_session_id = ctx.session_id.clone();
                         let bg_lcm = lcm_engine.clone();
                         let bg_lcm_compactor = self.lcm_compactor.clone();
                         let watermark = ctx.messages.len();
@@ -902,7 +910,7 @@ impl AgentLoopShared {
                                                 session = %bg_session_key,
                                                 "LCM: persisting summary turn to session"
                                             );
-                                            bg_core.sessions.add_message_raw(&bg_session_key, &summary_json).await;
+                                            bg_core.sessions.add_message(&bg_session_id, &summary_json).await;
                                         }
                                     }
 
@@ -1236,6 +1244,7 @@ impl AgentLoopShared {
                         }
                     } => {
                         // Cancelled — drop stream to signal provider task.
+                        debug!("streaming cancelled by user");
                         drop(stream);
                         break;
                     }

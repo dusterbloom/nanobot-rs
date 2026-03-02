@@ -63,6 +63,12 @@ enum Commands {
         /// Language hint for voice TTS engine (e.g. "en" uses faster Pocket).
         #[arg(long)]
         lang: Option<String>,
+        /// Resume the most recent session for the session key.
+        #[arg(short = 'c', long = "continue")]
+        continue_session: bool,
+        /// Resume a specific session by ID.
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
     },
     /// Start the nanobot gateway (channels + agent loop).
     Gateway {
@@ -305,8 +311,8 @@ enum SessionsAction {
     List,
     /// Resume an existing session's REPL.
     Resume {
-        /// Session key to resume (from `sessions list`).
-        key: String,
+        /// Session ID to resume (from `sessions list`).
+        id: String,
         /// Use local LLM instead of cloud API.
         #[arg(short, long)]
         local: bool,
@@ -540,6 +546,8 @@ fn main() {
             session,
             local,
             lang,
+            continue_session: _continue_session,
+            resume: _resume,
         } => repl::cmd_agent(message, session, local, lang),
         Commands::Gateway { port, verbose } => cli::cmd_gateway(port, verbose),
         Commands::Status => cli::cmd_status(),
@@ -611,7 +619,7 @@ fn main() {
         },
         Commands::Sessions { action } => match action {
             SessionsAction::List => sessions_cmd::cmd_sessions_list(),
-            SessionsAction::Resume { key, local } => repl::cmd_agent(None, key, local, None),
+            SessionsAction::Resume { id, local } => repl::cmd_agent(None, id, local, None),
             SessionsAction::New { name, local } => {
                 let key = sessions_cmd::make_session_key(name.as_deref());
                 repl::cmd_agent(None, key, local, None)
@@ -761,11 +769,11 @@ mod tests {
 
     #[test]
     fn test_cli_parses_sessions_resume() {
-        let cli = Cli::try_parse_from(["nanobot", "sessions", "resume", "cli:test"]).unwrap();
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "resume", "20260302_143022_a7f2b1"]).unwrap();
         match cli.command {
             Commands::Sessions { action } => match action {
-                SessionsAction::Resume { key, local } => {
-                    assert_eq!(key, "cli:test");
+                SessionsAction::Resume { id, local } => {
+                    assert_eq!(id, "20260302_143022_a7f2b1");
                     assert!(!local);
                 }
                 other => panic!("unexpected action: {:?}", std::mem::discriminant(&other)),

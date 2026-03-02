@@ -104,11 +104,15 @@ impl AgentLoopShared {
             // Engine will be created/rebuilt in step_pre_call if needed.
         }
 
+        // Resolve or create session for this key.
+        let session_meta = core.sessions.get_or_resume(&session_key).await;
+        let session_id = session_meta.id.clone();
+
         // Get session history. Track count so we know where new messages start.
         let history = core
             .sessions
             .get_history(
-                &session_key,
+                &session_id,
                 history_limit(core.token_budget.max_context()),
                 core.max_history_turns,
             )
@@ -260,6 +264,7 @@ impl AgentLoopShared {
             core,
             request_id,
             session_key,
+            session_id,
             session_policy,
             strict_local_only,
             turn_count,

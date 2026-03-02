@@ -381,14 +381,21 @@ pub(crate) fn spawn_input_watcher(
 
     std::thread::spawn(move || {
         let owned = tui::enter_raw_mode();
+        debug!("input_watcher: started, raw_mode_owned={}", owned);
         let mut last_esc: Option<Instant> = None;
+        let mut poll_cycles = 0u32;
 
         while !done.load(Ordering::Relaxed) {
+            poll_cycles += 1;
+            if poll_cycles % 50 == 0 {
+                debug!("input_watcher: alive, poll_cycles={}", poll_cycles);
+            }
             if event::poll(Duration::from_millis(100)).unwrap_or(false) {
                 if let Ok(Event::Key(key)) = event::read() {
                     // Enter → cancel + signal "user wants to input/record"
                     if key.code == KeyCode::Enter {
                         enter_interrupted.store(true, Ordering::Relaxed);
+                        debug!("input_watcher: key=Enter, cancelling");
                         cancel_token.cancel();
                         break;
                     }
@@ -397,6 +404,7 @@ pub(crate) fn spawn_input_watcher(
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        debug!("input_watcher: key=Ctrl+C, cancelling");
                         cancel_token.cancel();
                         break;
                     }
@@ -405,6 +413,7 @@ pub(crate) fn spawn_input_watcher(
                     if key.code == KeyCode::Esc {
                         if let Some(prev) = last_esc {
                             if prev.elapsed() < Duration::from_millis(2000) {
+                                debug!("input_watcher: key=Esc+Esc, cancelling");
                                 cancel_token.cancel();
                                 break;
                             }
@@ -443,6 +452,7 @@ pub(crate) fn spawn_input_watcher(
             }
         }
 
+        debug!("input_watcher: exiting, done={}", done.load(Ordering::Relaxed));
         tui::exit_raw_mode(owned);
     })
 }
@@ -1811,6 +1821,13 @@ pub(crate) fn cmd_agent(
             index_sessions_background();
 
             println!("Goodbye!");
+            // Print session resume hint so the user can pick up where they left off.
+            {
+                let core = ctx.core_handle.swappable();
+                if let Some(meta) = core.sessions.get_latest_session(&ctx.session_id).await {
+                    eprintln!("Resume this session with: nanobot sessions resume {}", meta.id);
+                }
+            }
         }
     });
 }

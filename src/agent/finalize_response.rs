@@ -162,7 +162,7 @@ impl AgentLoopShared {
         };
         if !new_messages.is_empty() {
             ctx.core.sessions
-                .add_messages_raw(&ctx.session_key, &new_messages)
+                .add_messages(&ctx.session_id, &new_messages)
                 .await;
         }
 

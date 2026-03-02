@@ -5,45 +5,35 @@
 
 use std::io::{self, Write};
 
-use crate::utils::helpers::get_workspace_path;
-
 // ---------------------------------------------------------------------------
 // Public commands
 // ---------------------------------------------------------------------------
 
 /// List all sessions with date, size, and message count.
 pub fn cmd_sessions_list() {
-    let workspace = get_workspace_path(None);
-    let mgr = crate::session::manager::SessionManager::new(&workspace);
-    let sessions = mgr.list_sessions();
+    let db_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nanobot")
+        .join("sessions.db");
+    let db = crate::session::db::SessionDb::new(&db_path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sessions = rt.block_on(db.list_sessions(None, 100));
 
     if sessions.is_empty() {
         println!("No sessions found.");
         return;
     }
 
-    println!("{:<40} {:<24} {:>6} {:>10}", "SESSION", "UPDATED", "MSGS", "SIZE");
-    println!("{}", "-".repeat(82));
+    println!("{:<40} {:<30} {:>6}", "SESSION KEY", "UPDATED", "MSGS");
+    println!("{}", "-".repeat(80));
 
     for s in &sessions {
-        let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-        let updated = s
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let path_str = s.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let size = std::fs::metadata(path_str)
-            .map(|m| format_bytes(m.len()))
-            .unwrap_or_else(|_| "?".to_string());
-        let msg_count = std::fs::read_to_string(path_str)
-            .map(|c| c.lines().filter(|l| !l.contains("\"_type\":\"metadata\"")).count())
-            .unwrap_or(0);
+        let updated = s.updated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
         println!(
-            "{:<40} {:<24} {:>6} {:>10}",
-            truncate(key, 38),
-            truncate(updated, 22),
-            msg_count,
-            size,
+            "{:<40} {:<30} {:>6}",
+            truncate(&s.session_key, 38),
+            truncate(&updated, 28),
+            s.message_count,
         );
     }
     println!("\n{} session(s) total.", sessions.len());
@@ -58,50 +48,39 @@ pub fn make_session_key(name: Option<&str>) -> String {
 }
 
 /// Export a session to stdout in markdown or JSONL format.
+///
+/// `key` may be a session key (like `cli:default`) or a session ID.
+/// We first try to match by key (most recent session), then by ID.
 pub fn cmd_sessions_export(key: &str, format: &str) {
-    let workspace = get_workspace_path(None);
-    let mgr = crate::session::manager::SessionManager::new(&workspace);
-    let sessions = mgr.list_sessions();
+    let db_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nanobot")
+        .join("sessions.db");
+    let db = crate::session::db::SessionDb::new(&db_path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Find matching session by key.
-    let matched = sessions.iter().find(|s| {
-        s.get("key").and_then(|v| v.as_str()) == Some(key)
-    });
-
-    let path_str = match matched {
-        Some(s) => s.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        None => {
-            eprintln!("Session '{}' not found.", key);
-            eprintln!("Use `nanobot sessions list` to see available sessions.");
-            return;
-        }
+    // Try to find session by key first, then by ID.
+    let session_id = if let Some(meta) = rt.block_on(db.get_latest_session(key)) {
+        meta.id
+    } else if let Some(meta) = rt.block_on(db.get_session(key)) {
+        meta.id
+    } else {
+        eprintln!("Session '{}' not found.", key);
+        eprintln!("Use `nanobot sessions list` to see available sessions.");
+        return;
     };
 
-    let content = match std::fs::read_to_string(&path_str) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error reading session file: {}", e);
-            return;
-        }
-    };
+    let messages = rt.block_on(db.get_all_messages(&session_id));
 
     match format {
         "jsonl" => {
-            print!("{}", content);
+            for msg in &messages {
+                println!("{}", serde_json::to_string(msg).unwrap_or_default());
+            }
         }
         "md" | _ => {
             println!("# Session: {}\n", key);
-            for line in content.lines() {
-                let parsed: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // Skip metadata lines.
-                if parsed.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
-                    continue;
-                }
-
+            for parsed in &messages {
                 let role = parsed.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let timestamp = parsed.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
 

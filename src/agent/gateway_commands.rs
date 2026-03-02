@@ -97,7 +97,8 @@ async fn cmd_status(shared: &AgentLoopShared) -> String {
 async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     let core = shared.core_handle.swappable();
     core.working_memory.clear(session_key);
-    core.sessions.clear_history(session_key).await;
+    let session_meta = core.sessions.get_or_resume(session_key).await;
+    core.sessions.clear_history(&session_meta.id).await;
     let mut engines = shared.lcm_engines.lock().await;
     engines.remove(session_key);
     drop(engines);

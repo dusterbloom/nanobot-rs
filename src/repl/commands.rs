@@ -1053,7 +1053,8 @@ impl ReplContext {
             .get_context(&self.session_id, 1)
             .is_empty();
         core.working_memory.clear(&self.session_id);
-        core.sessions.clear_history(&self.session_id).await;
+        let session_meta = core.sessions.get_or_resume(&self.session_id).await;
+        core.sessions.clear_history(&session_meta.id).await;
         self.agent_loop.clear_lcm_engine(&self.session_id).await;
         self.agent_loop.clear_bulletin_cache();
         if had_content {
@@ -1138,7 +1139,8 @@ impl ReplContext {
                 println!("\n  No audit entries to verify against.\n");
             } else {
                 // Get last assistant response from session history.
-                let history = core.sessions.get_history(&self.session_id, 10, 0).await;
+                let session_meta = core.sessions.get_or_resume(&self.session_id).await;
+                let history = core.sessions.get_history(&session_meta.id, 10, 0).await;
                 let last_response = history
                     .iter()
                     .rev()
@@ -1389,7 +1391,8 @@ impl ReplContext {
     /// /replay — show session message history.
     async fn cmd_replay(&self, arg: &str) {
         let core = self.core_handle.swappable();
-        let history = core.sessions.get_history(&self.session_id, 200, 0).await;
+        let session_meta = core.sessions.get_or_resume(&self.session_id).await;
+        let history = core.sessions.get_history(&session_meta.id, 200, 0).await;
 
         if history.is_empty() {
             println!("\n  No messages in session history.\n");
