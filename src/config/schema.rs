@@ -119,6 +119,7 @@ impl Default for FeishuConfig {
             encrypt_key: String::new(),
             verification_token: String::new(),
             allow_from: Vec::new(),
+            toolset: None,
         }
     }
 }
