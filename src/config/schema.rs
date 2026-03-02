@@ -175,6 +175,7 @@ impl Default for EmailConfig {
             password: String::new(),
             poll_interval_secs: default_poll_interval(),
             allow_from: Vec::new(),
+            toolset: None,
         }
     }
 }
