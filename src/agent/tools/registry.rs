@@ -664,7 +664,9 @@ impl ToolRegistry {
                 let allowed: HashSet<&str> = phase_tools.iter().copied().collect();
                 self.tools
                     .iter()
-                    .filter(|(name, _)| allowed.contains(name.as_str()))
+                    .filter(|(name, tool)| {
+                        allowed.contains(name.as_str()) && tool.is_available()
+                    })
                     .map(|(_, tool)| tool.to_schema())
                     .collect()
             }
