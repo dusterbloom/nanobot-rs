@@ -162,7 +162,10 @@ impl Tool for SpawnToolLite {
     }
 
     fn description(&self) -> &str {
-        "Run a background task, list tasks, check results, wait, or cancel."
+        "Run a background task, list tasks, check results, wait, or cancel.\n\
+         spawn: start task (needs 'task'). list: show all tasks. check: get result (needs 'task_id').\n\
+         wait: block until done (needs 'task_id'). cancel: abort task (needs 'task_id').\n\
+         Example: {\"action\": \"spawn\", \"task\": \"search for all TODO comments\"}"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -171,7 +174,8 @@ impl Tool for SpawnToolLite {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "list", "check", "wait", "cancel"]
+                    "enum": ["spawn", "list", "check", "wait", "cancel"],
+                    "description": "spawn=start new task, list=show tasks, check=get result, wait=block until done, cancel=abort"
                 },
                 "task": {
                     "type": "string",

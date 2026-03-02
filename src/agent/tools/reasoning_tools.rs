@@ -197,7 +197,9 @@ impl Tool for PlanTool {
     }
 
     fn description(&self) -> &str {
-        "Decompose a task into numbered steps with dependencies"
+        "Decompose a task into numbered steps with dependencies.\n\
+         Example: [{\"goal\": \"read config file\"}, {\"goal\": \"validate settings\", \"depends_on\": [0]}]\n\
+         depends_on uses 0-based indices: [0] means 'after step 0 (the first step)'."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -216,7 +218,7 @@ impl Tool for PlanTool {
                             },
                             "depends_on": {
                                 "type": "array",
-                                "description": "0-based indices of steps this step depends on",
+                                "description": "0-based step indices this step waits for. [0]=after first step, [0,1]=after steps 0 and 1. Omit or [] for no dependencies.",
                                 "items": { "type": "integer" }
                             }
                         },

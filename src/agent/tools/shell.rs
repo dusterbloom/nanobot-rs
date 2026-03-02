@@ -292,7 +292,10 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output. Use with caution."
+        "Execute a shell command and return its output.\n\
+         Safe: ls, pwd, cat, grep, find, python, cargo, git, echo, curl.\n\
+         Blocked: rm -rf, sudo, eval, shred (destructive commands are rejected).\n\
+         Prefer read_file over cat, list_dir over ls when available."
     }
 
     fn parameters(&self) -> serde_json::Value {
