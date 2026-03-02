@@ -1431,6 +1431,7 @@ mod tests {
             password: std::env::var("TEST_AGENTMAIL_PASS").expect("TEST_AGENTMAIL_PASS required"),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
+            toolset: None,
         };
 
         println!("Polling agentmail.to API as {}", config.username);
