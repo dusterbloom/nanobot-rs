@@ -278,7 +278,7 @@ pub(crate) fn render_input_bar(
     use std::sync::atomic::Ordering;
 
     let counters = &core_handle.counters;
-    let width = terminal_width().min(100);
+    let width = terminal_width();
     let height = terminal_height();
     let separator = "─".repeat(width);
 
