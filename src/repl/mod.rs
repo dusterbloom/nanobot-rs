@@ -676,27 +676,27 @@ async fn stream_and_render_inner(
                             collected.push(status_line);
 
                             if ok && !result_data.is_empty() {
-                                let truncated = truncate_output(result_data, 40, 2000);
+                                let truncated = truncate_output(result_data, 40, 8000);
                                 if !truncated.is_empty() {
                                     let header = "    \x1b[2m\u{250c}\u{2500} output \u{2500}\x1b[0m";
-                                    println!("\r{}", header);
+                                    println!("\r\x1b[K{}", header);
                                     collected.push(header.to_string());
                                     this_box_lines += 1;
                                     for line in truncated.lines() {
                                         let formatted = format!("    \x1b[2m\u{2502}\x1b[0m {}", line);
-                                        println!("\r{}", formatted);
+                                        println!("\r\x1b[K{}", formatted);
                                         collected.push(formatted);
                                         this_box_lines += 1;
                                     }
                                     let footer = "    \x1b[2m\u{2514}\u{2500}\x1b[0m";
-                                    println!("\r{}", footer);
+                                    println!("\r\x1b[K{}", footer);
                                     collected.push(footer.to_string());
                                     this_box_lines += 1;
                                 }
                             } else if !ok && !result_data.is_empty() {
                                 let preview: String = result_data.chars().take(80).collect();
-                                let err_line = format!("    \x1b[2m\x1b[31m{}\x1b[0m", preview);
-                                println!("\r{}", err_line);
+                                let err_line = format!("    \x1b[31m{}\x1b[0m", preview);
+                                println!("\r\x1b[K{}", err_line);
                                 collected.push(err_line);
                                 this_box_lines += 1;
                             }
