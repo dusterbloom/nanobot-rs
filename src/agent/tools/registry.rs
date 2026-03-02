@@ -649,7 +649,7 @@ impl ToolRegistry {
 
         self.tools
             .iter()
-            .filter(|(name, _)| relevant.contains(name.as_str()))
+            .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
             .collect()
     }
