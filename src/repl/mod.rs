@@ -135,6 +135,26 @@ fn extract_tool_context(tool_name: &str, result_data: &str) -> String {
     }
 }
 
+/// Extract the host from an endpoint URL like `"http://192.168.1.22:1234/v1"`.
+///
+/// Returns an empty string on parse failure (caller should fall back to
+/// `api_host()` or `"127.0.0.1"`).
+pub(crate) fn extract_url_host(url: &str) -> String {
+    // Strip scheme
+    let without_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    // Host is everything before the first ':' (port separator)
+    let host = without_scheme.split(':').next().unwrap_or("").trim();
+    if host.is_empty() || host == "localhost" {
+        // Treat "localhost" as empty so callers fall back to api_host()
+        // which resolves the WSL2 Windows host IP when needed.
+        String::new()
+    } else {
+        host.to_string()
+    }
+}
+
 async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     let base = config.agents.defaults.local_api_base.trim();
     if base.is_empty() {
@@ -865,7 +885,7 @@ impl ServerState {
     /// Unload models from the current LMS-managed server.
     pub async fn kill_current(&mut self, lms_port: u16, unload_timeout_secs: u64) {
         if self.lms_managed {
-            crate::lms::unload_all(lms_port, unload_timeout_secs).await.ok();
+            crate::lms::unload_all("", lms_port, unload_timeout_secs).await.ok();
         }
         self.engine = InferenceEngine::None;
     }
@@ -1000,7 +1020,7 @@ pub(crate) fn cmd_agent(
                 let lms_port = config.agents.defaults.lms_port;
                 match crate::lms::server_start(&bin, lms_port).await {
                     Ok(()) => {
-                        let available = crate::lms::list_available(lms_port).await;
+                        let available = crate::lms::list_available("", lms_port).await;
                         let main_model = if !config.agents.defaults.lms_main_model.is_empty() {
                             config.agents.defaults.lms_main_model.clone()
                         } else {
@@ -1008,7 +1028,7 @@ pub(crate) fn cmd_agent(
                             crate::lms::resolve_model_name(&available, hint)
                         };
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
-                        if let Err(e) = crate::lms::load_model(lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        if let Err(e) = crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
                             eprintln!("Warning: lms load failed: {}", e);
                         } else {
                             local_model_name = main_model;
@@ -1049,6 +1069,7 @@ pub(crate) fn cmd_agent(
                             // Load router model if configured.
                             if !config.trio.router_model.is_empty() {
                                 let _ = crate::lms::load_model(
+                                    "",
                                     lms_port,
                                     &config.trio.router_model,
                                     Some(config.trio.router_ctx_tokens),
@@ -1059,6 +1080,7 @@ pub(crate) fn cmd_agent(
                             // Load specialist model if configured.
                             if !config.trio.specialist_model.is_empty() {
                                 let _ = crate::lms::load_model(
+                                    "",
                                     lms_port,
                                     &config.trio.specialist_model,
                                     Some(config.trio.specialist_ctx_tokens),
@@ -1099,7 +1121,7 @@ pub(crate) fn cmd_agent(
 
                 match crate::lms::server_start(&bin, lms_port).await {
                     Ok(()) => {
-                        let available = crate::lms::list_available(lms_port).await;
+                        let available = crate::lms::list_available("", lms_port).await;
                         let main_model = if !config.agents.defaults.lms_main_model.is_empty() {
                             config.agents.defaults.lms_main_model.clone()
                         } else {
@@ -1109,7 +1131,7 @@ pub(crate) fn cmd_agent(
                         let main_ctx = Some(config.agents.defaults.local_max_context_tokens);
                         print!("  Loading {}... ", main_model);
                         io::stdout().flush().ok();
-                        match crate::lms::load_model(lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
+                        match crate::lms::load_model("", lms_port, &main_model, main_ctx, config.timeouts.lms_load_secs).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                         }
@@ -1134,7 +1156,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.router_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.router_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1142,7 +1164,7 @@ pub(crate) fn cmd_agent(
                             if !config.trio.specialist_model.is_empty() {
                                 print!("  Loading {}... ", config.trio.specialist_model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1154,7 +1176,7 @@ pub(crate) fn cmd_agent(
                             if let Some(ref ep) = config.lcm.compaction_endpoint {
                                 print!("  Loading {} (LCM compactor)... ", ep.model);
                                 io::stdout().flush().ok();
-                                match crate::lms::load_model(lms_port, &ep.model, Some(config.lcm.compaction_context_size), config.timeouts.lms_load_secs).await {
+                                match crate::lms::load_model("", lms_port, &ep.model, Some(config.lcm.compaction_context_size), config.timeouts.lms_load_secs).await {
                                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                                 }
@@ -1185,21 +1207,23 @@ pub(crate) fn cmd_agent(
         // Recompute has_remote_local after potential lms setup
         let mut has_remote_local = !config.agents.defaults.local_api_base.is_empty();
 
-        // --- Offline cluster peer fallback ---
+        // --- Remote peer probe ---
         // If the saved endpoint is a remote peer we didn't start, probe it.
-        // On failure: try starting local LMS, or clear the dead endpoint.
+        // When the user has explicitly configured localApiBase we NEVER fall back
+        // to a local llama.cpp server: requests would go to the configured remote
+        // while the local server receives nothing.  Instead, warn and clear the
+        // dead endpoint so the user knows what happened.
         if is_local && has_remote_local && !srv.lms_managed {
-            let peer_port = config
-                .agents
-                .defaults
-                .local_api_base
+            let peer_url = config.agents.defaults.local_api_base.clone();
+            let peer_host = extract_url_host(&peer_url);
+            let peer_port = peer_url
                 .split(':')
                 .last()
                 .and_then(|p| p.split('/').next())
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(18080);
 
-            let probe = crate::lms::list_available(peer_port).await;
+            let probe = crate::lms::list_available(&peer_host, peer_port).await;
             if !probe.is_empty() && config.agents.defaults.lms_main_model.is_empty() {
                 // Remote is alive but lms_main_model is not configured: use the
                 // first loaded model reported by the remote instead of the stale
@@ -1208,75 +1232,26 @@ pub(crate) fn cmd_agent(
                 local_model_name = probe[0].clone();
             }
             if probe.is_empty() {
-                let dead_url = config.agents.defaults.local_api_base.clone();
+                // Remote is unreachable.  Because localApiBase is explicitly
+                // configured, do NOT start a local llama.cpp server — requests
+                // still go to the configured URL, so a local server would be
+                // ignored.  Warn the user and clear the dead endpoint instead.
                 println!(
-                    "  {}{}Saved endpoint {} is unreachable.{}",
+                    "  {}{}Remote LM Studio at {} is unreachable.{} Check your localApiBase config.",
                     tui::BOLD,
                     tui::YELLOW,
-                    dead_url,
+                    peer_url,
                     tui::RESET,
                 );
-
-                let preference = &config.agents.defaults.inference_engine;
-                let mut fell_back = false;
-                if let Some((InferenceEngine::Lms, bin)) = resolve_inference_engine(preference) {
-                    let lms_port = config.agents.defaults.lms_port;
-                    println!(
-                        "  Attempting local LM Studio fallback on port {}...",
-                        lms_port
-                    );
-                    if let Ok(()) = crate::lms::server_start(&bin, lms_port).await {
-                        let available = crate::lms::list_available(lms_port).await;
-                        if !available.is_empty() {
-                            let model = if !config.agents.defaults.lms_main_model.is_empty() {
-                                config.agents.defaults.lms_main_model.clone()
-                            } else {
-                                let hint = cli::strip_gguf_suffix(&local_model_name);
-                                crate::lms::resolve_model_name(&available, hint)
-                            };
-                            let ctx =
-                                Some(config.agents.defaults.local_max_context_tokens);
-                            print!("  Loading {}... ", model);
-                            io::stdout().flush().ok();
-                            match crate::lms::load_model(lms_port, &model, ctx, config.timeouts.lms_load_secs).await {
-                                Ok(()) => {
-                                    println!("{}OK{}", tui::GREEN, tui::RESET);
-                                    local_model_name = model;
-                                    srv.lms_managed = true;
-                                    srv.lms_binary = Some(bin);
-                                    srv.local_port = lms_port.to_string();
-                                    if config.agents.defaults.local_api_base.is_empty() {
-                                        let lms_host = crate::lms::api_host();
-                                        config.agents.defaults.local_api_base =
-                                            format!("http://{}:{}/v1", lms_host, lms_port);
-                                    }
-                                    config.agents.defaults.skip_jit_gate = true;
-                                    fell_back = true;
-                                    println!(
-                                        "  {}Fell back to local LM Studio.{}",
-                                        tui::GREEN, tui::RESET
-                                    );
-                                }
-                                Err(e) => {
-                                    println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !fell_back {
-                    // Clear the dead endpoint so the user isn't stuck
-                    config.agents.defaults.local_api_base.clear();
-                    let mut disk_cfg = load_config(None);
-                    disk_cfg.agents.defaults.local_api_base.clear();
-                    save_config(&disk_cfg, None);
-                    has_remote_local = false;
-                    println!(
-                        "  Cleared dead endpoint. Use {}/m{} to pick a model when a peer comes online.",
-                        tui::BOLD, tui::RESET,
-                    );
-                }
+                config.agents.defaults.local_api_base.clear();
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.local_api_base.clear();
+                save_config(&disk_cfg, None);
+                has_remote_local = false;
+                println!(
+                    "  Cleared dead endpoint. Use {}/m{} to pick a model when the remote comes online.",
+                    tui::BOLD, tui::RESET,
+                );
             }
         }
 
@@ -1315,18 +1290,21 @@ pub(crate) fn cmd_agent(
             let router_available = if srv.lms_managed || has_remote_local {
                 // For both managed (started by nanobot) and remote LM Studio,
                 // verify the model is actually loaded via list_available()
-                let lms_port = if srv.lms_managed {
-                    config.agents.defaults.lms_port
+                let (lms_host, lms_port) = if srv.lms_managed {
+                    (String::new(), config.agents.defaults.lms_port)
                 } else {
-                    // Extract port from local_api_base (e.g. "http://localhost:18080/v1")
-                    config.agents.defaults.local_api_base
+                    // Extract host and port from local_api_base
+                    // (e.g. "http://192.168.1.22:18080/v1")
+                    let base = &config.agents.defaults.local_api_base;
+                    let port = base
                         .split(':')
                         .last()
                         .and_then(|p| p.split('/').next())
                         .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(18080)
+                        .unwrap_or(18080);
+                    (extract_url_host(base), port)
                 };
-                let available = crate::lms::list_available(lms_port).await;
+                let available = crate::lms::list_available(&lms_host, lms_port).await;
                 crate::lms::is_model_available(&available, &config.trio.router_model)
             } else {
                 false
@@ -1796,22 +1774,25 @@ pub(crate) fn cmd_agent(
             // Run when trio is enabled and we have any LMS connection (managed or
             // user-started via localApiBase) — not only when nanobot started the server.
             if ctx.config.trio.enabled && (ctx.srv.lms_managed || has_remote_local) {
-                let lms_port = if ctx.srv.lms_managed {
-                    ctx.config.agents.defaults.lms_port
+                let (lms_host, lms_port) = if ctx.srv.lms_managed {
+                    (String::new(), ctx.config.agents.defaults.lms_port)
                 } else {
-                    // Extract port from localApiBase (e.g. "http://localhost:18080/v1")
-                    ctx.config.agents.defaults.local_api_base
+                    // Extract host and port from localApiBase
+                    // (e.g. "http://192.168.1.22:18080/v1")
+                    let base = &ctx.config.agents.defaults.local_api_base;
+                    let port = base
                         .split(':')
                         .last()
                         .and_then(|p| p.split('/').next())
                         .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(ctx.config.agents.defaults.lms_port)
+                        .unwrap_or(ctx.config.agents.defaults.lms_port);
+                    (extract_url_host(base), port)
                 };
                 if !ctx.config.trio.router_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.router_model, ctx.config.timeouts.lms_unload_secs).await;
+                    let _ = crate::lms::unload_model(&lms_host, lms_port, &ctx.config.trio.router_model, ctx.config.timeouts.lms_unload_secs).await;
                 }
                 if !ctx.config.trio.specialist_model.is_empty() {
-                    let _ = crate::lms::unload_model(lms_port, &ctx.config.trio.specialist_model, ctx.config.timeouts.lms_unload_secs).await;
+                    let _ = crate::lms::unload_model(&lms_host, lms_port, &ctx.config.trio.specialist_model, ctx.config.timeouts.lms_unload_secs).await;
                 }
             }
 
@@ -1853,9 +1834,13 @@ pub(crate) fn cmd_agent(
 
             println!("Goodbye!");
             // Print session resume hint so the user can pick up where they left off.
+            // Try get_latest_session first (searches by session_key), then fall back to
+            // get_session (searches by ID) so resumed-by-ID sessions also print the hint.
             {
                 let core = ctx.core_handle.swappable();
-                if let Some(meta) = core.sessions.get_latest_session(&ctx.session_id).await {
+                let meta = core.sessions.get_latest_session(&ctx.session_id).await
+                    .or(core.sessions.get_session(&ctx.session_id).await);
+                if let Some(meta) = meta {
                     eprintln!("Resume this session with: nanobot sessions resume {}", meta.id);
                 }
             }

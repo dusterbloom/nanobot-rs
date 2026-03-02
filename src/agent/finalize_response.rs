@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use chrono::Utc;
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::agent::agent_core::provenance_warning_role;
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
@@ -20,6 +20,13 @@ impl AgentLoopShared {
     /// Consumes the `TurnContext` (by value) since this is the terminal phase.
     /// Stores context stats, writes audit summaries, verifies claims, and
     /// constructs the `OutboundMessage`.
+    #[instrument(name = "finalize_response", skip(self, ctx), fields(
+        session = %ctx.session_key,
+        model = %ctx.core.model,
+        iterations = ctx.iterations_used,
+        tools_called = ctx.used_tools.len(),
+        has_content = !ctx.final_content.is_empty(),
+    ))]
     pub(crate) async fn finalize_response(&self, mut ctx: TurnContext) -> Option<OutboundMessage> {
         let counters = &self.core_handle.counters;
 
@@ -222,13 +229,37 @@ impl AgentLoopShared {
             } else {
                 "tool_use"
             };
+            
+            // Calculate actual cost from token usage.
+            let prompt_tokens = counters.last_actual_prompt_tokens.load(Ordering::Relaxed) as i64;
+            let completion_tokens = counters.last_actual_completion_tokens.load(Ordering::Relaxed) as i64;
+            let cost_usd = if prompt_tokens > 0 || completion_tokens > 0 {
+                let prices = crate::agent::model_prices::ModelPrices::load().await;
+                prices.cost_of(&ctx.core.model, prompt_tokens, completion_tokens)
+            } else {
+                0.0
+            };
+            
+            // Structured log for observability.
+            info!(
+                task_type = %task_type,
+                iterations = ctx.iterations_used,
+                tool_calls = ctx.used_tools.len(),
+                prompt_tokens = prompt_tokens,
+                completion_tokens = completion_tokens,
+                cost_usd = format!("{:.6}", cost_usd),
+                duration_ms = ctx.turn_start.elapsed().as_millis() as u64,
+                success = !ctx.final_content.is_empty(),
+                "turn_completed"
+            );
+            
             let record = crate::agent::budget_calibrator::ExecutionRecord {
                 task_type: task_type.to_string(),
                 model: ctx.core.model.clone(),
                 iterations_used: ctx.iterations_used,
                 max_iterations: ctx.core.max_iterations,
                 success: !ctx.final_content.is_empty(),
-                cost_usd: 0.0, // TODO: wire actual cost tracking
+                cost_usd,
                 duration_ms: ctx.turn_start.elapsed().as_millis() as u64,
                 depth: 0,
                 tool_calls: ctx.used_tools.len() as u32,

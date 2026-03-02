@@ -1024,4 +1024,50 @@ mod tests {
         let results = db.search_messages("Rebuild", 10, None).await;
         assert!(!results.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Migration correctness: verify SessionDb handles all SessionManager scenarios
+    // -----------------------------------------------------------------------
+
+    /// Integration test: SessionDb must handle the same session_key patterns as SessionManager.
+    /// Keys like "cli:default", "telegram:12345", "disk:session" must all work.
+    #[tokio::test]
+    async fn test_session_key_patterns_match_legacy() {
+        let (db, _dir) = make_db();
+        
+        let keys = vec!["cli:default", "telegram:12345", "disk:session", "email:user@example.com"];
+        let mut ids = Vec::new();
+        
+        for key in &keys {
+            let meta = db.create_session(key).await;
+            ids.push(meta.id);
+            assert_eq!(meta.session_key, *key, "session_key must preserve the original key format");
+        }
+        
+        for (i, key) in keys.iter().enumerate() {
+            let loaded = db.get_session(&ids[i]).await.expect("session must exist");
+            assert_eq!(loaded.session_key, *key);
+        }
+    }
+
+    /// Integration test: filters module must work with SessionDb (same as with JSONL).
+    #[tokio::test]
+    async fn test_filters_integration_with_db() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:filter_test").await;
+        
+        db.add_messages(&meta.id, &[
+            json!({"role": "user", "content": "q1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "clear", "timestamp": "2024-01-01T00:00:00Z"}),
+            json!({"role": "user", "content": "q2"}),
+            json!({"role": "assistant", "content": "a2"}),
+        ]).await;
+        
+        let all = db.get_all_messages(&meta.id).await;
+        let filtered = filter_history(&all, 100, 0);
+        
+        assert_eq!(filtered.len(), 2, "clear marker must truncate history");
+        assert_eq!(filtered[0]["content"], "q2");
+    }
 }

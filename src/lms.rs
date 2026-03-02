@@ -146,43 +146,55 @@ pub(crate) fn server_stop(lms_bin: &Path) -> Result<(), String> {
 // ============================================================================
 
 /// Build the LMS REST API base URL.
-fn rest_base(port: u16) -> String {
-    format!("http://{}:{}", api_host(), port)
+///
+/// When `host` is non-empty it is used directly; otherwise `api_host()` is
+/// called to resolve the WSL2 Windows host IP (or `"127.0.0.1"` on native Linux).
+fn rest_base(host: &str, port: u16) -> String {
+    let h = if host.is_empty() { api_host() } else { host.to_string() };
+    format!("http://{}:{}", h, port)
 }
 
 /// Load a model via the LM Studio REST API.
 ///
 /// Uses `POST /api/v1/models/load` with optional `context_length`.
 /// Returns immediately if the model is already loaded.
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()` (WSL2 Windows host or `127.0.0.1`).
 pub(crate) async fn load_model(
+    host: &str,
     port: u16,
     model: &str,
     context_length: Option<usize>,
     timeout_secs: u64,
 ) -> Result<(), String> {
     // Check if already loaded
-    let loaded = list_loaded(port).await;
+    let loaded = list_loaded(host, port).await;
     if should_skip_load(&loaded, model, context_length) {
         return Ok(());
     }
 
-    post_load_model(port, model, context_length, timeout_secs).await
+    post_load_model(host, port, model, context_length, timeout_secs).await
 }
 
 /// Reload a model with a specific context length.
 ///
 /// Unlike `load_model`, this forces a reload when the model is already loaded,
 /// so context-size changes actually take effect.
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
 pub(crate) async fn reload_model_with_context(
+    host: &str,
     port: u16,
     model: &str,
     context_length: usize,
     load_timeout_secs: u64,
     unload_timeout_secs: u64,
 ) -> Result<(), String> {
-    let loaded = list_loaded(port).await;
+    let loaded = list_loaded(host, port).await;
     for loaded_model in loaded.iter().filter(|m| model_matches(m, model)) {
-        if let Err(e) = unload_model(port, loaded_model, unload_timeout_secs).await {
+        if let Err(e) = unload_model(host, port, loaded_model, unload_timeout_secs).await {
             tracing::warn!(
                 "lms unload before reload failed: model={} loaded_model={} error={}",
                 model,
@@ -192,7 +204,7 @@ pub(crate) async fn reload_model_with_context(
         }
     }
 
-    post_load_model(port, model, Some(context_length), load_timeout_secs).await
+    post_load_model(host, port, model, Some(context_length), load_timeout_secs).await
 }
 
 fn model_matches(loaded: &str, model: &str) -> bool {
@@ -204,13 +216,14 @@ fn should_skip_load(loaded: &[String], model: &str, _context_length: Option<usiz
 }
 
 async fn post_load_model(
+    host: &str,
     port: u16,
     model: &str,
     context_length: Option<usize>,
     timeout_secs: u64,
 ) -> Result<(), String> {
 
-    let url = format!("{}/api/v1/models/load", rest_base(port));
+    let url = format!("{}/api/v1/models/load", rest_base(host, port));
     let mut body = serde_json::json!({ "model": model });
     if let Some(ctx) = context_length {
         body["context_length"] = serde_json::json!(ctx);
@@ -243,8 +256,11 @@ async fn post_load_model(
 }
 
 /// Unload a single model via the LM Studio REST API.
-pub(crate) async fn unload_model(port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
-    let url = format!("{}/api/v1/models/unload", rest_base(port));
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
+pub(crate) async fn unload_model(host: &str, port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
+    let url = format!("{}/api/v1/models/unload", rest_base(host, port));
     let body = serde_json::json!({ "instance_id": model });
 
     let client = reqwest::Client::new();
@@ -266,10 +282,13 @@ pub(crate) async fn unload_model(port: u16, model: &str, timeout_secs: u64) -> R
 }
 
 /// Unload all models by querying loaded models and unloading each.
-pub(crate) async fn unload_all(port: u16, timeout_secs: u64) -> Result<(), String> {
-    let loaded = list_loaded(port).await;
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
+pub(crate) async fn unload_all(host: &str, port: u16, timeout_secs: u64) -> Result<(), String> {
+    let loaded = list_loaded(host, port).await;
     for model in &loaded {
-        unload_model(port, model, timeout_secs).await?;
+        unload_model(host, port, model, timeout_secs).await?;
     }
     Ok(())
 }
@@ -282,8 +301,8 @@ pub(crate) struct ModelInfo {
 }
 
 /// List all models via `GET /api/v1/models`, returning full info.
-async fn list_models_full(port: u16) -> Vec<ModelInfo> {
-    let url = format!("{}/api/v1/models", rest_base(port));
+async fn list_models_full(host: &str, port: u16) -> Vec<ModelInfo> {
+    let url = format!("{}/api/v1/models", rest_base(host, port));
     let resp = match reqwest::get(&url).await {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
@@ -314,8 +333,11 @@ async fn list_models_full(port: u16) -> Vec<ModelInfo> {
 }
 
 /// List currently loaded model identifiers via the HTTP API.
-pub(crate) async fn list_loaded(port: u16) -> Vec<String> {
-    list_models_full(port)
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
+pub(crate) async fn list_loaded(host: &str, port: u16) -> Vec<String> {
+    list_models_full(host, port)
         .await
         .into_iter()
         .filter(|m| m.loaded)
@@ -326,8 +348,11 @@ pub(crate) async fn list_loaded(port: u16) -> Vec<String> {
 /// List all available (downloaded) model identifiers via the HTTP API.
 ///
 /// Filters out embedding models by default.
-pub(crate) async fn list_available(port: u16) -> Vec<String> {
-    list_models_full(port)
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
+pub(crate) async fn list_available(host: &str, port: u16) -> Vec<String> {
+    list_models_full(host, port)
         .await
         .into_iter()
         .filter(|m| m.model_type == "llm")
@@ -336,8 +361,11 @@ pub(crate) async fn list_available(port: u16) -> Vec<String> {
 }
 
 /// List all available models with full info.
-pub(crate) async fn list_available_full(port: u16) -> Vec<ModelInfo> {
-    list_models_full(port)
+///
+/// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
+/// default resolved via `api_host()`.
+pub(crate) async fn list_available_full(host: &str, port: u16) -> Vec<ModelInfo> {
+    list_models_full(host, port)
         .await
         .into_iter()
         .filter(|m| m.model_type == "llm")
@@ -473,7 +501,7 @@ mod tests {
     use super::*;
 
     async fn fetch_loaded_context_length(port: u16, model: &str) -> Option<usize> {
-        let url = format!("{}/api/v1/models", rest_base(port));
+        let url = format!("{}/api/v1/models", rest_base("", port));
         let resp = reqwest::get(&url).await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -502,7 +530,7 @@ mod tests {
     }
 
     async fn fetch_max_context_length(port: u16, model: &str) -> Option<usize> {
-        let url = format!("{}/api/v1/models", rest_base(port));
+        let url = format!("{}/api/v1/models", rest_base("", port));
         let resp = reqwest::get(&url).await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -594,10 +622,16 @@ mod tests {
 
     #[test]
     fn test_rest_base() {
-        // Just verify the format (actual host depends on environment)
-        let base = rest_base(1234);
+        // Empty host falls back to api_host() (environment-dependent)
+        let base = rest_base("", 1234);
         assert!(base.starts_with("http://"));
         assert!(base.ends_with(":1234"));
+    }
+
+    #[test]
+    fn test_rest_base_explicit_host() {
+        let base = rest_base("192.168.1.22", 1234);
+        assert_eq!(base, "http://192.168.1.22:1234");
     }
 
     // -- resolve_model_name tests --
@@ -699,7 +733,7 @@ mod tests {
         let target_b = 6144.min(max_ctx).max(2048);
         let original = fetch_loaded_context_length(port, &model).await;
 
-        reload_model_with_context(port, &model, target_a, 120, 30)
+        reload_model_with_context("", port, &model, target_a, 120, 30)
             .await
             .expect("failed to reload model at target_a context");
         let observed_a = fetch_loaded_context_length(port, &model)
@@ -711,7 +745,7 @@ mod tests {
         );
 
         if target_b != target_a {
-            reload_model_with_context(port, &model, target_b, 120, 30)
+            reload_model_with_context("", port, &model, target_b, 120, 30)
                 .await
                 .expect("failed to reload model at target_b context");
             let observed_b = fetch_loaded_context_length(port, &model)
@@ -724,7 +758,7 @@ mod tests {
         }
 
         if let Some(orig_ctx) = original {
-            let _ = reload_model_with_context(port, &model, orig_ctx, 120, 30).await;
+            let _ = reload_model_with_context("", port, &model, orig_ctx, 120, 30).await;
         }
     }
 }

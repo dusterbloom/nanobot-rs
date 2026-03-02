@@ -1,0 +1,1623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nanobot — Architecture Diagram</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d0d1a;
+    color: #e0e0f0;
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', ui-monospace, monospace;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #header {
+    padding: 10px 20px;
+    background: #12122a;
+    border-bottom: 1px solid #2a2a4a;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-shrink: 0;
+    z-index: 10;
+  }
+
+  #header h1 {
+    font-size: 17px;
+    font-weight: 700;
+    color: #4a9eff;
+    letter-spacing: 3px;
+  }
+
+  #header .subtitle {
+    font-size: 11px;
+    color: #4a4a80;
+    letter-spacing: 1px;
+  }
+
+  #controls {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  #controls button {
+    background: #1a1a38;
+    border: 1px solid #32325a;
+    color: #8080b0;
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: inherit;
+    transition: all 0.15s;
+    letter-spacing: 0.5px;
+  }
+
+  #controls button:hover {
+    background: #22224a;
+    border-color: #4a9eff;
+    color: #4a9eff;
+  }
+
+  #controls button.active-btn {
+    background: #1a0a0a;
+    border-color: #ff4444;
+    color: #ff6666;
+  }
+
+  #main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  #canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    cursor: grab;
+    user-select: none;
+  }
+
+  #canvas-wrap.grabbing { cursor: grabbing; }
+
+  #svg-root {
+    width: 100%;
+    height: 100%;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+
+  /* ── Info panel ─────────────────────────────────────────────────────────── */
+  #info-panel {
+    width: 290px;
+    background: #11112a;
+    border-left: 1px solid #22224a;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    transition: width 0.2s ease;
+    overflow: hidden;
+  }
+
+  #info-panel.hidden { width: 0; }
+
+  #info-header {
+    padding: 13px 15px;
+    border-bottom: 1px solid #22224a;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  #info-title {
+    font-size: 11px; font-weight: 700; color: #6060a0;
+    letter-spacing: 1.5px; text-transform: uppercase;
+  }
+
+  #info-close {
+    background: none; border: none; cursor: pointer;
+    font-size: 14px; padding: 2px 6px; color: #4a4a80;
+    border-radius: 3px; transition: color 0.15s;
+  }
+  #info-close:hover { color: #e0e0f0; }
+
+  #info-body { padding: 16px; overflow-y: auto; flex: 1; }
+
+  .info-section { margin-bottom: 16px; }
+
+  .info-label {
+    font-size: 9px; letter-spacing: 1.8px; text-transform: uppercase;
+    color: #404070; margin-bottom: 5px;
+  }
+
+  .info-value { font-size: 12px; color: #b0b0d0; line-height: 1.6; }
+  .info-name  { font-size: 14px; color: #e0e0f0; font-weight: 700; }
+
+  .info-badge {
+    display: inline-block; padding: 3px 10px; border-radius: 3px;
+    font-size: 10px; font-weight: 600; margin-top: 2px; letter-spacing: 0.5px;
+  }
+
+  .loc-bar-wrap {
+    margin-top: 6px; height: 4px; background: #1a1a38;
+    border-radius: 2px; overflow: hidden;
+  }
+  .loc-bar-fill {
+    height: 100%; border-radius: 2px; transition: width 0.3s ease;
+  }
+
+  .dep-list { margin-top: 4px; }
+  .dep-item {
+    font-size: 11px; color: #6060a0; padding: 4px 0;
+    border-bottom: 1px solid #1a1a30;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .dep-item::before { content: '->'; color: #2a2a50; font-size: 10px; }
+
+  /* ── Stats panel ───────────────────────────────────────────────────────── */
+  #stats-panel {
+    position: absolute; top: 14px; right: 14px;
+    background: rgba(17, 17, 42, 0.94);
+    border: 1px solid #22224a; border-radius: 6px;
+    padding: 13px 15px; font-size: 11px; min-width: 215px;
+    backdrop-filter: blur(6px); z-index: 5;
+  }
+
+  #stats-panel h3 {
+    font-size: 9px; letter-spacing: 2px; text-transform: uppercase;
+    color: #404070; margin-bottom: 10px;
+  }
+
+  .stat-row {
+    display: flex; justify-content: space-between;
+    padding: 4px 0; border-bottom: 1px solid #181830; color: #7070a0;
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-val  { color: #4a9eff; font-weight: 700; }
+  .stat-warn { color: #ff6b35; }
+
+  /* ── Legend ──────────────────────────────────────────────────────────────  */
+  #legend {
+    position: absolute; bottom: 14px; left: 14px;
+    background: rgba(17, 17, 42, 0.94);
+    border: 1px solid #22224a; border-radius: 6px;
+    padding: 13px 15px; font-size: 10px;
+    backdrop-filter: blur(6px); display: flex; gap: 22px; z-index: 5;
+  }
+
+  .legend-col h4 {
+    font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: #404070; margin-bottom: 8px;
+  }
+
+  .legend-item {
+    display: flex; align-items: center; gap: 7px;
+    padding: 2.5px 0; color: #8080a0;
+  }
+
+  .legend-dot  { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+  .legend-dot.dead { border: 1px dashed #555 !important; }
+  .legend-line { width: 26px; height: 3px; flex-shrink: 0; border-radius: 2px; }
+
+  /* ── Tooltip ─────────────────────────────────────────────────────────────  */
+  #tooltip {
+    position: fixed; background: rgba(17, 17, 42, 0.97);
+    border: 1px solid #32325a; border-radius: 5px;
+    padding: 9px 13px; font-size: 11px; color: #b0b0d0;
+    pointer-events: none; opacity: 0; transition: opacity 0.12s;
+    max-width: 260px; z-index: 1000; line-height: 1.55;
+  }
+  #tooltip.visible { opacity: 1; }
+  #tooltip strong { color: #e0e0f0; display: block; margin-bottom: 3px; }
+
+  /* ── SVG element interaction styles ────────────────────────────────────── */
+  .module-box { cursor: pointer; }
+  .module-box .mr { transition: filter 0.15s, stroke-width 0.15s; }
+  .module-box:hover .mr { filter: brightness(1.35); stroke-width: 2.5px !important; }
+  .module-box.selected .mr { filter: brightness(1.6); stroke-width: 3px !important; }
+  .module-box.dimmed { opacity: 0.15; }
+
+  .flow-path { pointer-events: stroke; cursor: pointer; transition: opacity 0.15s; }
+  .flow-path.dimmed { opacity: 0.05; }
+
+  .labels-off .sl { display: none; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>NANOBOT</h1>
+  <span class="subtitle">Architecture · Interactive · 2026</span>
+  <div id="controls">
+    <button id="btn-reset">Reset View</button>
+    <button id="btn-flows">Hide Flows</button>
+    <button id="btn-labels">Hide Labels</button>
+    <button id="btn-dead">Dead Code</button>
+  </div>
+</div>
+
+<div id="main">
+  <div id="canvas-wrap">
+    <svg id="svg-root" viewBox="0 0 1900 1240" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+          <path d="M28 0L0 0 0 28" fill="none" stroke="#181828" stroke-width="0.6"/>
+        </pattern>
+
+        <marker id="aw" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="rgba(255,255,255,0.75)"/>
+        </marker>
+        <marker id="ap" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#9b59b6"/>
+        </marker>
+        <marker id="ag" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#2ecc71"/>
+        </marker>
+        <marker id="ay" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#f1c40f"/>
+        </marker>
+        <marker id="ak" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#e91e63"/>
+        </marker>
+        <marker id="ao" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#ff6b35"/>
+        </marker>
+
+        <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+          <feGaussianBlur stdDeviation="5" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+        <filter id="glows" x="-25%" y="-25%" width="150%" height="150%">
+          <feGaussianBlur stdDeviation="3" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+
+        <style>
+          @keyframes da1{to{stroke-dashoffset:-30}}
+          @keyframes da2{to{stroke-dashoffset:-24}}
+          @keyframes da3{to{stroke-dashoffset:-20}}
+          @keyframes da4{to{stroke-dashoffset:-18}}
+          @keyframes da5{to{stroke-dashoffset:-22}}
+          @keyframes da6{to{stroke-dashoffset:-16}}
+
+          .fw{stroke:rgba(255,255,255,.72);stroke-width:2.5;stroke-dasharray:10 5;
+              animation:da1 1.1s linear infinite;fill:none;marker-end:url(#aw)}
+          .fp{stroke:#9b59b6;stroke-width:2;stroke-dasharray:8 4;
+              animation:da2 1s linear infinite;fill:none;marker-end:url(#ap)}
+          .fg{stroke:#2ecc71;stroke-width:2;stroke-dasharray:6 4;
+              animation:da3 .85s linear infinite;fill:none;marker-end:url(#ag)}
+          .fy{stroke:#f1c40f;stroke-width:1.8;stroke-dasharray:6 3;
+              animation:da4 .8s linear infinite;fill:none;marker-end:url(#ay)}
+          .fk{stroke:#e91e63;stroke-width:1.8;stroke-dasharray:7 4;
+              animation:da5 1s linear infinite;fill:none;marker-end:url(#ak)}
+          .fo{stroke:#ff6b35;stroke-width:1.8;stroke-dasharray:5 3;
+              animation:da6 .9s linear infinite;fill:none;marker-end:url(#ao)}
+        </style>
+      </defs>
+
+      <!-- Background -->
+      <rect width="1900" height="1240" fill="url(#grid)"/>
+      <rect width="1900" height="1240" fill="rgba(13,13,26,.45)"/>
+
+      <!-- ============================================================
+           ZONE BACKGROUNDS
+           ============================================================ -->
+
+      <!-- Entry Points -->
+      <rect x="16" y="16" width="200" height="470" rx="8"
+        fill="rgba(74,158,255,.03)" stroke="rgba(74,158,255,.14)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="116" y="33" text-anchor="middle" fill="rgba(74,158,255,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">ENTRY POINTS</text>
+
+      <!-- Dead Code -->
+      <rect x="16" y="504" width="200" height="355" rx="8"
+        fill="rgba(90,90,90,.03)" stroke="rgba(100,100,100,.2)"
+        stroke-width="1" stroke-dasharray="6 4" pointer-events="none"/>
+      <text x="116" y="521" text-anchor="middle" fill="rgba(130,130,130,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">DEAD CODE</text>
+
+      <!-- Channels -->
+      <rect x="234" y="16" width="188" height="390" rx="8"
+        fill="rgba(0,188,212,.03)" stroke="rgba(0,188,212,.13)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="328" y="33" text-anchor="middle" fill="rgba(0,188,212,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">CHANNELS</text>
+
+      <!-- Context and Memory -->
+      <rect x="440" y="16" width="555" height="190" rx="8"
+        fill="rgba(241,196,15,.03)" stroke="rgba(241,196,15,.13)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="717" y="33" text-anchor="middle" fill="rgba(241,196,15,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">CONTEXT &amp; MEMORY</text>
+
+      <!-- Config -->
+      <rect x="1012" y="16" width="256" height="130" rx="8"
+        fill="rgba(149,165,166,.03)" stroke="rgba(149,165,166,.13)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="1140" y="33" text-anchor="middle" fill="rgba(149,165,166,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">CONFIG</text>
+
+      <!-- Agent Core -->
+      <rect x="440" y="222" width="610" height="465" rx="8"
+        fill="rgba(255,107,53,.03)" stroke="rgba(255,107,53,.16)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="745" y="240" text-anchor="middle" fill="rgba(255,107,53,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">AGENT CORE</text>
+
+      <!-- Tool System -->
+      <rect x="1064" y="240" width="376" height="475" rx="8"
+        fill="rgba(46,204,113,.03)" stroke="rgba(46,204,113,.14)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="1252" y="258" text-anchor="middle" fill="rgba(46,204,113,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">TOOL SYSTEM</text>
+
+      <!-- Providers -->
+      <rect x="1458" y="16" width="422" height="490" rx="8"
+        fill="rgba(155,89,182,.03)" stroke="rgba(155,89,182,.14)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="1669" y="33" text-anchor="middle" fill="rgba(155,89,182,.38)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">PROVIDERS</text>
+
+      <!-- Session + Observability -->
+      <rect x="234" y="720" width="1200" height="200" rx="8"
+        fill="rgba(233,30,99,.02)" stroke="rgba(200,50,100,.12)"
+        stroke-width="1" stroke-dasharray="5 4" pointer-events="none"/>
+      <text x="834" y="738" text-anchor="middle" fill="rgba(200,50,100,.32)"
+        font-size="8.5" letter-spacing="2" font-family="monospace" pointer-events="none">SESSION · HEALTH · OBSERVABILITY</text>
+
+      <!-- ============================================================
+           DATA FLOW PATHS
+           ============================================================ -->
+      <g id="flows-layer">
+        <!-- Message flow -->
+        <path class="flow-path fw" id="fl-msg-in"
+          d="M328 390 L328 430 L444 430 L444 368"
+          data-flow="Message Flow"
+          data-desc="InboundMessage: ChannelManager -> bus/events -> AgentLoop.run()"/>
+        <path class="flow-path fw" id="fl-msg-out"
+          d="M444 584 L444 640 L328 640 L328 414"
+          data-flow="Message Flow"
+          data-desc="OutboundMessage: AgentLoop -> bus/events -> ChannelManager -> Channel"/>
+
+        <!-- LLM Call flow -->
+        <path class="flow-path fp" id="fl-llm-req"
+          d="M1048 430 Q1240 430 1458 360"
+          data-flow="LLM Call Flow"
+          data-desc="AgentLoop -> protocol.rs -> OpenAICompatProvider -> HTTPS -> LLM API"/>
+        <path class="flow-path fp" id="fl-llm-resp"
+          d="M1458 400 Q1260 442 1048 452"
+          data-flow="LLM Call Flow"
+          data-desc="LLM API response (streaming) -> AgentLoop (tool_calls / text)"/>
+        <path class="flow-path fp" id="fl-llm-anth"
+          d="M1048 462 Q1300 492 1458 480"
+          data-flow="LLM Call Flow"
+          data-desc="AgentLoop -> anthropic.rs (native API for OAuth / Claude Max)"/>
+
+        <!-- Tool Execution flow -->
+        <path class="flow-path fg" id="fl-tool-route"
+          d="M1048 415 L1080 352"
+          data-flow="Tool Execution"
+          data-desc="AgentLoop -> router.rs (trio dispatch: pattern / heuristic / LLM)"/>
+        <path class="flow-path fg" id="fl-tool-guard"
+          d="M1080 422 L1080 460"
+          data-flow="Tool Execution"
+          data-desc="router.rs -> tool_guard.rs (dedup / rate-limit / block)"/>
+        <path class="flow-path fg" id="fl-tool-engine"
+          d="M1080 518 L1080 562"
+          data-flow="Tool Execution"
+          data-desc="tool_guard.rs -> tool_engine.rs -> tool_runner.rs"/>
+        <path class="flow-path fg" id="fl-tool-impl"
+          d="M1080 652 L1080 702 Q1080 732 1205 732"
+          data-flow="Tool Execution"
+          data-desc="tool_runner.rs -> tools/* (filesystem, shell, web, spawn, message)"/>
+
+        <!-- Context Assembly flow -->
+        <path class="flow-path fy" id="fl-ctx-mem"
+          d="M517 170 L517 240"
+          data-flow="Context Assembly"
+          data-desc="memory.rs -> context.rs (MEMORY.md injected every prompt)"/>
+        <path class="flow-path fy" id="fl-ctx-skills"
+          d="M660 170 L660 240"
+          data-flow="Context Assembly"
+          data-desc="skills.rs -> context.rs (always:true skills in every prompt)"/>
+        <path class="flow-path fy" id="fl-ctx-wm"
+          d="M858 174 L858 240"
+          data-flow="Context Assembly"
+          data-desc="working_memory.rs -> context.rs (session state)"/>
+        <path class="flow-path fy" id="fl-ctx-cfg"
+          d="M1080 82 Q970 82 900 100 L900 140"
+          data-flow="Context Assembly"
+          data-desc="config/schema.rs -> context.rs (identity, workspace path)"/>
+        <path class="flow-path fy" id="fl-ctx-out"
+          d="M810 332 L810 377"
+          data-flow="Context Assembly"
+          data-desc="context.rs -> system_prompt -> AgentLoop"/>
+
+        <!-- Session flow -->
+        <path class="flow-path fk" id="fl-session"
+          d="M700 700 L700 750"
+          data-flow="Session Flow"
+          data-desc="AgentLoop -> session/manager.rs -> ~/.nanobot/sessions/*.jsonl"/>
+
+        <!-- Compaction flow -->
+        <path class="flow-path fo" id="fl-compact-1"
+          d="M565 418 L509 418"
+          data-flow="Compaction Flow"
+          data-desc="token_budget.rs signals lcm.rs when budget is exceeded"/>
+        <path class="flow-path fo" id="fl-compact-2"
+          d="M492 358 L492 282"
+          data-flow="Compaction Flow"
+          data-desc="lcm.rs -> compaction.rs -> summary DAG construction"/>
+        <path class="flow-path fo" id="fl-compact-3"
+          d="M492 250 Q492 200 600 180 Q780 152 1458 252"
+          data-flow="Compaction Flow"
+          data-desc="compaction.rs -> providers (memory_provider) -> summarization LLM call"/>
+
+        <!-- Subagent loop-back -->
+        <path class="flow-path fw" id="fl-subagent"
+          style="stroke-width:1.4;stroke-dasharray:5 6;opacity:.45"
+          d="M680 572 Q618 612 618 652 Q618 702 660 724"
+          data-flow="Subagent Delegation"
+          data-desc="subagent.rs -> spawns a nested AgentLoop with its own context and tools"/>
+
+        <!-- Provider to external -->
+        <path class="flow-path fp" id="fl-ext"
+          d="M1704 302 L1730 282"
+          data-flow="External API Call"
+          data-desc="Providers -> External LLM API endpoint (HTTPS / REST)"/>
+      </g>
+
+      <!-- ============================================================
+           MODULE BOXES
+           ============================================================ -->
+      <g id="modules-layer">
+
+        <!-- ===== ENTRY POINTS ===== -->
+
+        <g class="module-box" id="mod-main"
+           data-name="main.rs" data-loc="822" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="Binary entry point. Parses top-level CLI arguments with clap, initializes tracing/logging, loads config, and hands off to the appropriate handler (CLI, gateway, repl, server)."
+           data-deps="cli.rs, config/loader.rs, channels/manager.rs">
+          <rect class="mr" x="22" y="44" width="188" height="54" rx="5"
+            fill="#071426" stroke="#4a9eff" stroke-width="1.5"/>
+          <text x="116" y="68" text-anchor="middle" fill="#4a9eff"
+            font-size="12.5" font-weight="700" font-family="monospace">main.rs</text>
+          <text class="sl" x="116" y="85" text-anchor="middle" fill="#2a5080"
+            font-size="9" font-family="monospace">822 LOC · CLI entry</text>
+        </g>
+
+        <g class="module-box" id="mod-cli"
+           data-name="cli.rs" data-loc="2690" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="Command handlers for all CLI subcommands: agent, chat, voice, session list/show/delete, config edit, eval suite. Bridges user commands to the agent loop and provider stack."
+           data-deps="agent_loop.rs, config, providers/factory.rs, session/manager.rs">
+          <rect class="mr" x="22" y="110" width="188" height="70" rx="5"
+            fill="#071426" stroke="#4a9eff" stroke-width="1.5"/>
+          <text x="116" y="135" text-anchor="middle" fill="#4a9eff"
+            font-size="12.5" font-weight="700" font-family="monospace">cli.rs</text>
+          <text class="sl" x="116" y="152" text-anchor="middle" fill="#2a5080"
+            font-size="9" font-family="monospace">2,690 LOC · Command handlers</text>
+          <rect x="30" y="170" width="172" height="3" rx="1.5" fill="#071426"/>
+          <rect x="30" y="170" width="85" height="3" rx="1.5" fill="#4a9eff" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-repl"
+           data-name="repl/" data-loc="6570" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="Interactive REPL subsystem (6,570 LOC across incremental.rs, tui.rs, syntax.rs, sessions_cmd.rs). Handles streaming output, terminal UI rendering, syntax highlighting, and session history browsing."
+           data-deps="agent_loop.rs, providers, session/manager.rs">
+          <rect class="mr" x="22" y="194" width="188" height="84" rx="5"
+            fill="#071426" stroke="#4a9eff" stroke-width="1.5"/>
+          <text x="116" y="219" text-anchor="middle" fill="#4a9eff"
+            font-size="12.5" font-weight="700" font-family="monospace">repl/</text>
+          <text class="sl" x="116" y="237" text-anchor="middle" fill="#2a5080"
+            font-size="9" font-family="monospace">6,570 LOC total</text>
+          <text class="sl" x="116" y="253" text-anchor="middle" fill="#1e3a5a"
+            font-size="8.5" font-family="monospace">incremental · tui · syntax</text>
+          <text class="sl" x="116" y="267" text-anchor="middle" fill="#1e3a5a"
+            font-size="8.5" font-family="monospace">sessions_cmd</text>
+          <rect x="30" y="271" width="172" height="3" rx="1.5" fill="#071426"/>
+          <rect x="30" y="271" width="155" height="3" rx="1.5" fill="#4a9eff" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-cron"
+           data-name="cron/" data-loc="620" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="Scheduled job system. Supports interval and cron expression scheduling (cron/types.rs, cron/service.rs). Injects scheduled messages into the agent loop."
+           data-deps="agent_loop.rs, bus/events.rs">
+          <rect class="mr" x="22" y="292" width="188" height="52" rx="5"
+            fill="#071426" stroke="#4a9eff" stroke-width="1.5"/>
+          <text x="116" y="314" text-anchor="middle" fill="#4a9eff"
+            font-size="12.5" font-weight="700" font-family="monospace">cron/</text>
+          <text class="sl" x="116" y="331" text-anchor="middle" fill="#2a5080"
+            font-size="9" font-family="monospace">620 LOC · Cron scheduler</text>
+        </g>
+
+        <g class="module-box" id="mod-server"
+           data-name="server.rs" data-loc="290" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="HTTP webhook server for gateway mode. Receives events from external services and injects them into the message bus."
+           data-deps="bus/events.rs, channels/manager.rs">
+          <rect class="mr" x="22" y="358" width="188" height="52" rx="5"
+            fill="#071426" stroke="#4a9eff" stroke-width="1.5"/>
+          <text x="116" y="380" text-anchor="middle" fill="#4a9eff"
+            font-size="12.5" font-weight="700" font-family="monospace">server.rs</text>
+          <text class="sl" x="116" y="397" text-anchor="middle" fill="#2a5080"
+            font-size="9" font-family="monospace">290 LOC · HTTP gateway</text>
+        </g>
+
+        <g class="module-box" id="mod-errors"
+           data-name="errors.rs" data-loc="180" data-group="Entry Points" data-color="#4a9eff"
+           data-desc="Unified error type definitions for the whole codebase using thiserror for ergonomic error propagation."
+           data-deps="">
+          <rect class="mr" x="22" y="424" width="188" height="44" rx="5"
+            fill="#071426" stroke="#3a7acc" stroke-width="1"/>
+          <text x="116" y="443" text-anchor="middle" fill="#3a7acc"
+            font-size="11.5" font-weight="700" font-family="monospace">errors.rs</text>
+          <text class="sl" x="116" y="458" text-anchor="middle" fill="#1e3a5a"
+            font-size="9" font-family="monospace">180 LOC · Error types</text>
+        </g>
+
+        <!-- ===== DEAD CODE ===== -->
+
+        <g class="module-box dead-mod" id="mod-lora"
+           data-name="lora_bridge.rs" data-loc="737" data-group="Dead Code" data-color="#666666"
+           data-desc="LoRA adapter bridge. Phase 2 planned code — not wired into any active call path. Likely intended for fine-tuned local model support via LoRA adapters."
+           data-deps="providers">
+          <rect class="mr" x="22" y="534" width="188" height="50" rx="5"
+            fill="#141414" stroke="#444" stroke-width="1" stroke-dasharray="5 3"/>
+          <text x="116" y="557" text-anchor="middle" fill="#585858"
+            font-size="11" font-weight="700" font-family="monospace">lora_bridge.rs</text>
+          <text class="sl" x="116" y="573" text-anchor="middle" fill="#383838"
+            font-size="9" font-family="monospace">737 LOC · Phase 2 dead</text>
+        </g>
+
+        <g class="module-box dead-mod" id="mod-step-voter"
+           data-name="step_voter.rs" data-loc="551" data-group="Dead Code" data-color="#666666"
+           data-desc="Step voting mechanism. Phase 3 planned feature — evaluates multiple candidate next-steps and picks the best via voting. Not integrated into the active agent loop."
+           data-deps="agent_loop.rs">
+          <rect class="mr" x="22" y="596" width="188" height="50" rx="5"
+            fill="#141414" stroke="#444" stroke-width="1" stroke-dasharray="5 3"/>
+          <text x="116" y="619" text-anchor="middle" fill="#585858"
+            font-size="11" font-weight="700" font-family="monospace">step_voter.rs</text>
+          <text class="sl" x="116" y="635" text-anchor="middle" fill="#383838"
+            font-size="9" font-family="monospace">551 LOC · Phase 3 dead</text>
+        </g>
+
+        <g class="module-box dead-mod" id="mod-knowledge"
+           data-name="knowledge_store.rs" data-loc="681" data-group="Dead Code" data-color="#666666"
+           data-desc="Persistent knowledge / RAG store. Phase 2 planned feature for fact storage and retrieval-augmented generation. Not integrated into the agent loop."
+           data-deps="">
+          <rect class="mr" x="22" y="658" width="188" height="50" rx="5"
+            fill="#141414" stroke="#444" stroke-width="1" stroke-dasharray="5 3"/>
+          <text x="116" y="681" text-anchor="middle" fill="#585858"
+            font-size="11" font-weight="700" font-family="monospace">knowledge_store.rs</text>
+          <text class="sl" x="116" y="697" text-anchor="middle" fill="#383838"
+            font-size="9" font-family="monospace">681 LOC · Phase 2 dead</text>
+        </g>
+
+        <g class="module-box dead-mod" id="mod-confidence"
+           data-name="confidence_gate.rs" data-loc="445" data-group="Dead Code" data-color="#666666"
+           data-desc="Confidence scoring gate. Phase 3 planned feature — filters low-confidence tool calls before execution. Not wired into router or tool_runner."
+           data-deps="">
+          <rect class="mr" x="22" y="720" width="188" height="50" rx="5"
+            fill="#141414" stroke="#444" stroke-width="1" stroke-dasharray="5 3"/>
+          <text x="116" y="743" text-anchor="middle" fill="#585858"
+            font-size="11" font-weight="700" font-family="monospace">confidence_gate.rs</text>
+          <text class="sl" x="116" y="759" text-anchor="middle" fill="#383838"
+            font-size="9" font-family="monospace">445 LOC · Phase 3 dead</text>
+        </g>
+
+        <!-- Dead code skull markers -->
+        <text x="207" y="559" fill="#aa2222" font-size="12" font-family="sans-serif"
+          opacity=".65" pointer-events="none">&#9760;</text>
+        <text x="207" y="621" fill="#aa2222" font-size="12" font-family="sans-serif"
+          opacity=".65" pointer-events="none">&#9760;</text>
+        <text x="207" y="683" fill="#aa2222" font-size="12" font-family="sans-serif"
+          opacity=".65" pointer-events="none">&#9760;</text>
+        <text x="207" y="745" fill="#aa2222" font-size="12" font-family="sans-serif"
+          opacity=".65" pointer-events="none">&#9760;</text>
+        <text x="116" y="521" text-anchor="middle" fill="rgba(190,50,50,.5)"
+          font-size="8" font-family="monospace" pointer-events="none">Phase 2-3: not wired in</text>
+
+        <!-- ===== CHANNELS ===== -->
+
+        <g class="module-box" id="mod-telegram"
+           data-name="channels/telegram.rs" data-loc="851" data-group="Channels" data-color="#00bcd4"
+           data-desc="Telegram adapter using long-polling. Handles message receipt, photo/file uploads, inline keyboards, and bot commands. Converts to InboundMessage format."
+           data-deps="channels/manager.rs, bus/events.rs">
+          <rect class="mr" x="240" y="44" width="180" height="52" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="1.5"/>
+          <text x="330" y="67" text-anchor="middle" fill="#00bcd4"
+            font-size="11.5" font-weight="700" font-family="monospace">telegram.rs</text>
+          <text class="sl" x="330" y="84" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">851 LOC · Long-polling</text>
+        </g>
+
+        <g class="module-box" id="mod-whatsapp"
+           data-name="channels/whatsapp.rs" data-loc="480" data-group="Channels" data-color="#00bcd4"
+           data-desc="WhatsApp adapter via WebSocket bridge. Converts WhatsApp message events to InboundMessage, handles media download."
+           data-deps="channels/manager.rs, bus/events.rs">
+          <rect class="mr" x="240" y="108" width="180" height="50" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="1.5"/>
+          <text x="330" y="130" text-anchor="middle" fill="#00bcd4"
+            font-size="11.5" font-weight="700" font-family="monospace">whatsapp.rs</text>
+          <text class="sl" x="330" y="147" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">480 LOC · WebSocket bridge</text>
+        </g>
+
+        <g class="module-box" id="mod-feishu"
+           data-name="channels/feishu.rs" data-loc="236" data-group="Channels" data-color="#00bcd4"
+           data-desc="Feishu/Lark enterprise chat adapter via WebSocket. Handles message events, card interactions, and mentions."
+           data-deps="channels/manager.rs, bus/events.rs">
+          <rect class="mr" x="240" y="170" width="180" height="48" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="1.5"/>
+          <text x="330" y="192" text-anchor="middle" fill="#00bcd4"
+            font-size="11.5" font-weight="700" font-family="monospace">feishu.rs</text>
+          <text class="sl" x="330" y="208" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">236 LOC · Lark/Feishu WS</text>
+        </g>
+
+        <g class="module-box" id="mod-email"
+           data-name="channels/email.rs" data-loc="1449" data-group="Channels" data-color="#00bcd4"
+           data-desc="Email channel adapter (IMAP + SMTP). Largest channel by LOC. Handles thread grouping, HTML stripping, reply formatting, and attachment handling."
+           data-deps="channels/manager.rs, bus/events.rs">
+          <rect class="mr" x="240" y="230" width="180" height="60" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="1.5"/>
+          <text x="330" y="255" text-anchor="middle" fill="#00bcd4"
+            font-size="11.5" font-weight="700" font-family="monospace">email.rs</text>
+          <text class="sl" x="330" y="272" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">1,449 LOC · IMAP/SMTP</text>
+          <rect x="248" y="283" width="164" height="3" rx="1.5" fill="#001c24"/>
+          <rect x="248" y="283" width="55" height="3" rx="1.5" fill="#00bcd4" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-chan-mgr"
+           data-name="channels/manager.rs" data-loc="181" data-group="Channels" data-color="#00bcd4"
+           data-desc="Channel coordinator. Spawns and supervises all channel adapters, routes InboundMessages from all channels into the bus queue, and routes OutboundMessages back to the correct channel."
+           data-deps="bus/events.rs, telegram.rs, whatsapp.rs, feishu.rs, email.rs">
+          <rect class="mr" x="240" y="304" width="180" height="58" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="2"/>
+          <text x="330" y="328" text-anchor="middle" fill="#00bcd4"
+            font-size="12" font-weight="700" font-family="monospace">manager.rs</text>
+          <text class="sl" x="330" y="345" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">181 LOC · Channel coordinator</text>
+        </g>
+
+        <g class="module-box" id="mod-bus"
+           data-name="bus/events.rs" data-loc="180" data-group="Channels" data-color="#00bcd4"
+           data-desc="InboundMessage and OutboundMessage event type definitions plus the mpsc queue wiring (bus/queue.rs). The central nervous system connecting channels to the agent."
+           data-deps="">
+          <rect class="mr" x="240" y="374" width="180" height="52" rx="5"
+            fill="#001c24" stroke="#00bcd4" stroke-width="1.5"/>
+          <text x="330" y="397" text-anchor="middle" fill="#00bcd4"
+            font-size="12" font-weight="700" font-family="monospace">bus/events.rs</text>
+          <text class="sl" x="330" y="414" text-anchor="middle" fill="#005060"
+            font-size="9" font-family="monospace">180 LOC · Message bus</text>
+        </g>
+
+        <!-- ===== CONTEXT AND MEMORY ===== -->
+
+        <g class="module-box" id="mod-memory"
+           data-name="memory.rs" data-loc="201" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="MEMORY.md persistence layer. Reads and appends to the agent's long-term memory file at {workspace}/MEMORY.md. Only MEMORY.md is injected into every system prompt."
+           data-deps="context.rs">
+          <rect class="mr" x="446" y="44" width="148" height="50" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="520" y="65" text-anchor="middle" fill="#f1c40f"
+            font-size="11" font-weight="700" font-family="monospace">memory.rs</text>
+          <text class="sl" x="520" y="82" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">201 LOC · MEMORY.md</text>
+        </g>
+
+        <g class="module-box" id="mod-skills"
+           data-name="skills.rs" data-loc="697" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Skills loader. Reads skill markdown files from {workspace}/skills/. Skills with always:true frontmatter are included in every prompt. Others appear as summaries the agent can read on demand."
+           data-deps="context.rs">
+          <rect class="mr" x="606" y="44" width="148" height="50" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="680" y="65" text-anchor="middle" fill="#f1c40f"
+            font-size="11" font-weight="700" font-family="monospace">skills.rs</text>
+          <text class="sl" x="680" y="82" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">697 LOC · Skill loader</text>
+        </g>
+
+        <g class="module-box" id="mod-working-mem"
+           data-name="working_memory.rs" data-loc="682" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Per-session working memory. Tracks intermediate results, pending tasks, tool call counts, and draft state. Feeds into ContextBuilder for assembling the conversation context."
+           data-deps="context.rs">
+          <rect class="mr" x="766" y="44" width="170" height="50" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="851" y="65" text-anchor="middle" fill="#f1c40f"
+            font-size="11" font-weight="700" font-family="monospace">working_memory.rs</text>
+          <text class="sl" x="851" y="82" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">682 LOC · Session state</text>
+        </g>
+
+        <g class="module-box" id="mod-learning"
+           data-name="learning.rs" data-loc="531" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Experience/learning database. Stores distilled agent learnings for cross-session recall. Not injected automatically — requires explicit recall tool use."
+           data-deps="memory.rs">
+          <rect class="mr" x="950" y="44" width="148" height="50" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="1024" y="65" text-anchor="middle" fill="#f1c40f"
+            font-size="11" font-weight="700" font-family="monospace">learning.rs</text>
+          <text class="sl" x="1024" y="82" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">531 LOC · Experience DB</text>
+        </g>
+
+        <!-- context.rs — central hub for memory -->
+        <g class="module-box" id="mod-context"
+           data-name="context.rs" data-loc="1443" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="ContextBuilder: assembles the full system prompt from identity text, bootstrap workspace files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOOLS.md), MEMORY.md, and skills. Also builds the full conversation message array with history, compacted sections, and tool results."
+           data-deps="memory.rs, skills.rs, working_memory.rs, config">
+          <rect class="mr" x="720" y="240" width="185" height="76" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="812" y="265" text-anchor="middle" fill="#f1c40f"
+            font-size="13" font-weight="700" font-family="monospace">context.rs</text>
+          <text class="sl" x="812" y="283" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">1,443 LOC</text>
+          <text class="sl" x="812" y="299" text-anchor="middle" fill="#60480a"
+            font-size="8.5" font-family="monospace">ContextBuilder · system_prompt</text>
+        </g>
+
+        <!-- lcm.rs -->
+        <g class="module-box" id="mod-lcm"
+           data-name="lcm.rs" data-loc="1733" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Lossless Context Management. Manages the full conversation transcript with lossless compression markers. Coordinates with compaction.rs when the token budget signals that summarization is needed."
+           data-deps="compaction.rs, token_budget.rs, agent_loop.rs">
+          <rect class="mr" x="446" y="250" width="150" height="70" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="521" y="275" text-anchor="middle" fill="#f1c40f"
+            font-size="12.5" font-weight="700" font-family="monospace">lcm.rs</text>
+          <text class="sl" x="521" y="292" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">1,733 LOC</text>
+          <text class="sl" x="521" y="308" text-anchor="middle" fill="#60480a"
+            font-size="8.5" font-family="monospace">Lossless Ctx Mgmt</text>
+        </g>
+
+        <!-- compaction.rs -->
+        <g class="module-box" id="mod-compaction"
+           data-name="compaction.rs" data-loc="1655" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Context compaction (summarization). When token budget is exceeded, compresses old conversation turns into a summary DAG via a dedicated provider call (memory_provider). This lets the agent maintain arbitrarily long sessions without losing important context."
+           data-deps="providers, lcm.rs, token_budget.rs">
+          <rect class="mr" x="446" y="334" width="150" height="70" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="521" y="358" text-anchor="middle" fill="#f1c40f"
+            font-size="12.5" font-weight="700" font-family="monospace">compaction.rs</text>
+          <text class="sl" x="521" y="376" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">1,655 LOC</text>
+          <text class="sl" x="521" y="392" text-anchor="middle" fill="#60480a"
+            font-size="8.5" font-family="monospace">Summary DAG</text>
+        </g>
+
+        <!-- token_budget.rs -->
+        <g class="module-box" id="mod-token-budget"
+           data-name="token_budget.rs" data-loc="683" data-group="Context &amp; Memory" data-color="#f1c40f"
+           data-desc="Token accounting and budget enforcement. Counts tokens per message turn, tracks totals per session, and signals lcm.rs when compaction thresholds are approached."
+           data-deps="lcm.rs, compaction.rs">
+          <rect class="mr" x="610" y="392" width="152" height="58" rx="5"
+            fill="#1e1800" stroke="#f1c40f" stroke-width="1.5"/>
+          <text x="686" y="416" text-anchor="middle" fill="#f1c40f"
+            font-size="11" font-weight="700" font-family="monospace">token_budget.rs</text>
+          <text class="sl" x="686" y="433" text-anchor="middle" fill="#806010"
+            font-size="9" font-family="monospace">683 LOC · Token accounting</text>
+        </g>
+
+        <!-- ===== CONFIG ===== -->
+
+        <g class="module-box" id="mod-config-schema"
+           data-name="config/schema.rs" data-loc="2504" data-group="Config" data-color="#95a5a6"
+           data-desc="Full configuration schema with 90+ fields and camelCase serde. Includes 18 tool_delegation fields, provider API keys and base URLs, channel configs, model selection, budget limits, workspace path, and eval settings. Candidate for decomposition into focused sub-schemas."
+           data-deps="config/loader.rs">
+          <rect class="mr" x="1018" y="44" width="238" height="76" rx="5"
+            fill="#141818" stroke="#95a5a6" stroke-width="1.5"/>
+          <text x="1137" y="71" text-anchor="middle" fill="#aabcbc"
+            font-size="12.5" font-weight="700" font-family="monospace">config/schema.rs</text>
+          <text class="sl" x="1137" y="88" text-anchor="middle" fill="#506060"
+            font-size="9" font-family="monospace">2,504 LOC · 90+ fields</text>
+          <text class="sl" x="1137" y="104" text-anchor="middle" fill="#3a4848"
+            font-size="8.5" font-family="monospace">18 tool_delegation · camelCase serde</text>
+          <rect x="1026" y="112" width="222" height="3" rx="1.5" fill="#141818"/>
+          <rect x="1026" y="112" width="105" height="3" rx="1.5" fill="#95a5a6" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-config-loader"
+           data-name="config/loader.rs" data-loc="116" data-group="Config" data-color="#95a5a6"
+           data-desc="Minimal JSON loader. Reads ~/.nanobot/config.json, deserializes with serde_json into the Config struct from schema.rs. Handles missing file gracefully with defaults."
+           data-deps="config/schema.rs">
+          <rect class="mr" x="1018" y="130" width="238" height="44" rx="5"
+            fill="#141818" stroke="#95a5a6" stroke-width="1"/>
+          <text x="1137" y="150" text-anchor="middle" fill="#aabcbc"
+            font-size="11.5" font-weight="700" font-family="monospace">config/loader.rs</text>
+          <text class="sl" x="1137" y="167" text-anchor="middle" fill="#506060"
+            font-size="9" font-family="monospace">116 LOC · JSON -> Config</text>
+        </g>
+
+        <!-- ===== AGENT CORE — agent_loop is the god object ===== -->
+
+        <g class="module-box" id="mod-agent-loop"
+           data-name="agent_loop.rs" data-loc="4874" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="GOD OBJECT: The central message processing loop. Receives InboundMessages via mpsc, assembles context (via ContextBuilder), calls the LLM provider, iterates over tool calls (up to max_tool_iterations), handles streaming, emits OutboundMessages. Two entry points: run() for gateway mode (bus-consuming), process_direct() for CLI/repl. Contains inline logic that should be in dedicated modules — prime candidate for decomposition."
+           data-deps="context.rs, protocol.rs, tool_wiring.rs, router.rs, lcm.rs, token_budget.rs, session/manager.rs, providers, anti_drift.rs, thread_repair.rs">
+          <rect class="mr" x="712" y="377" width="333" height="128" rx="6"
+            fill="#160900" stroke="#ff6b35" stroke-width="2.5" filter="url(#glow)"/>
+          <text x="878" y="416" text-anchor="middle" fill="#ff6b35"
+            font-size="15" font-weight="700" font-family="monospace">agent_loop.rs</text>
+          <text class="sl" x="878" y="438" text-anchor="middle" fill="#904020"
+            font-size="10" font-family="monospace">4,874 LOC  *  God Object</text>
+          <text class="sl" x="878" y="457" text-anchor="middle" fill="#6a2e10"
+            font-size="9" font-family="monospace">run() · process_direct()</text>
+          <text class="sl" x="878" y="474" text-anchor="middle" fill="#6a2e10"
+            font-size="9" font-family="monospace">LLM loop · tool iteration · streaming</text>
+          <rect x="724" y="493" width="309" height="4" rx="2" fill="#160900"/>
+          <rect x="724" y="493" width="260" height="4" rx="2" fill="#ff6b35" opacity=".8"/>
+        </g>
+
+        <g class="module-box" id="mod-agent-core"
+           data-name="agent_core.rs" data-loc="646" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="SwappableCore abstraction (allows mid-session model hot-swap) and RuntimeCounters (per-session iteration and token tracking)."
+           data-deps="agent_loop.rs, providers">
+          <rect class="mr" x="712" y="520" width="152" height="60" rx="5"
+            fill="#160900" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="788" y="544" text-anchor="middle" fill="#ff6b35"
+            font-size="11.5" font-weight="700" font-family="monospace">agent_core.rs</text>
+          <text class="sl" x="788" y="561" text-anchor="middle" fill="#904020"
+            font-size="9" font-family="monospace">646 LOC · SwappableCore</text>
+        </g>
+
+        <g class="module-box" id="mod-protocol"
+           data-name="protocol.rs" data-loc="592" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="Cloud/Local message protocol normalizer. Handles structural differences between cloud APIs (standard OpenAI format) and local LLM APIs (LM Studio, llama.cpp). Enforces the local constraint: conversations MUST end with a user message; assistant prefill NOT supported."
+           data-deps="agent_loop.rs, providers">
+          <rect class="mr" x="878" y="520" width="165" height="60" rx="5"
+            fill="#160900" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="960" y="544" text-anchor="middle" fill="#ff6b35"
+            font-size="11.5" font-weight="700" font-family="monospace">protocol.rs</text>
+          <text class="sl" x="960" y="561" text-anchor="middle" fill="#904020"
+            font-size="9" font-family="monospace">592 LOC · Cloud/Local msgs</text>
+        </g>
+
+        <g class="module-box" id="mod-subagent"
+           data-name="subagent.rs" data-loc="1565" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="Delegation engine. Spawns nested sub-agents with their own isolated context, tool registry, and message loop. Called by tools/spawn.rs. Allows the agent to delegate sub-tasks to specialized child agents."
+           data-deps="agent_loop.rs, tool_runner.rs, providers, context.rs">
+          <rect class="mr" x="712" y="594" width="152" height="60" rx="5"
+            fill="#160900" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="788" y="618" text-anchor="middle" fill="#ff6b35"
+            font-size="11.5" font-weight="700" font-family="monospace">subagent.rs</text>
+          <text class="sl" x="788" y="635" text-anchor="middle" fill="#904020"
+            font-size="9" font-family="monospace">1,565 LOC · Delegation</text>
+        </g>
+
+        <g class="module-box" id="mod-anti-drift"
+           data-name="anti_drift.rs" data-loc="851" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="Context hygiene module. Detects and removes drift in long conversations: repeated instructions, stale/contradictory context, bloated tool descriptions. Applied before each LLM call."
+           data-deps="agent_loop.rs">
+          <rect class="mr" x="878" y="594" width="165" height="60" rx="5"
+            fill="#160900" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="960" y="618" text-anchor="middle" fill="#ff6b35"
+            font-size="11.5" font-weight="700" font-family="monospace">anti_drift.rs</text>
+          <text class="sl" x="960" y="635" text-anchor="middle" fill="#904020"
+            font-size="9" font-family="monospace">851 LOC · Context hygiene</text>
+        </g>
+
+        <g class="module-box" id="mod-thread-repair"
+           data-name="thread_repair.rs" data-loc="1307" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="Message protocol repair. Detects and fixes malformed message sequences before LLM calls: missing user turn at end, orphaned tool result messages, duplicate system messages. Critical for local model compatibility."
+           data-deps="agent_loop.rs, protocol.rs">
+          <rect class="mr" x="712" y="667" width="331" height="55" rx="5"
+            fill="#160900" stroke="#ff6b35" stroke-width="1.5"/>
+          <text x="877" y="691" text-anchor="middle" fill="#ff6b35"
+            font-size="11.5" font-weight="700" font-family="monospace">thread_repair.rs</text>
+          <text class="sl" x="877" y="708" text-anchor="middle" fill="#904020"
+            font-size="9" font-family="monospace">1,307 LOC · Protocol repair</text>
+        </g>
+
+        <g class="module-box" id="mod-model-caps"
+           data-name="model_capabilities.rs" data-loc="348" data-group="Agent Core" data-color="#ff6b35"
+           data-desc="Model feature matrix. Tracks which models support which capabilities: function calling, vision input, context window size, streaming, tool_use blocks, thinking blocks. Used by agent_loop to adapt behavior per model."
+           data-deps="agent_loop.rs, providers">
+          <rect class="mr" x="600" y="492" width="104" height="60" rx="5"
+            fill="#160900" stroke="#cc5520" stroke-width="1"/>
+          <text x="652" y="513" text-anchor="middle" fill="#cc5520"
+            font-size="9.5" font-weight="700" font-family="monospace">model_caps.rs</text>
+          <text class="sl" x="652" y="530" text-anchor="middle" fill="#6a2e10"
+            font-size="8.5" font-family="monospace">348 LOC</text>
+          <text class="sl" x="652" y="545" text-anchor="middle" fill="#6a2e10"
+            font-size="8.5" font-family="monospace">Feature matrix</text>
+        </g>
+
+        <!-- ===== TOOL SYSTEM ===== -->
+
+        <g class="module-box" id="mod-router"
+           data-name="router.rs" data-loc="2221" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Trio routing dispatch. 3 separate decision paths: (1) pattern-based fast routing via router_fallback.rs, (2) heuristic scoring, (3) LLM-assisted routing for ambiguous cases. Complex fan-out — 3 decision paths is a simplification opportunity."
+           data-deps="tool_guard.rs, router_fallback.rs, tool_engine.rs, tool_wiring.rs">
+          <rect class="mr" x="1072" y="270" width="182" height="80" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1.5"/>
+          <text x="1163" y="296" text-anchor="middle" fill="#2ecc71"
+            font-size="12.5" font-weight="700" font-family="monospace">router.rs</text>
+          <text class="sl" x="1163" y="314" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">2,221 LOC · Trio dispatch</text>
+          <text class="sl" x="1163" y="330" text-anchor="middle" fill="#124028"
+            font-size="8.5" font-family="monospace">pattern / heuristic / LLM</text>
+          <rect x="1080" y="341" width="166" height="3" rx="1.5" fill="#061406"/>
+          <rect x="1080" y="341" width="96" height="3" rx="1.5" fill="#2ecc71" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-router-fallback"
+           data-name="router_fallback.rs" data-loc="351" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Deterministic fallback routing patterns. When LLM routing is too slow or uncertain, applies rule-based pattern matching to deterministically route tool calls without an LLM call."
+           data-deps="router.rs">
+          <rect class="mr" x="1072" y="362" width="182" height="52" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1163" y="383" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">router_fallback.rs</text>
+          <text class="sl" x="1163" y="400" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">351 LOC · Pattern fallback</text>
+        </g>
+
+        <g class="module-box" id="mod-tool-guard"
+           data-name="tool_guard.rs" data-loc="183" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Dedup/blocking guard. Prevents duplicate tool calls within a single iteration, enforces per-tool rate limits, and blocks disallowed tool call patterns."
+           data-deps="tool_runner.rs">
+          <rect class="mr" x="1072" y="426" width="182" height="52" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1163" y="447" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tool_guard.rs</text>
+          <text class="sl" x="1163" y="464" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">183 LOC · Dedup / block</text>
+        </g>
+
+        <g class="module-box" id="mod-tool-engine"
+           data-name="tool_engine.rs" data-loc="615" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Tool result analysis engine. Parses and validates raw tool call results, normalizes error representations, extracts structured data from text outputs, and packages results for the next LLM turn."
+           data-deps="tool_runner.rs">
+          <rect class="mr" x="1072" y="490" width="182" height="58" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1.5"/>
+          <text x="1163" y="514" text-anchor="middle" fill="#2ecc71"
+            font-size="12.5" font-weight="700" font-family="monospace">tool_engine.rs</text>
+          <text class="sl" x="1163" y="531" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">615 LOC · Result analysis</text>
+        </g>
+
+        <g class="module-box" id="mod-tool-runner"
+           data-name="tool_runner.rs" data-loc="3448" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Multi-step tool execution engine. Orchestrates the full tool call lifecycle: parse LLM tool_call JSON -> validate args -> dispatch to tool impl -> capture output -> format for next turn. Second largest active module — overlaps with tool_engine and may be a merge/split candidate."
+           data-deps="tools/registry.rs, tool_engine.rs, tool_guard.rs, audit.rs">
+          <rect class="mr" x="1072" y="560" width="182" height="95" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="2"/>
+          <text x="1163" y="588" text-anchor="middle" fill="#2ecc71"
+            font-size="12.5" font-weight="700" font-family="monospace">tool_runner.rs</text>
+          <text class="sl" x="1163" y="606" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">3,448 LOC</text>
+          <text class="sl" x="1163" y="623" text-anchor="middle" fill="#124028"
+            font-size="8.5" font-family="monospace">Multi-step execution</text>
+          <rect x="1080" y="640" width="166" height="4" rx="2" fill="#061406"/>
+          <rect x="1080" y="640" width="143" height="4" rx="2" fill="#2ecc71" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-tool-wiring"
+           data-name="tool_wiring.rs" data-loc="301" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Dynamic tool registry assembly. Wires tool implementations to the ToolRegistry based on runtime config and capability checks. Handles Arc-wrapping of stateful tools (MessageTool, SpawnTool, CronScheduleTool)."
+           data-deps="tools/registry.rs, agent_loop.rs">
+          <rect class="mr" x="1072" y="667" width="182" height="48" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1163" y="688" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tool_wiring.rs</text>
+          <text class="sl" x="1163" y="705" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">301 LOC · Registry wiring</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-registry"
+           data-name="tools/registry.rs" data-loc="234" data-group="Tool System" data-color="#2ecc71"
+           data-desc="ToolRegistry: maps tool name strings to Box&lt;dyn Tool&gt; implementations. Used by tool_runner to dispatch. Exposes OpenAI function-calling JSON schema for each registered tool."
+           data-deps="tools/base.rs">
+          <rect class="mr" x="1272" y="270" width="162" height="52" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="290" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/registry.rs</text>
+          <text class="sl" x="1353" y="307" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">234 LOC · Tool lookup</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-fs"
+           data-name="tools/filesystem.rs" data-loc="510" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Filesystem tools: read_file, write_file, list_directory, delete_file, search_files. The most commonly invoked tool family in typical agent sessions."
+           data-deps="tools/base.rs">
+          <rect class="mr" x="1272" y="334" width="162" height="52" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="354" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/filesystem.rs</text>
+          <text class="sl" x="1353" y="371" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">510 LOC · read/write/list</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-shell"
+           data-name="tools/shell.rs" data-loc="234" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Shell execution tool (execute_command). Runs commands via std::process::Command with configurable timeout and stdout/stderr capture."
+           data-deps="tools/base.rs">
+          <rect class="mr" x="1272" y="398" width="162" height="48" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="418" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/shell.rs</text>
+          <text class="sl" x="1353" y="435" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">234 LOC · exec</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-web"
+           data-name="tools/web.rs" data-loc="324" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Web tools: web_search (DuckDuckGo / SerpAPI) and web_fetch (Jina Reader integration for clean markdown content extraction from URLs)."
+           data-deps="tools/base.rs">
+          <rect class="mr" x="1272" y="458" width="162" height="48" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="478" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/web.rs</text>
+          <text class="sl" x="1353" y="495" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">324 LOC · search / Jina fetch</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-spawn"
+           data-name="tools/spawn.rs" data-loc="234" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Subagent spawning tool. Wraps subagent.rs as a Tool trait implementation. Allows the LLM to delegate sub-tasks to a new agent instance with its own context and tools."
+           data-deps="subagent.rs, tools/base.rs">
+          <rect class="mr" x="1272" y="518" width="162" height="48" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="538" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/spawn.rs</text>
+          <text class="sl" x="1353" y="555" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">234 LOC · Subagent spawn</text>
+        </g>
+
+        <g class="module-box" id="mod-tools-message"
+           data-name="tools/message.rs" data-loc="201" data-group="Tool System" data-color="#2ecc71"
+           data-desc="Channel messaging tool (send_message). Allows the agent to proactively send messages to chat channels as a tool call action, independent of receiving a user message."
+           data-deps="bus/events.rs, tools/base.rs">
+          <rect class="mr" x="1272" y="578" width="162" height="48" rx="5"
+            fill="#061406" stroke="#2ecc71" stroke-width="1"/>
+          <text x="1353" y="598" text-anchor="middle" fill="#2ecc71"
+            font-size="11" font-weight="700" font-family="monospace">tools/message.rs</text>
+          <text class="sl" x="1353" y="615" text-anchor="middle" fill="#1a6038"
+            font-size="9" font-family="monospace">201 LOC · send_message</text>
+        </g>
+
+        <!-- ===== PROVIDERS ===== -->
+
+        <g class="module-box" id="mod-openai"
+           data-name="openai_compat.rs" data-loc="2586" data-group="Providers" data-color="#9b59b6"
+           data-desc="Main LLM provider implementing the OpenAI-compatible chat completions API. Handles all non-native-Anthropic providers: OpenRouter, DeepSeek, Gemini, Groq, vLLM, OpenAI, and local LM Studio. Implements streaming via SSE."
+           data-deps="providers/base.rs, providers/retry.rs">
+          <rect class="mr" x="1464" y="44" width="240" height="88" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1.5"/>
+          <text x="1584" y="72" text-anchor="middle" fill="#9b59b6"
+            font-size="12.5" font-weight="700" font-family="monospace">openai_compat.rs</text>
+          <text class="sl" x="1584" y="90" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">2,586 LOC · Main provider</text>
+          <text class="sl" x="1584" y="107" text-anchor="middle" fill="#382050"
+            font-size="8.5" font-family="monospace">OpenRouter · DeepSeek · Gemini</text>
+          <text class="sl" x="1584" y="122" text-anchor="middle" fill="#382050"
+            font-size="8.5" font-family="monospace">Groq · vLLM · OpenAI · LM Studio</text>
+          <rect x="1472" y="124" width="224" height="3" rx="1.5" fill="#100820"/>
+          <rect x="1472" y="124" width="130" height="3" rx="1.5" fill="#9b59b6" opacity=".7"/>
+        </g>
+
+        <g class="module-box" id="mod-anthropic"
+           data-name="anthropic.rs" data-loc="1237" data-group="Providers" data-color="#9b59b6"
+           data-desc="Native Anthropic Messages API provider. Used for OAuth / Claude Max flows. Handles tool_use blocks, extended thinking blocks, and native streaming."
+           data-deps="providers/base.rs, providers/retry.rs, providers/oauth.rs">
+          <rect class="mr" x="1464" y="144" width="240" height="76" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1.5"/>
+          <text x="1584" y="169" text-anchor="middle" fill="#9b59b6"
+            font-size="12.5" font-weight="700" font-family="monospace">anthropic.rs</text>
+          <text class="sl" x="1584" y="187" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">1,237 LOC · Native Anthropic API</text>
+          <text class="sl" x="1584" y="204" text-anchor="middle" fill="#382050"
+            font-size="8.5" font-family="monospace">OAuth · Claude Max · thinking blocks</text>
+        </g>
+
+        <g class="module-box" id="mod-factory"
+           data-name="providers/factory.rs" data-loc="406" data-group="Providers" data-color="#9b59b6"
+           data-desc="Provider factory. Reads config and selects the active provider by API key priority: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM. Returns Box&lt;dyn Provider&gt;."
+           data-deps="openai_compat.rs, anthropic.rs, providers/base.rs">
+          <rect class="mr" x="1464" y="232" width="240" height="56" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1"/>
+          <text x="1584" y="256" text-anchor="middle" fill="#9b59b6"
+            font-size="11.5" font-weight="700" font-family="monospace">providers/factory.rs</text>
+          <text class="sl" x="1584" y="274" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">406 LOC · Provider selection</text>
+        </g>
+
+        <g class="module-box" id="mod-jit-gate"
+           data-name="jit_gate.rs" data-loc="198" data-group="Providers" data-color="#9b59b6"
+           data-desc="JIT health gate. Checks provider availability just-in-time before LLM calls. Falls back to alternative provider on failure. Prevents wasted retries against a known-down endpoint."
+           data-deps="providers/factory.rs, providers/base.rs">
+          <rect class="mr" x="1464" y="300" width="240" height="52" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1"/>
+          <text x="1584" y="321" text-anchor="middle" fill="#9b59b6"
+            font-size="11.5" font-weight="700" font-family="monospace">jit_gate.rs</text>
+          <text class="sl" x="1584" y="339" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">198 LOC · JIT health gate</text>
+        </g>
+
+        <g class="module-box" id="mod-retry"
+           data-name="providers/retry.rs" data-loc="81" data-group="Providers" data-color="#9b59b6"
+           data-desc="Exponential backoff retry wrapper. Handles HTTP 429 rate limits and transient 5xx errors from LLM APIs with configurable max attempts and jitter."
+           data-deps="providers/base.rs">
+          <rect class="mr" x="1464" y="364" width="240" height="48" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1"/>
+          <text x="1584" y="384" text-anchor="middle" fill="#9b59b6"
+            font-size="11.5" font-weight="700" font-family="monospace">providers/retry.rs</text>
+          <text class="sl" x="1584" y="401" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">81 LOC · Exponential backoff</text>
+        </g>
+
+        <g class="module-box" id="mod-transcription"
+           data-name="providers/transcription.rs" data-loc="320" data-group="Providers" data-color="#9b59b6"
+           data-desc="Audio transcription provider. Wraps Whisper-compatible transcription APIs for voice CLI commands."
+           data-deps="providers/base.rs">
+          <rect class="mr" x="1464" y="424" width="240" height="48" rx="5"
+            fill="#100820" stroke="#9b59b6" stroke-width="1"/>
+          <text x="1584" y="444" text-anchor="middle" fill="#9b59b6"
+            font-size="11.5" font-weight="700" font-family="monospace">providers/transcription.rs</text>
+          <text class="sl" x="1584" y="461" text-anchor="middle" fill="#50306a"
+            font-size="9" font-family="monospace">320 LOC · Whisper / speech</text>
+        </g>
+
+        <!-- External LLM APIs (dashed — external service) -->
+        <g class="module-box" id="mod-llm-api"
+           data-name="External LLM APIs" data-loc="0" data-group="External" data-color="#7a40a6"
+           data-desc="External LLM provider endpoints accessed over HTTPS. All supported backends: OpenAI, Anthropic, OpenRouter, DeepSeek, Google Gemini, Groq, and self-hosted vLLM / LM Studio."
+           data-deps="">
+          <rect class="mr" x="1730" y="195" width="150" height="145" rx="8"
+            fill="#0c0618" stroke="#5a2a8a" stroke-width="1.5" stroke-dasharray="6 3"/>
+          <text x="1805" y="244" text-anchor="middle" fill="#6a3a9a"
+            font-size="12" font-weight="700" font-family="monospace">External</text>
+          <text x="1805" y="263" text-anchor="middle" fill="#6a3a9a"
+            font-size="12" font-weight="700" font-family="monospace">LLM APIs</text>
+          <text class="sl" x="1805" y="288" text-anchor="middle" fill="#42206a"
+            font-size="8.5" font-family="monospace">OpenAI · Claude</text>
+          <text class="sl" x="1805" y="303" text-anchor="middle" fill="#42206a"
+            font-size="8.5" font-family="monospace">OpenRouter · DeepSeek</text>
+          <text class="sl" x="1805" y="318" text-anchor="middle" fill="#42206a"
+            font-size="8.5" font-family="monospace">Gemini · Groq · vLLM</text>
+        </g>
+
+        <!-- ===== SESSION ===== -->
+
+        <g class="module-box" id="mod-session"
+           data-name="session/manager.rs" data-loc="1064" data-group="Session" data-color="#e91e63"
+           data-desc="JSONL session persistence. Saves and loads full conversation history from ~/.nanobot/sessions/{session_id}.jsonl. Supports session listing with metadata, search by content, and full replay for context restoration."
+           data-deps="bus/events.rs">
+          <rect class="mr" x="612" y="752" width="210" height="74" rx="5"
+            fill="#180610" stroke="#e91e63" stroke-width="1.5"/>
+          <text x="717" y="778" text-anchor="middle" fill="#e91e63"
+            font-size="12.5" font-weight="700" font-family="monospace">session/manager.rs</text>
+          <text class="sl" x="717" y="796" text-anchor="middle" fill="#802050"
+            font-size="9" font-family="monospace">1,064 LOC</text>
+          <text class="sl" x="717" y="812" text-anchor="middle" fill="#601438"
+            font-size="8.5" font-family="monospace">~/.nanobot/sessions/*.jsonl</text>
+        </g>
+
+        <!-- ===== HEALTH AND OBSERVABILITY ===== -->
+
+        <g class="module-box" id="mod-health"
+           data-name="heartbeat/health.rs" data-loc="640" data-group="Health &amp; Observability" data-color="#e74c3c"
+           data-desc="Health probe implementations. Checks provider API reachability, session store read/write, and system resource usage. Results feed into the heartbeat service."
+           data-deps="providers, session/manager.rs">
+          <rect class="mr" x="840" y="752" width="178" height="68" rx="5"
+            fill="#160606" stroke="#e74c3c" stroke-width="1.5"/>
+          <text x="929" y="778" text-anchor="middle" fill="#e74c3c"
+            font-size="11.5" font-weight="700" font-family="monospace">heartbeat/health.rs</text>
+          <text class="sl" x="929" y="795" text-anchor="middle" fill="#882020"
+            font-size="9" font-family="monospace">640 LOC · Health probes</text>
+        </g>
+
+        <g class="module-box" id="mod-heartbeat"
+           data-name="heartbeat/service.rs" data-loc="381" data-group="Health &amp; Observability" data-color="#e74c3c"
+           data-desc="Heartbeat service. Runs periodic health checks on a configurable interval. Emits health status events to logs during long-running gateway sessions."
+           data-deps="heartbeat/health.rs">
+          <rect class="mr" x="840" y="830" width="178" height="52" rx="5"
+            fill="#160606" stroke="#e74c3c" stroke-width="1"/>
+          <text x="929" y="851" text-anchor="middle" fill="#e74c3c"
+            font-size="11.5" font-weight="700" font-family="monospace">heartbeat/service.rs</text>
+          <text class="sl" x="929" y="868" text-anchor="middle" fill="#882020"
+            font-size="9" font-family="monospace">381 LOC · Periodic checks</text>
+        </g>
+
+        <g class="module-box" id="mod-metrics"
+           data-name="metrics.rs" data-loc="212" data-group="Health &amp; Observability" data-color="#e74c3c"
+           data-desc="Per-request metrics collection. Records latency, token counts (prompt/completion), tool call counts, and error rates for each agent interaction."
+           data-deps="agent_loop.rs">
+          <rect class="mr" x="1034" y="752" width="172" height="56" rx="5"
+            fill="#160606" stroke="#e74c3c" stroke-width="1"/>
+          <text x="1120" y="774" text-anchor="middle" fill="#e74c3c"
+            font-size="11.5" font-weight="700" font-family="monospace">metrics.rs</text>
+          <text class="sl" x="1120" y="791" text-anchor="middle" fill="#882020"
+            font-size="9" font-family="monospace">212 LOC · Per-req metrics</text>
+        </g>
+
+        <g class="module-box" id="mod-audit"
+           data-name="audit.rs" data-loc="657" data-group="Health &amp; Observability" data-color="#e74c3c"
+           data-desc="Immutable tool call audit log. Records all tool calls with timestamps, caller identity, raw input arguments, and truncated output. Append-only for compliance and debugging."
+           data-deps="tool_runner.rs">
+          <rect class="mr" x="1034" y="818" width="172" height="56" rx="5"
+            fill="#160606" stroke="#e74c3c" stroke-width="1"/>
+          <text x="1120" y="840" text-anchor="middle" fill="#e74c3c"
+            font-size="11.5" font-weight="700" font-family="monospace">audit.rs</text>
+          <text class="sl" x="1120" y="857" text-anchor="middle" fill="#882020"
+            font-size="9" font-family="monospace">657 LOC · Tool audit trail</text>
+        </g>
+
+        <!-- ===== ARCHITECTURAL CONCERN CALLOUTS ===== -->
+
+        <!-- Red bang on agent_loop -->
+        <g filter="url(#glows)" pointer-events="none">
+          <rect x="1040" y="383" width="10" height="10" rx="2" fill="#cc2222"/>
+          <text x="1045" y="392" text-anchor="middle" fill="white"
+            font-size="7.5" font-weight="800" font-family="monospace">!</text>
+        </g>
+
+        <!-- Orange ? on tool_runner -->
+        <g filter="url(#glows)" pointer-events="none">
+          <rect x="1254" y="566" width="10" height="10" rx="2" fill="#cc6600"/>
+          <text x="1259" y="575" text-anchor="middle" fill="white"
+            font-size="7.5" font-weight="800" font-family="monospace">?</text>
+        </g>
+
+        <!-- Orange ? on router -->
+        <g filter="url(#glows)" pointer-events="none">
+          <rect x="1254" y="276" width="10" height="10" rx="2" fill="#cc6600"/>
+          <text x="1259" y="285" text-anchor="middle" fill="white"
+            font-size="7.5" font-weight="800" font-family="monospace">?</text>
+        </g>
+
+        <!-- Orange ? on config schema -->
+        <g filter="url(#glows)" pointer-events="none">
+          <rect x="1254" y="50" width="10" height="10" rx="2" fill="#cc6600"/>
+          <text x="1259" y="59" text-anchor="middle" fill="white"
+            font-size="7.5" font-weight="800" font-family="monospace">?</text>
+        </g>
+
+      </g><!-- /modules-layer -->
+
+      <!-- ============================================================
+           ANNOTATION CALLOUT BOXES
+           ============================================================ -->
+      <g pointer-events="none">
+
+        <rect x="928" y="503" width="110" height="30" rx="3"
+          fill="rgba(22,0,0,.9)" stroke="#cc2222" stroke-width="1"/>
+        <text x="983" y="516" text-anchor="middle" fill="#ff5555"
+          font-size="8.5" font-family="monospace">* God Object</text>
+        <text x="983" y="528" text-anchor="middle" fill="#992222"
+          font-size="8" font-family="monospace">52% of agent/ LOC</text>
+
+        <rect x="1264" y="658" width="160" height="30" rx="3"
+          fill="rgba(18,14,0,.9)" stroke="#cc6600" stroke-width="1"/>
+        <text x="1344" y="670" text-anchor="middle" fill="#ffaa44"
+          font-size="8.5" font-family="monospace">Merge candidate?</text>
+        <text x="1344" y="682" text-anchor="middle" fill="#996600"
+          font-size="8" font-family="monospace">runner + engine overlap</text>
+
+        <rect x="1264" y="288" width="160" height="30" rx="3"
+          fill="rgba(18,14,0,.9)" stroke="#cc6600" stroke-width="1"/>
+        <text x="1344" y="300" text-anchor="middle" fill="#ffaa44"
+          font-size="8.5" font-family="monospace">3 routing paths</text>
+        <text x="1344" y="312" text-anchor="middle" fill="#996600"
+          font-size="8" font-family="monospace">simplification opp.</text>
+
+        <rect x="1264" y="60" width="160" height="30" rx="3"
+          fill="rgba(14,14,10,.9)" stroke="#cc6600" stroke-width="1"/>
+        <text x="1344" y="72" text-anchor="middle" fill="#ffaa44"
+          font-size="8.5" font-family="monospace">90+ fields · needs split</text>
+        <text x="1344" y="84" text-anchor="middle" fill="#996600"
+          font-size="8" font-family="monospace">18 delegation fields alone</text>
+
+      </g>
+
+    </svg><!-- /svg-root -->
+
+    <!-- Stats panel -->
+    <div id="stats-panel">
+      <h3>Codebase Stats</h3>
+      <div class="stat-row"><span>Shown modules</span><span class="stat-val">~46</span></div>
+      <div class="stat-row"><span>Approx total LOC</span><span class="stat-val">~46,000</span></div>
+      <div class="stat-row"><span>Largest active module</span><span class="stat-warn">agent_loop (4,874)</span></div>
+      <div class="stat-row"><span>2nd largest active</span><span class="stat-warn">tool_runner (3,448)</span></div>
+      <div class="stat-row"><span>repl/ subsystem</span><span class="stat-val">6,570 total</span></div>
+      <div class="stat-row"><span>Dead code LOC</span><span class="stat-warn">2,414</span></div>
+      <div class="stat-row"><span>Provider backends</span><span class="stat-val">8</span></div>
+      <div class="stat-row"><span>Channel adapters</span><span class="stat-val">4</span></div>
+      <div class="stat-row"><span>Tool impls</span><span class="stat-val">10+</span></div>
+    </div>
+
+    <!-- Legend -->
+    <div id="legend">
+      <div class="legend-col">
+        <h4>Module Groups</h4>
+        <div class="legend-item"><div class="legend-dot" style="background:#4a9eff"></div>Entry Points</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ff6b35"></div>Agent Core</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#2ecc71"></div>Tool System</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#9b59b6"></div>Providers</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#00bcd4"></div>Channels</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#f1c40f"></div>Context &amp; Memory</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#e91e63"></div>Session</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#e74c3c"></div>Health</div>
+        <div class="legend-item"><div class="legend-dot dead" style="background:#1a1a1a"></div>Dead Code</div>
+      </div>
+      <div class="legend-col">
+        <h4>Data Flows</h4>
+        <div class="legend-item"><div class="legend-line" style="background:rgba(255,255,255,.7)"></div>Message flow</div>
+        <div class="legend-item"><div class="legend-line" style="background:#9b59b6"></div>LLM call</div>
+        <div class="legend-item"><div class="legend-line" style="background:#2ecc71"></div>Tool execution</div>
+        <div class="legend-item"><div class="legend-line" style="background:#f1c40f"></div>Context assembly</div>
+        <div class="legend-item"><div class="legend-line" style="background:#e91e63"></div>Session persist</div>
+        <div class="legend-item"><div class="legend-line" style="background:#ff6b35"></div>Compaction</div>
+      </div>
+      <div class="legend-col">
+        <h4>Callouts</h4>
+        <div class="legend-item">
+          <div style="width:13px;height:13px;background:#cc2222;border-radius:2px;flex-shrink:0;
+               display:flex;align-items:center;justify-content:center;
+               font-size:8px;color:white;font-weight:800;font-family:monospace">!</div>
+          Critical concern
+        </div>
+        <div class="legend-item">
+          <div style="width:13px;height:13px;background:#cc6600;border-radius:2px;flex-shrink:0;
+               display:flex;align-items:center;justify-content:center;
+               font-size:8px;color:white;font-weight:800;font-family:monospace">?</div>
+          Simplification opp.
+        </div>
+        <div class="legend-item">
+          <div style="width:13px;height:13px;display:flex;align-items:center;
+               justify-content:center;font-size:12px;flex-shrink:0">&#9760;</div>
+          Unused / dead code
+        </div>
+        <div class="legend-item" style="margin-top:4px">
+          <em style="font-size:9px;color:#4a4a80">Scroll to zoom · Drag to pan</em>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /canvas-wrap -->
+
+  <!-- Info panel -->
+  <div id="info-panel" class="hidden">
+    <div id="info-header">
+      <span id="info-title">Module Details</span>
+      <button id="info-close">x</button>
+    </div>
+    <div id="info-body">
+      <div class="info-section">
+        <div class="info-label">Module</div>
+        <div class="info-name" id="detail-name">—</div>
+      </div>
+      <div class="info-section">
+        <div class="info-label">Group</div>
+        <span class="info-badge" id="detail-group">—</span>
+      </div>
+      <div class="info-section">
+        <div class="info-label">Lines of Code</div>
+        <div class="info-value" id="detail-loc">—</div>
+        <div class="loc-bar-wrap">
+          <div class="loc-bar-fill" id="detail-loc-bar" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="info-section">
+        <div class="info-label">Description</div>
+        <div class="info-value" id="detail-desc">—</div>
+      </div>
+      <div class="info-section">
+        <div class="info-label">Key Dependencies</div>
+        <div class="dep-list" id="detail-deps"></div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<div id="tooltip"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // State
+  var scale = 1, tx = 0, ty = 0;
+  var dragging = false, dx0 = 0, dy0 = 0, txD = 0, tyD = 0;
+  var activeId = null;
+  var flowsOn = true, labelsOn = true, deadOn = false;
+
+  // Elements
+  var wrap    = document.getElementById('canvas-wrap');
+  var svg     = document.getElementById('svg-root');
+  var iPanel  = document.getElementById('info-panel');
+  var iClose  = document.getElementById('info-close');
+  var dName   = document.getElementById('detail-name');
+  var dGrp    = document.getElementById('detail-group');
+  var dLoc    = document.getElementById('detail-loc');
+  var dLocBar = document.getElementById('detail-loc-bar');
+  var dDesc   = document.getElementById('detail-desc');
+  var dDeps   = document.getElementById('detail-deps');
+  var tip     = document.getElementById('tooltip');
+  var flows   = document.getElementById('flows-layer');
+
+  var MAX_LOC = 5200;
+
+  function xform() {
+    svg.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
+  }
+
+  // Zoom
+  wrap.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var r = wrap.getBoundingClientRect();
+    var mx = e.clientX - r.left, my = e.clientY - r.top;
+    var f = e.deltaY > 0 ? 0.88 : 1.14;
+    var ns = Math.min(Math.max(scale * f, 0.22), 5.5);
+    tx = mx - (mx - tx) * (ns / scale);
+    ty = my - (my - ty) * (ns / scale);
+    scale = ns;
+    xform();
+  }, { passive: false });
+
+  // Pan
+  wrap.addEventListener('mousedown', function (e) {
+    if (e.target.closest('.module-box') || e.target.closest('.flow-path')) return;
+    dragging = true; dx0 = e.clientX; dy0 = e.clientY; txD = tx; tyD = ty;
+    wrap.classList.add('grabbing');
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    tx = txD + (e.clientX - dx0); ty = tyD + (e.clientY - dy0); xform();
+  });
+  document.addEventListener('mouseup', function () {
+    dragging = false; wrap.classList.remove('grabbing');
+  });
+
+  // Module interaction
+  var allMods  = Array.from(document.querySelectorAll('.module-box'));
+  var allFlows = Array.from(document.querySelectorAll('.flow-path'));
+
+  function dimAll() {
+    allMods.forEach(function (m) { m.classList.remove('selected'); m.classList.add('dimmed'); });
+  }
+  function undimAll() {
+    allMods.forEach(function (m) { m.classList.remove('selected', 'dimmed'); });
+  }
+  function selectOnly(id) {
+    allMods.forEach(function (m) {
+      if (m.id === id) { m.classList.add('selected'); m.classList.remove('dimmed'); }
+      else             { m.classList.remove('selected'); m.classList.add('dimmed'); }
+    });
+  }
+
+  function showInfo(mod) {
+    var name  = mod.dataset.name  || '—';
+    var loc   = parseInt(mod.dataset.loc) || 0;
+    var grp   = mod.dataset.group || '—';
+    var color = mod.dataset.color || '#888';
+    var desc  = mod.dataset.desc  || '';
+    var deps  = mod.dataset.deps  || '';
+
+    dName.textContent = name;
+    dGrp.textContent  = grp;
+    dGrp.style.cssText = 'background:' + color + '22;color:' + color + ';border:1px solid ' + color + '55';
+    dLoc.textContent  = loc > 0 ? loc.toLocaleString() + ' lines' : 'External service';
+    dLocBar.style.width      = loc > 0 ? Math.min(100, loc / MAX_LOC * 100) + '%' : '0%';
+    dLocBar.style.background = color;
+    dDesc.textContent = desc;
+
+    dDeps.innerHTML = '';
+    var list = deps.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (list.length) {
+      list.forEach(function (d) {
+        var el = document.createElement('div');
+        el.className = 'dep-item'; el.textContent = d;
+        dDeps.appendChild(el);
+      });
+    } else {
+      dDeps.innerHTML = '<div class="dep-item" style="color:#303050;border:none">None listed</div>';
+    }
+
+    iPanel.classList.remove('hidden');
+  }
+
+  allMods.forEach(function (mod) {
+    mod.addEventListener('click', function (e) {
+      e.stopPropagation();
+      activeId = mod.id;
+      selectOnly(mod.id);
+      showInfo(mod);
+    });
+    mod.addEventListener('mouseenter', function () {
+      if (!activeId) { dimAll(); mod.classList.remove('dimmed'); }
+    });
+    mod.addEventListener('mouseleave', function () {
+      if (!activeId) undimAll();
+    });
+  });
+
+  svg.addEventListener('click', function (e) {
+    if (!e.target.closest('.module-box') && !e.target.closest('.flow-path')) {
+      activeId = null; undimAll(); iPanel.classList.add('hidden');
+    }
+  });
+
+  iClose.addEventListener('click', function () {
+    activeId = null; undimAll(); iPanel.classList.add('hidden');
+  });
+
+  // Flow tooltips
+  allFlows.forEach(function (f) {
+    f.addEventListener('mouseenter', function (e) {
+      tip.innerHTML = '<strong>' + (f.dataset.flow || '') + '</strong>' + (f.dataset.desc || '');
+      tip.classList.add('visible');
+      moveTip(e);
+    });
+    f.addEventListener('mousemove', moveTip);
+    f.addEventListener('mouseleave', function () { tip.classList.remove('visible'); });
+  });
+
+  function moveTip(e) {
+    tip.style.left = Math.min(e.clientX + 16, window.innerWidth  - 275) + 'px';
+    tip.style.top  = Math.min(e.clientY - 10, window.innerHeight -  80) + 'px';
+  }
+
+  // Controls
+  document.getElementById('btn-reset').addEventListener('click', function () {
+    scale = 1; tx = 0; ty = 0; xform();
+  });
+
+  document.getElementById('btn-flows').addEventListener('click', function () {
+    flowsOn = !flowsOn;
+    flows.style.display = flowsOn ? '' : 'none';
+    this.textContent = flowsOn ? 'Hide Flows' : 'Show Flows';
+  });
+
+  document.getElementById('btn-labels').addEventListener('click', function () {
+    labelsOn = !labelsOn;
+    svg.classList.toggle('labels-off', !labelsOn);
+    this.textContent = labelsOn ? 'Hide Labels' : 'Show Labels';
+  });
+
+  var deadIds = ['mod-lora', 'mod-step-voter', 'mod-knowledge', 'mod-confidence'];
+
+  document.getElementById('btn-dead').addEventListener('click', function () {
+    deadOn = !deadOn;
+    this.classList.toggle('active-btn', deadOn);
+    if (deadOn) {
+      activeId = null;
+      allMods.forEach(function (m) {
+        if (deadIds.indexOf(m.id) >= 0) {
+          m.classList.remove('dimmed');
+          var r = m.querySelector('.mr');
+          if (r) { r.style.stroke = '#ff4444'; r.style.strokeWidth = '2.5'; }
+        } else {
+          m.classList.add('dimmed');
+        }
+      });
+    } else {
+      allMods.forEach(function (m) {
+        m.classList.remove('dimmed');
+        if (deadIds.indexOf(m.id) >= 0) {
+          var r = m.querySelector('.mr');
+          if (r) { r.style.stroke = ''; r.style.strokeWidth = ''; }
+        }
+      });
+    }
+  });
+
+  xform();
+})();
+</script>
+</body>
+</html>

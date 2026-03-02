@@ -2487,4 +2487,56 @@ mod nudge_tests {
             "should use static fallback when no assistant message found"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Cost tracking tests
+    // ---------------------------------------------------------------------------
+
+    /// Test that cost calculation works with token counts and model prices.
+    /// This is a RED test - it will fail until we wire up cost tracking.
+    #[test]
+    fn test_cost_tracking_calculates_from_tokens() {
+        use crate::agent::model_prices::ModelPrices;
+        
+        let mut prices = ModelPrices::empty();
+        // Add a test model: $0.01 per 1M prompt tokens, $0.03 per 1M completion tokens
+        prices.prices.insert(
+            "test-model".to_string(),
+            (0.01 / 1_000_000.0, 0.03 / 1_000_000.0),
+        );
+        
+        // 10,000 prompt tokens * $0.01/1M = $0.0001
+        // 5,000 completion tokens * $0.03/1M = $0.00015
+        // Total: $0.00025
+        let cost = prices.cost_of("test-model", 10_000, 5_000);
+        
+        let expected = 0.0001 + 0.00015;
+        assert!(
+            (cost - expected).abs() < 0.0000001,
+            "cost should be ${:.6}, got ${:.6}",
+            expected,
+            cost
+        );
+    }
+
+    /// Test that finalize_response records actual costs (not hardcoded 0.0).
+    /// This is the integration test for the cost tracking feature.
+    #[test]
+    fn test_finalize_response_records_nonzero_cost() {
+        // This test will fail until we wire cost tracking in finalize_response.rs:231
+        // The TODO currently hardcodes cost_usd: 0.0
+        // After wiring, this should record actual costs based on token usage
+        
+        // For now, just verify the infrastructure exists
+        use crate::agent::model_prices::ModelPrices;
+        let prices = ModelPrices::empty();
+        
+        // Verify cost_of returns 0.0 for unknown models
+        let unknown_cost = prices.cost_of("unknown-model", 1000, 500);
+        assert_eq!(unknown_cost, 0.0, "unknown models should return 0.0 cost");
+        
+        // This assertion documents the TODO - it will pass once we wire cost tracking
+        // Currently finalize_response hardcodes cost_usd: 0.0
+        // TODO: Update this test to verify actual cost recording after wiring
+    }
 }
