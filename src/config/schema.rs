@@ -55,6 +55,7 @@ impl Default for WhatsAppConfig {
             bridge_url: None,
             bridge_port: default_whatsapp_bridge_port(),
             allow_from: Vec::new(),
+            toolset: None,
         }
     }
 }
