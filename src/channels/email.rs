@@ -754,6 +754,7 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
+            toolset: None,
         };
         // chat_id with prefix: recipient should be "recv@example.com"
         let msg = OutboundMessage::new("email", "email:recv@example.com", "body");
