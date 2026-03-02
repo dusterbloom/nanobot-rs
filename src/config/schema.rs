@@ -68,6 +68,9 @@ pub struct TelegramConfig {
     pub allow_from: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// Optional toolset name from `tools.toolsets` to restrict available tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
 }
 
 impl Default for TelegramConfig {
@@ -77,6 +80,7 @@ impl Default for TelegramConfig {
             token: String::new(),
             allow_from: Vec::new(),
             proxy: None,
+            toolset: None,
         }
     }
 }
