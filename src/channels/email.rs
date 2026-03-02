@@ -710,6 +710,7 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
+            toolset: None,
         };
         let msg = OutboundMessage::new("email", "email:test@example.com", "body");
         let result = send_email(&config, &msg).await;
