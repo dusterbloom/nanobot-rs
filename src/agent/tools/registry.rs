@@ -1711,4 +1711,129 @@ mod tests {
 
         assert!(!names.contains(&"unavailable_test".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // resolve_toolset tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_builtin_core() {
+        let result = resolve_toolset("core", &HashMap::new(), &[]).unwrap();
+        assert!(result.contains(&"read_file".to_string()));
+        assert!(result.contains(&"exec".to_string()));
+        assert!(result.contains(&"write_file".to_string()));
+        assert!(result.contains(&"edit_file".to_string()));
+        assert!(result.contains(&"list_dir".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_builtin_web() {
+        let result = resolve_toolset("web", &HashMap::new(), &[]).unwrap();
+        assert!(result.contains(&"web_search".to_string()));
+        assert!(result.contains(&"web_fetch".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_builtin_memory() {
+        let result = resolve_toolset("memory", &HashMap::new(), &[]).unwrap();
+        assert!(result.contains(&"recall".to_string()));
+        assert!(result.contains(&"remember".to_string()));
+        assert!(result.contains(&"read_skill".to_string()));
+        assert!(result.contains(&"session_search".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_builtin_read_only() {
+        let result = resolve_toolset("read_only", &HashMap::new(), &[]).unwrap();
+        assert!(result.contains(&"read_file".to_string()));
+        assert!(result.contains(&"list_dir".to_string()));
+        assert!(result.contains(&"web_search".to_string()));
+        // write/exec not included
+        assert!(!result.contains(&"write_file".to_string()));
+        assert!(!result.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_custom_set() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "my_set".to_string(),
+            vec!["read_file".to_string(), "web_search".to_string()],
+        );
+        let result = resolve_toolset("my_set", &custom, &[]).unwrap();
+        assert_eq!(result, vec!["read_file", "web_search"]);
+    }
+
+    #[test]
+    fn test_resolve_at_ref() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "telegram".to_string(),
+            vec![
+                "@core".to_string(),
+                "@web".to_string(),
+                "recall".to_string(),
+            ],
+        );
+        let result = resolve_toolset("telegram", &custom, &[]).unwrap();
+        assert!(result.contains(&"read_file".to_string())); // from @core
+        assert!(result.contains(&"web_search".to_string())); // from @web
+        assert!(result.contains(&"recall".to_string())); // direct
+    }
+
+    #[test]
+    fn test_resolve_dedup() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "both".to_string(),
+            vec!["@core".to_string(), "read_file".to_string()],
+        );
+        let result = resolve_toolset("both", &custom, &[]).unwrap();
+        // read_file should appear only once
+        assert_eq!(
+            result.iter().filter(|t| t.as_str() == "read_file").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_resolve_cycle_detection() {
+        let mut custom = HashMap::new();
+        custom.insert("a".to_string(), vec!["@b".to_string()]);
+        custom.insert("b".to_string(), vec!["@a".to_string()]);
+        let result = resolve_toolset("a", &custom, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Cycle"));
+    }
+
+    #[test]
+    fn test_resolve_unknown_set() {
+        let result = resolve_toolset("nonexistent", &HashMap::new(), &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown toolset"));
+    }
+
+    #[test]
+    fn test_resolve_custom_overrides_builtin() {
+        // A custom set with the same name as a builtin should shadow it.
+        let mut custom = HashMap::new();
+        custom.insert("core".to_string(), vec!["only_this_tool".to_string()]);
+        let result = resolve_toolset("core", &custom, &[]).unwrap();
+        assert_eq!(result, vec!["only_this_tool"]);
+    }
+
+    #[test]
+    fn test_resolve_nested_at_refs() {
+        // Custom set referencing another custom set via @
+        let mut custom = HashMap::new();
+        custom.insert(
+            "base".to_string(),
+            vec!["tool_a".to_string(), "tool_b".to_string()],
+        );
+        custom.insert("extended".to_string(), vec!["@base".to_string(), "tool_c".to_string()]);
+        let result = resolve_toolset("extended", &custom, &[]).unwrap();
+        assert!(result.contains(&"tool_a".to_string()));
+        assert!(result.contains(&"tool_b".to_string()));
+        assert!(result.contains(&"tool_c".to_string()));
+    }
 }
