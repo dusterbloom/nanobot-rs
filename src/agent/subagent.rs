@@ -933,15 +933,16 @@ impl SubagentManager {
             ))
             .unwrap_or(4096);
 
-        let tool_defs = tools.get_definitions();
-        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-            None
+        let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tool_defs = if is_local {
+            tools.get_local_definitions(&messages, &used_tools)
         } else {
-            Some(&tool_defs)
+            tools.get_definitions()
         };
 
         let mut final_content = String::new();
         let mut taint_state = crate::agent::taint::TaintState::new();
+        let mut tools_invoked: u32 = 0;
 
         for iteration in 0..config.max_iterations {
             debug!(
@@ -950,6 +951,16 @@ impl SubagentManager {
                 iteration + 1,
                 config.max_iterations
             );
+
+            // Refresh tool definitions for local models as used_tools may have expanded.
+            if is_local && iteration > 0 {
+                tool_defs = tools.get_local_definitions(&messages, &used_tools);
+            }
+            let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+                None
+            } else {
+                Some(&tool_defs)
+            };
 
             if let Some(ctx_limit) = local_ctx_limit {
                 let tool_def_tokens = tool_defs_opt
@@ -1035,6 +1046,11 @@ impl SubagentManager {
             if crate::agent::tool_runner::process_tool_response(
                 &response, &mut messages, &tools,
             ).await {
+                // Track invocation count and expand used_tools for local definition refresh.
+                tools_invoked += response.tool_calls.len() as u32;
+                for tc in &response.tool_calls {
+                    used_tools.insert(tc.name.clone());
+                }
                 // Taint tracking: check sensitive tools before marking new taint sources.
                 for tc in &response.tool_calls {
                     if let Some(_spans) = taint_state.check_sensitive(&tc.name) {
@@ -1055,6 +1071,20 @@ impl SubagentManager {
                     &response.content.unwrap_or_default(),
                 );
                 break;
+            }
+        }
+
+        if tools_invoked == 0 && !tool_defs.is_empty() {
+            warn!(
+                "Subagent {} completed with 0 tool invocations despite {} tools available — possible hallucinated tool use",
+                task_id,
+                tool_defs.len()
+            );
+            if !final_content.is_empty() {
+                final_content = format!(
+                    "[Warning: subagent produced this response without invoking any tools]\n\n{}",
+                    final_content
+                );
             }
         }
 
@@ -1443,7 +1473,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, "Immediate answer.");
+        // The subagent answered immediately without calling any tools.  Our
+        // post-loop guard prepends a warning when tools were available but
+        // none were invoked (hallucinated-tool-use detection).
+        assert!(
+            result.contains("Immediate answer."),
+            "Result should contain the original content, got: {result}"
+        );
+        assert!(
+            result.starts_with("[Warning: subagent produced this response without invoking any tools]"),
+            "Result should carry the zero-invocation warning, got: {result}"
+        );
     }
 
     #[tokio::test]

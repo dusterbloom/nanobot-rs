@@ -61,7 +61,6 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
             target: "researcher".to_string(),
             args: json!({
                 "task": "Fetch latest news and summarize key points",
-                "model": "local",
             }),
             confidence: 0.4,
             idempotency_key: "fallback:spawn_local_news".to_string(),
