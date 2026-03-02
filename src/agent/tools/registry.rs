@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, RememberTool,
     SessionSearchTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
@@ -302,6 +302,9 @@ impl ToolRegistry {
         if should_include("recall") {
             self.register(Box::new(RecallTool::new(&config.workspace)));
         }
+        if should_include("remember") {
+            self.register(Box::new(RememberTool::new(config.workspace.clone())));
+        }
         if should_include("read_skill") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
         }
@@ -440,7 +443,6 @@ impl ToolRegistry {
         (
             &[
                 "recall",
-                "remember",
                 "memory",
                 "past",
                 "previous",
@@ -448,6 +450,10 @@ impl ToolRegistry {
                 "last time",
             ],
             "recall",
+        ),
+        (
+            &["remember", "save", "store", "note this"],
+            "remember",
         ),
         (
             &["skill", "capability", "how to", "technique", "method"],

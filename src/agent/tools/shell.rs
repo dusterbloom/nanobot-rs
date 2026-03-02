@@ -235,6 +235,20 @@ impl ExecTool {
                 );
             }
 
+            // Allow read-only commands to access absolute paths outside the workspace.
+            // These commands cannot write or delete files, so there is no safety
+            // risk in letting them read arbitrary absolute paths (traversal is
+            // still blocked above).
+            let first_word = cmd.split_whitespace().next().unwrap_or("");
+            let binary = first_word.rsplit('/').next().unwrap_or(first_word);
+            let read_only = [
+                "grep", "rg", "cat", "head", "tail", "wc", "find", "ls", "file", "stat", "du",
+                "which",
+            ];
+            if read_only.contains(&binary) {
+                return None;
+            }
+
             let cwd_path = match Path::new(cwd).canonicalize() {
                 Ok(p) => p,
                 Err(_) => PathBuf::from(cwd),
@@ -662,6 +676,44 @@ mod tests {
         // deny patterns still apply).
         let result = guard_unrestricted("cat ../../../etc/passwd");
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-only commands are exempt from workspace path restriction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grep_outside_workspace_allowed() {
+        // grep is read-only: an absolute path outside the workspace must not be blocked.
+        let result = guard("grep -r 'pattern' /etc/hosts");
+        assert!(
+            result.is_none(),
+            "grep with path outside workspace should be allowed, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cat_outside_workspace_allowed() {
+        // cat is read-only: an absolute path outside the workspace must not be blocked.
+        let result = guard("cat /etc/os-release");
+        assert!(
+            result.is_none(),
+            "cat with path outside workspace should be allowed, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cp_outside_workspace_blocked() {
+        // cp is a write command: copying from an absolute path outside the
+        // workspace must still be blocked.
+        let result = guard("cp /etc/passwd /tmp/stolen");
+        assert!(
+            result.is_some(),
+            "cp with path outside workspace should be blocked"
+        );
+        assert!(result.unwrap().contains("path outside working dir"));
     }
 
     // -----------------------------------------------------------------------

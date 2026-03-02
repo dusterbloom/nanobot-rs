@@ -307,7 +307,7 @@ fn default_max_tool_result_chars() -> usize {
 }
 
 fn default_max_continuations() -> u32 {
-    2
+    4
 }
 
 fn default_lms_port() -> u16 {
@@ -967,7 +967,7 @@ pub struct MemoryConfig {
     #[serde(default = "default_working_memory_budget")]
     pub working_memory_budget: usize,
 
-    /// Token threshold to trigger reflection (default: 20000).
+    /// Token threshold to trigger reflection (default: 5000).
     #[serde(default = "default_reflection_threshold")]
     pub reflection_threshold: usize,
 
@@ -1063,7 +1063,7 @@ fn default_max_history_turns() -> usize {
 }
 
 fn default_reflection_threshold() -> usize {
-    20000
+    5000
 }
 
 impl Default for MemoryConfig {
@@ -2844,5 +2844,12 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.trio.circuit_breaker.threshold, 5);
         assert_eq!(cfg.trio.circuit_breaker.cooldown_secs, 600);
+    }
+
+    #[test]
+    fn test_default_max_continuations() {
+        assert_eq!(default_max_continuations(), 4);
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.defaults.max_continuations, 4);
     }
 }

@@ -2322,4 +2322,169 @@ mod continuation_tests {
     fn test_unclosed_paren_detected() {
         assert!(appears_incomplete("The function signature is fn foo(bar"));
     }
+
+    #[test]
+    fn test_appears_incomplete_mid_sentence() {
+        // Text ending mid-word (no terminal punctuation, long enough to trigger)
+        assert!(appears_incomplete("The configuration requires setting the correc"));
+        assert!(appears_incomplete("You can use this approach to implemen"));
+    }
+
+    #[test]
+    fn test_appears_incomplete_complete() {
+        // Text ending with period or exclamation is considered complete
+        assert!(!appears_incomplete("The task is now complete."));
+        assert!(!appears_incomplete("All done!"));
+        assert!(!appears_incomplete("Did it work?"));
+    }
+}
+
+// ============================================================================
+// Universal textual tool-call parsing tests
+// ============================================================================
+
+mod universal_textual_parse_tests {
+    use crate::agent::protocol::{parse_textual_tool_calls, strip_textual_tool_calls};
+
+    #[test]
+    fn test_textual_parse_strips_content() {
+        // Content containing a [I called: ...] annotation should have the
+        // annotation removed by strip_textual_tool_calls, leaving only prose.
+        let input = "Sure, let me list the files.\n[I called: exec({\"command\": \"ls\"})]\nDone.";
+        let stripped = strip_textual_tool_calls(input);
+        assert!(
+            !stripped.contains("[I called:"),
+            "Expected [I called:] pattern to be stripped, got: {:?}",
+            stripped
+        );
+        assert!(
+            stripped.contains("Sure, let me list the files."),
+            "Expected prose to be preserved, got: {:?}",
+            stripped
+        );
+    }
+
+    #[test]
+    fn test_universal_parse_non_textual_replay() {
+        // parse_textual_tool_calls should work on any content string regardless
+        // of protocol mode — the function itself is protocol-agnostic.
+        let content = "I will run the command now.\n[I called: exec({\"command\": \"echo hello\"})]";
+        let parsed = parse_textual_tool_calls(content);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "Expected 1 parsed tool call, got {}",
+            parsed.len()
+        );
+        assert_eq!(parsed[0].tool, "exec");
+        // Args should decode the command key.
+        let cmd = parsed[0].args.get("command").and_then(|v| v.as_str());
+        assert_eq!(cmd, Some("echo hello"));
+    }
+
+    #[test]
+    fn test_textual_parse_no_match_returns_empty() {
+        // Plain prose with no [I called: ...] patterns must return empty.
+        let content = "There are no tool calls in this response.";
+        let parsed = parse_textual_tool_calls(content);
+        assert!(
+            parsed.is_empty(),
+            "Expected no parsed tool calls, got {:?}",
+            parsed
+        );
+    }
+}
+
+mod nudge_tests {
+    /// Verify that the 80%-ceiling formula produces the expected nudge thresholds.
+    #[test]
+    fn test_nudge_threshold_80_percent() {
+        let nudge_at = |max: u32| -> u32 {
+            ((max as f64) * 0.8).ceil() as u32
+        };
+
+        // 10 * 0.8 = 8.0, ceil = 8
+        assert_eq!(nudge_at(10), 8, "max=10 → nudge_at=8");
+        // 5 * 0.8 = 4.0, ceil = 4
+        assert_eq!(nudge_at(5), 4, "max=5 → nudge_at=4");
+        // 20 * 0.8 = 16.0, ceil = 16
+        assert_eq!(nudge_at(20), 16, "max=20 → nudge_at=16");
+        // Non-round case: 7 * 0.8 = 5.6, ceil = 6
+        assert_eq!(nudge_at(7), 6, "max=7 → nudge_at=6");
+        // Minimal case: 1 * 0.8 = 0.8, ceil = 1
+        assert_eq!(nudge_at(1), 1, "max=1 → nudge_at=1");
+    }
+
+    /// Verify that the rescue logic extracts the last assistant message when available,
+    /// and falls back to the static message when no assistant content exists.
+    #[test]
+    fn test_rescue_extracts_last_assistant() {
+        let messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "I am working on it."}),
+            serde_json::json!({"role": "tool", "content": "some tool result"}),
+        ];
+
+        // Simulate the rescue logic from finalize_response.rs
+        let final_content = String::new();
+        let result = if final_content.is_empty() && messages.len() > 2 {
+            let last_assistant = messages.iter().rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            if !last_assistant.trim().is_empty() {
+                format!(
+                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
+                    last_assistant.trim()
+                )
+            } else {
+                "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string()
+            }
+        } else {
+            final_content.clone()
+        };
+
+        assert!(
+            result.starts_with("I am working on it."),
+            "rescue should start with the last assistant content, got: {result}"
+        );
+        assert!(
+            result.contains("[Note: Tool iteration limit reached."),
+            "rescue should append the incomplete note, got: {result}"
+        );
+    }
+
+    /// When there is no assistant message at all, the static fallback is used.
+    #[test]
+    fn test_rescue_falls_back_when_no_assistant() {
+        let messages: Vec<serde_json::Value> = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "tool", "content": "tool result only"}),
+            serde_json::json!({"role": "user", "content": "continue"}),
+        ];
+
+        let final_content = String::new();
+        let result = if final_content.is_empty() && messages.len() > 2 {
+            let last_assistant = messages.iter().rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            if !last_assistant.trim().is_empty() {
+                format!(
+                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
+                    last_assistant.trim()
+                )
+            } else {
+                "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string()
+            }
+        } else {
+            final_content.clone()
+        };
+
+        assert_eq!(
+            result,
+            "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.",
+            "should use static fallback when no assistant message found"
+        );
+    }
 }

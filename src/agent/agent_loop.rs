@@ -343,11 +343,33 @@ impl AgentLoopShared {
         // `iteration` counts only "real" (non-validation-retry) iterations so
         // that format-correction retries don't eat into the main budget.
         let mut iteration: u32 = 0;
+        // Nudge the model to wrap up before it hits the hard iteration cap.
+        // Trigger at 80% of the budget (ceiling), sent only once.
+        let nudge_at = ((ctx.core.max_iterations as f64) * 0.8).ceil() as u32;
+        let mut nudge_sent = false;
         while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
                 debug!("agent loop: cancelled before iteration {}", iteration);
                 break;
+            }
+
+            // Nudge the model when approaching the iteration budget.
+            if iteration == nudge_at && !nudge_sent {
+                nudge_sent = true;
+                let remaining = ctx.core.max_iterations - iteration;
+                let nudge_msg = format!(
+                    "[System notice] You have {} iteration(s) remaining. Produce your final answer now.",
+                    remaining
+                );
+                ctx.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": nudge_msg
+                }));
+                info!(
+                    "iteration_nudge: injected wrap-up nudge at iteration {}/{}",
+                    iteration, ctx.core.max_iterations
+                );
             }
 
             // Plan-guided: inject current step instruction into conversation.
@@ -1357,6 +1379,47 @@ impl AgentLoopShared {
     ) -> StepResult {
         let counters = &self.core_handle.counters;
 
+        // --- Universal textual tool-call extraction ---
+        // If the response has no native tool_calls but contains [I called: ...]
+        // patterns, parse them regardless of protocol mode. This prevents
+        // the validation step from flagging them as hallucinated tool calls.
+        if !response.has_tool_calls()
+            && response
+                .content
+                .as_ref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
+        {
+            let content_text = response.content.as_deref().unwrap_or("");
+            let parsed = parse_textual_tool_calls(content_text);
+            if !parsed.is_empty() {
+                debug!(
+                    n = parsed.len(),
+                    "universal_textual_parse: parsed {} tool call(s) from response text",
+                    parsed.len()
+                );
+                let synthesised: Vec<crate::providers::base::ToolCallRequest> = parsed
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, ptc)| {
+                        let args: HashMap<String, Value> = match ptc.args {
+                            Value::Object(map) => map.into_iter().collect(),
+                            _ => HashMap::new(),
+                        };
+                        crate::providers::base::ToolCallRequest {
+                            id: format!("tc_textual_{}", i + 1),
+                            name: ptc.tool,
+                            arguments: args,
+                        }
+                    })
+                    .collect();
+                if let Some(ref mut content) = response.content {
+                    *content = strip_textual_tool_calls(content);
+                }
+                response.tool_calls = synthesised;
+            }
+        }
+
         // --- Response Validation: detect hallucinated tool calls ---
         let content_str = response.content.as_deref().unwrap_or("");
         let tool_calls_as_maps: Vec<HashMap<String, Value>> = response
@@ -1474,7 +1537,6 @@ impl AgentLoopShared {
                 .unwrap_or(false)
             && (response.finish_reason == "length"
                 || (response.finish_reason == "stop"
-                    && ctx.core.is_local
                     && response.content.as_ref().map(|s| appears_incomplete(s)).unwrap_or(false)))
             && ctx.flow.continuations_used < max_cont
         {
@@ -1628,56 +1690,6 @@ impl AgentLoopShared {
                 tool_calls_executed: 0, // updated after execution
                 validation_result: None,
             });
-        }
-
-        // --- TextualReplay: extract tool calls written as `[I called: ...]` text ---
-        //
-        // When the model is in textual replay mode and produced no native tool calls,
-        // scan the response text for the bracket pattern and synthesise ToolCallRequest
-        // entries so the normal tool-execution path can handle them.
-        if ctx.protocol.is_textual_replay()
-            && !response.has_tool_calls()
-            && response
-                .content
-                .as_ref()
-                .map(|c| !c.trim().is_empty())
-                .unwrap_or(false)
-        {
-            let content_text = response.content.as_deref().unwrap_or("");
-            let parsed = parse_textual_tool_calls(content_text);
-            if !parsed.is_empty() {
-                debug!(
-                    n = parsed.len(),
-                    "textual_replay: parsed {} tool call(s) from response text",
-                    parsed.len()
-                );
-                // Convert ParsedToolCall → ToolCallRequest with synthetic IDs.
-                let synthesised: Vec<crate::providers::base::ToolCallRequest> = parsed
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, ptc)| {
-                        let args: HashMap<String, Value> = match ptc.args {
-                            Value::Object(map) => {
-                                map.into_iter().collect()
-                            }
-                            _ => HashMap::new(),
-                        };
-                        crate::providers::base::ToolCallRequest {
-                            id: format!("tc_textual_{}", i + 1),
-                            name: ptc.tool,
-                            arguments: args,
-                        }
-                    })
-                    .collect();
-
-                // Strip the bracket annotations from the visible response text so
-                // they are not shown to the user or leaked into tool argument values.
-                if let Some(ref mut content) = response.content {
-                    *content = strip_textual_tool_calls(content);
-                }
-
-                response.tool_calls = synthesised;
-            }
         }
 
         // Branch: tool calls → Executing, no tool calls → finished.

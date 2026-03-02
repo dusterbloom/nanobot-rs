@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use crate::agent::agent_loop::SharedCoreHandle;
 use crate::agent::audit::{AuditLog, ToolEvent};
 use crate::agent::provenance::{ClaimStatus, ClaimVerifier};
+use crate::agent::reflector::Reflector;
 use crate::cli;
 use crate::config::loader::{get_data_dir, load_config, save_config};
 use crate::config::schema::Config;
@@ -1815,6 +1816,36 @@ pub(crate) fn cmd_agent(
             }
 
             ctx.srv.shutdown();
+
+            // On exit, force a reflection pass if any working memory has
+            // accumulated — threshold=0 means "reflect if there is anything".
+            // This ensures facts from the just-completed session are distilled
+            // into MEMORY.md before the process exits.
+            {
+                let core = ctx.core_handle.swappable();
+                if core.memory_enabled {
+                    let reflector = Reflector::new(
+                        core.memory_provider.clone(),
+                        core.memory_model.clone(),
+                        &core.workspace,
+                        0, // threshold=0: reflect whenever there is any content
+                    );
+                    if reflector.should_reflect() {
+                        info!("Exit: reflecting on accumulated working memory (background)...");
+                        let reflection_handle = tokio::spawn(async move {
+                            match reflector.reflect().await {
+                                Ok(()) => info!("Exit reflection complete — MEMORY.md updated"),
+                                Err(e) => warn!("Exit reflection failed: {}", e),
+                            }
+                        });
+                        // Wait up to 5s for reflection to complete; don't block exit indefinitely
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            reflection_handle,
+                        ).await;
+                    }
+                }
+            }
 
             // Re-index qmd sessions collection so the latest conversation is
             // immediately searchable via recall in the next session.

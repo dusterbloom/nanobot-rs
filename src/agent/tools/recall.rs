@@ -8,10 +8,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::base::Tool;
+
+static QMD_URI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"qmd://\S+").unwrap());
+
+/// Strip internal `qmd://…` URI references from text so they are not exposed
+/// to the LLM, which might otherwise try to fetch them.
+pub fn strip_qmd_uris(text: &str) -> String {
+    QMD_URI_RE.replace_all(text, "[internal ref]").to_string()
+}
 
 /// A step in the recall search pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,8 +247,9 @@ impl Tool for RecallTool {
         if sections.is_empty() {
             format!("No results found for '{}'.", query)
         } else {
+            // Strip internal qmd:// URIs before exposing output to the LLM.
             // Truncate total output to avoid blowing context (UTF-8 safe).
-            let output = sections.join("\n\n");
+            let output = strip_qmd_uris(&sections.join("\n\n"));
             if output.len() > 8000 {
                 let truncated: String = output.chars().take(8000).collect();
                 format!(
@@ -424,5 +435,29 @@ mod tests {
     fn test_hybrid_mode_pipeline() {
         let steps = search_order("hybrid");
         assert_eq!(steps, vec![SearchStep::QmdHybrid, SearchStep::GrepFallback]);
+    }
+
+    // ---------------------------------------------------------------
+    // strip_qmd_uris tests (pure function, no IO)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_strip_qmd_uris_passthrough() {
+        let text = "No internal refs here. Just plain text.";
+        assert_eq!(strip_qmd_uris(text), text);
+    }
+
+    #[test]
+    fn test_strip_qmd_uris_single() {
+        let input = "See qmd://sessions/abc123 for details";
+        let expected = "See [internal ref] for details";
+        assert_eq!(strip_qmd_uris(input), expected);
+    }
+
+    #[test]
+    fn test_strip_qmd_uris_multiple() {
+        let input = "First ref qmd://sessions/abc123 and second ref qmd://memory/xyz456 done.";
+        let expected = "First ref [internal ref] and second ref [internal ref] done.";
+        assert_eq!(strip_qmd_uris(input), expected);
     }
 }

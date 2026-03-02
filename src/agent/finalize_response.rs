@@ -66,7 +66,22 @@ impl AgentLoopShared {
         }
 
         if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
-            ctx.final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+            // Try to surface the last meaningful assistant message as a rescue
+            // rather than emitting a generic fallback. This happens when the
+            // model exhausted iterations without producing a text-only response
+            // (e.g. ended on a tool result with no follow-up assistant turn).
+            let last_assistant = ctx.messages.iter().rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            if !last_assistant.trim().is_empty() {
+                ctx.final_content = format!(
+                    "{}\n\n[Note: Tool iteration limit reached. This response may be incomplete.]",
+                    last_assistant.trim()
+                );
+            } else {
+                ctx.final_content = "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.".to_string();
+            }
         }
 
         // Phase 3+4: Claim verification and context hygiene.
