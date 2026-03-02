@@ -550,6 +550,7 @@ mod tests {
             password: data["pass"].as_str()?.to_string(),
             poll_interval_secs: 5,
             allow_from: Vec::new(),
+            toolset: None,
         })
     }
 
