@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, warn, Instrument};
 
 use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
@@ -439,96 +439,99 @@ async fn execute_single_tool(
         tool = %tc.name,
         ok = tracing::field::Empty,
     );
-    let _span_guard = tool_span.enter();
 
-    debug!("Executing tool: {} (id: {})", tc.name, tc.id);
+    async {
+        debug!("Executing tool: {} (id: {})", tc.name, tc.id);
 
-    if let Some(summary) = taint_warning {
-        warn!(
-            "TAINT WARNING: Executing sensitive tool '{}' with tainted context from: {}",
-            tc.name, summary
-        );
-    }
+        if let Some(summary) = taint_warning {
+            warn!(
+                "TAINT WARNING: Executing sensitive tool '{}' with tainted context from: {}",
+                tc.name, summary
+            );
+        }
 
-    // Emit CallStart.
-    if let Some(ref tx) = tool_event_tx {
-        let preview: String = serde_json::to_string(&tc.arguments)
-            .unwrap_or_default()
-            .chars()
-            .take(80)
-            .collect();
-        let _ = tx.send(ToolEvent::CallStart {
-            tool_name: tc.name.clone(),
-            tool_call_id: tc.id.clone(),
-            arguments_preview: preview,
-        });
-    }
+        // Emit CallStart.
+        if let Some(ref tx) = tool_event_tx {
+            let preview: String = serde_json::to_string(&tc.arguments)
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect();
+            let _ = tx.send(ToolEvent::CallStart {
+                tool_name: tc.name.clone(),
+                tool_call_id: tc.id.clone(),
+                arguments_preview: preview,
+            });
+        }
 
-    let start = std::time::Instant::now();
+        let start = std::time::Instant::now();
 
-    // Spawn heartbeat that emits Progress ticks until the tool finishes.
-    let heartbeat = if let Some(ref tx) = tool_event_tx {
-        let hb_tx = tx.clone();
-        let hb_name = tc.name.clone();
-        let hb_id = tc.id.clone();
-        let hb_start = start;
-        let hb_interval = tool_heartbeat_secs;
-        Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(hb_interval));
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                interval.tick().await;
-                let _ = hb_tx.send(ToolEvent::Progress {
-                    tool_name: hb_name.clone(),
-                    tool_call_id: hb_id.clone(),
-                    elapsed_ms: hb_start.elapsed().as_millis() as u64,
-                    output_preview: None,
-                });
-            }
-        }))
-    } else {
-        None
-    };
-
-    let result = if let Some(ref tx) = tool_event_tx {
-        use crate::agent::tools::base::ToolExecutionContext;
-        let exec_ctx = ToolExecutionContext {
-            event_tx: tx.clone(),
-            cancellation_token: cancellation_token
-                .as_ref()
-                .map(|t| t.child_token())
-                .unwrap_or_else(tokio_util::sync::CancellationToken::new),
-            tool_call_id: tc.id.clone(),
+        // Spawn heartbeat that emits Progress ticks until the tool finishes.
+        let heartbeat = if let Some(ref tx) = tool_event_tx {
+            let hb_tx = tx.clone();
+            let hb_name = tc.name.clone();
+            let hb_id = tc.id.clone();
+            let hb_start = start;
+            let hb_interval = tool_heartbeat_secs;
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(hb_interval));
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    let _ = hb_tx.send(ToolEvent::Progress {
+                        tool_name: hb_name.clone(),
+                        tool_call_id: hb_id.clone(),
+                        elapsed_ms: hb_start.elapsed().as_millis() as u64,
+                        output_preview: None,
+                    });
+                }
+            }))
+        } else {
+            None
         };
-        tools
-            .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
-            .await
-    } else {
-        tools.execute(&tc.name, tc.arguments.clone()).await
-    };
 
-    // Stop heartbeat.
-    if let Some(hb) = heartbeat {
-        hb.abort();
+        let result = if let Some(ref tx) = tool_event_tx {
+            use crate::agent::tools::base::ToolExecutionContext;
+            let exec_ctx = ToolExecutionContext {
+                event_tx: tx.clone(),
+                cancellation_token: cancellation_token
+                    .as_ref()
+                    .map(|t| t.child_token())
+                    .unwrap_or_else(tokio_util::sync::CancellationToken::new),
+                tool_call_id: tc.id.clone(),
+            };
+            tools
+                .execute_with_context(&tc.name, tc.arguments.clone(), &exec_ctx)
+                .await
+        } else {
+            tools.execute(&tc.name, tc.arguments.clone()).await
+        };
+
+        // Stop heartbeat.
+        if let Some(hb) = heartbeat {
+            hb.abort();
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        tracing::Span::current().record("ok", result.ok);
+        debug!(
+            "Tool {} result ({}B, ok={}, {}ms)",
+            tc.name,
+            result.data.len(),
+            result.ok,
+            duration_ms
+        );
+
+        SingleToolResult {
+            tool_name: tc.name.clone(),
+            tool_id: tc.id.clone(),
+            arguments: tc.arguments.clone(),
+            result,
+            duration_ms,
+        }
     }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    tool_span.record("ok", result.ok);
-    debug!(
-        "Tool {} result ({}B, ok={}, {}ms)",
-        tc.name,
-        result.data.len(),
-        result.ok,
-        duration_ms
-    );
-
-    SingleToolResult {
-        tool_name: tc.name.clone(),
-        tool_id: tc.id.clone(),
-        arguments: tc.arguments.clone(),
-        result,
-        duration_ms,
-    }
+    .instrument(tool_span)
+    .await
 }
 
 /// Post-process one completed tool result: gate content, inject into messages,
