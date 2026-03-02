@@ -105,6 +105,10 @@ impl Tool for SendEmailTool {
         "Send an email to a recipient."
     }
 
+    fn is_available(&self) -> bool {
+        self.email_config.enabled
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
