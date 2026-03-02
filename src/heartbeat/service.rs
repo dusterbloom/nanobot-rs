@@ -2,7 +2,7 @@
 //! Heartbeat service -- periodic maintenance + agent wake-up.
 //!
 //! Two layers run on each tick:
-//! 1. **Maintenance commands** — cheap shell commands (e.g. `qmd update -c sessions`)
+//! 1. **Maintenance commands** — cheap shell commands (e.g. `qmd update`)
 //!    that run unconditionally on every tick.  No LLM involved.
 //! 2. **Agent tasks** — reads `HEARTBEAT.md` and invokes the LLM callback only
 //!    when there are actionable tasks.  Skipped when the file is empty.
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_HEARTBEAT_INTERVAL_S: u64 = 5 * 60;
 
 /// Default maintenance commands run on every tick.
-pub const DEFAULT_MAINTENANCE_COMMANDS: &[&str] = &["qmd update -c sessions"];
+pub const DEFAULT_MAINTENANCE_COMMANDS: &[&str] = &["qmd update"];
 
 /// The prompt sent to the agent during a heartbeat.
 pub const HEARTBEAT_PROMPT: &str = "Read HEARTBEAT.md in your workspace (if it exists).\n\
