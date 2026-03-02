@@ -337,8 +337,14 @@ impl ToolRegistry {
     }
 
     /// Get all tool definitions in OpenAI format.
+    ///
+    /// Tools where [`Tool::is_available`] returns `false` are excluded.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
-        self.tools.values().map(|tool| tool.to_schema()).collect()
+        self.tools
+            .values()
+            .filter(|tool| tool.is_available())
+            .map(|tool| tool.to_schema())
+            .collect()
     }
 
     /// Execute a tool by name with given parameters.
