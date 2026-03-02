@@ -1509,4 +1509,119 @@ mod tests {
         assert!(names.contains("spawn")); // used tool preserved
         assert!(!names.contains("message")); // not used, not in local core
     }
+
+    // -----------------------------------------------------------------------
+    // is_available() gating tests
+    // -----------------------------------------------------------------------
+
+    /// A tool that reports itself as unavailable.
+    struct UnavailableTool;
+
+    #[async_trait]
+    impl Tool for UnavailableTool {
+        fn name(&self) -> &str {
+            "unavailable_test"
+        }
+        fn description(&self) -> &str {
+            "test tool that is unavailable"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+            "executed".to_string()
+        }
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_unavailable_tool_excluded_from_get_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("available_tool")));
+        registry.register(Box::new(UnavailableTool));
+
+        let defs = registry.get_definitions();
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(
+            names.contains(&"available_tool".to_string()),
+            "Available tool should appear in definitions"
+        );
+        assert!(
+            !names.contains(&"unavailable_test".to_string()),
+            "Unavailable tool must NOT appear in definitions"
+        );
+    }
+
+    #[test]
+    fn test_available_tool_included_in_get_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("my_tool")));
+
+        let defs = registry.get_definitions();
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(names.contains(&"my_tool".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_tool_can_still_be_executed() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(UnavailableTool));
+
+        // The tool is registered but not in definitions; execute() should still work.
+        let result = registry.execute("unavailable_test", HashMap::new()).await;
+        assert!(
+            result.ok,
+            "Unavailable tool should still execute when called directly: {:?}",
+            result.error
+        );
+        assert_eq!(result.data, "executed");
+    }
+
+    #[test]
+    fn test_unavailable_tool_excluded_from_relevant_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(UnavailableTool));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "read some file"})];
+        let used = HashSet::new();
+        let defs = registry.get_relevant_definitions(&messages, &used);
+
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(!names.contains(&"unavailable_test".to_string()));
+    }
+
+    #[test]
+    fn test_unavailable_tool_excluded_from_local_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(MockTool::new("list_dir")));
+        registry.register(Box::new(MockTool::new("exec")));
+        registry.register(Box::new(UnavailableTool));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "fix the bug"})];
+        let used = HashSet::new();
+        let defs = registry.get_local_definitions(&messages, &used);
+
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(!names.contains(&"unavailable_test".to_string()));
+    }
 }
