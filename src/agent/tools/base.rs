@@ -130,6 +130,17 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// Whether this tool is currently available for use.
+    ///
+    /// Tools can return `false` when their required backend is not configured.
+    /// Unavailable tools are excluded from `get_definitions()` so the LLM
+    /// never sees them, but they can still be executed directly if needed.
+    ///
+    /// Default implementation always returns `true`.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Convert tool to OpenAI function schema format.
     fn to_schema(&self) -> serde_json::Value {
         serde_json::json!({
