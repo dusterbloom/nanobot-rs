@@ -31,6 +31,10 @@ impl Tool for CheckInboxTool {
         "Check the email inbox for new/unread messages. Returns a list of unread emails with sender, subject, and body."
     }
 
+    fn is_available(&self) -> bool {
+        self.email_config.enabled
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
