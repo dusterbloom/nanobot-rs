@@ -781,6 +781,7 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
+            toolset: None,
         };
         // chat_id WITHOUT "email:" prefix — should still work
         let msg = OutboundMessage::new("email", "recv@example.com", "body");
