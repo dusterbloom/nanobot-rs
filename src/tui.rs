@@ -339,36 +339,45 @@ pub(crate) fn render_input_bar(
         ));
     }
 
-    let bar_lines = 3usize;
-    // bar_row is the terminal row where the separator starts (1-indexed)
+    let bar_lines = 5usize;
     let bar_row = height.saturating_sub(bar_lines) + 1;
-    // prompt_row is where the user types — just above the bar
-    let prompt_row = bar_row.saturating_sub(1);
 
     // Reset scroll region to full screen so we can position cursor freely
     print!("\x1b[r");
 
     if push_content {
-        // First render: push existing content up to make room for the bar.
-        print!("\x1b[{};1H", height); // move to last row
+        print!("\x1b[{};1H", height);
         for _ in 0..bar_lines + 1 {
-            println!(); // push content up by scrolling
+            println!();
         }
     }
 
-    // Render the bar at its fixed position (outside scroll region)
-    // Only clear from bar_row onwards, not the whole screen
-    print!("\x1b[{};1H", bar_row);
-    print!("\x1b[J"); // clear from bar_row to end of screen
+    // Row 1: Top separator
+    print!("\x1b[{};1H\x1b[2K", bar_row);
     println!("{DIM}{separator}{RESET}");
+
+    // Row 2: Prompt row (left empty for readline)
+    let prompt_row = bar_row + 1;
+    print!("\x1b[{};1H\x1b[2K", prompt_row);
+
+    // Row 3: Bottom separator
+    print!("\x1b[{};1H\x1b[2K", prompt_row + 1);
+    println!("{DIM}{separator}{RESET}");
+
+    // Row 4: Info line (cwd + model)
+    print!("\x1b[{};1H\x1b[2K", prompt_row + 2);
     println!("  {DIM}{cwd} · {RESET}{GREEN}{model_name}{RESET}{think_str}");
+
+    // Row 5: Hints line
+    print!("\x1b[{};1H\x1b[2K", prompt_row + 3);
     print!("  {}", hints.join(" · "));
 
-    // Set scroll region to rows 1..prompt_row so text never overwrites the bar
+    // Set scroll region: text scrolls in rows 1..(prompt_row-1), above the top separator
     print!("\x1b[1;{}r", prompt_row);
 
-    // Always position cursor at prompt_row for input
-    print!("\x1b[{};1H\x1b[2K", prompt_row);
+    // Position cursor at prompt row for readline input
+    print!("\x1b[{};1H", prompt_row);
+
     std::io::stdout().flush().ok();
 
     bar_lines
