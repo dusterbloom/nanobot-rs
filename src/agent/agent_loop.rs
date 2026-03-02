@@ -26,7 +26,10 @@ use crate::errors::is_retryable_provider_error;
 use crate::agent::anti_drift;
 use crate::agent::context_hygiene;
 use crate::agent::policy;
-use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
+use crate::agent::protocol::{
+    parse_textual_tool_calls, strip_textual_tool_calls, CloudProtocol, ConversationProtocol,
+    LocalProtocol,
+};
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
@@ -198,6 +201,11 @@ pub(crate) struct FlowControl {
     pub(crate) agent_retry_attempted: bool,
     /// Number of auto-continuations used this turn for truncated responses.
     pub(crate) continuations_used: u32,
+    /// Consecutive validation retries for the current main-loop iteration.
+    /// Reset to 0 on each successful (non-validation) iteration. Capped at
+    /// `MAX_VALIDATION_RETRIES` before the retry is treated as a normal
+    /// continuation (i.e. consumes an iteration slot).
+    pub(crate) validation_retries: u32,
 }
 
 /// Shared handles for background compaction coordination.
@@ -234,6 +242,9 @@ enum IterationPhase {
 enum IterationOutcome {
     /// Continue to next iteration.
     Continue,
+    /// Validation failed and a retry hint was injected. Does NOT consume a
+    /// main-loop iteration slot — the outer loop re-runs the same iteration.
+    ValidationRetry,
     /// Agent produced final content — use as response.
     Finished(String),
     /// Error occurred — use as final content.
@@ -328,7 +339,10 @@ impl AgentLoopShared {
             }
         }
 
-        for iteration in 0..ctx.core.max_iterations {
+        // `iteration` counts only "real" (non-validation-retry) iterations so
+        // that format-correction retries don't eat into the main budget.
+        let mut iteration: u32 = 0;
+        while iteration < ctx.core.max_iterations {
             // Plan-guided: inject current step instruction into conversation.
             {
                 if let Ok(engine) = ctx.reasoning.lock() {
@@ -343,10 +357,11 @@ impl AgentLoopShared {
             }
 
             debug!(
-                "Agent iteration{} {}/{}",
+                "Agent iteration{} {}/{} (validation_retries={})",
                 if ctx.streaming { " (streaming)" } else { "" },
                 iteration + 1,
-                ctx.core.max_iterations
+                ctx.core.max_iterations,
+                ctx.flow.validation_retries
             );
 
             // Sync messages to reasoning engine so CheckpointTool can capture them.
@@ -362,13 +377,44 @@ impl AgentLoopShared {
                 if let Ok(mut engine) = ctx.reasoning.lock() {
                     if let Some(restored) = engine.take_pending_restore() {
                         ctx.messages = restored;
+                        iteration += 1;
+                        ctx.flow.validation_retries = 0;
                         continue;
                     }
                 }
             }
 
             match outcome {
+                IterationOutcome::ValidationRetry => {
+                    // A validation error injected a corrective hint. Only count
+                    // this against the validation budget, not the main iteration
+                    // budget, so format corrections don't exhaust real work slots.
+                    ctx.flow.validation_retries += 1;
+                    if ctx.flow.validation_retries >= validation::MAX_VALIDATION_RETRIES as u32 {
+                        // Exhausted validation retries — treat as a normal
+                        // iteration so the loop can make forward progress.
+                        warn!(
+                            "validation retries exhausted ({}/{}), counting as real iteration",
+                            ctx.flow.validation_retries,
+                            validation::MAX_VALIDATION_RETRIES,
+                        );
+                        ctx.flow.validation_retries = 0;
+                        iteration += 1;
+                    } else {
+                        debug!(
+                            "validation retry {}/{} — not counting against main budget",
+                            ctx.flow.validation_retries,
+                            validation::MAX_VALIDATION_RETRIES,
+                        );
+                        // Do NOT increment `iteration` — re-run the same slot.
+                    }
+                    continue;
+                }
                 IterationOutcome::Continue => {
+                    // Successful (non-validation) iteration — reset retry counter
+                    // and advance to the next main-budget slot.
+                    ctx.flow.validation_retries = 0;
+                    iteration += 1;
                     // Consume step budget if plan-guided.
                     if let Ok(mut engine) = ctx.reasoning.lock() {
                         engine.consume_iteration();
@@ -386,6 +432,8 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Finished(content) => {
+                    ctx.flow.validation_retries = 0;
+                    iteration += 1;
                     // In plan-guided mode, advance to next step.
                     let should_continue = {
                         if let Ok(mut engine) = ctx.reasoning.lock() {
@@ -408,6 +456,8 @@ impl AgentLoopShared {
                     break;
                 }
                 IterationOutcome::Error(msg) => {
+                    ctx.flow.validation_retries = 0;
+                    iteration += 1;
                     // Try backtracking before giving up.
                     let should_backtrack = {
                         if let Ok(mut engine) = ctx.reasoning.lock() {
@@ -1315,14 +1365,20 @@ impl AgentLoopShared {
             })
             .collect();
 
-        match validation::validate_response(content_str, &tool_calls_as_maps) {
+        match validation::validate_response(content_str, &tool_calls_as_maps, ctx.protocol.is_textual_replay()) {
             validation::ValidationOutcome::Error(validation_err) => {
+                let retry_num = ctx.flow.validation_retries + 1;
                 warn!(
                     model = %ctx.core.model,
                     validation = %format!("{:?}", validation_err),
+                    retry = retry_num,
+                    max_retries = validation::MAX_VALIDATION_RETRIES,
                     "response_validation_failed"
                 );
-                let hint = validation::generate_retry_prompt(&validation_err, 1);
+                let hint = validation::generate_retry_prompt(
+                    &validation_err,
+                    retry_num as u8,
+                );
                 ctx.messages.push(json!({
                     "role": "assistant",
                     "content": content_str
@@ -1331,8 +1387,8 @@ impl AgentLoopShared {
                     "role": "user",
                     "content": hint
                 }));
-                debug!("Injected validation retry hint");
-                return StepResult::Done(IterationOutcome::Continue);
+                debug!("Injected validation retry hint (retry {}/{})", retry_num, validation::MAX_VALIDATION_RETRIES);
+                return StepResult::Done(IterationOutcome::ValidationRetry);
             }
             validation::ValidationOutcome::StripHallucination => {
                 debug!("Stripping hallucinated tool-call text from response");
@@ -1563,6 +1619,56 @@ impl AgentLoopShared {
                 tool_calls_executed: 0, // updated after execution
                 validation_result: None,
             });
+        }
+
+        // --- TextualReplay: extract tool calls written as `[I called: ...]` text ---
+        //
+        // When the model is in textual replay mode and produced no native tool calls,
+        // scan the response text for the bracket pattern and synthesise ToolCallRequest
+        // entries so the normal tool-execution path can handle them.
+        if ctx.protocol.is_textual_replay()
+            && !response.has_tool_calls()
+            && response
+                .content
+                .as_ref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
+        {
+            let content_text = response.content.as_deref().unwrap_or("");
+            let parsed = parse_textual_tool_calls(content_text);
+            if !parsed.is_empty() {
+                debug!(
+                    n = parsed.len(),
+                    "textual_replay: parsed {} tool call(s) from response text",
+                    parsed.len()
+                );
+                // Convert ParsedToolCall → ToolCallRequest with synthetic IDs.
+                let synthesised: Vec<crate::providers::base::ToolCallRequest> = parsed
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, ptc)| {
+                        let args: HashMap<String, Value> = match ptc.args {
+                            Value::Object(map) => {
+                                map.into_iter().collect()
+                            }
+                            _ => HashMap::new(),
+                        };
+                        crate::providers::base::ToolCallRequest {
+                            id: format!("tc_textual_{}", i + 1),
+                            name: ptc.tool,
+                            arguments: args,
+                        }
+                    })
+                    .collect();
+
+                // Strip the bracket annotations from the visible response text so
+                // they are not shown to the user or leaked into tool argument values.
+                if let Some(ref mut content) = response.content {
+                    *content = strip_textual_tool_calls(content);
+                }
+
+                response.tool_calls = synthesised;
+            }
         }
 
         // Branch: tool calls → Executing, no tool calls → finished.

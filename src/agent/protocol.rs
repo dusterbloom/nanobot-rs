@@ -16,11 +16,33 @@
 //! };
 //! ```
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use super::turn::{ToolCall, Turn};
 use crate::agent::model_capabilities::{lookup, ModelSizeClass};
+
+// Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` bracket.
+// Captures the inner content (everything between `[` ... `]`).
+static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\[(?:I\s+)?called[:\s]\s*(.*?)\]").expect("textual call outer regex")
+});
+
+// Matches a single `tool_name({...})` pair within the inner content.
+// The format rendered by TextualReplay is: tool_name({"arg": "val"})
+// Captures: (1) tool name, (2) JSON args string (including the braces)
+static TEXTUAL_CALL_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)").expect("textual call item regex")
+});
+
+/// A parsed tool call extracted from textual replay format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolCall {
+    pub tool: String,
+    pub args: Value,
+}
 
 const CONTINUE_SENTINEL: &str = "Continue.";
 const SYSTEM_NOTICE_PREFIX: &str = "[System notice]";
@@ -60,6 +82,15 @@ pub trait ConversationProtocol: Send + Sync {
 
     /// Human-readable name for logging / tracing.
     fn name(&self) -> &'static str;
+
+    /// Returns `true` when this protocol renders past tool calls as textual
+    /// summaries (`[I called: tool_name({...})]`) instead of native `tool_calls`
+    /// JSON.  Callers use this to:
+    /// - Skip hallucination validation (the pattern is expected, not erroneous).
+    /// - Parse textual tool call patterns from the model's response.
+    fn is_textual_replay(&self) -> bool {
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -294,11 +325,66 @@ impl ConversationProtocol for LocalProtocol {
     fn name(&self) -> &'static str {
         "local"
     }
+
+    fn is_textual_replay(&self) -> bool {
+        self.replay_mode == LocalReplayMode::TextualReplay
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
 // Public helpers
 // ─────────────────────────────────────────────────────────────
+
+/// Parse tool calls from a textual replay response.
+///
+/// TextualReplay-mode models express tool intent by writing bracket patterns like:
+/// ```text
+/// [I called: read_file({"path": "x"}), write_file({"path": "y", "content": "z"})]
+/// [Called: shell_exec({"cmd": "ls"})]
+/// [I called read_file({"path": "x"})]
+/// ```
+///
+/// This function extracts each `tool_name({args})` pair and returns a
+/// `Vec<ParsedToolCall>`. Entries with malformed JSON are silently skipped.
+///
+/// The caller is responsible for assigning call IDs and stripping the matched
+/// text from the response content.
+pub fn parse_textual_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    let mut result = Vec::new();
+
+    for outer_cap in TEXTUAL_CALL_OUTER_RE.captures_iter(text) {
+        let inner = match outer_cap.get(1) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
+
+        for item_cap in TEXTUAL_CALL_ITEM_RE.captures_iter(inner) {
+            let tool = item_cap[1].to_string();
+            let args_str = &item_cap[2];
+
+            match serde_json::from_str::<Value>(args_str) {
+                Ok(args) => result.push(ParsedToolCall { tool, args }),
+                Err(_) => {
+                    // Best-effort: skip malformed JSON, don't abort the whole parse.
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Strip textual tool call brackets from response content.
+///
+/// Removes all `[I called: ...]` / `[Called: ...]` patterns, trims, and returns
+/// the cleaned text.  Used after `parse_textual_tool_calls()` to avoid sending
+/// bracket noise to the user or to downstream tools.
+pub fn strip_textual_tool_calls(content: &str) -> String {
+    TEXTUAL_CALL_OUTER_RE
+        .replace_all(content, "")
+        .trim()
+        .to_string()
+}
 
 /// Convert a raw wire-format message array to a protocol-rendered wire format.
 ///
@@ -588,5 +674,113 @@ mod tests {
             .unwrap_or("");
         assert!(tool_result.contains("read_file(tc_1)"));
         assert!(tool_result.contains("data"));
+    }
+
+    // ---- is_textual_replay() ----
+
+    #[test]
+    fn cloud_protocol_is_not_textual_replay() {
+        assert!(!CloudProtocol.is_textual_replay());
+    }
+
+    #[test]
+    fn local_native_is_not_textual_replay() {
+        assert!(!LocalProtocol::native().is_textual_replay());
+    }
+
+    #[test]
+    fn local_textual_is_textual_replay() {
+        assert!(LocalProtocol::textual().is_textual_replay());
+    }
+
+    // ---- parse_textual_tool_calls() ----
+
+    #[test]
+    fn parse_single_call_with_colon() {
+        let text = r#"[I called: read_file({"path": "/tmp/foo"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].args["path"], "/tmp/foo");
+    }
+
+    #[test]
+    fn parse_single_call_without_colon() {
+        let text = r#"[I called read_file({"path": "/tmp/bar"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].args["path"], "/tmp/bar");
+    }
+
+    #[test]
+    fn parse_called_prefix() {
+        let text = r#"[Called: shell_exec({"cmd": "ls"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "shell_exec");
+        assert_eq!(calls[0].args["cmd"], "ls");
+    }
+
+    #[test]
+    fn parse_multiple_calls_comma_separated() {
+        let text = r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "x"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[0].args["path"], "a");
+        assert_eq!(calls[1].tool, "write_file");
+        assert_eq!(calls[1].args["path"], "b");
+    }
+
+    #[test]
+    fn parse_empty_args_object() {
+        let text = r#"[Called: get_time({})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "get_time");
+        assert!(calls[0].args.is_object());
+    }
+
+    #[test]
+    fn parse_skips_malformed_json() {
+        // Only the valid call should be returned; the broken one is silently dropped.
+        let text = r#"[I called: bad_tool({NOT JSON}), good_tool({"k": "v"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        // `good_tool` is returned; `bad_tool` was skipped.
+        assert!(calls.iter().any(|c| c.tool == "good_tool"));
+        assert!(!calls.iter().any(|c| c.tool == "bad_tool"));
+    }
+
+    #[test]
+    fn parse_no_match_returns_empty() {
+        let text = "The answer is 42. No tool calls here.";
+        let calls = parse_textual_tool_calls(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_case_insensitive_prefix() {
+        let text = r#"[CALLED: read_file({"path": "x"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+    }
+
+    // ---- strip_textual_tool_calls() ----
+
+    #[test]
+    fn strip_removes_bracket_pattern() {
+        let text = r#"Some text. [I called: read_file({"path": "x"})] Done."#;
+        let stripped = strip_textual_tool_calls(text);
+        assert!(!stripped.contains("[I called:"));
+        assert!(stripped.contains("Some text."));
+        assert!(stripped.contains("Done."));
+    }
+
+    #[test]
+    fn strip_leaves_plain_text_unchanged() {
+        let text = "The answer is 42.";
+        assert_eq!(strip_textual_tool_calls(text), text);
     }
 }

@@ -87,3 +87,32 @@ messages.push(json!({
 ```
 
 **Affected code paths:** `tool_runner.rs`, `subagent.rs`, `agent_loop.rs` (inline path, conditional on `is_local`). Any new code path that builds message arrays with tool results must follow this pattern.
+
+### Local Model Function Calling
+
+For local models to use native function calling (tool_calls JSON), LM Studio must have `--jinja` enabled. This requires llama.cpp b8148 or newer. Without `--jinja`, models receive the `tools` parameter but can't generate proper `tool_calls` responses.
+
+**Protocol modes:**
+- `NativeToolCalls` — Model generates `tool_calls` JSON (requires LM Studio `--jinja`)
+- `TextualReplay` — Tool calls rendered as `[I called: tool_name({...})]` in text; nanobot parses them back
+
+Protocol is auto-selected by model capabilities. Override via:
+```bash
+NANOBOT_LOCAL_PROTOCOL_MODE=native nanobot agent -m "message"
+```
+
+**Model capability overrides** (`~/.nanobot/config.json`):
+```json
+{
+  "modelCapabilities": {
+    "qwen3.5-35b": {
+      "sizeClass": "medium",
+      "toolCalling": true,
+      "maxReliableOutput": 4096,
+      "scratchPadRounds": 8
+    }
+  }
+}
+```
+
+Keys match as case-insensitive substrings against the model name. Override `sizeClass` to `"medium"` for MoE models whose names contain small-model markers (e.g., `"a3b"` in `qwen3.5-35b-a3b`).
