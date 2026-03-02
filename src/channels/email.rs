@@ -731,6 +731,7 @@ mod tests {
             password: "test".to_string(),
             poll_interval_secs: 30,
             allow_from: Vec::new(),
+            toolset: None,
         };
         // chat_id with invalid email after "email:" prefix
         let msg = OutboundMessage::new("email", "email:not-valid", "body");
