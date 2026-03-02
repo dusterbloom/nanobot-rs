@@ -105,6 +105,9 @@ pub struct FeishuConfig {
     pub verification_token: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Optional toolset name from `tools.toolsets` to restrict available tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
 }
 
 impl Default for FeishuConfig {
