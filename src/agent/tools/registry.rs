@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool,
+    SessionSearchTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
 use crate::config::schema::JinaReaderConfig;
@@ -36,6 +36,9 @@ pub struct ToolConfig {
     pub searxng_url: String,
     /// Optional Jina Reader config for AI-powered web content extraction.
     pub jina_config: Option<JinaReaderConfig>,
+    /// Path to the SQLite sessions database for session_search tool.
+    /// When `None`, the session_search tool is not registered.
+    pub db_path: Option<PathBuf>,
 }
 
 impl ToolConfig {
@@ -53,6 +56,7 @@ impl ToolConfig {
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
             jina_config: None,
+            db_path: None,
         }
     }
 }
@@ -300,6 +304,11 @@ impl ToolRegistry {
         }
         if should_include("read_skill") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
+        }
+        if should_include("session_search") {
+            if let Some(ref db_path) = config.db_path {
+                self.register(Box::new(SessionSearchTool::new(db_path.clone())));
+            }
         }
     }
 

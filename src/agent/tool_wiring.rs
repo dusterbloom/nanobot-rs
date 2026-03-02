@@ -55,6 +55,10 @@ impl AgentLoopShared {
         chat_id: &str,
     ) -> (ToolRegistry, crate::agent::tools::reasoning_tools::SharedEngine) {
         // Standard stateless tools via unified ToolConfig.
+        let db_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nanobot")
+            .join("sessions.db");
         let tool_config = ToolConfig {
             workspace: core.workspace.clone(),
             exec_timeout: core.exec_timeout,
@@ -64,6 +68,7 @@ impl AgentLoopShared {
             exec_working_dir: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
+            db_path: Some(db_path),
             ..ToolConfig::new(&core.workspace)
         };
         let mut tools = ToolRegistry::with_standard_tools(&tool_config);

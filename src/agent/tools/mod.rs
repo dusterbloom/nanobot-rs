@@ -9,6 +9,7 @@ pub mod read_skill;
 pub mod reasoning_tools;
 pub mod recall;
 pub mod registry;
+pub mod session_search;
 pub mod shell;
 pub mod spawn;
 pub mod web;
@@ -20,6 +21,7 @@ pub use filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use message::{MessageTool, SendCallback};
 pub use read_skill::ReadSkillTool;
 pub use recall::RecallTool;
+pub use session_search::SessionSearchTool;
 pub use registry::ToolRegistry;
 pub use shell::ExecTool;
 pub use spawn::{
