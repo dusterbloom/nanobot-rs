@@ -146,6 +146,9 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Optional toolset name from `tools.toolsets` to restrict available tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
 }
 
 fn default_imap_port() -> u16 {
