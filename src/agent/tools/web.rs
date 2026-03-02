@@ -172,6 +172,17 @@ impl Tool for WebSearchTool {
         })
     }
 
+    /// Returns `true` when at least one search backend is configured.
+    ///
+    /// - SearXNG: available when `provider == "searxng"` and a non-empty
+    ///   SearXNG URL is present (the default `"http://localhost:8888"` counts).
+    /// - Brave: available when an API key is present (either passed at
+    ///   construction time or read from `$BRAVE_API_KEY`).
+    fn is_available(&self) -> bool {
+        (self.provider == "searxng" && !self.searxng_url.is_empty())
+            || !self.api_key.is_empty()
+    }
+
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
         let query = match params.get("query").and_then(|v| v.as_str()) {
             Some(q) => q,
