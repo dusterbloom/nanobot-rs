@@ -300,14 +300,16 @@ impl Tool for CodeExecutionTool {
             .env("NANOBOT_RPC_SOCKET", &socket_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true) // Automatically kill on drop (timeout path).
             .spawn();
 
-        let mut child = match child_result {
+        let child = match child_result {
             Ok(c) => c,
             Err(e) => return format!("Error: failed to spawn python3: {}", e),
         };
 
         // Wait for child with timeout.
+        // `wait_with_output` takes ownership, so we handle timeout via kill_on_drop.
         let timeout = Duration::from_secs(self.timeout_secs);
         let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
@@ -335,7 +337,7 @@ impl Tool for CodeExecutionTool {
             }
             Ok(Err(e)) => format!("Error: waiting for child process failed: {}", e),
             Err(_) => {
-                child.kill().await.ok();
+                // kill_on_drop(true) ensures the child is killed when dropped.
                 format!(
                     "Error: script timed out after {} seconds",
                     self.timeout_secs
@@ -343,6 +345,7 @@ impl Tool for CodeExecutionTool {
             }
         }
         // tmp_dir drops here, cleaning up script and socket.
+        // child was already moved into wait_with_output — kill_on_drop handles cleanup.
     }
 }
 
