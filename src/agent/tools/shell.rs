@@ -417,6 +417,14 @@ impl Tool for ExecTool {
             return error;
         }
 
+        // Emit a "start" progress event so the REPL shows the command immediately.
+        let _ = ctx.event_tx.send(ToolEvent::Progress {
+            tool_name: "exec".to_string(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            elapsed_ms: 0,
+            output_preview: Some(format!("Running: {}", command)),
+        });
+
         let start = std::time::Instant::now();
         let timeout_dur = Duration::from_secs(self.timeout);
 
