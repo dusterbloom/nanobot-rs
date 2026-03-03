@@ -134,6 +134,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 512,
             scratch_pad_rounds: 3,
             reader_tier: ReaderTier::Minimal,
+            parser: None,
         };
     }
     if lower.contains("functiongemma") {
@@ -146,6 +147,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 512,
             scratch_pad_rounds: 2,
             reader_tier: ReaderTier::Minimal,
+            parser: None,
         };
     }
     if lower.contains("ministral-3") {
@@ -158,6 +160,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
+            parser: None,
         };
     }
     if lower.contains("qwen3-1.7b") {
@@ -170,6 +173,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
+            parser: None,
         };
     }
     // Nemotron / orchestrator models (Medium, thinking enabled, native LMS API)
@@ -183,6 +187,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 4096,
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Standard,
+            parser: None,
         };
     }
     // Cloud / large models
@@ -203,6 +208,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 16384,
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Advanced,
+            parser: None,
         };
     }
     // Generic small model patterns (catch-all for size indicators)
@@ -223,6 +229,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
+            parser: None,
         };
     }
     // Unknown default: Medium, conservative
@@ -235,6 +242,7 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
         max_reliable_output: 4096,
         scratch_pad_rounds: 10,
         reader_tier: ReaderTier::Standard,
+        parser: None,
     }
 }
 
