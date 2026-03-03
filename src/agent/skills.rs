@@ -19,6 +19,22 @@ pub struct SkillInfo {
     pub source: String,
 }
 
+/// Result of validating a single skill.
+#[derive(Debug, Clone)]
+pub struct SkillValidationResult {
+    pub name: String,
+    pub path: String,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl SkillValidationResult {
+    /// Returns true when there are no errors.
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
 /// Loads and manages agent skills from workspace and built-in directories.
 pub struct SkillsLoader {
     workspace: PathBuf,
