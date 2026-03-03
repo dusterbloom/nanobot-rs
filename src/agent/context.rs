@@ -69,7 +69,6 @@ pub struct ContextBuilder {
     pub bootstrap_budget: usize,
     /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
     pub long_term_memory_budget: usize,
-<<<<<<< Updated upstream
     /// Max tokens for skills (always-loaded + summary) in the system prompt.
     pub skills_budget: usize,
     /// Max tokens for subagent profiles in the system prompt.
@@ -96,18 +95,6 @@ pub struct ContextBuilder {
     pub instruction_profiles: Option<crate::agent::instructions::InstructionProfiles>,
     /// Task kind used when resolving instruction profiles (default: "main").
     pub task_kind: String,
-=======
-    /// Max tokens for today's notes in the system prompt.
-    pub today_notes_budget: usize,
-    /// Max tokens for observations in the system prompt (default: 2000).
-    pub observation_budget: usize,
-    /// Max tokens for learning context in the system prompt.
-    pub learning_budget: usize,
-    /// Timestamp of the last user interaction (for time awareness).
-    pub last_interaction: Option<DateTime<Local>>,
-    /// Git change summary detected at session start.
-    pub git_changes: Option<String>,
->>>>>>> Stashed changes
 }
 
 impl ContextBuilder {
