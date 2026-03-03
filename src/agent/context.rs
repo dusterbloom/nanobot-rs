@@ -645,7 +645,6 @@ Only access files outside it when the user explicitly asks.
 Your workspace ({workspace_path}) is for your internal state (memory, skills, config) — not the user's project.
 Use absolute paths or paths relative to the working directory.{delegation_hint}
 
-<<<<<<< Updated upstream
 ## Memory
 Working Memory is injected automatically (session state). Long-term facts: {workspace_path}/memory/MEMORY.md.
 Use `recall` to search all memory (sessions, facts, archives).
@@ -670,49 +669,6 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach �
         let mut included: Vec<String> = Vec::new();
         let mut skipped: Vec<&str> = Vec::new();
         let mut remaining = budget_tokens;
-=======
-Always be helpful, accurate, and concise. When using tools, explain what you're doing.
-When remembering something, write to {workspace_path}/memory/MEMORY.md{git_section}"#
-        )
-    }
-
-    /// Format a duration into a human-readable gap string.
-    fn format_time_gap(gap: ChronoDuration) -> String {
-        let minutes = gap.num_minutes();
-        if minutes < 2 {
-            "Just now".to_string()
-        } else if minutes < 60 {
-            format!("{} min ago", minutes)
-        } else if gap.num_hours() < 24 {
-            let hours = gap.num_hours();
-            if hours == 1 {
-                "1 hour ago".to_string()
-            } else {
-                format!("{} hours ago", hours)
-            }
-        } else if gap.num_days() == 1 {
-            "Yesterday".to_string()
-        } else {
-            format!("{} days ago", gap.num_days())
-        }
-    }
-
-    /// Behavioral hint based on the time gap.
-    fn time_gap_hint(gap: ChronoDuration) -> &'static str {
-        let hours = gap.num_hours();
-        if hours < 1 {
-            "Continue naturally from where you left off."
-        } else if hours < 8 {
-            "The user is returning after a short break."
-        } else {
-            "The user is starting a new session — briefly re-orient if context changed."
-        }
-    }
-
-    /// Load all bootstrap files from workspace.
-    fn _load_bootstrap_files(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
->>>>>>> Stashed changes
 
         for filename in BOOTSTRAP_FILES {
             let file_path = self.workspace.join(filename);
