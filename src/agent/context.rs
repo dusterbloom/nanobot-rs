@@ -112,6 +112,7 @@ impl ContextBuilder {
             system_prompt_cap: 0, // no cap by default (cloud models)
             provenance_enabled: false,
             lazy_skills: false,
+            skill_disclosure: "compact".to_string(),
             agent_profiles: String::new(),
             instruction_profiles: None,
             task_kind: "main".to_string(),
