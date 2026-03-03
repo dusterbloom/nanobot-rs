@@ -8,27 +8,29 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              CLI (main.rs)                                   │
 │  Commands: onboard, agent, gateway, telegram, whatsapp, email, cron, eval   │
-└─────────────────────────────────────┬───────────────────────────────────────┘
-                                      │
-          ┌───────────────────────────┼───────────────────────────┐
-          │                           │                           │
-          ▼                           ▼                           ▼
-┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
-│   REPL Mode     │         │  Gateway Mode   │         │   Eval Mode     │
-│  (interactive)  │         │  (multi-chat)   │         │  (benchmarks)   │
-└────────┬────────┘         └────────┬────────┘         └─────────────────┘
-         │                           │
-         │    ┌──────────────────────┴──────────────────────┐
-         │    │                                             │
-         ▼    ▼                                             ▼
-┌─────────────────────────────────────┐    ┌─────────────────────────────────┐
-│           AgentLoop                 │    │        ChannelManager           │
-│  (core message processing)          │    │  (Telegram, WhatsApp, Email,    │
-│                                     │    │   Feishu adapters)              │
-└─────────────────────────────────────┘    └─────────────────────────────────┘
-         │                                             │
-         │              InboundMessage                │
-         │◄────────────────────────────────────────────┘
+│            realtime                                                          │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+     ┌─────────────────────────┼─────────────────────────┬──────────────────┐
+     │                         │                         │                  │
+     ▼                         ▼                         ▼                  ▼
+┌──────────────┐     ┌─────────────────┐     ┌─────────────────┐  ┌──────────────────┐
+│  REPL Mode   │     │  Gateway Mode   │     │   Eval Mode     │  │  Voice/Realtime  │
+│ (interactive)│     │  (multi-chat)   │     │  (benchmarks)   │  │  Mode (PTT/VAD)  │
+└──────┬───────┘     └────────┬────────┘     └─────────────────┘  └────────┬─────────┘
+       │                      │                                             │
+       │    ┌─────────────────┴──────────────────────┐                     │
+       │    │                                        │                     ▼
+       ▼    ▼                                        ▼             ┌───────────────┐
+┌─────────────────────────────────────┐    ┌─────────────────────────────────┐    │ VoiceAgent    │
+│           AgentLoop                 │    │        ChannelManager           │    │ (state machine│
+│  (core message processing)          │    │  (Telegram, WhatsApp, Email,    │    │  + barge-in)  │
+│                                     │    │   Feishu adapters)              │    └───────┬───────┘
+└─────────────────────────────────────┘    └─────────────────────────────────┘            │
+         │                                             │                          process_direct_
+         │              InboundMessage                │                          streaming()
+         │◄────────────────────────────────────────────┘                                  │
+         │◄─────────────────────────────────────────────────────────────────────────────────┘
          │
          │              OutboundMessage
          └────────────────────────────────────────────►
@@ -47,6 +49,7 @@
 **cli.rs** - Agent/config command implementations:
 - `cmd_onboard()` - Initialize config and workspace
 - `cmd_gateway()` - Start multi-channel gateway
+- `cmd_realtime()` - Start realtime voice session (continuous or PTT mode)
 - `build_core_handle()` - Create swappable core with provider
 - `rebuild_core()` - Hot-swap provider on `/local` toggle
 - `create_agent_loop()` - Wire agent loop with channels
@@ -664,6 +667,50 @@ Applied to live conversation
     └── audit.jsonl       # Tool call log (provenance)
 ```
 
+### 15. Realtime Voice Pipeline (`src/realtime/`)
+
+**Continuous voice-to-voice conversation pipeline:**
+
+```
+AudioCapture (always-on in Continuous mode)
+    │ Vec<f32> via mpsc
+    ▼
+RealtimeSession processing loop
+    ├── VAD (Silero) → SpeechSegment
+    ├── TurnDetector (SmartTurn v3) → TurnDecision::Complete(audio)
+    └── STT (batch) → TranscriptionResult
+    │
+    │ RealtimeEvent::TurnComplete { text, language }
+    ▼
+VoiceAgent event loop (pure state machine)
+    │
+    ├── LlmProcessor.process_text() → TextDelta stream
+    ├── SentenceAccumulator → TtsCommand::Synthesize
+    └── TTS → AudioPlayer
+        │
+        ├── Barge-in: SpeechStart during Speaking/Processing
+        │   → CancellationToken.cancel() + state → Listening
+```
+
+**Key Types:**
+- `InputMode` — `Continuous` (VAD-based, hands-free) or `PushToTalk` (Space key)
+- `VoiceAgentState` — `Listening` / `Processing` / `Speaking` (pure state machine)
+- `VoiceAction` — `EmitEvent` / `StartLlm` / `CancelAll` (barge-in)
+- `LlmProcessor` trait — abstracts LLM calls; `AgentLoopProcessor` (production) wraps `process_direct_streaming()`
+- `run_voice_event_loop()` — event-driven loop consuming `RealtimeEvent`, dispatching via `next_state()`
+
+**Barge-in:** When user speaks during Processing or Speaking state, `CancelAll` action fires: cancels in-flight LLM via `CancellationToken`, stops TTS, transitions to Listening.
+
+**TTS Pipeline:** LLM deltas → `SentenceAccumulator::new_streaming()` (eager mode, 500ms timeout) → `TtsCommand::Synthesize` → synthesis thread → playback thread. Reuses `start_streaming_speak()` pattern from `voice.rs`.
+
+**Modules:**
+| Module | Purpose |
+|--------|---------|
+| `session.rs` | RealtimeConfig, RealtimeSession, RealtimeEvent, InputMode, AudioCapture bridge |
+| `voice_agent.rs` | VoiceAgent, VoiceAgentState, next_state(), LlmProcessor trait, run_voice_event_loop() |
+| `ws_server.rs` | WebSocket server for OpenAI-compatible realtime API |
+| `mod.rs` | Public exports |
+
 ## Testing
 
 - All tests inline in `#[cfg(test)] mod tests`
@@ -675,7 +722,7 @@ Applied to live conversation
 ## Feature Flags
 
 - `default` - Core functionality
-- `voice` - Voice mode (requires jack-voice, crossterm, lingua)
+- `voice` - Voice mode + realtime pipeline (requires jack-voice, crossterm, lingua). Enables `/voice` REPL mode and `nanobot realtime` continuous/PTT voice sessions.
 
 ---
 

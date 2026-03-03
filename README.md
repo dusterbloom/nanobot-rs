@@ -90,6 +90,21 @@ Audio is streamed sentence-by-sentence through PulseAudio. First audio plays in 
 
 **Interrupt anytime**: press Enter during playback to cut the response short and start speaking. The assistant stops talking and listens.
 
+### Realtime voice (continuous)
+
+```bash
+nanobot realtime --engine pocket --voice alba
+```
+
+Hands-free conversation with VAD-based turn detection. No keys needed -- just speak. The pipeline:
+
+1. **Listen** -- Silero VAD detects speech, SmartTurn v3 determines when you're done
+2. **Process** -- Whisper transcribes, LLM streams response
+3. **Speak** -- Sentences stream to TTS as they arrive (~300ms to first audio)
+4. **Barge-in** -- Start speaking during a response to interrupt immediately
+
+Switch to push-to-talk with `--mode ptt` (hold Space to record).
+
 ### Tools
 
 The agent has hands. It can read and write files, run shell commands, search the web, spawn sub-agents, and schedule recurring tasks:
@@ -200,6 +215,8 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot channels status` | Channel status |
 | `nanobot cron list` | List scheduled jobs |
 | `nanobot cron add` | Add a scheduled job |
+| `nanobot realtime` | Realtime voice session (continuous mode) |
+| `nanobot realtime --mode ptt` | Realtime voice with push-to-talk |
 
 ## Building
 
@@ -235,7 +252,7 @@ For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). M
               Channels (Telegram / WhatsApp / Feishu)
                               |
                               v
-User --> CLI / Voice --> AgentLoop --> LLM Provider
+User --> CLI / Voice / Realtime --> AgentLoop --> LLM Provider
                            |   ^        (any OpenAI-compat API)
                            |   |
                            v   |
