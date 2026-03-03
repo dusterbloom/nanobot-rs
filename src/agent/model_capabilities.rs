@@ -52,6 +52,9 @@ pub struct ModelCapabilitiesOverride {
     pub max_reliable_output: Option<usize>,
     pub scratch_pad_rounds: Option<usize>,
     pub reader_tier: Option<ReaderTier>,
+    /// Parser override: selects a specific textual tool call parser by name.
+    /// Valid values: "hermes", "qwen", "llama", "deepseek".
+    pub parser: Option<String>,
 }
 
 /// Build `ModelCapabilities` from a model name string.
