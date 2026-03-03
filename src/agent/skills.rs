@@ -721,4 +721,77 @@ mod tests {
         let content = loader.load_skill("overlap").unwrap();
         assert_eq!(content, "workspace version");
     }
+
+    // ----- build_compact_index -----
+
+    #[test]
+    fn test_compact_index_format() {
+        let frontmatter = "description: A helpful skill for coding tasks";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_compact_index();
+        // Must start with the header line.
+        assert!(
+            index.starts_with("Available skills"),
+            "index should start with header: {}",
+            index
+        );
+        // Must contain one-line entry for the skill.
+        assert!(
+            index.contains("- test-skill: A helpful skill for coding tasks"),
+            "index should contain skill entry: {}",
+            index
+        );
+    }
+
+    #[test]
+    fn test_compact_index_empty() {
+        let tmp = TempDir::new().unwrap();
+        let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
+        let index = loader.build_compact_index();
+        assert_eq!(index, "", "empty skills should return empty string");
+    }
+
+    #[test]
+    fn test_compact_index_truncates_long_description() {
+        let long_desc = "A".repeat(80);
+        let frontmatter = format!("description: {}", long_desc);
+        let (_tmp, loader) = make_workspace_with_skill(Some(&frontmatter), "body");
+        let index = loader.build_compact_index();
+        // The description should be truncated to 60 chars.
+        let entry_line = index
+            .lines()
+            .find(|l| l.starts_with("- test-skill:"))
+            .expect("should have a test-skill entry");
+        // After "- test-skill: " (15 chars), description should be <= 60 chars.
+        let desc_part = entry_line
+            .strip_prefix("- test-skill: ")
+            .expect("entry should start with '- test-skill: '");
+        assert!(
+            desc_part.len() <= 60,
+            "description part '{}' should be <= 60 chars, got {}",
+            desc_part,
+            desc_part.len()
+        );
+    }
+
+    #[test]
+    fn test_compact_index_multiple_skills() {
+        let tmp = TempDir::new().unwrap();
+        // Create two workspace skills.
+        for name in &["skill-a", "skill-b"] {
+            let skill_dir = tmp.path().join("skills").join(name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\ndescription: Desc for {}\n---\nbody", name),
+            )
+            .unwrap();
+        }
+        let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
+        let index = loader.build_compact_index();
+        assert!(index.contains("skill-a"), "should contain skill-a");
+        assert!(index.contains("skill-b"), "should contain skill-b");
+        // Should be multi-line (header + 2 skills).
+        assert!(index.lines().count() >= 3);
+    }
 }
