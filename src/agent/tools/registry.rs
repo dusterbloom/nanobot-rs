@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use std::sync::Arc;
-
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
     CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool,
