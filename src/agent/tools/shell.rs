@@ -1023,23 +1023,18 @@ mod tests {
         let result = tool.execute_with_context(params, &ctx).await;
         assert!(result.contains("end"));
 
-        // Collect all Progress events
+        // Collect all Progress events (includes start event with elapsed_ms=0)
         let mut progress_count = 0;
         while let Ok(event) = rx.try_recv() {
-            if let ToolEvent::Progress {
-                tool_name,
-                elapsed_ms,
-                ..
-            } = event
-            {
+            if let ToolEvent::Progress { tool_name, .. } = event {
                 assert_eq!(tool_name, "exec");
-                assert!(elapsed_ms > 0);
                 progress_count += 1;
             }
         }
+        // Expect at least: 1 start event + at least 1 periodic ticker event for a 2s command
         assert!(
-            progress_count >= 1,
-            "Expected at least 1 Progress event, got {}",
+            progress_count >= 2,
+            "Expected at least 2 Progress events (start + ticker), got {}",
             progress_count
         );
     }
