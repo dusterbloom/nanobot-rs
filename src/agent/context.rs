@@ -558,7 +558,6 @@ impl ContextBuilder {
     /// Core identity section including current time, time awareness, and workspace info.
     fn _get_identity(&self) -> String {
         let now = Local::now();
-        let now_str = now.format("%Y-%m-%d %H:%M (%A)").to_string();
         let workspace_path = self
             .workspace
             .canonicalize()
