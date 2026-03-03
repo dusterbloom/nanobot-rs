@@ -136,6 +136,7 @@ impl ContextBuilder {
             system_prompt_cap: 800, // ~20% of typical 4K local model
             provenance_enabled: false,
             lazy_skills: false,
+            skill_disclosure: "compact".to_string(),
             agent_profiles: String::new(),
             instruction_profiles: None,
             task_kind: "main".to_string(),
