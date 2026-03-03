@@ -845,6 +845,98 @@ mod tests {
         );
     }
 
+    // ----- validate_skill -----
+
+    #[test]
+    fn test_validate_skill_missing_description() {
+        // A skill with no frontmatter has no description.
+        let (_tmp, loader) = make_workspace_with_skill(None, "# Undescribed skill\nDoes stuff.");
+        let skills = loader.list_skills(false);
+        assert_eq!(skills.len(), 1);
+        let result = loader.validate_skill(&skills[0]);
+        assert!(
+            result.errors.iter().any(|e| e.contains("Missing description")),
+            "expected 'Missing description' error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_ok() {
+        let frontmatter = "description: A proper description for the skill";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let skills = loader.list_skills(false);
+        assert_eq!(skills.len(), 1);
+        let result = loader.validate_skill(&skills[0]);
+        assert!(
+            result.errors.is_empty(),
+            "expected no errors, got: {:?}",
+            result.errors
+        );
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn test_validate_all_returns_one_per_skill() {
+        let tmp = TempDir::new().unwrap();
+        for name in &["skill-a", "skill-b"] {
+            let skill_dir = tmp.path().join("skills").join(name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\ndescription: Desc for {}\n---\nbody", name),
+            )
+            .unwrap();
+        }
+        let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
+        let results = loader.validate_all();
+        assert_eq!(results.len(), 2);
+    }
+
+    // ----- version support (Feature 3.5) -----
+
+    #[test]
+    fn test_skill_version_in_compact_index() {
+        let frontmatter = "description: A versioned skill\nversion: 1.0";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_compact_index();
+        assert!(
+            index.contains("(v1.0)"),
+            "compact index should contain '(v1.0)', got: {}",
+            index
+        );
+    }
+
+    #[test]
+    fn test_skill_version_in_xml_summary() {
+        let frontmatter = "description: A versioned skill\nversion: 2.3";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let summary = loader.build_skills_summary();
+        assert!(
+            summary.contains("version=\"2.3\""),
+            "XML summary should contain version attribute, got: {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_skill_no_version_omits_marker() {
+        let frontmatter = "description: A skill without version";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_compact_index();
+        assert!(
+            !index.contains("(v)"),
+            "compact index must not contain bare '(v)', got: {}",
+            index
+        );
+        let summary = loader.build_skills_summary();
+        assert!(
+            !summary.contains("version="),
+            "XML summary must not contain version attribute when absent, got: {}",
+            summary
+        );
+    }
+
     #[test]
     fn test_compact_index_multiple_skills() {
         let tmp = TempDir::new().unwrap();
