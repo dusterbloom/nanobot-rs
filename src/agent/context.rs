@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use chrono::{DateTime, Duration as ChronoDuration, Local};
+use chrono::Local;
 use serde_json::{json, Value};
 
 use crate::agent::memory::MemoryStore;
