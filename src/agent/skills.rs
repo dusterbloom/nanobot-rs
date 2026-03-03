@@ -209,7 +209,7 @@ impl SkillsLoader {
 
     /// Build a compact one-line-per-skill index for system prompt injection.
     ///
-    /// Format: "- skill_name: first 60 chars of description"
+    /// Format: "- skill_name (vX.Y): first 60 chars of description"
     /// Token cost: ~20 tokens per skill vs ~150 for XML summary.
     pub fn build_compact_index(&self) -> String {
         let skills = self.list_skills(false);
@@ -229,7 +229,10 @@ impl SkillsLoader {
             } else {
                 desc
             };
-            lines.push(format!("- {}: {}", skill.name, display));
+            let version_suffix = self._get_skill_version(&skill.name)
+                .map(|v| format!(" (v{})", v))
+                .unwrap_or_default();
+            lines.push(format!("- {}{}: {}", skill.name, version_suffix, display));
         }
         lines.join("\n")
     }
