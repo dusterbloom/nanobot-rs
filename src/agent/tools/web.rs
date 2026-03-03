@@ -1211,15 +1211,10 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         // always produces a briefing — matching real production behaviour
         // where web pages exceed the agent's remaining token budget.
         // ----------------------------------------------------------------
-        let cache_dir = PathBuf::from(std::env::temp_dir()).join("nanobot_test_gate");
-        let _ = std::fs::create_dir_all(&cache_dir);
         // 50 token budget → raw (≈575 tokens) will not fit → briefing path.
-        let mut gate = ContentGate::new(50, 0.2, cache_dir.clone());
+        let mut gate = ContentGate::new(50, 0.2);
         let gate_result = gate.admit_simple(&raw);
         let gate_view = gate_result.into_text();
-
-        // Clean up temp dir (best-effort).
-        let _ = std::fs::remove_dir_all(&cache_dir);
 
         // ----------------------------------------------------------------
         // Print what each approach produces (visible with `-- --nocapture`).

@@ -12,6 +12,166 @@ use tiktoken_rs::CoreBPE;
 
 use crate::agent::compaction::tool_output_digest;
 
+/// Remove tool result messages whose `tool_call_id` is in `ids_to_remove`.
+///
+/// Tool results without a `tool_call_id` field (legacy messages) are kept.
+fn remove_orphaned_tool_results(messages: &mut Vec<Value>, ids_to_remove: &HashSet<String>) {
+    if ids_to_remove.is_empty() {
+        return;
+    }
+    messages.retain(|m| {
+        if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            return true;
+        }
+        m.get("tool_call_id")
+            .and_then(|id| id.as_str())
+            .map(|id| !ids_to_remove.contains(id))
+            .unwrap_or(true) // keep tool msgs without tool_call_id (legacy)
+    });
+}
+
+/// Stage 0: Evict messages older than `age_threshold` turns.
+///
+/// Preserves the system message (index 0) and the last message unconditionally.
+/// After filtering, removes any tool results that were orphaned by the eviction.
+/// No-op when `max_age_turns == 0` or `current_turn == 0` or `msgs.len() <= 2`.
+fn evict_by_age(msgs: &mut Vec<Value>, current_turn: u64, max_age_turns: usize) {
+    if max_age_turns == 0 || current_turn == 0 || msgs.len() <= 2 {
+        return;
+    }
+    let age_threshold = current_turn.saturating_sub(max_age_turns as u64);
+    let last_idx = msgs.len() - 1;
+    let retained: Vec<Value> = msgs
+        .drain(..)
+        .enumerate()
+        .filter(|(i, m)| {
+            if *i == 0 || *i == last_idx {
+                return true;
+            }
+            if let Some(turn) = m.get("_turn").and_then(|v| v.as_u64()) {
+                turn >= age_threshold
+            } else {
+                true
+            }
+        })
+        .map(|(_, m)| m)
+        .collect();
+    *msgs = retained;
+
+    // Remove orphaned tool results whose assistant was age-evicted.
+    let known_call_ids: HashSet<String> = msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .filter_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
+        .flat_map(|tcs| tcs.iter())
+        .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()).map(String::from))
+        .collect();
+    let ids_to_remove: HashSet<String> = msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .filter_map(|m| m.get("tool_call_id").and_then(|id| id.as_str()).map(String::from))
+        .filter(|id| !known_call_ids.contains(id))
+        .collect();
+    remove_orphaned_tool_results(msgs, &ids_to_remove);
+}
+
+/// Stage 1: Truncate old tool results to digest summaries, keeping the most recent 4 intact.
+///
+/// Only fires when there are more than 4 tool messages. Results longer than 200 chars are
+/// replaced with a compact digest marker so the LLM can see data existed and was compressed.
+fn truncate_old_tool_results(msgs: &mut Vec<Value>) {
+    let tool_msg_indices: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+
+    if tool_msg_indices.len() > 4 {
+        let truncate_up_to = tool_msg_indices.len() - 4;
+        for &idx in &tool_msg_indices[..truncate_up_to] {
+            if let Some(content) = msgs[idx].get("content").and_then(|c| c.as_str()) {
+                if content.len() > 200 {
+                    msgs[idx]["content"] = Value::String(tool_output_digest(content, 200));
+                }
+            }
+        }
+    }
+}
+
+/// Stage 2: Walk backward from the tail, keeping messages that fit within `budget`.
+///
+/// The system message (index 0) is always preserved. Tool results whose assistant
+/// message was skipped are also dropped to maintain protocol integrity.
+fn keep_recent_within_budget(msgs: &mut Vec<Value>, budget: usize) {
+    if msgs.len() <= 2 {
+        return;
+    }
+    let system_msg = msgs[0].clone();
+    let system_tokens = TokenBudget::estimate_message_tokens(&system_msg);
+    let remaining_budget = budget.saturating_sub(system_tokens);
+
+    let mut kept_tail: Vec<Value> = Vec::new();
+    let mut tail_tokens = 0;
+    let mut skipped_call_ids: HashSet<String> = HashSet::new();
+
+    for msg in msgs[1..].iter().rev() {
+        let msg_tokens = TokenBudget::estimate_message_tokens(msg);
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        // Skip tool results whose assistant was already skipped.
+        if role == "tool" {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                if skipped_call_ids.contains(id) {
+                    continue;
+                }
+            }
+        }
+
+        if tail_tokens + msg_tokens <= remaining_budget {
+            kept_tail.push(msg.clone());
+            tail_tokens += msg_tokens;
+        } else {
+            // Track tool_call IDs from skipped assistant messages.
+            if role == "assistant" {
+                if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            skipped_call_ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    kept_tail.reverse();
+
+    // Post-walk cleanup: remove tool results whose assistant was skipped.
+    // This catches cases where the backward walk saw the tool result before
+    // discovering its assistant would be skipped.
+    remove_orphaned_tool_results(&mut kept_tail, &skipped_call_ids);
+
+    *msgs = std::iter::once(system_msg).chain(kept_tail).collect();
+}
+
+/// Stage 3 (hard reset): Keep only system prompt + truncation notice + last user message.
+///
+/// Last resort when all softer strategies still exceed the budget.
+/// No-op when `msgs.len() <= 2` (nothing to collapse).
+fn hard_reset(msgs: &mut Vec<Value>) {
+    if msgs.len() <= 2 {
+        return;
+    }
+    let system_msg = msgs[0].clone();
+    let last_msg = msgs.last().cloned().unwrap();
+    let summary_msg = serde_json::json!({
+        "role": "user",
+        "content": "[Previous conversation truncated due to context limits. Please continue from the latest message.]"
+    });
+    *msgs = vec![system_msg, summary_msg, last_msg];
+}
+
 /// Manages the token budget for LLM context windows.
 ///
 /// Unified budget system: handles both context-window trimming (for message
@@ -189,159 +349,29 @@ impl TokenBudget {
         let mut msgs = messages.to_vec();
 
         // Stage 0: Proactive age-based eviction — runs even when within budget.
-        // This prevents context rot from old messages accumulating in large windows.
-        if max_age_turns > 0 && current_turn > 0 && msgs.len() > 2 {
-            let age_threshold = current_turn.saturating_sub(max_age_turns as u64);
-            let last_idx = msgs.len() - 1;
-            msgs = msgs
-                .into_iter()
-                .enumerate()
-                .filter(|(i, m)| {
-                    if *i == 0 || *i == last_idx {
-                        return true;
-                    }
-                    if let Some(turn) = m.get("_turn").and_then(|v| v.as_u64()) {
-                        turn >= age_threshold
-                    } else {
-                        true
-                    }
-                })
-                .map(|(_, m)| m)
-                .collect();
-
-            // Remove orphaned tool results whose assistant was age-evicted.
-            let known_call_ids: HashSet<String> = msgs
-                .iter()
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                .filter_map(|m| m.get("tool_calls").and_then(|tc| tc.as_array()))
-                .flat_map(|tcs| tcs.iter())
-                .filter_map(|tc| tc.get("id").and_then(|id| id.as_str()).map(String::from))
-                .collect();
-            msgs.retain(|m| {
-                if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
-                    return true;
-                }
-                m.get("tool_call_id")
-                    .and_then(|id| id.as_str())
-                    .map(|id| known_call_ids.contains(id))
-                    .unwrap_or(true) // keep tool msgs without tool_call_id (legacy)
-            });
-        }
-
-        // Already within budget?
-        if Self::estimate_tokens(&msgs) <= budget {
-            return msgs;
-        }
-
-        // Stage 1: Truncate old tool results (keeping most recent 4).
-        let tool_msg_indices: Vec<usize> = msgs
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-            .map(|(i, _)| i)
-            .collect();
-
-        if tool_msg_indices.len() > 4 {
-            let truncate_up_to = tool_msg_indices.len() - 4;
-            for &idx in &tool_msg_indices[..truncate_up_to] {
-                if let Some(content) = msgs[idx].get("content").and_then(|c| c.as_str()) {
-                    if content.len() > 200 {
-                        // Replace with a digest marker so the LLM can see that
-                        // data existed and was compressed, rather than silently
-                        // dropping it.
-                        msgs[idx]["content"] =
-                            Value::String(tool_output_digest(content, 200));
-                    }
-                }
-            }
-        }
+        // Prevents context rot from old messages accumulating in large windows.
+        evict_by_age(&mut msgs, current_turn, max_age_turns);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
-        // Stage 2: Drop oldest non-system, non-recent messages.
-        // Keep: system (index 0) + last N messages that fit.
-        if msgs.len() > 2 {
-            let system_msg = msgs[0].clone();
-            let system_tokens = Self::estimate_message_tokens(&system_msg);
-
-            let mut kept_tail: Vec<Value> = Vec::new();
-            let mut tail_tokens = 0;
-            let remaining_budget = budget.saturating_sub(system_tokens);
-
-            // Walk backwards from the end, keeping messages that fit.
-            // Track tool_call IDs from skipped assistant messages so we also
-            // skip their orphaned tool results (protocol safety).
-            let mut skipped_call_ids: HashSet<String> = HashSet::new();
-
-            for msg in msgs[1..].iter().rev() {
-                let msg_tokens = Self::estimate_message_tokens(msg);
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-
-                // Skip tool results whose assistant was already skipped.
-                if role == "tool" {
-                    if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
-                        if skipped_call_ids.contains(id) {
-                            continue;
-                        }
-                    }
-                }
-
-                if tail_tokens + msg_tokens <= remaining_budget {
-                    kept_tail.push(msg.clone());
-                    tail_tokens += msg_tokens;
-                } else {
-                    // Track tool_call IDs from skipped assistant messages.
-                    if role == "assistant" {
-                        if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                            for tc in tcs {
-                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                    skipped_call_ids.insert(id.to_string());
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            kept_tail.reverse();
-
-            // Post-walk cleanup: remove tool results whose assistant was
-            // skipped. This catches cases where the backward walk saw the tool
-            // result before discovering its assistant would be skipped.
-            if !skipped_call_ids.is_empty() {
-                kept_tail.retain(|m| {
-                    if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
-                        return true;
-                    }
-                    m.get("tool_call_id")
-                        .and_then(|id| id.as_str())
-                        .map(|id| !skipped_call_ids.contains(id))
-                        .unwrap_or(true)
-                });
-            }
-
-            let mut result = vec![system_msg];
-            result.extend(kept_tail);
-            msgs = result;
-        }
+        // Stage 1: Truncate old tool results to digest summaries.
+        truncate_old_tool_results(&mut msgs);
 
         if Self::estimate_tokens(&msgs) <= budget {
             return msgs;
         }
 
-        // Stage 3 (hard): System prompt + summary + last user message.
-        if msgs.len() > 2 {
-            let system_msg = msgs[0].clone();
-            let last_msg = msgs.last().cloned().unwrap();
-            let summary_msg = serde_json::json!({
-                "role": "user",
-                "content": "[Previous conversation truncated due to context limits. Please continue from the latest message.]"
-            });
-            msgs = vec![system_msg, summary_msg, last_msg];
+        // Stage 2: Drop oldest messages, keeping system + recent tail that fits.
+        keep_recent_within_budget(&mut msgs, budget);
+
+        if Self::estimate_tokens(&msgs) <= budget {
+            return msgs;
         }
+
+        // Stage 3 (hard): System prompt + truncation notice + last message.
+        hard_reset(&mut msgs);
 
         msgs
     }

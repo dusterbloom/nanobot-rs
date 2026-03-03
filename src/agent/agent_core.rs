@@ -334,6 +334,7 @@ pub struct SwappableCoreConfig {
 ///
 /// Called once at startup and again for every `/local` or `/model` toggle.
 /// Resolves provider selection, memory config, tool delegation, and router setup.
+#[allow(deprecated)] // reads lazy_skills for backward-compat wire-through
 pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     let SwappableCoreConfig {
         provider,

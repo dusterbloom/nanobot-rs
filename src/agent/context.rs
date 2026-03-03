@@ -392,40 +392,7 @@ impl ContextBuilder {
 
         if is_local {
             let mut system_prompt = self.build_system_prompt(skill_names, channel);
-            if let (Some(ch), Some(cid)) = (channel, chat_id) {
-                system_prompt.push_str(&format!(
-                    "\n\n## Current Session\nChannel: {}\nChat ID: {}",
-                    ch, cid
-                ));
-                if ch == "voice" || is_voice_message {
-                    system_prompt.push_str(concat!(
-                        "\n\n## Voice Mode (IMPORTANT)\n",
-                        "The user is speaking via microphone and your response will be read aloud by TTS. ",
-                        "STRICT RULES:\n",
-                        "- Keep responses to 1-3 sentences. Be concise.\n",
-                        "- Use plain spoken language only.\n",
-                        "- NEVER use emoji, emoticons, or unicode symbols.\n",
-                        "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
-                        "- NEVER output code blocks or technical formatting.\n",
-                        "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
-                        "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
-                        "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
-                        "Never say 'sorry I can not' without exhausting your options.",
-                    ));
-                    if let Some(lang) = detected_language {
-                        if lang == "en" {
-                            system_prompt.push_str(
-                                "\n- The user is speaking in English. You MUST respond in English.",
-                            );
-                        } else {
-                            system_prompt.push_str(&format!(
-                                "\n- The user is speaking in {}. You MUST respond in the same language.",
-                                lang_code_to_name(lang)
-                            ));
-                        }
-                    }
-                }
-            }
+            system_prompt.push_str(&_session_metadata_suffix(channel, chat_id, is_voice_message, detected_language));
             system_prompt.push_str(concat!(
                 "\n\n## Tool Usage (IMPORTANT for Local Models)\n",
                 "1. AFTER getting tool results, SYNTHESIZE and ANSWER the user's question directly.\n",
@@ -443,40 +410,7 @@ impl ContextBuilder {
             let mut developer = self.build_developer_context(skill_names, channel);
 
             // Append session/voice metadata to the developer context block.
-            if let (Some(ch), Some(cid)) = (channel, chat_id) {
-                developer.push_str(&format!(
-                    "\n\n## Current Session\nChannel: {}\nChat ID: {}",
-                    ch, cid
-                ));
-                if ch == "voice" || is_voice_message {
-                    developer.push_str(concat!(
-                        "\n\n## Voice Mode (IMPORTANT)\n",
-                        "The user is speaking via microphone and your response will be read aloud by TTS. ",
-                        "STRICT RULES:\n",
-                        "- Keep responses to 1-3 sentences. Be concise.\n",
-                        "- Use plain spoken language only.\n",
-                        "- NEVER use emoji, emoticons, or unicode symbols.\n",
-                        "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
-                        "- NEVER output code blocks or technical formatting.\n",
-                        "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
-                        "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
-                        "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
-                        "Never say 'sorry I can not' without exhausting your options.",
-                    ));
-                    if let Some(lang) = detected_language {
-                        if lang == "en" {
-                            developer.push_str(
-                                "\n- The user is speaking in English. You MUST respond in English.",
-                            );
-                        } else {
-                            developer.push_str(&format!(
-                                "\n- The user is speaking in {}. You MUST respond in the same language.",
-                                lang_code_to_name(lang)
-                            ));
-                        }
-                    }
-                }
-            }
+            developer.push_str(&_session_metadata_suffix(channel, chat_id, is_voice_message, detected_language));
 
             messages.push(json!({"role": "system", "content": identity}));
             if !developer.is_empty() {
@@ -629,14 +563,17 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
         )
     }
 
-    /// Load bootstrap files within budget using file-granularity inclusion.
+    /// Load bootstrap files within budget using progressive line-level inclusion.
     ///
-    /// Each file is included in full if it fits the remaining budget; otherwise
-    /// it is skipped entirely. Skipped files are listed in a brief note so the
-    /// model knows they exist and can fetch them with `read_file`.
+    /// If a file fits fully within the remaining budget it is included in full.
+    /// If a file does not fit fully, as many lines as will fit are included and
+    /// a truncation note is appended. Files that cannot fit even a single line
+    /// are skipped entirely and listed so the model can fetch them with
+    /// `read_file`.
     ///
-    /// This avoids mid-content truncation that would show broken/incomplete
-    /// instructions to the model â€” a complete file or nothing.
+    /// Priority follows `BOOTSTRAP_FILES` ordering: earlier files and earlier
+    /// lines within a file always win. Cloud models with generous budgets see
+    /// the same result as before (all files fit fully).
     fn _load_bootstrap_files_within_budget(&self, budget_tokens: usize) -> String {
         if budget_tokens == 0 {
             return String::new();
@@ -660,14 +597,44 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
             let cost = TokenBudget::estimate_str_tokens(&section);
 
             if cost <= remaining {
+                // File fits fully â€” include as-is.
                 included.push(section);
                 remaining = remaining.saturating_sub(cost);
             } else {
-                skipped.push(filename);
+                // File does not fit fully â€” include as many lines as possible.
+                let header = format!("## {}\n\n", filename);
+                let header_cost = TokenBudget::estimate_str_tokens(&header);
+                if header_cost >= remaining {
+                    // Not even the header fits; skip entirely.
+                    skipped.push(filename);
+                    continue;
+                }
+                remaining = remaining.saturating_sub(header_cost);
+
+                let mut partial_lines: Vec<&str> = Vec::new();
+                for line in content.lines() {
+                    let line_cost = TokenBudget::estimate_str_tokens(line) + 1; // +1 for newline
+                    if line_cost > remaining {
+                        break;
+                    }
+                    partial_lines.push(line);
+                    remaining = remaining.saturating_sub(line_cost);
+                }
+
+                if partial_lines.is_empty() {
+                    skipped.push(filename);
+                } else {
+                    included.push(format!(
+                        "{}{}",
+                        header,
+                        partial_lines.join("\n")
+                    ));
+                    skipped.push(filename); // full file still available via read_file
+                }
             }
         }
 
-        // Tell the model about skipped files (never a "truncated" marker).
+        // Tell the model about skipped/truncated files.
         if !skipped.is_empty() {
             let note = format!(
                 "_Workspace files available via read_file: {}_",
@@ -800,6 +767,60 @@ fn lang_code_to_name(code: &str) -> &'static str {
         "en" => "English",
         _ => "the user's language",
     }
+}
+
+/// Build the session metadata suffix appended to the system/developer prompt.
+///
+/// Returns a string starting with `"\n\n"` when channel and chat_id are both present,
+/// or an empty string when either is `None`.
+/// Appends voice mode instructions when appropriate.
+fn _session_metadata_suffix(
+    channel: Option<&str>,
+    chat_id: Option<&str>,
+    is_voice: bool,
+    detected_language: Option<&str>,
+) -> String {
+    let (Some(ch), Some(cid)) = (channel, chat_id) else {
+        return String::new();
+    };
+    let mut text = format!("\n\n## Current Session\nChannel: {}\nChat ID: {}", ch, cid);
+    if ch == "voice" || is_voice {
+        text.push_str(&_voice_mode_instructions(detected_language));
+    }
+    text
+}
+
+/// Build the voice mode instruction block appended to the system/developer prompt.
+///
+/// `detected_language` is an ISO 639-1 code (e.g. `"en"`, `"es"`) or `None`.
+/// The returned string always starts with `"\n\n"` so callers can push it directly.
+fn _voice_mode_instructions(detected_language: Option<&str>) -> String {
+    let mut text = concat!(
+        "\n\n## Voice Mode (IMPORTANT)\n",
+        "The user is speaking via microphone and your response will be read aloud by TTS. ",
+        "STRICT RULES:\n",
+        "- Keep responses to 1-3 sentences. Be concise.\n",
+        "- Use plain spoken language only.\n",
+        "- NEVER use emoji, emoticons, or unicode symbols.\n",
+        "- NEVER use markdown: no **, no ##, no ```, no bullet points, no numbered lists.\n",
+        "- NEVER output code blocks or technical formatting.\n",
+        "- If asked a complex question, give a brief spoken answer, not a written essay.\n",
+        "- Be concise in SPOKEN OUTPUT, but still be resourceful with tools. ",
+        "If one tool or approach fails, try alternatives (spawn agents, web_fetch, exec curl, etc.) before giving up. ",
+        "Never say 'sorry I can not' without exhausting your options.",
+    )
+    .to_string();
+    if let Some(lang) = detected_language {
+        if lang == "en" {
+            text.push_str("\n- The user is speaking in English. You MUST respond in English.");
+        } else {
+            text.push_str(&format!(
+                "\n- The user is speaking in {}. You MUST respond in the same language.",
+                lang_code_to_name(lang)
+            ));
+        }
+    }
+    text
 }
 
 /// Guess MIME type from a file extension.
@@ -946,6 +967,67 @@ mod tests {
         // Model should be told the file exists and can be fetched.
         assert!(prompt.contains("AGENTS.md"));
         assert!(prompt.contains("read_file"));
+    }
+
+    #[test]
+    fn test_bootstrap_partial_inclusion_tight_budget() {
+        // Budget is large enough for AGENTS.md header + a few lines but not
+        // the whole file.  Verify that the first lines are present.
+        let tmp = TempDir::new().unwrap();
+        let long_content = (0..50)
+            .map(|i| format!("Line {}: some important directive here\n", i))
+            .collect::<String>();
+        fs::write(tmp.path().join("AGENTS.md"), &long_content).unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        // Budget: fits header (~6 tok) + a handful of lines but not all 50.
+        cb.bootstrap_budget = 80;
+        let result = cb._load_bootstrap_files_within_budget(80);
+        // First line must be present.
+        assert!(
+            result.contains("Line 0:"),
+            "first line should be present in partial inclusion"
+        );
+        // Last line must be absent (budget exhausted before line 49).
+        assert!(
+            !result.contains("Line 49:"),
+            "last line should be absent when budget is tight"
+        );
+        // The AGENTS.md section header should be present.
+        assert!(result.contains("AGENTS.md"), "file header should appear in partial section");
+    }
+
+    #[test]
+    fn test_bootstrap_full_inclusion_generous_budget() {
+        // Generous budget: every file must be fully included (no truncation).
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "Agent directive alpha").unwrap();
+        fs::write(tmp.path().join("SOUL.md"), "Soul directive beta").unwrap();
+        fs::write(tmp.path().join("USER.md"), "User directive gamma").unwrap();
+        let cb = ContextBuilder::new(tmp.path());
+        let result = cb._load_bootstrap_files_within_budget(10_000);
+        assert!(result.contains("Agent directive alpha"), "AGENTS.md fully included");
+        assert!(result.contains("Soul directive beta"), "SOUL.md fully included");
+        assert!(result.contains("User directive gamma"), "USER.md fully included");
+        // No skipped-file note should appear since all files fit.
+        assert!(!result.contains("read_file"), "no skipped files when budget is generous");
+    }
+
+    #[test]
+    fn test_bootstrap_critical_directive_survives_tight_budget() {
+        // A critical directive on line 2 of USER.md must survive when the
+        // budget is too tight to include the whole file.
+        let tmp = TempDir::new().unwrap();
+        let user_content = "# User preferences\nRespond in the user's language\n".to_string()
+            + &"filler line\n".repeat(100);
+        fs::write(tmp.path().join("USER.md"), &user_content).unwrap();
+        let mut cb = ContextBuilder::new(tmp.path());
+        // Budget: fits the header + first two lines but not the 100 filler lines.
+        cb.bootstrap_budget = 60;
+        let result = cb._load_bootstrap_files_within_budget(60);
+        assert!(
+            result.contains("Respond in the user's language"),
+            "critical directive on line 2 must survive tight budget"
+        );
     }
 
     // ----- build_messages -----

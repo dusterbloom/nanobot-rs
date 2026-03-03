@@ -229,13 +229,9 @@ impl AgentLoopShared {
         let compaction_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Context gate: budget-aware content sizing for this turn.
-        let cache_dir = crate::utils::helpers::get_data_path()
-            .join("cache")
-            .join("tool_outputs");
         let mut content_gate = ContentGate::new(
             core.token_budget.max_context(),
             0.20,
-            cache_dir,
         );
         // Pre-consume the tokens already used by system prompt + history.
         let initial_tokens = TokenBudget::estimate_tokens(&messages);

@@ -19,7 +19,6 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use nanobot::agent::compaction::ContextCompactor;
 use nanobot::agent::context_gate::ContentGate;
 use nanobot::agent::token_budget::TokenBudget;
 use nanobot::providers::base::LLMProvider;
@@ -81,18 +80,12 @@ struct Aggregate {
 #[derive(Clone, Copy)]
 enum BenchMode {
     Specialist,
-    Compactor,
-    Deterministic,
-    Hybrid,
 }
 
 impl BenchMode {
     fn as_str(self) -> &'static str {
         match self {
             BenchMode::Specialist => "specialist",
-            BenchMode::Compactor => "compactor",
-            BenchMode::Deterministic => "deterministic",
-            BenchMode::Hybrid => "hybrid",
         }
     }
 }
@@ -581,29 +574,10 @@ async fn summarize_once(
     gate_max_tokens = gate_max_tokens.max(64);
 
     for attempt in 0..3 {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let cache_dir = std::env::temp_dir().join(format!(
-            "nanobot_specialist_gate_bench_{}_{}_{}",
-            std::process::id(),
-            stamp,
-            attempt
-        ));
-        let mut gate = ContentGate::new(gate_max_tokens, 0.20, cache_dir);
+        let mut gate = ContentGate::new(gate_max_tokens, 0.20);
         let out = match mode {
             BenchMode::Specialist => {
                 gate.admit_with_specialist(source_content, provider.as_ref(), model)
-                    .await
-            }
-            BenchMode::Compactor => {
-                let compactor = ContextCompactor::new(provider.clone(), model.to_string(), 4096);
-                gate.admit_with_compactor(source_content, &compactor).await
-            }
-            BenchMode::Deterministic => gate.admit_with_deterministic(source_content),
-            BenchMode::Hybrid => {
-                gate.admit_with_hybrid(source_content, provider.as_ref(), model)
                     .await
             }
         };
@@ -666,12 +640,7 @@ async fn bench_specialist_summaries_small_to_3b() {
         .unwrap_or(true);
     let mode = std::env::var("NANOBOT_SPECIALIST_BENCH_MODE")
         .ok()
-        .map(|v| match v.to_ascii_lowercase().as_str() {
-            "compactor" => BenchMode::Compactor,
-            "deterministic" => BenchMode::Deterministic,
-            "hybrid" => BenchMode::Hybrid,
-            _ => BenchMode::Specialist,
-        })
+        .map(|_v| BenchMode::Specialist)
         .unwrap_or(BenchMode::Specialist);
 
     let requested_models = env_models();

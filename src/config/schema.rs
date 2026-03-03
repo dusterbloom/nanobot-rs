@@ -1028,6 +1028,7 @@ pub struct MemoryConfig {
 
     /// Deprecated: observations are no longer injected into the system prompt.
     /// Kept for backward compatibility with existing config files.
+    #[deprecated(note = "Observations removed from system prompt; this field has no effect")]
     #[serde(default = "default_observation_budget")]
     pub observation_budget: usize,
 
@@ -1072,6 +1073,7 @@ pub struct MemoryConfig {
     /// When true, skills are loaded as names+descriptions only (not full content).
     /// The agent fetches full skill content on demand via the `read_skill` tool.
     /// This keeps the system prompt lean (RLM pattern: context as variable).
+    #[deprecated(note = "Superseded by `skill_disclosure` enum; set skill_disclosure = \"compact\" instead")]
     #[serde(default)]
     pub lazy_skills: bool,
 
@@ -1146,6 +1148,7 @@ fn default_skill_disclosure() -> String {
     "compact".to_string()
 }
 
+#[allow(deprecated)]
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
