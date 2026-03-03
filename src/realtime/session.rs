@@ -17,6 +17,16 @@ use jack_voice::{
 
 use crate::config::schema::TtsEngineConfig;
 
+/// Audio input mode for the realtime session.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum InputMode {
+    /// VAD-based continuous listening (hands-free).
+    #[default]
+    Continuous,
+    /// Push-to-talk: audio flows only while key held.
+    PushToTalk,
+}
+
 /// Configuration for realtime voice sessions.
 #[derive(Debug, Clone)]
 pub struct RealtimeConfig {
@@ -30,6 +40,8 @@ pub struct RealtimeConfig {
     pub silence_timeout_ms: u64,
     /// Enable SmartTurn for turn detection.
     pub smart_turn_enabled: bool,
+    /// Audio input mode (continuous VAD or push-to-talk).
+    pub input_mode: InputMode,
 }
 
 impl Default for RealtimeConfig {
@@ -40,6 +52,7 @@ impl Default for RealtimeConfig {
             vad_threshold: 0.3,
             silence_timeout_ms: 1200,
             smart_turn_enabled: true,
+            input_mode: InputMode::default(),
         }
     }
 }
@@ -59,6 +72,8 @@ pub enum RealtimeEvent {
     AudioChunk { samples: Vec<f32>, sample_rate: u32 },
     /// TTS finished.
     SynthesisComplete,
+    /// TTS playback finished (all audio played to speaker).
+    TtsPlaybackComplete,
     /// Error occurred.
     Error(String),
 }
@@ -197,6 +212,11 @@ impl RealtimeSession {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
 
+        // Start audio capture in continuous mode
+        if self.config.input_mode == InputMode::Continuous {
+            self.start_continuous_capture(audio_tx.clone())?;
+        }
+
         // Take ownership of components
         let mut vad = self.vad.take().ok_or("VAD not initialized")?;
         let mut turn_detector = self.turn_detector.take();
@@ -297,9 +317,47 @@ impl RealtimeSession {
         Ok(())
     }
 
+    /// Start continuous audio capture via microphone.
+    ///
+    /// Creates a std::sync::mpsc channel, passes the sender to AudioCapture::start(),
+    /// then spawns a bridge task that forwards chunks from the sync receiver to the
+    /// async mpsc sender. Stores the capture handle for cleanup on stop().
+    #[cfg(feature = "voice")]
+    fn start_continuous_capture(&mut self, audio_tx: mpsc::Sender<Vec<f32>>) -> Result<(), String> {
+        // AudioCapture::start() takes a std::sync::mpsc::Sender and writes directly to it
+        let (cap_tx, cap_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+
+        let capture = AudioCapture::start(cap_tx)
+            .map_err(|e| format!("AudioCapture start failed: {}", e))?;
+
+        self.capture = Some(capture);
+
+        // Bridge: sync cap_rx -> async audio_tx
+        // Uses spawn_blocking because cap_rx.recv() is blocking
+        let running = self.running.clone();
+        tokio::task::spawn_blocking(move || {
+            while running.load(Ordering::SeqCst) {
+                match cap_rx.recv() {
+                    Ok(samples) => {
+                        // try_send drops samples on backpressure to maintain real-time
+                        if audio_tx.try_send(samples).is_err() {
+                            tracing::debug!("Audio bridge: dropped samples (backpressure)");
+                        }
+                    }
+                    Err(_) => break, // Capture stopped
+                }
+            }
+        });
+
+        tracing::info!("Continuous audio capture started");
+        Ok(())
+    }
+
     /// Stop the session.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Drop capture handle to stop audio recording
+        self.capture = None;
     }
 
     /// Check if the session is running.
@@ -342,12 +400,48 @@ mod tests {
             vad_threshold: 0.5,
             silence_timeout_ms: 800,
             smart_turn_enabled: false,
+            input_mode: InputMode::Continuous,
         };
         assert_eq!(config.tts_engine, TtsEngineConfig::Qwen);
         assert_eq!(config.qwen_voice, "serena");
         assert!((config.vad_threshold - 0.5f32).abs() < f32::EPSILON);
         assert_eq!(config.silence_timeout_ms, 800);
         assert!(!config.smart_turn_enabled);
+    }
+
+    #[test]
+    fn test_input_mode_default_is_continuous() {
+        assert_eq!(InputMode::default(), InputMode::Continuous);
+    }
+
+    #[test]
+    fn test_realtime_config_has_input_mode() {
+        let config = RealtimeConfig::default();
+        assert_eq!(config.input_mode, InputMode::Continuous);
+    }
+
+    #[test]
+    fn test_realtime_config_ptt_mode() {
+        let config = RealtimeConfig {
+            input_mode: InputMode::PushToTalk,
+            ..Default::default()
+        };
+        assert_eq!(config.input_mode, InputMode::PushToTalk);
+    }
+
+    #[test]
+    fn test_continuous_mode_config_default() {
+        let config = RealtimeConfig::default();
+        assert_eq!(config.input_mode, InputMode::Continuous);
+    }
+
+    #[test]
+    fn test_ptt_mode_config() {
+        let config = RealtimeConfig {
+            input_mode: InputMode::PushToTalk,
+            ..Default::default()
+        };
+        assert_eq!(config.input_mode, InputMode::PushToTalk);
     }
 
     #[test]
@@ -391,17 +485,46 @@ mod tests {
 
     #[tokio::test]
     async fn test_realtime_session_start_stop() {
-        let config = RealtimeConfig::default();
+        // Use PushToTalk mode to avoid opening audio hardware (no device in CI/WSL)
+        let config = RealtimeConfig {
+            input_mode: InputMode::PushToTalk,
+            ..Default::default()
+        };
         let mut session = RealtimeSession::new(config).await.expect("Should create session");
-        
+
         let (audio_tx, event_rx) = session.start().expect("Should start session");
         assert!(session.is_running());
-        
+
         session.stop();
         assert!(!session.is_running());
-        
+
         drop(audio_tx);
         drop(event_rx);
+    }
+
+    #[tokio::test]
+    async fn test_realtime_session_start_continuous_no_device() {
+        // Continuous mode attempts AudioCapture; on systems without a mic it should
+        // return an error rather than panic.
+        let config = RealtimeConfig {
+            input_mode: InputMode::Continuous,
+            ..Default::default()
+        };
+        let result = RealtimeSession::new(config).await;
+        if let Ok(mut session) = result {
+            let start_result = session.start();
+            // Either succeeds (device present) or returns a descriptive error (no device)
+            match start_result {
+                Ok(_) => { session.stop(); }
+                Err(e) => {
+                    assert!(
+                        e.contains("AudioCapture") || e.contains("device") || e.contains("audio"),
+                        "Error should mention audio capture: {}",
+                        e
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

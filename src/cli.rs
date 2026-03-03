@@ -269,6 +269,19 @@ mod tests {
         assert_eq!(strip_gguf_suffix("model-q8_0"), "model");
     }
 
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_input_mode_from_cli_flag() {
+        use crate::realtime::InputMode;
+
+        assert_eq!(parse_input_mode("continuous"), InputMode::Continuous);
+        assert_eq!(parse_input_mode("c"), InputMode::Continuous);
+        assert_eq!(parse_input_mode("ptt"), InputMode::PushToTalk);
+        assert_eq!(parse_input_mode("push-to-talk"), InputMode::PushToTalk);
+        assert_eq!(parse_input_mode("p"), InputMode::PushToTalk);
+        assert_eq!(parse_input_mode("unknown"), InputMode::Continuous);
+    }
+
 }
 
 // ============================================================================
@@ -2412,9 +2425,18 @@ pub(crate) fn cmd_eval_report() {
 }
 
 #[cfg(feature = "voice")]
-pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local: bool) {
+fn parse_input_mode(s: &str) -> crate::realtime::InputMode {
+    match s.to_lowercase().as_str() {
+        "continuous" | "c" => crate::realtime::InputMode::Continuous,
+        "ptt" | "push-to-talk" | "p" => crate::realtime::InputMode::PushToTalk,
+        _ => crate::realtime::InputMode::Continuous,
+    }
+}
+
+#[cfg(feature = "voice")]
+pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local: bool, mode: String) {
     use crate::config::schema::TtsEngineConfig;
-    use crate::realtime::{VoiceAgent, VoiceAgentConfig, VoiceAgentEvent, RealtimeConfig};
+    use crate::realtime::{VoiceAgent, VoiceAgentConfig, VoiceAgentEvent, RealtimeConfig, InputMode};
 
     println!("{} Realtime Voice Mode\n", crate::LOGO);
 
@@ -2431,10 +2453,13 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
         }
     };
 
+    let input_mode = parse_input_mode(&mode);
+
     let config = VoiceAgentConfig {
         realtime: RealtimeConfig {
             tts_engine,
             qwen_voice: voice,
+            input_mode: input_mode.clone(),
             ..Default::default()
         },
         session_key: session.clone(),
@@ -2447,8 +2472,15 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
     println!("  Session: {}", config.session_key);
     println!("  Local: {}", config.local);
     println!();
+    if input_mode == InputMode::Continuous {
+        println!("  Mode: Continuous (hands-free, VAD-based)");
+        println!("  Just speak — no keys needed");
+    } else {
+        println!("  Mode: Push-to-Talk");
+        println!("  Hold Space to speak, release to process");
+    }
+    println!();
     println!("  Hotkeys:");
-    println!("    Space = Push-to-talk (hold)");
     println!("    Q = Quit");
     println!("    I = Interrupt TTS");
     println!();
@@ -2460,7 +2492,11 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
         
         match agent.start().await {
             Ok(mut event_rx) => {
-                println!("Voice agent initialized. Press Space to speak.\n");
+                if input_mode == InputMode::PushToTalk {
+                    println!("Voice agent initialized. Hold Space to speak.\n");
+                } else {
+                    println!("Voice agent initialized. Just speak — audio flows automatically.\n");
+                }
                 
                 while agent.is_running() {
                     tokio::select! {
@@ -2512,6 +2548,15 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
                                         }
                                         KeyCode::Char('i') => {
                                             println!("\x1b[2m[Interrupted]\x1b[0m");
+                                        }
+                                        KeyCode::Char(' ') => {
+                                            // Space key is only used in PTT mode.
+                                            // In continuous mode, audio flows automatically via AudioCapture.
+                                            if input_mode == InputMode::PushToTalk {
+                                                // TODO: Toggle recording state for PTT.
+                                                // This will be connected to audio_tx gating in the future.
+                                                eprintln!("[PTT] Space pressed");
+                                            }
                                         }
                                         _ => {}
                                     }

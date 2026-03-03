@@ -177,6 +177,9 @@ enum Commands {
         /// Use local LLM instead of cloud API.
         #[arg(short, long)]
         local: bool,
+        /// Input mode: "continuous" (hands-free VAD) or "ptt" (push-to-talk with Space).
+        #[arg(long, default_value = "continuous")]
+        mode: String,
     },
     /// Start WebSocket server for OpenAI-compatible realtime API.
     #[cfg(feature = "voice")]
@@ -715,7 +718,8 @@ fn main() {
             voice,
             session,
             local,
-        } => cli::cmd_realtime(engine, voice, session, local),
+            mode,
+        } => cli::cmd_realtime(engine, voice, session, local, mode),
         #[cfg(feature = "voice")]
         Commands::RealtimeServer {
             port,
