@@ -386,6 +386,29 @@ pub fn strip_textual_tool_calls(content: &str) -> String {
         .to_string()
 }
 
+/// Parse tool calls using the model-appropriate parser from the registry.
+///
+/// Selects the correct parser for the given model by name substring matching,
+/// with an optional config override to force a specific parser.
+///
+/// Returns a `Vec<(name, arguments)>` compatible with the existing tool call
+/// dispatch format. The original `parse_textual_tool_calls` is kept for
+/// backward compatibility; this is the new preferred entry point.
+pub fn parse_tool_calls_for_model(
+    text: &str,
+    model_name: &str,
+    parser_override: Option<&str>,
+) -> Vec<(String, Value)> {
+    use crate::agent::parsers::ParserRegistry;
+    let registry = ParserRegistry::new();
+    let parser = registry.select_for_model(model_name, parser_override);
+    parser
+        .parse(text)
+        .into_iter()
+        .map(|tc| (tc.name, tc.arguments))
+        .collect()
+}
+
 /// Convert a raw wire-format message array to a protocol-rendered wire format.
 ///
 /// Extracts the leading `role:system` message as the system prompt, converts
