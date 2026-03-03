@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use std::sync::Arc;
+
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool, RecallTool, RememberTool,
-    SessionSearchTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool,
+    RecallTool, RememberTool, SessionSearchTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
-use crate::config::schema::JinaReaderConfig;
+use crate::config::schema::{CodeExecutionConfig, JinaReaderConfig};
 
 /// Configuration for building a standard tool registry.
 ///
