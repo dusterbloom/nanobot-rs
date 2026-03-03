@@ -9,6 +9,7 @@ pub mod agent_core;
 pub mod parsers;
 pub mod agent_loop;
 pub mod agent_profiles;
+pub mod capabilities;
 pub mod instructions;
 pub mod anti_drift;
 pub mod audit;
