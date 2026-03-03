@@ -271,6 +271,9 @@ fn apply_override(caps: &mut ModelCapabilities, ovr: &ModelCapabilitiesOverride)
     if let Some(v) = ovr.reader_tier {
         caps.reader_tier = v;
     }
+    if ovr.parser.is_some() {
+        caps.parser = ovr.parser.clone();
+    }
 }
 
 #[cfg(test)]
