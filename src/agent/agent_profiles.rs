@@ -110,6 +110,11 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
     // Merge capability-derived tools with any explicit tool list.
     // If both are absent, the result is None (all tools available).
     // If either is present, produce a merged, sorted, deduplicated list.
+    //
+    // `inherit: true` is a runtime hint — the actual parent capability list is
+    // only known at spawn time, not at parse time.  We store `inherit` and
+    // `deny_capabilities` on the profile and leave `tools` as None so that
+    // callers can apply `inherit_capabilities(parent, deny)` themselves.
     let resolved_tools = match (fm.tools, fm.capabilities) {
         (None, None) => None,
         (Some(explicit), None) => Some(explicit),
@@ -126,6 +131,8 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
         }
     };
 
+    let deny_capabilities = fm.deny_capabilities.unwrap_or_default();
+
     Some(AgentProfile {
         name,
         description,
@@ -134,6 +141,8 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
         model: fm.model,
         max_iterations: fm.max_iterations,
         read_only: fm.read_only,
+        inherit: fm.inherit,
+        deny_capabilities,
     })
 }
 
