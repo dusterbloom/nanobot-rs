@@ -398,6 +398,8 @@ Do stuff."#;
                 model: Some("haiku".to_string()),
                 max_iterations: Some(10),
                 read_only: true,
+                inherit: false,
+                deny_capabilities: vec![],
             },
         );
         let summary = profiles_summary(&profiles);
