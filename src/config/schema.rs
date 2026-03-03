@@ -1039,6 +1039,14 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub lazy_skills: bool,
 
+    /// Controls how skills are disclosed in the system prompt.
+    /// - "compact" (default): one-line index per skill (~20 tokens each)
+    /// - "xml": full XML summary with descriptions and metadata (~150 tokens each)
+    /// - "eager": full skill content loaded into the system prompt
+    /// Overrides `lazy_skills` when set to "eager" (disables lazy loading).
+    #[serde(default = "default_skill_disclosure")]
+    pub skill_disclosure: String,
+
     /// Context window (tokens) of the compaction/memory model.
     /// Set when the memory model differs from the main model (e.g. a 2K summarizer).
     /// Default: 0 (use main model's context size).
