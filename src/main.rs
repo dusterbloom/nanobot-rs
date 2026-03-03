@@ -152,6 +152,11 @@ enum Commands {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Manage skills.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     /// Run evaluation benchmarks.
     Eval {
         #[command(subcommand)]
