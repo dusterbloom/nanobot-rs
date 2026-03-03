@@ -10,7 +10,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::agent::capabilities::{inherit_capabilities, resolve_capabilities, Capability};
+use crate::agent::capabilities::{resolve_capabilities, Capability};
 
 /// A loaded agent profile.
 #[derive(Debug, Clone)]
