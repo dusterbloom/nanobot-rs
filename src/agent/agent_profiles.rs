@@ -94,11 +94,30 @@ pub fn parse_profile(content: &str, fallback_name: &str) -> Option<AgentProfile>
     let name = fm.name.unwrap_or_else(|| fallback_name.to_string());
     let description = fm.description.unwrap_or_else(|| format!("Agent: {}", name));
 
+    // Merge capability-derived tools with any explicit tool list.
+    // If both are absent, the result is None (all tools available).
+    // If either is present, produce a merged, sorted, deduplicated list.
+    let resolved_tools = match (fm.tools, fm.capabilities) {
+        (None, None) => None,
+        (Some(explicit), None) => Some(explicit),
+        (None, Some(caps)) => Some(resolve_capabilities(&caps)),
+        (Some(explicit), Some(caps)) => {
+            let mut merged = resolve_capabilities(&caps);
+            for t in explicit {
+                if !merged.contains(&t) {
+                    merged.push(t);
+                }
+            }
+            merged.sort();
+            Some(merged)
+        }
+    };
+
     Some(AgentProfile {
         name,
         description,
         system_prompt: body.to_string(),
-        tools: fm.tools,
+        tools: resolved_tools,
         model: fm.model,
         max_iterations: fm.max_iterations,
         read_only: fm.read_only,
