@@ -191,6 +191,33 @@ impl SkillsLoader {
         lines.join("\n")
     }
 
+    /// Build a compact one-line-per-skill index for system prompt injection.
+    ///
+    /// Format: "- skill_name: first 60 chars of description"
+    /// Token cost: ~20 tokens per skill vs ~150 for XML summary.
+    pub fn build_compact_index(&self) -> String {
+        let skills = self.list_skills(false);
+        if skills.is_empty() {
+            return String::new();
+        }
+        let mut lines = vec![
+            "Available skills (use `read_skill __list__` for details, `read_skill <name>` for full content):"
+                .to_string(),
+        ];
+        for skill in &skills {
+            let desc = self._get_skill_description(&skill.name);
+            let truncated = if desc.len() > 60 {
+                // Truncate at a char boundary to avoid breaking multibyte chars.
+                let end = crate::utils::helpers::floor_char_boundary(&desc, 60);
+                &desc[..end]
+            } else {
+                &desc
+            };
+            lines.push(format!("- {}: {}", skill.name, truncated));
+        }
+        lines.join("\n")
+    }
+
     /// Get skills marked as `always=true` that also meet requirements.
     pub fn get_always_skills(&self) -> Vec<String> {
         let mut result: Vec<String> = Vec::new();
