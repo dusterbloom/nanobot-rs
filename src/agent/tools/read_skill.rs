@@ -147,4 +147,34 @@ mod tests {
         assert_eq!(schema["function"]["name"], "read_skill");
         assert!(schema["function"]["parameters"]["properties"]["name"].is_object());
     }
+
+    #[tokio::test]
+    async fn test_read_skill_list_returns_xml() {
+        // Set up a workspace with a skill that has a description.
+        let (_tmp, tool) = make_workspace_with_skill(
+            "my-skill",
+            "---\ndescription: My skill description\n---\n# My Skill\nDo things.",
+        );
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), json!("__list__"));
+        let result = tool.execute(params).await;
+        // Should return the XML summary format.
+        assert!(
+            result.starts_with("<skills>"),
+            "list should return XML starting with <skills>: {}",
+            result
+        );
+        assert!(result.contains("<name>my-skill</name>"), "list should include skill name");
+        assert!(result.ends_with("</skills>"), "list should end with </skills>");
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_list_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ReadSkillTool::new(tmp.path());
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), json!("__list__"));
+        let result = tool.execute(params).await;
+        assert_eq!(result, "No skills are installed.");
+    }
 }
