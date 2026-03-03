@@ -122,6 +122,50 @@ mod tests {
         assert_eq!(parsed, Capability::Read);
     }
 
+    // ----- inherit_capabilities -----
+
+    #[test]
+    fn test_inherit_minus_removes_denied() {
+        let parent = vec![
+            Capability::Read,
+            Capability::Write,
+            Capability::Execute,
+            Capability::Http,
+        ];
+        let deny = vec![Capability::Write, Capability::Execute];
+        let result = inherit_capabilities(&parent, &deny);
+        assert!(result.contains(&Capability::Read));
+        assert!(result.contains(&Capability::Http));
+        assert!(!result.contains(&Capability::Write));
+        assert!(!result.contains(&Capability::Execute));
+    }
+
+    #[test]
+    fn test_inherit_empty_deny_keeps_all() {
+        let parent = vec![Capability::Read, Capability::Http];
+        let result = inherit_capabilities(&parent, &[]);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&Capability::Read));
+        assert!(result.contains(&Capability::Http));
+    }
+
+    #[test]
+    fn test_inherit_deny_all() {
+        let parent = vec![Capability::Read];
+        let result = inherit_capabilities(&parent, &[Capability::Read]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_inherit_deny_not_in_parent_is_noop() {
+        // Denying a capability not held by parent should have no effect.
+        let parent = vec![Capability::Read];
+        let deny = vec![Capability::Http]; // parent doesn't have Http
+        let result = inherit_capabilities(&parent, &deny);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&Capability::Read));
+    }
+
     #[test]
     fn test_resolve_sorted() {
         let tools = resolve_capabilities(&[Capability::Http, Capability::Read]);
