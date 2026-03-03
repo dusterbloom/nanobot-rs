@@ -1949,4 +1949,180 @@ mod tests {
         assert!(result.contains(&"tool_b".to_string()));
         assert!(result.contains(&"tool_c".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: capability resolution -> tool availability gating
+    // -----------------------------------------------------------------------
+
+    /// Test 1: Capability-resolved tools are gated by is_available().
+    ///
+    /// Verifies that resolve_capabilities() produces the expected tool names and
+    /// that the registry's get_definitions() correctly excludes unavailable tools
+    /// even when both available and unavailable tools are registered.
+    #[test]
+    fn test_integration_capability_tools_gated_by_availability() {
+        use crate::agent::capabilities::{resolve_capabilities, Capability};
+
+        // Step 1: Resolve capabilities to tool names.
+        let tool_names = resolve_capabilities(&[Capability::Read, Capability::Http]);
+
+        // Step 2: Verify expected tools are in the resolved set.
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(tool_names.contains(&"web_search".to_string()));
+        assert!(tool_names.contains(&"list_dir".to_string()));
+        assert!(tool_names.contains(&"web_fetch".to_string()));
+
+        // Step 3: Build a registry where read_file is available but web_search is not
+        // (simulating the case where the search backend key is missing).
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(UnavailableTool)); // stands in for unavailable web_search
+
+        let defs = registry.get_definitions();
+        let def_names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // read_file (available) should appear; unavailable_test should not.
+        assert!(def_names.contains(&"read_file".to_string()));
+        assert!(!def_names.contains(&"unavailable_test".to_string()));
+    }
+
+    /// Test 2: Toolset resolves @core and custom additions correctly.
+    ///
+    /// Verifies the full chain: custom toolset referencing @core built-in,
+    /// expanding to the correct tool names, with recall added on top.
+    #[test]
+    fn test_integration_toolset_resolves_with_builtins() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "agent_set".to_string(),
+            vec!["@core".to_string(), "recall".to_string()],
+        );
+
+        let result = resolve_toolset("agent_set", &custom, &[]).unwrap();
+
+        // Should include all core tools (read_file, write_file, edit_file, list_dir, exec).
+        assert!(result.contains(&"read_file".to_string()));
+        assert!(result.contains(&"write_file".to_string()));
+        assert!(result.contains(&"edit_file".to_string()));
+        assert!(result.contains(&"list_dir".to_string()));
+        assert!(result.contains(&"exec".to_string()));
+        // Plus the custom addition.
+        assert!(result.contains(&"recall".to_string()));
+        // Should NOT include web tools (not in @core).
+        assert!(!result.contains(&"web_search".to_string()));
+        assert!(!result.contains(&"web_fetch".to_string()));
+        // Each tool appears exactly once despite @core + explicit recall.
+        assert_eq!(result.iter().filter(|t| t.as_str() == "read_file").count(), 1);
+    }
+
+    /// Test 3: Full chain — profile capabilities -> resolved tools -> no forbidden tools.
+    ///
+    /// Simulates what happens when a subagent profile declares Read + Memory + Skills
+    /// capabilities: verifies the correct tool set is produced and forbidden tools
+    /// (Execute, Write, Http) are excluded.
+    #[test]
+    fn test_integration_profile_capabilities_to_registry() {
+        use crate::agent::capabilities::{resolve_capabilities, Capability};
+
+        // Simulate a subagent profile that declares these capabilities.
+        let profile_caps = vec![Capability::Read, Capability::Memory, Capability::Skills];
+        let allowed_tools = resolve_capabilities(&profile_caps);
+
+        // These tools should be allowed.
+        assert!(allowed_tools.contains(&"read_file".to_string()));
+        assert!(allowed_tools.contains(&"list_dir".to_string()));
+        assert!(allowed_tools.contains(&"recall".to_string()));
+        assert!(allowed_tools.contains(&"remember".to_string()));
+        assert!(allowed_tools.contains(&"session_search".to_string()));
+        assert!(allowed_tools.contains(&"read_skill".to_string()));
+
+        // These should NOT be allowed (not in the declared capabilities).
+        assert!(!allowed_tools.contains(&"exec".to_string()));
+        assert!(!allowed_tools.contains(&"write_file".to_string()));
+        assert!(!allowed_tools.contains(&"edit_file".to_string()));
+        assert!(!allowed_tools.contains(&"web_search".to_string()));
+        assert!(!allowed_tools.contains(&"web_fetch".to_string()));
+        assert!(!allowed_tools.contains(&"spawn".to_string()));
+    }
+
+    /// Test 4: Inherited capabilities minus deny list, resolved to tool names.
+    ///
+    /// Verifies the full chain: parent has broad access, child inherits but
+    /// strips Write and Execute, and the resulting tool set matches expectations.
+    #[test]
+    fn test_integration_inherited_capabilities_deny_list() {
+        use crate::agent::capabilities::{inherit_capabilities, resolve_capabilities, Capability};
+
+        // Parent has broad access.
+        let parent_caps = vec![
+            Capability::Read,
+            Capability::Write,
+            Capability::Execute,
+            Capability::Http,
+            Capability::Memory,
+        ];
+
+        // Child inherits but denies Write and Execute.
+        let child_caps = inherit_capabilities(&parent_caps, &[Capability::Write, Capability::Execute]);
+        let child_tools = resolve_capabilities(&child_caps);
+
+        // Child should have read, http, and memory tools.
+        assert!(child_tools.contains(&"read_file".to_string()));
+        assert!(child_tools.contains(&"list_dir".to_string()));
+        assert!(child_tools.contains(&"web_search".to_string()));
+        assert!(child_tools.contains(&"web_fetch".to_string()));
+        assert!(child_tools.contains(&"recall".to_string()));
+        assert!(child_tools.contains(&"remember".to_string()));
+
+        // Child should NOT have write or execute tools.
+        assert!(!child_tools.contains(&"write_file".to_string()));
+        assert!(!child_tools.contains(&"edit_file".to_string()));
+        assert!(!child_tools.contains(&"exec".to_string()));
+    }
+
+    /// Test 5: CodeExecutionTool availability gating via is_available().
+    ///
+    /// Verifies that the Tool::is_available() contract works for CodeExecutionTool:
+    /// disabled -> excluded from definitions, enabled -> included in definitions.
+    #[test]
+    fn test_integration_code_execution_availability() {
+        use crate::agent::tools::CodeExecutionTool;
+
+        // Disabled tool should not be available.
+        let disabled = CodeExecutionTool::new(false, 30, 20, vec![], None);
+        assert!(!disabled.is_available());
+
+        // Enabled tool should be available.
+        let enabled = CodeExecutionTool::new(true, 30, 20, vec![], None);
+        assert!(enabled.is_available());
+
+        // Registry gating: disabled execute_code must not appear in definitions.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(CodeExecutionTool::new(false, 30, 20, vec![], None)));
+
+        let defs = registry.get_definitions();
+        let def_names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(def_names.contains(&"read_file".to_string()));
+        assert!(!def_names.contains(&"execute_code".to_string()));
+
+        // Registry gating: enabled execute_code must appear in definitions.
+        let mut registry2 = ToolRegistry::new();
+        registry2.register(Box::new(CodeExecutionTool::new(true, 30, 20, vec![], None)));
+
+        let defs2 = registry2.get_definitions();
+        let def_names2: Vec<String> = defs2
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(def_names2.contains(&"execute_code".to_string()));
+    }
 }
