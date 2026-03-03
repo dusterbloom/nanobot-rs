@@ -66,6 +66,8 @@ impl ToolConfig {
 /// Allows dynamic registration and execution of tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    /// When true, tool descriptions are truncated to first sentence to save tokens.
+    pub condensed: bool,
 }
 
 impl ToolRegistry {
@@ -228,6 +230,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            condensed: false,
         }
     }
 
@@ -340,11 +343,41 @@ impl ToolRegistry {
     ///
     /// Tools where [`Tool::is_available`] returns `false` are excluded.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
+<<<<<<< Updated upstream
         self.tools
             .values()
             .filter(|tool| tool.is_available())
             .map(|tool| tool.to_schema())
             .collect()
+=======
+        let mut defs: Vec<serde_json::Value> =
+            self.tools.values().map(|tool| tool.to_schema()).collect();
+        if self.condensed {
+            Self::condense_definitions(&mut defs);
+        }
+        defs
+    }
+
+    /// Truncate tool descriptions to their first sentence to save tokens.
+    fn condense_definitions(defs: &mut [serde_json::Value]) {
+        for def in defs.iter_mut() {
+            if let Some(func) = def.get_mut("function") {
+                if let Some(desc) = func.get("description").and_then(|d| d.as_str()) {
+                    let condensed = Self::condense_description(desc);
+                    func["description"] = serde_json::Value::String(condensed);
+                }
+            }
+        }
+    }
+
+    /// Condense a description to its first sentence.
+    fn condense_description(desc: &str) -> String {
+        if let Some((first, _)) = desc.split_once('.') {
+            format!("{}.", first)
+        } else {
+            desc.to_string()
+        }
+>>>>>>> Stashed changes
     }
 
     /// Execute a tool by name with given parameters.
@@ -513,7 +546,8 @@ impl ToolRegistry {
             return self.get_definitions();
         }
 
-        self.tools
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
             .iter()
             .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
@@ -562,7 +596,11 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
-            .collect()
+            .collect();
+        if self.condensed {
+            Self::condense_definitions(&mut defs);
+        }
+        defs
     }
 
     /// Extract text content from the last N messages for keyword scanning.
@@ -1334,6 +1372,61 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
         assert!(names.contains(&"web_search".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // condense_description tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_condense_description_with_period() {
+        let desc = "Read a file from disk. Supports binary and text files. Very useful.";
+        assert_eq!(ToolRegistry::condense_description(desc), "Read a file from disk.");
+    }
+
+    #[test]
+    fn test_condense_description_without_period() {
+        let desc = "A mock tool for testing";
+        assert_eq!(ToolRegistry::condense_description(desc), "A mock tool for testing");
+    }
+
+    #[test]
+    fn test_condensed_mode_modifies_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.condensed = true;
+
+        // MockTool's description is "A mock tool for testing" (no period).
+        registry.register(Box::new(MockTool::new("test_tool")));
+        let defs = registry.get_definitions();
+        assert_eq!(defs.len(), 1);
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        // No period in original, so condense_description returns it unchanged.
+        assert_eq!(desc, "A mock tool for testing");
+    }
+
+    #[test]
+    fn test_condensed_mode_truncates_in_relevant_defs() {
+        let mut registry = ToolRegistry::new();
+        registry.condensed = true;
+        registry.register(Box::new(MockTool::new("read_file"))); // core tool
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+        let defs = registry.get_relevant_definitions(&messages, &used);
+        assert_eq!(defs.len(), 1);
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        // MockTool desc has no period, so it's unchanged.
+        assert_eq!(desc, "A mock tool for testing");
+    }
+
+    #[test]
+    fn test_non_condensed_mode_preserves_full_descriptions() {
+        let mut registry = ToolRegistry::new();
+        // condensed defaults to false
+        registry.register(Box::new(MockTool::new("test_tool")));
+        let defs = registry.get_definitions();
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(desc, "A mock tool for testing");
     }
 
     #[test]

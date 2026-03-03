@@ -669,6 +669,839 @@ fn main() {
 // Tests
 // ============================================================================
 
+<<<<<<< Updated upstream
+=======
+fn find_available_port(start: u16) -> u16 {
+    for port in start..=start.saturating_add(99) {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    start // fallback
+}
+
+fn list_local_models() -> Vec<std::path::PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return vec![],
+    };
+    let models_dir = home.join("models");
+    let mut models: Vec<std::path::PathBuf> = std::fs::read_dir(&models_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+        .collect();
+    models.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    models
+}
+
+const DEFAULT_LOCAL_MODEL: &str = "NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf";
+
+const COMPACTION_MODEL_URL: &str =
+    "https://huggingface.co/MaziyarPanahi/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B.Q4_K_M.gguf";
+const COMPACTION_MODEL_FILENAME: &str = "Qwen3-0.6B.Q4_K_M.gguf";
+
+/// Ensure the dedicated compaction model is available locally.
+///
+/// Downloads Qwen3-0.6B Q4_K_M (~500MB) to `~/.nanobot/models/` if not already
+/// present. Returns `None` on failure (graceful degradation — compaction just
+/// gets skipped and the system falls back to `trim_to_fit`).
+fn ensure_compaction_model() -> Option<std::path::PathBuf> {
+    let models_dir = dirs::home_dir()?.join(".nanobot").join("models");
+    std::fs::create_dir_all(&models_dir).ok()?;
+
+    let model_path = models_dir.join(COMPACTION_MODEL_FILENAME);
+    if model_path.exists() {
+        return Some(model_path);
+    }
+
+    println!(
+        "  {}{}Downloading{} compaction model (Qwen3-0.6B, ~500MB)...",
+        tui::BOLD,
+        tui::YELLOW,
+        tui::RESET
+    );
+
+    let tmp_path = models_dir.join(format!("{}.downloading", COMPACTION_MODEL_FILENAME));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut resp = reqwest::blocking::get(COMPACTION_MODEL_URL)?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()).into());
+        }
+        let mut file = std::fs::File::create(&tmp_path)?;
+        resp.copy_to(&mut file)?;
+        std::fs::rename(&tmp_path, &model_path)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            println!(
+                "  {}{}Done{} — saved to {}",
+                tui::BOLD,
+                tui::GREEN,
+                tui::RESET,
+                model_path.display()
+            );
+            Some(model_path)
+        }
+        Err(e) => {
+            println!(
+                "  {}{}Download failed:{} {} (compaction will use trim_to_fit fallback)",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                e
+            );
+            // Clean up partial download
+            let _ = std::fs::remove_file(&tmp_path);
+            None
+        }
+    }
+}
+
+/// Start the dedicated compaction server if the model is available.
+///
+/// Downloads the model on first run, spawns a CPU-only llama-server on port 8090+,
+/// and stores the process handle and port. Gracefully degrades if anything fails.
+async fn start_compaction_if_available(
+    compaction_process: &mut Option<std::process::Child>,
+    compaction_port: &mut Option<String>,
+) {
+    // Already running?
+    if compaction_process.is_some() {
+        return;
+    }
+
+    let model_path = match ensure_compaction_model() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let port = find_available_port(8090);
+    println!(
+        "  {}{}Starting{} compaction server on port {} (CPU-only)...",
+        tui::BOLD,
+        tui::YELLOW,
+        tui::RESET,
+        port
+    );
+
+    match spawn_compaction_server(port, &model_path) {
+        Ok(child) => {
+            *compaction_process = Some(child);
+            if wait_for_server_ready(port, 15, compaction_process).await {
+                *compaction_port = Some(port.to_string());
+                println!(
+                    "  {}{}Compaction server ready{} (Qwen3-0.6B on CPU)",
+                    tui::BOLD,
+                    tui::GREEN,
+                    tui::RESET
+                );
+            } else {
+                println!(
+                    "  {}{}Compaction server failed to start{} (using trim_to_fit fallback)",
+                    tui::BOLD,
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                if let Some(ref mut child) = compaction_process {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                *compaction_process = None;
+            }
+        }
+        Err(e) => {
+            println!(
+                "  {}{}Compaction server failed:{} {} (using trim_to_fit fallback)",
+                tui::BOLD,
+                tui::YELLOW,
+                tui::RESET,
+                e
+            );
+        }
+    }
+}
+
+/// Stop the compaction server and clear state.
+fn stop_compaction_server(
+    compaction_process: &mut Option<std::process::Child>,
+    compaction_port: &mut Option<String>,
+) {
+    if let Some(ref mut child) = compaction_process {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    *compaction_process = None;
+    *compaction_port = None;
+}
+
+fn kill_stale_llama_servers() {
+    // Kill any orphaned llama-server processes from previous runs
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "llama-server"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Brief pause to let ports be released
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+// ---------------------------------------------------------------------------
+// Auto-size context window: GGUF metadata + system resources
+// ---------------------------------------------------------------------------
+
+struct GgufModelInfo {
+    n_layers: u32,
+    n_kv_heads: u32,
+    n_heads: u32,
+    embedding_dim: u32,
+    context_length: u32,
+}
+
+/// Parse architecture-specific metadata from a GGUF file header.
+fn parse_gguf_metadata(path: &std::path::Path) -> Option<GgufModelInfo> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+
+    // Magic "GGUF"
+    f.read_exact(&mut buf4).ok()?;
+    if &buf4 != b"GGUF" {
+        return None;
+    }
+
+    // Version (u32 LE) — we support v2 and v3
+    f.read_exact(&mut buf4).ok()?;
+    let version = u32::from_le_bytes(buf4);
+    if version < 2 {
+        return None;
+    }
+
+    // tensor_count (u64), kv_count (u64)
+    f.read_exact(&mut buf8).ok()?;
+    let _tensor_count = u64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8).ok()?;
+    let kv_count = u64::from_le_bytes(buf8);
+
+    fn gguf_read_string(f: &mut std::fs::File) -> Option<String> {
+        let mut b8 = [0u8; 8];
+        f.read_exact(&mut b8).ok()?;
+        let len = u64::from_le_bytes(b8) as usize;
+        if len > 256 {
+            f.seek(SeekFrom::Current(len as i64)).ok()?;
+            return Some(String::new());
+        }
+        let mut s = vec![0u8; len];
+        f.read_exact(&mut s).ok()?;
+        String::from_utf8(s).ok()
+    }
+
+    fn gguf_skip_value(f: &mut std::fs::File, vtype: u32) -> Option<()> {
+        match vtype {
+            0 | 1 | 7 => {
+                let mut b = [0u8; 1];
+                f.read_exact(&mut b).ok()?;
+            }
+            2 | 3 => {
+                let mut b = [0u8; 2];
+                f.read_exact(&mut b).ok()?;
+            }
+            4 | 5 | 6 => {
+                let mut b = [0u8; 4];
+                f.read_exact(&mut b).ok()?;
+            }
+            8 => {
+                gguf_read_string(f)?;
+            }
+            9 => {
+                let mut tb = [0u8; 4];
+                f.read_exact(&mut tb).ok()?;
+                let elem_type = u32::from_le_bytes(tb);
+                let mut cb = [0u8; 8];
+                f.read_exact(&mut cb).ok()?;
+                let count = u64::from_le_bytes(cb);
+                for _ in 0..count {
+                    gguf_skip_value(f, elem_type)?;
+                }
+            }
+            10 | 11 | 12 => {
+                let mut b = [0u8; 8];
+                f.read_exact(&mut b).ok()?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    let mut arch = String::new();
+    let mut n_layers: Option<u32> = None;
+    let mut n_kv_heads: Option<u32> = None;
+    let mut n_heads: Option<u32> = None;
+    let mut embedding_dim: Option<u32> = None;
+    let mut context_length: Option<u32> = None;
+
+    for _ in 0..kv_count {
+        let key = match gguf_read_string(&mut f) {
+            Some(k) => k,
+            None => return None,
+        };
+
+        // Read value type
+        f.read_exact(&mut buf4).ok()?;
+        let vtype = u32::from_le_bytes(buf4);
+
+        if key == "general.architecture" && vtype == 8 {
+            arch = gguf_read_string(&mut f)?;
+            continue;
+        }
+
+        // Check for u32 metadata fields (type 4 = u32, type 5 = i32)
+        if (vtype == 4 || vtype == 5) && !arch.is_empty() {
+            let mut vb = [0u8; 4];
+            f.read_exact(&mut vb).ok()?;
+            let val = u32::from_le_bytes(vb);
+            if key == format!("{}.block_count", arch) {
+                n_layers = Some(val);
+            } else if key == format!("{}.attention.head_count_kv", arch) {
+                n_kv_heads = Some(val);
+            } else if key == format!("{}.attention.head_count", arch) {
+                n_heads = Some(val);
+            } else if key == format!("{}.embedding_length", arch) {
+                embedding_dim = Some(val);
+            } else if key == format!("{}.context_length", arch) {
+                context_length = Some(val);
+            }
+            continue;
+        }
+
+        // Skip values we don't need
+        gguf_skip_value(&mut f, vtype)?;
+    }
+
+    Some(GgufModelInfo {
+        n_layers: n_layers?,
+        n_kv_heads: n_kv_heads?,
+        n_heads: n_heads?,
+        embedding_dim: embedding_dim?,
+        context_length: context_length?,
+    })
+}
+
+/// Detect available VRAM (via nvidia-smi) and RAM (via /proc/meminfo).
+/// Returns (vram_bytes, ram_bytes).
+fn detect_available_memory() -> (Option<u64>, u64) {
+    // Try VRAM via nvidia-smi
+    let vram = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().lines().next()?.trim().parse::<u64>().ok()
+        })
+        .map(|mib| mib * 1024 * 1024);
+
+    // RAM via /proc/meminfo
+    let ram = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| {
+            for line in contents.lines() {
+                if line.starts_with("MemAvailable:") {
+                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                    return Some(kb * 1024);
+                }
+            }
+            None
+        })
+        .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB fallback
+
+    (vram, ram)
+}
+
+/// Practical context cap based on model file size (proxy for parameter count).
+///
+/// Small models become unresponsive with very large contexts — attention is O(n²)
+/// and they lack the capacity to utilize long contexts effectively.
+fn practical_context_cap(model_file_size_bytes: u64) -> usize {
+    let gb = model_file_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gb < 2.0 {
+        8192
+    }
+    // tiny (~1-3B heavy quant)
+    else if gb < 4.0 {
+        16384
+    }
+    // small (~3-7B)
+    else if gb < 8.0 {
+        32768
+    }
+    // medium (~7-14B)
+    else if gb < 16.0 {
+        65536
+    }
+    // large (~14-30B)
+    else {
+        usize::MAX
+    } // xlarge (30B+) — no cap
+}
+
+/// Compute optimal --ctx-size for a GGUF model given available system resources.
+fn compute_optimal_context_size(model_path: &std::path::Path) -> usize {
+    const OVERHEAD: u64 = 512 * 1024 * 1024; // 512 MB
+    const FALLBACK_CTX: usize = 16384;
+
+    let model_file_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+
+    let gguf = match parse_gguf_metadata(model_path) {
+        Some(info) => info,
+        None => {
+            // GGUF parse failed — use practical cap based on file size, or fallback
+            let cap = practical_context_cap(model_file_size).min(FALLBACK_CTX);
+            debug!(
+                "GGUF parse failed for {}, using {}K context (file size: {:.1}GB)",
+                model_path.display(),
+                cap / 1024,
+                model_file_size as f64 / 1e9
+            );
+            return cap;
+        }
+    };
+
+    let head_dim = gguf.embedding_dim / gguf.n_heads;
+    // KV cache per token (FP16): 2 (K+V) × layers × kv_heads × head_dim × 2 bytes
+    let kv_per_token = 2u64 * gguf.n_layers as u64 * gguf.n_kv_heads as u64 * head_dim as u64 * 2;
+
+    let (vram, ram) = detect_available_memory();
+
+    let available_for_kv = if let Some(vram_bytes) = vram {
+        // GPU mode: VRAM must hold model weights + KV cache
+        vram_bytes
+            .saturating_sub(model_file_size)
+            .saturating_sub(OVERHEAD)
+    } else {
+        // CPU mode: weights are mmap'd, RAM mainly for KV cache
+        ram.saturating_sub(OVERHEAD)
+    };
+
+    if kv_per_token == 0 {
+        let cap = practical_context_cap(model_file_size).min(FALLBACK_CTX);
+        debug!("KV per token is 0, using {}K context", cap / 1024);
+        return cap;
+    }
+
+    let max_ctx_from_memory = (available_for_kv / kv_per_token) as usize;
+    let cap = practical_context_cap(model_file_size);
+    // Clamp: at least 4096, at most min(memory allows, GGUF native, practical cap)
+    let ctx = max_ctx_from_memory
+        .max(4096)
+        .min(gguf.context_length as usize)
+        .min(cap);
+    // Round down to nearest 1024
+    let ctx = (ctx / 1024) * 1024;
+
+    let mem_source = if vram.is_some() { "VRAM" } else { "RAM" };
+    debug!(
+        "Auto-sized context: {} tokens ({}K) — kv/tok={}B, available {}={:.1}GB, model={:.1}GB, practical_cap={}K",
+        ctx, ctx / 1024, kv_per_token,
+        mem_source, available_for_kv as f64 / 1e9,
+        model_file_size as f64 / 1e9,
+        cap / 1024,
+    );
+
+    ctx
+}
+
+/// Spawn a CPU-only llama-server for context compaction (summarization).
+///
+/// Uses `--n-gpu-layers 0` so it never competes with the main model for VRAM.
+/// Fixed 4K context — summarization doesn't need more.
+fn spawn_compaction_server(
+    port: u16,
+    model_path: &std::path::Path,
+) -> Result<std::process::Child, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let server_path = home.join("llama.cpp/build/bin/llama-server");
+
+    if !server_path.exists() {
+        return Err(format!(
+            "llama-server not found at {}",
+            server_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!(
+            "Compaction model not found at {}",
+            model_path.display()
+        ));
+    }
+
+    std::process::Command::new(&server_path)
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg("16384")
+        .arg("--parallel")
+        .arg("1")
+        .arg("--n-gpu-layers")
+        .arg("0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn compaction server: {}", e))
+}
+
+fn spawn_llama_server(
+    port: u16,
+    model_path: &std::path::Path,
+    ctx_size: usize,
+) -> Result<std::process::Child, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let server_path = home.join("llama.cpp/build/bin/llama-server");
+
+    if !server_path.exists() {
+        return Err(format!(
+            "llama-server not found at {}",
+            server_path.display()
+        ));
+    }
+    if !model_path.exists() {
+        return Err(format!("Model not found at {}", model_path.display()));
+    }
+
+    std::process::Command::new(&server_path)
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg(ctx_size.to_string())
+        .arg("--parallel")
+        .arg("1")
+        .arg("--n-gpu-layers")
+        .arg("99")
+        .arg("--flash-attn")
+        .arg("on")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn llama-server: {}", e))
+}
+
+async fn wait_for_server_ready(
+    port: u16,
+    timeout_secs: u64,
+    llama_process: &mut Option<std::process::Child>,
+) -> bool {
+    use std::io::Write;
+
+    // Drain stderr in a background thread so the pipe buffer doesn't block the server.
+    let stderr_lines: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Some(ref mut child) = llama_process {
+        if let Some(stderr) = child.stderr.take() {
+            let lines = stderr_lines.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        lines.lock().unwrap().push(l);
+                    }
+                }
+            });
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("http://localhost:{}/health", port);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(timeout_secs);
+    let bar_width = 24usize;
+
+    print!("{}", tui::HIDE_CURSOR);
+    std::io::stdout().flush().ok();
+
+    while std::time::Instant::now() < deadline {
+        // Check if server process crashed
+        if let Some(ref mut child) = llama_process {
+            if let Ok(Some(_)) = child.try_wait() {
+                // Clear the bar line, show error
+                print!(
+                    "\r{}{}{}  ",
+                    tui::SHOW_CURSOR,
+                    tui::RESET,
+                    " ".repeat(bar_width + 30)
+                );
+                print!(
+                    "\r  {}Server exited unexpectedly{}\n",
+                    tui::YELLOW,
+                    tui::RESET
+                );
+                // Show last few stderr lines as hint
+                let lines = stderr_lines.lock().unwrap();
+                if let Some(last) = lines.last() {
+                    println!("  {}{}{}", tui::DIM, last, tui::RESET);
+                }
+                std::io::stdout().flush().ok();
+                return false;
+            }
+        }
+
+        // Draw progress bar
+        let elapsed = start.elapsed().as_secs_f64();
+        let frac = (elapsed / timeout_secs as f64).min(1.0);
+        let filled = (frac * bar_width as f64) as usize;
+        let empty = bar_width - filled;
+        print!(
+            "\r  {}Loading model [{}{}{}{}{}] {:.0}s{}",
+            tui::DIM,
+            tui::RESET,
+            tui::CYAN,
+            "\u{2588}".repeat(filled), // █
+            "\u{2591}".repeat(empty),  // ░
+            tui::DIM,
+            elapsed,
+            tui::RESET,
+        );
+        std::io::stdout().flush().ok();
+
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                // Fill bar to 100% briefly
+                print!(
+                    "\r  {}Loading model [{}{}{}] done{}",
+                    tui::DIM,
+                    tui::RESET,
+                    tui::CYAN,
+                    "\u{2588}".repeat(bar_width),
+                    tui::RESET,
+                );
+                std::io::stdout().flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                print!("\r{}{}\r", tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+                std::io::stdout().flush().ok();
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    print!("\r{}{}\r", tui::SHOW_CURSOR, " ".repeat(bar_width + 30));
+    std::io::stdout().flush().ok();
+    false
+}
+
+/// Strip markdown formatting, code blocks, emojis, and special characters
+/// so that TTS receives only clean natural language text.
+#[cfg(feature = "voice")]
+pub(crate) fn strip_markdown_for_tts(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        let line = trimmed.trim_start_matches('#').trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        for c in line.chars() {
+            match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' => out.push(c),
+                ' ' | '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"' | '-' | '(' | ')' => {
+                    out.push(c)
+                }
+                '*' | '_' | '`' | '~' | '[' | ']' | '|' | '#' => {} // strip markdown syntax
+                _ if c.is_alphabetic() => out.push(c),              // keep non-English letters
+                _ => {}                                             // strip emojis, arrows, etc.
+            }
+        }
+        out.push(' ');
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Flush any buffered terminal input (e.g. extra Enter keypresses during recording).
+#[cfg(feature = "voice")]
+fn drain_stdin() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        unsafe {
+            libc::tcflush(fd, libc::TCIFLUSH);
+        }
+    }
+}
+
+/// Speak with TTS while watching for user interrupt (Enter or Ctrl+Space).
+/// Returns true if the user interrupted (wants to speak next).
+#[cfg(feature = "voice")]
+fn speak_interruptible(vs: &mut voice::VoiceSession, text: &str, lang: &str) -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    vs.clear_cancel();
+    let cancel = vs.cancel_flag();
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = done.clone();
+
+    // Spawn thread to watch for keypress during TTS
+    let watcher = std::thread::spawn(move || {
+        terminal::enable_raw_mode().ok();
+        let mut interrupted = false;
+        while !done2.load(Ordering::Relaxed) {
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    let is_interrupt = key.code == KeyCode::Enter
+                        || (key.code == KeyCode::Char(' ')
+                            && key.modifiers.contains(KeyModifiers::CONTROL));
+                    if is_interrupt {
+                        cancel.store(true, Ordering::Relaxed);
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        terminal::disable_raw_mode().ok();
+        interrupted
+    });
+
+    if let Err(e) = vs.speak(text, lang) {
+        eprintln!("TTS error: {}", e);
+    }
+
+    // Signal watcher to stop and collect result
+    done.store(true, Ordering::Relaxed);
+    let interrupted = watcher.join().unwrap_or(false);
+
+    if interrupted {
+        vs.stop_playback();
+    }
+
+    interrupted
+}
+
+#[cfg(feature = "voice")]
+enum VoiceAction {
+    Record,
+    Text(String),
+    Exit,
+}
+
+/// Read input in voice mode using crossterm raw terminal.
+/// Ctrl+Space or Enter (empty) → Record, typed text + Enter → Text, Ctrl+C → Exit.
+#[cfg(feature = "voice")]
+fn voice_read_input() -> VoiceAction {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal;
+
+    if terminal::enable_raw_mode().is_err() {
+        // Fallback: just use regular read_line
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => VoiceAction::Exit,
+            _ => {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    VoiceAction::Record
+                } else {
+                    VoiceAction::Text(trimmed)
+                }
+            }
+        };
+    }
+
+    let mut buffer = String::new();
+
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                // Ctrl+Space → record
+                if (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('\0'))
+                {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    break VoiceAction::Record;
+                }
+                // Ctrl+C → exit
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    break VoiceAction::Exit;
+                }
+                // Enter
+                if key.code == KeyCode::Enter {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    if buffer.is_empty() {
+                        break VoiceAction::Record;
+                    }
+                    break VoiceAction::Text(buffer);
+                }
+                // Backspace
+                if key.code == KeyCode::Backspace {
+                    if buffer.pop().is_some() {
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
+                    }
+                    continue;
+                }
+                // Regular character (no ctrl/alt modifier)
+                if let KeyCode::Char(c) = key.code {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        buffer.push(c);
+                        print!("{}", c);
+                        io::stdout().flush().ok();
+                    }
+                }
+            }
+            Ok(_) => {} // ignore mouse, resize, etc.
+            Err(_) => break VoiceAction::Exit,
+        }
+    };
+
+    terminal::disable_raw_mode().ok();
+    result
+}
+
+fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
+    let api_key = config.get_api_key().unwrap_or_default();
+    let api_base = config.get_api_base();
+    let model = &config.agents.defaults.model;
+    Arc::new(OpenAICompatProvider::new(
+        &api_key,
+        api_base.as_deref(),
+        Some(model.as_str()),
+    ))
+}
+
+>>>>>>> Stashed changes
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -57,6 +57,215 @@ pub use crate::agent::agent_core::{
     SwappableCoreConfig,
 };
 
+<<<<<<< Updated upstream
+=======
+/// Core state shared identically across all agent instances.
+///
+/// When the user toggles `/local` or `/model`, a new `SharedCore` is built
+/// and swapped into the handle so every agent sees the change.
+pub struct SharedCore {
+    pub provider: Arc<dyn LLMProvider>,
+    pub workspace: PathBuf,
+    pub model: String,
+    pub max_iterations: u32,
+    pub max_tokens: u32,
+    pub temperature: f64,
+    pub context: ContextBuilder,
+    pub sessions: SessionManager,
+    pub token_budget: TokenBudget,
+    pub compactor: ContextCompactor,
+    pub learning: LearningStore,
+    pub brave_api_key: Option<String>,
+    pub exec_timeout: u64,
+    pub restrict_to_workspace: bool,
+    pub memory_enabled: bool,
+    pub memory_provider: Arc<dyn LLMProvider>,
+    pub memory_model: String,
+    pub reflection_threshold: usize,
+    pub learning_turn_counter: AtomicU64,
+    pub last_context_used: AtomicU64,
+    pub last_context_max: AtomicU64,
+    pub is_local: bool,
+}
+
+/// Handle for hot-swapping the shared core.
+///
+/// Readers clone the inner `Arc<SharedCore>` under a brief read lock.
+/// Writers (only `/local` toggle) take the write lock to replace the inner Arc.
+pub type SharedCoreHandle = Arc<std::sync::RwLock<Arc<SharedCore>>>;
+
+/// Detect the timestamp of the most recently modified session file.
+///
+/// Scans `~/.nanobot/sessions/*.jsonl` and returns the latest mtime as a
+/// `DateTime<Local>`, or `None` if no sessions exist.
+fn detect_last_interaction(sessions: &SessionManager) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    let mut latest: Option<std::time::SystemTime> = None;
+    if let Ok(entries) = std::fs::read_dir(&sessions.sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        latest = Some(match latest {
+                            Some(prev) if mtime > prev => mtime,
+                            Some(prev) => prev,
+                            None => mtime,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    latest.and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| chrono::Local.timestamp_opt(d.as_secs() as i64, 0).unwrap())
+    })
+}
+
+/// Detect git changes in the workspace since the last session.
+///
+/// Runs `git status --porcelain` and `git log --oneline -5 --since=12h` in
+/// the workspace directory. Returns a compact summary, or `None` if the
+/// workspace isn't a git repo or no changes are found.
+fn detect_git_changes(workspace: &std::path::Path) -> Option<String> {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+
+    let log = std::process::Command::new("git")
+        .args(["log", "--oneline", "-5", "--since=12h"])
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+
+    let status_text = String::from_utf8_lossy(&status.stdout).trim().to_string();
+    let log_text = String::from_utf8_lossy(&log.stdout).trim().to_string();
+
+    if status_text.is_empty() && log_text.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !status_text.is_empty() {
+        let file_count = status_text.lines().count();
+        parts.push(format!("{} files modified/untracked", file_count));
+    }
+    if !log_text.is_empty() {
+        parts.push(format!("Recent commits:\n{}", log_text));
+    }
+    Some(parts.join("\n"))
+}
+
+/// Build a `SharedCore` from the given parameters.
+///
+/// When `is_local` is true, the compactor and memory operations use a dedicated
+/// `compaction_provider` if supplied (e.g. a CPU-only Qwen3-0.6B server), or
+/// fall back to the main (local) provider.
+pub fn build_shared_core(
+    provider: Arc<dyn LLMProvider>,
+    workspace: PathBuf,
+    model: String,
+    max_iterations: u32,
+    max_tokens: u32,
+    temperature: f64,
+    max_context_tokens: usize,
+    brave_api_key: Option<String>,
+    exec_timeout: u64,
+    restrict_to_workspace: bool,
+    memory_config: MemoryConfig,
+    is_local: bool,
+    compaction_provider: Option<Arc<dyn LLMProvider>>,
+) -> SharedCore {
+    let mut context = ContextBuilder::new(&workspace);
+    context.model_name = model.clone();
+    context.observation_budget = memory_config.observation_budget;
+    let sessions = SessionManager::new(&workspace);
+
+    // Time awareness: detect when the user last interacted.
+    context.last_interaction = detect_last_interaction(&sessions);
+
+    // Git change detection: scan workspace for external changes.
+    context.git_changes = detect_git_changes(&workspace);
+
+    // SLM budget mode: reduce context budgets for local models.
+    if is_local {
+        context.bootstrap_budget = 1000;
+        context.long_term_memory_budget = 500;
+        context.today_notes_budget = 0;
+        context.observation_budget = 0;
+        context.learning_budget = 0;
+    }
+
+    // When local, use dedicated compaction provider if available, else main provider.
+    let (memory_provider, memory_model): (Arc<dyn LLMProvider>, String) = if is_local {
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        if let Some(cp) = compaction_provider {
+            (cp, m)
+        } else {
+            (provider.clone(), m)
+        }
+    } else if let Some(ref mem_provider_cfg) = memory_config.provider {
+        let p: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+            &mem_provider_cfg.api_key,
+            mem_provider_cfg
+                .api_base
+                .as_deref()
+                .or(Some("http://localhost:8080/v1")),
+            None,
+        ));
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        (p, m)
+    } else {
+        let m = if memory_config.model.is_empty() {
+            model.clone()
+        } else {
+            memory_config.model.clone()
+        };
+        (provider.clone(), m)
+    };
+
+    let token_budget = TokenBudget::new(max_context_tokens, max_tokens as usize);
+    let compactor = ContextCompactor::new(memory_provider.clone(), memory_model.clone());
+    let learning = LearningStore::new(&workspace);
+
+    SharedCore {
+        provider,
+        workspace,
+        model,
+        max_iterations,
+        max_tokens,
+        temperature,
+        context,
+        sessions,
+        token_budget,
+        compactor,
+        learning,
+        brave_api_key,
+        exec_timeout,
+        restrict_to_workspace,
+        memory_enabled: memory_config.enabled,
+        memory_provider,
+        memory_model,
+        reflection_threshold: memory_config.reflection_threshold,
+        learning_turn_counter: AtomicU64::new(0),
+        last_context_used: AtomicU64::new(0),
+        last_context_max: AtomicU64::new(max_context_tokens as u64),
+        is_local,
+    }
+}
+>>>>>>> Stashed changes
 
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
@@ -264,9 +473,78 @@ impl AgentLoopShared {
 
     /// Process an inbound message through the agent loop.
     ///
+<<<<<<< Updated upstream
     /// When `text_delta_tx` is `Some`, text deltas are streamed to the sender
     /// as they arrive (used by CLI/voice). When `None`, a blocking LLM call
     /// is used (gateway mode).
+=======
+    /// Takes a snapshot of `SharedCore` so the registry is consistent for the
+    /// entire message processing.
+    async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        tools.condensed = core.is_local;
+
+        // File system tools (stateless).
+        tools.register(Box::new(ReadFileTool));
+        tools.register(Box::new(WriteFileTool));
+        tools.register(Box::new(EditFileTool));
+        tools.register(Box::new(ListDirTool));
+
+        // Shell (stateless config).
+        tools.register(Box::new(ExecTool::new(
+            core.exec_timeout,
+            Some(core.workspace.to_string_lossy().to_string()),
+            None,
+            None,
+            core.restrict_to_workspace,
+        )));
+
+        // Web (stateless config).
+        tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
+        tools.register(Box::new(WebFetchTool::new(50_000)));
+
+        // Message tool - context baked in.
+        let outbound_tx_clone = self.bus_outbound_tx.clone();
+        let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
+            let tx = outbound_tx_clone.clone();
+            Box::pin(async move {
+                tx.send(msg)
+                    .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
+            })
+        });
+        let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
+        tools.register(Box::new(MessageToolProxy(message_tool)));
+
+        // Spawn tool - context baked in.
+        let subagents_ref = self.subagents.clone();
+        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid| {
+            let mgr = subagents_ref.clone();
+            Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
+        });
+        let spawn_tool = Arc::new(SpawnTool::new());
+        // Set callback and context before registering so they're ready for use.
+        spawn_tool.set_callback(spawn_cb).await;
+        spawn_tool.set_context(channel, chat_id).await;
+        tools.register(Box::new(SpawnToolProxy(spawn_tool)));
+
+        // Cron tool (optional) - context baked in.
+        if let Some(ref svc) = self.cron_service {
+            let ct = Arc::new(CronScheduleTool::new(svc.clone()));
+            ct.set_context(channel, chat_id).await;
+            tools.register(Box::new(CronToolProxy(ct)));
+        }
+
+        // Email tools (optional) - available when email is configured.
+        if let Some(ref email_cfg) = self.email_config {
+            tools.register(Box::new(CheckInboxTool::new(email_cfg.clone())));
+            tools.register(Box::new(SendEmailTool::new(email_cfg.clone())));
+        }
+
+        tools
+    }
+
+    /// Process a regular inbound message through the agent loop.
+>>>>>>> Stashed changes
     ///
     /// This method takes `&self` and is safe to call from multiple concurrent
     /// tasks. Per-message tool instances eliminate shared-context races.

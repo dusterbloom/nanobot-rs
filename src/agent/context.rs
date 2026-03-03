@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use chrono::Local;
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use serde_json::{json, Value};
 
 use crate::agent::memory::MemoryStore;
@@ -69,6 +69,7 @@ pub struct ContextBuilder {
     pub bootstrap_budget: usize,
     /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
     pub long_term_memory_budget: usize,
+<<<<<<< Updated upstream
     /// Max tokens for skills (always-loaded + summary) in the system prompt.
     pub skills_budget: usize,
     /// Max tokens for subagent profiles in the system prompt.
@@ -95,6 +96,18 @@ pub struct ContextBuilder {
     pub instruction_profiles: Option<crate::agent::instructions::InstructionProfiles>,
     /// Task kind used when resolving instruction profiles (default: "main").
     pub task_kind: String,
+=======
+    /// Max tokens for today's notes in the system prompt.
+    pub today_notes_budget: usize,
+    /// Max tokens for observations in the system prompt (default: 2000).
+    pub observation_budget: usize,
+    /// Max tokens for learning context in the system prompt.
+    pub learning_budget: usize,
+    /// Timestamp of the last user interaction (for time awareness).
+    pub last_interaction: Option<DateTime<Local>>,
+    /// Git change summary detected at session start.
+    pub git_changes: Option<String>,
+>>>>>>> Stashed changes
 }
 
 impl ContextBuilder {
@@ -105,6 +118,7 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
+<<<<<<< Updated upstream
             bootstrap_budget: 1500,
             long_term_memory_budget: 400,
             skills_budget: 1000,
@@ -116,6 +130,15 @@ impl ContextBuilder {
             agent_profiles: String::new(),
             instruction_profiles: None,
             task_kind: "main".to_string(),
+=======
+            bootstrap_budget: 3000,
+            long_term_memory_budget: 2000,
+            today_notes_budget: 1200,
+            observation_budget: 2000,
+            learning_budget: 800,
+            last_interaction: None,
+            git_changes: None,
+>>>>>>> Stashed changes
         }
     }
 
@@ -555,9 +578,10 @@ impl ContextBuilder {
     // Private helpers
     // ------------------------------------------------------------------
 
-    /// Core identity section including current time and workspace info.
+    /// Core identity section including current time, time awareness, and workspace info.
     fn _get_identity(&self) -> String {
-        let now = Local::now().format("%Y-%m-%d %H:%M (%A)").to_string();
+        let now = Local::now();
+        let now_str = now.format("%Y-%m-%d %H:%M (%A)").to_string();
         let workspace_path = self
             .workspace
             .canonicalize()
@@ -584,6 +608,7 @@ impl ContextBuilder {
             format!("\n\n## Model\nYou are powered by: {}", self.model_name)
         };
 
+<<<<<<< Updated upstream
         // Cost-aware delegation hint for expensive models.
         let is_expensive = self.model_name.contains("opus")
             || self.model_name.contains("gpt-4o")
@@ -597,6 +622,24 @@ impl ContextBuilder {
              Only do it yourself when the result feeds directly into your next sentence."
         } else {
             ""
+=======
+        // Time awareness: show gap since last interaction with behavioral hint.
+        let time_awareness = if let Some(last) = self.last_interaction {
+            let gap = now.signed_duration_since(last);
+            let gap_str = Self::format_time_gap(gap);
+            let hint = Self::time_gap_hint(gap);
+            format!("\nLast session: {}. {}", gap_str, hint)
+        } else {
+            String::new()
+        };
+
+        // Git changes detected since last session.
+        let git_section = match self.git_changes {
+            Some(ref changes) if !changes.is_empty() => {
+                format!("\n\n## External Changes\n{}", changes)
+            }
+            _ => String::new(),
+>>>>>>> Stashed changes
         };
 
         format!(
@@ -604,11 +647,16 @@ impl ContextBuilder {
 
 You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, messaging, and subagents.
 
+<<<<<<< Updated upstream
 ## Context
 Time: {now}{model_section}
 Home: {home_dir}
 Working directory: {cwd}
 Workspace: {workspace_path}
+=======
+## Current Time
+{now_str}{time_awareness}{model_section}
+>>>>>>> Stashed changes
 
 ## Rules
 1. ALWAYS use tools. NEVER guess file contents, command output, or system state. Run the command, read the file, check with a tool. If you don't know, use a tool to find out — do not make up an answer.
@@ -621,6 +669,7 @@ Only access files outside it when the user explicitly asks.
 Your workspace ({workspace_path}) is for your internal state (memory, skills, config) — not the user's project.
 Use absolute paths or paths relative to the working directory.{delegation_hint}
 
+<<<<<<< Updated upstream
 ## Memory
 Working Memory is injected automatically (session state). Long-term facts: {workspace_path}/memory/MEMORY.md.
 Use `recall` to search all memory (sessions, facts, archives).
@@ -645,6 +694,49 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach �
         let mut included: Vec<String> = Vec::new();
         let mut skipped: Vec<&str> = Vec::new();
         let mut remaining = budget_tokens;
+=======
+Always be helpful, accurate, and concise. When using tools, explain what you're doing.
+When remembering something, write to {workspace_path}/memory/MEMORY.md{git_section}"#
+        )
+    }
+
+    /// Format a duration into a human-readable gap string.
+    fn format_time_gap(gap: ChronoDuration) -> String {
+        let minutes = gap.num_minutes();
+        if minutes < 2 {
+            "Just now".to_string()
+        } else if minutes < 60 {
+            format!("{} min ago", minutes)
+        } else if gap.num_hours() < 24 {
+            let hours = gap.num_hours();
+            if hours == 1 {
+                "1 hour ago".to_string()
+            } else {
+                format!("{} hours ago", hours)
+            }
+        } else if gap.num_days() == 1 {
+            "Yesterday".to_string()
+        } else {
+            format!("{} days ago", gap.num_days())
+        }
+    }
+
+    /// Behavioral hint based on the time gap.
+    fn time_gap_hint(gap: ChronoDuration) -> &'static str {
+        let hours = gap.num_hours();
+        if hours < 1 {
+            "Continue naturally from where you left off."
+        } else if hours < 8 {
+            "The user is returning after a short break."
+        } else {
+            "The user is starting a new session — briefly re-orient if context changed."
+        }
+    }
+
+    /// Load all bootstrap files from workspace.
+    fn _load_bootstrap_files(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+>>>>>>> Stashed changes
 
         for filename in BOOTSTRAP_FILES {
             let file_path = self.workspace.join(filename);
@@ -1223,6 +1315,146 @@ mod tests {
             "system prompt ({} tokens) should be near cap (50)",
             tokens
         );
+    }
+
+    // ----- time awareness -----
+
+    #[test]
+    fn test_format_time_gap_just_now() {
+        let gap = ChronoDuration::seconds(30);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "Just now");
+    }
+
+    #[test]
+    fn test_format_time_gap_minutes() {
+        let gap = ChronoDuration::minutes(15);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "15 min ago");
+    }
+
+    #[test]
+    fn test_format_time_gap_one_hour() {
+        let gap = ChronoDuration::hours(1);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "1 hour ago");
+    }
+
+    #[test]
+    fn test_format_time_gap_hours() {
+        let gap = ChronoDuration::hours(5);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "5 hours ago");
+    }
+
+    #[test]
+    fn test_format_time_gap_yesterday() {
+        let gap = ChronoDuration::days(1);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "Yesterday");
+    }
+
+    #[test]
+    fn test_format_time_gap_days() {
+        let gap = ChronoDuration::days(3);
+        assert_eq!(ContextBuilder::format_time_gap(gap), "3 days ago");
+    }
+
+    #[test]
+    fn test_time_gap_hint_short() {
+        let gap = ChronoDuration::minutes(30);
+        assert_eq!(
+            ContextBuilder::time_gap_hint(gap),
+            "Continue naturally from where you left off."
+        );
+    }
+
+    #[test]
+    fn test_time_gap_hint_medium() {
+        let gap = ChronoDuration::hours(3);
+        assert_eq!(
+            ContextBuilder::time_gap_hint(gap),
+            "The user is returning after a short break."
+        );
+    }
+
+    #[test]
+    fn test_time_gap_hint_long() {
+        let gap = ChronoDuration::hours(12);
+        assert_eq!(
+            ContextBuilder::time_gap_hint(gap),
+            "The user is starting a new session — briefly re-orient if context changed."
+        );
+    }
+
+    #[test]
+    fn test_identity_includes_time_awareness() {
+        let (_tmp, mut cb) = make_context();
+        cb.last_interaction = Some(Local::now() - ChronoDuration::hours(3));
+        let prompt = cb.build_system_prompt(None);
+        assert!(
+            prompt.contains("Last session:"),
+            "prompt should include time awareness"
+        );
+        assert!(
+            prompt.contains("hours ago"),
+            "prompt should include time gap"
+        );
+    }
+
+    #[test]
+    fn test_identity_includes_git_changes() {
+        let (_tmp, mut cb) = make_context();
+        cb.git_changes = Some("3 files modified/untracked".to_string());
+        let prompt = cb.build_system_prompt(None);
+        assert!(
+            prompt.contains("External Changes"),
+            "prompt should include git changes header"
+        );
+        assert!(
+            prompt.contains("3 files modified"),
+            "prompt should include git change summary"
+        );
+    }
+
+    #[test]
+    fn test_identity_no_time_awareness_without_last_interaction() {
+        let (_tmp, cb) = make_context();
+        let prompt = cb.build_system_prompt(None);
+        assert!(
+            !prompt.contains("Last session:"),
+            "prompt should not include time awareness without last_interaction"
+        );
+    }
+
+    #[test]
+    fn test_identity_no_git_section_without_changes() {
+        let (_tmp, cb) = make_context();
+        let prompt = cb.build_system_prompt(None);
+        assert!(
+            !prompt.contains("External Changes"),
+            "prompt should not include git changes header without changes"
+        );
+    }
+
+    // ----- SLM budget mode -----
+
+    #[test]
+    fn test_slm_budget_zeroes_out_sections() {
+        let tmp = TempDir::new().unwrap();
+        // Write memory that would normally appear.
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), "User prefers dark mode").unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        // Simulate SLM budget mode.
+        cb.bootstrap_budget = 1000;
+        cb.long_term_memory_budget = 500;
+        cb.today_notes_budget = 0;
+        cb.observation_budget = 0;
+        cb.learning_budget = 0;
+
+        let prompt = cb.build_system_prompt(None);
+        // Memory should still be there (budget 500, not 0).
+        assert!(prompt.contains("User prefers dark mode"));
+        // Observations header should not appear (budget 0).
+        assert!(!prompt.contains("Observations from Past Conversations"));
     }
 
     #[test]
