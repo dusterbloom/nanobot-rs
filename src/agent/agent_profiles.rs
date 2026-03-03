@@ -49,6 +49,13 @@ struct ProfileFrontmatter {
     max_iterations: Option<u32>,
     #[serde(default)]
     read_only: bool,
+    /// When true, the subagent inherits capabilities from the parent (minus `deny_capabilities`).
+    /// Explicit `capabilities` takes priority over `inherit`.
+    #[serde(default)]
+    inherit: bool,
+    /// Capabilities to remove when `inherit: true` is set.
+    #[serde(default)]
+    deny_capabilities: Option<Vec<Capability>>,
 }
 
 /// Parse a markdown file with YAML frontmatter into an AgentProfile.
