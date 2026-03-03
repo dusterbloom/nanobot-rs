@@ -277,6 +277,7 @@ pub fn profiles_summary(profiles: &HashMap<String, AgentProfile>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::capabilities::inherit_capabilities;
 
     #[test]
     fn test_parse_profile_basic() {
