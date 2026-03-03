@@ -58,6 +58,16 @@ impl Tool for ReadSkillTool {
 
         let loader = SkillsLoader::new(&self.workspace, None);
 
+        // Special sentinel: return the full XML summary (T1 view).
+        if name == "__list__" {
+            let summary = loader.build_skills_summary();
+            return if summary.is_empty() {
+                "No skills are installed.".to_string()
+            } else {
+                summary
+            };
+        }
+
         match loader.load_skill(name) {
             Some(content) => content,
             None => {
