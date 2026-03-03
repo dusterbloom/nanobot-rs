@@ -568,6 +568,62 @@ fn main() {
         Commands::Channels { action } => match action {
             ChannelsAction::Status => cli::cmd_channels_status(),
         },
+        Commands::Skills { action } => {
+            let workspace = crate::utils::helpers::get_workspace_path(None);
+            let loader = agent::skills::SkillsLoader::new(&workspace, None);
+            match action {
+                SkillsAction::List => {
+                    let skills = loader.list_skills(false);
+                    if skills.is_empty() {
+                        println!("No skills found.");
+                    } else {
+                        println!("{} skill(s) found:\n", skills.len());
+                        for s in &skills {
+                            let desc = loader
+                                .get_skill_metadata(&s.name)
+                                .and_then(|m| m.get("description").cloned())
+                                .unwrap_or_else(|| "(no description)".to_string());
+                            let version = loader
+                                .get_skill_metadata(&s.name)
+                                .and_then(|m| m.get("version").cloned())
+                                .map(|v| format!(" v{}", v))
+                                .unwrap_or_default();
+                            println!("  [{}]{} — {} ({})", s.source, version, s.name, desc);
+                        }
+                    }
+                }
+                SkillsAction::Validate => {
+                    let results = loader.validate_all();
+                    if results.is_empty() {
+                        println!("No skills found.");
+                        return;
+                    }
+                    let mut any_issue = false;
+                    for r in &results {
+                        if r.errors.is_empty() && r.warnings.is_empty() {
+                            println!("  OK   {}", r.name);
+                        } else {
+                            any_issue = true;
+                            if !r.errors.is_empty() {
+                                println!("  FAIL {}", r.name);
+                                for e in &r.errors {
+                                    println!("       ERROR: {}", e);
+                                }
+                            }
+                            for w in &r.warnings {
+                                println!("       WARN:  {}", w);
+                            }
+                        }
+                    }
+                    let total = results.len();
+                    let ok = results.iter().filter(|r| r.is_valid()).count();
+                    println!("\n{}/{} skill(s) valid.", ok, total);
+                    if any_issue {
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         Commands::Cron { action } => match action {
             CronAction::List { all } => cli::cmd_cron_list(all),
             CronAction::Add {
