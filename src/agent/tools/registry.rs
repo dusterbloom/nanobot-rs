@@ -41,6 +41,8 @@ pub struct ToolConfig {
     /// Path to the SQLite sessions database for session_search tool.
     /// When `None`, the session_search tool is not registered.
     pub db_path: Option<PathBuf>,
+    /// Code execution tool config. Disabled by default.
+    pub code_execution: CodeExecutionConfig,
 }
 
 impl ToolConfig {
@@ -59,6 +61,7 @@ impl ToolConfig {
             searxng_url: "http://localhost:8888".to_string(),
             jina_config: None,
             db_path: None,
+            code_execution: CodeExecutionConfig::default(),
         }
     }
 }
