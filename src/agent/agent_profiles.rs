@@ -317,6 +317,47 @@ Do stuff."#;
     }
 
     #[test]
+    fn test_profile_with_capabilities() {
+        let yaml = "---\ncapabilities: [read, http, skills]\n---\nYou are a researcher.";
+        let profile = parse_profile(yaml, "researcher").unwrap();
+        let tools = profile.tools.expect("capabilities should produce a tools list");
+        // read -> [list_dir, read_file], http -> [web_fetch, web_search], skills -> [read_skill]
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"list_dir".to_string()));
+        assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"web_fetch".to_string()));
+        assert!(tools.contains(&"read_skill".to_string()));
+        assert_eq!(tools.len(), 5);
+        // Verify sorted
+        for i in 1..tools.len() {
+            assert!(tools[i] >= tools[i - 1], "tools should be sorted");
+        }
+    }
+
+    #[test]
+    fn test_profile_capabilities_and_explicit_tools_merge() {
+        let yaml = "---\ncapabilities: [read]\ntools: [exec, read_file]\n---\nDo stuff.";
+        let profile = parse_profile(yaml, "test").unwrap();
+        let tools = profile.tools.expect("merged tools should be present");
+        // capabilities read -> [list_dir, read_file], plus explicit exec; read_file deduped
+        assert!(tools.contains(&"read_file".to_string()));
+        assert!(tools.contains(&"list_dir".to_string()));
+        assert!(tools.contains(&"exec".to_string()));
+        assert_eq!(tools.iter().filter(|t| *t == "read_file").count(), 1, "read_file deduped");
+        // Verify sorted
+        for i in 1..tools.len() {
+            assert!(tools[i] >= tools[i - 1], "tools should be sorted");
+        }
+    }
+
+    #[test]
+    fn test_profile_no_capabilities_no_tools_is_none() {
+        let yaml = "---\ndescription: minimal\n---\nDo stuff.";
+        let profile = parse_profile(yaml, "minimal").unwrap();
+        assert!(profile.tools.is_none(), "neither capabilities nor tools => None means all tools");
+    }
+
+    #[test]
     fn test_profiles_summary_empty() {
         let profiles = HashMap::new();
         assert_eq!(profiles_summary(&profiles), "");
