@@ -347,6 +347,16 @@ impl SkillsLoader {
         name.to_string()
     }
 
+    fn _get_skill_version(&self, name: &str) -> Option<String> {
+        let meta = self.get_skill_metadata(name)?;
+        let v = meta.get("version")?;
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.clone())
+        }
+    }
+
     fn _get_skill_meta(&self, name: &str) -> HashMap<String, serde_json::Value> {
         let meta = match self.get_skill_metadata(name) {
             Some(m) => m,
