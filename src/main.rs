@@ -669,8 +669,6 @@ fn main() {
 // Tests
 // ============================================================================
 
-<<<<<<< Updated upstream
-=======
 fn find_available_port(start: u16) -> u16 {
     for port in start..=start.saturating_add(99) {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
