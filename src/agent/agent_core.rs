@@ -383,6 +383,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     }
     // RLM lazy skills: skills loaded as summaries, fetched on demand.
     context.lazy_skills = memory_config.lazy_skills;
+    // 3-tier skill disclosure: compact (default) | xml | eager.
+    context.skill_disclosure = memory_config.skill_disclosure.clone();
     // Wire subagent profiles into the system prompt so the model knows
     // what agents exist and when to delegate instead of doing everything itself.
     let profiles = agent_profiles::load_profiles(&workspace);
