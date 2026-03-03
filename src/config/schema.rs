@@ -1126,6 +1126,7 @@ impl Default for MemoryConfig {
             max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),
             lazy_skills: true,
+            skill_disclosure: default_skill_disclosure(),
             compaction_model_context_size: 0,
             compaction: CompactionTuning::default(),
             session: SessionTuning::default(),
