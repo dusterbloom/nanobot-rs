@@ -1178,6 +1178,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exec_with_context_emits_start_progress_with_command() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        let tool = make_exec_tool(false);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_start".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("echo hello".to_string()),
+        );
+
+        tool.execute_with_context(params, &ctx).await;
+
+        // The very first event must be a Progress with "Running: echo hello".
+        let first = rx.try_recv().expect("Expected at least one progress event");
+        match first {
+            ToolEvent::Progress {
+                tool_name,
+                tool_call_id,
+                elapsed_ms,
+                output_preview: Some(ref preview),
+            } => {
+                assert_eq!(tool_name, "exec");
+                assert_eq!(tool_call_id, "call_start");
+                assert_eq!(elapsed_ms, 0);
+                assert_eq!(preview, "Running: echo hello");
+            }
+            other => panic!("Expected start Progress event, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn test_exec_with_context_matches_execute_for_simple_command() {
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
