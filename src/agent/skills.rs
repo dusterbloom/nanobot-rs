@@ -294,6 +294,44 @@ impl SkillsLoader {
         Some(metadata)
     }
 
+    /// Validate a skill by name and return a `SkillValidationResult`.
+    pub fn validate_skill(&self, skill: &SkillInfo) -> SkillValidationResult {
+        let mut errors = vec![];
+        let mut warnings = vec![];
+
+        if skill.name.is_empty() {
+            errors.push("Missing name".to_string());
+        }
+
+        let desc = self._get_skill_description(&skill.name);
+        // _get_skill_description falls back to the name itself when no description found.
+        if desc == skill.name || desc.is_empty() {
+            errors.push("Missing description".to_string());
+        }
+
+        // Check requirements availability.
+        let skill_meta = self._get_skill_meta(&skill.name);
+        if !_check_requirements(&skill_meta) {
+            let missing = _get_missing_requirements(&skill_meta);
+            warnings.push(format!("Unmet requirement(s): {}", missing));
+        }
+
+        SkillValidationResult {
+            name: skill.name.clone(),
+            path: skill.path.clone(),
+            errors,
+            warnings,
+        }
+    }
+
+    /// Validate all discoverable skills and return one result per skill.
+    pub fn validate_all(&self) -> Vec<SkillValidationResult> {
+        self.list_skills(false)
+            .iter()
+            .map(|s| self.validate_skill(s))
+            .collect()
+    }
+
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
