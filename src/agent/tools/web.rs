@@ -599,6 +599,35 @@ impl Tool for WebFetchTool {
             .to_string(),
         }
     }
+
+    async fn execute_with_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> String {
+        let url = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let _ = ctx.event_tx.send(ToolEvent::Progress {
+            tool_name: "web_fetch".to_string(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            elapsed_ms: 0,
+            output_preview: Some(format!("Fetching: {}", url)),
+        });
+
+        let result = self.execute(params).await;
+
+        let _ = ctx.event_tx.send(ToolEvent::Progress {
+            tool_name: "web_fetch".to_string(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            elapsed_ms: 0,
+            output_preview: Some("Extracting content...".to_string()),
+        });
+
+        result
+    }
 }
 
 /// Extract readable content from HTML using `dom_smoothie` (Mozilla Readability port).
