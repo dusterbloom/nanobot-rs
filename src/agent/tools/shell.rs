@@ -1111,12 +1111,18 @@ mod tests {
         let result = tool.execute_with_context(params, &ctx).await;
         assert_eq!(result, "(no output)");
 
-        // Fast command should emit no progress events
-        let mut count = 0;
-        while let Ok(_) = rx.try_recv() {
-            count += 1;
+        // Fast command emits exactly one "start" progress event with the command preview.
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
         }
-        assert_eq!(count, 0, "Fast command should emit no progress events");
+        assert_eq!(events.len(), 1, "Expected 1 start-progress event, got {}", events.len());
+        match &events[0] {
+            ToolEvent::Progress { output_preview: Some(p), .. } => {
+                assert!(p.starts_with("Running:"), "Expected 'Running:' prefix, got: {}", p);
+            }
+            other => panic!("Expected Progress with output_preview, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
