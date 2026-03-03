@@ -264,78 +264,9 @@ impl AgentLoopShared {
 
     /// Process an inbound message through the agent loop.
     ///
-<<<<<<< Updated upstream
     /// When `text_delta_tx` is `Some`, text deltas are streamed to the sender
     /// as they arrive (used by CLI/voice). When `None`, a blocking LLM call
     /// is used (gateway mode).
-=======
-    /// Takes a snapshot of `SharedCore` so the registry is consistent for the
-    /// entire message processing.
-    async fn build_tools(&self, core: &SharedCore, channel: &str, chat_id: &str) -> ToolRegistry {
-        let mut tools = ToolRegistry::new();
-        tools.condensed = core.is_local;
-
-        // File system tools (stateless).
-        tools.register(Box::new(ReadFileTool));
-        tools.register(Box::new(WriteFileTool));
-        tools.register(Box::new(EditFileTool));
-        tools.register(Box::new(ListDirTool));
-
-        // Shell (stateless config).
-        tools.register(Box::new(ExecTool::new(
-            core.exec_timeout,
-            Some(core.workspace.to_string_lossy().to_string()),
-            None,
-            None,
-            core.restrict_to_workspace,
-        )));
-
-        // Web (stateless config).
-        tools.register(Box::new(WebSearchTool::new(core.brave_api_key.clone(), 5)));
-        tools.register(Box::new(WebFetchTool::new(50_000)));
-
-        // Message tool - context baked in.
-        let outbound_tx_clone = self.bus_outbound_tx.clone();
-        let send_cb: SendCallback = Arc::new(move |msg: OutboundMessage| {
-            let tx = outbound_tx_clone.clone();
-            Box::pin(async move {
-                tx.send(msg)
-                    .map_err(|e| anyhow::anyhow!("Failed to send outbound message: {}", e))
-            })
-        });
-        let message_tool = Arc::new(MessageTool::new(Some(send_cb), channel, chat_id));
-        tools.register(Box::new(MessageToolProxy(message_tool)));
-
-        // Spawn tool - context baked in.
-        let subagents_ref = self.subagents.clone();
-        let spawn_cb: SpawnCallback = Arc::new(move |task, label, ch, cid| {
-            let mgr = subagents_ref.clone();
-            Box::pin(async move { mgr.spawn(task, label, ch, cid).await })
-        });
-        let spawn_tool = Arc::new(SpawnTool::new());
-        // Set callback and context before registering so they're ready for use.
-        spawn_tool.set_callback(spawn_cb).await;
-        spawn_tool.set_context(channel, chat_id).await;
-        tools.register(Box::new(SpawnToolProxy(spawn_tool)));
-
-        // Cron tool (optional) - context baked in.
-        if let Some(ref svc) = self.cron_service {
-            let ct = Arc::new(CronScheduleTool::new(svc.clone()));
-            ct.set_context(channel, chat_id).await;
-            tools.register(Box::new(CronToolProxy(ct)));
-        }
-
-        // Email tools (optional) - available when email is configured.
-        if let Some(ref email_cfg) = self.email_config {
-            tools.register(Box::new(CheckInboxTool::new(email_cfg.clone())));
-            tools.register(Box::new(SendEmailTool::new(email_cfg.clone())));
-        }
-
-        tools
-    }
-
-    /// Process a regular inbound message through the agent loop.
->>>>>>> Stashed changes
     ///
     /// This method takes `&self` and is safe to call from multiple concurrent
     /// tasks. Per-message tool instances eliminate shared-context races.
