@@ -88,21 +88,31 @@ def _rpc_call(tool_name, **kwargs):
 // RPC dispatcher (runs in a blocking thread)
 // ---------------------------------------------------------------------------
 
-/// Accepts connections on `listener`, dispatches tool calls through a fresh
-/// registry built from `tool_config`, until the child exits or `max_tool_calls`
-/// is exhausted.
+/// Accepts connections on `listener` until `stop` is signalled, dispatching
+/// tool calls through `registry`.
+///
+/// The listener is set to non-blocking mode with a 100 ms accept loop so the
+/// server can notice the stop signal promptly after the child process exits.
 fn run_rpc_server(
     listener: UnixListener,
     registry: Arc<ToolRegistry>,
     max_tool_calls: usize,
     call_count: Arc<Mutex<usize>>,
+    stop: Arc<AtomicBool>,
 ) {
-    listener.set_nonblocking(false).ok();
+    // Non-blocking so the accept loop can poll `stop`.
+    listener.set_nonblocking(true).ok();
 
-    // We process one connection at a time (each tool call = one connection).
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                // Switch the connected stream to blocking for clean line reads.
+                stream.set_nonblocking(false).ok();
+
                 // Read one JSON line.
                 let request_line = {
                     let mut reader = BufReader::new(&stream);
@@ -136,19 +146,16 @@ fn run_rpc_server(
                         if count > max_tool_calls {
                             json!({"error": format!("max_tool_calls ({}) exceeded", max_tool_calls)})
                         } else {
-                            // We are already in a spawn_blocking context, so we
-                            // need a way to run async code.  Use block_in_place
-                            // if we can reach the tokio runtime, otherwise build
-                            // a mini runtime.
-                            let result =
-                                match tokio::runtime::Handle::try_current() {
-                                    Ok(handle) => tokio::task::block_in_place(|| {
-                                        handle.block_on(registry.execute(&tool_name, params))
-                                    }),
-                                    Err(_) => tokio::runtime::Runtime::new()
-                                        .expect("tokio runtime")
-                                        .block_on(registry.execute(&tool_name, params)),
-                                };
+                            // We are in a spawn_blocking context — use block_in_place
+                            // to reach the ambient tokio runtime if available.
+                            let result = match tokio::runtime::Handle::try_current() {
+                                Ok(handle) => tokio::task::block_in_place(|| {
+                                    handle.block_on(registry.execute(&tool_name, params))
+                                }),
+                                Err(_) => tokio::runtime::Runtime::new()
+                                    .expect("tokio runtime")
+                                    .block_on(registry.execute(&tool_name, params)),
+                            };
 
                             if result.ok {
                                 json!({"result": result.data})
@@ -165,6 +172,10 @@ fn run_rpc_server(
                 let mut response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                 response_bytes.push(b'\n');
                 stream.write_all(&response_bytes).ok();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No connection pending — sleep briefly before retrying.
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break,
         }
