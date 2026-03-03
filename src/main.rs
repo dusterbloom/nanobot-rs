@@ -1499,7 +1499,6 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
     ))
 }
 
->>>>>>> Stashed changes
 #[cfg(test)]
 mod tests {
     use super::*;
