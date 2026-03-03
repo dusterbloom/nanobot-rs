@@ -379,6 +379,53 @@ Do stuff."#;
         assert!(profile.tools.is_none(), "neither capabilities nor tools => None means all tools");
     }
 
+    // ----- inherit / deny_capabilities -----
+
+    #[test]
+    fn test_profile_inherit_flag_parsed() {
+        let yaml = "---\ninherit: true\ndeny_capabilities: [write, execute]\n---\nDo restricted work.";
+        let profile = parse_profile(yaml, "restricted").unwrap();
+        assert!(profile.inherit, "inherit flag should be true");
+        assert!(profile.deny_capabilities.contains(&Capability::Write));
+        assert!(profile.deny_capabilities.contains(&Capability::Execute));
+        // tools should be None because no explicit capabilities/tools listed
+        assert!(profile.tools.is_none());
+    }
+
+    #[test]
+    fn test_profile_inherit_false_by_default() {
+        let yaml = "---\ndescription: normal agent\n---\nDo stuff.";
+        let profile = parse_profile(yaml, "normal").unwrap();
+        assert!(!profile.inherit);
+        assert!(profile.deny_capabilities.is_empty());
+    }
+
+    #[test]
+    fn test_profile_explicit_capabilities_override_inherit() {
+        // When `capabilities` are explicit, they define `tools` regardless of `inherit`.
+        let yaml = "---\ncapabilities: [read]\ninherit: true\ndeny_capabilities: [http]\n---\nDo stuff.";
+        let profile = parse_profile(yaml, "mixed").unwrap();
+        let tools = profile.tools.expect("should have tools from capabilities");
+        assert!(tools.contains(&"read_file".to_string()));
+        // inherit flag is recorded but explicit capabilities win for tools
+        assert!(profile.inherit);
+        assert!(profile.deny_capabilities.contains(&Capability::Http));
+    }
+
+    #[test]
+    fn test_inherit_capabilities_integration() {
+        // Simulate a spawn-time resolution: parent has Read + Http + Write,
+        // child profile says inherit=true, deny=[write].
+        let parent_caps = vec![Capability::Read, Capability::Http, Capability::Write];
+        let deny = vec![Capability::Write];
+        let resolved = inherit_capabilities(&parent_caps, &deny);
+        let tool_names = resolve_capabilities(&resolved);
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(tool_names.contains(&"web_fetch".to_string()));
+        assert!(!tool_names.contains(&"write_file".to_string()));
+        assert!(!tool_names.contains(&"edit_file".to_string()));
+    }
+
     #[test]
     fn test_profiles_summary_empty() {
         let profiles = HashMap::new();
