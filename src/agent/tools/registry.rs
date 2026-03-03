@@ -321,6 +321,22 @@ impl ToolRegistry {
                 self.register(Box::new(SessionSearchTool::new(db_path.clone())));
             }
         }
+        if config.code_execution.enabled && should_include("execute_code") {
+            // Collect tool names for the Python stub (excluding execute_code itself).
+            let available_tools: Vec<String> = self
+                .tools
+                .keys()
+                .filter(|n| n.as_str() != "execute_code")
+                .cloned()
+                .collect();
+            self.register(Box::new(CodeExecutionTool::new(
+                true,
+                config.code_execution.timeout,
+                config.code_execution.max_tool_calls,
+                available_tools,
+                None, // No nested tool_config — scripts get a stub-only registry.
+            )));
+        }
     }
 
     /// Register a tool. Replaces any existing tool with the same name.
