@@ -231,39 +231,68 @@ impl ContextBuilder {
             parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
         }
 
-        // Skills -- progressive loading (with lazy/RLM mode support).
-        // All skills content is accumulated then capped at skills_budget.
-        let fetch_hint = if self.lazy_skills {
-            "Use the read_skill tool to load a skill's full instructions."
+        // Skills -- progressive loading (3-tier disclosure model).
+        // Tier selection is driven by `skill_disclosure`:
+        //   "compact" (default): one-line index in system prompt, full content on demand via read_skill
+        //   "xml": full XML summary with descriptions and metadata
+        //   "eager": full skill content loaded immediately (legacy behaviour)
+        // `lazy_skills` is kept for backward compat and treated as "xml" disclosure.
+        let effective_disclosure = if self.skill_disclosure == "eager" {
+            "eager"
+        } else if self.skill_disclosure == "xml" || (!self.skill_disclosure.is_empty() && self.skill_disclosure != "compact") {
+            "xml"
         } else {
-            "To use a skill, read its SKILL.md file using the read_file tool."
+            // "compact" is default; also applied when lazy_skills=true (unless overridden)
+            "compact"
         };
 
         let mut skills_parts: Vec<String> = Vec::new();
 
-        if !self.lazy_skills {
-            // Eager mode: always-loaded skills get full content.
-            let always_skills = self.skills.get_always_skills();
-            if !always_skills.is_empty() {
-                let always_content = self.skills.load_skills_for_context(&always_skills);
-                if !always_content.is_empty() {
-                    skills_parts.push(format!("# Active Skills\n\n{}", always_content));
+        match effective_disclosure {
+            "eager" => {
+                // Eager mode: always-loaded skills get full content, others as XML summary.
+                let always_skills = self.skills.get_always_skills();
+                if !always_skills.is_empty() {
+                    let always_content = self.skills.load_skills_for_context(&always_skills);
+                    if !always_content.is_empty() {
+                        skills_parts.push(format!("# Active Skills\n\n{}", always_content));
+                    }
+                }
+                let skills_summary = self.skills.build_skills_summary();
+                if !skills_summary.is_empty() {
+                    skills_parts.push(format!(
+                        "# Skills\n\n\
+                         The following skills extend your capabilities. \
+                         To use a skill, read its SKILL.md file using the read_file tool.\n\
+                         Skills with available=\"false\" need dependencies installed first \
+                         - you can try installing them with apt/brew.\n\n\
+                         {}",
+                        skills_summary
+                    ));
                 }
             }
-        }
-        // In lazy mode, always-skills appear in the summary below instead.
-
-        // Available skills: summary only (name + description).
-        let skills_summary = self.skills.build_skills_summary();
-        if !skills_summary.is_empty() {
-            skills_parts.push(format!(
-                "# Skills\n\n\
-                 The following skills extend your capabilities. {}\n\
-                 Skills with available=\"false\" need dependencies installed first \
-                 - you can try installing them with apt/brew.\n\n\
-                 {}",
-                fetch_hint, skills_summary
-            ));
+            "xml" => {
+                // XML mode: full XML summary, agent fetches full content via read_skill.
+                let skills_summary = self.skills.build_skills_summary();
+                if !skills_summary.is_empty() {
+                    skills_parts.push(format!(
+                        "# Skills\n\n\
+                         The following skills extend your capabilities. \
+                         Use the read_skill tool to load a skill's full instructions.\n\
+                         Skills with available=\"false\" need dependencies installed first \
+                         - you can try installing them with apt/brew.\n\n\
+                         {}",
+                        skills_summary
+                    ));
+                }
+            }
+            _ => {
+                // "compact" (default): one-line index, full content on demand.
+                let index = self.skills.build_compact_index();
+                if !index.is_empty() {
+                    skills_parts.push(format!("# Skills\n\n{}", index));
+                }
+            }
         }
 
         if !skills_parts.is_empty() {
