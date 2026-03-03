@@ -2337,6 +2337,26 @@ mod continuation_tests {
         assert!(!appears_incomplete("All done!"));
         assert!(!appears_incomplete("Did it work?"));
     }
+
+    #[test]
+    fn test_trailing_emoji_not_flagged() {
+        // Period before emoji — response is complete, must not trigger continuation
+        assert!(!appears_incomplete("Why cross the road? To avoid borrows. 🦀"));
+        // Period before multiple emojis
+        assert!(!appears_incomplete("The answer is 42. 🎉✨"));
+    }
+
+    #[test]
+    fn test_trailing_emoji_mid_sentence_still_flagged() {
+        // No punctuation even after stripping emojis — still incomplete
+        assert!(appears_incomplete("Here's a joke 🤣😂🔥"));
+    }
+
+    #[test]
+    fn test_short_response_with_emoji_not_flagged() {
+        // Under the 20-char length threshold
+        assert!(!appears_incomplete("OK 👍"));
+    }
 }
 
 // ============================================================================

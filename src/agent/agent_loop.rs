@@ -2670,8 +2670,13 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
         return false;
     }
 
-    // Ends mid-sentence (no terminal punctuation, not a code block fence)
-    let last_char = trimmed.chars().last().unwrap();
+    // Ends mid-sentence (no terminal punctuation, not a code block fence).
+    // Strip trailing emoji (non-ASCII symbols like 🦀 😄 🔁) and any surrounding
+    // whitespace before checking the "real" last character — an emoji after a
+    // period must not trigger continuation.
+    let stripped = trimmed.trim_end_matches(|c: char| !c.is_alphanumeric() && !c.is_ascii()).trim_end();
+    let text_for_check = if stripped.is_empty() { trimmed } else { stripped };
+    let last_char = text_for_check.chars().last().unwrap();
     let ends_mid_sentence = !matches!(last_char, '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']' | '}' | '`')
         && !trimmed.ends_with("```");
 
