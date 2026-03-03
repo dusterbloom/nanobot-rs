@@ -29,6 +29,12 @@ pub struct AgentProfile {
     pub max_iterations: Option<u32>,
     /// If true, exclude write/edit tools even if listed.
     pub read_only: bool,
+    /// When true, capabilities are inherited from the parent context
+    /// (minus `deny_capabilities`). Explicit `capabilities` in frontmatter
+    /// takes priority over this flag.
+    pub inherit: bool,
+    /// Capabilities stripped from inherited set when `inherit: true`.
+    pub deny_capabilities: Vec<Capability>,
 }
 
 /// Raw YAML frontmatter (deserialized from the --- block).
