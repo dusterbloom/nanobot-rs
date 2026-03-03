@@ -181,10 +181,14 @@ impl SkillsLoader {
             let desc = _escape_xml(&self._get_skill_description(&s.name));
             let skill_meta = self._get_skill_meta(&s.name);
             let available = _check_requirements(&skill_meta);
+            let version_attr = self._get_skill_version(&s.name)
+                .map(|v| format!(" version=\"{}\"", _escape_xml(&v)))
+                .unwrap_or_default();
 
             lines.push(format!(
-                "  <skill available=\"{}\">",
-                if available { "true" } else { "false" }
+                "  <skill available=\"{}\"{}>",
+                if available { "true" } else { "false" },
+                version_attr
             ));
             lines.push(format!("    <name>{}</name>", name));
             lines.push(format!("    <description>{}</description>", desc));
