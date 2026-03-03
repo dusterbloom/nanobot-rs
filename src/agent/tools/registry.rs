@@ -547,7 +547,11 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
-            .collect()
+            .collect();
+        if self.condensed {
+            Self::condense_definitions(&mut defs);
+        }
+        defs
     }
 
     /// Get tool definitions for local models — smaller core set with keyword
@@ -588,7 +592,8 @@ impl ToolRegistry {
             }
         }
 
-        self.tools
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
             .iter()
             .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
