@@ -39,6 +39,10 @@ struct ProfileFrontmatter {
     description: Option<String>,
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// Semantic capability groups. Resolved to tool names and merged with
+    /// any explicit `tools` list. Both may be specified simultaneously.
+    #[serde(default)]
+    capabilities: Option<Vec<Capability>>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
