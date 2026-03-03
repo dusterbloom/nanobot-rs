@@ -1376,4 +1376,158 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             "JSON without text field should fall back to raw string"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Progress event emission tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_web_search_emits_start_progress_event() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        // Use brave provider with empty key — it fails fast without network I/O.
+        let tool = WebSearchTool::new(
+            Some(String::new()),
+            5,
+            "brave".to_string(),
+            "http://localhost:8888".to_string(),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_search".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "query".to_string(),
+            serde_json::Value::String("rust programming".to_string()),
+        );
+
+        tool.execute_with_context(params, &ctx).await;
+
+        // Must have emitted at least one Progress event with the search query.
+        let first = rx.try_recv().expect("Expected at least one progress event");
+        match first {
+            ToolEvent::Progress {
+                tool_name,
+                tool_call_id,
+                elapsed_ms,
+                output_preview: Some(ref preview),
+            } => {
+                assert_eq!(tool_name, "web_search");
+                assert_eq!(tool_call_id, "call_search");
+                assert_eq!(elapsed_ms, 0);
+                assert!(
+                    preview.contains("rust programming"),
+                    "Expected query in preview, got: {}",
+                    preview
+                );
+            }
+            other => panic!("Expected Progress event with output_preview, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_emits_fetch_and_extract_progress_events() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        // Use an invalid URL so the request fails fast — we only care about
+        // the progress events emitted before and after execution, not the result.
+        let tool = WebFetchTool::new(50000, None);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_fetch".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "url".to_string(),
+            serde_json::Value::String("ftp://invalid-url-that-fails-fast".to_string()),
+        );
+
+        tool.execute_with_context(params, &ctx).await;
+
+        // Collect all emitted events.
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // First event: "Fetching: <url>"
+        assert!(!events.is_empty(), "Expected at least one progress event");
+        match &events[0] {
+            ToolEvent::Progress {
+                tool_name,
+                tool_call_id,
+                output_preview: Some(preview),
+                ..
+            } => {
+                assert_eq!(tool_name, "web_fetch");
+                assert_eq!(tool_call_id, "call_fetch");
+                assert!(
+                    preview.starts_with("Fetching:"),
+                    "Expected 'Fetching:' prefix, got: {}",
+                    preview
+                );
+            }
+            other => panic!("Expected Fetching progress event, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_emits_extracting_progress_after_fetch() {
+        use crate::agent::audit::ToolEvent;
+        use crate::agent::tools::base::ToolExecutionContext;
+
+        // Use a URL that passes validation but will fail at network level quickly.
+        // The "Extracting content..." event is emitted after execute() returns.
+        // Using an invalid URL ensures execute() returns quickly.
+        let tool = WebFetchTool::new(50000, None);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = ToolExecutionContext {
+            event_tx: tx,
+            cancellation_token: token,
+            tool_call_id: "call_fetch2".to_string(),
+        };
+
+        let mut params = HashMap::new();
+        // Invalid scheme fails URL validation before any network I/O.
+        params.insert(
+            "url".to_string(),
+            serde_json::Value::String("ftp://example.com".to_string()),
+        );
+
+        tool.execute_with_context(params, &ctx).await;
+
+        // Collect all events.
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Must have 2 events: "Fetching: ..." and "Extracting content..."
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected 2 progress events, got {}",
+            events.len()
+        );
+
+        let has_extracting = events.iter().any(|ev| {
+            matches!(ev, ToolEvent::Progress { output_preview: Some(p), .. } if p.contains("Extracting content"))
+        });
+        assert!(has_extracting, "Expected 'Extracting content...' progress event");
+    }
 }
