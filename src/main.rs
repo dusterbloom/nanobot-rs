@@ -364,6 +364,14 @@ enum ChannelsAction {
 }
 
 #[derive(Subcommand)]
+enum SkillsAction {
+    /// Validate all discoverable skills and report issues.
+    Validate,
+    /// List all skills with their source and description.
+    List,
+}
+
+#[derive(Subcommand)]
 enum CronAction {
     /// List scheduled jobs.
     List {
