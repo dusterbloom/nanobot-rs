@@ -608,7 +608,6 @@ impl ContextBuilder {
             format!("\n\n## Model\nYou are powered by: {}", self.model_name)
         };
 
-<<<<<<< Updated upstream
         // Cost-aware delegation hint for expensive models.
         let is_expensive = self.model_name.contains("opus")
             || self.model_name.contains("gpt-4o")
@@ -622,24 +621,6 @@ impl ContextBuilder {
              Only do it yourself when the result feeds directly into your next sentence."
         } else {
             ""
-=======
-        // Time awareness: show gap since last interaction with behavioral hint.
-        let time_awareness = if let Some(last) = self.last_interaction {
-            let gap = now.signed_duration_since(last);
-            let gap_str = Self::format_time_gap(gap);
-            let hint = Self::time_gap_hint(gap);
-            format!("\nLast session: {}. {}", gap_str, hint)
-        } else {
-            String::new()
-        };
-
-        // Git changes detected since last session.
-        let git_section = match self.git_changes {
-            Some(ref changes) if !changes.is_empty() => {
-                format!("\n\n## External Changes\n{}", changes)
-            }
-            _ => String::new(),
->>>>>>> Stashed changes
         };
 
         format!(
