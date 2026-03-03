@@ -202,6 +202,26 @@ impl Tool for WebSearchTool {
             other => format!("Error: unknown search provider '{}'. Use 'searxng' or 'brave'.", other),
         }
     }
+
+    async fn execute_with_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> String {
+        let query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let _ = ctx.event_tx.send(ToolEvent::Progress {
+            tool_name: "web_search".to_string(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            elapsed_ms: 0,
+            output_preview: Some(format!("Searching: {}", query)),
+        });
+
+        self.execute(params).await
+    }
 }
 
 impl WebSearchTool {
