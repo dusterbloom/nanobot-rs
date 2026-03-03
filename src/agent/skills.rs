@@ -206,14 +206,14 @@ impl SkillsLoader {
         ];
         for skill in &skills {
             let desc = self._get_skill_description(&skill.name);
-            let truncated = if desc.len() > 60 {
+            let display = if desc.len() > 60 {
                 // Truncate at a char boundary to avoid breaking multibyte chars.
                 let end = crate::utils::helpers::floor_char_boundary(&desc, 60);
-                &desc[..end]
+                desc[..end].to_string()
             } else {
-                &desc
+                desc
             };
-            lines.push(format!("- {}: {}", skill.name, truncated));
+            lines.push(format!("- {}: {}", skill.name, display));
         }
         lines.join("\n")
     }
