@@ -6,6 +6,7 @@ pub(crate) fn is_synthetic_injection(message: &serde_json::Value) -> bool {
 }
 
 pub mod agent_core;
+pub mod parsers;
 pub mod agent_loop;
 pub mod agent_profiles;
 pub mod instructions;
