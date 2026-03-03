@@ -82,6 +82,11 @@ pub struct ContextBuilder {
     /// When true, all skills are loaded as summaries only (RLM lazy mode).
     /// The agent uses `read_skill` to fetch full content on demand.
     pub lazy_skills: bool,
+    /// Controls how skills are disclosed in the system prompt.
+    /// - "compact" (default): one-line index per skill (~20 tokens each)
+    /// - "xml": full XML summary with descriptions and metadata
+    /// - "eager": full skill content loaded into the system prompt
+    pub skill_disclosure: String,
     /// Pre-rendered subagent profiles section (from `profiles_summary()`).
     /// Injected into the system prompt when non-empty.
     pub agent_profiles: String,
