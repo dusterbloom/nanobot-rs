@@ -1106,6 +1106,10 @@ fn default_reflection_threshold() -> usize {
     5000
 }
 
+fn default_skill_disclosure() -> String {
+    "compact".to_string()
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
