@@ -34,6 +34,9 @@ pub struct ModelCapabilities {
     pub max_reliable_output: usize,
     pub scratch_pad_rounds: usize,
     pub reader_tier: ReaderTier,
+    /// Optional parser override name (e.g. "hermes", "qwen", "llama", "deepseek").
+    /// When set, the parser registry will use this parser regardless of model name matching.
+    pub parser: Option<String>,
 }
 
 /// Partial override from config.json `modelCapabilities` section.
