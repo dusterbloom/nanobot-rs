@@ -105,7 +105,6 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
-<<<<<<< Updated upstream
             bootstrap_budget: 1500,
             long_term_memory_budget: 400,
             skills_budget: 1000,
@@ -117,15 +116,6 @@ impl ContextBuilder {
             agent_profiles: String::new(),
             instruction_profiles: None,
             task_kind: "main".to_string(),
-=======
-            bootstrap_budget: 3000,
-            long_term_memory_budget: 2000,
-            today_notes_budget: 1200,
-            observation_budget: 2000,
-            learning_budget: 800,
-            last_interaction: None,
-            git_changes: None,
->>>>>>> Stashed changes
         }
     }
 
