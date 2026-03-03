@@ -343,15 +343,12 @@ impl ToolRegistry {
     ///
     /// Tools where [`Tool::is_available`] returns `false` are excluded.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
-<<<<<<< Updated upstream
-        self.tools
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
             .values()
             .filter(|tool| tool.is_available())
             .map(|tool| tool.to_schema())
-            .collect()
-=======
-        let mut defs: Vec<serde_json::Value> =
-            self.tools.values().map(|tool| tool.to_schema()).collect();
+            .collect();
         if self.condensed {
             Self::condense_definitions(&mut defs);
         }
@@ -377,7 +374,6 @@ impl ToolRegistry {
         } else {
             desc.to_string()
         }
->>>>>>> Stashed changes
     }
 
     /// Execute a tool by name with given parameters.
