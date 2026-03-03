@@ -8,7 +8,8 @@ use regex::Regex;
 use reqwest::Client;
 use url::Url;
 
-use super::base::Tool;
+use super::base::{Tool, ToolExecutionContext};
+use crate::agent::audit::ToolEvent;
 use crate::config::schema::JinaReaderConfig;
 
 /// Shared user-agent string.
