@@ -301,9 +301,13 @@ impl Tool for CodeExecutionTool {
         let call_count = Arc::new(Mutex::new(0usize));
         let call_count_clone = Arc::clone(&call_count);
 
+        // Shared stop flag: set after the child exits so the server thread can exit.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
         // Spawn RPC server in a dedicated blocking thread.
         let _server_handle = task::spawn_blocking(move || {
-            run_rpc_server(listener, registry, max_tool_calls, call_count_clone);
+            run_rpc_server(listener, registry, max_tool_calls, call_count_clone, stop_clone);
         });
 
         // Spawn child python3 process.
@@ -324,6 +328,9 @@ impl Tool for CodeExecutionTool {
         // `wait_with_output` takes ownership, so we handle timeout via kill_on_drop.
         let timeout = Duration::from_secs(self.timeout_secs);
         let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+
+        // Signal the server thread to stop regardless of outcome.
+        stop.store(true, Ordering::Relaxed);
 
         match output {
             Ok(Ok(out)) => {
