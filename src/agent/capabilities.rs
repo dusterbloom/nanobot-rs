@@ -35,6 +35,19 @@ impl Capability {
     }
 }
 
+/// Resolve inherited capabilities: start from parent's capabilities and
+/// remove any in the `deny` list.
+///
+/// When a subagent profile sets `inherit: true`, it starts with the parent's
+/// full capability set and narrows it by removing anything in `deny_capabilities`.
+pub fn inherit_capabilities(parent_caps: &[Capability], deny: &[Capability]) -> Vec<Capability> {
+    parent_caps
+        .iter()
+        .filter(|c| !deny.contains(c))
+        .cloned()
+        .collect()
+}
+
 /// Resolve a list of capabilities to a deduplicated, sorted list of tool names.
 pub fn resolve_capabilities(caps: &[Capability]) -> Vec<String> {
     let mut tools: HashSet<String> = HashSet::new();
