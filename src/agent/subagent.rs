@@ -340,11 +340,11 @@ impl SubagentManager {
 
         // Build config: model_override > profile.model > default_subagent_model > self.model (last resort)
         let effective_model = if let Some(ref m) = model_override {
-            agent_profiles::resolve_model_alias(m)
+            agent_profiles::resolve_model_for_env(m, self.is_local, &self.model)
         } else if let Some(ref p) = profile {
             p.model
                 .as_ref()
-                .map(|m| agent_profiles::resolve_model_alias(m))
+                .map(|m| agent_profiles::resolve_model_for_env(m, self.is_local, &self.model))
                 .unwrap_or_else(|| {
                     self.default_subagent_model.clone().unwrap_or_else(|| {
                         warn!("EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config", self.model);

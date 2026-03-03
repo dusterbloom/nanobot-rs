@@ -235,6 +235,25 @@ pub fn resolve_model_alias(alias: &str) -> String {
     }
 }
 
+/// Resolve a model tier alias for the current runtime environment.
+///
+/// In local mode, tier aliases (`haiku`, `sonnet`, `opus`) resolve to the
+/// active local model — there is typically one model loaded in LM Studio.
+/// In cloud mode, they resolve to specific cloud model identifiers.
+///
+/// This keeps agent profiles portable: `model: haiku` means "fast/cheap tier"
+/// regardless of whether the session is local or cloud.
+pub fn resolve_model_for_env(alias: &str, is_local: bool, local_model: &str) -> String {
+    if is_local {
+        match alias.to_lowercase().as_str() {
+            "haiku" | "sonnet" | "opus" | "local" => local_model.to_string(),
+            other => other.to_string(),
+        }
+    } else {
+        resolve_model_alias(alias)
+    }
+}
+
 /// Get a one-line summary of available profiles for the system prompt.
 pub fn profiles_summary(profiles: &HashMap<String, AgentProfile>) -> String {
     if profiles.is_empty() {
@@ -337,6 +356,23 @@ Do stuff."#;
         assert_eq!(resolve_model_alias("Haiku"), "claude-haiku-4-5-20251001"); // case insensitive
         assert_eq!(resolve_model_alias("local"), "local");
         assert_eq!(resolve_model_alias("custom-model-v2"), "custom-model-v2");
+    }
+
+    #[test]
+    fn test_resolve_model_for_env() {
+        // Cloud mode: same as resolve_model_alias
+        assert_eq!(resolve_model_for_env("haiku", false, "unused"), "claude-haiku-4-5-20251001");
+        assert_eq!(resolve_model_for_env("sonnet", false, "unused"), "claude-sonnet-4-5-20250929");
+
+        // Local mode: tier aliases resolve to local model
+        let local = "qwen3.5-prism";
+        assert_eq!(resolve_model_for_env("haiku", true, local), local);
+        assert_eq!(resolve_model_for_env("sonnet", true, local), local);
+        assert_eq!(resolve_model_for_env("opus", true, local), local);
+        assert_eq!(resolve_model_for_env("local", true, local), local);
+
+        // Local mode: non-tier names pass through
+        assert_eq!(resolve_model_for_env("groq/llama-3.3-70b", true, local), "groq/llama-3.3-70b");
     }
 
     #[test]

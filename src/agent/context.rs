@@ -511,8 +511,14 @@ impl ContextBuilder {
             format!(
                 "\n\n## Model\nYou are running locally via LM Studio. \
                  Your model file: {}. You are NOT Claude or any cloud AI. \
-                 Respond as nanobot powered by this local model.",
-                gguf_name
+                 Respond as nanobot powered by this local model.\n\n\
+                 ## Local Mode Constraints\n\
+                 - Cloud models (claude-*, gpt-*, etc.) are **not available** in this session.\n\
+                 - When spawning subagents, omit the `model` parameter to use the local model, \
+                 or specify it by name: `{}`.\n\
+                 - Do not request cloud-specific model tiers (haiku, sonnet, opus) — \
+                 they will automatically resolve to the local model.",
+                gguf_name, gguf_name
             )
         } else {
             format!("\n\n## Model\nYou are powered by: {}", self.model_name)
