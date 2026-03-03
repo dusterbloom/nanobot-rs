@@ -17,7 +17,7 @@ pub mod spawn;
 pub mod web;
 
 pub use base::Tool;
-pub use code_execution::{generate_python_stub, CodeExecutionTool};
+pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;
 pub use email::{CheckInboxTool, SendEmailTool};
 pub use filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
