@@ -40,7 +40,7 @@ impl Default for VoiceAgentConfig {
             channel: "voice".to_string(),
             chat_id: "voice".to_string(),
             local: false,
-            system_prompt: Some("You are a helpful voice assistant. Keep responses concise and conversational. Respond in the same language the user speaks.".to_string()),
+            system_prompt: Some("You are a helpful voice assistant. Keep responses concise and conversational. Respond in the same language the user speaks. Never use emoji, markdown formatting, or special characters — your output will be spoken aloud.".to_string()),
         }
     }
 }
@@ -313,15 +313,70 @@ pub(crate) async fn run_voice_event_loop(
 #[cfg(feature = "voice")]
 pub(crate) async fn drive_llm_to_tts(
     mut delta_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-    tts_tx: std::sync::mpsc::Sender<crate::voice::TtsCommand>,
+    tts_tx: std::sync::mpsc::Sender<crate::voice_pipeline::TtsCommand>,
     event_tx: mpsc::Sender<VoiceAgentEvent>,
 ) {
-    let mut accumulator = crate::voice::SentenceAccumulator::new_streaming(tts_tx);
+    let mut accumulator = crate::voice_pipeline::SentenceAccumulator::new_streaming(tts_tx);
+    let mut delta_count = 0u32;
     while let Some(delta) = delta_rx.recv().await {
+        delta_count += 1;
         let _ = event_tx.send(VoiceAgentEvent::LlmTextDelta { delta: delta.clone() }).await;
-        accumulator.push(&delta);
+
+        // Filter out protocol metadata (NUL-prefixed messages from agent_loop)
+        if delta.starts_with('\x00') {
+            tracing::debug!("[drive-tts] skipping metadata: {:?}", delta);
+            continue;
+        }
+        // Skip error messages — display them but don't speak them
+        if is_error_message(&delta) {
+            tracing::debug!("[drive-tts] skipping error message from TTS");
+            continue;
+        }
+        // Strip ANSI escape sequences (thinking token decorations)
+        let cleaned = strip_ansi(&delta);
+        if !cleaned.is_empty() {
+            accumulator.push(&cleaned);
+        }
     }
+    tracing::debug!("[drive-tts] LLM stream ended after {} deltas, flushing accumulator", delta_count);
     accumulator.flush();
+}
+
+/// Check if a delta looks like an error message that should not be spoken.
+fn is_error_message(text: &str) -> bool {
+    text.contains("I encountered an error")
+        || text.starts_with("[LLM Error]")
+        || text.starts_with("[nanobot]")
+        || text.contains("error sending request for url")
+}
+
+/// Check if a full LLM response indicates a transient error worth retrying.
+fn is_error_response(text: &str) -> bool {
+    text.contains("I encountered an error")
+        || text.starts_with("[LLM Error]")
+        || text.contains("error sending request for url")
+        || text.contains("HTTP request failed")
+}
+
+/// Strip ANSI escape sequences from a string (CSI sequences like \x1b[...m).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... <final byte>
+            if chars.next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Voice agent that integrates realtime voice with LLM.
@@ -336,6 +391,7 @@ pub(crate) async fn drive_llm_to_tts(
 pub struct VoiceAgent {
     config: VoiceAgentConfig,
     running: Arc<AtomicBool>,
+    agent_loop: Option<Arc<crate::agent::agent_loop::AgentLoop>>,
 }
 
 impl VoiceAgent {
@@ -344,6 +400,16 @@ impl VoiceAgent {
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
+            agent_loop: None,
+        }
+    }
+
+    /// Create a new voice agent with an AgentLoop for real LLM processing.
+    pub fn with_agent_loop(config: VoiceAgentConfig, agent_loop: Arc<crate::agent::agent_loop::AgentLoop>) -> Self {
+        Self {
+            config,
+            running: Arc::new(AtomicBool::new(false)),
+            agent_loop: Some(agent_loop),
         }
     }
 
@@ -358,6 +424,10 @@ impl VoiceAgent {
 
         let realtime_config = self.config.realtime.clone();
         let running = self.running.clone();
+        let agent_loop = self.agent_loop.clone();
+        let session_key = self.config.session_key.clone();
+        let channel = self.config.channel.clone();
+        let chat_id = self.config.chat_id.clone();
 
         // Spawn the main voice agent loop in a dedicated thread
         // We create the RealtimeSession inside the thread to avoid Send issues
@@ -366,13 +436,13 @@ impl VoiceAgent {
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime");
-            
+
             rt.block_on(async move {
-                use super::{RealtimeConfig, RealtimeSession, RealtimeEvent};
-                
+                use super::{RealtimeSession, RealtimeEvent};
+
                 // Create session inside the dedicated runtime
                 let session_result = RealtimeSession::new(realtime_config).await;
-                
+
                 let mut session = match session_result {
                     Ok(s) => s,
                     Err(e) => {
@@ -380,44 +450,172 @@ impl VoiceAgent {
                         return;
                     }
                 };
-                
+
                 let start_result = session.start();
-                
+
                 if let Err(e) = start_result {
                     let _ = event_tx.send(VoiceAgentEvent::Error(format!("Failed to start session: {}", e))).await;
                     return;
                 }
-                
+
                 let (_audio_tx, mut realtime_rx) = start_result.unwrap();
-                
+
+                // Set up TTS playback pipeline with echo suppression
+                let (tts_en, tts_multi) = session.tts_handles();
+                let tts_playing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let tts_state: Option<(
+                    std::sync::mpsc::Sender<crate::voice_pipeline::TtsCommand>,
+                    std::sync::Arc<std::sync::atomic::AtomicBool>,
+                )> = if tts_en.is_some() || tts_multi.is_some() {
+                    Some(crate::voice_pipeline::start_tts_playback(
+                        tts_en, tts_multi, tts_playing.clone(),
+                    ))
+                } else {
+                    None
+                };
+
                 // Send Ready only after session is successfully started
                 let _ = event_tx.send(VoiceAgentEvent::Ready).await;
-                
-                tracing::info!("Voice agent started");
+
+                tracing::info!("Voice agent started (LLM: {}, TTS: {})",
+                    if agent_loop.is_some() { "enabled" } else { "stub" },
+                    if tts_state.is_some() { "enabled" } else { "none" });
+
+                // Track active LLM cancellation token for barge-in
+                let mut current_cancel: Option<CancellationToken> = None;
+                // Grace period: ignore SpeechStart for 500ms after entering
+                // Processing state, to avoid residual audio triggering false barge-in.
+                let mut processing_started_at: Option<std::time::Instant> = None;
+                const BARGEIN_GRACE_MS: u128 = 500;
 
                 while running.load(Ordering::SeqCst) {
                     tokio::select! {
                         Some(event) = realtime_rx.recv() => {
                             match event {
                                 RealtimeEvent::SpeechStart => {
+                                    // Suppress false barge-in from TTS speaker echo
+                                    if tts_playing.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tracing::debug!("Barge-in: suppressed (TTS playing, echo rejection)");
+                                        continue;
+                                    }
+                                    // Skip barge-in during grace period after processing starts
+                                    if let Some(started) = processing_started_at {
+                                        if started.elapsed().as_millis() < BARGEIN_GRACE_MS {
+                                            tracing::debug!("Barge-in: suppressed ({}ms grace period)", started.elapsed().as_millis());
+                                            continue;
+                                        }
+                                    }
+                                    // Barge-in: cancel in-flight LLM + TTS
+                                    if let Some(ref cancel) = current_cancel {
+                                        cancel.cancel();
+                                        current_cancel = None;
+                                        tracing::debug!("Barge-in: cancelled LLM");
+                                    }
+                                    if let Some((_, ref tts_cancel)) = tts_state {
+                                        tts_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    // Clear tts_playing so echo suppression doesn't block further input
+                                    tts_playing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    processing_started_at = None;
                                     let _ = event_tx.send(VoiceAgentEvent::UserSpeechStart).await;
                                 }
                                 RealtimeEvent::SpeechEnd => {
                                     let _ = event_tx.send(VoiceAgentEvent::UserSpeechEnd).await;
                                 }
                                 RealtimeEvent::TurnComplete { text, language } => {
+                                    // Start grace period to suppress false barge-in
+                                    // from residual audio after STT completes
+                                    processing_started_at = Some(std::time::Instant::now());
+
+                                    // Cancel any in-flight LLM task from a previous turn
+                                    if let Some(ref cancel) = current_cancel {
+                                        cancel.cancel();
+                                    }
+
                                     let _ = event_tx.send(VoiceAgentEvent::UserText {
                                         text: text.clone(),
                                         language: language.clone(),
                                     }).await;
 
-                                    // TODO: Process with LLM agent
-                                    // For now, echo back via TTS
-                                    let response = format!("You said: {}", text);
-                                    
-                                    let _ = event_tx.send(VoiceAgentEvent::LlmResponseStart).await;
-                                    let _ = event_tx.send(VoiceAgentEvent::LlmTextDelta { delta: response.clone() }).await;
-                                    let _ = event_tx.send(VoiceAgentEvent::LlmResponseComplete { full_text: response }).await;
+                                    if let Some(ref al) = agent_loop {
+                                        // Reset TTS cancel flag for new turn
+                                        if let Some((_, ref tts_cancel)) = tts_state {
+                                            tts_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        }
+
+                                        let cancel_token = CancellationToken::new();
+                                        current_cancel = Some(cancel_token.clone());
+
+                                        let al = al.clone();
+                                        let event_tx = event_tx.clone();
+                                        let sk = session_key.clone();
+                                        let ch = channel.clone();
+                                        let ci = chat_id.clone();
+                                        let tts_tx = tts_state.as_ref().map(|(tx, _)| tx.clone());
+
+                                        tokio::spawn(async move {
+                                            const MAX_RETRIES: u32 = 2;
+                                            let mut attempt = 0u32;
+
+                                            loop {
+                                                let _ = event_tx.send(VoiceAgentEvent::LlmResponseStart).await;
+
+                                                let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+                                                // Forward deltas to event channel AND TTS
+                                                let event_tx_deltas = event_tx.clone();
+                                                let delta_forwarder = if let Some(ref tts_tx) = tts_tx {
+                                                    let tts_tx = tts_tx.clone();
+                                                    tokio::spawn(drive_llm_to_tts(delta_rx, tts_tx, event_tx_deltas))
+                                                } else {
+                                                    tokio::spawn(async move {
+                                                        let mut delta_rx = delta_rx;
+                                                        while let Some(delta) = delta_rx.recv().await {
+                                                            let _ = event_tx_deltas
+                                                                .send(VoiceAgentEvent::LlmTextDelta { delta })
+                                                                .await;
+                                                        }
+                                                    })
+                                                };
+
+                                                let cancel_for_call = cancel_token.clone();
+                                                let full_text = al
+                                                    .process_direct_streaming(
+                                                        &text,
+                                                        &sk,
+                                                        &ch,
+                                                        &ci,
+                                                        Some(&language),
+                                                        delta_tx,
+                                                        None,
+                                                        Some(cancel_for_call),
+                                                        None,
+                                                    )
+                                                    .await;
+
+                                                let _ = delta_forwarder.await;
+
+                                                // Retry on transient LLM errors
+                                                if is_error_response(&full_text) && attempt < MAX_RETRIES && !cancel_token.is_cancelled() {
+                                                    attempt += 1;
+                                                    tracing::warn!("[voice-agent] LLM error (attempt {}/{}), retrying in 2s", attempt, MAX_RETRIES);
+                                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                    continue;
+                                                }
+
+                                                let _ = event_tx
+                                                    .send(VoiceAgentEvent::LlmResponseComplete { full_text })
+                                                    .await;
+                                                break;
+                                            }
+                                        });
+                                    } else {
+                                        // No AgentLoop — echo stub
+                                        let response = format!("You said: {}", text);
+                                        let _ = event_tx.send(VoiceAgentEvent::LlmResponseStart).await;
+                                        let _ = event_tx.send(VoiceAgentEvent::LlmTextDelta { delta: response.clone() }).await;
+                                        let _ = event_tx.send(VoiceAgentEvent::LlmResponseComplete { full_text: response }).await;
+                                    }
                                 }
                                 RealtimeEvent::PartialTranscript { text } => {
                                     tracing::debug!("Partial: {}", text);
@@ -915,8 +1113,7 @@ mod voice_feature_tests {
     fn test_voice_agent_config_custom() {
         let config = VoiceAgentConfig {
             realtime: super::super::RealtimeConfig {
-                tts_engine: TtsEngineConfig::Qwen,
-                qwen_voice: "serena".to_string(),
+                tts_engine: TtsEngineConfig::Kokoro,
                 ..Default::default()
             },
             session_key: "my-session".to_string(),
@@ -925,7 +1122,7 @@ mod voice_feature_tests {
             local: true,
             system_prompt: None,
         };
-        assert_eq!(config.realtime.tts_engine, TtsEngineConfig::Qwen);
+        assert_eq!(config.realtime.tts_engine, TtsEngineConfig::Kokoro);
         assert_eq!(config.session_key, "my-session");
         assert!(config.local);
     }
@@ -976,28 +1173,4 @@ mod voice_feature_tests {
         assert!(!agent.is_running());
     }
 
-    #[tokio::test]
-    async fn test_voice_agent_with_qwen_config() {
-        let config = VoiceAgentConfig {
-            realtime: super::super::RealtimeConfig {
-                tts_engine: TtsEngineConfig::Qwen,
-                qwen_voice: "ryan".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut agent = VoiceAgent::new(config);
-        
-        let result = agent.start().await;
-        // Qwen requires GPU - may fail on systems without GPU
-        if result.is_ok() {
-            let _event_rx = result.unwrap();
-            assert!(agent.is_running());
-            agent.stop();
-        } else {
-            // Expected on systems without GPU
-            let err = result.unwrap_err();
-            assert!(err.contains("GPU") || err.contains("Qwen"));
-        }
-    }
 }
