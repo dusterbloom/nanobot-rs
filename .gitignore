@@ -9,3 +9,5 @@ bridge/whatsapp/node_modules/
 .sisyphus/
 .venv/
 experiments/**/.venv/
+.planning/
+src/.janitor/
