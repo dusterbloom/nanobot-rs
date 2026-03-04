@@ -502,6 +502,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/ctx-info" => "/context",
         "/c" => "/clear",
         "/cl" => "/cluster",
+        "/sk" => "/skill",
         other => other,
     }
 }
@@ -601,6 +602,9 @@ impl ReplContext {
             }
             "/adapt" => {
                 self.cmd_adapt(arg).await;
+            }
+            "/skill" | "/skills" => {
+                self.cmd_skill(arg).await;
             }
             _ => {
                 return false;
@@ -2911,6 +2915,64 @@ impl ReplContext {
     /adapt              Show adapter status
     /adapt run          Generate D2L + T2L adapters
     /adapt scale <f>    Set adapter scale (0.0-1.0)
+");
+            }
+        }
+    }
+
+    /// /skill — manage skills (add, remove, list).
+    async fn cmd_skill(&mut self, arg: &str) {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        let workspace = self.core_handle.swappable().workspace.clone();
+
+        match parts.as_slice() {
+            [] | ["list"] => {
+                let loader = crate::agent::skills::SkillsLoader::new(&workspace, None);
+                let skills = loader.list_skills(false);
+                if skills.is_empty() {
+                    println!("\n  No skills installed.\n");
+                } else {
+                    println!("\n  {} skill(s):\n", skills.len());
+                    for s in &skills {
+                        let desc = loader
+                            .get_skill_metadata(&s.name)
+                            .and_then(|m| m.get("description").cloned())
+                            .unwrap_or_else(|| "(no description)".to_string());
+                        let version = loader
+                            .get_skill_metadata(&s.name)
+                            .and_then(|m| m.get("version").cloned())
+                            .map(|v| format!(" v{}", v))
+                            .unwrap_or_default();
+                        println!("    [{}]{} {} — {}", s.source, version, s.name, desc);
+                    }
+                    println!();
+                }
+            }
+            ["add", source] => {
+                println!("\n  Installing from {}...", source);
+                match cli::cmd_skill_add(&workspace, source).await {
+                    Ok(installed) => {
+                        for name in &installed {
+                            println!("    Installed: {}", name);
+                        }
+                        println!("  {} skill(s) installed.\n", installed.len());
+                    }
+                    Err(e) => println!("  Error: {}\n", e),
+                }
+            }
+            ["remove", name] | ["rm", name] => {
+                match cli::cmd_skill_remove(&workspace, name) {
+                    Ok(()) => println!("\n  Removed skill: {}\n", name),
+                    Err(e) => println!("\n  Error: {}\n", e),
+                }
+            }
+            _ => {
+                println!("
+  Usage: /skill [subcommand]
+    /skill              List installed skills
+    /skill list         List installed skills
+    /skill add <src>    Install from GitHub (owner/repo or owner/repo@skill)
+    /skill remove <n>   Remove a skill by name
 ");
             }
         }

@@ -371,6 +371,20 @@ enum SkillsAction {
     Validate,
     /// List all skills with their source and description.
     List,
+    /// Install skills from a GitHub repository.
+    ///
+    /// Examples:
+    ///   nanobot skills add vercel-labs/agent-skills
+    ///   nanobot skills add vercel-labs/agent-skills@vercel-react-best-practices
+    Add {
+        /// Source in format owner/repo or owner/repo@skill-name
+        source: String,
+    },
+    /// Remove an installed skill by name.
+    Remove {
+        /// Skill name to remove
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -622,6 +636,31 @@ fn main() {
                     println!("\n{}/{} skill(s) valid.", ok, total);
                     if any_issue {
                         std::process::exit(1);
+                    }
+                }
+                SkillsAction::Add { source } => {
+                    let rt = tokio::runtime::Runtime::new()
+                        .expect("Failed to create tokio runtime");
+                    match rt.block_on(cli::cmd_skill_add(&workspace, &source)) {
+                        Ok(installed) => {
+                            for name in &installed {
+                                println!("  Installed: {}", name);
+                            }
+                            println!("\n{} skill(s) installed.", installed.len());
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                SkillsAction::Remove { name } => {
+                    match cli::cmd_skill_remove(&workspace, &name) {
+                        Ok(()) => println!("Removed skill: {}", name),
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
