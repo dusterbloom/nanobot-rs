@@ -25,8 +25,6 @@ mod syntax;
 mod tui;
 mod utils;
 #[cfg(feature = "voice")]
-mod voice;
-#[cfg(feature = "voice")]
 mod voice_pipeline;
 
 use std::io::IsTerminal;

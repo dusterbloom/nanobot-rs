@@ -212,12 +212,12 @@ mod tests {
     fn test_realtime_server_config_custom() {
         let config = RealtimeServerConfig {
             port: 9000,
-            tts_engine: TtsEngineConfig::Qwen,
+            tts_engine: TtsEngineConfig::Kokoro,
             voice: "serena".to_string(),
             host: "0.0.0.0".to_string(),
         };
         assert_eq!(config.port, 9000);
-        assert_eq!(config.tts_engine, TtsEngineConfig::Qwen);
+        assert_eq!(config.tts_engine, TtsEngineConfig::Kokoro);
         assert_eq!(config.voice, "serena");
         assert_eq!(config.host, "0.0.0.0");
     }

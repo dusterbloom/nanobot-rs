@@ -55,7 +55,7 @@ pub(crate) struct ReplContext {
     /// Health probe registry for endpoint liveness (shown in /status).
     pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     #[cfg(feature = "voice")]
-    pub voice_session: Option<crate::voice::VoiceSession>,
+    pub voice_session: Option<crate::voice_pipeline::VoiceSession>,
     /// Cluster state for /cluster command (peer discovery, model listing).
     #[cfg(feature = "cluster")]
     pub cluster_state: Option<Arc<crate::cluster::state::ClusterState>>,
@@ -2624,7 +2624,7 @@ impl ReplContext {
                 .store(false, Ordering::Relaxed);
             println!("\nVoice mode OFF\n");
         } else {
-            match crate::voice::VoiceSession::with_lang(self.lang.as_deref()).await {
+            match crate::voice_pipeline::VoiceSession::with_lang(self.lang.as_deref()).await {
                 Ok(vs) => {
                     self.voice_session = Some(vs);
                     // Auto-suppress thinking tokens from TTS.

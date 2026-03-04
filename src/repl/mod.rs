@@ -39,7 +39,7 @@ use crate::tui;
 // ============================================================================
 
 #[cfg(feature = "voice")]
-type TtsSentenceSender = Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>;
+type TtsSentenceSender = Option<std::sync::mpsc::Sender<crate::voice_pipeline::TtsCommand>>;
 #[cfg(not(feature = "voice"))]
 type TtsSentenceSender = Option<()>;
 
@@ -561,7 +561,7 @@ pub(crate) async fn stream_and_render_voice(
     channel: &str,
     lang: Option<&str>,
     core_handle: &SharedCoreHandle,
-    tts_sentence_tx: Option<std::sync::mpsc::Sender<crate::voice::TtsCommand>>,
+    tts_sentence_tx: Option<std::sync::mpsc::Sender<crate::voice_pipeline::TtsCommand>>,
 ) -> (String, bool) {
     stream_and_render_inner(
         agent_loop,
@@ -628,7 +628,7 @@ async fn stream_and_render_inner(
     let print_task = tokio::spawn(async move {
         use std::io::Write as _;
         #[cfg(feature = "voice")]
-        let mut tts_acc = tts_tx.map(|tx| crate::voice::SentenceAccumulator::new_streaming(tx));
+        let mut tts_acc = tts_tx.map(|tx| crate::voice_pipeline::SentenceAccumulator::new_streaming(tx));
         #[cfg(not(feature = "voice"))]
         let _ = tts_tx;
 

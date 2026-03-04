@@ -685,7 +685,7 @@ pub(crate) fn spawn_interrupt_watcher(
 /// Returns true if the user interrupted (wants to speak next).
 #[cfg(feature = "voice")]
 pub(crate) fn speak_interruptible(
-    vs: &mut crate::voice::VoiceSession,
+    vs: &mut crate::voice_pipeline::VoiceSession,
     text: &str,
     lang: &str,
 ) -> bool {

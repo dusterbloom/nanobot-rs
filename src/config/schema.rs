@@ -1648,23 +1648,6 @@ pub enum TtsEngineConfig {
     #[default]
     Pocket,
     Kokoro,
-    Qwen,
-    QwenLarge,
-    /// Qwen3 TTS via ONNX Runtime (FP16, ~3GB)
-    QwenOnnx,
-    /// Qwen3 TTS via ONNX Runtime (INT8 quantized, ~1.6GB)
-    QwenOnnxInt8,
-}
-
-/// Voice clone reference for QwenLarge TTS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceCloneRef {
-    /// Path to reference audio file (.wav).
-    pub audio_path: String,
-    /// Optional transcript of the reference audio.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<String>,
 }
 
 /// Configuration for voice mode TTS/STT.
@@ -1680,12 +1663,8 @@ pub struct VoiceConfig {
     /// Voice ID for the selected TTS engine.
     /// - Pocket: "alba", "marius", "javert", etc.
     /// - Kokoro: numeric string "0"-"10"
-    /// - Qwen: "ryan", "serena", "vivian", etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_voice: Option<String>,
-    /// Voice clone reference (only for QwenLarge engine).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub voice_clone_ref: Option<VoiceCloneRef>,
 }
 
 impl Default for VoiceConfig {
@@ -1694,7 +1673,6 @@ impl Default for VoiceConfig {
             language: None,
             tts_engine: TtsEngineConfig::default(),
             tts_voice: None,
-            voice_clone_ref: None,
         }
     }
 }
@@ -2452,27 +2430,11 @@ mod tests {
         assert!(cfg.voice.language.is_none());
     }
 
-    // -- Qwen TTS config tests (RED phase) --
 
     #[test]
     fn test_voice_config_tts_engine_default_is_pocket() {
         let vc = VoiceConfig::default();
         assert_eq!(vc.tts_engine, TtsEngineConfig::Pocket);
-    }
-
-    #[test]
-    fn test_voice_config_tts_engine_qwen_from_json() {
-        let json = r#"{"voice": {"ttsEngine": "qwen", "ttsVoice": "ryan"}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::Qwen);
-        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("ryan"));
-    }
-
-    #[test]
-    fn test_voice_config_tts_engine_qwen_large_from_json() {
-        let json = r#"{"voice": {"ttsEngine": "qwenLarge"}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenLarge);
     }
 
     #[test]
@@ -2490,56 +2452,17 @@ mod tests {
     }
 
     #[test]
-    fn test_voice_config_voice_clone_ref_absent_by_default() {
-        let vc = VoiceConfig::default();
-        assert!(vc.voice_clone_ref.is_none());
-    }
-
-    #[test]
-    fn test_voice_config_voice_clone_ref_from_json() {
-        let json = r#"{
-            "voice": {
-                "ttsEngine": "qwenLarge",
-                "voiceCloneRef": {
-                    "audioPath": "~/.nanobot/voice_ref.wav",
-                    "transcript": "Hello, this is a test."
-                }
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        let ref_ = cfg.voice.voice_clone_ref.as_ref().unwrap();
-        assert!(ref_.audio_path.ends_with("voice_ref.wav"));
-        assert_eq!(ref_.transcript.as_deref(), Some("Hello, this is a test."));
-    }
-
-    #[test]
-    fn test_voice_config_voice_clone_ref_without_transcript() {
-        let json = r#"{
-            "voice": {
-                "ttsEngine": "qwenLarge",
-                "voiceCloneRef": {
-                    "audioPath": "/path/to/ref.wav"
-                }
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        let ref_ = cfg.voice.voice_clone_ref.as_ref().unwrap();
-        assert!(ref_.transcript.is_none());
-    }
-
-    #[test]
     fn test_voice_config_roundtrip() {
         let vc = VoiceConfig {
             language: Some("en".to_string()),
-            tts_engine: TtsEngineConfig::Qwen,
-            tts_voice: Some("serena".to_string()),
-            voice_clone_ref: None,
+            tts_engine: TtsEngineConfig::Pocket,
+            tts_voice: Some("alba".to_string()),
         };
         let json = serde_json::to_string(&vc).unwrap();
         let vc2: VoiceConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(vc2.language.as_deref(), Some("en"));
-        assert_eq!(vc2.tts_engine, TtsEngineConfig::Qwen);
-        assert_eq!(vc2.tts_voice.as_deref(), Some("serena"));
+        assert_eq!(vc2.tts_engine, TtsEngineConfig::Pocket);
+        assert_eq!(vc2.tts_voice.as_deref(), Some("alba"));
     }
 
     #[test]
@@ -2552,54 +2475,14 @@ mod tests {
             serde_json::to_string(&TtsEngineConfig::Kokoro).unwrap(),
             r#""kokoro""#
         );
-        assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::Qwen).unwrap(),
-            r#""qwen""#
-        );
-        assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::QwenLarge).unwrap(),
-            r#""qwenLarge""#
-        );
-        assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::QwenOnnx).unwrap(),
-            r#""qwenOnnx""#
-        );
-        assert_eq!(
-            serde_json::to_string(&TtsEngineConfig::QwenOnnxInt8).unwrap(),
-            r#""qwenOnnxInt8""#
-        );
     }
 
     #[test]
     fn test_tts_engine_config_deserialization() {
         let pocket: TtsEngineConfig = serde_json::from_str(r#""pocket""#).unwrap();
         let kokoro: TtsEngineConfig = serde_json::from_str(r#""kokoro""#).unwrap();
-        let qwen: TtsEngineConfig = serde_json::from_str(r#""qwen""#).unwrap();
-        let qwen_large: TtsEngineConfig = serde_json::from_str(r#""qwenLarge""#).unwrap();
-        let qwen_onnx: TtsEngineConfig = serde_json::from_str(r#""qwenOnnx""#).unwrap();
-        let qwen_onnx_int8: TtsEngineConfig = serde_json::from_str(r#""qwenOnnxInt8""#).unwrap();
         assert_eq!(pocket, TtsEngineConfig::Pocket);
         assert_eq!(kokoro, TtsEngineConfig::Kokoro);
-        assert_eq!(qwen, TtsEngineConfig::Qwen);
-        assert_eq!(qwen_large, TtsEngineConfig::QwenLarge);
-        assert_eq!(qwen_onnx, TtsEngineConfig::QwenOnnx);
-        assert_eq!(qwen_onnx_int8, TtsEngineConfig::QwenOnnxInt8);
-    }
-
-    #[test]
-    fn test_voice_config_qwen_onnx_from_json() {
-        let json = r#"{"voice": {"ttsEngine": "qwenOnnx", "ttsVoice": "serena"}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenOnnx);
-        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("serena"));
-    }
-
-    #[test]
-    fn test_voice_config_qwen_onnx_int8_from_json() {
-        let json = r#"{"voice": {"ttsEngine": "qwenOnnxInt8", "ttsVoice": "ryan"}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.voice.tts_engine, TtsEngineConfig::QwenOnnxInt8);
-        assert_eq!(cfg.voice.tts_voice.as_deref(), Some("ryan"));
     }
 
     #[test]

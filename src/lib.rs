@@ -18,6 +18,4 @@ pub mod session;
 pub mod tui;
 pub mod utils;
 #[cfg(feature = "voice")]
-pub mod voice;
-#[cfg(feature = "voice")]
 pub mod voice_pipeline;

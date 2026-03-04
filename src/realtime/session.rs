@@ -32,8 +32,6 @@ pub enum InputMode {
 pub struct RealtimeConfig {
     /// TTS engine to use for synthesis.
     pub tts_engine: TtsEngineConfig,
-    /// Voice name for Qwen TTS engines.
-    pub qwen_voice: String,
     /// VAD threshold (0.0-1.0).
     pub vad_threshold: f32,
     /// Silence duration in ms before turn completion check.
@@ -48,7 +46,6 @@ impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
             tts_engine: TtsEngineConfig::Pocket,
-            qwen_voice: "ryan".to_string(),
             vad_threshold: 0.3,
             silence_timeout_ms: 1200,
             smart_turn_enabled: true,
@@ -90,8 +87,12 @@ pub struct RealtimeSession {
     turn_detector: Option<TurnDetector>,
     #[cfg(feature = "voice")]
     stt: Option<SpeechToText>,
+    /// English TTS engine (Pocket — fast, English-only).
     #[cfg(feature = "voice")]
-    tts: Option<Arc<Mutex<TextToSpeech>>>,
+    tts_en: Option<Arc<Mutex<TextToSpeech>>>,
+    /// Multilingual TTS engine (Kokoro — supports 8 languages).
+    #[cfg(feature = "voice")]
+    tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
     #[cfg(feature = "voice")]
     capture: Option<AudioCapture>,
     running: Arc<AtomicBool>,
@@ -103,6 +104,17 @@ impl RealtimeSession {
     pub async fn new(config: RealtimeConfig) -> Result<Self, String> {
         tracing::info!("Initializing realtime session with {:?}...", config.tts_engine);
 
+        // Ensure required models are downloaded (VAD, STT, turn detector)
+        let progress = jack_voice::LogProgress;
+        for bundle in jack_voice::models::MODEL_BUNDLES {
+            let target = if bundle.extract_dir.is_empty() { bundle.name } else { bundle.extract_dir };
+            if !jack_voice::models::model_exists(target) {
+                tracing::info!("Downloading model: {} ({}MB)...", bundle.name, bundle.size_mb);
+                jack_voice::models::download_model(bundle, &progress)
+                    .await
+                    .map_err(|e| format!("Model download failed ({}): {}", bundle.name, e))?;
+            }
+        }
         // Initialize VAD
         let vad = VoiceActivityDetector::new()
             .map_err(|e| format!("VAD init failed: {}", e))?;
@@ -125,70 +137,61 @@ impl RealtimeSession {
             None
         };
 
-        // Initialize STT
-        let stt = SpeechToText::new(SttMode::Streaming)
-            .map_err(|e| format!("STT init failed: {}", e))?;
-        tracing::info!("STT ready (streaming mode)");
+        // Ensure Parakeet TDT model is downloaded (multilingual, 25 langs, ~600MB)
+        if !jack_voice::models::parakeet_tdt_ready() {
+            tracing::info!("Downloading Parakeet TDT model (600MB)...");
+            jack_voice::models::ensure_parakeet_models(&progress)
+                .await
+                .map_err(|e| format!("Parakeet TDT download failed: {}", e))?;
+        }
 
-        // Initialize TTS
-        let tts = match config.tts_engine {
-            TtsEngineConfig::Pocket => {
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("Pocket TTS init failed: {}", e))?;
+        // Initialize STT — Parakeet TDT batch mode (multilingual, 25 langs, ~10x faster than Whisper)
+        // Falls back to Whisper Turbo if Parakeet unavailable
+        let stt = SpeechToText::with_language(SttMode::Batch, Some(String::new()), None)
+            .map_err(|e| format!("STT init failed: {}", e))?;
+        tracing::info!("STT ready (Parakeet TDT primary, Whisper fallback)");
+
+        // Initialize TTS — always load both Pocket (English) and Kokoro (multilingual)
+        let tts_en = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket)).await {
+            Ok(Ok(tts)) => {
+                tracing::info!("Pocket TTS ready (English)");
                 Some(Arc::new(Mutex::new(tts)))
             }
-            TtsEngineConfig::Kokoro => {
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("Kokoro TTS init failed: {}", e))?;
-                Some(Arc::new(Mutex::new(tts)))
+            Ok(Err(e)) => {
+                tracing::warn!("Pocket TTS init failed: {}", e);
+                None
             }
-            TtsEngineConfig::Qwen => {
-                if !TextToSpeech::can_run_qwen() {
-                    return Err("Qwen TTS requires GPU (CUDA)".to_string());
-                }
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::Qwen))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("Qwen TTS init failed: {}", e))?;
-                Some(Arc::new(Mutex::new(tts)))
-            }
-            TtsEngineConfig::QwenLarge => {
-                if !TextToSpeech::can_run_qwen() {
-                    return Err("QwenLarge TTS requires GPU (CUDA)".to_string());
-                }
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine_auto(TtsEngine::QwenLarge))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("QwenLarge TTS init failed: {}", e))?;
-                Some(Arc::new(Mutex::new(tts)))
-            }
-            TtsEngineConfig::QwenOnnx => {
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnx))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("QwenOnnx TTS init failed: {}", e))?;
-                Some(Arc::new(Mutex::new(tts)))
-            }
-            TtsEngineConfig::QwenOnnxInt8 => {
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::QwenOnnxInt8))
-                    .await
-                    .map_err(|e| format!("TTS spawn error: {}", e))?
-                    .map_err(|e| format!("QwenOnnxInt8 TTS init failed: {}", e))?;
-                Some(Arc::new(Mutex::new(tts)))
+            Err(e) => {
+                tracing::warn!("Pocket TTS spawn error: {}", e);
+                None
             }
         };
-        tracing::info!("TTS ready ({:?})", config.tts_engine);
+
+        let tts_multi = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro)).await {
+            Ok(Ok(tts)) => {
+                tracing::info!("Kokoro TTS ready (multilingual)");
+                Some(Arc::new(Mutex::new(tts)))
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Kokoro TTS init failed: {}", e);
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Kokoro TTS spawn error: {}", e);
+                None
+            }
+        };
+        tracing::info!("TTS ready (en: {}, multi: {})",
+            if tts_en.is_some() { "Pocket" } else { "none" },
+            if tts_multi.is_some() { "Kokoro" } else { "none" });
 
         Ok(Self {
             config,
             vad: Some(vad),
             turn_detector,
             stt: Some(stt),
-            tts,
+            tts_en,
+            tts_multi,
             capture: None,
             running: Arc::new(AtomicBool::new(false)),
         })
@@ -221,46 +224,81 @@ impl RealtimeSession {
         let mut vad = self.vad.take().ok_or("VAD not initialized")?;
         let mut turn_detector = self.turn_detector.take();
         let mut stt_engine = self.stt.take().ok_or("STT not initialized")?;
-        let tts = self.tts.clone();
         let config = self.config.clone();
 
         // Spawn the audio processing loop
         tokio::spawn(async move {
             tracing::info!("Realtime session started");
+            let mut was_speaking = false;
 
             while running.load(Ordering::SeqCst) {
                 tokio::select! {
                     Some(samples) = audio_rx.recv() => {
+                        // Feed ALL audio to turn detector continuously (speech + silence).
+                        if let Some(ref mut td) = turn_detector {
+                            td.feed_audio(&samples);
+                        }
+
                         // Process audio through VAD
-                        if let Some(segment) = vad.process(&samples).ok().flatten() {
-                            let _ = event_tx.send(RealtimeEvent::SpeechStart).await;
-                            
-                            // Feed to turn detector
-                            if let Some(ref mut td) = turn_detector {
-                                td.feed_audio(&segment.samples);
-                                
-                                // Check for turn completion
-                                let decision = td.on_silence();
-                                if let TurnDecision::Complete(audio) = decision {
-                                    let _ = event_tx.send(RealtimeEvent::SpeechEnd).await;
-                                    
-                                    // Transcribe
-                                    if let Ok(result) = stt_engine.transcribe(&audio) {
-                                        let text = result.text.trim().to_string();
-                                        if !text.is_empty() {
-                                            let lang = crate::voice::detect_language(&text);
-                                            let _ = event_tx.send(RealtimeEvent::TurnComplete {
-                                                text,
-                                                language: lang,
-                                            }).await;
+                        match vad.process(&samples) {
+                            Ok(Some(segment)) => {
+                                // VAD returned a complete speech segment (speech ended).
+                                tracing::debug!("VAD segment: {} samples", segment.samples.len());
+                                let _ = event_tx.send(RealtimeEvent::SpeechEnd).await;
+                                was_speaking = false;
+
+                                // Try smart turn detection first
+                                let audio_to_transcribe = if let Some(ref mut td) = turn_detector {
+                                    let decision = td.on_silence();
+                                    match decision {
+                                        TurnDecision::Complete(audio) => {
+                                            tracing::debug!("TurnDetector: Complete ({} samples)", audio.len());
+                                            audio
+                                        }
+                                        _ => {
+                                            // Turn detector says incomplete — use VAD segment directly.
+                                            tracing::debug!("TurnDetector: not complete, using VAD segment");
+                                            td.clear();
+                                            segment.samples
                                         }
                                     }
+                                } else {
+                                    // No turn detector — use VAD segment directly.
+                                    segment.samples
+                                };
+
+                                // Transcribe
+                                if let Ok(result) = stt_engine.transcribe(&audio_to_transcribe) {
+                                    let text = result.text.trim().to_string();
+                                    if !text.is_empty() {
+                                        let lang = crate::voice_pipeline::detect_language(&text);
+                                        tracing::info!("Transcribed: \"{}\" ({})", text, lang);
+                                        let _ = event_tx.send(RealtimeEvent::TurnComplete {
+                                            text,
+                                            language: lang,
+                                        }).await;
+                                    }
                                 }
+                            }
+                            Ok(None) => {
+                                // No segment yet — check if VAD sees speech starting.
+                                // Use energy-gated check to reject speaker echo / ambient noise.
+                                if vad.is_speech_with_energy(&samples) && !was_speaking {
+                                    was_speaking = true;
+                                    tracing::debug!("Speech detected");
+                                    let _ = event_tx.send(RealtimeEvent::SpeechStart).await;
+                                    if let Some(ref mut td) = turn_detector {
+                                        td.on_speech_start();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("VAD error: {}", e);
                             }
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        // Periodic check for silence timeout
+                        // Periodic check
                     }
                 }
             }
@@ -282,19 +320,12 @@ impl RealtimeSession {
     /// Sends AudioChunk events to the event channel.
     #[cfg(feature = "voice")]
     pub async fn synthesize(&self, text: &str, event_tx: mpsc::Sender<RealtimeEvent>) -> Result<(), String> {
-        let tts = self.tts.as_ref().ok_or("TTS not initialized")?;
+        let tts = self.tts_en.as_ref().or(self.tts_multi.as_ref()).ok_or("TTS not initialized")?;
         let tts = tts.clone();
         let text = text.to_string();
-        let voice = self.config.qwen_voice.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut guard = tts.lock().map_err(|e| format!("TTS lock error: {}", e))?;
-            
-            // Set voice for Qwen engines
-            let engine_type = guard.engine_type();
-            if engine_type == "qwen" || engine_type == "qwen-large" {
-                guard.set_speaker(&voice).ok();
-            }
 
             guard
                 .synthesize_streaming(&text, |samples, sample_rate| {
@@ -365,6 +396,13 @@ impl RealtimeSession {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Get clones of both TTS engine handles for external use (e.g., voice agent playback).
+    /// Returns (English/Pocket, Multilingual/Kokoro).
+    #[cfg(feature = "voice")]
+    pub fn tts_handles(&self) -> (Option<Arc<Mutex<TextToSpeech>>>, Option<Arc<Mutex<TextToSpeech>>>) {
+        (self.tts_en.clone(), self.tts_multi.clone())
+    }
+
     /// Check if SmartTurn is available.
     #[cfg(feature = "voice")]
     pub fn has_smart_turn(&self) -> bool {
@@ -386,7 +424,6 @@ mod tests {
     fn test_realtime_config_default() {
         let config = RealtimeConfig::default();
         assert_eq!(config.tts_engine, TtsEngineConfig::Pocket);
-        assert_eq!(config.qwen_voice, "ryan");
         assert!((config.vad_threshold - 0.3f32).abs() < f32::EPSILON);
         assert_eq!(config.silence_timeout_ms, 1200);
         assert!(config.smart_turn_enabled);
@@ -395,15 +432,13 @@ mod tests {
     #[test]
     fn test_realtime_config_custom() {
         let config = RealtimeConfig {
-            tts_engine: TtsEngineConfig::Qwen,
-            qwen_voice: "serena".to_string(),
+            tts_engine: TtsEngineConfig::Kokoro,
             vad_threshold: 0.5,
             silence_timeout_ms: 800,
             smart_turn_enabled: false,
             input_mode: InputMode::Continuous,
         };
-        assert_eq!(config.tts_engine, TtsEngineConfig::Qwen);
-        assert_eq!(config.qwen_voice, "serena");
+        assert_eq!(config.tts_engine, TtsEngineConfig::Kokoro);
         assert!((config.vad_threshold - 0.5f32).abs() < f32::EPSILON);
         assert_eq!(config.silence_timeout_ms, 800);
         assert!(!config.smart_turn_enabled);
@@ -527,22 +562,4 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_realtime_session_qwen_requires_gpu() {
-        let config = RealtimeConfig {
-            tts_engine: TtsEngineConfig::Qwen,
-            ..Default::default()
-        };
-        let result = RealtimeSession::new(config).await;
-        if TextToSpeech::can_run_qwen() {
-            assert!(result.is_ok(), "Should create session with Qwen if GPU available");
-        } else {
-            match result {
-                Err(err) => {
-                    assert!(err.contains("GPU"), "Error should mention GPU: {}", err);
-                }
-                Ok(_) => panic!("Should fail without GPU"),
-            }
-        }
-    }
 }

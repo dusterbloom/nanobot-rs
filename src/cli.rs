@@ -1044,7 +1044,7 @@ pub(crate) async fn run_gateway_async(
                 // Try fallback to Pocket if Qwen/Kokoro failed
                 if tts_engine != TtsEngineConfig::Pocket {
                     warn!("Falling back to Pocket TTS...");
-                    match crate::voice_pipeline::VoicePipeline::new().await {
+                    match crate::voice_pipeline::VoicePipeline::with_engine(TtsEngineConfig::Pocket).await {
                         Ok(vp) => {
                             info!("Voice pipeline initialized with Pocket TTS (fallback)");
                             Some(Arc::new(vp))
@@ -2461,10 +2461,6 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
     let tts_engine = match engine.to_lowercase().as_str() {
         "pocket" => TtsEngineConfig::Pocket,
         "kokoro" => TtsEngineConfig::Kokoro,
-        "qwen" => TtsEngineConfig::Qwen,
-        "qwenlarge" | "qwen_large" => TtsEngineConfig::QwenLarge,
-        "qwenonnx" | "qwen_onnx" | "onnx" => TtsEngineConfig::QwenOnnx,
-        "qwenonnxint8" | "qwen_onnx_int8" | "onnx-int8" | "int8" => TtsEngineConfig::QwenOnnxInt8,
         _ => {
             eprintln!("Unknown TTS engine: {}. Using pocket.", engine);
             TtsEngineConfig::Pocket
@@ -2473,22 +2469,30 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
 
     let input_mode = parse_input_mode(&mode);
 
-    let config = VoiceAgentConfig {
+    // Load nanobot config for LLM provider
+    let nanobot_config = load_config(None);
+    let is_local = local || !nanobot_config.agents.defaults.local_api_base.is_empty();
+
+    let va_config = VoiceAgentConfig {
         realtime: RealtimeConfig {
             tts_engine,
-            qwen_voice: voice,
             input_mode: input_mode.clone(),
             ..Default::default()
         },
         session_key: session.clone(),
-        local,
+        local: is_local,
         ..Default::default()
     };
 
-    println!("  TTS Engine: {:?}", config.realtime.tts_engine);
-    println!("  Voice: {}", config.realtime.qwen_voice);
-    println!("  Session: {}", config.session_key);
-    println!("  Local: {}", config.local);
+    println!("  TTS Engine: {:?}", va_config.realtime.tts_engine);
+    println!("  TTS: {:?}", va_config.realtime.tts_engine);
+    println!("  Session: {}", va_config.session_key);
+    println!("  Local: {}", va_config.local);
+    if is_local {
+        println!("  Model: {}", nanobot_config.agents.defaults.local_model);
+    } else {
+        println!("  Model: {}", nanobot_config.agents.defaults.model);
+    }
     println!();
     if input_mode == InputMode::Continuous {
         println!("  Mode: Continuous (hands-free, VAD-based)");
@@ -2503,10 +2507,20 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
     println!("    I = Interrupt TTS");
     println!();
 
+    // Build LLM provider + agent loop
+    let local_model = if nanobot_config.agents.defaults.local_model.is_empty() {
+        None
+    } else {
+        Some(nanobot_config.agents.defaults.local_model.as_str())
+    };
+    let core_handle = build_core_handle(&nanobot_config, "8080", local_model, None, None, None, is_local);
+    let agent_loop = create_agent_loop(core_handle, &nanobot_config, None, None, None, None);
+    let agent_loop = Arc::new(agent_loop);
+
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    
+
     rt.block_on(async {
-        let mut agent = VoiceAgent::new(config);
+        let mut agent = VoiceAgent::with_agent_loop(va_config, agent_loop);
         
         match agent.start().await {
             Ok(mut event_rx) => {
@@ -2602,8 +2616,6 @@ pub(crate) fn cmd_realtime_server(port: u16, engine: String, voice: String, host
     let tts_engine = match engine.to_lowercase().as_str() {
         "pocket" => TtsEngineConfig::Pocket,
         "kokoro" => TtsEngineConfig::Kokoro,
-        "qwen" => TtsEngineConfig::Qwen,
-        "qwenlarge" | "qwen_large" => TtsEngineConfig::QwenLarge,
         _ => {
             eprintln!("Unknown TTS engine: {}. Using pocket.", engine);
             TtsEngineConfig::Pocket
@@ -2654,37 +2666,6 @@ pub(crate) fn cmd_voice_list(engine: String) {
     println!("{} Available Voices\n", crate::LOGO);
 
     match engine.to_lowercase().as_str() {
-        "qwen" | "qwenlarge" | "qwen_large" => {
-            println!("Qwen TTS Voices (use with --engine qwen or --engine qwenLarge):\n");
-            let voices = jack_voice::QWEN_LITE_VOICES;
-            for (id, name) in voices {
-                println!("  {:15} {}", id, name);
-            }
-            println!();
-            println!("Voice cloning (QwenLarge only):");
-            println!("  Clone from audio: nanobot voice clone myvoice audio.wav");
-        }
-        "qwenonnx" | "qwen_onnx" | "onnx" => {
-            println!("Qwen ONNX TTS Voices (use with --engine qwenOnnx):\n");
-            let voices = jack_voice::QWEN_LITE_VOICES;
-            for (id, name) in voices {
-                println!("  {:15} {}", id, name);
-            }
-            println!();
-            println!("  Model size: ~3 GB (FP16)");
-            println!("  Supports: CoreML (macOS), CUDA, CPU");
-        }
-        "qwenonnxint8" | "qwen_onnx_int8" | "onnx-int8" | "int8" => {
-            println!("Qwen ONNX INT8 TTS Voices (use with --engine qwenOnnxInt8):\n");
-            let voices = jack_voice::QWEN_LITE_VOICES;
-            for (id, name) in voices {
-                println!("  {:15} {}", id, name);
-            }
-            println!();
-            println!("  Model size: ~1.6 GB (INT8 quantized)");
-            println!("  Optimized for: Edge devices, low memory, realtime");
-            println!("  Supports: CoreML (macOS), CUDA, CPU");
-        }
         "kokoro" => {
             println!("Kokoro TTS Voices (use with --engine kokoro):\n");
             println!("  Voice IDs: 0-10 (numeric)");
