@@ -64,11 +64,6 @@ pub(crate) async fn execute_tools_delegated(
         tr_model
     );
 
-    // Local delegation providers require user-last messages
-    // for tool→generate flow.
-    // Check delegation provider's locality, not the main model's.
-    let needs_user_cont = ctx.core.is_local || delegation_provider.is_some();
-
     // Detect [VERBATIM] marker: the main model is asking for
     // raw tool output instead of a delegation summary.
     let verbatim = response
@@ -88,7 +83,7 @@ pub(crate) async fn execute_tools_delegated(
         model: tr_model.clone(),
         max_iterations: ctx.core.tool_delegation_config.max_iterations,
         max_tokens: ctx.core.tool_delegation_config.max_tokens,
-        needs_user_continuation: needs_user_cont,
+
         max_tool_result_chars: delegation_result_limit,
         short_circuit_chars: 200,
         depth: 0,

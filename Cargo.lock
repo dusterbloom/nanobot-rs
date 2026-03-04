@@ -3522,6 +3522,7 @@ dependencies = [
  "mdns-sd",
  "mime_guess",
  "once_cell",
+ "parking_lot",
  "petgraph 0.8.3",
  "qlora-rs",
  "regex",

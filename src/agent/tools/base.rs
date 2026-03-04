@@ -27,6 +27,11 @@ impl ToolExecutionResult {
         }
     }
 
+    /// Whether this result represents a retryable (transient) error.
+    pub fn is_retryable(&self) -> bool {
+        self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
+    }
+
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {
@@ -401,5 +406,23 @@ mod tests {
         assert!(!ctx.cancellation_token.is_cancelled());
         token.cancel();
         assert!(ctx.cancellation_token.is_cancelled());
+    }
+
+    #[test]
+    fn test_tool_execution_result_is_retryable() {
+        // Success is never retryable.
+        assert!(!ToolExecutionResult::success("ok".into()).is_retryable());
+
+        // Non-retryable failure (e.g. "not found" → NotFound).
+        let nf = ToolExecutionResult::failure("No such file or directory".into());
+        assert!(!nf.is_retryable());
+
+        // Retryable failure (e.g. "connection refused" → NetworkError).
+        let net = ToolExecutionResult::failure("connection refused".into());
+        assert!(net.is_retryable());
+
+        // Retryable failure (rate limit).
+        let rl = ToolExecutionResult::failure("429 rate limit exceeded".into());
+        assert!(rl.is_retryable());
     }
 }

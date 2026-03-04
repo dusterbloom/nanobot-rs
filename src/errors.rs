@@ -103,6 +103,28 @@ pub enum ToolErrorKind {
 
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
+
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    #[error("Rate limited")]
+    RateLimited,
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+}
+
+impl ToolErrorKind {
+    /// Whether this tool error is transient and the operation should be retried.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout(_)
+                | Self::NetworkError(_)
+                | Self::RateLimited
+                | Self::ServiceUnavailable(_)
+        )
+    }
 }
 
 /// Classify a tool error string into a structured [`ToolErrorKind`].
@@ -120,6 +142,34 @@ pub fn classify_tool_error(error_msg: &str) -> Option<ToolErrorKind> {
 
     if lower.contains("permission denied") {
         return Some(ToolErrorKind::PermissionDenied(error_msg.to_string()));
+    }
+
+    // Network errors (check before "not found" which would false-match).
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("check network")
+        || lower.contains("dns")
+        || lower.contains("broken pipe")
+    {
+        return Some(ToolErrorKind::NetworkError(error_msg.to_string()));
+    }
+
+    // Rate limiting.
+    if lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("quota exceeded")
+        || lower.contains("too many requests")
+    {
+        return Some(ToolErrorKind::RateLimited);
+    }
+
+    // Service unavailable.
+    if lower.contains("503")
+        || lower.contains("service unavailable")
+        || lower.contains("no models loaded")
+        || lower.contains("model is loading")
+    {
+        return Some(ToolErrorKind::ServiceUnavailable(error_msg.to_string()));
     }
 
     if lower.contains("no such file")
@@ -350,5 +400,44 @@ mod tests {
     fn test_is_retryable_provider_error_non_provider() {
         let anyhow_err = anyhow::anyhow!("some random error");
         assert!(!is_retryable_provider_error(&anyhow_err));
+    }
+
+    // -- ToolErrorKind classification: network/rate-limit/service-unavailable --
+
+    #[test]
+    fn test_classify_network_error() {
+        let kind = classify_tool_error("connection refused by remote host");
+        assert!(matches!(kind, Some(ToolErrorKind::NetworkError(_))));
+    }
+
+    #[test]
+    fn test_classify_rate_limited() {
+        let kind = classify_tool_error("429 rate limit exceeded");
+        assert_eq!(kind, Some(ToolErrorKind::RateLimited));
+    }
+
+    #[test]
+    fn test_classify_service_unavailable() {
+        let kind = classify_tool_error("service unavailable, try again later");
+        assert!(matches!(kind, Some(ToolErrorKind::ServiceUnavailable(_))));
+    }
+
+    // -- ToolErrorKind::is_retryable --
+
+    #[test]
+    fn test_retryable_tool_error_variants() {
+        assert!(ToolErrorKind::Timeout(30).is_retryable());
+        assert!(ToolErrorKind::NetworkError("conn reset".into()).is_retryable());
+        assert!(ToolErrorKind::RateLimited.is_retryable());
+        assert!(ToolErrorKind::ServiceUnavailable("503".into()).is_retryable());
+    }
+
+    #[test]
+    fn test_not_retryable_tool_error_variants() {
+        assert!(!ToolErrorKind::NotFound("missing".into()).is_retryable());
+        assert!(!ToolErrorKind::PermissionDenied("denied".into()).is_retryable());
+        assert!(!ToolErrorKind::InvalidArgs("bad arg".into()).is_retryable());
+        assert!(!ToolErrorKind::ToolNotFound("no_tool".into()).is_retryable());
+        assert!(!ToolErrorKind::ExecutionFailed("fail".into()).is_retryable());
     }
 }

@@ -27,10 +27,6 @@ pub struct ToolRunnerConfig {
     pub model: String,
     pub max_iterations: u32,
     pub max_tokens: u32,
-    /// When true, append a `role: "user"` continuation after tool results
-    /// before calling the LLM.  Local models require this; some cloud models
-    /// handle tool→generate natively and break if a user message is injected.
-    pub needs_user_continuation: bool,
     /// Maximum characters per tool result shown to the delegation model.
     /// Results exceeding this are truncated (with a marker) before the
     /// delegation model sees them, but full data is kept for the main model.
@@ -414,22 +410,16 @@ async fn analyze_via_scratch_pad(
                     id_counter += 1;
                     all_results.push((original_id, tc.name.clone(), result));
                 } else {
-                    // Real tool — execute and store in ContextStore.
+                    // Real tool — execute with retry on transient errors.
                     debug!("Scratch pad executing real tool: {}", tc.name);
-                    let result = if let Some(ref token) = config.cancellation_token {
-                        use crate::agent::tools::base::ToolExecutionContext;
-                        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-                        let ctx = ToolExecutionContext {
-                            event_tx,
-                            cancellation_token: token.child_token(),
-                            tool_call_id: tc.id.clone(),
-                        };
-                        tools
-                            .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
-                            .await
-                    } else {
-                        tools.execute(&tc.name, tc.arguments.clone()).await
-                    };
+                    let result = execute_with_retry(
+                        tools,
+                        &tc.name,
+                        tc.arguments.clone(),
+                        config.cancellation_token.as_ref(),
+                        TOOL_MAX_RETRIES,
+                    )
+                    .await;
                     let (_, _metadata) = context_store.store(result.data.clone());
                     let original_id = format!("sp{:07}", id_counter);
                     id_counter += 1;
@@ -773,7 +763,7 @@ pub async fn run_tool_loop(
                     model: config.model.clone(),
                     max_iterations: child_budget.max_iterations,
                     max_tokens: config.max_tokens,
-                    needs_user_continuation: config.needs_user_continuation,
+
                     max_tool_result_chars: config.max_tool_result_chars,
                     short_circuit_chars: config.short_circuit_chars,
                     depth: config.depth + 1,
@@ -964,22 +954,16 @@ pub async fn run_tool_loop(
                 ContextBuilder::add_tool_result(&mut messages, &tc.id, &tc.name, &result);
                 // NOT added to all_results — micro-tools are internal.
             } else {
-                // Real tool: execute, store in ContextStore.
+                // Real tool: execute with retry on transient errors.
                 debug!("Tool runner executing: {} (id: {})", tc.name, tc.id);
-                let result = if let Some(ref token) = config.cancellation_token {
-                    use crate::agent::tools::base::ToolExecutionContext;
-                    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-                    let ctx = ToolExecutionContext {
-                        event_tx,
-                        cancellation_token: token.child_token(),
-                        tool_call_id: tc.id.clone(),
-                    };
-                    tools
-                        .execute_with_context(&tc.name, tc.arguments.clone(), &ctx)
-                        .await
-                } else {
-                    tools.execute(&tc.name, tc.arguments.clone()).await
-                };
+                let result = execute_with_retry(
+                    tools,
+                    &tc.name,
+                    tc.arguments.clone(),
+                    config.cancellation_token.as_ref(),
+                    TOOL_MAX_RETRIES,
+                )
+                .await;
                 // For web_fetch/web_search: unwrap the JSON envelope so the model
                 // sees clean article text rather than a JSON metadata summary.
                 let raw_data = if tc.name == "web_fetch" || tc.name == "web_search" {
@@ -1141,6 +1125,75 @@ fn normalize_tool_call_id(counter: usize) -> String {
     format!("tc{:07}", counter)
 }
 
+/// Execute a tool with automatic retry on transient (retryable) errors.
+///
+/// Retries up to `max_retries` times with exponential backoff (500ms, 1s, 2s, …).
+/// Respects the cancellation token between retries.
+async fn execute_with_retry(
+    tools: &ToolRegistry,
+    name: &str,
+    arguments: HashMap<String, serde_json::Value>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    max_retries: u32,
+) -> crate::agent::tools::base::ToolExecutionResult {
+    use crate::agent::tools::base::{ToolExecutionContext, ToolExecutionResult};
+
+    let mut attempts = 0u32;
+    loop {
+        let result = if let Some(token) = cancel {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let ctx = ToolExecutionContext {
+                event_tx,
+                cancellation_token: token.child_token(),
+                tool_call_id: String::new(),
+            };
+            tools
+                .execute_with_context(name, arguments.clone(), &ctx)
+                .await
+        } else {
+            tools.execute(name, arguments.clone()).await
+        };
+
+        attempts += 1;
+
+        if !result.is_retryable() || attempts > max_retries {
+            return result;
+        }
+
+        // Check cancellation before sleeping.
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                return ToolExecutionResult::failure("Cancelled during retry".into());
+            }
+        }
+
+        let backoff = std::time::Duration::from_millis(500 * (1 << (attempts - 1)));
+        warn!(
+            "Tool '{}' returned retryable error (attempt {}/{}), retrying in {:?}: {}",
+            name,
+            attempts,
+            max_retries + 1,
+            backoff,
+            result.data
+        );
+
+        // Sleep with cancellation awareness.
+        if let Some(token) = cancel {
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = token.cancelled() => {
+                    return ToolExecutionResult::failure("Cancelled during retry backoff".into());
+                }
+            }
+        } else {
+            tokio::time::sleep(backoff).await;
+        }
+    }
+}
+
+/// Default maximum retries for transient tool errors.
+const TOOL_MAX_RETRIES: u32 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1260,7 +1313,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1315,7 +1368,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 3,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1365,7 +1418,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1407,7 +1460,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1540,7 +1593,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1615,7 +1668,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1652,7 +1705,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1716,7 +1769,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1758,7 +1811,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1819,7 +1872,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1871,7 +1924,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -1946,7 +1999,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
             depth: 0,
@@ -2004,7 +2057,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 100,
             short_circuit_chars: 0,
             depth: 0,
@@ -2058,7 +2111,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
@@ -2111,7 +2164,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0, // disabled
             depth: 0,
@@ -2188,7 +2241,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2254,7 +2307,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2295,7 +2348,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2365,7 +2418,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2467,7 +2520,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2528,7 +2581,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 200, // 16 < 200 → short-circuit
             depth: 0,
@@ -2703,7 +2756,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 100, // Force large result → metadata
             short_circuit_chars: 0,
             depth: 0, // First level — ctx_summarize allowed
@@ -2753,7 +2806,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2854,7 +2907,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2905,7 +2958,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2942,7 +2995,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -2993,7 +3046,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -3067,7 +3120,6 @@ mod tests {
             model: "local:nanbeige4.1-3b-q8_0.gguf".to_string(),
             max_iterations: 10,
             max_tokens: 1024,
-            needs_user_continuation: true,
             max_tool_result_chars: 2000,
             short_circuit_chars: 200,
             depth: 0,
@@ -3334,7 +3386,7 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: false,
+
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
@@ -3381,13 +3433,9 @@ mod tests {
         );
     }
 
-    // -- needs_user_continuation irrelevance for scratch pad --
-
     #[tokio::test]
-    async fn test_scratch_pad_ignores_needs_user_continuation() {
-        // With needs_user_continuation=true (local model mode),
-        // the scratch pad should still send only [system, user] messages.
-        // No extra user continuation should be injected.
+    async fn test_scratch_pad_sends_system_user_only() {
+        // The scratch pad should send only [system, user] messages per round.
         let provider = Arc::new(CapturingProvider::new());
 
         let mut tools = ToolRegistry::new();
@@ -3398,7 +3446,6 @@ mod tests {
             model: "mock".to_string(),
             max_iterations: 10,
             max_tokens: 4096,
-            needs_user_continuation: true, // key: local model mode
             max_tool_result_chars: 30000,
             short_circuit_chars: 0,
             depth: 0,
