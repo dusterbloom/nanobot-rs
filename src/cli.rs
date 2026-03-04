@@ -971,7 +971,15 @@ pub(crate) async fn run_gateway_async(
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
 ) {
     use std::time::Duration;
-    use tracing::info;
+    use tracing::{info, warn};
+
+    // Auto-start SearXNG if configured
+    if config.tools.web.search.provider == "searxng" && config.tools.web.search.auto_start {
+        match crate::searxng::ensure_searxng(&config.tools.web.search.searxng_url).await {
+            Ok(()) => info!("SearXNG ready"),
+            Err(e) => warn!("SearXNG auto-setup failed: {e} — web search will use fallback"),
+        }
+    }
 
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();

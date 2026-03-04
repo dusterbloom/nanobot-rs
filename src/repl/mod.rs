@@ -1029,6 +1029,14 @@ pub(crate) fn cmd_agent(
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
     runtime.block_on(async {
+        // Auto-start SearXNG if configured
+        if config.tools.web.search.provider == "searxng" && config.tools.web.search.auto_start {
+            match crate::searxng::ensure_searxng(&config.tools.web.search.searxng_url).await {
+                Ok(()) => info!("SearXNG ready"),
+                Err(e) => warn!("SearXNG auto-setup failed: {e} — web search will use fallback"),
+            }
+        }
+
         // Create shared core and initial agent loop.
         // Use persisted local model name if available, else hardcoded default.
         // Prefer lms_main_model (clean identifier like "nanbeige4.1-3b") over

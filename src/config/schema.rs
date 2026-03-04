@@ -582,6 +582,9 @@ pub struct WebSearchConfig {
     /// Jina AI API key for zero-config web search fallback.
     #[serde(default)]
     pub jina_api_key: String,
+    /// Auto-start SearXNG Docker container if not running. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
 }
 
 fn default_max_results() -> u32 {
@@ -604,6 +607,7 @@ impl Default for WebSearchConfig {
             provider: default_search_provider(),
             searxng_url: default_searxng_url(),
             jina_api_key: String::new(),
+            auto_start: default_true(),
         }
     }
 }

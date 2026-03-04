@@ -18,6 +18,7 @@ mod lms;
 mod realtime;
 mod providers;
 mod repl;
+mod searxng;
 mod server;
 mod session;
 mod sessions_cmd;

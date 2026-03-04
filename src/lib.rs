@@ -13,6 +13,7 @@ pub mod lms;
 #[cfg(feature = "voice")]
 pub mod realtime;
 pub mod providers;
+pub mod searxng;
 pub mod server;
 pub mod session;
 pub mod tui;
