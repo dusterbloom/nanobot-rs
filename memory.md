@@ -1,1 +1,0 @@
-Peppi is a bald and bold developer.
