@@ -1,6 +1,7 @@
 //! Agent tool definitions, registry, and built-in tool implementations.
 
 pub mod base;
+pub mod browser;
 pub mod code_execution;
 pub mod cron_tool;
 pub mod email;
@@ -17,6 +18,7 @@ pub mod spawn;
 pub mod web;
 
 pub use base::Tool;
+pub use browser::BrowserTool;
 pub use code_execution::CodeExecutionTool;
 pub use cron_tool::CronScheduleTool;
 pub use email::{CheckInboxTool, SendEmailTool};
@@ -33,3 +35,4 @@ pub use spawn::{
     SpawnTool, SpawnToolLite, WaitCallback,
 };
 pub use web::{WebFetchTool, WebSearchTool};
+

@@ -380,11 +380,11 @@ Do stuff."#;
         let yaml = "---\ncapabilities: [read, http, skills]\n---\nYou are a researcher.";
         let profile = parse_profile(yaml, "researcher").unwrap();
         let tools = profile.tools.expect("capabilities should produce a tools list");
-        // read -> [list_dir, read_file], http -> [web_fetch, web_search], skills -> [read_skill]
+        // read -> [list_dir, read_file], http -> [browser, web_search], skills -> [read_skill]
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
-        assert!(tools.contains(&"web_fetch".to_string()));
+        assert!(tools.contains(&"browser".to_string()));
         assert!(tools.contains(&"read_skill".to_string()));
         assert_eq!(tools.len(), 5);
         // Verify sorted
@@ -458,7 +458,7 @@ Do stuff."#;
         let resolved = inherit_capabilities(&parent_caps, &deny);
         let tool_names = resolve_capabilities(&resolved);
         assert!(tool_names.contains(&"read_file".to_string()));
-        assert!(tool_names.contains(&"web_fetch".to_string()));
+        assert!(tool_names.contains(&"browser".to_string()));
         assert!(!tool_names.contains(&"write_file".to_string()));
         assert!(!tool_names.contains(&"edit_file".to_string()));
     }

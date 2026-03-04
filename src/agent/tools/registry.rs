@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
-    CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool,
-    RecallTool, RememberTool, SessionSearchTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool,
+    ReadSkillTool, RecallTool, RememberTool, SessionSearchTool, WebSearchTool, WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
 use crate::config::schema::{CodeExecutionConfig, JinaReaderConfig};
@@ -154,13 +154,18 @@ impl ToolRegistry {
             Self::require_non_empty_string(&params, "query", "web_search")?;
         }
 
-        if canonical_name == "web_fetch" {
-            if !params.contains_key("url") {
-                if let Some(v) = params.get("link").cloned() {
-                    params.insert("url".to_string(), v);
+        if canonical_name == "browser" {
+            // Normalize element/selector → ref
+            if !params.contains_key("ref") {
+                if let Some(v) = params
+                    .get("element")
+                    .cloned()
+                    .or_else(|| params.get("selector").cloned())
+                {
+                    params.insert("ref".to_string(), v);
                 }
             }
-            Self::require_non_empty_string(&params, "url", "web_fetch")?;
+            Self::require_non_empty_string(&params, "action", "browser")?;
         }
 
         if canonical_name == "read_file" {
@@ -309,8 +314,8 @@ impl ToolRegistry {
                 config.jina_api_key.clone(),
             )));
         }
-        if should_include("web_fetch") {
-            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars, config.jina_config.clone())));
+        if should_include("browser") {
+            self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
         }
         if should_include("recall") {
             self.register(Box::new(RecallTool::new(&config.workspace)));
@@ -489,8 +494,8 @@ impl ToolRegistry {
             "web_search",
         ),
         (
-            &["http", "url", "fetch", "website", "webpage", "download"],
-            "web_fetch",
+            &["browser", "browse", "click", "navigate", "http", "url", "website", "webpage"],
+            "browser",
         ),
         (&["schedule", "cron", "every", "timer", "periodic"], "cron"),
         (
@@ -651,7 +656,7 @@ impl ToolRegistry {
                 Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"])
             }
             TaskPhase::CodeExecution => Some(&["exec", "read_file", "list_dir"]),
-            TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "read_file"]),
+            TaskPhase::WebResearch => Some(&["web_search", "browser", "read_file"]),
             TaskPhase::Communication => Some(&["message", "send_email", "check_inbox"]),
             _ => None, // Idle/Understanding/Planning/Reflection -> all tools
         }
@@ -771,7 +776,7 @@ fn builtin_toolsets() -> HashMap<&'static str, Vec<&'static str>> {
         "core",
         vec!["read_file", "write_file", "edit_file", "list_dir", "exec"],
     );
-    m.insert("web", vec!["web_search", "web_fetch"]);
+    m.insert("web", vec!["web_search", "browser"]);
     m.insert(
         "memory",
         vec!["recall", "remember", "read_skill", "session_search"],
@@ -782,7 +787,7 @@ fn builtin_toolsets() -> HashMap<&'static str, Vec<&'static str>> {
             "read_file",
             "list_dir",
             "web_search",
-            "web_fetch",
+            "browser",
             "recall",
             "read_skill",
             "session_search",
@@ -1460,18 +1465,18 @@ mod tests {
     fn test_relevant_defs_includes_used_tools() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("web_fetch")));
+        registry.register(Box::new(MockTool::new("browser")));
 
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
         let mut used = HashSet::new();
-        used.insert("web_fetch".to_string());
+        used.insert("browser".to_string());
 
         let defs = registry.get_relevant_definitions(&messages, &used);
         let names: Vec<String> = defs
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
-        assert!(names.contains(&"web_fetch".to_string()));
+        assert!(names.contains(&"browser".to_string()));
     }
 
     #[tokio::test]
@@ -1547,7 +1552,7 @@ mod tests {
     fn test_tools_for_phase_web_research() {
         let tools = ToolRegistry::tools_for_phase(&TaskPhase::WebResearch).unwrap();
         assert!(tools.contains(&"web_search"));
-        assert!(tools.contains(&"web_fetch"));
+        assert!(tools.contains(&"browser"));
         assert_eq!(tools.len(), 3);
     }
 
@@ -1617,14 +1622,14 @@ mod tests {
             "list_dir",
             "exec",
             "web_search",
-            "web_fetch",
+            "browser",
         ] {
             registry.register(Box::new(MockTool::new(name)));
         }
 
         let messages = vec![serde_json::json!({"role": "user", "content": "edit the code"})];
         let mut used = HashSet::new();
-        used.insert("web_fetch".to_string());
+        used.insert("browser".to_string());
 
         let defs = registry.get_scoped_definitions(&TaskPhase::FileEditing, &messages, &used);
         let names: HashSet<String> = defs
@@ -1632,10 +1637,10 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
 
-        // Should include phase tools + used tools (web_fetch)
+        // Should include phase tools + used tools (browser)
         assert!(names.contains("read_file"));
         assert!(names.contains("edit_file"));
-        assert!(names.contains("web_fetch")); // used tool, added back
+        assert!(names.contains("browser")); // used tool, added back
     }
 
     #[test]
@@ -1649,7 +1654,7 @@ mod tests {
             "exec",
             "spawn",
             "web_search",
-            "web_fetch",
+            "browser",
             "message",
         ] {
             registry.register(Box::new(MockTool::new(name)));
@@ -1850,7 +1855,7 @@ mod tests {
     fn test_resolve_builtin_web() {
         let result = resolve_toolset("web", &HashMap::new(), &[]).unwrap();
         assert!(result.contains(&"web_search".to_string()));
-        assert!(result.contains(&"web_fetch".to_string()));
+        assert!(result.contains(&"browser".to_string()));
     }
 
     #[test]
@@ -1977,7 +1982,7 @@ mod tests {
         assert!(tool_names.contains(&"read_file".to_string()));
         assert!(tool_names.contains(&"web_search".to_string()));
         assert!(tool_names.contains(&"list_dir".to_string()));
-        assert!(tool_names.contains(&"web_fetch".to_string()));
+        assert!(tool_names.contains(&"browser".to_string()));
 
         // Step 3: Build a registry where read_file is available but web_search is not
         // (simulating the case where the search backend key is missing).
@@ -2020,7 +2025,7 @@ mod tests {
         assert!(result.contains(&"recall".to_string()));
         // Should NOT include web tools (not in @core).
         assert!(!result.contains(&"web_search".to_string()));
-        assert!(!result.contains(&"web_fetch".to_string()));
+        assert!(!result.contains(&"browser".to_string()));
         // Each tool appears exactly once despite @core + explicit recall.
         assert_eq!(result.iter().filter(|t| t.as_str() == "read_file").count(), 1);
     }
@@ -2051,7 +2056,7 @@ mod tests {
         assert!(!allowed_tools.contains(&"write_file".to_string()));
         assert!(!allowed_tools.contains(&"edit_file".to_string()));
         assert!(!allowed_tools.contains(&"web_search".to_string()));
-        assert!(!allowed_tools.contains(&"web_fetch".to_string()));
+        assert!(!allowed_tools.contains(&"browser".to_string()));
         assert!(!allowed_tools.contains(&"spawn".to_string()));
     }
 
@@ -2080,7 +2085,7 @@ mod tests {
         assert!(child_tools.contains(&"read_file".to_string()));
         assert!(child_tools.contains(&"list_dir".to_string()));
         assert!(child_tools.contains(&"web_search".to_string()));
-        assert!(child_tools.contains(&"web_fetch".to_string()));
+        assert!(child_tools.contains(&"browser".to_string()));
         assert!(child_tools.contains(&"recall".to_string()));
         assert!(child_tools.contains(&"remember".to_string()));
 

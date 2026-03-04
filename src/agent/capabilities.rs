@@ -24,7 +24,7 @@ impl Capability {
             Capability::Read => &["read_file", "list_dir"],
             Capability::Write => &["write_file", "edit_file"],
             Capability::Execute => &["exec"],
-            Capability::Http => &["web_search", "web_fetch"],
+            Capability::Http => &["web_search", "browser"],
             Capability::Memory => &["recall", "remember", "session_search"],
             Capability::Spawn => &["spawn"],
             Capability::Skills => &["read_skill"],
@@ -78,7 +78,7 @@ mod tests {
         let tools = resolve_capabilities(&[Capability::Read, Capability::Http]);
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
-        assert!(tools.contains(&"web_fetch".to_string()));
+        assert!(tools.contains(&"browser".to_string()));
     }
 
     #[test]
