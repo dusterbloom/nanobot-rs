@@ -236,18 +236,10 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         if !seen.insert(model.clone()) {
             continue;
         }
-        // Skip if model is already loaded with matching context
-        if let Some(loaded_ctx) = loaded_map.iter().find_map(|(k, lc)| {
-            if crate::lms::model_matches(k, &model) { Some(lc) } else { None }
-        }) {
-            let skip = match ctx {
-                None => true,
-                Some(requested) => *loaded_ctx == Some(requested),
-            };
-            if skip {
-                info!(model = %model, "remote_lms_prewarm_already_loaded");
-                continue;
-            }
+        // Skip if model is already loaded on the remote — don't force context reload
+        if loaded_map.keys().any(|k| crate::lms::model_matches(k, &model)) {
+            info!(model = %model, "remote_lms_prewarm_already_loaded");
+            continue;
         }
         let mut body = serde_json::json!({ "model": model });
         if let Some(c) = ctx {
