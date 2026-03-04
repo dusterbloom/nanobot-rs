@@ -4,6 +4,7 @@
 //! file can use camelCase keys while Rust code uses snake_case fields.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -61,7 +62,7 @@ impl Default for WhatsAppConfig {
 }
 
 /// Telegram channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelegramConfig {
     #[serde(default)]
@@ -77,6 +78,18 @@ pub struct TelegramConfig {
     pub toolset: Option<String>,
 }
 
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("enabled", &self.enabled)
+            .field("token", &crate::config::redact(&self.token))
+            .field("allow_from", &self.allow_from)
+            .field("proxy", &self.proxy)
+            .field("toolset", &self.toolset)
+            .finish()
+    }
+}
+
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
@@ -90,7 +103,7 @@ impl Default for TelegramConfig {
 }
 
 /// Feishu/Lark channel configuration using WebSocket long connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeishuConfig {
     #[serde(default)]
@@ -110,6 +123,20 @@ pub struct FeishuConfig {
     pub toolset: Option<String>,
 }
 
+impl fmt::Debug for FeishuConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeishuConfig")
+            .field("enabled", &self.enabled)
+            .field("app_id", &self.app_id)
+            .field("app_secret", &crate::config::redact(&self.app_secret))
+            .field("encrypt_key", &crate::config::redact(&self.encrypt_key))
+            .field("verification_token", &crate::config::redact(&self.verification_token))
+            .field("allow_from", &self.allow_from)
+            .field("toolset", &self.toolset)
+            .finish()
+    }
+}
+
 impl Default for FeishuConfig {
     fn default() -> Self {
         Self {
@@ -125,7 +152,7 @@ impl Default for FeishuConfig {
 }
 
 /// Email channel configuration (IMAP polling + SMTP sending).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailConfig {
     #[serde(default)]
@@ -161,6 +188,23 @@ fn default_smtp_port() -> u16 {
 
 fn default_poll_interval() -> u64 {
     30
+}
+
+impl fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmailConfig")
+            .field("enabled", &self.enabled)
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("username", &self.username)
+            .field("password", &crate::config::redact(&self.password))
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("allow_from", &self.allow_from)
+            .field("toolset", &self.toolset)
+            .finish()
+    }
 }
 
 impl Default for EmailConfig {
@@ -462,13 +506,22 @@ impl AdaptiveTokenConfig {
 // ---------------------------------------------------------------------------
 
 /// LLM provider configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &crate::config::redact(&self.api_key))
+            .field("api_base", &self.api_base)
+            .finish()
+    }
 }
 
 /// Configuration for LLM providers.
@@ -568,7 +621,7 @@ impl Default for GatewayConfig {
 // ---------------------------------------------------------------------------
 
 /// Web search tool configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebSearchConfig {
     #[serde(default)]
@@ -599,6 +652,19 @@ fn default_searxng_url() -> String {
     "http://localhost:8888".to_string()
 }
 
+impl fmt::Debug for WebSearchConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebSearchConfig")
+            .field("api_key", &crate::config::redact(&self.api_key))
+            .field("max_results", &self.max_results)
+            .field("provider", &self.provider)
+            .field("searxng_url", &self.searxng_url)
+            .field("jina_api_key", &crate::config::redact(&self.jina_api_key))
+            .field("auto_start", &self.auto_start)
+            .finish()
+    }
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
@@ -617,7 +683,7 @@ fn default_jina_url() -> String {
 }
 
 /// Jina Reader configuration for AI-powered web content extraction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JinaReaderConfig {
     #[serde(default = "default_true")]
@@ -626,6 +692,16 @@ pub struct JinaReaderConfig {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+impl fmt::Debug for JinaReaderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JinaReaderConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("api_key", &crate::config::redact_opt(&self.api_key))
+            .finish()
+    }
 }
 
 impl Default for JinaReaderConfig {
@@ -2826,5 +2902,32 @@ mod tests {
         assert_eq!(default_max_continuations(), 4);
         let cfg = Config::default();
         assert_eq!(cfg.agents.defaults.max_continuations, 4);
+    }
+
+    #[test]
+    fn test_debug_redacts_credentials() {
+        let mut cfg = Config::default();
+        let fake_key = "sk-super-secret-key-12345";
+        cfg.providers.openrouter.api_key = fake_key.to_string();
+        cfg.providers.anthropic.api_key = "anthropic-secret".to_string();
+        cfg.channels.telegram.token = "bot-token-secret".to_string();
+        cfg.channels.feishu.app_secret = "feishu-secret".to_string();
+        cfg.channels.email.password = "email-password".to_string();
+        cfg.tools.web.search.api_key = "search-key".to_string();
+        cfg.tools.web.search.jina_api_key = "jina-key".to_string();
+
+        let debug_output = format!("{:?}", cfg);
+
+        // None of the secret values should appear in Debug output
+        assert!(!debug_output.contains(fake_key), "openrouter api_key leaked");
+        assert!(!debug_output.contains("anthropic-secret"), "anthropic api_key leaked");
+        assert!(!debug_output.contains("bot-token-secret"), "telegram token leaked");
+        assert!(!debug_output.contains("feishu-secret"), "feishu app_secret leaked");
+        assert!(!debug_output.contains("email-password"), "email password leaked");
+        assert!(!debug_output.contains("search-key"), "web search api_key leaked");
+        assert!(!debug_output.contains("jina-key"), "jina api_key leaked");
+
+        // Redaction markers should be present
+        assert!(debug_output.contains("[REDACTED"), "missing redaction markers");
     }
 }

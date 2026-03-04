@@ -4,6 +4,8 @@
 //! the Claude CLI during authentication) and provides valid access tokens
 //! with automatic refresh when expired.
 
+use std::fmt;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -29,7 +31,7 @@ pub struct CredentialsFile {
 }
 
 /// The `claudeAiOauth` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     #[serde(rename = "accessToken")]
     pub access_token: String,
@@ -41,6 +43,18 @@ pub struct OAuthCredentials {
     pub scopes: Vec<String>,
     #[serde(rename = "subscriptionType", default)]
     pub subscription_type: String,
+}
+
+impl fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthCredentials")
+            .field("access_token", &crate::config::redact(&self.access_token))
+            .field("refresh_token", &crate::config::redact(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .field("subscription_type", &self.subscription_type)
+            .finish()
+    }
 }
 
 /// Response from the OAuth token refresh endpoint.
