@@ -5,7 +5,8 @@
 //! into a dependency DAG.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use daggy::Dag;
@@ -73,7 +74,7 @@ impl Tool for CheckpointTool {
                 )
             });
 
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.lock();
         let msgs = engine.current_messages().to_vec();
         engine.save_checkpoint(&label, &msgs, 0);
         let n = engine.checkpoint_count();
@@ -137,7 +138,7 @@ impl Tool for BacktrackTool {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.lock();
 
         let checkpoint = if let Some(ref lbl) = label {
             // Named backtrack: find by label, then pop the stack to that point.
@@ -312,7 +313,7 @@ impl Tool for PlanTool {
 
         // Install the new plan into the engine.
         let new_engine = ReasoningEngine::new_with_plan(dag, step_budget);
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.lock();
         *engine = new_engine;
 
         format!(
@@ -343,7 +344,7 @@ mod tests {
 
         // Pre-load messages into the engine's current_messages field.
         {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.lock();
             e.sync_messages(&[json!({"role": "user", "content": "hello"})]);
         }
 
@@ -365,7 +366,7 @@ mod tests {
         );
 
         // Verify the engine actually has the checkpoint with the right messages.
-        let mut engine_guard = engine.lock().unwrap();
+        let mut engine_guard = engine.lock();
         let cp = engine_guard.pop_checkpoint().unwrap();
         assert_eq!(cp.label, "before_tool_call");
         assert_eq!(cp.messages.len(), 1);
@@ -402,7 +403,7 @@ mod tests {
             tool.execute(params).await;
         }
 
-        let count = engine.lock().unwrap().checkpoint_count();
+        let count = engine.lock().checkpoint_count();
         assert_eq!(count, 3);
     }
 
@@ -415,7 +416,7 @@ mod tests {
         // Manually save a checkpoint.
         {
             let msgs = vec![json!({"role": "user", "content": "v1"})];
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.lock();
             e.save_checkpoint("safe_point", &msgs, 0);
         }
 
@@ -442,7 +443,7 @@ mod tests {
         );
 
         // Verify the pending restore was set on the engine.
-        let mut e = engine.lock().unwrap();
+        let mut e = engine.lock();
         let restored = e.take_pending_restore().unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0]["content"], "v1");
@@ -454,7 +455,7 @@ mod tests {
 
         // Save two checkpoints.
         {
-            let mut e = engine.lock().unwrap();
+            let mut e = engine.lock();
             e.save_checkpoint("first", &[json!({"role":"user","content":"first"})], 0);
             e.save_checkpoint("second", &[json!({"role":"user","content":"second"})], 1);
         }
@@ -476,7 +477,7 @@ mod tests {
             "should mention 'first' checkpoint, got: {result}"
         );
         // Pending restore should have the first checkpoint messages.
-        let mut e = engine.lock().unwrap();
+        let mut e = engine.lock();
         let restored = e.take_pending_restore().unwrap();
         assert_eq!(restored[0]["content"], "first");
     }
@@ -529,7 +530,7 @@ mod tests {
         );
 
         // Engine should now be in plan-guided mode.
-        let engine_guard = engine.lock().unwrap();
+        let engine_guard = engine.lock();
         let step = engine_guard.current_step().unwrap();
         assert_eq!(step.goal, "Research the topic");
     }
@@ -557,7 +558,7 @@ mod tests {
         );
 
         // Verify the plan advances in order.
-        let mut engine_guard = engine.lock().unwrap();
+        let mut engine_guard = engine.lock();
         assert_eq!(engine_guard.current_step().unwrap().goal, "Fetch data");
         engine_guard.mark_current_completed(None);
         let next = engine_guard.advance().unwrap();

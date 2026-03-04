@@ -6,7 +6,8 @@
 //! API format.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -360,7 +361,7 @@ async fn try_native_lms_chat(
     // Check the per-base-URL availability cache.  If a previous probe already
     // determined the endpoint is unavailable, skip the 10s timeout entirely.
     {
-        let cache = native_lms_cache().lock().unwrap();
+        let cache = native_lms_cache().lock();
         if cache.get(native_base) == Some(&false) {
             tracing::debug!(
                 "native LMS chat skipped (cached unavailable) for {}",
@@ -453,7 +454,6 @@ async fn try_native_lms_chat(
             tracing::debug!("native LMS chat send error (will fall back): {}", e);
             native_lms_cache()
                 .lock()
-                .unwrap()
                 .insert(native_base.to_string(), false);
             return None;
         }
@@ -464,7 +464,6 @@ async fn try_native_lms_chat(
             );
             native_lms_cache()
                 .lock()
-                .unwrap()
                 .insert(native_base.to_string(), false);
             return None;
         }
@@ -486,7 +485,6 @@ async fn try_native_lms_chat(
         // Mark the endpoint as unavailable so future calls skip the probe.
         native_lms_cache()
             .lock()
-            .unwrap()
             .insert(native_base.to_string(), false);
         return None; // Fall back to regular path
     }
@@ -494,7 +492,6 @@ async fn try_native_lms_chat(
     // Endpoint responded successfully — mark it available for future calls.
     native_lms_cache()
         .lock()
-        .unwrap()
         .insert(native_base.to_string(), true);
 
     let json: serde_json::Value = resp.json().await.ok()?;
@@ -2641,10 +2638,9 @@ mod tests {
         // Mark unavailable.
         native_lms_cache()
             .lock()
-            .unwrap()
             .insert(base.to_string(), false);
         // Verify the cache entry.
-        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        let val = native_lms_cache().lock().get(base).copied();
         assert_eq!(val, Some(false), "cache should hold false after marking unavailable");
     }
 
@@ -2654,9 +2650,8 @@ mod tests {
         let base = "http://127.0.0.1:29992";
         native_lms_cache()
             .lock()
-            .unwrap()
             .insert(base.to_string(), true);
-        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        let val = native_lms_cache().lock().get(base).copied();
         assert_eq!(val, Some(true), "cache should hold true after marking available");
     }
 
@@ -2665,7 +2660,7 @@ mod tests {
     fn test_native_lms_cache_absent_for_unknown_base() {
         let base = "http://127.0.0.1:29993";
         // Do NOT insert — just read.
-        let val = native_lms_cache().lock().unwrap().get(base).copied();
+        let val = native_lms_cache().lock().get(base).copied();
         assert_eq!(val, None, "cache should return None for an un-probed endpoint");
     }
 
@@ -2680,7 +2675,6 @@ mod tests {
         // Pre-populate cache as unavailable.
         native_lms_cache()
             .lock()
-            .unwrap()
             .insert(native_base.to_string(), false);
 
         let client = Client::builder()

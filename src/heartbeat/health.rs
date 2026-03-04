@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::Instant;
 
 use tracing::{debug, warn};
@@ -111,7 +111,6 @@ impl HealthRegistry {
         let name = probe.name().to_string();
         self.states
             .write()
-            .unwrap()
             .insert(name.clone(), ProbeState::new_with_threshold(name, self.degraded_threshold));
         self.probes.push(probe);
     }
@@ -124,7 +123,7 @@ impl HealthRegistry {
 
             // Check if this probe is due
             let is_due = {
-                let states = self.states.read().unwrap();
+                let states = self.states.read();
                 match states.get(&name) {
                     Some(state) => match state.last_checked {
                         Some(last) => last.elapsed().as_secs() >= interval,
@@ -140,7 +139,7 @@ impl HealthRegistry {
                     "Health probe '{}': healthy={}, latency={}ms",
                     name, result.healthy, result.latency_ms
                 );
-                let mut states = self.states.write().unwrap();
+                let mut states = self.states.write();
                 if let Some(state) = states.get_mut(&name) {
                     state.record_result(result);
                 }
@@ -151,7 +150,7 @@ impl HealthRegistry {
     /// Returns true if the named probe is NOT degraded.
     /// Unknown probes (not registered) return true (optimistic default).
     pub fn is_healthy(&self, name: &str) -> bool {
-        let states = self.states.read().unwrap();
+        let states = self.states.read();
         match states.get(name) {
             Some(state) => state.status != ProbeStatus::Degraded,
             None => true, // Optimistic: unknown = healthy
@@ -160,14 +159,14 @@ impl HealthRegistry {
 
     /// Snapshot of all probe states for display.
     pub fn all_states(&self) -> Vec<ProbeState> {
-        let states = self.states.read().unwrap();
+        let states = self.states.read();
         states.values().cloned().collect()
     }
 
     /// One-line summary of all probes.
     #[allow(dead_code)]
     pub fn summary_line(&self) -> String {
-        let states = self.states.read().unwrap();
+        let states = self.states.read();
         if states.is_empty() {
             return "no probes".to_string();
         }
@@ -434,7 +433,7 @@ mod tests {
         let mut reg = HealthRegistry::new();
         // Manually insert a degraded state
         {
-            let mut states = reg.states.write().unwrap();
+            let mut states = reg.states.write();
             let mut state = ProbeState::new("test_probe".to_string());
             for _ in 0..DEGRADED_THRESHOLD {
                 state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
@@ -448,7 +447,7 @@ mod tests {
     fn test_registry_healthy_probe_is_healthy() {
         let mut reg = HealthRegistry::new();
         {
-            let mut states = reg.states.write().unwrap();
+            let mut states = reg.states.write();
             let mut state = ProbeState::new("test_probe".to_string());
             state.record_result(ProbeResult { healthy: true, latency_ms: 10, detail: None });
             states.insert("test_probe".to_string(), state);
@@ -482,7 +481,7 @@ mod tests {
             healthy: true,
         }));
         reg.run_due_probes().await;
-        let states = reg.states.read().unwrap();
+        let states = reg.states.read();
         let state = states.get("mock").unwrap();
         assert_eq!(state.status, ProbeStatus::Healthy);
         assert!(state.last_checked.is_some());
@@ -499,13 +498,13 @@ mod tests {
         // First run: should check (never checked before)
         reg.run_due_probes().await;
         let first_check = {
-            let states = reg.states.read().unwrap();
+            let states = reg.states.read();
             states.get("slow_mock").unwrap().last_checked.unwrap()
         };
         // Second run immediately: should NOT check (interval not elapsed)
         reg.run_due_probes().await;
         let second_check = {
-            let states = reg.states.read().unwrap();
+            let states = reg.states.read();
             states.get("slow_mock").unwrap().last_checked.unwrap()
         };
         // last_checked should be unchanged (same instant)

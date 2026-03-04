@@ -625,7 +625,7 @@ pub(crate) async fn dispatch_specialist(
     };
 
     let cb_key = format!("specialist:{}", specialist_model);
-    if !counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+    if !counters.trio_circuit_breaker.lock().is_available(&cb_key) {
         tracing::Span::current().record("outcome", "error");
         return Err(format!("circuit breaker open for {}", cb_key));
     }
@@ -652,7 +652,7 @@ pub(crate) async fn dispatch_specialist(
         specialist_state
     };
     // Load specialist domain memory and prepend to pack if available.
-    let domain_memory = counters.specialist_memory.lock().unwrap().format_context(target);
+    let domain_memory = counters.specialist_memory.lock().format_context(target);
     let specialist_pack = if !domain_memory.is_empty() {
         format!("{}\n\n{}", domain_memory, specialist_pack)
     } else {
@@ -676,7 +676,7 @@ pub(crate) async fn dispatch_specialist(
         .await
     {
         Ok(sp_resp) => {
-            counters.trio_circuit_breaker.lock().unwrap().record_success(&cb_key);
+            counters.trio_circuit_breaker.lock().record_success(&cb_key);
             let raw_text = sp_resp
                 .content
                 .unwrap_or_else(|| "Specialist returned no content.".to_string());
@@ -699,7 +699,7 @@ pub(crate) async fn dispatch_specialist(
             })
         }
         Err(e) => {
-            counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            counters.trio_circuit_breaker.lock().record_failure(&cb_key);
             tracing::Span::current().record("outcome", "error");
             Err(format!("Specialist lane failed: {}", e))
         }
@@ -851,7 +851,7 @@ pub(crate) async fn router_preflight(
 
     // Circuit breaker gate: skip if router has too many recent failures.
     let cb_key = format!("router:{}", router_model);
-    if !ctx.counters.trio_circuit_breaker.lock().unwrap().is_available(&cb_key) {
+    if !ctx.counters.trio_circuit_breaker.lock().is_available(&cb_key) {
         ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
         warn!("[router] circuit breaker open for {cb_key} — falling through to main model");
         tracing::Span::current().record("routing_decision", "passthrough_circuit_open");
@@ -911,12 +911,12 @@ pub(crate) async fn router_preflight(
     .await
     {
         Ok(d) => {
-            ctx.counters.trio_circuit_breaker.lock().unwrap().record_success(&cb_key);
+            ctx.counters.trio_circuit_breaker.lock().record_success(&cb_key);
             d
         }
         Err(e) => {
             warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
-            ctx.counters.trio_circuit_breaker.lock().unwrap().record_failure(&cb_key);
+            ctx.counters.trio_circuit_breaker.lock().record_failure(&cb_key);
             tracing::Span::current().record("routing_decision", "passthrough_router_error");
             return PreflightResult::Passthrough;
         }
@@ -930,7 +930,7 @@ pub(crate) async fn router_preflight(
         target = %decision.target,
         "router_decision"
     );
-    *ctx.counters.trio_metrics.router_action.lock().unwrap() = Some(decision.action.clone());
+    *ctx.counters.trio_metrics.router_action.lock() = Some(decision.action.clone());
 
     let base_trace = RouterDecisionTrace {
         phase: "preflight".to_string(),
@@ -983,7 +983,7 @@ pub(crate) async fn router_preflight(
                         super::trace_store::append_specialist_trace(&record);
                     }
                     // Record specialist output for domain memory.
-                    ctx.counters.specialist_memory.lock().unwrap().push(&decision.target, &record.specialist_response);
+                    ctx.counters.specialist_memory.lock().push(&decision.target, &record.specialist_response);
                     let injected = format!("[specialist:{}] {}", decision.target, record.specialist_response);
                     ctx.messages
                         .push(json!({"role":"user","content": injected, "_synthetic": true}));
@@ -1070,7 +1070,7 @@ pub(crate) async fn router_preflight(
                 ),
                 "_synthetic": true,
             }));
-            *ctx.counters.trio_metrics.tool_dispatched.lock().unwrap() = Some(decision.target.clone());
+            *ctx.counters.trio_metrics.tool_dispatched.lock() = Some(decision.target.clone());
             ctx.used_tools.insert(decision.target.clone());
             tool_preflight_result(&decision.target, &truncated, None)
         }

@@ -124,18 +124,18 @@ pub enum TrioState {
 /// Observability counters for trio routing, populated by router.rs.
 pub struct TrioMetrics {
     pub router_preflight_fired: AtomicBool,
-    pub router_action: std::sync::Mutex<Option<String>>,
+    pub router_action: parking_lot::Mutex<Option<String>>,
     pub specialist_dispatched: AtomicBool,
-    pub tool_dispatched: std::sync::Mutex<Option<String>>,
+    pub tool_dispatched: parking_lot::Mutex<Option<String>>,
 }
 
 impl Default for TrioMetrics {
     fn default() -> Self {
         Self {
             router_preflight_fired: AtomicBool::new(false),
-            router_action: std::sync::Mutex::new(None),
+            router_action: parking_lot::Mutex::new(None),
             specialist_dispatched: AtomicBool::new(false),
-            tool_dispatched: std::sync::Mutex::new(None),
+            tool_dispatched: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -144,9 +144,9 @@ impl TrioMetrics {
     /// Reset all metrics for a new turn/test.
     pub fn reset(&self) {
         self.router_preflight_fired.store(false, Ordering::Relaxed);
-        *self.router_action.lock().unwrap() = None;
+        *self.router_action.lock() = None;
         self.specialist_dispatched.store(false, Ordering::Relaxed);
-        *self.tool_dispatched.lock().unwrap() = None;
+        *self.tool_dispatched.lock() = None;
     }
 }
 
@@ -161,7 +161,7 @@ pub struct RuntimeCounters {
     pub last_context_max: AtomicU64,
     pub last_message_count: AtomicU64,
     pub last_working_memory_tokens: AtomicU64,
-    pub last_tools_called: std::sync::Mutex<Vec<String>>,
+    pub last_tools_called: parking_lot::Mutex<Vec<String>>,
     /// Tracks whether the delegation provider is alive. Set to `false` when
     /// the delegation LLM returns a hard error or times out, causing subsequent
     /// calls to fall through to inline execution. Reset to `true` on core
@@ -194,11 +194,11 @@ pub struct RuntimeCounters {
     /// Trio routing observability.
     pub trio_metrics: TrioMetrics,
     /// Circuit breaker for trio routing providers.
-    pub trio_circuit_breaker: std::sync::Mutex<CircuitBreaker>,
+    pub trio_circuit_breaker: parking_lot::Mutex<CircuitBreaker>,
     /// Current trio routing state for observability.
     pub trio_state: AtomicU8,
     /// Per-domain ring buffer memory for specialist multi-turn context.
-    pub specialist_memory: std::sync::Mutex<crate::agent::router::SpecialistMemory>,
+    pub specialist_memory: parking_lot::Mutex<crate::agent::router::SpecialistMemory>,
 }
 
 impl RuntimeCounters {
@@ -213,7 +213,7 @@ impl RuntimeCounters {
             last_context_max: AtomicU64::new(max_context_tokens as u64),
             last_message_count: AtomicU64::new(0),
             last_working_memory_tokens: AtomicU64::new(0),
-            last_tools_called: std::sync::Mutex::new(Vec::new()),
+            last_tools_called: parking_lot::Mutex::new(Vec::new()),
             delegation_healthy: AtomicBool::new(true),
             delegation_retry_counter: AtomicU64::new(0),
             thinking_budget: AtomicU32::new(0),
@@ -224,9 +224,9 @@ impl RuntimeCounters {
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
             trio_metrics: TrioMetrics::default(),
-            trio_circuit_breaker: std::sync::Mutex::new(CircuitBreaker::new(cb_config)),
+            trio_circuit_breaker: parking_lot::Mutex::new(CircuitBreaker::new(cb_config)),
             trio_state: AtomicU8::new(TrioState::Standalone as u8),
-            specialist_memory: std::sync::Mutex::new(crate::agent::router::SpecialistMemory::default()),
+            specialist_memory: parking_lot::Mutex::new(crate::agent::router::SpecialistMemory::default()),
         }
     }
 }
@@ -258,7 +258,7 @@ impl RuntimeCounters {
 /// `core` is swapped on `/local` and `/model`. `counters` persists forever.
 #[derive(Clone)]
 pub struct AgentHandle {
-    core: Arc<std::sync::RwLock<Arc<SwappableCore>>>,
+    core: Arc<parking_lot::RwLock<Arc<SwappableCore>>>,
     pub counters: Arc<RuntimeCounters>,
 }
 
@@ -266,19 +266,19 @@ impl AgentHandle {
     /// Create a new handle from a swappable core and runtime counters.
     pub fn new(core: SwappableCore, counters: Arc<RuntimeCounters>) -> Self {
         Self {
-            core: Arc::new(std::sync::RwLock::new(Arc::new(core))),
+            core: Arc::new(parking_lot::RwLock::new(Arc::new(core))),
             counters,
         }
     }
 
     /// Snapshot the current swappable core (cheap Arc clone under brief read lock).
     pub fn swappable(&self) -> Arc<SwappableCore> {
-        self.core.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.core.read().clone()
     }
 
     /// Replace the swappable core (write lock). Counters are untouched.
     pub fn swap_core(&self, new_core: SwappableCore) {
-        *self.core.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_core);
+        *self.core.write() = Arc::new(new_core);
     }
 }
 

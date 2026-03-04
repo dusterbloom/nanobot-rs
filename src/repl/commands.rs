@@ -859,7 +859,6 @@ impl ReplContext {
                 .trio_metrics
                 .router_action
                 .lock()
-                .unwrap()
                 .clone()
                 .unwrap_or_else(|| "none".to_string());
             let preflight = counters

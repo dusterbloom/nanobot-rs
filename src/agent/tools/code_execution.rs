@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -139,7 +140,7 @@ fn run_rpc_server(
 
                         // Enforce max_tool_calls.
                         let count = {
-                            let mut c = call_count.lock().unwrap();
+                            let mut c = call_count.lock();
                             *c += 1;
                             *c
                         };

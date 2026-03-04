@@ -65,6 +65,9 @@ bytes = "1"
 # Base64
 base64 = "0.22"
 
+# Faster, poison-free Mutex/RwLock
+parking_lot = "0.12"
+
 # HTML processing
 scraper = "0.22"
 html-escape = "0.2"

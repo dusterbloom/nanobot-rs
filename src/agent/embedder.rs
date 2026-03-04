@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "semantic")]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 #[cfg(feature = "semantic")]
-use std::sync::Mutex;
+use parking_lot::Mutex;
 #[cfg(feature = "semantic")]
 use tracing::{debug, info};
 
@@ -35,7 +35,7 @@ static MODEL: once_cell::sync::Lazy<Mutex<TextEmbedding>> = once_cell::sync::Laz
 /// Embed a single text string. Returns a vector of EMBEDDING_DIM floats.
 #[cfg(feature = "semantic")]
 pub fn embed_one(text: &str) -> Result<Embedding> {
-    let mut model = MODEL.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {}", e))?;
+    let mut model = MODEL.lock();
     let mut results = model
         .embed(vec![text], None)
         .context("Embedding failed")?;
@@ -51,7 +51,7 @@ pub fn embed_batch(texts: &[&str]) -> Result<Vec<Embedding>> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
-    let mut model = MODEL.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {}", e))?;
+    let mut model = MODEL.lock();
     let results = model
         .embed(texts.to_vec(), None)
         .context("Batch embedding failed")?;

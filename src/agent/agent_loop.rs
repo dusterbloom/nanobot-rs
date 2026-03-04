@@ -93,12 +93,12 @@ pub(crate) struct AgentLoopShared {
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Budget calibrator for recording execution stats (append-only SQLite).
-    pub(crate) calibrator: Option<std::sync::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
+    pub(crate) calibrator: Option<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     /// Knowledge store for proactive grounding retrieval.
-    pub(crate) knowledge_store: Option<Arc<std::sync::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
+    pub(crate) knowledge_store: Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
 }
 
 /// Per-message state that flows through the three processing phases.
@@ -320,14 +320,14 @@ impl AgentLoopShared {
         // Auto-decompose: detect numbered steps in user message and build a plan.
         // This helps small models that can't call the plan tool themselves.
         if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
-            if let Ok(engine) = ctx.reasoning.lock() {
+            { let engine = ctx.reasoning.lock();
                 // Only auto-decompose if no plan exists yet (Linear mode).
                 if *engine.mode() == ReasoningMode::Linear {
                     drop(engine); // Release lock before re-acquiring mutably
                     if let Some(steps) = crate::agent::reasoning::parse_numbered_steps(&ctx.user_content) {
                         let step_budget = ctx.core.reasoning_config.step_budget;
                         let new_engine = ReasoningEngine::from_goals(&steps, step_budget);
-                        if let Ok(mut engine) = ctx.reasoning.lock() {
+                        { let mut engine = ctx.reasoning.lock();
                             *engine = new_engine;
                             info!(
                                 steps = steps.len(),
@@ -374,7 +374,7 @@ impl AgentLoopShared {
 
             // Plan-guided: inject current step instruction into conversation.
             {
-                if let Ok(engine) = ctx.reasoning.lock() {
+                { let engine = ctx.reasoning.lock();
                     if let Some(instruction) = engine.step_instruction() {
                         ctx.messages.push(json!({
                             "role": "user",
@@ -394,7 +394,7 @@ impl AgentLoopShared {
             );
 
             // Sync messages to reasoning engine so CheckpointTool can capture them.
-            if let Ok(mut engine) = ctx.reasoning.lock() {
+            { let mut engine = ctx.reasoning.lock();
                 engine.sync_messages(&ctx.messages);
             }
 
@@ -403,7 +403,7 @@ impl AgentLoopShared {
 
             // Check for pending backtrack (set by BacktrackTool during tool execution).
             {
-                if let Ok(mut engine) = ctx.reasoning.lock() {
+                { let mut engine = ctx.reasoning.lock();
                     if let Some(restored) = engine.take_pending_restore() {
                         ctx.messages = restored;
                         iteration += 1;
@@ -445,7 +445,7 @@ impl AgentLoopShared {
                     ctx.flow.validation_retries = 0;
                     iteration += 1;
                     // Consume step budget if plan-guided.
-                    if let Ok(mut engine) = ctx.reasoning.lock() {
+                    { let mut engine = ctx.reasoning.lock();
                         engine.consume_iteration();
                         if *engine.mode() != ReasoningMode::Linear
                             && engine.step_budget_remaining() == 0
@@ -465,14 +465,11 @@ impl AgentLoopShared {
                     iteration += 1;
                     // In plan-guided mode, advance to next step.
                     let should_continue = {
-                        if let Ok(mut engine) = ctx.reasoning.lock() {
-                            if *engine.mode() != ReasoningMode::Linear {
-                                engine.mark_current_completed(Some(content.clone()));
-                                engine.advance();
-                                !engine.is_complete()
-                            } else {
-                                false
-                            }
+                        let mut engine = ctx.reasoning.lock();
+                        if *engine.mode() != ReasoningMode::Linear {
+                            engine.mark_current_completed(Some(content.clone()));
+                            engine.advance();
+                            !engine.is_complete()
                         } else {
                             false
                         }
@@ -489,21 +486,18 @@ impl AgentLoopShared {
                     iteration += 1;
                     // Try backtracking before giving up.
                     let should_backtrack = {
-                        if let Ok(mut engine) = ctx.reasoning.lock() {
-                            if *engine.mode() != ReasoningMode::Linear {
-                                engine.mark_current_failed(&msg);
-                                if engine.find_alternative().is_some() {
-                                    if let Some(cp) = engine.pop_checkpoint() {
-                                        engine.record_branch(BranchAttempt {
-                                            step_id: 0,
-                                            approach: "previous".into(),
-                                            outcome: StepStatus::Failed(msg.clone()),
-                                            iterations_consumed: iteration,
-                                        });
-                                        Some(cp.messages)
-                                    } else {
-                                        None
-                                    }
+                        let mut engine = ctx.reasoning.lock();
+                        if *engine.mode() != ReasoningMode::Linear {
+                            engine.mark_current_failed(&msg);
+                            if engine.find_alternative().is_some() {
+                                if let Some(cp) = engine.pop_checkpoint() {
+                                    engine.record_branch(BranchAttempt {
+                                        step_id: 0,
+                                        approach: "previous".into(),
+                                        outcome: StepStatus::Failed(msg.clone()),
+                                        iterations_consumed: iteration,
+                                    });
+                                    Some(cp.messages)
                                 } else {
                                     None
                                 }
@@ -579,10 +573,9 @@ impl AgentLoopShared {
 
         // --- Proprioception: update SystemState ---
         if self.proprioception_config.enabled {
-            let tools_list: Vec<String> = if let Ok(guard) = counters.last_tools_called.lock() {
+            let tools_list: Vec<String> = {
+                let guard = counters.last_tools_called.lock();
                 guard.clone()
-            } else {
-                Vec::new()
             };
             let tool_refs: Vec<&str> = tools_list.iter().map(|s| s.as_str()).collect();
             let phase = system_state::infer_phase(&tool_refs);
@@ -752,7 +745,7 @@ impl AgentLoopShared {
             let cb_key = ctx.core.router_model
                 .as_deref()
                 .map_or_else(|| "trio_router".to_string(), |m| format!("router:{}", m));
-            let cb_available = ctx.counters.trio_circuit_breaker.lock().unwrap()
+            let cb_available = ctx.counters.trio_circuit_breaker.lock()
                 .is_available(&cb_key);
             if should_strip_tools_for_trio(
                 ctx.core.is_local,
@@ -1047,7 +1040,7 @@ impl AgentLoopShared {
                     if intent.confidence >= 0.2 {
                         let budget = (ctx.core.token_budget.max_context() / 20).min(500);
                         let learning_context = ctx.core.learning.get_learning_context();
-                        let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock().unwrap());
+                        let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
                         let ks_ref = ks_guard.as_deref();
                         let payload = crate::agent::proactive::retrieve_grounding(
                             &intent, ks_ref, &learning_context, budget,
@@ -1852,7 +1845,7 @@ impl AgentLoopShared {
                 tc.name == "exec" || tc.name == "write_file"
             });
             if should_checkpoint {
-                if let Ok(mut engine) = ctx.reasoning.lock() {
+                { let mut engine = ctx.reasoning.lock();
                     if *engine.mode() != crate::agent::reasoning::ReasoningMode::Linear {
                         engine.sync_messages(&ctx.messages);
                         engine.save_checkpoint("pre_exec", &ctx.messages, ctx.iterations_used);
@@ -2141,7 +2134,7 @@ impl AgentLoop {
             lcm_compactor,
             health_registry,
             calibrator: match crate::agent::budget_calibrator::BudgetCalibrator::open_default() {
-                Ok(c) => Some(std::sync::Mutex::new(c)),
+                Ok(c) => Some(parking_lot::Mutex::new(c)),
                 Err(e) => {
                     tracing::warn!("BudgetCalibrator init failed, recording disabled: {}", e);
                     None
@@ -2150,7 +2143,7 @@ impl AgentLoop {
             #[cfg(feature = "cluster")]
             cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default().ok()
-                .map(|ks| Arc::new(std::sync::Mutex::new(ks))),
+                .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
         });
 
         Self {

@@ -54,7 +54,7 @@ impl AgentLoopShared {
         // Store tools called this turn.
         {
             let tools_list: Vec<String> = ctx.used_tools.iter().cloned().collect();
-            if let Ok(mut guard) = counters.last_tools_called.lock() {
+            { let mut guard = counters.last_tools_called.lock();
                 *guard = tools_list;
             }
         }
@@ -265,7 +265,7 @@ impl AgentLoopShared {
                 tool_calls: ctx.used_tools.len() as u32,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
-            if let Ok(cal) = cal_mutex.lock() {
+            { let cal = cal_mutex.lock();
                 if let Err(e) = cal.record(&record) {
                     tracing::debug!("BudgetCalibrator record failed: {}", e);
                 }

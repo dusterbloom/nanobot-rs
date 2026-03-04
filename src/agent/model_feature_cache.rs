@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ struct CacheFile {
 ///
 /// `feature` is a raw field name, e.g. `"reasoning"`.
 pub fn is_feature_unsupported(model: &str, feature: &str) -> bool {
-    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = CACHE.lock();
     guard
         .get(model)
         .map(|set| set.contains(feature))
@@ -43,7 +43,7 @@ pub fn is_feature_unsupported(model: &str, feature: &str) -> bool {
 /// Idempotent. Persists the updated cache to disk (best-effort).
 pub fn mark_feature_unsupported(model: &str, feature: &str) {
     {
-        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = CACHE.lock();
         guard
             .entry(model.to_string())
             .or_default()
@@ -93,7 +93,7 @@ fn save_to_disk_sync() {
     };
 
     let snapshot: HashMap<String, Vec<String>> = {
-        let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = CACHE.lock();
         guard
             .iter()
             .map(|(k, v)| {

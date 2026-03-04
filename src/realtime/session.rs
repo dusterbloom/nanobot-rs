@@ -3,7 +3,8 @@
 //! Integrates VAD, turn detection, STT, and TTS for realtime conversations.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -325,7 +326,7 @@ impl RealtimeSession {
         let text = text.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = tts.lock().map_err(|e| format!("TTS lock error: {}", e))?;
+            let mut guard = tts.lock();
 
             guard
                 .synthesize_streaming(&text, |samples, sample_rate| {

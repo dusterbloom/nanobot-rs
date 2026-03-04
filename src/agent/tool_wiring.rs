@@ -315,9 +315,9 @@ impl AgentLoopShared {
             BacktrackTool, CheckpointTool, PlanTool, SharedEngine,
         };
         let reasoning_engine: SharedEngine =
-            Arc::new(std::sync::Mutex::new(ReasoningEngine::new()));
+            Arc::new(parking_lot::Mutex::new(ReasoningEngine::new()));
         {
-            let mut eng = reasoning_engine.lock().unwrap();
+            let mut eng = reasoning_engine.lock();
             eng.set_max_checkpoints(core.reasoning_config.max_checkpoints);
         }
         if core.reasoning_config.enabled {

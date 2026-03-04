@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -167,7 +167,7 @@ impl AuditLog {
         }
 
         // Update in-memory state for next call from this instance.
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = hash;
+        *self.last_hash.lock() = hash;
         self.seq_counter.store(seq + 1, Ordering::SeqCst);
     }
 

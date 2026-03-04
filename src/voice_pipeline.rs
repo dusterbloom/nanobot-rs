@@ -15,7 +15,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use crate::config::schema::TtsEngineConfig;
@@ -878,7 +879,7 @@ impl VoicePipeline {
 
         let stt = self.stt.clone();
         let result = {
-            let mut guard = stt.lock().map_err(|e| format!("STT lock: {e}"))?;
+            let mut guard = stt.lock();
             guard.transcribe(&all_samples).map_err(|e| format!("Transcription failed: {e}"))?
         };
 
@@ -908,7 +909,7 @@ impl VoicePipeline {
         .ok_or("No TTS engine available")?
         .clone();
 
-        let is_pocket = tts.lock().unwrap().engine_type() == "pocket";
+        let is_pocket = tts.lock().engine_type() == "pocket";
         let voice_id = if is_pocket {
             "alba".to_string()
         } else {
@@ -936,7 +937,7 @@ impl VoicePipeline {
         let synth_handle = std::thread::spawn(move || {
             #[cfg(unix)]
             mask_sigint();
-            let mut guard = tts.lock().unwrap();
+            let mut guard = tts.lock();
             if let Err(e) = guard.set_speaker(&voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
             }
@@ -1006,7 +1007,7 @@ impl VoicePipeline {
         let synth_handle = std::thread::spawn(move || {
             #[cfg(unix)]
             mask_sigint();
-            let mut guard = tts.lock().unwrap();
+            let mut guard = tts.lock();
             if let Err(e) = guard.set_speaker(&voice_id) {
                 tracing::warn!("Voice switch to {} failed: {}", voice_id, e);
             }
@@ -1112,7 +1113,7 @@ impl VoicePipeline {
 
         let stt = self.stt.clone();
         let text = tokio::task::spawn_blocking(move || {
-            let mut guard = stt.lock().map_err(|e| format!("STT lock poisoned: {e}"))?;
+            let mut guard = stt.lock();
             let result = guard
                 .transcribe(&samples)
                 .map_err(|e| format!("Transcription failed: {e}"))?;
@@ -1147,7 +1148,7 @@ impl VoicePipeline {
         };
 
         let (all_samples, sample_rate) = tokio::task::spawn_blocking(move || {
-            let mut guard = tts.lock().map_err(|e| format!("TTS lock poisoned: {e}"))?;
+            let mut guard = tts.lock();
             let engine_type = guard.engine_type().to_string();
 
             if engine_type == "pocket" {
@@ -1331,12 +1332,12 @@ pub(crate) fn start_tts_playback(
         // Pre-warm: lock each engine once, set default voices, then release.
         // This forces model loading to happen NOW, not on first synthesis.
         if let Some(ref tts) = tts_en {
-            let mut g = tts.lock().unwrap();
+            let mut g = tts.lock();
             let _ = g.set_speaker("alba");
             tracing::debug!("[tts-synth] Pocket pre-warmed (English)");
         }
         if let Some(ref tts) = tts_multi {
-            let mut g = tts.lock().unwrap();
+            let mut g = tts.lock();
             // Set a default Kokoro voice to force model load
             let _ = g.set_speaker("35"); // Italian (if_sara)
             tracing::debug!("[tts-synth] Kokoro pre-warmed (multilingual)");
@@ -1371,7 +1372,7 @@ pub(crate) fn start_tts_playback(
                         }
                     };
 
-                    let mut guard = engine.lock().unwrap();
+                    let mut guard = engine.lock();
 
                     // Set voice per language
                     if is_english {

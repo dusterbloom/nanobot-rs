@@ -3,7 +3,8 @@
 
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use parking_lot::Mutex;
 #[cfg(feature = "voice")]
 use std::sync::Arc;
 
@@ -52,7 +53,7 @@ impl TerminalWriter {
 
     /// Write a string to stdout under the lock, then flush.
     pub fn write_str(&self, s: &str) {
-        if let Ok(mut w) = self.inner.lock() {
+        { let mut w = self.inner.lock();
             let _ = w.write_all(s.as_bytes());
             let _ = w.flush();
         }
@@ -60,7 +61,7 @@ impl TerminalWriter {
 
     /// Write a string followed by newline.
     pub fn writeln(&self, s: &str) {
-        if let Ok(mut w) = self.inner.lock() {
+        { let mut w = self.inner.lock();
             let _ = w.write_all(s.as_bytes());
             let _ = w.write_all(b"\n");
             let _ = w.flush();
@@ -73,7 +74,7 @@ impl TerminalWriter {
     where
         F: FnOnce(&mut BufWriter<io::Stdout>),
     {
-        if let Ok(mut w) = self.inner.lock() {
+        { let mut w = self.inner.lock();
             f(&mut w);
             let _ = w.flush();
         }
@@ -446,8 +447,7 @@ pub(crate) fn print_status_bar(
     let tools_called: Vec<String> = counters
         .last_tools_called
         .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+        .clone();
     if !tools_called.is_empty() {
         let mut sorted = tools_called.clone();
         sorted.sort();

@@ -1208,9 +1208,9 @@ async fn test_trio_e2e_tool_dispatch() {
     eprintln!(
         "  metrics: preflight={} action={:?} specialist={} tool={:?}",
         metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
-        metrics.router_action.lock().unwrap(),
+        metrics.router_action.lock(),
         metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
-        metrics.tool_dispatched.lock().unwrap(),
+        metrics.tool_dispatched.lock(),
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1636,7 +1636,7 @@ fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
 /// sentinel error string so tests can detect over-calling.
 struct SequenceProvider {
     name: String,
-    responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+    responses: parking_lot::Mutex<std::collections::VecDeque<String>>,
     call_count: std::sync::atomic::AtomicU32,
 }
 
@@ -1644,7 +1644,7 @@ impl SequenceProvider {
     fn new(name: &str, responses: Vec<&str>) -> Self {
         Self {
             name: name.to_string(),
-            responses: std::sync::Mutex::new(
+            responses: parking_lot::Mutex::new(
                 responses.into_iter().map(|s| s.to_string()).collect(),
             ),
             call_count: std::sync::atomic::AtomicU32::new(0),
@@ -1671,7 +1671,7 @@ impl LLMProvider for SequenceProvider {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let response = {
-            let mut deque = self.responses.lock().unwrap();
+            let mut deque = self.responses.lock();
             if deque.is_empty() {
                 "ERROR: no responses left in SequenceProvider".to_string()
             } else {
@@ -1866,7 +1866,7 @@ async fn test_trio_offline_e2e_respond() {
         "router preflight should have fired"
     );
     assert_eq!(
-        metrics.router_action.lock().unwrap().as_deref(),
+        metrics.router_action.lock().as_deref(),
         Some("respond"),
         "router_action should be 'respond'"
     );
@@ -1954,7 +1954,7 @@ async fn test_trio_offline_e2e_specialist_dispatch() {
     let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
 
     assert_eq!(
-        metrics.router_action.lock().unwrap().as_deref(),
+        metrics.router_action.lock().as_deref(),
         Some("specialist"),
         "router_action should be 'specialist'"
     );
@@ -2045,7 +2045,6 @@ async fn test_trio_offline_e2e_circuit_breaker_cascade() {
     let cb_correct_key_available = counters
         .trio_circuit_breaker
         .lock()
-        .unwrap()
         .is_available("router:offline-router");
     eprintln!(
         "CB 'router:offline-router' available after 4 turns: {}",
@@ -2060,7 +2059,6 @@ async fn test_trio_offline_e2e_circuit_breaker_cascade() {
     let cb_legacy_key_available = counters
         .trio_circuit_breaker
         .lock()
-        .unwrap()
         .is_available("trio_router");
     assert!(
         cb_legacy_key_available,
@@ -2311,7 +2309,7 @@ async fn test_trio_offline_e2e_parse_fallback_lenient() {
     let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
 
     assert_eq!(
-        metrics.router_action.lock().unwrap().as_deref(),
+        metrics.router_action.lock().as_deref(),
         Some("specialist"),
         "router_action should be 'specialist' after lenient parse"
     );
