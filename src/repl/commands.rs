@@ -1419,11 +1419,11 @@ impl ReplContext {
                     tui::RESET,
                     role,
                     if has_tc {
-                        "[+tool_calls]"
+                        "[+tool_calls]".to_string()
                     } else if tc_id.is_some() {
-                        &format!("[tc:{}]", tc_id.unwrap())
+                        format!("[tc:{}]", tc_id.unwrap())
                     } else {
-                        ""
+                        String::new()
                     }
                 );
                 if !content.is_empty() {
@@ -2858,7 +2858,7 @@ impl ReplContext {
                 println!("\n  Generating adapters...");
                 let server_url = &self.config.agents.defaults.local_api_base;
                 let workspace = self.core_handle.swappable().workspace.clone();
-                match lora_bridge::regenerate_adapters(&workspace, server_url, 0.5).await {
+                match lora_bridge::regenerate_adapters(&workspace, server_url, 0.5, &self.config.agents.defaults.local_model).await {
                     Ok(r) => {
                         println!("  D2L: {} ({} chars input)",
                             r.d2l_path.as_ref().map(|p| p.display().to_string()).unwrap_or("skipped".into()),

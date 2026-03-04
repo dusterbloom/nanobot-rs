@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
+use crate::agent::embedder::{self, Embedding, EMBEDDING_DIM};
+
 /// Persistent knowledge store backed by SQLite + FTS5.
 ///
 /// Stores chunked documents with full-text search (BM25 ranking).
@@ -53,6 +55,11 @@ impl KnowledgeStore {
                 .context("Failed to create knowledge store directory")?;
         }
 
+        // Register sqlite-vec extension before opening the connection so that
+        // the vec0 module is available when we create the virtual table.
+        #[cfg(feature = "semantic")]
+        Self::register_vec_extension();
+
         let conn = Connection::open(db_path).context("Failed to open knowledge database")?;
 
         // Enable WAL mode and mmap for performance
@@ -102,10 +109,43 @@ impl KnowledgeStore {
         )
         .context("Failed to initialize knowledge store schema")?;
 
+        // Initialize vector search schema when the semantic feature is enabled.
+        #[cfg(feature = "semantic")]
+        Self::init_vec_schema(&conn)?;
+
         Ok(Self {
             conn,
             db_path: db_path.to_path_buf(),
         })
+    }
+
+    /// Register the sqlite-vec extension globally so vec0 is available on new connections.
+    #[cfg(feature = "semantic")]
+    fn register_vec_extension() {
+        use std::sync::Once;
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        });
+    }
+
+    /// Create the vec0 virtual table for cosine KNN search.
+    #[cfg(feature = "semantic")]
+    fn init_vec_schema(conn: &Connection) -> Result<()> {
+        // chunk_id maps to chunks.id for joining back to text content.
+        conn.execute_batch(&format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+                chunk_id INTEGER PRIMARY KEY,
+                embedding float[{EMBEDDING_DIM}] distance_metric=cosine
+            );
+            "#,
+        ))
+        .context("Failed to initialize vector search schema")?;
+
+        Ok(())
     }
 
     /// Open the knowledge database at the default location (~/.nanobot/knowledge.db).
@@ -188,6 +228,161 @@ impl KnowledgeStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(hits)
+    }
+
+    /// Ingest a document with embeddings (requires `semantic` feature).
+    ///
+    /// Same as `ingest()` but also computes and stores vector embeddings for
+    /// each chunk, enabling hybrid BM25+cosine search via `hybrid_search()`.
+    #[cfg(feature = "semantic")]
+    pub fn ingest_with_embeddings(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        text: &str,
+        chunk_size: usize,
+        overlap: usize,
+    ) -> Result<IngestResult> {
+        // First do the normal text ingest (FTS5).
+        let result = self.ingest(name, path, text, chunk_size, overlap)?;
+
+        // Now compute embeddings for all chunks and insert into chunks_vec.
+        // Collect chunk ids + texts.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content FROM chunks WHERE source_id = ?1 ORDER BY chunk_idx",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![result.source_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if rows.is_empty() {
+            return Ok(result);
+        }
+
+        // Batch embed all chunk texts.
+        let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
+        let embeddings = embedder::embed_batch(&texts)
+            .context("Failed to embed chunks")?;
+
+        // Insert into vec0 table.
+        let mut insert = self.conn.prepare(
+            "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?1, ?2)",
+        )?;
+        for ((chunk_id, _), emb) in rows.iter().zip(embeddings.iter()) {
+            let bytes = vec_to_bytes(emb);
+            insert.execute(params![chunk_id, bytes])?;
+        }
+
+        Ok(result)
+    }
+
+    /// Hybrid search: fuses BM25 (FTS5) and cosine (vec0) results using
+    /// Reciprocal Rank Fusion (RRF). Returns the top `limit` results.
+    ///
+    /// When the `semantic` feature is disabled, falls back to plain BM25.
+    pub fn hybrid_search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        // Always get BM25 results.
+        let bm25_hits = self.search(query, limit * 2)?;
+
+        // Try to get vector results; fall back to BM25-only if unavailable.
+        let vec_hits = self.vector_search(query, limit * 2).unwrap_or_default();
+
+        if vec_hits.is_empty() {
+            // No vector results — just return BM25.
+            return Ok(bm25_hits.into_iter().take(limit).collect());
+        }
+
+        // RRF fusion: score = sum(1 / (k + rank)) across both lists.
+        // k=60 is the standard RRF constant.
+        const K: f64 = 60.0;
+        let mut scores: std::collections::HashMap<(String, i64), (f64, String)> =
+            std::collections::HashMap::new();
+
+        for (rank, hit) in bm25_hits.iter().enumerate() {
+            let key = (hit.source_name.clone(), hit.chunk_idx);
+            let entry = scores.entry(key).or_insert((0.0, hit.snippet.clone()));
+            entry.0 += 1.0 / (K + rank as f64 + 1.0);
+        }
+
+        for (rank, hit) in vec_hits.iter().enumerate() {
+            let key = (hit.source_name.clone(), hit.chunk_idx);
+            let entry = scores.entry(key).or_insert((0.0, hit.snippet.clone()));
+            entry.0 += 1.0 / (K + rank as f64 + 1.0);
+        }
+
+        // Sort by fused score descending.
+        let mut fused: Vec<SearchHit> = scores
+            .into_iter()
+            .map(|((source_name, chunk_idx), (score, snippet))| SearchHit {
+                source_name,
+                chunk_idx,
+                snippet,
+                rank: -score, // negate so lower = better (consistent with BM25)
+            })
+            .collect();
+        fused.sort_by(|a, b| a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal));
+        fused.truncate(limit);
+
+        Ok(fused)
+    }
+
+    /// Vector-only search using sqlite-vec cosine KNN.
+    /// Returns empty vec if semantic feature is disabled or no vectors exist.
+    fn vector_search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        #[cfg(not(feature = "semantic"))]
+        {
+            let _ = (query, limit);
+            return Ok(vec![]);
+        }
+
+        #[cfg(feature = "semantic")]
+        {
+            // Check if chunks_vec table exists (may not if DB was created without semantic).
+            let has_vec: bool = self.conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='chunks_vec'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_vec {
+                return Ok(vec![]);
+            }
+
+            // Embed the query.
+            let query_vec = embedder::embed_one(query)
+                .context("Failed to embed query")?;
+            let query_bytes = vec_to_bytes(&query_vec);
+
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT
+                    s.name,
+                    c.chunk_idx,
+                    substr(c.content, 1, 200) as snippet,
+                    v.distance
+                FROM chunks_vec v
+                JOIN chunks c ON v.chunk_id = c.id
+                JOIN sources s ON c.source_id = s.id
+                WHERE v.embedding MATCH ?1
+                    AND k = ?2
+                ORDER BY v.distance
+                "#,
+            )?;
+
+            let hits = stmt
+                .query_map(params![query_bytes, limit as i64], |row| {
+                    Ok(SearchHit {
+                        source_name: row.get(0)?,
+                        chunk_idx: row.get(1)?,
+                        snippet: row.get(2)?,
+                        rank: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(hits)
+        }
     }
 
     /// Get a specific chunk by source name and chunk index.
@@ -274,6 +469,12 @@ impl KnowledgeStore {
             .optional()?;
 
         if let Some(id) = source_id {
+            // Delete vector entries if table exists.
+            let _ = self.conn.execute(
+                "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id = ?1)",
+                params![id],
+            );
+
             // Delete chunks (triggers will handle FTS cleanup)
             self.conn
                 .execute("DELETE FROM chunks WHERE source_id = ?1", params![id])?;
@@ -315,6 +516,11 @@ impl KnowledgeStore {
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
+}
+
+/// Convert an f32 embedding vector to raw bytes for sqlite-vec.
+fn vec_to_bytes(vec: &[f32]) -> Vec<u8> {
+    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// Split text into overlapping chunks, avoiding mid-line splits.
@@ -677,5 +883,84 @@ mod tests {
     fn test_chunk_text_empty() {
         let chunks = chunk_text("", 100, 10);
         assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn test_vec_to_bytes_roundtrip() {
+        let original = vec![1.0f32, -2.5, 0.0, 3.14159];
+        let bytes = vec_to_bytes(&original);
+        assert_eq!(bytes.len(), original.len() * 4);
+        // Roundtrip
+        let recovered: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_hybrid_search_bm25_fallback() {
+        // Without semantic feature, hybrid_search should fall back to BM25.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = KnowledgeStore::open(&db_path).unwrap();
+
+        store
+            .ingest("doc1", None, "Rust programming language systems", 4096, 256)
+            .unwrap();
+        store
+            .ingest("doc2", None, "Python scripting language interpreted", 4096, 256)
+            .unwrap();
+
+        let results = store.hybrid_search("Rust", 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_name, "doc1");
+    }
+
+    #[test]
+    fn test_hybrid_search_empty_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = KnowledgeStore::open(&db_path).unwrap();
+
+        let results = store.hybrid_search("anything", 10).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_hybrid_search_respects_limit() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = KnowledgeStore::open(&db_path).unwrap();
+
+        for i in 0..10 {
+            store
+                .ingest(
+                    &format!("doc{}", i),
+                    None,
+                    &format!("This document number {} discusses Rust systems programming", i),
+                    4096,
+                    256,
+                )
+                .unwrap();
+        }
+
+        let results = store.hybrid_search("Rust", 3).unwrap();
+        assert!(results.len() <= 3);
+    }
+
+    #[test]
+    fn test_vector_search_returns_empty_without_vec_table() {
+        // Without semantic feature, vector_search should return empty.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = KnowledgeStore::open(&db_path).unwrap();
+
+        store
+            .ingest("doc1", None, "test content", 4096, 256)
+            .unwrap();
+
+        let results = store.vector_search("test", 5).unwrap();
+        assert!(results.is_empty());
     }
 }

@@ -1343,6 +1343,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             5,
             "brave".to_string(),
             "http://localhost:8888".to_string(),
+            None,
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();

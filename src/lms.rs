@@ -168,14 +168,23 @@ pub(crate) async fn load_model(
     context_length: Option<usize>,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    load_model_at(&rest_base(host, port), model, context_length).await
+}
+
+/// Like `load_model` but accepts a full base URL (e.g. `"http://192.168.1.22:1234"`).
+pub(crate) async fn load_model_at(
+    base_url: &str,
+    model: &str,
+    context_length: Option<usize>,
+) -> Result<(), String> {
     // Check if already loaded with matching context
-    let models = list_models_full(host, port).await;
+    let models = list_models_full_at(base_url).await;
     if should_skip_load(&models, model, context_length) {
         tracing::debug!("lms skip load: model={} already loaded with matching context", model);
         return Ok(());
     }
 
-    post_load_model(host, port, model, context_length, timeout_secs).await
+    post_load_model_at(base_url, model, context_length).await
 }
 
 /// Reload a model with a specific context length.
@@ -193,13 +202,23 @@ pub(crate) async fn reload_model_with_context(
     load_timeout_secs: u64,
     unload_timeout_secs: u64,
 ) -> Result<(), String> {
-    let models = list_models_full(host, port).await;
+    reload_model_with_context_at(&rest_base(host, port), model, context_length, unload_timeout_secs).await
+}
+
+/// Like `reload_model_with_context` but accepts a full base URL.
+pub(crate) async fn reload_model_with_context_at(
+    base_url: &str,
+    model: &str,
+    context_length: usize,
+    unload_timeout_secs: u64,
+) -> Result<(), String> {
+    let models = list_models_full_at(base_url).await;
     let loaded_keys: Vec<String> = models.iter()
         .filter(|m| m.loaded && model_matches(&m.key, model))
         .map(|m| m.key.clone())
         .collect();
     for loaded_model in &loaded_keys {
-        if let Err(e) = unload_model(host, port, loaded_model, unload_timeout_secs).await {
+        if let Err(e) = unload_model_at(base_url, loaded_model).await {
             tracing::warn!(
                 "lms unload before reload failed: model={} loaded_model={} error={}",
                 model,
@@ -209,7 +228,7 @@ pub(crate) async fn reload_model_with_context(
         }
     }
 
-    post_load_model(host, port, model, Some(context_length), load_timeout_secs).await
+    post_load_model_at(base_url, model, Some(context_length)).await
 }
 
 pub(crate) fn model_matches(loaded: &str, model: &str) -> bool {
@@ -236,8 +255,16 @@ async fn post_load_model(
     context_length: Option<usize>,
     timeout_secs: u64,
 ) -> Result<(), String> {
+    post_load_model_at(&rest_base(host, port), model, context_length).await
+}
 
-    let url = format!("{}/api/v1/models/load", rest_base(host, port));
+async fn post_load_model_at(
+    base_url: &str,
+    model: &str,
+    context_length: Option<usize>,
+) -> Result<(), String> {
+
+    let url = format!("{}/api/v1/models/load", base_url);
     let mut body = serde_json::json!({ "model": model });
     if let Some(ctx) = context_length {
         body["context_length"] = serde_json::json!(ctx);
@@ -249,7 +276,7 @@ async fn post_load_model(
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| format!("HTTP load request failed: {}", e))?;
@@ -274,14 +301,19 @@ async fn post_load_model(
 /// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
 /// default resolved via `api_host()`.
 pub(crate) async fn unload_model(host: &str, port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
-    let url = format!("{}/api/v1/models/unload", rest_base(host, port));
+    unload_model_at(&rest_base(host, port), model).await
+}
+
+/// Like `unload_model` but accepts a full base URL.
+pub(crate) async fn unload_model_at(base_url: &str, model: &str) -> Result<(), String> {
+    let url = format!("{}/api/v1/models/unload", base_url);
     let body = serde_json::json!({ "identifier": model });
 
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
         .map_err(|e| format!("HTTP unload request failed: {}", e))?;
@@ -318,7 +350,11 @@ pub(crate) struct ModelInfo {
 
 /// List all models via `GET /api/v1/models`, returning full info.
 async fn list_models_full(host: &str, port: u16) -> Vec<ModelInfo> {
-    let url = format!("{}/api/v1/models", rest_base(host, port));
+    list_models_full_at(&rest_base(host, port)).await
+}
+
+async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
+    let url = format!("{}/api/v1/models", base_url);
     let resp = match reqwest::get(&url).await {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),

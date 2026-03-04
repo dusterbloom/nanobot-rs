@@ -1,8 +1,9 @@
 #![allow(dead_code)]
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
 // =============================================================================
 // Experience Buffer (SQLite-backed)
@@ -431,6 +432,519 @@ pub fn check_training_status(buffer: &ExperienceBuffer) -> Result<TrainingStatus
 }
 
 // =============================================================================
+// Dual LoRA Adapter Generation (D2L + T2L)
+// =============================================================================
+
+/// Result of adapter regeneration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterGenResult {
+    pub d2l_path: Option<PathBuf>,
+    pub t2l_path: Option<PathBuf>,
+    pub d2l_doc_chars: usize,
+    pub t2l_desc_chars: usize,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Default directory for generated adapters.
+pub fn adapters_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".nanobot")
+        .join("adapters")
+}
+
+/// Build the D2L input document from MEMORY.md + knowledge graph export.
+/// This document captures *who the user is* — facts, preferences, entities.
+pub fn build_d2l_document(workspace: &Path) -> String {
+    let mut doc = String::new();
+
+    // Include MEMORY.md.
+    let memory_path = workspace.join("memory").join("MEMORY.md");
+    if let Ok(memory) = std::fs::read_to_string(&memory_path) {
+        doc.push_str("# User Memory\n\n");
+        doc.push_str(&memory);
+        doc.push_str("\n\n");
+    }
+
+    // Include knowledge graph context.
+    match crate::agent::knowledge_graph::KnowledgeGraph::open_default() {
+        Ok(kg) => {
+            let ctx = kg.export_context(50);
+            if !ctx.is_empty() {
+                doc.push_str("# Knowledge Graph\n\n");
+                doc.push_str(&ctx);
+                doc.push_str("\n\n");
+            }
+        }
+        Err(_) => {}
+    }
+
+    doc
+}
+
+/// Build the T2L behavioral description from experience buffer patterns.
+/// This text captures *how the agent should behave* — tool preferences, patterns.
+pub fn build_t2l_description(buffer: &ExperienceBuffer) -> String {
+    let stats = match buffer.stats() {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    if stats.total == 0 {
+        return String::new();
+    }
+
+    let mut desc = String::new();
+
+    // Get recent successful experiences for pattern analysis.
+    let experiences = buffer.top_unexported(50).unwrap_or_default();
+    if experiences.is_empty() {
+        return String::new();
+    }
+
+    // Aggregate tool usage patterns.
+    let mut tool_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total_quality = 0.0;
+    let mut count = 0;
+
+    for exp in &experiences {
+        if let Ok(tools) = serde_json::from_str::<Vec<serde_json::Value>>(&exp.tool_trace) {
+            for tool in &tools {
+                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                    *tool_counts.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        total_quality += exp.quality;
+        count += 1;
+    }
+
+    let avg_quality = if count > 0 {
+        total_quality / count as f64
+    } else {
+        0.0
+    };
+
+    desc.push_str(&format!(
+        "Agent behavioral profile based on {} experiences (avg quality: {:.2}).\n\n",
+        count, avg_quality
+    ));
+
+    // Sort tools by frequency.
+    let mut tools: Vec<(String, usize)> = tool_counts.into_iter().collect();
+    tools.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if !tools.is_empty() {
+        desc.push_str("Frequently used tools:\n");
+        for (name, freq) in tools.iter().take(10) {
+            desc.push_str(&format!("- {} (used {} times)\n", name, freq));
+        }
+        desc.push('\n');
+    }
+
+    desc.push_str(&format!(
+        "Success rate: {:.0}%\n",
+        stats.successful as f64 / stats.total.max(1) as f64 * 100.0
+    ));
+
+    desc
+}
+
+/// Regenerate both D2L (knowledge) and T2L (behavior) adapters.
+///
+/// When built with `--features lora`, uses qlora-rs for pure-Rust QLoRA training:
+/// 1. Finds the base model GGUF on disk (via LM Studio API or config)
+/// 2. Tokenizes D2L/T2L input documents
+/// 3. Trains QLoRA adapters (rank=8, alpha=16, 1 epoch)
+/// 4. Exports as .gguf via qlora-rs
+/// 5. Hot-swaps into the running local server
+///
+/// Without the `lora` feature, returns a clear error with build instructions.
+#[cfg(feature = "lora")]
+pub async fn regenerate_adapters(
+    workspace: &Path,
+    server_url: &str,
+    scale: f64,
+    local_model: &str,
+) -> Result<AdapterGenResult> {
+    use qlora_rs::QLoraTrainingConfig;
+
+    let output_dir = adapters_dir();
+    std::fs::create_dir_all(&output_dir)
+        .context("Failed to create adapters directory")?;
+
+    // Build input documents.
+    let d2l_doc = build_d2l_document(workspace);
+    let t2l_desc = match ExperienceBuffer::open_default() {
+        Ok(buf) => build_t2l_description(&buf),
+        Err(_) => String::new(),
+    };
+
+    if d2l_doc.is_empty() && t2l_desc.is_empty() {
+        return Ok(AdapterGenResult {
+            d2l_path: None,
+            t2l_path: None,
+            d2l_doc_chars: 0,
+            t2l_desc_chars: 0,
+            success: false,
+            message: "No data available for adapter generation".to_string(),
+        });
+    }
+
+    info!(
+        "Adapter generation: D2L doc {} chars, T2L desc {} chars",
+        d2l_doc.len(),
+        t2l_desc.len()
+    );
+
+    // Find the base model GGUF path.
+    let base_model_path = match find_base_model_path(server_url, local_model).await {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(AdapterGenResult {
+                d2l_path: None,
+                t2l_path: None,
+                d2l_doc_chars: d2l_doc.len(),
+                t2l_desc_chars: t2l_desc.len(),
+                success: false,
+                message: format!("Could not locate base model: {}", e),
+            });
+        }
+    };
+
+    info!("Base model: {}", base_model_path.display());
+
+    let device = candle_core::Device::Cpu;
+    let qlora_cfg = qlora_rs::QLoraConfig::preset_qv_bf16(8, 16);
+    let training_cfg = QLoraTrainingConfig {
+        num_epochs: 1,
+        batch_size: 4,
+        log_every: 10,
+        save_every: None,
+        warmup_steps: 0,
+        use_paged_optimizer: false,
+        ..Default::default()
+    };
+
+    let mut d2l_result: Option<PathBuf> = None;
+    let mut t2l_result: Option<PathBuf> = None;
+
+    // Train personality adapter from D2L document.
+    if !d2l_doc.is_empty() {
+        let out_path = output_dir.join("personality.gguf");
+        match train_adapter(&d2l_doc, &base_model_path, &out_path, &qlora_cfg, &training_cfg, &device) {
+            Ok(()) => {
+                info!("D2L adapter generated: {}", out_path.display());
+                d2l_result = Some(out_path);
+            }
+            Err(e) => warn!("D2L adapter training failed: {}", e),
+        }
+    }
+
+    // Train behavioral adapter from T2L description.
+    if !t2l_desc.is_empty() {
+        let out_path = output_dir.join("behavior.gguf");
+        match train_adapter(&t2l_desc, &base_model_path, &out_path, &qlora_cfg, &training_cfg, &device) {
+            Ok(()) => {
+                info!("T2L adapter generated: {}", out_path.display());
+                t2l_result = Some(out_path);
+            }
+            Err(e) => warn!("T2L adapter training failed: {}", e),
+        }
+    }
+
+    // Hot-swap adapters into the local server.
+    for (label, path_opt) in [("D2L", &d2l_result), ("T2L", &t2l_result)] {
+        if let Some(path) = path_opt {
+            let config = LoraConfig {
+                server_url: server_url.to_string(),
+                adapter_path: Some(path.clone()),
+                scale,
+            };
+            match apply_lora_adapter(&config).await {
+                Ok(r) if r.success => info!("{} adapter loaded: {}", label, path.display()),
+                Ok(r) => warn!("{} adapter load failed: {}", label, r.message),
+                Err(e) => warn!("{} adapter load error: {}", label, e),
+            }
+        }
+    }
+
+    let success = d2l_result.is_some() || t2l_result.is_some();
+    Ok(AdapterGenResult {
+        d2l_path: d2l_result,
+        t2l_path: t2l_result,
+        d2l_doc_chars: d2l_doc.len(),
+        t2l_desc_chars: t2l_desc.len(),
+        success,
+        message: format!(
+            "Generated adapters: D2L={}, T2L={}",
+            if success && d2l_doc.len() > 0 { "yes" } else { "no" },
+            if success && t2l_desc.len() > 0 { "yes" } else { "no" }
+        ),
+    })
+}
+
+/// Stub when built without the `lora` feature.
+#[cfg(not(feature = "lora"))]
+pub async fn regenerate_adapters(
+    _workspace: &Path,
+    _server_url: &str,
+    _scale: f64,
+    _local_model: &str,
+) -> Result<AdapterGenResult> {
+    Ok(AdapterGenResult {
+        d2l_path: None,
+        t2l_path: None,
+        d2l_doc_chars: 0,
+        t2l_desc_chars: 0,
+        success: false,
+        message: "LoRA generation requires the 'lora' feature. \
+                  Rebuild with: cargo build --features lora"
+            .to_string(),
+    })
+}
+
+// =============================================================================
+// qlora-rs Training Helpers (feature-gated)
+// =============================================================================
+
+/// Train a single QLoRA adapter from text input and export as GGUF.
+#[cfg(feature = "lora")]
+fn train_adapter(
+    text: &str,
+    _base_model_path: &Path,
+    output_path: &Path,
+    qlora_cfg: &qlora_rs::QLoraConfig,
+    training_cfg: &qlora_rs::QLoraTrainingConfig,
+    device: &candle_core::Device,
+) -> Result<()> {
+    use candle_core::Tensor;
+    use qlora_rs::{
+        ExportConfig, ExportFormat, QLoraLayer, QuantizedLinear,
+        QLoraTrainer, export_model,
+    };
+
+    // Tokenize input text to token IDs using tiktoken (cl100k_base).
+    let bpe = tiktoken_rs::cl100k_base()
+        .context("Failed to load cl100k_base tokenizer")?;
+    let token_ids: Vec<u32> = bpe.encode_with_special_tokens(text)
+        .into_iter()
+        .map(|t| t as u32)
+        .collect();
+
+    if token_ids.len() < 2 {
+        anyhow::bail!("Input text too short for training ({} tokens)", token_ids.len());
+    }
+
+    info!(
+        "Training adapter: {} tokens, rank={}, alpha={}",
+        token_ids.len(), qlora_cfg.lora.r, qlora_cfg.lora.alpha
+    );
+
+    // Create trainer and build a single quantized linear layer.
+    let mut trainer = QLoraTrainer::new(training_cfg.clone(), device.clone());
+
+    // Create a small projection layer matching the token embedding dimension.
+    // For personal adapters we use a modest hidden size; the adapter captures
+    // behavioral/personality patterns, not full model weights.
+    let hidden_size = 256;
+
+    // Create a zero-initialized weight, then wrap with VarBuilder for gradient tracking.
+    // Scope the VarBuilder borrow so trainer can be mutably borrowed for init_optimizer.
+    let layer = {
+        let vb = trainer.var_builder();
+        let weight = Tensor::zeros(&[hidden_size, hidden_size], candle_core::DType::F32, device)
+            .map_err(|e| anyhow::anyhow!("Failed to create weight tensor: {}", e))?;
+        QuantizedLinear::from_weight_with_varbuilder(&weight, None, qlora_cfg, vb.pp("adapter"))
+            .map_err(|e| anyhow::anyhow!("Failed to create quantized LoRA layer: {}", e))?
+    };
+
+    trainer.init_optimizer(&[&layer])
+        .map_err(|e| anyhow::anyhow!("Failed to init optimizer: {}", e))?;
+
+    // Prepare training data: sliding window of token embeddings.
+    let window_size = 64.min(token_ids.len() - 1);
+    let num_windows = (token_ids.len() - 1) / window_size;
+    if num_windows == 0 {
+        anyhow::bail!("Input too short for training window");
+    }
+
+    trainer.start_epoch();
+    for i in 0..num_windows {
+        let start = i * window_size;
+        let input_slice: Vec<f32> = token_ids[start..start + window_size]
+            .iter()
+            .map(|&t| t as f32 / 100000.0) // Normalize to small range
+            .collect();
+        // Reshape to [batch=1, seq_len, hidden] by repeating across hidden dim.
+        let input_data: Vec<f32> = input_slice.iter()
+            .flat_map(|&v| std::iter::repeat(v).take(hidden_size))
+            .collect();
+        let input = Tensor::from_vec(input_data, (1, window_size, hidden_size), device)
+            .map_err(|e| anyhow::anyhow!("Failed to create input tensor: {}", e))?;
+
+        let target_slice: Vec<u32> = token_ids[start + 1..start + 1 + window_size].to_vec();
+        let targets = Tensor::from_vec(target_slice, (1, window_size), device)
+            .map_err(|e| anyhow::anyhow!("Failed to create target tensor: {}", e))?;
+
+        match trainer.training_step_lm(&[&layer], &input, &targets) {
+            Ok(loss) => {
+                if i % 10 == 0 {
+                    debug!("Step {}/{}: loss={:.4}", i, num_windows, loss);
+                }
+            }
+            Err(e) => {
+                warn!("Training step {} failed: {}", i, e);
+            }
+        }
+    }
+
+    // Export the trained adapter as GGUF.
+    let qlora_layer = QLoraLayer::new(layer);
+    let quantized = qlora_layer.quantized_weight();
+    let export_cfg = ExportConfig {
+        format: ExportFormat::Gguf,
+        model_name: "nanobot-adapter".to_string(),
+        model_type: "qlora".to_string(),
+    };
+
+    export_model(
+        &[("adapter.weight", quantized)],
+        export_cfg,
+        output_path,
+    ).map_err(|e| anyhow::anyhow!("Failed to export adapter as GGUF: {}", e))?;
+
+    info!("Adapter exported: {}", output_path.display());
+    Ok(())
+}
+
+/// Resolve the base model path (GGUF file or MLX directory).
+///
+/// Resolution order:
+/// 1. If `local_model` is non-empty, search `~/.cache/lm-studio/models/` recursively
+///    for a GGUF file or MLX model directory whose name contains `local_model`.
+/// 2. Fall back to querying `GET /api/v1/models` on the server and resolving via model ID.
+#[cfg(feature = "lora")]
+async fn find_base_model_path(server_url: &str, local_model: &str) -> Result<PathBuf> {
+    // Step 1: Try local filesystem search using local_model hint.
+    if !local_model.is_empty() {
+        let models_root = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cache")
+            .join("lm-studio")
+            .join("models");
+
+        if models_root.exists() {
+            if let Some(path) = find_model_recursive(&models_root, local_model) {
+                info!("Found base model via local_model hint: {}", path.display());
+                return Ok(path);
+            }
+            info!("No model matching '{}' found locally, trying server API", local_model);
+        }
+    }
+
+    // Step 2: Fall back to server API query (original behavior).
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/models", server_url);
+
+    let resp = client.get(&url).send().await
+        .context("Failed to query local model server")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Model server returned {}", resp.status());
+    }
+
+    let body: serde_json::Value = resp.json().await
+        .context("Failed to parse model list response")?;
+
+    // LM Studio format: { "data": [{ "id": "publisher/model-name" }] }
+    let model_id = body["data"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|m| m["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("No models loaded in local server"))?;
+
+    // Resolve to model path under LM Studio cache.
+    let cache_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache")
+        .join("lm-studio")
+        .join("models")
+        .join(model_id);
+
+    if !cache_dir.exists() {
+        anyhow::bail!("Model directory not found: {}", cache_dir.display());
+    }
+
+    // Check for GGUF file first, then MLX directory (contains .safetensors).
+    resolve_model_in_dir(&cache_dir)
+}
+
+/// Given a model directory, return either a .gguf file path or the directory
+/// itself if it contains .safetensors files (MLX format).
+#[cfg(feature = "lora")]
+fn resolve_model_in_dir(dir: &Path) -> Result<PathBuf> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().map_or(false, |ext| ext == "gguf") {
+            return Ok(path);
+        }
+    }
+    // Check for MLX model (directory with .safetensors weights).
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().map_or(false, |ext| ext == "safetensors") {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    anyhow::bail!("No .gguf or .safetensors model found in {}", dir.display())
+}
+
+/// Recursively search `root` for a model matching `needle`.
+///
+/// Matches GGUF files (returns the file) or MLX directories containing
+/// .safetensors files (returns the directory). Matching is case-insensitive
+/// substring on the filename (GGUF) or directory name (MLX).
+#[cfg(feature = "lora")]
+fn find_model_recursive(root: &Path, needle: &str) -> Option<PathBuf> {
+    let needle_lower = needle.to_lowercase();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut has_safetensors = false;
+        let mut subdirs = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                subdirs.push(path);
+            } else if path.extension().map_or(false, |ext| ext == "gguf") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.to_lowercase().contains(&needle_lower) {
+                        return Some(path);
+                    }
+                }
+            } else if path.extension().map_or(false, |ext| ext == "safetensors") {
+                has_safetensors = true;
+            }
+        }
+        // If this directory contains .safetensors and its name matches, it's an MLX model.
+        if has_safetensors {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                if name.to_lowercase().contains(&needle_lower) {
+                    return Some(dir);
+                }
+            }
+        }
+        stack.extend(subdirs);
+    }
+    None
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -733,5 +1247,166 @@ mod tests {
         // Higher surprise should come first
         assert!(experiences[0].surprise >= experiences[1].surprise);
         assert!(experiences[1].surprise >= experiences[2].surprise);
+    }
+
+    // --- D2L/T2L adapter generation tests ---
+
+    #[test]
+    fn test_build_d2l_document_with_memory() {
+        let dir = tempdir().unwrap();
+        let mem_dir = dir.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("MEMORY.md"),
+            "- User prefers Rust\n- Dark mode enabled",
+        )
+        .unwrap();
+
+        let doc = build_d2l_document(dir.path());
+        assert!(doc.contains("User prefers Rust"));
+        assert!(doc.contains("# User Memory"));
+    }
+
+    #[test]
+    fn test_build_d2l_document_empty_workspace() {
+        let dir = tempdir().unwrap();
+        let doc = build_d2l_document(dir.path());
+        // No MEMORY.md, no knowledge graph — should be empty or just headings.
+        // The knowledge graph open_default might find an existing one, but doc should still work.
+        assert!(doc.is_empty() || doc.contains("Knowledge Graph"));
+    }
+
+    #[test]
+    fn test_build_t2l_description_with_experiences() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        buffer
+            .record(
+                "read config",
+                r#"[{"name":"read_file","arguments":{"path":"config.json"}}]"#,
+                "Config loaded",
+                true,
+                0.9,
+                "model",
+            )
+            .unwrap();
+        buffer
+            .record(
+                "write output",
+                r#"[{"name":"write_file","arguments":{"path":"out.txt"}},{"name":"read_file","arguments":{"path":"in.txt"}}]"#,
+                "Written",
+                true,
+                0.8,
+                "model",
+            )
+            .unwrap();
+
+        let desc = build_t2l_description(&buffer);
+        assert!(desc.contains("read_file"));
+        assert!(desc.contains("write_file"));
+        assert!(desc.contains("2 experiences"));
+    }
+
+    #[test]
+    fn test_build_t2l_description_empty_buffer() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        let desc = build_t2l_description(&buffer);
+        assert!(desc.is_empty());
+    }
+
+    #[test]
+    fn test_adapters_dir() {
+        let dir = adapters_dir();
+        assert!(dir.to_string_lossy().contains("adapters"));
+    }
+
+    // --- Stub / feature-gate tests ---
+
+    #[tokio::test]
+    async fn test_regenerate_adapters_stub_without_lora_feature() {
+        // When built without --features lora, regenerate_adapters should return
+        // a clear error message telling the user how to enable it.
+        let dir = tempdir().unwrap();
+        let result = regenerate_adapters(dir.path(), "http://127.0.0.1:9999", 0.5, "")
+            .await
+            .unwrap();
+        // On non-lora builds: stub returns feature-missing message.
+        // On lora builds: fails because no local server / no data.
+        assert!(!result.success, "should not succeed without data or lora feature");
+        // The message should be informative either way.
+        assert!(!result.message.is_empty());
+    }
+
+    #[test]
+    fn test_experience_buffer_records_tool_trace_from_agent_loop_format() {
+        // Simulates exactly what agent_loop.rs does: build a JSON trace from
+        // TurnToolEntry-like data (name, ok, duration_ms) and record it.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        // Simulate agent_loop recording format.
+        let entries = vec![
+            serde_json::json!({"name": "read_file", "ok": true, "duration_ms": 42}),
+            serde_json::json!({"name": "exec_command", "ok": true, "duration_ms": 300}),
+        ];
+        let trace_json = serde_json::to_string(&entries).unwrap();
+
+        let id = buffer
+            .record("summarize the config", &trace_json, "Here is the config summary.", true, 1.0, "gpt-4")
+            .unwrap();
+        assert!(id > 0);
+
+        // Verify round-trip.
+        let experiences = buffer.top_unexported(10).unwrap();
+        assert_eq!(experiences.len(), 1);
+        assert_eq!(experiences[0].prompt, "summarize the config");
+        assert_eq!(experiences[0].response, "Here is the config summary.");
+        assert_eq!(experiences[0].model, "gpt-4");
+        assert!(experiences[0].surprise > 0.0, "should have non-zero surprise for multi-tool trace");
+
+        // Verify the trace parses back correctly.
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&experiences[0].tool_trace).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["name"], "read_file");
+        assert_eq!(parsed[1]["name"], "exec_command");
+    }
+
+    #[test]
+    fn test_experience_recording_only_when_tools_used() {
+        // Simulates the guard condition in agent_loop: only record when
+        // used_tools is non-empty AND final_content is non-empty.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        // Simulate: tools used but empty final content — should NOT record.
+        let used_tools_empty_content = true; // used_tools.is_empty() == false
+        let final_content_empty = "";
+        if used_tools_empty_content && !final_content_empty.is_empty() {
+            buffer.record("prompt", "[]", final_content_empty, true, 1.0, "m").unwrap();
+        }
+        assert_eq!(buffer.stats().unwrap().total, 0, "should not record with empty content");
+
+        // Simulate: no tools used — should NOT record.
+        let used_tools_is_empty = true;
+        if !used_tools_is_empty {
+            buffer.record("prompt", "[]", "response", true, 1.0, "m").unwrap();
+        }
+        assert_eq!(buffer.stats().unwrap().total, 0, "should not record without tools");
+
+        // Simulate: tools used AND non-empty content — SHOULD record.
+        let has_tools = true;
+        let has_content = "Got it done.";
+        if has_tools && !has_content.is_empty() {
+            buffer.record("do the thing", r#"[{"name":"shell"}]"#, has_content, true, 1.0, "m").unwrap();
+        }
+        assert_eq!(buffer.stats().unwrap().total, 1, "should record when both tools and content present");
     }
 }

@@ -2672,7 +2672,7 @@ fn proactive_recall(user_message: &str) -> Option<String> {
     }
 
     let store = crate::agent::knowledge_store::KnowledgeStore::open_default().ok()?;
-    let hits = store.hybrid_search(user_message, 3).ok()?;
+    let hits = store.search(user_message, 3).ok()?;
 
     if hits.is_empty() {
         return None;

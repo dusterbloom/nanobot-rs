@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::agent::knowledge_store::KnowledgeStore;
 
 /// A single indexed session ready to be written as SESSION_*.md.
 #[derive(Debug)]
@@ -239,6 +241,9 @@ pub fn index_sessions(
             continue;
         }
 
+        // Ingest into knowledge store for hybrid search.
+        ingest_session_to_knowledge_store(&md_filename, &md_content);
+
         indexed += 1;
     }
 
@@ -258,6 +263,42 @@ fn extract_session_key_from_content(content: &str, filename: &str) -> String {
     }
     // Fallback: derive from filename.
     session_key_from_filename(filename)
+}
+
+/// Ingest a session document into the knowledge store for hybrid search.
+/// Uses `ingest_with_embeddings` when the semantic feature is enabled,
+/// falls back to text-only `ingest` otherwise. Errors are logged but not fatal.
+fn ingest_session_to_knowledge_store(source_name: &str, content: &str) {
+    let store = match KnowledgeStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Cannot open knowledge store for session ingestion: {}", e);
+            return;
+        }
+    };
+
+    // Use embeddings when available, fall back to text-only.
+    #[cfg(feature = "semantic")]
+    {
+        match store.ingest_with_embeddings(source_name, None, content, 512, 64) {
+            Ok(r) => debug!(
+                "Ingested {} into knowledge store ({} chunks, with embeddings)",
+                source_name, r.chunks_created
+            ),
+            Err(e) => warn!("Failed to ingest {} with embeddings: {}", source_name, e),
+        }
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    {
+        match store.ingest(source_name, None, content, 512, 64) {
+            Ok(r) => debug!(
+                "Ingested {} into knowledge store ({} chunks)",
+                source_name, r.chunks_created
+            ),
+            Err(e) => warn!("Failed to ingest {}: {}", source_name, e),
+        }
+    }
 }
 
 // ============================================================================
@@ -506,5 +547,29 @@ mod tests {
         let (indexed, _skipped, errors) = index_sessions(fake, memory_dir.path());
         assert_eq!(indexed, 0);
         assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn test_index_ingests_into_knowledge_store() {
+        let sessions_dir = tempdir().unwrap();
+        let memory_dir = tempdir().unwrap();
+
+        let jsonl = r#"{"_type":"metadata","session_key":"cli:ks_test","created_at":"2026-02-01T00:00:00Z","updated_at":"2026-02-01T01:00:00Z"}
+{"role":"user","content":"How does async Rust handle cancellation?"}
+{"role":"assistant","content":"Rust uses drop guards and select! for structured concurrency."}"#;
+        fs::write(sessions_dir.path().join("cli_ks_test_2026-02-01.jsonl"), jsonl).unwrap();
+
+        let (indexed, _skipped, errors) =
+            index_sessions(sessions_dir.path(), memory_dir.path());
+        assert_eq!(indexed, 1);
+        assert_eq!(errors, 0);
+
+        // Verify the session was ingested into the knowledge store.
+        let store = KnowledgeStore::open_default().unwrap();
+        let hits = store.search("async cancellation", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "Knowledge store should have the session content"
+        );
     }
 }

@@ -231,6 +231,17 @@ impl ContextBuilder {
             parts.push(format!("# Memory\n\n## Long-term Memory\n{}", long_term));
         }
 
+        // Knowledge graph context (entity/relation summaries).
+        #[cfg(feature = "knowledge-graph")]
+        {
+            if let Ok(kg) = crate::agent::knowledge_graph::KnowledgeGraph::open_default() {
+                let kg_ctx = kg.export_context(30);
+                if !kg_ctx.is_empty() {
+                    parts.push(format!("## Knowledge Graph\n{}", kg_ctx));
+                }
+            }
+        }
+
         // Skills -- progressive loading (3-tier disclosure model).
         // Tier selection is driven by `skill_disclosure`:
         //   "compact" (default): one-line index in system prompt, full content on demand via read_skill
@@ -1541,6 +1552,29 @@ model_profiles:
         assert!(
             !dev_content.contains("Llama-specific"),
             "Non-matching model profile should NOT be present"
+        );
+    }
+
+    #[test]
+    fn test_developer_context_without_knowledge_graph_feature() {
+        // Without --features knowledge-graph, developer context should still
+        // build correctly and not contain any "Knowledge Graph" section.
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), "User prefers Rust").unwrap();
+
+        let cb = ContextBuilder::new(tmp.path());
+        let ctx = cb.build_developer_context(None, None);
+
+        assert!(ctx.contains("User prefers Rust"), "Memory should be present");
+
+        // Without the feature flag, no KG section should appear.
+        // (On knowledge-graph builds, it could appear if open_default finds data.)
+        #[cfg(not(feature = "knowledge-graph"))]
+        assert!(
+            !ctx.contains("Knowledge Graph"),
+            "KG section should not appear without knowledge-graph feature"
         );
     }
 }

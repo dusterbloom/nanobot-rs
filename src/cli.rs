@@ -1377,12 +1377,17 @@ pub(crate) fn check_api_key(config: &Config) {
 }
 
 /// Check if a model name refers to a Claude/Anthropic model.
+///
+/// Handles both bare names (`claude-opus-4-5`) and prefixed names
+/// (`anthropic/claude-opus-4-5`).
 fn is_claude_model(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.starts_with("claude")
-        || m.starts_with("opus")
-        || m.starts_with("sonnet")
-        || m.starts_with("haiku")
+    // Strip provider prefix if present (e.g. "anthropic/claude-opus-4-5" → "claude-opus-4-5")
+    let base = m.rsplit('/').next().unwrap_or(&m);
+    base.starts_with("claude")
+        || base.starts_with("opus")
+        || base.starts_with("sonnet")
+        || base.starts_with("haiku")
 }
 
 /// Check if Claude CLI OAuth credentials exist on disk.

@@ -18,15 +18,17 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
+use crate::agent::knowledge_graph::KnowledgeGraph;
 use crate::agent::memory::MemoryStore;
 use crate::agent::observer::ObservationStore;
 use crate::agent::working_memory::{SessionStatus, WorkingMemoryStore};
 use crate::providers::base::LLMProvider;
 
-/// Prompt sent to the memory model for facts-only reflection.
+/// Prompt sent to the memory model for facts + entity extraction.
 const REFLECTION_PROMPT: &str = "\
 You are distilling conversation sessions into permanent factual memory.
 
+## Part 1: Facts
 RULES:
 - Extract ONLY concrete, reusable facts
 - NO session logs, task status, or temporary context
@@ -43,13 +45,29 @@ Bad examples (DO NOT include):
 - Currently working on memory refactor
 - Last session discussed file handling
 
+## Part 2: Entities & Relations
+After the facts, write a section starting with `## Entities` that lists key entities and their relationships.
+Format each entity as: `- ENTITY_NAME (TYPE): brief description`
+Format each relation as: `- FROM -> LABEL -> TO`
+
+Types: person, tool, project, language, concept, service, file
+Labels: uses, prefers, created, knows, works-on, depends-on, related-to
+
+Example:
+## Entities
+- Alex (person): the user
+- Rust (language): preferred systems programming language
+- nanobot (project): AI assistant framework
+- Alex -> prefers -> Rust
+- nanobot -> depends-on -> Rust
+
 Current long-term memory:
 {current_memory}
 
 Recent session summaries:
 {observations}
 
-Write updated factual memory. Bullet points only. Be concise.";
+Write updated factual memory (bullet points), then ## Entities section. Be concise.";
 
 /// Background reflector that crystallizes sessions into MEMORY.md.
 pub struct Reflector {
@@ -160,9 +178,33 @@ impl Reflector {
             .content
             .ok_or_else(|| anyhow::anyhow!("Reflection returned no content"))?;
 
+        // Split response into facts and entities sections.
+        let (facts, entities_section) = split_entities_section(&updated_memory);
+
         // Write updated memory (atomic — single write call).
-        memory_store.write_long_term(&updated_memory);
+        memory_store.write_long_term(&facts);
         info!("Reflector: MEMORY.md updated");
+
+        // Extract entities/relations into knowledge graph.
+        if !entities_section.is_empty() {
+            match KnowledgeGraph::open_default() {
+                Ok(mut kg) => {
+                    let (ent_count, rel_count) =
+                        parse_entities_into_graph(&mut kg, &entities_section);
+                    if ent_count > 0 || rel_count > 0 {
+                        if let Err(e) = kg.save() {
+                            warn!("Failed to save knowledge graph: {}", e);
+                        } else {
+                            info!(
+                                "Reflector: updated knowledge graph ({} entities, {} relations)",
+                                ent_count, rel_count
+                            );
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to open knowledge graph: {}", e),
+            }
+        }
 
         // Archive processed working sessions.
         for session in &completed_sessions {
@@ -186,6 +228,56 @@ impl Reflector {
 
         Ok(())
     }
+}
+
+/// Split LLM response into facts (before `## Entities`) and entities section (after).
+fn split_entities_section(response: &str) -> (String, String) {
+    // Look for "## Entities" marker (case-insensitive).
+    let lower = response.to_lowercase();
+    if let Some(pos) = lower.find("## entities") {
+        let facts = response[..pos].trim().to_string();
+        let entities = response[pos..].to_string();
+        (facts, entities)
+    } else {
+        (response.to_string(), String::new())
+    }
+}
+
+/// Parse the entities section and upsert into the knowledge graph.
+/// Returns (entities_added, relations_added).
+fn parse_entities_into_graph(kg: &mut KnowledgeGraph, section: &str) -> (usize, usize) {
+    let mut ent_count = 0;
+    let mut rel_count = 0;
+
+    for line in section.lines() {
+        let line = line.trim().trim_start_matches('-').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Try relation format: "FROM -> LABEL -> TO"
+        let parts: Vec<&str> = line.split("->").map(|s| s.trim()).collect();
+        if parts.len() == 3 && !parts[0].is_empty() && !parts[2].is_empty() {
+            kg.add_relation(parts[0], parts[1], parts[2], "reflector");
+            rel_count += 1;
+            continue;
+        }
+
+        // Try entity format: "NAME (TYPE): description"
+        if let Some((name_type, desc)) = line.split_once(':') {
+            let desc = desc.trim();
+            if let Some((name, kind)) = name_type.split_once('(') {
+                let name = name.trim();
+                let kind = kind.trim().trim_end_matches(')').trim();
+                if !name.is_empty() && !kind.is_empty() {
+                    kg.upsert_entity(name, kind, desc);
+                    ent_count += 1;
+                }
+            }
+        }
+    }
+
+    (ent_count, rel_count)
 }
 
 #[cfg(test)]
@@ -404,5 +496,61 @@ mod tests {
             2,
             "completed sessions should be preserved on failure"
         );
+    }
+
+    // --- Entity extraction parsing tests ---
+
+    #[test]
+    fn test_split_entities_section() {
+        let response = "- Fact one\n- Fact two\n\n## Entities\n- Alice (person): the user\n- Alice -> prefers -> Rust";
+        let (facts, entities) = split_entities_section(response);
+        assert!(facts.contains("Fact one"));
+        assert!(!facts.contains("Entities"));
+        assert!(entities.contains("Alice (person)"));
+        assert!(entities.contains("-> prefers ->"));
+    }
+
+    #[test]
+    fn test_split_entities_section_no_entities() {
+        let response = "- Fact one\n- Fact two";
+        let (facts, entities) = split_entities_section(response);
+        assert_eq!(facts, response);
+        assert!(entities.is_empty());
+    }
+
+    #[cfg(feature = "knowledge-graph")]
+    #[test]
+    fn test_parse_entities_into_graph_entities() {
+        let tmp = TempDir::new().unwrap();
+        let section = "## Entities\n- Alice (person): the user\n- Rust (language): systems lang";
+        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_ent.json")).unwrap();
+        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
+        assert_eq!(ent, 2);
+        assert_eq!(rel, 0);
+        assert_eq!(kg.entity_count(), 2);
+    }
+
+    #[cfg(feature = "knowledge-graph")]
+    #[test]
+    fn test_parse_entities_into_graph_relations() {
+        let tmp = TempDir::new().unwrap();
+        let section = "## Entities\n- Alice (person): user\n- Rust (language): lang\n- Alice -> prefers -> Rust\n- Alice -> uses -> nanobot";
+        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_rel.json")).unwrap();
+        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
+        assert_eq!(ent, 2);
+        assert_eq!(rel, 2);
+        // Relations auto-create entities for "nanobot".
+        assert!(kg.entity_count() >= 3);
+    }
+
+    #[cfg(feature = "knowledge-graph")]
+    #[test]
+    fn test_parse_entities_skips_malformed_lines() {
+        let tmp = TempDir::new().unwrap();
+        let section = "## Entities\n- just some text without parens\n- (bad): no name\n- -> -> -> too many arrows";
+        let mut kg = KnowledgeGraph::open(&tmp.path().join("test_parse_bad.json")).unwrap();
+        let (ent, rel) = parse_entities_into_graph(&mut kg, section);
+        assert_eq!(ent, 0);
+        assert_eq!(rel, 0);
     }
 }
