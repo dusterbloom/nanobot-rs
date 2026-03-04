@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use html2md::rewrite_html;
 use regex::Regex;
 use reqwest::Client;
+use std::sync::LazyLock;
 use url::Url;
 
 use super::base::{Tool, ToolExecutionContext};
@@ -22,28 +23,30 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// Static regexes (compiled once)
+// ---------------------------------------------------------------------------
+static RE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<script[\s\S]*?</script>").unwrap());
+static RE_STYLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<style[\s\S]*?</style>").unwrap());
+static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
+static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
+static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Remove HTML tags and decode entities.
 fn strip_tags(text: &str) -> String {
-    // Remove script and style blocks.
-    let re_script = Regex::new(r"(?is)<script[\s\S]*?</script>").unwrap();
-    let text = re_script.replace_all(text, "");
-    let re_style = Regex::new(r"(?is)<style[\s\S]*?</style>").unwrap();
-    let text = re_style.replace_all(&text, "");
-    // Remove remaining tags.
-    let re_tags = Regex::new(r"<[^>]+>").unwrap();
-    let text = re_tags.replace_all(&text, "");
+    let text = RE_SCRIPT.replace_all(text, "");
+    let text = RE_STYLE.replace_all(&text, "");
+    let text = RE_TAGS.replace_all(&text, "");
     html_escape::decode_html_entities(&text).trim().to_string()
 }
 
 /// Normalize whitespace: collapse runs of spaces/tabs, limit consecutive newlines.
 fn normalize_whitespace(text: &str) -> String {
-    let re_spaces = Regex::new(r"[ \t]+").unwrap();
-    let text = re_spaces.replace_all(text, " ");
-    let re_newlines = Regex::new(r"\n{3,}").unwrap();
-    re_newlines.replace_all(&text, "\n\n").trim().to_string()
+    let text = RE_SPACES.replace_all(text, " ");
+    RE_NEWLINES.replace_all(&text, "\n\n").trim().to_string()
 }
 
 /// Extract the `text` field from a web_fetch JSON envelope, falling back to raw input.

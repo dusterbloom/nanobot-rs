@@ -4,9 +4,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use regex::Regex;
 use tokio::process::Command;
+
+// Static regexes for command normalization (compiled once).
+static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").unwrap());
+static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).unwrap());
+static RE_WIN_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
 
 use super::base::{Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
@@ -97,17 +105,14 @@ impl ExecTool {
 
         // Remove single backslashes used to break up command names (e.g. r\m → rm).
         // But keep actual escape sequences like \n, \t.
-        let escape_re =
-            Regex::new(r"\\([^nrtav\\0])").unwrap_or_else(|_| Regex::new(r"^$").unwrap());
-        normalized = escape_re.replace_all(&normalized, "$1").to_string();
+        normalized = RE_ESCAPE.replace_all(&normalized, "$1").to_string();
 
         // Remove inserted empty quotes used to evade: r""m → rm.
         normalized = normalized.replace("\"\"", "");
         normalized = normalized.replace("''", "");
 
         // Collapse whitespace.
-        let ws_re = Regex::new(r"\s+").unwrap_or_else(|_| Regex::new(r"^$").unwrap());
-        normalized = ws_re.replace_all(&normalized, " ").to_string();
+        normalized = RE_WHITESPACE.replace_all(&normalized, " ").to_string();
 
         normalized.trim().to_lowercase()
     }
@@ -255,16 +260,11 @@ impl ExecTool {
             };
 
             // Extract absolute paths from the command.
-            let posix_re =
-                Regex::new(r#"/[^\s"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
-            let win_re =
-                Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap_or_else(|_| Regex::new(r"^$").unwrap());
-
             let mut paths: Vec<String> = Vec::new();
-            for m in posix_re.find_iter(cmd) {
+            for m in RE_POSIX_PATH.find_iter(cmd) {
                 paths.push(m.as_str().to_string());
             }
-            for m in win_re.find_iter(cmd) {
+            for m in RE_WIN_PATH.find_iter(cmd) {
                 paths.push(m.as_str().to_string());
             }
 

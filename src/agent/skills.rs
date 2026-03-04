@@ -8,7 +8,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::LazyLock;
+
 use regex::Regex;
+
+static RE_FRONTMATTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---").unwrap());
+static RE_FRONTMATTER_STRIP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^---\n.*?\n---\n").unwrap());
 use tracing::debug;
 
 /// Information about a discovered skill.
@@ -275,8 +280,7 @@ impl SkillsLoader {
             return None;
         }
 
-        let re = Regex::new(r"(?s)^---\n(.*?)\n---").ok()?;
-        let caps = re.captures(&content)?;
+        let caps = RE_FRONTMATTER.captures(&content)?;
         let frontmatter = caps.get(1)?.as_str();
 
         let mut metadata = HashMap::new();
@@ -374,10 +378,8 @@ impl SkillsLoader {
 /// Strip YAML frontmatter from markdown content.
 fn _strip_frontmatter(content: &str) -> String {
     if content.starts_with("---") {
-        if let Some(re) = Regex::new(r"(?s)^---\n.*?\n---\n").ok() {
-            if let Some(m) = re.find(content) {
-                return content[m.end()..].trim().to_string();
-            }
+        if let Some(m) = RE_FRONTMATTER_STRIP.find(content) {
+            return content[m.end()..].trim().to_string();
         }
     }
     content.to_string()

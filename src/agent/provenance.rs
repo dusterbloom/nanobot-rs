@@ -3,9 +3,40 @@
 //! Extracts claims from agent text output and verifies them against
 //! the audit log. No LLM involved — purely regex + string matching.
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use crate::agent::audit::AuditEntry;
+
+// Static regexes for claim extraction (compiled once).
+static RE_FILE_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(read|wrote|created|edited|deleted|found|opened)\b[^`\n]{0,20}[`]([/~][^\s`]+)[`]").unwrap()
+});
+static RE_CMD_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap()
+});
+static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").unwrap()
+});
+static RE_ACTION_PAST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b[^.\n]{0,80}").unwrap()
+});
+static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}").unwrap()
+});
+static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}").unwrap()
+});
+static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b").unwrap()
+});
+static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").unwrap()
+});
+static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap()
+});
 
 /// Classification of how well a claim is supported by the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,12 +134,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_file_refs(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        // Match patterns like: read/wrote/created/edited + path-like string
-        let re = Regex::new(
-            r"(?i)\b(read|wrote|created|edited|deleted|found|opened)\b[^`\n]{0,20}[`]([/~][^\s`]+)[`]"
-        ).unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_FILE_REF.captures_iter(text) {
             if let (Some(full), Some(path)) = (cap.get(0), cap.get(2)) {
                 let path_str = path.as_str();
                 let status = self.match_against_entries(path_str, Some("file"));
@@ -125,10 +151,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_command_refs(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        // Match: ran/executed + backtick content
-        let re = Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_CMD_REF.captures_iter(text) {
             if let (Some(full), Some(cmd)) = (cap.get(0), cap.get(2)) {
                 let cmd_str = cmd.as_str();
                 let status = self.match_against_entries(cmd_str, Some("exec"));
@@ -145,12 +168,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_quoted_output(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        // Match: "output/result/returns/shows" followed by backtick block
-        let re = Regex::new(
-            r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```"
-        ).unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_QUOTED_OUTPUT.captures_iter(text) {
             if let (Some(full), Some(content)) = (cap.get(0), cap.get(2)) {
                 let content_str = content.as_str().trim();
                 if content_str.len() < 5 {
@@ -172,11 +190,7 @@ impl<'a> ClaimVerifier<'a> {
         let mut claims = Vec::new();
 
         // Pattern 1: "I read/wrote/ran/..." (past-tense self-attribution)
-        let re_past = Regex::new(
-            r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b[^.\n]{0,80}"
-        ).unwrap();
-
-        for cap in re_past.captures_iter(text) {
+        for cap in RE_ACTION_PAST.captures_iter(text) {
             if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
@@ -191,11 +205,7 @@ impl<'a> ClaimVerifier<'a> {
         }
 
         // Pattern 2: "Let me check/run/verify/look" (present-tense with implied result)
-        let re_present = Regex::new(
-            r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}"
-        ).unwrap();
-
-        for cap in re_present.captures_iter(text) {
+        for cap in RE_ACTION_PRESENT.captures_iter(text) {
             if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
@@ -210,12 +220,7 @@ impl<'a> ClaimVerifier<'a> {
         }
 
         // Pattern 3: "When I run X" / "If I run X" (implied action)
-        let re_when = Regex::new(
-            r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}",
-        )
-        .unwrap();
-
-        for cap in re_when.captures_iter(text) {
+        for cap in RE_ACTION_WHEN.captures_iter(text) {
             if let (Some(full), Some(action)) = (cap.get(0), cap.get(1)) {
                 let action_str = action.as_str().to_lowercase();
                 let tool_hint = Self::action_to_tool_hint(&action_str);
@@ -250,12 +255,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_numeric_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        let re = Regex::new(
-            r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b",
-        )
-        .unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_NUMERIC.captures_iter(text) {
             if let (Some(full), Some(num)) = (cap.get(0), cap.get(1)) {
                 let num_str = num.as_str();
                 // Check if any audit entry result contains this number in context
@@ -279,12 +279,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_outcome_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        // Match outcome assertions: "Build succeeded", "copy worked", "install completed", etc.
-        let re = Regex::new(
-            r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b"
-        ).unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_OUTCOME.captures_iter(text) {
             if let Some(full) = cap.get(0) {
                 let claim_text = full.as_str();
                 // Check if any audit entry contains evidence matching this outcome.
@@ -302,10 +297,7 @@ impl<'a> ClaimVerifier<'a> {
 
     fn extract_timestamp_claims(&self, text: &str) -> Vec<AnnotatedClaim> {
         let mut claims = Vec::new();
-        // Match time patterns: "17:45", "from 17:36", "at 3:30 PM"
-        let re = Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap();
-
-        for cap in re.captures_iter(text) {
+        for cap in RE_TIMESTAMP.captures_iter(text) {
             if let Some(full) = cap.get(0) {
                 let time_str = full.as_str();
                 // Check if any audit entry result contains this timestamp.
