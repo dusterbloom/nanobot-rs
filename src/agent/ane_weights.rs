@@ -487,6 +487,220 @@ impl ModelWeights {
             lm_head: None,
         })
     }
+
+    /// Load weights from an MLX safetensors directory (Qwen3 architecture).
+    ///
+    /// Handles 8-bit quantized weights (U32-packed + BF16 scales/biases, group_size=64).
+    /// Expands KV weights for GQA (replicates each KV head `heads_per_group` times).
+    pub fn from_mlx_safetensors(dir: &Path, cfg: &MilConfig) -> io::Result<Self> {
+        use std::collections::HashMap;
+
+        // Find safetensors files
+        let mut st_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+            .collect();
+        st_files.sort();
+
+        if st_files.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no safetensors files"));
+        }
+
+        // Parse all safetensors files into a name→data map
+        let mut tensors: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut tensor_meta: HashMap<String, (String, Vec<usize>)> = HashMap::new(); // name → (dtype, shape)
+
+        for st_path in &st_files {
+            let data = std::fs::read(st_path)?;
+            if data.len() < 8 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
+            }
+            let hdr_size = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+            let hdr_json: serde_json::Value = serde_json::from_slice(&data[8..8 + hdr_size])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}")))?;
+            let data_start = 8 + hdr_size;
+
+            if let serde_json::Value::Object(map) = hdr_json {
+                for (name, meta) in &map {
+                    if name == "__metadata__" { continue; }
+                    let dtype = meta["dtype"].as_str().unwrap_or("").to_string();
+                    let shape: Vec<usize> = meta["shape"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                        .unwrap_or_default();
+                    let offsets = meta["data_offsets"].as_array().unwrap();
+                    let start = offsets[0].as_u64().unwrap() as usize;
+                    let end = offsets[1].as_u64().unwrap() as usize;
+                    tensors.insert(name.clone(), data[data_start + start..data_start + end].to_vec());
+                    tensor_meta.insert(name.clone(), (dtype, shape));
+                }
+            }
+        }
+
+        /// BF16 bytes → f32 vec
+        fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
+            data.chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+
+        /// Dequantize MLX 8-bit: U32-packed weights + BF16 scales/biases, group_size
+        fn dequant_8bit(weight: &[u8], scales: &[u8], biases: &[u8], rows: usize, cols: usize, group_size: usize) -> Vec<f32> {
+            let n_groups = cols / group_size;
+            let sc = bf16_to_f32(scales);
+            let bi = bf16_to_f32(biases);
+            let mut out = vec![0.0f32; rows * cols];
+
+            for r in 0..rows {
+                // Unpack U32 → uint8 for this row
+                let row_u32s = cols / 4;
+                let row_start = r * row_u32s * 4;
+                for c in 0..cols {
+                    let byte_idx = row_start + c; // each byte is one quantized value
+                    let qval = weight[byte_idx] as f32;
+                    let g = c / group_size;
+                    let s = sc[r * n_groups + g];
+                    let b = bi[r * n_groups + g];
+                    out[r * cols + c] = s * qval + b;
+                }
+            }
+            out
+        }
+
+        /// Get a dequantized weight tensor by base name (e.g. "model.layers.0.self_attn.q_proj")
+        let get_weight = |tensors: &HashMap<String, Vec<u8>>, tensor_meta: &HashMap<String, (String, Vec<usize>)>,
+                          base: &str, group_size: usize| -> io::Result<Vec<f32>> {
+            let w_key = format!("{base}.weight");
+            let s_key = format!("{base}.scales");
+            let b_key = format!("{base}.biases");
+
+            if let (Some(w), Some(s), Some(b)) = (tensors.get(&w_key), tensors.get(&s_key), tensors.get(&b_key)) {
+                let (_, shape) = tensor_meta.get(&w_key).unwrap();
+                let rows = shape[0];
+                let packed_cols = shape[1];
+                let cols = packed_cols * 4; // U32 → 4 bytes
+                Ok(dequant_8bit(w, s, b, rows, cols, group_size))
+            } else {
+                // Try non-quantized (BF16)
+                let key = base.to_string();
+                if let Some(data) = tensors.get(&format!("{base}.weight")).or(tensors.get(&key)) {
+                    let (dtype, _) = tensor_meta.get(&format!("{base}.weight")).or(tensor_meta.get(&key)).unwrap();
+                    if dtype == "BF16" {
+                        Ok(bf16_to_f32(data))
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported dtype {dtype} for {base}")))
+                    }
+                } else {
+                    Err(io::Error::new(io::ErrorKind::NotFound, format!("missing tensor: {base}")))
+                }
+            }
+        };
+
+        /// Get a BF16 tensor directly (for layernorm weights, QK-norm)
+        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>, name: &str| -> io::Result<Vec<f32>> {
+            let data = tensors.get(name)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}")))?;
+            Ok(bf16_to_f32(data))
+        };
+
+        // Read config.json for group_size
+        let config_path = dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}")))?;
+        let group_size = config["quantization"]["group_size"].as_u64().unwrap_or(64) as usize;
+
+        let dim = cfg.dim;
+        let kv_dim = cfg.kv_dim();
+        let n_layers = config["num_hidden_layers"].as_u64().unwrap() as usize;
+        let vocab_size = config["vocab_size"].as_u64().unwrap() as usize;
+        let hpg = cfg.heads_per_group();
+
+        // Embedding (quantized)
+        let embed_raw = get_weight(&tensors, &tensor_meta, "model.embed_tokens", group_size)?;
+        // embed_raw is [vocab, dim] row-major → we need [dim, vocab] col-major (our format: embed[d * vocab + v])
+        // Actually our format: embed[v * dim + d] for embed_lookup which does: out[d * seq + t] = embed[token * dim + d]
+        // So we need [vocab, dim] row-major — that's what we already have.
+        // Wait, our embed_lookup: out[d*seq+t] = embed[tok*dim + d]. So embed is [vocab, dim] where embed[tok*dim+d].
+        // The safetensors gives us [vocab, dim] row-major. That matches!
+
+        // Expand KV: replicate each KV head hpg times to get [dim, dim] from [kv_dim, dim]
+        let expand_kv = |kv: &[f32], kv_dim: usize, dim: usize, hpg: usize| -> Vec<f32> {
+            if hpg == 1 { return kv.to_vec(); }
+            let head_dim = kv_dim / (dim / (hpg * (kv_dim / (dim / hpg / hpg))));
+            // Simpler: kv is [kv_dim, dim_in] where kv_dim = n_kv_heads * head_dim
+            // We want [dim, dim_in] by repeating each head_dim-sized block hpg times
+            let hd = cfg.head_dim();
+            let n_kv = kv_dim / hd;
+            let dim_in = kv.len() / kv_dim;
+            let mut expanded = vec![0.0f32; dim * dim_in];
+            for kv_h in 0..n_kv {
+                for rep in 0..hpg {
+                    let dst_h = kv_h * hpg + rep;
+                    for d in 0..hd {
+                        let src_row = kv_h * hd + d;
+                        let dst_row = dst_h * hd + d;
+                        expanded[dst_row * dim_in..dst_row * dim_in + dim_in]
+                            .copy_from_slice(&kv[src_row * dim_in..src_row * dim_in + dim_in]);
+                    }
+                }
+            }
+            expanded
+        };
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let prefix = format!("model.layers.{l}");
+
+            // Attention weights: [out_dim, in_dim] row-major
+            // q_proj: [dim, dim], k_proj: [kv_dim, dim], v_proj: [kv_dim, dim], o_proj: [dim, dim]
+            let wq = get_weight(&tensors, &tensor_meta, &format!("{prefix}.self_attn.q_proj"), group_size)?;
+            let wk_raw = get_weight(&tensors, &tensor_meta, &format!("{prefix}.self_attn.k_proj"), group_size)?;
+            let wv_raw = get_weight(&tensors, &tensor_meta, &format!("{prefix}.self_attn.v_proj"), group_size)?;
+            let wo = get_weight(&tensors, &tensor_meta, &format!("{prefix}.self_attn.o_proj"), group_size)?;
+
+            // Expand KV for GQA
+            let wk = expand_kv(&wk_raw, kv_dim, dim, hpg);
+            let wv = expand_kv(&wv_raw, kv_dim, dim, hpg);
+
+            // FFN weights
+            let w1 = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.gate_proj"), group_size)?;
+            let w2 = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.down_proj"), group_size)?;
+            let w3 = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.up_proj"), group_size)?;
+
+            // RMSNorm weights (BF16, not quantized)
+            let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
+            let rms_ffn = get_bf16(&tensors, &format!("{prefix}.post_attention_layernorm.weight"))?;
+
+            // QK-norm
+            let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
+            let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
+
+            layers.push(LayerWeights {
+                wq, wk, wv, wo, w1, w2, w3, rms_att, rms_ffn, q_norm, k_norm,
+            });
+
+            if l == 0 {
+                eprintln!("loaded layer 0: wq={} wk={} wv={} wo={} w1={} w2={}",
+                    layers[0].wq.len(), layers[0].wk.len(), layers[0].wv.len(),
+                    layers[0].wo.len(), layers[0].w1.len(), layers[0].w2.len());
+            }
+        }
+
+        let rms_final = get_bf16(&tensors, "model.norm.weight")?;
+
+        Ok(ModelWeights {
+            cfg: cfg.clone(),
+            layers,
+            rms_final,
+            embed: embed_raw,
+            vocab_size,
+            lm_head: None, // tied embeddings
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1259,69 @@ mod tests {
         assert_eq!(model.rms_final.len(), 768);
         assert!(model.vocab_size > 0);
         assert_eq!(model.embed.len(), model.vocab_size * 768);
+    }
+
+    #[test]
+    fn test_from_mlx_safetensors_qwen3() {
+        let model_dir = std::path::Path::new(
+            &std::env::var("HOME").unwrap()
+        ).join(".cache/lm-studio/models/mlx-community/Qwen3-0.6B-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-0.6B-8bit not found, skipping MLX loader test");
+            return;
+        }
+
+        // Qwen3-0.6B: dim=1024, hidden=3072, 16 heads (8 KV), head_dim=128
+        // BUT: 16*128=2048 ≠ 1024=dim. We can't use this model with current MIL kernels.
+        // Use head_dim=64 (dim/n_heads) to match our MilConfig assumption.
+        // This means KV expansion will produce wrong shapes for the real model,
+        // but we can at least verify the loader parses correctly.
+
+        // For a true E2E test, use Qwen3-1.7B (dim=2048, 16*128=2048=dim).
+        let model_dir_17b = std::path::Path::new(
+            &std::env::var("HOME").unwrap()
+        ).join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit");
+        if !model_dir_17b.exists() {
+            eprintln!("Qwen3-1.7B-MLX-8bit not found, skipping MLX loader test");
+            return;
+        }
+
+        // Qwen3-1.7B: dim=2048, hidden=6144, 16 heads, 8 KV heads, head_dim=128
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 16,
+            seq_len: 32, // small seq for testing
+            n_kv_heads: 8,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+        };
+
+        let t0 = std::time::Instant::now();
+        let model = ModelWeights::from_mlx_safetensors(&model_dir_17b, &cfg)
+            .expect("from_mlx_safetensors failed");
+        let load_ms = t0.elapsed().as_millis();
+
+        assert_eq!(model.layers.len(), 28);
+        // After KV expansion, wk/wv should be [dim, dim]
+        assert_eq!(model.layers[0].wq.len(), 2048 * 2048, "wq size");
+        assert_eq!(model.layers[0].wk.len(), 2048 * 2048, "wk size (expanded)");
+        assert_eq!(model.layers[0].wv.len(), 2048 * 2048, "wv size (expanded)");
+        assert_eq!(model.layers[0].wo.len(), 2048 * 2048, "wo size");
+        assert_eq!(model.layers[0].w1.len(), 6144 * 2048, "w1 size");
+        assert_eq!(model.layers[0].w2.len(), 2048 * 6144, "w2 size");
+        assert_eq!(model.rms_final.len(), 2048);
+
+        // QK-norm should be present for Qwen3
+        assert!(model.layers[0].q_norm.is_some(), "q_norm should be present");
+        assert!(model.layers[0].k_norm.is_some(), "k_norm should be present");
+
+        // Weights should be nonzero
+        let sum: f32 = model.layers[0].wq.iter().take(100).map(|v| v.abs()).sum();
+        assert!(sum > 0.01, "dequantized weights should be nonzero");
+
+        eprintln!("loaded Qwen3-1.7B in {load_ms}ms, {} layers, vocab={}", model.layers.len(), model.vocab_size);
     }
 
     // ---- Round 6: Delta adapter round-trip ----
