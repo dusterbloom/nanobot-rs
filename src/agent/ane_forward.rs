@@ -30,7 +30,7 @@ impl TokenId for u32 {
 ///
 /// Data layout: [dim, seq] row-major — each row is one dimension across all seq positions.
 /// `x[i*seq + t]` = dimension `i`, position `t`.
-pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize, eps: f32) {
     debug_assert_eq!(x.len(), dim * seq);
     debug_assert_eq!(out.len(), dim * seq);
     debug_assert_eq!(w.len(), dim);
@@ -46,7 +46,6 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
 
     // ss[t] = 1/sqrt(ss[t]/dim + eps)
     let inv_dim = 1.0 / dim as f32;
-    let eps = 1e-5f32;
     for t in 0..seq {
         ss[t] = 1.0 / (ss[t] * inv_dim + eps).sqrt();
     }
@@ -161,6 +160,145 @@ pub fn classifier_forward(
     }
 }
 
+/// RoPE backward: un-rotate dQ and dK gradients on CPU.
+///
+/// Forward applied: rot1 = x1*cos - x2*sin, rot2 = x1*sin + x2*cos
+/// Inverse (transpose of rotation matrix):
+///   dx1 = drot1*cos + drot2*sin
+///   dx2 = -drot1*sin + drot2*cos
+///
+/// Data layout: [dim, seq] where dim = n_heads * head_dim.
+/// cos/sin tables: [seq, half_hd] where half_hd = head_dim / 2.
+pub fn rope_backward(
+    dq: &mut [f32],
+    dk: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+    theta: f64,
+) {
+    let half_hd = head_dim / 2;
+    let dim = n_heads * head_dim;
+    debug_assert_eq!(dq.len(), dim * seq);
+    debug_assert_eq!(dk.len(), dim * seq);
+
+    // dq/dk layout: [dim, seq] = [n_heads*head_dim, seq]
+    // For head h, dimension d within head: channel = h*head_dim + d
+    // Split d into first-half (d < half_hd) and second-half (d >= half_hd)
+    for h in 0..n_heads {
+        for t in 0..seq {
+            for i in 0..half_hd {
+                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+                let angle = t as f64 * freq;
+                let cos_v = angle.cos() as f32;
+                let sin_v = angle.sin() as f32;
+
+                let ch1 = (h * head_dim + i) * seq + t;
+                let ch2 = (h * head_dim + half_hd + i) * seq + t;
+
+                // Un-rotate dQ
+                let dq1 = dq[ch1];
+                let dq2 = dq[ch2];
+                dq[ch1] = dq1 * cos_v + dq2 * sin_v;
+                dq[ch2] = -dq1 * sin_v + dq2 * cos_v;
+
+                // Un-rotate dK
+                let dk1 = dk[ch1];
+                let dk2 = dk[ch2];
+                dk[ch1] = dk1 * cos_v + dk2 * sin_v;
+                dk[ch2] = -dk1 * sin_v + dk2 * cos_v;
+            }
+        }
+    }
+}
+
+/// Per-head QK RMSNorm forward on CPU.
+///
+/// Applies RMSNorm per-head to Q or K after projection, before RoPE.
+/// Data layout: [dim, seq] where dim = n_heads * head_dim.
+/// norm_w: [head_dim] — shared across heads.
+/// Modifies `x` in-place. Returns pre-norm copy for backward.
+pub fn qk_rmsnorm_fwd(
+    x: &mut [f32],
+    norm_w: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let dim = n_heads * head_dim;
+    debug_assert_eq!(x.len(), dim * seq);
+    debug_assert_eq!(norm_w.len(), head_dim);
+
+    let pre_norm = x.to_vec();
+
+    for h in 0..n_heads {
+        for t in 0..seq {
+            // Compute sum of squares for this head at this position
+            let mut ss = 0.0f32;
+            for d in 0..head_dim {
+                let idx = (h * head_dim + d) * seq + t;
+                ss += x[idx] * x[idx];
+            }
+            let rrms = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+            for d in 0..head_dim {
+                let idx = (h * head_dim + d) * seq + t;
+                x[idx] = pre_norm[idx] * rrms * norm_w[d];
+            }
+        }
+    }
+    pre_norm
+}
+
+/// Per-head QK RMSNorm backward on CPU.
+///
+/// Given gradient w.r.t. normed output (dx_normed), computes gradient w.r.t.
+/// pre-norm input (overwrites dx_normed) and accumulates dnorm_w.
+pub fn qk_rmsnorm_bwd(
+    dx: &mut [f32],       // in: grad w.r.t. normed, out: grad w.r.t. pre-norm
+    dnorm_w: &mut [f32],  // accumulated [head_dim]
+    pre_norm: &[f32],     // saved pre-norm values
+    norm_w: &[f32],       // [head_dim]
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+    eps: f32,
+) {
+    let dim = n_heads * head_dim;
+    debug_assert_eq!(dx.len(), dim * seq);
+    debug_assert_eq!(pre_norm.len(), dim * seq);
+
+    let inv_hd = 1.0 / head_dim as f32;
+
+    for h in 0..n_heads {
+        for t in 0..seq {
+            // Recompute rrms
+            let mut ss = 0.0f32;
+            for d in 0..head_dim {
+                let idx = (h * head_dim + d) * seq + t;
+                ss += pre_norm[idx] * pre_norm[idx];
+            }
+            let rrms = 1.0 / (ss * inv_hd + eps).sqrt();
+
+            // dot = sum_d(dy[d] * x[d] * w[d]) * rrms^2 / hd
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                let idx = (h * head_dim + d) * seq + t;
+                dot += dx[idx] * pre_norm[idx] * norm_w[d];
+            }
+            dot *= rrms * rrms * inv_hd;
+
+            // dx[d] = rrms * (w[d]*dy[d] - x[d]*dot), dnorm_w[d] += dy[d]*x[d]*rrms
+            for d in 0..head_dim {
+                let idx = (h * head_dim + d) * seq + t;
+                let dy_val = dx[idx];
+                dx[idx] = rrms * (norm_w[d] * dy_val - pre_norm[idx] * dot);
+                dnorm_w[d] += dy_val * pre_norm[idx] * rrms;
+            }
+        }
+    }
+}
+
 /// Vector add in-place: dst[i] += src[i] (residual connections).
 pub fn vec_add_inplace(dst: &mut [f32], src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -179,6 +317,8 @@ pub struct CompiledKernels {
     pub ffn_w13: AneKernel,
     pub ffn_w2: AneKernel,
     pub mask_blob: Vec<u8>,
+    pub rope_cos_blob: Vec<u8>,
+    pub rope_sin_blob: Vec<u8>,
 }
 
 impl CompiledKernels {
@@ -186,13 +326,19 @@ impl CompiledKernels {
     pub fn compile_forward(cfg: &MilConfig) -> Result<Self, String> {
         ane_bridge::ane_init()?;
 
-        // SDPA forward needs causal mask as a static weight
+        // SDPA forward needs causal mask + RoPE cos/sin as static weights
         let mask_blob = ane_mil::build_causal_mask_blob(cfg.seq_len);
+        let (rope_cos_blob, rope_sin_blob) =
+            ane_weights::generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
         let sdpa_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaFwd);
         let sdpa_fwd = AneKernel::compile_multi_weights(
             &sdpa_spec.mil_text,
-            &["@model_path/weights/mask.bin"],
-            &[&mask_blob],
+            &[
+                "@model_path/weights/mask.bin",
+                "@model_path/weights/rope_cos.bin",
+                "@model_path/weights/rope_sin.bin",
+            ],
+            &[&mask_blob, &rope_cos_blob, &rope_sin_blob],
             &[sdpa_spec.input_bytes],
             &[sdpa_spec.output_bytes],
         )?;
@@ -220,6 +366,8 @@ impl CompiledKernels {
             ffn_w13,
             ffn_w2,
             mask_blob,
+            rope_cos_blob,
+            rope_sin_blob,
         })
     }
 }
@@ -232,8 +380,8 @@ impl CompiledKernels {
 pub struct LayerActivations {
     pub layer_in: Vec<f32>,  // [dim, seq]
     pub xnorm: Vec<f32>,     // [dim, seq]
-    pub q: Vec<f32>,         // [dim, seq]
-    pub k: Vec<f32>,         // [dim, seq]
+    pub q: Vec<f32>,         // [dim, seq] (post-norm, post-rope)
+    pub k: Vec<f32>,         // [dim, seq] (post-norm, post-rope)
     pub v: Vec<f32>,         // [dim, seq]
     pub attn_out: Vec<f32>,  // [dim, seq]
     pub o_out: Vec<f32>,     // [dim, seq]
@@ -243,6 +391,8 @@ pub struct LayerActivations {
     pub h3: Vec<f32>,        // [hidden, seq]
     pub gate: Vec<f32>,      // [hidden, seq]  (silu(h1)*h3)
     pub ffn_out: Vec<f32>,   // [dim, seq]
+    pub q_pre_norm: Option<Vec<f32>>,  // [dim, seq] pre-QK-norm Q (for backward)
+    pub k_pre_norm: Option<Vec<f32>>,  // [dim, seq] pre-QK-norm K (for backward)
 }
 
 /// Forward pass result.
@@ -253,40 +403,68 @@ pub struct ForwardResult {
     pub layer_acts: Vec<LayerActivations>,
 }
 
+/// Forward pass result with optional LoRA activations.
+pub struct ForwardResultWithLora {
+    pub base: ForwardResult,
+    pub lora_acts: Vec<super::ane_lora::LoraLayerActivations>,
+}
+
 /// Run full forward pass: embed → layers → classifier → loss.
 ///
 /// Follows train.m lines 400-506:
 /// 1. embed_lookup → x_cur[dim, seq]
 /// 2. Per layer: rmsnorm → SDPA(ANE) → residual → rmsnorm → FFN(ANE) → residual
 /// 3. Final rmsnorm → classifier → cross-entropy loss
+///
+/// When `lora` and `lora_kernels` are provided, LoRA deltas are injected:
+/// - After Wo (SDPA output): o_out += scale * B_wo @ (A_wo @ attn_out)
+/// - After FFN W2: ffn_out += scale * B_w2 @ (A_w2 @ gate)
 pub fn forward<T: TokenId>(
     kernels: &CompiledKernels,
     model: &ModelWeights,
     tokens: &[T],
     targets: &[T],
 ) -> Result<ForwardResult, String> {
+    forward_with_lora(kernels, model, None, None, tokens, targets)
+        .map(|r| r.base)
+}
+
+/// Forward pass with optional LoRA adapters.
+pub fn forward_with_lora<T: TokenId>(
+    kernels: &CompiledKernels,
+    model: &ModelWeights,
+    lora: Option<&super::ane_lora::LoraModel>,
+    lora_kernels: Option<&super::ane_lora::LoraKernels>,
+    tokens: &[T],
+    targets: &[T],
+) -> Result<ForwardResultWithLora, String> {
+    use super::ane_lora::{self, LoraLayerActivations};
+
     let cfg = &model.cfg;
     let dim = cfg.dim;
     let seq = cfg.seq_len;
     let _hidden = cfg.hidden_dim;
     let n_layers = model.layers.len();
+    let lora_scale = lora.map_or(0.0, |l| l.scale());
 
     // 1. Embedding lookup
     let mut x_cur = vec![0.0f32; dim * seq];
     embed_lookup(&mut x_cur, &model.embed, tokens, dim, seq);
 
     let mut layer_acts = Vec::with_capacity(n_layers);
+    let mut lora_acts_vec = Vec::with_capacity(n_layers);
 
     // 2. Transformer layers
     for l in 0..n_layers {
         let lw = &model.layers[l];
+        let lora_layer = lora.map(|lm| &lm.layers[l]);
 
         // Save layer input for backward pass
         let layer_in = x_cur.clone();
 
         // RMSNorm before attention
         let mut xnorm = vec![0.0f32; dim * seq];
-        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq);
+        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
 
         // SDPA forward on ANE
         let sdpa_input = ane_weights::pack_sdpa_fwd(
@@ -297,8 +475,27 @@ pub fn forward<T: TokenId>(
         kernels.sdpa_fwd.eval()?;
         let mut sdpa_out = vec![0u8; sdpa_spec.output_bytes];
         kernels.sdpa_fwd.read_output(0, &mut sdpa_out);
-        let [o_out, q, k, v, attn_out, _xnorm_pass] =
+        let [mut o_out, q, k, v, attn_out, _xnorm_pass] =
             ane_weights::unpack_sdpa_fwd(&sdpa_out, cfg);
+
+        let mut lora_layer_acts = LoraLayerActivations::empty();
+
+        // LoRA on Wo: o_out += scale * B_wo @ (A_wo @ attn_out)
+        if let (Some(ll), Some(lk)) = (lora_layer, lora_kernels) {
+            if let Some(wo_adapter) = ll.wo.as_ref() {
+                let (wo_delta, wo_h) = if lora_kernels.is_some() {
+                    ane_lora::lora_forward_ane(
+                        &lk.attn_a_fwd, &lk.attn_b_fwd,
+                        wo_adapter, &attn_out, seq,
+                    )?
+                } else {
+                    wo_adapter.forward_cpu(&attn_out, seq)
+                };
+                ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                lora_layer_acts.wo_x = Some(attn_out.clone());
+                lora_layer_acts.wo_h = Some(wo_h);
+            }
+        }
 
         // Residual: x2 = x_cur + o_out
         let mut x2 = x_cur.clone();
@@ -306,7 +503,7 @@ pub fn forward<T: TokenId>(
 
         // RMSNorm before FFN
         let mut x2norm = vec![0.0f32; dim * seq];
-        rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq);
+        rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
 
         // FFN W1+W3 on ANE
         let w13_input = ane_weights::pack_ffn_w13(&x2norm, &lw.w1, &lw.w3, cfg);
@@ -325,10 +522,27 @@ pub fn forward<T: TokenId>(
         let mut w2_out = vec![0u8; w2_spec.output_bytes];
         kernels.ffn_w2.read_output(0, &mut w2_out);
         // FFN W2 output is [1, dim, 1, seq] fp32
-        let ffn_out: Vec<f32> = w2_out
+        let mut ffn_out: Vec<f32> = w2_out
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+
+        // LoRA on W2: ffn_out += scale * B_w2 @ (A_w2 @ gate)
+        if let (Some(ll), Some(lk)) = (lora_layer, lora_kernels) {
+            if let Some(w2_adapter) = ll.w2.as_ref() {
+                let (w2_delta, w2_h) = if lora_kernels.is_some() {
+                    ane_lora::lora_forward_ane(
+                        &lk.ffn_a_fwd, &lk.ffn_b_fwd,
+                        w2_adapter, &gate, seq,
+                    )?
+                } else {
+                    w2_adapter.forward_cpu(&gate, seq)
+                };
+                ane_lora::vec_add_scaled(&mut ffn_out, &w2_delta, lora_scale);
+                lora_layer_acts.w2_x = Some(gate.clone());
+                lora_layer_acts.w2_h = Some(w2_h);
+            }
+        }
 
         // Residual: x_cur = x2 + ffn_out
         x_cur = x2.clone();
@@ -348,26 +562,33 @@ pub fn forward<T: TokenId>(
             h3,
             gate,
             ffn_out,
+            q_pre_norm: None,
+            k_pre_norm: None,
         });
+        lora_acts_vec.push(lora_layer_acts);
     }
 
     // 3. Final RMSNorm
     let mut x_final = vec![0.0f32; dim * seq];
-    rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq);
+    rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
 
-    // 4. Classifier
+    // 4. Classifier (use lm_head if untied, else share embed)
     let vocab = model.vocab_size;
     let mut logits = vec![0.0f32; vocab * seq];
-    classifier_forward(&mut logits, &model.embed, &x_final, vocab, dim, seq);
+    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
+    classifier_forward(&mut logits, cls_w, &x_final, vocab, dim, seq);
 
     // 5. Cross-entropy loss
     let (loss, dlogits) = cross_entropy_loss(&logits, targets, vocab, seq);
 
-    Ok(ForwardResult {
-        logits,
-        loss,
-        dlogits,
-        layer_acts,
+    Ok(ForwardResultWithLora {
+        base: ForwardResult {
+            logits,
+            loss,
+            dlogits,
+            layer_acts,
+        },
+        lora_acts: lora_acts_vec,
     })
 }
 
@@ -392,7 +613,7 @@ mod tests {
         let w = vec![1.0f32; dim];
         let mut out = vec![0.0f32; dim * seq];
 
-        rmsnorm(&mut out, &x, &w, dim, seq);
+        rmsnorm(&mut out, &x, &w, dim, seq, 1e-5);
 
         // For all-ones: mean(x^2) = 1.0, so rrms = 1/sqrt(1.0 + 1e-5) ≈ 0.99999...
         // out[i,t] = 1.0 * rrms * 1.0 ≈ 1.0
@@ -412,7 +633,7 @@ mod tests {
         let w = vec![2.0, 0.5];
         let mut out = vec![0.0f32; dim * seq];
 
-        rmsnorm(&mut out, &x, &w, dim, seq);
+        rmsnorm(&mut out, &x, &w, dim, seq, 1e-5);
 
         // Position 0: ss = (1^2 + 3^2)/2 = 5.0, rrms = 1/sqrt(5+1e-5)
         // Position 1: ss = (2^2 + 4^2)/2 = 10.0, rrms = 1/sqrt(10+1e-5)
@@ -736,5 +957,139 @@ mod tests {
         let src = vec![10.0, 20.0, 30.0];
         vec_add_inplace(&mut dst, &src);
         assert_eq!(dst, vec![11.0, 22.0, 33.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round 8.1: RoPE forward+backward roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qk_rmsnorm_fwd_matches_manual() {
+        let n_heads = 2;
+        let head_dim = 4;
+        let dim = n_heads * head_dim;
+        let seq = 2;
+        let eps = 1e-5f32;
+        let norm_w = vec![1.0, 2.0, 0.5, 1.5];
+
+        let mut x: Vec<f32> = (0..dim * seq)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let pre = qk_rmsnorm_fwd(&mut x, &norm_w, n_heads, head_dim, seq, eps);
+
+        // Verify manually for head 0, position 0
+        let mut ss = 0.0f32;
+        for d in 0..head_dim {
+            ss += pre[(0 * head_dim + d) * seq + 0].powi(2);
+        }
+        let rrms = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for d in 0..head_dim {
+            let idx = (0 * head_dim + d) * seq + 0;
+            let expected = pre[idx] * rrms * norm_w[d];
+            assert!(
+                (x[idx] - expected).abs() < 1e-5,
+                "qk_rmsnorm h=0 t=0 d={d}: got {}, expected {}",
+                x[idx], expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_qk_rmsnorm_bwd_numerical() {
+        let n_heads = 2;
+        let head_dim = 4;
+        let dim = n_heads * head_dim;
+        let seq = 2;
+        let eps_norm = 1e-5f32;
+        let fd_eps = 1e-4f32;
+        let norm_w = vec![1.0, 2.0, 0.5, 1.5];
+
+        let x_orig: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i as f32 * 0.7 + 0.3).sin()) * 2.0)
+            .collect();
+        let dy: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i as f32 * 1.3 + 0.7).cos()) * 0.5)
+            .collect();
+
+        // Analytical
+        let mut x_fwd = x_orig.clone();
+        let pre = qk_rmsnorm_fwd(&mut x_fwd, &norm_w, n_heads, head_dim, seq, eps_norm);
+        let mut dx = dy.clone();
+        let mut dw = vec![0.0f32; head_dim];
+        qk_rmsnorm_bwd(&mut dx, &mut dw, &pre, &norm_w, n_heads, head_dim, seq, eps_norm);
+
+        // Numerical dx
+        for idx in 0..dim * seq {
+            let mut xp = x_orig.clone();
+            let mut xm = x_orig.clone();
+            xp[idx] += fd_eps;
+            xm[idx] -= fd_eps;
+            qk_rmsnorm_fwd(&mut xp, &norm_w, n_heads, head_dim, seq, eps_norm);
+            qk_rmsnorm_fwd(&mut xm, &norm_w, n_heads, head_dim, seq, eps_norm);
+            let mut num = 0.0f32;
+            for j in 0..dim * seq {
+                num += dy[j] * (xp[j] - xm[j]) / (2.0 * fd_eps);
+            }
+            assert!(
+                (dx[idx] - num).abs() < 0.01,
+                "qk_rmsnorm_bwd dx[{idx}]: analytical={:.6}, numerical={:.6}",
+                dx[idx], num
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_backward_roundtrip() {
+        // Rotate then un-rotate should be identity
+        let n_heads = 4;
+        let head_dim = 16;
+        let dim = n_heads * head_dim;
+        let seq = 8;
+        let theta = 10000.0;
+        let half_hd = head_dim / 2;
+
+        // Random-ish input
+        let orig_q: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i as f32 * 0.7 + 0.3).sin()) * 2.0)
+            .collect();
+        let orig_k = orig_q.clone();
+
+        // Forward rotate on CPU (same logic as MIL kernel)
+        let mut q_rot = vec![0.0f32; dim * seq];
+        let mut k_rot = vec![0.0f32; dim * seq];
+        for h in 0..n_heads {
+            for t in 0..seq {
+                for i in 0..half_hd {
+                    let freq = 1.0 / (theta as f64).powf(2.0 * i as f64 / head_dim as f64);
+                    let angle = t as f64 * freq;
+                    let cos_v = angle.cos() as f32;
+                    let sin_v = angle.sin() as f32;
+                    let ch1 = (h * head_dim + i) * seq + t;
+                    let ch2 = (h * head_dim + half_hd + i) * seq + t;
+
+                    q_rot[ch1] = orig_q[ch1] * cos_v - orig_q[ch2] * sin_v;
+                    q_rot[ch2] = orig_q[ch1] * sin_v + orig_q[ch2] * cos_v;
+                    k_rot[ch1] = orig_k[ch1] * cos_v - orig_k[ch2] * sin_v;
+                    k_rot[ch2] = orig_k[ch1] * sin_v + orig_k[ch2] * cos_v;
+                }
+            }
+        }
+
+        // Backward un-rotate
+        rope_backward(&mut q_rot, &mut k_rot, n_heads, head_dim, seq, theta);
+
+        // Should match original
+        for i in 0..dim * seq {
+            assert!(
+                (q_rot[i] - orig_q[i]).abs() < 1e-5,
+                "rope roundtrip q[{i}]: got {}, expected {}",
+                q_rot[i], orig_q[i]
+            );
+            assert!(
+                (k_rot[i] - orig_k[i]).abs() < 1e-5,
+                "rope roundtrip k[{i}]: got {}, expected {}",
+                k_rot[i], orig_k[i]
+            );
+        }
     }
 }

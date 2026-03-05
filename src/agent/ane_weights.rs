@@ -40,6 +40,57 @@ pub struct ModelWeights {
 }
 
 // ---------------------------------------------------------------------------
+// RoPE blob generation
+// ---------------------------------------------------------------------------
+
+/// Generate precomputed RoPE cos/sin blobs as ANE BLOBFILE format.
+///
+/// Shape: [1, 1, seq, hd/2] fp16, packed with ANE blob header.
+/// Uses half-convention (split, not interleaved): standard for LLaMA/Qwen.
+pub fn generate_rope_blobs(seq: usize, head_dim: usize, theta: f64) -> (Vec<u8>, Vec<u8>) {
+    let half_hd = head_dim / 2;
+    let n = seq * half_hd;
+
+    let mut cos_data = vec![0.0f32; n];
+    let mut sin_data = vec![0.0f32; n];
+
+    for t in 0..seq {
+        for i in 0..half_hd {
+            let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+            let angle = t as f64 * freq;
+            cos_data[t * half_hd + i] = angle.cos() as f32;
+            sin_data[t * half_hd + i] = angle.sin() as f32;
+        }
+    }
+
+    (build_fp16_blob(&cos_data), build_fp16_blob(&sin_data))
+}
+
+/// Build an ANE blob with 128-byte header + fp16 data (same format as causal mask).
+fn build_fp16_blob(data: &[f32]) -> Vec<u8> {
+    let data_bytes = data.len() * 2;
+    let header_bytes = 128;
+    let mut blob = vec![0u8; header_bytes + data_bytes];
+
+    blob[0] = 1;
+    blob[4] = 2;
+    blob[64] = 0xEF;
+    blob[65] = 0xBE;
+    blob[66] = 0xAD;
+    blob[67] = 0xDE;
+    blob[68] = 1;
+    blob[72..76].copy_from_slice(&(data_bytes as u32).to_le_bytes());
+    blob[80..84].copy_from_slice(&(header_bytes as u32).to_le_bytes());
+
+    for (i, &v) in data.iter().enumerate() {
+        let fp16 = half::f16::from_f32(v);
+        let offset = header_bytes + i * 2;
+        blob[offset..offset + 2].copy_from_slice(&fp16.to_le_bytes());
+    }
+    blob
+}
+
+// ---------------------------------------------------------------------------
 // Weight transpose
 // ---------------------------------------------------------------------------
 
@@ -739,12 +790,17 @@ mod tests {
 
         let input_buf = pack_sdpa_fwd(&xnorm, &w_id, &w_id, &w_id, &w_id, &cfg);
         let mask_blob = build_causal_mask_blob(seq);
+        let (rope_cos_blob, rope_sin_blob) = generate_rope_blobs(seq, cfg.head_dim(), cfg.rope_theta);
 
         let spec = KernelSpec::for_kernel(&cfg, KernelType::SdpaFwd);
         let kernel = AneKernel::compile_multi_weights(
             &spec.mil_text,
-            &["@model_path/weights/mask.bin"],
-            &[&mask_blob],
+            &[
+                "@model_path/weights/mask.bin",
+                "@model_path/weights/rope_cos.bin",
+                "@model_path/weights/rope_sin.bin",
+            ],
+            &[&mask_blob, &rope_cos_blob, &rope_sin_blob],
             &[spec.input_bytes],
             &[spec.output_bytes],
         )

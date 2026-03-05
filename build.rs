@@ -12,6 +12,70 @@ fn safe_copy(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 fn main() {
+    // ANE (Apple Neural Engine) bridge — compile Obj-C dylib when `ane` feature is active.
+    #[cfg(feature = "ane")]
+    {
+        #[cfg(not(target_os = "macos"))]
+        compile_error!("The `ane` feature requires macOS with Apple Silicon");
+
+        #[cfg(target_os = "macos")]
+        {
+            let bridge_dir = std::path::Path::new("bridge/ane");
+            println!("cargo:rerun-if-changed=bridge/ane/ane_bridge.h");
+            println!("cargo:rerun-if-changed=bridge/ane/ane_bridge.m");
+
+            let status = std::process::Command::new("make")
+                .arg("-C")
+                .arg(bridge_dir)
+                .status()
+                .expect("Failed to run make for ANE bridge");
+            assert!(status.success(), "ANE bridge compilation failed");
+
+            let bridge_abs = std::fs::canonicalize(bridge_dir)
+                .expect("Failed to resolve bridge/ane path");
+            println!(
+                "cargo:rustc-link-search=native={}",
+                bridge_abs.display()
+            );
+            println!("cargo:rustc-link-lib=dylib=ane_bridge");
+            println!("cargo:rustc-link-lib=framework=Accelerate");
+
+            // Set install name on the dylib so it can be found at runtime
+            // relative to the executable, and also add rpath for the bridge dir.
+            let dylib_src = bridge_abs.join("libane_bridge.dylib");
+            let _ = std::process::Command::new("install_name_tool")
+                .args([
+                    "-id",
+                    "@rpath/libane_bridge.dylib",
+                    dylib_src.to_str().unwrap(),
+                ])
+                .status();
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+            println!(
+                "cargo:rustc-link-arg=-Wl,-rpath,{}",
+                bridge_abs.display()
+            );
+
+            // Copy dylib next to output binaries so @rpath finds it.
+            if let Ok(out_dir) = std::env::var("OUT_DIR") {
+                let mut target_dir = std::path::PathBuf::from(&out_dir);
+                while target_dir
+                    .file_name()
+                    .map_or(false, |f| f != "release" && f != "debug")
+                {
+                    if !target_dir.pop() {
+                        break;
+                    }
+                }
+                // Copy to target/debug (or release) and target/debug/deps
+                let _ = std::fs::copy(&dylib_src, target_dir.join("libane_bridge.dylib"));
+                let _ = std::fs::copy(
+                    &dylib_src,
+                    target_dir.join("deps/libane_bridge.dylib"),
+                );
+            }
+        }
+    }
     // When the voice feature is enabled, sherpa-rs links against libsherpa-onnx-c-api.so/.dylib
     // which gets copied to the target dir at build time. Set rpath so the binary can find
     // it at runtime relative to the executable ($ORIGIN on Linux, @executable_path on macOS)

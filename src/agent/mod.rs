@@ -71,3 +71,17 @@ pub mod validation;
 pub mod worker_tools;
 pub mod working_memory;
 pub(crate) mod gateway_commands;
+#[cfg(feature = "ane")]
+pub mod ane_bridge;
+#[cfg(feature = "ane")]
+pub mod ane_mil;
+#[cfg(feature = "ane")]
+pub mod ane_weights;
+#[cfg(feature = "ane")]
+pub mod ane_forward;
+#[cfg(feature = "ane")]
+pub mod ane_backward;
+#[cfg(feature = "ane")]
+pub mod ane_train;
+#[cfg(feature = "ane")]
+pub mod ane_lora;

@@ -113,6 +113,12 @@ lingua = { version = "1.7", default-features = false, features = [
 # Mime type guessing
 mime_guess = "2"
 
+# fp16 (half-precision) for ANE kernel I/O
+half = { version = "2", optional = true }
+
+# Memory-mapped file I/O for training data loader
+memmap2 = { version = "0.9", optional = true }
+
 # Accurate BPE token counting (cl100k_base, compatible with OpenAI/Claude)
 tiktoken-rs = "0.6"
 
@@ -150,6 +156,7 @@ cluster = ["dep:mdns-sd"]
 semantic = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 knowledge-graph = ["dep:petgraph"]
 lora = ["dep:qlora-rs", "dep:candle-core"]
+ane = ["dep:half", "dep:memmap2"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
 
 [dependencies.jack-voice]
 path = "../jack-voice/jack-voice"

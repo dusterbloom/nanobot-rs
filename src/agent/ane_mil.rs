@@ -302,8 +302,43 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> v4 = reshape(shape=qsh,x=vf)[name=string(\"rv\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> v = transpose(perm=pm,x=v4)[name=string(\"tv\")];");
 
-    // Q @ K^T
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string(\"mm1\")];");
+    // RoPE rotation (half-convention: split, not interleaved)
+    // Load precomputed cos/sin [1, 1, seq, hd/2] — broadcast across heads
+    let half_hd = hd / 2;
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{half_hd}]> rope_cos = const()[name=string(\"rc\"), val=tensor<fp16, [1,1,{seq},{half_hd}]>(BLOBFILE(path=string(\"@model_path/weights/rope_cos.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{half_hd}]> rope_sin = const()[name=string(\"rs\"), val=tensor<fp16, [1,1,{seq},{half_hd}]>(BLOBFILE(path=string(\"@model_path/weights/rope_sin.bin\"), offset=uint64(64)))];");
+
+    // Slice Q into halves: q1 = q[:,:,:,:hd/2], q2 = q[:,:,:,hd/2:]
+    let _ = writeln!(m, "        tensor<int32, [4]> rp_b0 = const()[name=string(\"rpb0\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rp_sh = const()[name=string(\"rpsh\"), val=tensor<int32, [4]>([1,{heads},{seq},{half_hd}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1 = slice_by_size(x=q,begin=rp_b0,size=rp_sh)[name=string(\"q1\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rp_bh = const()[name=string(\"rpbh\"), val=tensor<int32, [4]>([0,0,0,{half_hd}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2 = slice_by_size(x=q,begin=rp_bh,size=rp_sh)[name=string(\"q2\")];");
+
+    // q_rot = concat(q1*cos - q2*sin, q1*sin + q2*cos)
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1c = mul(x=q1,y=rope_cos)[name=string(\"q1c\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2s = mul(x=q2,y=rope_sin)[name=string(\"q2s\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> qr1 = sub(x=q1c,y=q2s)[name=string(\"qr1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1s = mul(x=q1,y=rope_sin)[name=string(\"q1s\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2c = mul(x=q2,y=rope_cos)[name=string(\"q2c\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> qr2 = add(x=q1s,y=q2c)[name=string(\"qr2\")];");
+    let _ = writeln!(m, "        int32 rpax = const()[name=string(\"rpax\"), val=int32(-1)];");
+    let _ = writeln!(m, "        bool rpid = const()[name=string(\"rpid\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q_rot = concat(axis=rpax,interleave=rpid,values=(qr1,qr2))[name=string(\"qrot\")];");
+
+    // Same for K
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k1 = slice_by_size(x=k,begin=rp_b0,size=rp_sh)[name=string(\"k1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k2 = slice_by_size(x=k,begin=rp_bh,size=rp_sh)[name=string(\"k2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k1c = mul(x=k1,y=rope_cos)[name=string(\"k1c\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k2s = mul(x=k2,y=rope_sin)[name=string(\"k2s\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> kr1 = sub(x=k1c,y=k2s)[name=string(\"kr1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k1s = mul(x=k1,y=rope_sin)[name=string(\"k1s\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> k2c = mul(x=k2,y=rope_cos)[name=string(\"k2c\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> kr2 = add(x=k1s,y=k2c)[name=string(\"kr2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> k_rot = concat(axis=rpax,interleave=rpid,values=(kr1,kr2))[name=string(\"krot\")];");
+
+    // Q @ K^T (using rotated Q, K)
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q_rot,y=k_rot)[name=string(\"mm1\")];");
     let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];");
 
@@ -329,11 +364,17 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ot = transpose(perm=pm,x=om)[name=string(\"ot\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];");
 
-    // Output: concat(o_out, qf, kf, vf, af, xn)
+    // Reshape rotated Q, K back to [1, dim, 1, seq] for output
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> qrt = transpose(perm=pm,x=q_rot)[name=string(\"qrt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> qrf = reshape(shape=os,x=qrt)[name=string(\"qrf\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> krt = transpose(perm=pm,x=k_rot)[name=string(\"krt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> krf = reshape(shape=os,x=krt)[name=string(\"krf\")];");
+
+    // Output: concat(o_out, qf_rotated, kf_rotated, vf, af, xn)
     let out_ch = 6 * dim;
     let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
     let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(oo,qf,kf,vf,af,xn))[name=string(\"cat\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(oo,qrf,krf,vf,af,xn))[name=string(\"cat\")];");
     let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
     let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out32 = cast(dtype=to32,x=out)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (out32);");
@@ -799,6 +840,7 @@ pub fn build_causal_mask_blob(seq: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::agent::ane_bridge::{self, AneKernel};
+    use crate::agent::ane_weights::generate_rope_blobs;
 
     fn init_ane() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -963,13 +1005,18 @@ mod tests {
         let out_ch = 6 * cfg.dim;
         let output_bytes = out_ch * cfg.seq_len * 4;
 
-        // Build causal mask blob
+        // Build causal mask blob and rope blobs
         let mask_blob = build_causal_mask_blob(cfg.seq_len);
+        let (rope_cos_blob, rope_sin_blob) = generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
 
         let kernel = AneKernel::compile_multi_weights(
             &mil,
-            &["@model_path/weights/mask.bin"],
-            &[&mask_blob],
+            &[
+                "@model_path/weights/mask.bin",
+                "@model_path/weights/rope_cos.bin",
+                "@model_path/weights/rope_sin.bin",
+            ],
+            &[&mask_blob, &rope_cos_blob, &rope_sin_blob],
             &[input_bytes],
             &[output_bytes],
         )
