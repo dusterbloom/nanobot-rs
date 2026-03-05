@@ -203,6 +203,23 @@ enum Commands {
         #[command(subcommand)]
         action: VoiceAction,
     },
+    /// Start OpenAI-compatible MLX inference server for local LoRA models.
+    #[cfg(feature = "mlx")]
+    #[command(name = "mlx-serve")]
+    MlxServe {
+        /// Path to MLX model directory (containing .safetensors + tokenizer.json).
+        #[arg(short, long)]
+        model_dir: Option<String>,
+        /// Model config preset: "qwen3-1.7b" or "qwen3.5-2b".
+        #[arg(long, default_value = "qwen3.5-2b")]
+        preset: String,
+        /// Host to bind to.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on.
+        #[arg(short, long, default_value_t = 8766)]
+        port: u16,
+    },
 }
 
 #[cfg(feature = "voice")]
@@ -773,6 +790,35 @@ fn main() {
             }
             VoiceAction::Config => cli::cmd_voice_config(),
         },
+        #[cfg(feature = "mlx")]
+        Commands::MlxServe { model_dir, preset, host, port } => {
+            let model_dir = model_dir
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var("HOME").expect("HOME not set");
+                    std::path::PathBuf::from(home)
+                        .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
+                });
+            let model_config = match preset.as_str() {
+                "qwen3-1.7b" => crate::agent::mlx_lora::ModelConfig::qwen3_1_7b(),
+                "qwen3.5-2b" | _ => crate::agent::mlx_lora::ModelConfig::qwen3_5_2b(),
+            };
+            let server_cfg = crate::agent::mlx_server::MlxServerConfig {
+                model_dir,
+                model_config,
+                lora_config: crate::agent::mlx_lora::LoraConfig {
+                    lr: 1e-5,  // mlx_lm default; 5e-4 causes NaN on real sequences
+                    ..crate::agent::mlx_lora::LoraConfig::default()
+                },
+                host,
+                port,
+            };
+            let runtime = tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime");
+            if let Err(e) = runtime.block_on(crate::agent::mlx_server::serve(server_cfg)) {
+                eprintln!("MLX server error: {e}");
+            }
+        }
     }
 }
 

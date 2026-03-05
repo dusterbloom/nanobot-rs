@@ -87,3 +87,5 @@ pub mod ane_train;
 pub mod ane_lora;
 #[cfg(feature = "mlx")]
 pub mod mlx_lora;
+#[cfg(feature = "mlx")]
+pub mod mlx_server;

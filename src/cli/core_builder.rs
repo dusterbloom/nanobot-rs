@@ -1,0 +1,501 @@
+//! Core handle construction, agent loop creation, and local provider wiring.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
+use super::*;
+use crate::agent::agent_loop::{
+    build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle,
+    SwappableCoreConfig,
+};
+use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::config::schema::{AdaptiveTokenConfig, Config};
+use crate::cron::service::CronService;
+use crate::providers::base::LLMProvider;
+use crate::providers::factory;
+use crate::providers::jit_gate::JitGate;
+
+/// Return the appropriate context window size for a cloud model.
+///
+/// Scale max tool iterations with context size.
+///
+/// Cloud models with large context windows (128K+) can use many more tool
+/// iterations without risking context exhaustion. Local models with tight
+/// context (16K-32K) need a lower cap to leave room for the actual
+/// conversation.
+///
+/// Returns the configured value unchanged when it's already appropriate,
+/// or scales it up/down based on available context.
+pub(crate) fn effective_max_iterations(
+    configured: u32,
+    max_context_tokens: usize,
+    is_local: bool,
+) -> u32 {
+    if is_local {
+        // Local models: cap at 15 to preserve limited context.
+        configured.min(15)
+    } else {
+        // Cloud models: scale up with context. Each tool iteration uses
+        // ~500-1500 tokens on average, so even 50 iterations at 1M context
+        // is only ~5% of the budget.
+        // ~25 at 128K, ~40 at 500K, ~50 at 1M+
+        let context_scaled = (max_context_tokens / 4000).min(50) as u32;
+        configured.max(context_scaled)
+    }
+}
+
+/// Models with known large context windows get their full capacity;
+/// everything else uses the config default (128K).
+pub(super) fn model_context_size(model: &str, config_default: usize) -> usize {
+    let m = model.to_lowercase();
+    if m.contains("opus") || m.contains("sonnet") || m.contains("claude") {
+        // Claude 4.x family: 1M token context
+        config_default.max(1_000_000)
+    } else if m.contains("gemini") {
+        config_default.max(1_000_000)
+    } else {
+        config_default
+    }
+}
+
+/// Strip GGUF quantisation suffix and extension from a model filename to get
+/// the bare model identifier that LM Studio / remote servers recognise.
+///
+/// Examples:
+///   "nanbeige4.1-3b-q8_0.gguf"          -> "nanbeige4.1-3b"
+///   "Qwen3-8B-Q4_K_M.gguf"              -> "Qwen3-8B"
+///   "ministral-3-8b-instruct-2512.gguf"  -> "ministral-3-8b-instruct-2512"
+///   "nanbeige4.1-3b"                     -> "nanbeige4.1-3b" (no-op)
+pub(crate) fn strip_gguf_suffix(name: &str) -> &str {
+    let name = name.strip_suffix(".gguf").unwrap_or(name);
+    // Match common quant patterns: -q8_0, -Q4_K_M, -IQ2_XS, -f16, -f32, etc.
+    // Pattern: last segment starting with `-[qQfFiI]` followed by digits/underscores/letters.
+    // Minimum 3 chars to avoid stripping model variant suffixes like `-i1` (imatrix).
+    if let Some(idx) = name.rfind('-') {
+        let suffix = &name[idx + 1..];
+        let first = suffix.as_bytes().first().copied().unwrap_or(0);
+        if matches!(first, b'q' | b'Q' | b'f' | b'F' | b'i' | b'I')
+            && suffix.len() >= 3
+            && suffix.as_bytes()[1].is_ascii_digit()
+        {
+            return &name[..idx];
+        }
+    }
+    name
+}
+
+/// Resolve the API base URL for a local role.
+///
+/// When `localApiBase` is set in config, ALL local providers share that URL
+/// (LM Studio JIT loading differentiates by model name, not by port).
+/// Otherwise falls back to `http://localhost:{port}/v1`.
+pub(super) fn local_base_url(config: &Config, fallback_port: &str) -> String {
+    let custom = &config.agents.defaults.local_api_base;
+    if !custom.is_empty() {
+        custom.clone()
+    } else {
+        format!("http://localhost:{}/v1", fallback_port)
+    }
+}
+
+/// Resolved local providers for all roles (main, compaction, delegation, specialist).
+pub(super) struct LocalProviders {
+    pub main: Arc<dyn LLMProvider>,
+    pub model_id: String,
+    pub compaction: Option<Arc<dyn LLMProvider>>,
+    pub delegation: Option<Arc<dyn LLMProvider>>,
+    pub specialist: Option<Arc<dyn LLMProvider>>,
+    pub max_context_tokens: usize,
+}
+
+/// Build providers for all local roles from config + endpoint resolution.
+///
+/// Endpoint priority per trio role:
+///   1. `trio.router_endpoint` / `trio.specialist_endpoint` (explicit URL+model)
+///   2. `localApiBase` + `trio.router_model` / `trio.specialist_model` (shared JIT server)
+///   3. Separate port fallback (delegation_port / specialist_port)
+///   4. None (disabled)
+pub(super) fn make_local_providers(
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
+) -> LocalProviders {
+    let has_custom_base = !config.agents.defaults.local_api_base.is_empty();
+    let base_url = local_base_url(config, local_port);
+
+    // Resolve main model name.
+    // Always strip GGUF suffix -- config may hold a .gguf filename even when
+    // using LM Studio, which expects clean identifiers.
+    let model_id = strip_gguf_suffix(local_model_name.unwrap_or("local-model")).to_string();
+
+    // Create JIT gate for JIT-loading servers (e.g. LM Studio).
+    // All providers sharing the same JIT endpoint get the same gate so requests
+    // are serialised -- prevents concurrent model switches that crash the server.
+    // Skip when lms CLI pre-loads models (skip_jit_gate = true).
+    let jit_gate: Option<Arc<JitGate>> = if has_custom_base && !config.agents.defaults.skip_jit_gate
+    {
+        Some(Arc::new(JitGate::new()))
+    } else {
+        None
+    };
+
+    let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
+        factory::ProviderSpec::local(&base_url, Some(&model_id))
+            .with_jit_gate_opt(jit_gate.clone())
+            .with_timeout_config(&config.timeouts)
+            .with_retry(config.retry.clone()),
+    );
+
+    // Auto-detect context size from local server; fall back to config default.
+    let max_context_tokens = if !has_custom_base {
+        crate::server::query_local_context_size(local_port)
+            .unwrap_or(config.agents.defaults.local_max_context_tokens)
+    } else {
+        config.agents.defaults.local_max_context_tokens
+    };
+
+    // Compaction provider (separate port only).
+    let compaction: Option<Arc<dyn LLMProvider>> =
+        compaction_port.map(|p| -> Arc<dyn LLMProvider> {
+            factory::create_openai_compat(
+                factory::ProviderSpec::local(&local_base_url(config, p), None)
+                    .with_jit_gate_opt(jit_gate.clone())
+                    .with_timeout_config(&config.timeouts)
+                    .with_retry(config.retry.clone()),
+            )
+        });
+
+    // Helper: create a provider for a trio role with endpoint resolution.
+    let make_role_provider = |role_name: &str,
+                              endpoint: &Option<crate::config::schema::ModelEndpoint>,
+                              trio_model: &str,
+                              fallback_port: Option<&str>|
+     -> Option<Arc<dyn LLMProvider>> {
+        // Priority 1: explicit endpoint (url + model)
+        if let Some(ep) = endpoint {
+            // Use JIT gate if endpoint URL matches the shared base (same server).
+            let gate = jit_gate.as_ref().filter(|_| ep.url == base_url).cloned();
+            return Some(factory::create_openai_compat(factory::ProviderSpec {
+                api_key: role_name.to_string(),
+                api_base: Some(ep.url.clone()),
+                model: Some(ep.model.clone()),
+                jit_gate: gate,
+                retry: config.retry.clone(),
+                timeout_secs: config.timeouts.provider_http_secs,
+                lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
+            }));
+        }
+
+        // Priority 2: shared JIT server (localApiBase set) + trio model name
+        if has_custom_base {
+            let model = if !trio_model.is_empty() {
+                trio_model
+            } else {
+                role_name
+            };
+            return Some(factory::create_openai_compat(
+                factory::ProviderSpec::local(&base_url, Some(model))
+                    .with_jit_gate_opt(jit_gate.clone())
+                    .with_timeout_config(&config.timeouts)
+                    .with_retry(config.retry.clone()),
+            ));
+        }
+
+        // Priority 3: separate port fallback
+        fallback_port.map(|p| -> Arc<dyn LLMProvider> {
+            factory::create_openai_compat(
+                factory::ProviderSpec::local(&local_base_url(config, p), Some(role_name))
+                    .with_timeout_config(&config.timeouts)
+                    .with_retry(config.retry.clone()),
+            )
+        })
+    };
+
+    let delegation = if config.tool_delegation.enabled || config.trio.enabled {
+        make_role_provider(
+            "local-delegation",
+            &config.trio.router_endpoint,
+            &config.trio.router_model,
+            delegation_port,
+        )
+    } else {
+        None
+    };
+
+    let specialist = if config.trio.enabled {
+        make_role_provider(
+            "local-specialist",
+            &config.trio.specialist_endpoint,
+            &config.trio.specialist_model,
+            specialist_port,
+        )
+    } else {
+        None
+    };
+
+    LocalProviders {
+        main,
+        model_id,
+        compaction,
+        delegation,
+        specialist,
+        max_context_tokens,
+    }
+}
+
+pub(crate) fn build_core_handle(
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
+    is_local: bool,
+) -> SharedCoreHandle {
+    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+        let lp = make_local_providers(
+            config,
+            local_port,
+            local_model_name,
+            compaction_port,
+            delegation_port,
+            specialist_port,
+        );
+        let model = format!("local:{}", lp.model_id);
+        (
+            lp.main,
+            model,
+            lp.max_context_tokens,
+            lp.compaction,
+            lp.delegation,
+            lp.specialist,
+        )
+    } else {
+        let provider = create_provider(config);
+        let model = config.agents.defaults.model.clone();
+        let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
+        (provider, model, ctx, None, None, None)
+    };
+
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
+
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        is_local,
+    );
+
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace: config.workspace_path(),
+        model,
+        max_iterations: max_iters,
+        max_continuations: config.agents.defaults.max_continuations,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
+        max_context_tokens,
+        brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
+        is_local,
+        compaction_provider: cp,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: dp,
+        specialist_provider: sp,
+        trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
+    });
+    let counters = Arc::new(RuntimeCounters::new_with_config(
+        max_context_tokens,
+        &config.trio.circuit_breaker,
+    ));
+    // When main_no_think is enabled, also suppress thinking display from the start
+    // so the user doesn't need to run /nothink manually each session.
+    if config.trio.main_no_think {
+        counters
+            .suppress_thinking_in_tts
+            .store(true, Ordering::Relaxed);
+    }
+    AgentHandle::new(core, counters)
+}
+
+/// Rebuild the shared core for `/local` toggle or `/model` swap.
+///
+/// All agents sharing this handle see the new provider on their next message.
+pub(crate) fn rebuild_core(
+    handle: &SharedCoreHandle,
+    config: &Config,
+    local_port: &str,
+    local_model_name: Option<&str>,
+    compaction_port: Option<&str>,
+    delegation_port: Option<&str>,
+    specialist_port: Option<&str>,
+    is_local: bool,
+) {
+    let (provider, model, max_context_tokens, cp, dp, sp) = if is_local {
+        let lp = make_local_providers(
+            config,
+            local_port,
+            local_model_name,
+            compaction_port,
+            delegation_port,
+            specialist_port,
+        );
+        let model = format!("local:{}", lp.model_id);
+        (
+            lp.main,
+            model,
+            lp.max_context_tokens,
+            lp.compaction,
+            lp.delegation,
+            lp.specialist,
+        )
+    } else {
+        let provider = create_provider(config);
+        let model = config.agents.defaults.model.clone();
+        let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
+        (provider, model, ctx, None, None, None)
+    };
+
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
+
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        is_local,
+    );
+
+    let new_core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace: config.workspace_path(),
+        model,
+        max_iterations: max_iters,
+        max_continuations: config.agents.defaults.max_continuations,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
+        max_context_tokens,
+        brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
+        is_local,
+        compaction_provider: cp,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: dp,
+        specialist_provider: sp,
+        trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
+    });
+    // Swap only the core; counters survive.
+    handle.swap_core(new_core);
+    // Update max context since the new model may have a different size.
+    handle
+        .counters
+        .last_context_max
+        .store(max_context_tokens as u64, Ordering::Relaxed);
+    // Reset delegation health -- new core may have a fresh delegation server.
+    handle
+        .counters
+        .delegation_healthy
+        .store(true, Ordering::Relaxed);
+    handle
+        .counters
+        .delegation_retry_counter
+        .store(0, Ordering::Relaxed);
+}
+
+/// Create an agent loop with per-instance channels, using the shared core handle.
+pub(crate) fn create_agent_loop(
+    core_handle: SharedCoreHandle,
+    config: &Config,
+    cron_service: Option<Arc<CronService>>,
+    email_config: Option<crate::config::schema::EmailConfig>,
+    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+) -> AgentLoop {
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+
+    let mut lcm_config = config.lcm.clone();
+    if core_handle.swappable().is_local && !lcm_config.enabled {
+        tracing::info!("Auto-enabling LCM for local mode");
+        lcm_config.enabled = true;
+    }
+
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        cron_service,
+        config.agents.defaults.max_concurrent_chats,
+        email_config,
+        repl_display_tx,
+        Some(config.providers.clone()),
+        config.proprioception.clone(),
+        lcm_config,
+        health_registry,
+    );
+
+    agent_loop
+}
+
+/// Set up cluster discovery for REPL path. Returns the ClusterState so callers
+/// can store it for /cluster command access.
+///
+/// Must be called after `create_agent_loop` -- attaches a `ClusterRouter` to the
+/// existing agent loop and starts the background discovery task.
+#[cfg(feature = "cluster")]
+pub(crate) fn setup_cluster_for_repl(
+    agent_loop: &mut AgentLoop,
+    config: &Config,
+) -> Option<Arc<crate::cluster::state::ClusterState>> {
+    if !config.cluster.enabled {
+        return None;
+    }
+    let cluster_state = crate::cluster::state::ClusterState::new();
+    let discovery = crate::cluster::discovery::ClusterDiscovery::new(
+        config.cluster.clone(),
+        cluster_state.clone(),
+    );
+    let _discovery_handle = discovery.run();
+    tracing::info!("cluster_discovery_started");
+    let router = Arc::new(crate::cluster::router::ClusterRouter::new(
+        cluster_state.clone(),
+        config.cluster.clone(),
+    ));
+    agent_loop.set_cluster_router(router);
+    Some(Arc::new(cluster_state))
+}

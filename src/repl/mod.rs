@@ -382,6 +382,8 @@ pub(crate) fn print_help() {
     println!("  /trio cap <GB>  - Set VRAM cap (e.g. /trio cap 12)");
     println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
     println!("  /think, /t      - Toggle extended thinking (/thinking on|off|N)");
+    println!("  /nothink, /nt   - Disable extended thinking");
+    println!("  /long           - Set large output budget (/long on|off|N)");
     println!("  /voice, /v      - Toggle voice mode (Ctrl+Space or Enter to speak)");
     println!("  /whatsapp, /wa  - Start WhatsApp channel (runs alongside chat)");
     println!("  /telegram, /tg  - Start Telegram channel (runs alongside chat)");
@@ -401,6 +403,8 @@ pub(crate) fn print_help() {
     println!("  /verify         - Re-verify claims in last response");
     println!("  /provenance     - Toggle provenance display on/off");
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
+    println!("  /adapt          - LoRA adapter management (status, run, scale)");
+    println!("  /skill, /sk     - Manage skills (list, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
 }
