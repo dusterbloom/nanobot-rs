@@ -1014,7 +1014,15 @@ impl MlxLoraDecoderLayer {
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attn {
             AttentionKind::Full(attn) => attn.forward(&h, mask)?,
-            AttentionKind::Linear(attn) => attn.forward(&h)?,
+            AttentionKind::Linear(attn) => {
+                // Stop gradient through GDN recurrence to prevent NaN during backward.
+                // The GDN sequential loop's backward has exponentially growing gradients
+                // (verified: grad_norm=inf at T=64 even in Python mlx_lm). Python avoids
+                // this by using a non-differentiable Metal kernel for GDN forward.
+                // Gradient still flows through the residual connection, so MLP LoRA
+                // params in all layers (including GDN layers) still receive gradients.
+                mlx_rs::stop_gradient(&attn.forward(&h)?)?
+            },
         };
         let x = h.add(residual)?;
 
@@ -1699,6 +1707,53 @@ mod tests {
         }
         assert!(losses.len() >= 2);
         assert!(losses.last().unwrap() < &losses[0], "loss should decrease");
+    }
+
+    /// Regression test: train on real ChatML-tokenized conversation.
+    /// Previously produced NaN gradients because the GDN recurrence backward
+    /// has exponentially growing gradients (verified: inf at T=64 in Python).
+    /// Fixed by applying stop_gradient to GDN attention output.
+    #[test]
+    fn test_e2e_qwen3_5_2b_chatml_no_nan() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig { lr: 1e-5, ..LoraConfig::default() };
+
+        eprintln!("loading model for ChatML NaN regression test...");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        let tokenizer = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
+
+        // Real ChatML conversation — the exact pattern that previously caused NaN
+        let text = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+                    <|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+                    <|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n\
+                    <|im_start|>user\nWhat about Germany?<|im_end|>\n\
+                    <|im_start|>assistant\nThe capital of Germany is Berlin.<|im_end|>\n";
+        let all_tokens = tokenizer.encode(text).expect("tokenize failed");
+        eprintln!("  ChatML tokens: {}, first 10: {:?}", all_tokens.len(), &all_tokens[..10.min(all_tokens.len())]);
+
+        let input = Array::from_slice(&all_tokens[..all_tokens.len() - 1], &[1, (all_tokens.len() - 1) as i32]);
+        let target = Array::from_slice(&all_tokens[1..], &[1, (all_tokens.len() - 1) as i32]);
+
+        let losses = train_loop(
+            &mut model, &[input], &[target],
+            &lora_cfg, 3, 0.5, 10,
+        ).expect("training failed — likely NaN gradient regression");
+
+        for (i, l) in losses.iter().enumerate() {
+            eprintln!("  step {i}: loss={l:.4}");
+            assert!(l.is_finite(), "step {i} loss is NaN/Inf: {l}");
+        }
+        assert!(losses.len() >= 2);
+        assert!(losses.last().unwrap() < &losses[0], "loss should decrease: {:.4} -> {:.4}", losses[0], losses.last().unwrap());
     }
 
     /// Load a raw f32 binary tensor from a reference directory under tests/

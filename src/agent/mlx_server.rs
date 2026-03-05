@@ -624,7 +624,9 @@ mod tests {
         let prompt = apply_chat_template(&messages);
         assert!(prompt.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
         assert!(prompt.contains("<|im_start|>user\nHi<|im_end|>"));
-        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+        // Ends with assistant prefill including empty think block (think-skip)
+        assert!(prompt.contains("<|im_start|>assistant\n"));
+        assert!(prompt.ends_with("<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -635,7 +637,7 @@ mod tests {
         let prompt = apply_chat_template(&messages);
         assert_eq!(
             prompt,
-            "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+            "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
     }
 }
