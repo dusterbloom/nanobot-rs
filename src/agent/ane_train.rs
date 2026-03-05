@@ -90,12 +90,18 @@ pub struct TrainingConfig {
     pub adam_beta1: f32,
     pub adam_beta2: f32,
     pub adam_eps: f32,
+    pub weight_decay: f32,
     pub accum_steps: usize,
     pub warmup_steps: usize,
     pub grad_clip: f32,
     pub min_lr_frac: f32,
     pub ckpt_interval: usize,
     pub log_interval: usize,
+    /// Early stopping: halt when loss drops below this threshold.
+    /// Set to 0.0 to disable.
+    pub early_stop_loss: f32,
+    /// Early stopping patience: stop after this many consecutive steps below threshold.
+    pub early_stop_patience: usize,
 }
 
 impl Default for TrainingConfig {
@@ -106,12 +112,15 @@ impl Default for TrainingConfig {
             adam_beta1: 0.9,
             adam_beta2: 0.999,
             adam_eps: 1e-8,
+            weight_decay: 0.0,
             accum_steps: 10,
             warmup_steps: 100,
             grad_clip: 1.0,
             min_lr_frac: 0.1,
             ckpt_interval: 100,
             log_interval: 10,
+            early_stop_loss: 0.0,
+            early_stop_patience: 0,
         }
     }
 }
@@ -120,9 +129,10 @@ impl Default for TrainingConfig {
 // Adam update
 // ---------------------------------------------------------------------------
 
-/// Adam update: w -= lr * m_hat / (sqrt(v_hat) + eps)
+/// Decoupled AdamW update: apply weight decay separately from gradient step.
 ///
 /// `t` = optimizer step count (1-indexed, for bias correction).
+/// `wd` = weight decay coefficient (0.0 to disable, typical: 0.01).
 pub fn adam_update(
     w: &mut [f32],
     g: &[f32],
@@ -132,6 +142,7 @@ pub fn adam_update(
     b1: f32,
     b2: f32,
     eps: f32,
+    wd: f32,
 ) {
     debug_assert_eq!(w.len(), g.len());
     debug_assert_eq!(w.len(), state.m.len());
@@ -142,6 +153,10 @@ pub fn adam_update(
     let bc2 = 1.0 / (1.0 - b2.powi(t as i32));
 
     for i in 0..w.len() {
+        // Decoupled weight decay (AdamW): applied to weight, not gradient
+        if wd > 0.0 {
+            w[i] *= 1.0 - lr * wd;
+        }
         state.m[i] = b1 * state.m[i] + (1.0 - b1) * g[i];
         state.v[i] = b2 * state.v[i] + (1.0 - b2) * g[i] * g[i];
         let m_hat = state.m[i] * bc1;
@@ -266,7 +281,7 @@ fn adam_one(
     lr: f32,
     cfg: &TrainingConfig,
 ) {
-    adam_update(w, g, st, t, lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps);
+    adam_update(w, g, st, t, lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, cfg.weight_decay);
 }
 
 /// Apply Adam to all model weights using corresponding gradients.
@@ -440,6 +455,7 @@ impl TokenDataset {
 pub struct TrainingResult {
     pub final_loss: f32,
     pub steps_completed: usize,
+    pub early_stopped: bool,
 }
 
 /// Run the training loop.
@@ -464,6 +480,8 @@ pub fn train(
     let mut adam = ModelAdamState::zeros(model);
     let mut adam_t: usize = 0; // optimizer step counter (1-indexed when used)
     let mut last_loss = f32::NAN;
+    let mut early_stopped = false;
+    let mut patience_counter: usize = 0;
 
     for step in 0..cfg.total_steps {
         // 1. Sample
@@ -517,12 +535,25 @@ pub fn train(
                     eprintln!("checkpoint saved at step {adam_t}");
                 }
             }
+
+            // Early stopping
+            if cfg.early_stop_loss > 0.0 && last_loss < cfg.early_stop_loss {
+                patience_counter += 1;
+                if patience_counter >= cfg.early_stop_patience.max(1) {
+                    eprintln!("early stopping at step {adam_t}: loss {last_loss:.4} < {:.4}", cfg.early_stop_loss);
+                    early_stopped = true;
+                    break;
+                }
+            } else {
+                patience_counter = 0;
+            }
         }
     }
 
     Ok(TrainingResult {
         final_loss: last_loss,
         steps_completed: adam_t,
+        early_stopped,
     })
 }
 
@@ -826,7 +857,7 @@ mod tests {
         let eps = 1e-8;
 
         // Step 1
-        adam_update(&mut w, &g, &mut state, 1, lr, b1, b2, eps);
+        adam_update(&mut w, &g, &mut state, 1, lr, b1, b2, eps, 0.0);
 
         // m should be (1-b1)*g = 0.1*g
         for i in 0..3 {
@@ -853,7 +884,7 @@ mod tests {
 
         // Step 2 — moments should accumulate
         let w_after_1 = w.clone();
-        adam_update(&mut w, &g, &mut state, 2, lr, b1, b2, eps);
+        adam_update(&mut w, &g, &mut state, 2, lr, b1, b2, eps, 0.0);
         // Weights continue decreasing with same-sign gradient
         assert!(w[0] < w_after_1[0]);
         assert!(w[1] < w_after_1[1]);
@@ -867,11 +898,41 @@ mod tests {
         let mut state = AdamState::zeros(1);
         let lr = 0.01;
 
-        adam_update(&mut w, &[1.0], &mut state, 1, lr, 0.9, 0.999, 1e-8);
+        adam_update(&mut w, &[1.0], &mut state, 1, lr, 0.9, 0.999, 1e-8, 0.0);
         let after_pos = w[0];
-        adam_update(&mut w, &[-1.0], &mut state, 2, lr, 0.9, 0.999, 1e-8);
+        adam_update(&mut w, &[-1.0], &mut state, 2, lr, 0.9, 0.999, 1e-8, 0.0);
         // After negative grad, weight should move back toward zero
         assert!(w[0] > after_pos, "negative grad should push weight up");
+    }
+
+    #[test]
+    fn test_adam_weight_decay_shrinks_weights() {
+        let mut w = vec![1.0, 2.0, 3.0];
+        let g = vec![0.0, 0.0, 0.0]; // Zero gradient — only weight decay acts
+        let mut state = AdamState::zeros(3);
+        let lr = 0.01;
+        let wd = 0.1;
+
+        let w_before = w.clone();
+        adam_update(&mut w, &g, &mut state, 1, lr, 0.9, 0.999, 1e-8, wd);
+
+        // With zero gradient and wd > 0, weights should shrink toward zero
+        for i in 0..3 {
+            assert!(w[i].abs() < w_before[i].abs(),
+                "weight[{i}] should shrink: {:.6} → {:.6}", w_before[i], w[i]);
+        }
+    }
+
+    #[test]
+    fn test_early_stopping_config() {
+        let cfg = TrainingConfig {
+            total_steps: 1000,
+            early_stop_loss: 0.8,
+            early_stop_patience: 2,
+            ..Default::default()
+        };
+        assert_eq!(cfg.early_stop_loss, 0.8);
+        assert_eq!(cfg.early_stop_patience, 2);
     }
 
     #[test]

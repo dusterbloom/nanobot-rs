@@ -15,6 +15,11 @@ cargo test                   # Run all tests (unit tests are inline in each modu
 cargo test -- test_name      # Run a single test by name
 cargo test module::tests     # Run tests for a specific module
 RUST_LOG=debug cargo run -- agent -m "Hello"  # Run with debug logging
+
+# ANE tests (require Apple Silicon, use serial execution to avoid hardware contention)
+cargo build --features ane
+cargo test --features ane --lib -- "ane_" --test-threads=1
+cargo test --features ane --release --lib -- "bench_" --nocapture --test-threads=1  # Benchmarks
 ```
 
 No CI, no linter config, no integration tests. All tests are `#[cfg(test)] mod tests` inside their source files.
