@@ -109,40 +109,32 @@ fn validate_url(url_str: &str) -> Result<(), String> {
 // WebSearchTool
 // ---------------------------------------------------------------------------
 
-/// Search the web using SearXNG (default), Brave Search API, or Jina AI (zero-config fallback).
+/// Search the web using SearXNG (default) or Brave Search API.
 pub struct WebSearchTool {
     api_key: String,
     max_results: u32,
     provider: String,
     searxng_url: String,
-    jina_api_key: String,
     client: Client,
 }
 
 impl WebSearchTool {
     /// Create a new web search tool.
     ///
-    /// `provider` selects the backend: `"searxng"` (default), `"brave"`, or `"jina"`.
+    /// `provider` selects the backend: `"searxng"` (default) or `"brave"`.
     /// `searxng_url` is the base URL of the SearXNG instance (e.g. `"http://localhost:8888"`).
     ///
     /// If `api_key` is `None`, the `BRAVE_API_KEY` environment variable is
     /// checked. Passing `Some("")` explicitly disables env fallback.
-    /// If `jina_api_key` is `None`, the `JINA_API_KEY` environment variable is checked.
     pub fn new(
         api_key: Option<String>,
         max_results: u32,
         provider: String,
         searxng_url: String,
-        jina_api_key: Option<String>,
     ) -> Self {
         let resolved_key = match api_key {
             Some(key) => key,
             None => std::env::var("BRAVE_API_KEY").unwrap_or_default(),
-        };
-
-        let resolved_jina_key = match jina_api_key {
-            Some(key) => key,
-            None => std::env::var("JINA_API_KEY").unwrap_or_default(),
         };
 
         Self {
@@ -150,7 +142,6 @@ impl WebSearchTool {
             max_results,
             provider,
             searxng_url,
-            jina_api_key: resolved_jina_key,
             client: Client::new(),
         }
     }
@@ -211,8 +202,7 @@ impl Tool for WebSearchTool {
         match self.provider.as_str() {
             "searxng" => self.execute_searxng(query, count).await,
             "brave" => self.execute_brave(query, count).await,
-            "jina" => self.execute_jina(query, count).await,
-            other => format!("Error: unknown search provider '{}'. Use 'searxng', 'brave', or 'jina'.", other),
+            other => format!("Error: unknown search provider '{}'. Use 'searxng' or 'brave'.", other),
         }
     }
 
@@ -267,14 +257,12 @@ impl WebSearchTool {
                         result.push_str("\n(Fell back to Brave Search)");
                         return result;
                     }
-                    // No Brave key — fall through to Jina AI as last resort.
-                    tracing::warn!(
-                        "SearXNG returned HTTP {}, no Brave key, falling back to Jina AI",
+                    // No Brave key - return error
+                    return format!(
+                        "Error: SearXNG returned HTTP {} and no Brave API key configured. \
+                         Set 'braveApiKey' in config.json or fix SearXNG URL.",
                         status
                     );
-                    let mut result = self.execute_jina(query, count).await;
-                    result.push_str("\n(Fell back to Jina AI Search)");
-                    return result;
                 }
 
                 match response.json::<serde_json::Value>().await {
@@ -315,14 +303,12 @@ impl WebSearchTool {
                     result.push_str("\n(Fell back to Brave Search)");
                     return result;
                 }
-                // No Brave key — fall through to Jina AI as last resort.
-                tracing::warn!(
-                    "SearXNG unavailable ({}), no Brave key, falling back to Jina AI",
+                // No Brave key - return error
+                format!(
+                    "Error: SearXNG unavailable ({}) and no Brave API key configured. \
+                     Set 'braveApiKey' in config.json or fix SearXNG URL.",
                     e
-                );
-                let mut result = self.execute_jina(query, count).await;
-                result.push_str("\n(Fell back to Jina AI Search)");
-                result
+                )
             }
         }
     }
@@ -389,74 +375,10 @@ impl WebSearchTool {
             Err(e) => format!("Error: {}. Hint: check network connectivity.", e),
         }
     }
-
-    /// Execute a search via Jina AI Search. Works without an API key (rate-limited).
-    async fn execute_jina(&self, query: &str, count: u32) -> String {
-        let encoded_query = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-        let url = format!("https://s.jina.ai/{}", encoded_query);
-
-        let mut request = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json")
-            .timeout(std::time::Duration::from_secs(15));
-
-        if !self.jina_api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.jina_api_key));
-        }
-
-        match request.send().await {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    return format!(
-                        "Error: Jina AI Search returned HTTP {}: {}",
-                        status, body
-                    );
-                }
-
-                match response.json::<serde_json::Value>().await {
-                    Ok(data) => {
-                        let results = data
-                            .get("data")
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-
-                        if results.is_empty() {
-                            return format!("No results for: {}", query);
-                        }
-
-                        let mut lines = vec![format!("Results for: {}\n", query)];
-                        for (i, item) in results.iter().take(count as usize).enumerate() {
-                            let title =
-                                item.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                            let url =
-                                item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            lines.push(format!("{}. {}\n   {}", i + 1, title, url));
-
-                            // Jina uses "description" or "content" for snippets.
-                            if let Some(desc) = item
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| item.get("content").and_then(|v| v.as_str()))
-                            {
-                                // Truncate long content snippets.
-                                let snippet: String = desc.chars().take(300).collect();
-                                lines.push(format!("   {}", snippet));
-                            }
-                        }
-                        lines.join("\n")
-                    }
-                    Err(e) => format!("Error parsing Jina AI results: {}", e),
-                }
-            }
-            Err(e) => format!("Error: Jina AI Search failed: {}", e),
-        }
-    }
 }
 
+// ---------------------------------------------------------------------------
+// WebFetchTool
 // ---------------------------------------------------------------------------
 // WebFetchTool
 // ---------------------------------------------------------------------------
@@ -1047,13 +969,13 @@ mod tests {
 
     #[test]
     fn test_web_search_tool_name() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string(), None);
+        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
         assert_eq!(tool.name(), "web_search");
     }
 
     #[test]
     fn test_web_search_tool_parameters() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string(), None);
+        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
@@ -1076,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn test_web_search_no_api_key() {
         // With provider="brave" and no API key, expect the Brave key error.
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string(), None);
+        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
@@ -1088,7 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_no_api_key_has_hint() {
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string(), None);
+        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
@@ -1100,14 +1022,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_web_search_searxng_unavailable_falls_to_jina() {
-        // SearXNG provider with no Brave key and unreachable URL falls through to Jina.
+    async fn test_web_search_searxng_unavailable_no_brave_key() {
+        // SearXNG provider with no Brave key and unreachable URL should return error.
         let tool = WebSearchTool::new(
             Some(String::new()),
             5,
             "searxng".to_string(),
             "http://127.0.0.1:19999".to_string(), // nothing listening here
-            None,
         );
         let mut params = HashMap::new();
         params.insert(
@@ -1116,8 +1037,8 @@ mod tests {
         );
         let result = tool.execute(params).await;
         assert!(
-            result.contains("Jina") || result.contains("Results for"),
-            "Expected Jina fallback or results, got: {}",
+            result.contains("Error:") && result.contains("no Brave API key configured"),
+            "Expected error about no Brave key, got: {}",
             result
         );
     }
@@ -1130,7 +1051,6 @@ mod tests {
             5,
             "bing".to_string(),
             "http://localhost:8888".to_string(),
-            None,
         );
         // We check the provider field directly since execute is async
         assert_eq!(tool.provider, "bing");
@@ -1186,7 +1106,7 @@ mod tests {
     fn test_jina_config_defaults() {
         let json = r#"{}"#;
         let config: JinaReaderConfig = serde_json::from_str(json).unwrap();
-        assert!(config.enabled);
+        assert!(!config.enabled); // Default is now false (disabled)
         assert_eq!(config.url, "https://r.jina.ai");
         assert!(config.api_key.is_none());
     }
@@ -1307,32 +1227,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     }
 
     // -----------------------------------------------------------------------
-    // Jina AI search tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_explicit_jina_provider() {
-        let tool = WebSearchTool::new(
-            Some(String::new()),
-            5,
-            "jina".to_string(),
-            "http://localhost:8888".to_string(),
-            None,
-        );
-        let mut params = HashMap::new();
-        params.insert(
-            "query".to_string(),
-            serde_json::Value::String("rust programming".to_string()),
-        );
-        let result = tool.execute(params).await;
-        assert!(
-            !result.contains("SearXNG") && !result.contains("BRAVE_API_KEY"),
-            "Jina provider should not mention SearXNG or Brave: {}",
-            result
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Progress event emission tests
     // -----------------------------------------------------------------------
 
@@ -1346,7 +1240,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             5,
             "brave".to_string(),
             "http://localhost:8888".to_string(),
-            None,
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
@@ -1460,25 +1353,5 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             matches!(ev, ToolEvent::Progress { output_preview: Some(p), .. } if p.contains("Extracting content"))
         });
         assert!(has_extracting, "Expected 'Extracting content...' progress event");
-    }
-
-    #[test]
-    fn test_jina_url_construction() {
-        let query = "rust async await";
-        let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-        let url = format!("https://s.jina.ai/{}", encoded);
-        assert!(!url.contains(' '), "URL should not contain spaces: {}", url);
-        assert!(url.contains("rust"), "URL should contain query terms: {}", url);
-        assert!(url::Url::parse(&url).is_ok(), "Should be a valid URL: {}", url);
-    }
-
-    #[test]
-    fn test_jina_url_encoding_special_chars() {
-        let query = "what is C++ & Rust?";
-        let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-        let url = format!("https://s.jina.ai/{}", encoded);
-        assert!(!url.contains(' '), "No spaces: {}", url);
-        assert!(!url.contains('&'), "Ampersand should be encoded: {}", url);
-        assert!(url::Url::parse(&url).is_ok(), "Valid URL: {}", url);
     }
 }

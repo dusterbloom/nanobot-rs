@@ -68,7 +68,6 @@ impl AgentLoopShared {
             search_provider: core.search_provider.clone(),
             searxng_url: core.searxng_url.clone(),
             search_max_results: core.search_max_results,
-            jina_api_key: core.jina_api_key.clone(),
             exec_working_dir: std::env::current_dir()
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),

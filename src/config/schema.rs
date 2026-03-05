@@ -130,7 +130,10 @@ impl fmt::Debug for FeishuConfig {
             .field("app_id", &self.app_id)
             .field("app_secret", &crate::config::redact(&self.app_secret))
             .field("encrypt_key", &crate::config::redact(&self.encrypt_key))
-            .field("verification_token", &crate::config::redact(&self.verification_token))
+            .field(
+                "verification_token",
+                &crate::config::redact(&self.verification_token),
+            )
             .field("allow_from", &self.allow_from)
             .field("toolset", &self.toolset)
             .finish()
@@ -620,6 +623,35 @@ impl Default for GatewayConfig {
 // Tools configs
 // ---------------------------------------------------------------------------
 
+/// Jina Reader configuration for AI-powered web content extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JinaReaderConfig {
+    /// Enable Jina Reader for web_fetch tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Jina Reader URL. Default: "https://r.jina.ai".
+    #[serde(default = "default_jina_url")]
+    pub url: String,
+    /// Optional API key for Jina Reader.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_jina_url() -> String {
+    "https://r.jina.ai".to_string()
+}
+
+impl Default for JinaReaderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_jina_url(),
+            api_key: None,
+        }
+    }
+}
+
 /// Web search tool configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -632,9 +664,6 @@ pub struct WebSearchConfig {
     pub provider: String,
     #[serde(default = "default_searxng_url")]
     pub searxng_url: String,
-    /// Jina AI API key for zero-config web search fallback.
-    #[serde(default)]
-    pub jina_api_key: String,
     /// Auto-start SearXNG Docker container if not running. Default: true.
     #[serde(default = "default_true")]
     pub auto_start: bool,
@@ -659,7 +688,6 @@ impl fmt::Debug for WebSearchConfig {
             .field("max_results", &self.max_results)
             .field("provider", &self.provider)
             .field("searxng_url", &self.searxng_url)
-            .field("jina_api_key", &crate::config::redact(&self.jina_api_key))
             .field("auto_start", &self.auto_start)
             .finish()
     }
@@ -672,44 +700,7 @@ impl Default for WebSearchConfig {
             max_results: default_max_results(),
             provider: default_search_provider(),
             searxng_url: default_searxng_url(),
-            jina_api_key: String::new(),
             auto_start: default_true(),
-        }
-    }
-}
-
-fn default_jina_url() -> String {
-    "https://r.jina.ai".to_string()
-}
-
-/// Jina Reader configuration for AI-powered web content extraction.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JinaReaderConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_jina_url")]
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-}
-
-impl fmt::Debug for JinaReaderConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JinaReaderConfig")
-            .field("enabled", &self.enabled)
-            .field("url", &self.url)
-            .field("api_key", &crate::config::redact_opt(&self.api_key))
-            .finish()
-    }
-}
-
-impl Default for JinaReaderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_true(),
-            url: default_jina_url(),
-            api_key: None,
         }
     }
 }
@@ -720,6 +711,8 @@ impl Default for JinaReaderConfig {
 pub struct WebToolsConfig {
     #[serde(default)]
     pub search: WebSearchConfig,
+    #[serde(default)]
+    pub jina_reader: Option<JinaReaderConfig>,
 }
 
 /// Shell exec tool configuration.
@@ -1157,7 +1150,9 @@ pub struct MemoryConfig {
     /// When true, skills are loaded as names+descriptions only (not full content).
     /// The agent fetches full skill content on demand via the `read_skill` tool.
     /// This keeps the system prompt lean (RLM pattern: context as variable).
-    #[deprecated(note = "Superseded by `skill_disclosure` enum; set skill_disclosure = \"compact\" instead")]
+    #[deprecated(
+        note = "Superseded by `skill_disclosure` enum; set skill_disclosure = \"compact\" instead"
+    )]
     #[serde(default)]
     pub lazy_skills: bool,
 
@@ -1898,9 +1893,15 @@ pub struct ReasoningConfig {
     pub auto_checkpoint_before_exec: bool,
 }
 
-fn default_max_checkpoints() -> usize { 5 }
-fn default_step_budget() -> u32 { 5 }
-fn default_auto_checkpoint_before_exec() -> bool { true }
+fn default_max_checkpoints() -> usize {
+    5
+}
+fn default_step_budget() -> u32 {
+    5
+}
+fn default_auto_checkpoint_before_exec() -> bool {
+    true
+}
 
 impl Default for ReasoningConfig {
     fn default() -> Self {
@@ -1936,10 +1937,18 @@ pub struct TimeoutsConfig {
     pub lms_unload_secs: u64,
 }
 
-fn default_provider_http_secs() -> u64 { 120 }
-fn default_lms_native_probe_secs() -> u64 { 2 }
-fn default_lms_load_secs() -> u64 { 120 }
-fn default_lms_unload_secs() -> u64 { 30 }
+fn default_provider_http_secs() -> u64 {
+    120
+}
+fn default_lms_native_probe_secs() -> u64 {
+    2
+}
+fn default_lms_load_secs() -> u64 {
+    120
+}
+fn default_lms_unload_secs() -> u64 {
+    30
+}
 
 impl Default for TimeoutsConfig {
     fn default() -> Self {
@@ -1974,10 +1983,18 @@ pub struct RetryConfig {
     pub jit_max_secs: u64,
 }
 
-fn default_provider_retry_min_secs() -> u64 { 1 }
-fn default_provider_retry_max_secs() -> u64 { 30 }
-fn default_jit_retry_min_secs() -> u64 { 2 }
-fn default_jit_retry_max_secs() -> u64 { 8 }
+fn default_provider_retry_min_secs() -> u64 {
+    1
+}
+fn default_provider_retry_max_secs() -> u64 {
+    30
+}
+fn default_jit_retry_min_secs() -> u64 {
+    2
+}
+fn default_jit_retry_max_secs() -> u64 {
+    8
+}
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -2076,8 +2093,6 @@ pub struct Config {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub lcm: LcmSchemaConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jina_reader: Option<JinaReaderConfig>,
     #[serde(default)]
     pub model_capabilities:
         HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
@@ -2234,10 +2249,7 @@ mod tests {
     fn test_api_base_openrouter() {
         let mut cfg = Config::default();
         cfg.providers.openrouter.api_key = "key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(OPENROUTER_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(OPENROUTER_API_BASE.to_string()));
     }
 
     #[test]
@@ -2259,40 +2271,28 @@ mod tests {
     fn test_api_base_anthropic() {
         let mut cfg = Config::default();
         cfg.providers.anthropic.api_key = "sk-ant-key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(ANTHROPIC_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(ANTHROPIC_API_BASE.to_string()));
     }
 
     #[test]
     fn test_api_base_openai() {
         let mut cfg = Config::default();
         cfg.providers.openai.api_key = "sk-key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(OPENAI_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(OPENAI_API_BASE.to_string()));
     }
 
     #[test]
     fn test_api_base_groq() {
         let mut cfg = Config::default();
         cfg.providers.groq.api_key = "gsk_key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(GROQ_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(GROQ_API_BASE.to_string()));
     }
 
     #[test]
     fn test_api_base_deepseek() {
         let mut cfg = Config::default();
         cfg.providers.deepseek.api_key = "sk-ds-key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(DEEPSEEK_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(DEEPSEEK_API_BASE.to_string()));
     }
 
     #[test]
@@ -2400,10 +2400,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.providers.openrouter.api_key = "or-key".to_string();
         cfg.providers.anthropic.api_key = "ant-key".to_string();
-        assert_eq!(
-            cfg.get_api_base(),
-            Some(OPENROUTER_API_BASE.to_string())
-        );
+        assert_eq!(cfg.get_api_base(), Some(OPENROUTER_API_BASE.to_string()));
     }
 
     #[test]
@@ -2509,7 +2506,6 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.voice.language.is_none());
     }
-
 
     #[test]
     fn test_voice_config_tts_engine_default_is_pocket() {
@@ -2914,20 +2910,39 @@ mod tests {
         cfg.channels.feishu.app_secret = "feishu-secret".to_string();
         cfg.channels.email.password = "email-password".to_string();
         cfg.tools.web.search.api_key = "search-key".to_string();
-        cfg.tools.web.search.jina_api_key = "jina-key".to_string();
 
         let debug_output = format!("{:?}", cfg);
 
         // None of the secret values should appear in Debug output
-        assert!(!debug_output.contains(fake_key), "openrouter api_key leaked");
-        assert!(!debug_output.contains("anthropic-secret"), "anthropic api_key leaked");
-        assert!(!debug_output.contains("bot-token-secret"), "telegram token leaked");
-        assert!(!debug_output.contains("feishu-secret"), "feishu app_secret leaked");
-        assert!(!debug_output.contains("email-password"), "email password leaked");
-        assert!(!debug_output.contains("search-key"), "web search api_key leaked");
-        assert!(!debug_output.contains("jina-key"), "jina api_key leaked");
+        assert!(
+            !debug_output.contains(fake_key),
+            "openrouter api_key leaked"
+        );
+        assert!(
+            !debug_output.contains("anthropic-secret"),
+            "anthropic api_key leaked"
+        );
+        assert!(
+            !debug_output.contains("bot-token-secret"),
+            "telegram token leaked"
+        );
+        assert!(
+            !debug_output.contains("feishu-secret"),
+            "feishu app_secret leaked"
+        );
+        assert!(
+            !debug_output.contains("email-password"),
+            "email password leaked"
+        );
+        assert!(
+            !debug_output.contains("search-key"),
+            "web search api_key leaked"
+        );
 
         // Redaction markers should be present
-        assert!(debug_output.contains("[REDACTED"), "missing redaction markers");
+        assert!(
+            debug_output.contains("[REDACTED"),
+            "missing redaction markers"
+        );
     }
 }

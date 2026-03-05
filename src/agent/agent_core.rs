@@ -12,13 +12,16 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::agent::agent_profiles;
+use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
-use crate::agent::circuit_breaker::CircuitBreaker;
-use crate::config::schema::{AdaptiveTokenConfig, AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig};
+use crate::config::schema::{
+    AdaptiveTokenConfig, AntiDriftConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig,
+    ToolDelegationConfig, TrioConfig,
+};
 use crate::providers::base::LLMProvider;
 use crate::session::db::SessionDb;
 
@@ -49,7 +52,6 @@ pub struct SwappableCore {
     pub search_provider: String,
     pub searxng_url: String,
     pub search_max_results: u32,
-    pub jina_api_key: Option<String>,
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
     pub memory_enabled: bool,
@@ -226,7 +228,9 @@ impl RuntimeCounters {
             trio_metrics: TrioMetrics::default(),
             trio_circuit_breaker: parking_lot::Mutex::new(CircuitBreaker::new(cb_config)),
             trio_state: AtomicU8::new(TrioState::Standalone as u8),
-            specialist_memory: parking_lot::Mutex::new(crate::agent::router::SpecialistMemory::default()),
+            specialist_memory: parking_lot::Mutex::new(
+                crate::agent::router::SpecialistMemory::default(),
+            ),
         }
     }
 }
@@ -234,7 +238,9 @@ impl RuntimeCounters {
 impl RuntimeCounters {
     /// Update trio state, logging only on transitions.
     pub fn set_trio_state(&self, new_state: TrioState) {
-        let old = self.trio_state.swap(new_state as u8, std::sync::atomic::Ordering::Relaxed);
+        let old = self
+            .trio_state
+            .swap(new_state as u8, std::sync::atomic::Ordering::Relaxed);
         if old != new_state as u8 {
             match new_state {
                 TrioState::Active => tracing::info!("trio_state_transition: -> Active"),
@@ -316,7 +322,6 @@ pub struct SwappableCoreConfig {
     pub search_provider: String,
     pub searxng_url: String,
     pub search_max_results: u32,
-    pub jina_api_key: Option<String>,
     pub exec_timeout: u64,
     pub restrict_to_workspace: bool,
     pub memory_config: MemoryConfig,
@@ -328,7 +333,10 @@ pub struct SwappableCoreConfig {
     pub delegation_provider: Option<Arc<dyn LLMProvider>>,
     pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub trio_config: TrioConfig,
-    pub model_capabilities_overrides: std::collections::HashMap<String, crate::agent::model_capabilities::ModelCapabilitiesOverride>,
+    pub model_capabilities_overrides: std::collections::HashMap<
+        String,
+        crate::agent::model_capabilities::ModelCapabilitiesOverride,
+    >,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
     /// Interval in seconds between tool-heartbeat progress ticks (default: 2).
     pub tool_heartbeat_secs: u64,
@@ -357,7 +365,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         search_provider,
         searxng_url,
         search_max_results,
-        jina_api_key,
         exec_timeout,
         restrict_to_workspace,
         memory_config,
@@ -375,7 +382,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         health_check_timeout_secs,
         adaptive_tokens,
     } = cfg;
-    let model_capabilities = crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
+    let model_capabilities =
+        crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
     let router_provider = delegation_provider.clone();
     let mut context = if is_local {
         ContextBuilder::new_lite(&workspace)
@@ -425,19 +433,21 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         } else {
             model.clone()
         };
-        let mem_provider: Arc<dyn LLMProvider> = if let Some(ref mem_provider_cfg) =
-            memory_config.provider
-        {
-            crate::providers::factory::from_provider_config_for_model(mem_provider_cfg, Some(&mem_model))
-        } else if let Some(ref sp) = specialist_provider {
-            // Reuse trio specialist provider when no explicit memory provider.
-            sp.clone()
-        } else if let Some(cp) = compaction_provider {
-            cp
-        } else {
-            // In local mode, provider is already the local server — use it directly.
-            provider.clone()
-        };
+        let mem_provider: Arc<dyn LLMProvider> =
+            if let Some(ref mem_provider_cfg) = memory_config.provider {
+                crate::providers::factory::from_provider_config_for_model(
+                    mem_provider_cfg,
+                    Some(&mem_model),
+                )
+            } else if let Some(ref sp) = specialist_provider {
+                // Reuse trio specialist provider when no explicit memory provider.
+                sp.clone()
+            } else if let Some(cp) = compaction_provider {
+                cp
+            } else {
+                // In local mode, provider is already the local server — use it directly.
+                provider.clone()
+            };
         (mem_provider, mem_model)
     } else {
         // --- Cloud mode ---
@@ -455,7 +465,10 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         };
         let mem_provider: Arc<dyn LLMProvider> =
             if let Some(ref mem_provider_cfg) = memory_config.provider {
-                crate::providers::factory::from_provider_config_for_model(mem_provider_cfg, Some(&mem_model))
+                crate::providers::factory::from_provider_config_for_model(
+                    mem_provider_cfg,
+                    Some(&mem_model),
+                )
             } else {
                 provider.clone()
             };
@@ -559,7 +572,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         search_provider,
         searxng_url,
         search_max_results,
-        jina_api_key,
         exec_timeout,
         restrict_to_workspace,
         memory_enabled: memory_config.enabled,

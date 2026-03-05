@@ -30,16 +30,12 @@ pub struct ToolConfig {
     pub tools_filter: Option<Vec<String>>,
     /// Optional override for exec working directory.
     pub exec_working_dir: Option<String>,
-    /// Search backend: "searxng" (default), "brave", or "jina".
+    /// Search backend: "searxng" (default) or "brave".
     pub search_provider: String,
     /// Base URL of the SearXNG instance (default: "http://localhost:8888").
     pub searxng_url: String,
-    /// Max search results to return.
+    /// Maximum search results to return (default: 5).
     pub search_max_results: u32,
-    /// Jina AI API key for zero-config web search fallback.
-    pub jina_api_key: Option<String>,
-    /// Optional Jina Reader config for AI-powered web content extraction.
-    pub jina_config: Option<JinaReaderConfig>,
     /// Path to the SQLite sessions database for session_search tool.
     /// When `None`, the session_search tool is not registered.
     pub db_path: Option<PathBuf>,
@@ -62,8 +58,6 @@ impl ToolConfig {
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
             search_max_results: 5,
-            jina_api_key: None,
-            jina_config: None,
             db_path: None,
             code_execution: CodeExecutionConfig::default(),
         }
@@ -311,7 +305,6 @@ impl ToolRegistry {
                 config.search_max_results,
                 config.search_provider.clone(),
                 config.searxng_url.clone(),
-                config.jina_api_key.clone(),
             )));
         }
         if should_include("browser") {

@@ -132,7 +132,6 @@ pub struct SubagentManager {
     search_provider: String,
     searxng_url: String,
     search_max_results: u32,
-    jina_api_key: Option<String>,
     exec_timeout: u64,
     restrict_to_workspace: bool,
     is_local: bool,
@@ -211,7 +210,6 @@ impl SubagentManager {
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
             search_max_results: 5,
-            jina_api_key: None,
             exec_timeout,
             restrict_to_workspace,
             is_local,
@@ -284,12 +282,10 @@ impl SubagentManager {
         provider: String,
         searxng_url: String,
         max_results: u32,
-        jina_api_key: Option<String>,
     ) -> Self {
         self.search_provider = provider;
         self.searxng_url = searxng_url;
         self.search_max_results = max_results;
-        self.jina_api_key = jina_api_key;
         self
     }
 
@@ -441,7 +437,6 @@ impl SubagentManager {
         let search_provider = self.search_provider.clone();
         let searxng_url = self.searxng_url.clone();
         let search_max_results = self.search_max_results;
-        let jina_api_key = self.jina_api_key.clone();
         let exec_timeout = self.exec_timeout;
         let restrict_to_workspace = self.restrict_to_workspace;
         // Provider-routed subagents: check if the resolved API base is localhost.
@@ -473,7 +468,6 @@ impl SubagentManager {
                 &search_provider,
                 &searxng_url,
                 search_max_results,
-                jina_api_key.as_deref(),
                 exec_timeout,
                 restrict_to_workspace,
                 is_local,
@@ -743,7 +737,6 @@ impl SubagentManager {
                 &self.search_provider,
                 &self.searxng_url,
                 self.search_max_results,
-                self.jina_api_key.as_deref(),
                 self.exec_timeout,
                 self.restrict_to_workspace,
                 is_local,
@@ -892,7 +885,6 @@ impl SubagentManager {
         search_provider: &str,
         searxng_url: &str,
         search_max_results: u32,
-        jina_api_key: Option<&str>,
         exec_timeout: u64,
         restrict_to_workspace: bool,
         is_local: bool,
@@ -920,7 +912,6 @@ impl SubagentManager {
             search_provider: search_provider.to_string(),
             searxng_url: searxng_url.to_string(),
             search_max_results,
-            jina_api_key: jina_api_key.map(|s| s.to_string()),
             read_only: config.read_only,
             tools_filter: config.tools_filter.clone(),
             exec_working_dir: exec_working_dir.map(|s| s.to_string()),
@@ -1435,7 +1426,6 @@ mod tests {
             "searxng",
             "http://localhost:8888",
             5,
-            None,
             5,
             false,
             false, // is_local
@@ -1513,7 +1503,6 @@ mod tests {
             "searxng",
             "http://localhost:8888",
             5,
-            None,
             5,
             false,
             false, // is_local
