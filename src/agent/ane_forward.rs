@@ -593,6 +593,256 @@ pub fn forward_with_lora<T: TokenId>(
 }
 
 // ---------------------------------------------------------------------------
+// CPU-only forward pass (no ANE — for large-dim models where dynamic packing
+// exceeds IOSurface limits, and for correctness testing)
+// ---------------------------------------------------------------------------
+
+/// CPU matmul: out[M,S] = W[M,N] @ x[N,S] (row-major W, channels-first x).
+///
+/// W: [M, N] row-major — W[m*N + n]
+/// x: [N, S] channels-first — x[n*S + s]
+/// out: [M, S] — out[m*S + s]
+pub fn cpu_matmul(w: &[f32], x: &[f32], m: usize, n: usize, s: usize) -> Vec<f32> {
+    debug_assert_eq!(w.len(), m * n);
+    debug_assert_eq!(x.len(), n * s);
+    let mut out = vec![0.0f32; m * s];
+    for mi in 0..m {
+        for si in 0..s {
+            let mut acc = 0.0f32;
+            for ni in 0..n {
+                acc += w[mi * n + ni] * x[ni * s + si];
+            }
+            out[mi * s + si] = acc;
+        }
+    }
+    out
+}
+
+/// CPU RoPE rotation (half-convention, channels-first layout).
+///
+/// q/k: [dim, seq] where dim = n_heads * head_dim.
+/// Modifies q and k in-place.
+fn cpu_rope(q: &mut [f32], k: &mut [f32], n_heads: usize, head_dim: usize, seq: usize, theta: f64) {
+    let half_hd = head_dim / 2;
+    for h in 0..n_heads {
+        for t in 0..seq {
+            for i in 0..half_hd {
+                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+                let angle = t as f64 * freq;
+                let cos_v = angle.cos() as f32;
+                let sin_v = angle.sin() as f32;
+
+                let ch1 = (h * head_dim + i) * seq + t;
+                let ch2 = (h * head_dim + half_hd + i) * seq + t;
+
+                let q1 = q[ch1]; let q2 = q[ch2];
+                q[ch1] = q1 * cos_v - q2 * sin_v;
+                q[ch2] = q1 * sin_v + q2 * cos_v;
+
+                let k1 = k[ch1]; let k2 = k[ch2];
+                k[ch1] = k1 * cos_v - k2 * sin_v;
+                k[ch2] = k1 * sin_v + k2 * cos_v;
+            }
+        }
+    }
+}
+
+/// CPU scaled dot-product attention with causal mask.
+///
+/// q, k, v: [dim, seq] where dim = n_heads * head_dim.
+/// Returns: attn_out [dim, seq].
+fn cpu_sdpa(q: &[f32], k: &[f32], v: &[f32], n_heads: usize, head_dim: usize, seq: usize) -> Vec<f32> {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; n_heads * head_dim * seq];
+
+    for h in 0..n_heads {
+        // Compute scores[s1, s2] = sum_d q[h,d,s1] * k[h,d,s2] * scale
+        let mut scores = vec![0.0f32; seq * seq];
+        for s1 in 0..seq {
+            for s2 in 0..seq {
+                if s2 > s1 {
+                    scores[s1 * seq + s2] = f32::NEG_INFINITY; // causal mask
+                } else {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        let qi = q[(h * head_dim + d) * seq + s1];
+                        let ki = k[(h * head_dim + d) * seq + s2];
+                        dot += qi * ki;
+                    }
+                    scores[s1 * seq + s2] = dot * scale;
+                }
+            }
+        }
+
+        // Softmax per row
+        for s1 in 0..seq {
+            let row = &mut scores[s1 * seq..(s1 + 1) * seq];
+            let max_v = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                *v = (*v - max_v).exp();
+                sum += *v;
+            }
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        }
+
+        // out[h,d,s1] = sum_s2 scores[s1,s2] * v[h,d,s2]
+        for d in 0..head_dim {
+            for s1 in 0..seq {
+                let mut acc = 0.0f32;
+                for s2 in 0..seq {
+                    acc += scores[s1 * seq + s2] * v[(h * head_dim + d) * seq + s2];
+                }
+                out[(h * head_dim + d) * seq + s1] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// CPU SiLU activation: silu(x) = x * sigmoid(x).
+fn cpu_silu_inplace(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+/// CPU-only forward pass for large-dim models.
+///
+/// No ANE kernels needed — all ops run on CPU. Slower but works at any dimension.
+/// Supports QK-norm (Qwen3). Supports optional LoRA adapters.
+pub fn forward_cpu<T: TokenId>(
+    model: &ModelWeights,
+    lora: Option<&super::ane_lora::LoraModel>,
+    tokens: &[T],
+    targets: &[T],
+) -> ForwardResultWithLora {
+    use super::ane_lora::LoraLayerActivations;
+
+    let cfg = &model.cfg;
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let n_heads = cfg.n_heads;
+    let head_dim = cfg.head_dim();
+    let n_layers = model.layers.len();
+    let lora_scale = lora.map_or(0.0, |l| l.scale());
+
+    // 1. Embedding
+    let mut x_cur = vec![0.0f32; dim * seq];
+    embed_lookup(&mut x_cur, &model.embed, tokens, dim, seq);
+
+    let mut layer_acts = Vec::with_capacity(n_layers);
+    let mut lora_acts_vec = Vec::with_capacity(n_layers);
+
+    // 2. Transformer layers
+    for l in 0..n_layers {
+        let lw = &model.layers[l];
+        let lora_layer = lora.map(|lm| &lm.layers[l]);
+
+        let layer_in = x_cur.clone();
+
+        // RMSNorm before attention
+        let mut xnorm = vec![0.0f32; dim * seq];
+        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+
+        // QKV projections on CPU
+        let mut q = cpu_matmul(&lw.wq, &xnorm, dim, dim, seq);
+        let mut k = cpu_matmul(&lw.wk, &xnorm, dim, dim, seq);
+        let v = cpu_matmul(&lw.wv, &xnorm, dim, dim, seq);
+
+        // QK-norm (Qwen3)
+        let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
+            Some(qk_rmsnorm_fwd(&mut q, q_norm_w, n_heads, head_dim, seq, cfg.rms_eps))
+        } else { None };
+        let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
+            Some(qk_rmsnorm_fwd(&mut k, k_norm_w, n_heads, head_dim, seq, cfg.rms_eps))
+        } else { None };
+
+        // RoPE
+        cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
+
+        // Attention
+        let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+        // Wo projection
+        let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, dim, seq);
+
+        let mut lora_layer_acts = LoraLayerActivations::empty();
+
+        // LoRA on Wo
+        if let Some(ll) = lora_layer {
+            if let Some(wo_adapter) = ll.wo.as_ref() {
+                let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
+                super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                lora_layer_acts.wo_x = Some(attn_out.clone());
+                lora_layer_acts.wo_h = Some(wo_h);
+            }
+        }
+
+        // Residual
+        let mut x2 = x_cur.clone();
+        vec_add_inplace(&mut x2, &o_out);
+
+        // RMSNorm before FFN
+        let mut x2norm = vec![0.0f32; dim * seq];
+        rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+
+        // FFN: gate = silu(W1 @ x2norm) * (W3 @ x2norm)
+        let mut h1 = cpu_matmul(&lw.w1, &x2norm, hidden, dim, seq);
+        let h3 = cpu_matmul(&lw.w3, &x2norm, hidden, dim, seq);
+        cpu_silu_inplace(&mut h1);
+        let mut gate = vec![0.0f32; hidden * seq];
+        for i in 0..hidden * seq {
+            gate[i] = h1[i] * h3[i];
+        }
+
+        // FFN W2
+        let mut ffn_out = cpu_matmul(&lw.w2, &gate, dim, hidden, seq);
+
+        // LoRA on W2
+        if let Some(ll) = lora_layer {
+            if let Some(w2_adapter) = ll.w2.as_ref() {
+                let (w2_delta, w2_h) = w2_adapter.forward_cpu(&gate, seq);
+                super::ane_lora::vec_add_scaled(&mut ffn_out, &w2_delta, lora_scale);
+                lora_layer_acts.w2_x = Some(gate.clone());
+                lora_layer_acts.w2_h = Some(w2_h);
+            }
+        }
+
+        // Residual
+        x_cur = x2.clone();
+        vec_add_inplace(&mut x_cur, &ffn_out);
+
+        layer_acts.push(LayerActivations {
+            layer_in, xnorm, q, k, v, attn_out, o_out, x2, x2norm,
+            h1, h3, gate, ffn_out, q_pre_norm, k_pre_norm,
+        });
+        lora_acts_vec.push(lora_layer_acts);
+    }
+
+    // 3. Final RMSNorm
+    let mut x_final = vec![0.0f32; dim * seq];
+    rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+
+    // 4. Classifier
+    let vocab = model.vocab_size;
+    let mut logits = vec![0.0f32; vocab * seq];
+    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
+    classifier_forward(&mut logits, cls_w, &x_final, vocab, dim, seq);
+
+    // 5. Cross-entropy loss
+    let (loss, dlogits) = cross_entropy_loss(&logits, targets, vocab, seq);
+
+    ForwardResultWithLora {
+        base: ForwardResult { logits, loss, dlogits, layer_acts },
+        lora_acts: lora_acts_vec,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1091,5 +1341,137 @@ mod tests {
                 k_rot[i], orig_k[i]
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Qwen3-1.7B forward smoke test (requires ANE + model weights)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_e2e_qwen3_forward_smoke() {
+        use super::super::ane_weights::ModelWeights;
+
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-1.7B not found, skipping E2E forward test");
+            return;
+        }
+
+        // Qwen3-1.7B: dim=2048, hidden=6144, 16 heads, 8 KV heads, head_dim=128
+        let seq = 4; // small seq to keep classifier (vocab=151936) tractable on CPU
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 16,
+            seq_len: seq,
+            n_kv_heads: 8,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+        };
+
+        eprintln!("loading Qwen3-1.7B weights...");
+        let t0 = std::time::Instant::now();
+        let model = ModelWeights::from_mlx_safetensors(&model_dir, &cfg)
+            .expect("from_mlx_safetensors failed");
+        eprintln!("loaded in {}ms", t0.elapsed().as_millis());
+
+        let tokens: Vec<u32> = (100..100 + seq as u32).collect();
+        let targets: Vec<u32> = (101..101 + seq as u32).collect();
+
+        // CPU-only forward (ANE dynamic packing exceeds IOSurface limits at dim=2048)
+        eprintln!("running CPU forward pass (28 layers, vocab={})", model.vocab_size);
+        let t0 = std::time::Instant::now();
+        let result = forward_cpu(&model, None, &tokens, &targets);
+        let fwd_ms = t0.elapsed().as_millis();
+
+        let r = &result.base;
+        assert!(r.loss.is_finite(), "loss not finite: {}", r.loss);
+        assert!(r.loss > 0.0, "loss should be positive: {}", r.loss);
+        assert_eq!(r.layer_acts.len(), 28);
+        assert_eq!(r.logits.len(), model.vocab_size * seq);
+
+        // With real trained weights, loss should be well below ln(151936) ~ 11.9
+        eprintln!("E2E forward: loss={:.4}, time={}ms", r.loss, fwd_ms);
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: Qwen3-1.7B LoRA training test (requires ANE + model weights)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_e2e_qwen3_lora_training() {
+        use super::super::ane_lora::{LoraConfig, LoraModel, LoraModelAdam};
+        use super::super::ane_weights::ModelWeights;
+
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-1.7B not found, skipping E2E LoRA test");
+            return;
+        }
+
+        let seq = 4;
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 16,
+            seq_len: seq,
+            n_kv_heads: 8,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+        };
+
+        eprintln!("loading Qwen3-1.7B...");
+        let model = ModelWeights::from_mlx_safetensors(&model_dir, &cfg)
+            .expect("from_mlx_safetensors failed");
+
+        let lora_cfg = LoraConfig::default(); // rank=32, targets: wq, wv, wo, w2
+        let mut lora = LoraModel::new(lora_cfg, model.layers.len(), cfg.dim, cfg.hidden_dim);
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        // Simple training data: predict next token
+        let tokens: Vec<u32> = (100..100 + seq as u32).collect();
+        let targets: Vec<u32> = (101..101 + seq as u32).collect();
+
+        let n_steps = 5;
+        let lr = 5e-4;
+        let mut losses = Vec::with_capacity(n_steps);
+
+        eprintln!("training {} steps with LoRA rank=32 (CPU)...", n_steps);
+        for step in 0..n_steps {
+            let t0 = std::time::Instant::now();
+
+            // CPU forward with LoRA
+            let fwd = forward_cpu(&model, Some(&lora), &tokens, &targets);
+            let loss = fwd.base.loss;
+            losses.push(loss);
+            assert!(loss.is_finite(), "step {step}: loss not finite: {loss}");
+
+            // CPU backward for LoRA gradients
+            let bwd = super::super::ane_backward::backward_lora_cpu(
+                &model, &fwd, &lora, &tokens,
+            );
+
+            // Adam update on LoRA params only
+            super::super::ane_lora::lora_adam_update(
+                &mut lora, &bwd.lora_grads, &mut adam,
+                step + 1, lr, 0.9, 0.999, 1e-8, 0.01,
+            );
+
+            let step_ms = t0.elapsed().as_millis();
+            eprintln!("  step {step}: loss={loss:.4}, time={step_ms}ms");
+        }
+
+        // Verify loss decreased
+        let first = losses[0];
+        let last = losses[n_steps - 1];
+        eprintln!("loss trajectory: {:.4} -> {:.4} (delta={:.4})", first, last, last - first);
+        assert!(
+            last < first,
+            "loss should decrease over training: first={first:.4}, last={last:.4}"
+        );
     }
 }

@@ -622,6 +622,251 @@ pub struct BackwardResultWithLora {
     pub lora_grads: super::ane_lora::LoraModelGrads,
 }
 
+// ---------------------------------------------------------------------------
+// CPU-only backward for LoRA training (no ANE kernels)
+// ---------------------------------------------------------------------------
+
+/// CPU SDPA backward: given dO (gradient w.r.t attention output), compute dQ, dK, dV.
+///
+/// All tensors [dim, seq] where dim = n_heads * head_dim.
+/// Recomputes attention probabilities from saved Q, K.
+fn cpu_sdpa_backward(
+    d_out: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let dim = n_heads * head_dim;
+    let mut dq = vec![0.0f32; dim * seq];
+    let mut dk = vec![0.0f32; dim * seq];
+    let mut dv = vec![0.0f32; dim * seq];
+
+    for h in 0..n_heads {
+        // Recompute attention probs
+        let mut scores = vec![0.0f32; seq * seq];
+        for s1 in 0..seq {
+            for s2 in 0..seq {
+                if s2 > s1 {
+                    scores[s1 * seq + s2] = f32::NEG_INFINITY;
+                } else {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[(h * head_dim + d) * seq + s1] * k[(h * head_dim + d) * seq + s2];
+                    }
+                    scores[s1 * seq + s2] = dot * scale;
+                }
+            }
+        }
+        // Softmax
+        let mut probs = vec![0.0f32; seq * seq];
+        for s1 in 0..seq {
+            let row = &scores[s1 * seq..(s1 + 1) * seq];
+            let max_v = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s2 in 0..seq {
+                probs[s1 * seq + s2] = (row[s2] - max_v).exp();
+                sum += probs[s1 * seq + s2];
+            }
+            for s2 in 0..seq {
+                probs[s1 * seq + s2] /= sum;
+            }
+        }
+
+        // dV[h,d,s2] = sum_s1 probs[s1,s2] * dO[h,d,s1]
+        for d in 0..head_dim {
+            for s2 in 0..seq {
+                let mut acc = 0.0f32;
+                for s1 in 0..seq {
+                    acc += probs[s1 * seq + s2] * d_out[(h * head_dim + d) * seq + s1];
+                }
+                dv[(h * head_dim + d) * seq + s2] = acc;
+            }
+        }
+
+        // dP[s1,s2] = sum_d dO[h,d,s1] * V[h,d,s2]
+        let mut dp = vec![0.0f32; seq * seq];
+        for s1 in 0..seq {
+            for s2 in 0..seq {
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += d_out[(h * head_dim + d) * seq + s1] * v[(h * head_dim + d) * seq + s2];
+                }
+                dp[s1 * seq + s2] = acc;
+            }
+        }
+
+        // dS = probs * (dP - sum_s2(probs * dP))  (softmax backward)
+        let mut ds = vec![0.0f32; seq * seq];
+        for s1 in 0..seq {
+            let mut dot_sum = 0.0f32;
+            for s2 in 0..seq {
+                dot_sum += probs[s1 * seq + s2] * dp[s1 * seq + s2];
+            }
+            for s2 in 0..seq {
+                ds[s1 * seq + s2] = probs[s1 * seq + s2] * (dp[s1 * seq + s2] - dot_sum);
+            }
+        }
+
+        // dQ[h,d,s1] = scale * sum_s2 dS[s1,s2] * K[h,d,s2]
+        for d in 0..head_dim {
+            for s1 in 0..seq {
+                let mut acc = 0.0f32;
+                for s2 in 0..seq {
+                    acc += ds[s1 * seq + s2] * k[(h * head_dim + d) * seq + s2];
+                }
+                dq[(h * head_dim + d) * seq + s1] = acc * scale;
+            }
+        }
+
+        // dK[h,d,s2] = scale * sum_s1 dS[s1,s2] * Q[h,d,s1]
+        for d in 0..head_dim {
+            for s2 in 0..seq {
+                let mut acc = 0.0f32;
+                for s1 in 0..seq {
+                    acc += ds[s1 * seq + s2] * q[(h * head_dim + d) * seq + s1];
+                }
+                dk[(h * head_dim + d) * seq + s2] = acc * scale;
+            }
+        }
+    }
+
+    (dq, dk, dv)
+}
+
+/// CPU-only backward pass for LoRA training (no ANE kernels needed).
+///
+/// Only computes LoRA adapter gradients — base model weights are frozen.
+/// All matmuls (W^T @ gradient) run on CPU. SDPA backward runs on CPU.
+pub fn backward_lora_cpu<T: ane_forward::TokenId>(
+    model: &ModelWeights,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    tokens: &[T],
+) -> BackwardResultWithLora {
+    use super::ane_lora;
+
+    let cfg = &model.cfg;
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let n_layers = model.layers.len();
+    let scale = lora.scale();
+
+    // We don't compute base model gradients for LoRA training
+    let model_grads = ModelGradients::zeros(model);
+    let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
+
+    // Reconstruct x_cur from last layer
+    let last_act = &fwd.base.layer_acts[n_layers - 1];
+    let mut x_cur = last_act.x2.clone();
+    ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
+
+    let mut x_final = vec![0.0f32; dim * seq];
+    ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+
+    // Classifier backward
+    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
+    let mut dy = vec![0.0f32; dim * seq];
+    let mut _dcls = vec![0.0f32; cls_w.len()];
+    classifier_bwd(&mut dy, &mut _dcls, &fwd.base.dlogits, cls_w, &x_final, model.vocab_size, dim, seq);
+
+    // Final RMSNorm backward
+    let mut dx_rms = vec![0.0f32; dim * seq];
+    rmsnorm_bwd(&mut dx_rms, &mut vec![0.0f32; dim], &dy, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    dy = dx_rms;
+
+    // Per-layer backward (reverse)
+    for l in (0..n_layers).rev() {
+        let lw = &model.layers[l];
+        let ac = &fwd.base.layer_acts[l];
+        let la = &fwd.lora_acts[l];
+
+        let dffn = dy.clone();
+
+        // LoRA W2 backward
+        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) =
+            (lora.layers[l].w2.as_ref(), la.w2_x.as_ref(), la.w2_h.as_ref(), lora_grads.layers[l].w2.as_mut())
+        {
+            let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
+            let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+        }
+
+        // CPU: dsilu = dffn @ W2^T
+        let w2t = ane_weights::transpose_weight(&lw.w2, hidden, dim);
+        let dsilu = ane_forward::cpu_matmul(&w2t, &dffn, hidden, dim, seq);
+
+        // silu backward
+        let mut dh1 = vec![0.0f32; hidden * seq];
+        let mut dh3 = vec![0.0f32; hidden * seq];
+        silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
+
+        // CPU: dx_ffn = dh1 @ W1^T + dh3 @ W3^T
+        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
+        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
+        let dx_w1 = ane_forward::cpu_matmul(&w1t, &dh1, dim, hidden, seq);
+        let dx_w3 = ane_forward::cpu_matmul(&w3t, &dh3, dim, hidden, seq);
+        let mut dx_ffn = dx_w1;
+        ane_forward::vec_add_inplace(&mut dx_ffn, &dx_w3);
+
+        // RMSNorm backward (FFN)
+        let mut dx2 = vec![0.0f32; dim * seq];
+        rmsnorm_bwd(&mut dx2, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+        ane_forward::vec_add_inplace(&mut dx2, &dy);
+
+        // LoRA Wo backward
+        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) =
+            (lora.layers[l].wo.as_ref(), la.wo_x.as_ref(), la.wo_h.as_ref(), lora_grads.layers[l].wo.as_mut())
+        {
+            let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
+            let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+        }
+
+        // CPU: da = dx2 @ Wo^T
+        let wot = ane_weights::transpose_weight(&lw.wo, dim, dim);
+        let da = ane_forward::cpu_matmul(&wot, &dx2, dim, dim, seq);
+
+        // CPU SDPA backward
+        let (mut dq, mut dk, _dv) = cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
+
+        // RoPE backward
+        ane_forward::rope_backward(&mut dq, &mut dk, cfg.n_heads, cfg.head_dim(), seq, cfg.rope_theta);
+
+        // QK-norm backward
+        if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
+            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; cfg.head_dim()], q_pre, q_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+        }
+        if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
+            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; cfg.head_dim()], k_pre, k_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+        }
+
+        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
+        let wqt = ane_weights::transpose_weight(&lw.wq, dim, dim);
+        let wkt = ane_weights::transpose_weight(&lw.wk, dim, dim);
+        let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
+        let mut dx_attn = ane_forward::cpu_matmul(&wqt, &dq, dim, dim, seq);
+        let dx_k = ane_forward::cpu_matmul(&wkt, &dk, dim, dim, seq);
+        let dx_v = ane_forward::cpu_matmul(&wvt, &_dv, dim, dim, seq);
+        ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
+        ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
+
+        // RMSNorm backward (attention)
+        let mut dx_rms1 = vec![0.0f32; dim * seq];
+        rmsnorm_bwd(&mut dx_rms1, &mut vec![0.0f32; dim], &dx_attn, &ac.layer_in, &lw.rms_att, dim, seq, cfg.rms_eps);
+        dy = dx_rms1;
+        ane_forward::vec_add_inplace(&mut dy, &dx2);
+    }
+
+    BackwardResultWithLora { model_grads, lora_grads }
+}
+
 /// Backward pass with LoRA gradient computation.
 ///
 /// Computes base model gradients (frozen — caller ignores them for LoRA training)
