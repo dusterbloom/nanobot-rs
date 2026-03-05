@@ -69,6 +69,14 @@
 - [ ] **B5: RLM model evaluation** — Systematic experiments to find best RLM model per VRAM tier. Critical for "3 impossible things". See experiment plan below. _Routing benchmarks started in `experiments/lcm-routing/` (orchestrator_bench.py, test_bench.py)._
 - [x] **B8: Trio mode activation & role-scoped context** ⚡ — ✅ All 5 steps complete. Metrics + circuit breaker (commit `0f80ad9`). Auto-activation + auto-detect as B10 (commit `3774742`). E2E verified: local session → `delegation_mode=Trio` in log → Main emits natural language → Router preflight intercepts → Specialist executes tool. _Ref: `src/agent/router.rs`_
 
+### ✅ Codebase Health (Phases 1-4 complete, 2026-03-04)
+
+- [x] **Phase 1:** parking_lot::Mutex (18 files), LazyLock regexes (20+ sites)
+- [x] **Phase 2:** Credential redaction (custom Debug impls), removed dead `needs_user_continuation`
+- [x] **Phase 3:** ToolError retryability + `execute_with_retry()` with exponential backoff
+- [x] **Phase 4:** File splits — `tool_runner.rs` tests extracted, `cli.rs` → `src/cli/` module (6 files), `agent_loop.rs` → 3 files via `#[path]`, `commands.rs` → 7 files via `#[path]`. All 4117 tests pass.
+- [ ] **Phase 5 (next):** Shell injection adversarial tests, LM Studio `--jinja` probe
+
 ### 🟡 Important — do soon
 
 - [~] **B12: Configuration debt — eliminate hardcoded magic values** _(Approach E implemented: Phases 1-3 complete, Phase 4 deferred)_

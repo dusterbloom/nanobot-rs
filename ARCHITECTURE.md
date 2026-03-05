@@ -46,13 +46,13 @@
 - Panic hook restores terminal state
 - Global `LOCAL_MODE` atomic flag for cloud/local switching
 
-**cli.rs** - Agent/config command implementations:
-- `cmd_onboard()` - Initialize config and workspace
-- `cmd_gateway()` - Start multi-channel gateway
-- `cmd_realtime()` - Start realtime voice session (continuous or PTT mode)
-- `build_core_handle()` - Create swappable core with provider
-- `rebuild_core()` - Hot-swap provider on `/local` toggle
-- `create_agent_loop()` - Wire agent loop with channels
+**cli/** - Agent/config command implementations (split into module, 2026-03-04):
+- `mod.rs` - Onboard, gateway, channels, status, cron, tune, tests
+- `core_builder.rs` - `build_core_handle()`, `rebuild_core()`, `create_agent_loop()`, `make_local_providers()`
+- `provider.rs` - `create_provider()`, `load_oauth_provider()`, `is_claude_model()`
+- `eval.rs` - All `cmd_eval_*` benchmark commands
+- `voice.rs` - All `#[cfg(feature="voice")]` commands
+- `skills.rs` - `cmd_skill_add()`, `cmd_skill_remove()`
 
 **sessions_cmd.rs** - Session management CLI:
 - `cmd_sessions_list()` - List sessions with date, size, message count
@@ -730,20 +730,15 @@ VoiceAgent event loop (pure state machine)
 
 ## Critical Flaws
 
-### 1. **agent_loop.rs size** *(substantially addressed)*
-**Previously:** 4200+ lines handling routing, streaming, tool execution, compaction, provenance, and trio mode.
+### 1. **agent_loop.rs size** *(resolved)*
+**Previously:** 4200+ lines. Now 720 lines after Phase 4 splits (2026-03-04).
 
-**Progress (2544 lines remaining):** Major extractions completed:
-- `agent_core.rs` — SwappableCore, RuntimeCounters, AgentHandle (extracted from agent_loop)
-- `tool_engine.rs` — Tool execution engine (delegated + inline paths)
-- `router.rs` — Trio router preflight and dispatch
-- `router_fallback.rs` — Deterministic fallback patterns (9 patterns)
-- `tool_guard.rs` — Tool dedup/blocking guard (read-tool limit tightened from 5 to 2)
-- `tool_wiring.rs` — Dynamic per-phase tool registry assembly
-
-**Remaining recommendation:**
-- Extract `ConversationManager` - handles message assembly, history, compaction
-- Keep `agent_loop.rs` as thin coordinator
+**Extractions completed:**
+- `agent_core.rs` — SwappableCore, RuntimeCounters, AgentHandle
+- `agent_shared.rs` — AgentLoopShared struct + all step methods (1880 lines, via `#[path]`)
+- `agent_heuristics.rs` — Pure helpers: `adaptive_max_tokens`, `render_via_protocol`, etc. (190 lines, via `#[path]`)
+- `agent_loop_tests.rs` — Tests (2600 lines, via `#[path]`)
+- `tool_engine.rs`, `router.rs`, `router_fallback.rs`, `tool_guard.rs`, `tool_wiring.rs`
 
 ### 2. **Implicit State Machine in TurnContext**
 **Problem:** `TurnContext` has 26 fields tracking turn state, with flow control delegated to `FlowControl` (8 fields: 4 booleans, `ToolGuard`, 2x `u32`, `Option<Instant>`). Easy to get into invalid states.

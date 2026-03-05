@@ -21,7 +21,50 @@ use mlx_rs::module::{Module, ModuleParameters, ModuleParamMut, ModuleParamRef, P
 use mlx_rs::nested::{NestedHashMap, NestedValue};
 use mlx_rs::nn::{self, Embedding, Linear, QuantizedEmbedding, QuantizedLinear, RmsNorm};
 use mlx_rs::optimizers::{AdamW, Optimizer};
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::losses::{CrossEntropyBuilder, LossReduction};
 use mlx_rs::{array, Array};
+
+// ---------------------------------------------------------------------------
+// Tokenizer wrapper (reads tokenizer.json from model directory)
+// ---------------------------------------------------------------------------
+
+pub struct MlxTokenizer {
+    inner: tokenizers::Tokenizer,
+}
+
+impl MlxTokenizer {
+    pub fn load(model_dir: &Path) -> Result<Self, anyhow::Error> {
+        let path = model_dir.join("tokenizer.json");
+        let inner = tokenizers::Tokenizer::from_file(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", path.display()))?;
+        Ok(MlxTokenizer { inner })
+    }
+
+    pub fn encode(&self, text: &str) -> Result<Vec<i32>, anyhow::Error> {
+        let encoding = self.inner.encode(text, false)
+            .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
+        Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
+    }
+
+    pub fn decode(&self, ids: &[i32]) -> Result<String, anyhow::Error> {
+        let u32_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+        let text = self.inner.decode(&u32_ids, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer decode failed: {e}"))?;
+        Ok(text)
+    }
+
+    pub fn eos_token_id(&self) -> Option<u32> {
+        let vocab = self.inner.get_vocab(true);
+        // Prefer <|im_end|> for chat models, then general EOS markers
+        for name in &["<|im_end|>", "<|endoftext|>", "</s>", "<eos>"] {
+            if let Some(&id) = vocab.get(*name) {
+                return Some(id);
+            }
+        }
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LoRA configuration
@@ -485,23 +528,31 @@ impl MlxLoraAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // When attn_output_gate is enabled, q_proj outputs [Q, gate] concatenated.
-        // Split: first half is Q, second half is the sigmoid gate for the output.
+        // When attn_output_gate is enabled, q_proj outputs [Q, gate] interleaved per-head.
+        // Python: reshape to [B, S, H, 2*D] then split → per-head [B, S, H, D] each.
+        // Memory layout is [Q_h0, Gate_h0, Q_h1, Gate_h1, ...] NOT [Q_all | Gate_all].
         let (q, output_gate) = if self.attn_output_gate {
-            let parts = q_raw.split(2, -1)?;
-            (parts[0].clone(), Some(parts[1].clone()))
+            let q4d = q_raw.reshape(&[batch, seq_len, self.num_heads, self.head_dim * 2])?;
+            let parts = q4d.split(2, -1)?; // [B, S, H, D] × 2
+            let gate = parts[1].reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
+            (parts[0].clone(), Some(gate))
         } else {
             (q_raw, None)
         };
 
-        // QK norm before reshape (weight shape matches projected dim, not head_dim)
-        let q_norm_size = self.q_norm.weight.shape()[0] as i32;
-        let q = if q_norm_size == self.head_dim {
-            let q = q.reshape(&[batch * seq_len * self.num_heads, self.head_dim])?;
-            let q = self.q_norm.forward(&q)?;
-            q.reshape(&[batch, seq_len, self.num_heads * self.head_dim])?
-        } else {
+        // QK norm — when gated, q is already [B, S, H, D] from the per-head split
+        let q = if self.attn_output_gate {
+            // q is [B, S, H, D] — RMSNorm applies on last dim (head_dim), which matches weight shape
             self.q_norm.forward(&q)?
+        } else {
+            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
+            if q_norm_size == self.head_dim {
+                let q = q.reshape(&[batch * seq_len * self.num_heads, self.head_dim])?;
+                let q = self.q_norm.forward(&q)?;
+                q.reshape(&[batch, seq_len, self.num_heads * self.head_dim])?
+            } else {
+                self.q_norm.forward(&q)?
+            }
         };
         let k_norm_size = self.k_norm.weight.shape()[0] as i32;
         let k = if k_norm_size == self.head_dim {
@@ -512,7 +563,12 @@ impl MlxLoraAttention {
             self.k_norm.forward(&k)?
         };
 
-        let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
+        // Reshape to [B, S, H, D] — q may already be 4D if gated
+        let q = if self.attn_output_gate {
+            q // already [B, S, H, D]
+        } else {
+            q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
+        };
         let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
 
@@ -523,6 +579,7 @@ impl MlxLoraAttention {
         let q = mlx_rs::fast::rope(&q, self.rope_dims, false, self.rope_base, 1.0, 0, None::<&Array>)?;
         let k = mlx_rs::fast::rope(&k, self.rope_dims, false, self.rope_base, 1.0, 0, None::<&Array>)?;
 
+        // MLX SDPA handles GQA natively (num_heads != num_kv_heads) — no expansion needed
         use mlx_rs::fast::ScaledDotProductAttentionMask;
         let attn = if let Some(m) = mask {
             let m = m.as_dtype(q.dtype())?;
@@ -533,7 +590,7 @@ impl MlxLoraAttention {
         } else {
             mlx_rs::fast::scaled_dot_product_attention(
                 &q, &k, &v, self.attn_scale,
-                None::<ScaledDotProductAttentionMask>,
+                ScaledDotProductAttentionMask::Causal,
             )?
         };
 
@@ -744,49 +801,110 @@ impl MlxLinearAttention {
         Ok(attn)
     }
 
-    /// Simplified Mamba2 SSM forward.
+    /// Gated Delta Net forward (linear attention with delta rule).
     ///
-    /// Uses causal attention as an approximation of the full selective scan.
-    /// Not numerically identical to the real SSM but produces correct-shape
-    /// output and meaningful gradients through the residual+MLP path.
+    /// Implements the recurrence from `mlx_lm.models.gated_delta`:
+    ///   g = exp(-exp(A_log) * softplus(a + dt_bias))    // decay
+    ///   beta = sigmoid(b)                                 // write gate
+    ///   for each token:
+    ///     state *= g; delta = (v - state@k) * beta; state += outer(k, delta); y = state@q
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
+        let h = self.n_heads;
+        let d = self.head_dim;
+        let key_dim = h * d;  // 2048 for Qwen3.5-2B
 
-        // Project to Q, K, V and split
-        let qkv = self.in_proj_qkv.forward(x)?;
-        let parts = qkv.split(3, -1)?;
-        let (q, k, v) = (&parts[0], &parts[1], &parts[2]);
+        // 1. Project QKV, alpha, beta, z
+        let qkv = self.in_proj_qkv.forward(x)?;     // [B, L, key_dim*2 + value_dim]
+        let a = self.in_proj_a.forward(x)?;           // [B, L, H]
+        let b = self.in_proj_b.forward(x)?;           // [B, L, H]
 
-        // Reshape to heads: [B, L, H, D] then [B, H, L, D]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-
-        // Causal attention (simplified stand-in for SSM selective scan)
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let mask = create_causal_mask(seq_len as i32)?;
-        use mlx_rs::fast::ScaledDotProductAttentionMask;
-        let attn = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k, &v, scale,
-            ScaledDotProductAttentionMask::Array(&mask.as_dtype(q.dtype())?),
+        // 2. Causal depthwise conv1d on QKV
+        //    Weight shape from safetensors: [conv_dim, kernel, 1] (depthwise: groups=conv_dim)
+        let conv_dim = qkv.shape()[2];  // key_dim*2 + value_dim
+        let kernel = self.conv_kernel;
+        // Left-pad for causal convolution (kernel-1 on left, 0 on right)
+        let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
+        let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
+        // Depthwise conv1d: groups = conv_dim, weight [conv_dim, kernel, 1]
+        let qkv_conv = mlx_rs::ops::conv1d(
+            &qkv_padded, &*self.conv1d_weight, None, None, None, conv_dim as i32,
         )?;
+        let qkv_conv = nn::silu(&qkv_conv)?;
 
-        // Back to [B, L, H*D]
-        let y = attn.transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        // 3. Split into Q, K, V (NOT equal thirds)
+        let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
+        let q = parts[0].reshape(&[batch, seq_len, h, d])?;
+        let k = parts[1].reshape(&[batch, seq_len, h, d])?;
+        let v = parts[2].reshape(&[batch, seq_len, h, d])?;
 
-        // Per-head group norm
-        let y_flat = y.reshape(&[batch * seq_len * self.n_heads, self.head_dim])?;
-        let y_normed = self.norm.forward(&y_flat)?;
-        let y = y_normed.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        // 4. QK RMS normalization (weight-free, just normalize)
+        let inv_scale = (d as f32).powf(-0.5);
+        let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
+        let q_flat = q.reshape(&[-1, d])?;
+        let k_flat = k.reshape(&[-1, d])?;
+        let q_norm = mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let k_norm = mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
+        let k = k_norm.multiply(array!(inv_scale))?;
 
-        // Output gate
-        let z = nn::silu(&self.in_proj_z.forward(x)?)?;
-        let y = y.multiply(&z)?;
+        // 5. Compute decay g and write gate beta
+        //    g = exp(-exp(A_log) * softplus(a + dt_bias))
+        let a_plus_bias = a.add(&*self.dt_bias)?;           // [B, L, H]
+        let sp = nn::softplus(&a_plus_bias)?;
+        let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
+        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;  // [B, L, H]
+        let beta = nn::sigmoid(&b)?;                          // [B, L, H]
+
+        // 6. Gated delta recurrence
+        //    State: [B, H, D_v, D_k] — we accumulate outer products
+        let mut state = mlx_rs::ops::zeros::<f32>(&[batch, h, d, d])?;
+        let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
+
+        for t in 0..seq_len {
+            // Slice [B, H] for this timestep
+            let g_t = g.index((.., t, ..));       // [B, H]
+            let beta_t = beta.index((.., t, ..)); // [B, H]
+            let q_t = q.index((.., t, .., ..));   // [B, H, D]
+            let k_t = k.index((.., t, .., ..));   // [B, H, D]
+            let v_t = v.index((.., t, .., ..));   // [B, H, D]
+
+            // state *= g (broadcast [B, H, 1, 1])
+            let g_t = g_t.reshape(&[batch, h, 1, 1])?;
+            state = state.multiply(&g_t)?;
+
+            // kv_mem = (state * k[..., None, :]).sum(-1) → [B, H, D_v]
+            let k_expanded = k_t.expand_dims(-2)?;  // [B, H, 1, D_k]
+            let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
+
+            // delta = (v - kv_mem) * beta[..., None]
+            let beta_t = beta_t.reshape(&[batch, h, 1])?;
+            let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?; // [B, H, D_v]
+
+            // state += k[..., None, :] * delta[..., :, None]  (outer product update)
+            let delta_expanded = delta.expand_dims(-1)?;   // [B, H, D_v, 1]
+            state = state.add(&k_expanded.multiply(&delta_expanded)?)?;
+
+            // y_t = (state * q[..., None, :]).sum(-1) → [B, H, D_v]
+            let q_expanded = q_t.expand_dims(-2)?;  // [B, H, 1, D_k]
+            let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
+            outputs.push(y_t);
+        }
+
+        // Stack: [B, H, D_v] * L → [B, L, H, D_v]
+        let y = mlx_rs::ops::stack_axis(&outputs, 1)?;  // [B, L, H, D]
+
+        // 7. RMSNormGated: rms_norm(out) on last dim (D), then silu(z) * normed
+        //    z is [B, L, H, D], norm weight is [D=128]
+        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h, d])?;
+        let y_flat = y.reshape(&[-1, d])?;
+        let y_normed = self.norm.forward(&y_flat)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let y = nn::silu(&z)?.multiply(&y_normed)?;
+        let y = y.reshape(&[batch, seq_len, h * d])?;
 
         self.out_proj.forward(&y)
     }
@@ -880,6 +998,15 @@ impl MlxLoraDecoderLayer {
             input_layernorm: load_rms_norm(weights, &format!("{prefix}.input_layernorm"), cfg.rms_eps)?,
             post_attention_layernorm: load_rms_norm(weights, &format!("{prefix}.post_attention_layernorm"), cfg.rms_eps)?,
         })
+    }
+
+    /// Test-only: run the linear_attn sub-module directly on pre-layernormed input.
+    #[cfg(test)]
+    pub fn forward_linear_attn(&mut self, x: &Array) -> Result<Array, Exception> {
+        match &mut self.attn {
+            AttentionKind::Linear(attn) => attn.forward(x),
+            AttentionKind::Full(_) => panic!("not a linear_attn layer"),
+        }
     }
 
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
@@ -1022,6 +1149,65 @@ impl MlxLoraModel {
         Ok(MlxLoraModel { embed_tokens, layers, norm, lm_head })
     }
 
+    /// Greedy autoregressive text generation.
+    ///
+    /// Takes a prompt token sequence and generates up to `max_tokens` new tokens.
+    /// Uses temperature sampling when temp > 0, greedy argmax otherwise.
+    /// Returns the generated token IDs (NOT including the prompt).
+    pub fn generate(
+        &mut self,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+        temperature: f32,
+        stop_tokens: &[i32],
+    ) -> Result<Vec<i32>, Exception> {
+        let mut tokens = prompt_tokens.to_vec();
+        let mut generated = Vec::with_capacity(max_tokens);
+
+        for _ in 0..max_tokens {
+            let input = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
+            let logits = self.forward_logits(&input)?;
+
+            // Take logits for last position: [1, seq, vocab] → [1, vocab]
+            let last_logits = logits.index((.., -1, ..));
+
+            let next_token = if temperature <= 0.0 || temperature < 1e-6 {
+                // Greedy
+                mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)?
+            } else {
+                // Temperature sampling
+                let scaled = last_logits.multiply(array!(1.0 / temperature))?;
+                mlx_rs::random::categorical(&scaled, None, None, None)?
+            };
+
+            let next_token = next_token.as_dtype(mlx_rs::Dtype::Int32)?;
+            let token_id: i32 = next_token.as_slice::<i32>()[0];
+
+            if stop_tokens.contains(&token_id) {
+                break;
+            }
+
+            generated.push(token_id);
+            tokens.push(token_id);
+        }
+
+        Ok(generated)
+    }
+
+    pub fn generate_text(
+        &mut self,
+        tokenizer: &MlxTokenizer,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> Result<String, anyhow::Error> {
+        let prompt_tokens = tokenizer.encode(prompt)?;
+        let eos = tokenizer.eos_token_id().unwrap_or(248046) as i32;
+        let generated = self.generate(&prompt_tokens, max_tokens, temperature, &[eos])
+            .map_err(|e| anyhow::anyhow!("Generation failed: {e}"))?;
+        tokenizer.decode(&generated)
+    }
+
     pub fn forward_logits(&mut self, tokens: &Array) -> Result<Array, Exception> {
         let seq_len = tokens.shape()[1] as i32;
         let mut h = self.embed_tokens.forward(tokens)?;
@@ -1132,21 +1318,22 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
 // ---------------------------------------------------------------------------
 
 /// Cross-entropy loss: logits [batch, seq, vocab], targets [batch, seq] -> scalar.
+///
+/// Uses mlx-rs built-in CrossEntropy which computes `logsumexp(logits) - logits[target]`
+/// instead of materializing the full log_softmax gradient over the vocab dimension.
+/// This avoids NaN gradients on large vocab (248k) with real-length sequences.
 pub fn cross_entropy_loss(logits: &Array, targets: &Array) -> Result<Array, Exception> {
     let shape = logits.shape();
     let vocab = shape[shape.len() - 1];
 
     let flat_logits = logits.reshape(&[-1, vocab])?;
-    let flat_targets = targets.reshape(&[-1])?;
+    let flat_targets = targets.reshape(&[-1])?.as_dtype(mlx_rs::Dtype::Int32)?;
 
-    let log_probs = nn::log_softmax(&flat_logits, -1)?;
+    let ce = CrossEntropyBuilder::new()
+        .reduction(LossReduction::Mean)
+        .build()?;
 
-    // Gather log-probs at target indices
-    let target_indices = flat_targets.reshape(&[-1, 1])?.as_dtype(mlx_rs::Dtype::Int32)?;
-    let selected = log_probs.take_along_axis_device(&target_indices, -1, mlx_rs::StreamOrDevice::default())?;
-
-    // Mean negative log-likelihood
-    selected.mean(None)?.negative()
+    ce.apply(&flat_logits, &flat_targets)
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,19 +1361,31 @@ pub fn train_step(
     let (clipped, total_norm) = mlx_rs::optimizers::clip_grad_norm(&grads, grad_clip)
         .map_err(|e| anyhow::anyhow!("clip_grad_norm: {e}"))?;
 
-    let owned_grads: HashMap<Rc<str>, Array> =
-        clipped.into_iter().map(|(k, v)| (k, v.into_owned())).collect();
+    // Skip optimizer update if gradient is NaN (prevents permanent weight corruption).
+    if total_norm.is_finite() {
+        let owned_grads: HashMap<Rc<str>, Array> =
+            clipped.into_iter().map(|(k, v)| (k, v.into_owned())).collect();
 
-    optimizer
-        .update(model, &owned_grads)
-        .map_err(|e| anyhow::anyhow!("optimizer update: {e}"))?;
+        optimizer
+            .update(model, &owned_grads)
+            .map_err(|e| anyhow::anyhow!("optimizer update: {e}"))?;
+    } else {
+        eprintln!("    [skipped NaN gradient update]");
+    }
 
-    mlx_rs::transforms::eval(std::iter::once(&loss))
+    // Evaluate loss, model parameters, AND optimizer state — matching Python mlx_lm.
+    let params = model.parameters().flatten();
+    let mut eval_targets: Vec<&Array> = vec![&loss];
+    eval_targets.extend(params.values());
+    mlx_rs::transforms::eval(eval_targets.into_iter())
         .map_err(|e| anyhow::anyhow!("eval: {e}"))?;
 
     let loss_val: f32 = loss.as_slice::<f32>()[0];
     Ok((loss_val, total_norm))
 }
+
+/// Optional callback invoked after each training step with (step, loss, grad_norm).
+pub type TrainCallback = Box<dyn FnMut(usize, f32, f32) + Send>;
 
 pub fn train_loop(
     model: &mut MlxLoraModel,
@@ -1196,6 +1395,19 @@ pub fn train_loop(
     max_steps: usize,
     early_stop_loss: f32,
     patience: usize,
+) -> Result<Vec<f32>, anyhow::Error> {
+    train_loop_with_callback(model, tokens_list, targets_list, config, max_steps, early_stop_loss, patience, None)
+}
+
+pub fn train_loop_with_callback(
+    model: &mut MlxLoraModel,
+    tokens_list: &[Array],
+    targets_list: &[Array],
+    config: &LoraConfig,
+    max_steps: usize,
+    early_stop_loss: f32,
+    patience: usize,
+    mut on_step: Option<TrainCallback>,
 ) -> Result<Vec<f32>, anyhow::Error> {
     let mut optimizer = AdamW::new(config.lr);
     optimizer.weight_decay = array!(config.weight_decay);
@@ -1218,6 +1430,10 @@ pub fn train_loop(
         let ms = t0.elapsed().as_millis();
         eprintln!("  step {step}: loss={loss:.4}, grad_norm={grad_norm:.4}, time={ms}ms");
         losses.push(loss);
+
+        if let Some(ref mut cb) = on_step {
+            cb(step, loss, grad_norm);
+        }
 
         if loss < best_loss {
             best_loss = loss;
@@ -1299,6 +1515,44 @@ mod tests {
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         let loss_val: f32 = loss.as_slice::<f32>()[0];
         assert!(loss_val < 0.1, "loss should be small, got {loss_val}");
+    }
+
+    /// Regression test: our old log_softmax-based CE produced NaN gradients on
+    /// large vocab (248k) with sequences longer than ~10 tokens. The built-in
+    /// CrossEntropy uses logsumexp - score which avoids materializing the full
+    /// log_softmax gradient.
+    #[test]
+    fn test_cross_entropy_grad_large_vocab_no_nan() {
+        let vocab = 248320i32;
+        let seq_len = 64;
+        // Random logits in a realistic range
+        let logits = mlx_rs::random::normal::<f32>(
+            &[1, seq_len, vocab],
+            None, None, None,
+        ).unwrap();
+        // Random target indices in [0, vocab)
+        let targets = mlx_rs::random::randint::<_, i32>(
+            0, vocab, &[1, seq_len], None,
+        ).unwrap();
+
+        // Forward: loss must be finite
+        let loss = cross_entropy_loss(&logits, &targets).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&loss)).unwrap();
+        let loss_val: f32 = loss.as_slice::<f32>()[0];
+        assert!(loss_val.is_finite(), "loss should be finite, got {loss_val}");
+        eprintln!("large vocab CE loss = {loss_val:.4}");
+
+        // Backward: gradient via grad() must be finite
+        let mut grad_fn = mlx_rs::transforms::grad(
+            |logits: &Array| -> Result<Array, Exception> {
+                cross_entropy_loss(logits, &targets)
+            },
+        );
+        let grad = grad_fn(&logits).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&grad)).unwrap();
+        let grad_sum: f32 = grad.sum(None).unwrap().as_slice::<f32>()[0];
+        assert!(grad_sum.is_finite(), "gradient should be finite, got {grad_sum}");
+        eprintln!("large vocab CE grad_sum = {grad_sum:.6}");
     }
 
     #[test]
@@ -1409,5 +1663,300 @@ mod tests {
         eprintln!("loss: {first:.4} -> {last:.4}");
         assert!(first.is_finite(), "first loss should be finite");
         assert!(last < first, "loss should decrease: {first:.4} -> {last:.4}");
+    }
+
+    /// Regression test: train on a real-length tokenized sequence (64 tokens)
+    /// to verify no NaN gradients. Previously failed with log_softmax-based CE.
+    #[test]
+    fn test_e2e_qwen3_5_2b_long_sequence_no_nan() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig { lr: 1e-5, ..LoraConfig::default() };
+
+        eprintln!("loading model for long-sequence NaN regression test...");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        // Simulate a real conversation: 64 random token IDs in valid vocab range
+        let seq: Vec<i32> = (0..65).map(|i| ((i * 7919 + 1337) % 248320) as i32).collect();
+        let tokens = Array::from_slice(&seq[..64], &[1, 64]);
+        let targets = Array::from_slice(&seq[1..65], &[1, 64]);
+
+        let losses = train_loop(
+            &mut model, &[tokens], &[targets],
+            &lora_cfg, 3, 0.5, 10,
+        ).expect("training failed — likely NaN gradient regression");
+
+        for (i, l) in losses.iter().enumerate() {
+            eprintln!("  step {i}: loss={l:.4}");
+            assert!(l.is_finite(), "step {i} loss is NaN/Inf: {l}");
+        }
+        assert!(losses.len() >= 2);
+        assert!(losses.last().unwrap() < &losses[0], "loss should decrease");
+    }
+
+    /// Load a raw f32 binary tensor from a reference directory under tests/
+    fn load_reference_tensor_from(dir: &str, name: &str, shape: &[i32]) -> Array {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(dir)
+            .join(format!("{name}.bin"));
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}\nRun the appropriate reference script", path.display()));
+        let floats: Vec<f32> = bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Array::from_slice(&floats, shape)
+    }
+
+    /// Compare two arrays element-wise, return (max_abs_diff, mean_abs_diff).
+    fn compare_arrays(a: &Array, b: &Array) -> (f32, f32) {
+        let diff = a.subtract(b).unwrap();
+        let abs_diff = mlx_rs::ops::abs(&diff).unwrap();
+        let max_diff: f32 = abs_diff.max(None).unwrap().as_slice::<f32>()[0];
+        let mean_diff: f32 = abs_diff.mean(None).unwrap().as_slice::<f32>()[0];
+        (max_diff, mean_diff)
+    }
+
+    #[test]
+    fn test_gdn_numerical_vs_python_reference() {
+        // Check reference files exist
+        let ref_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/gdn_reference_raw");
+        if !ref_dir.join("manifest.json").exists() {
+            eprintln!("Reference tensors not found. Run: python3 tests/gdn_reference.py");
+            return;
+        }
+
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        // Load model (same weights as Python reference)
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        // Load reference input [1, 4, 2048] and expected output [1, 4, 2048]
+        let ref_input = load_reference_tensor_from("tests/gdn_reference_raw","input", &[1, 4, 2048]);
+        let ref_output = load_reference_tensor_from("tests/gdn_reference_raw","output", &[1, 4, 2048]);
+
+        // Run our forward on layer 0 (which is a linear_attn layer)
+        // The reference was computed on raw input (before layernorm), so we must
+        // call the linear_attn sub-module directly
+        let our_output = model.layers[0].forward_linear_attn(&ref_input)
+            .expect("forward failed");
+
+        // Compare
+        let (max_diff, mean_diff) = compare_arrays(&our_output, &ref_output);
+        eprintln!("GDN output vs Python reference:");
+        eprintln!("  max_abs_diff:  {max_diff:.6e}");
+        eprintln!("  mean_abs_diff: {mean_diff:.6e}");
+        eprintln!("  our shape:     {:?}", our_output.shape());
+        eprintln!("  ref shape:     {:?}", ref_output.shape());
+
+        // Tolerance: quantized model with bf16 intermediates — expect ~1e-2 to 1e-3
+        // Python runs bf16 on GPU, our Rust runs bf16 quantized path on GPU
+        assert!(
+            max_diff < 0.05,
+            "max diff {max_diff:.6e} exceeds tolerance 0.05 — implementation mismatch"
+        );
+        assert!(
+            mean_diff < 0.01,
+            "mean diff {mean_diff:.6e} exceeds tolerance 0.01 — implementation mismatch"
+        );
+        eprintln!("PASS: Gated Delta Net matches Python reference within tolerance");
+
+        // Also compare intermediate tensors for debugging
+        let ref_recurrence = load_reference_tensor_from("tests/gdn_reference_raw","recurrence_out", &[1, 4, 16, 128]);
+        eprintln!("\nIntermediate reference tensors (for debugging):");
+        eprintln!("  recurrence_out sample: {:?}",
+            &ref_recurrence.as_slice::<f32>()[..8]);
+    }
+
+    #[test]
+    fn test_full_attn_numerical_vs_python_reference() {
+        let ref_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/full_attn_reference_raw");
+        if !ref_dir.join("manifest.json").exists() {
+            eprintln!("Reference tensors not found. Run: python3 tests/full_attn_reference.py");
+            return;
+        }
+
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        let d = "tests/full_attn_reference_raw";
+        let ref_input = load_reference_tensor_from(d, "attn_input", &[1, 4, 2048]);
+        let ref_output = load_reference_tensor_from(d, "attn_output", &[1, 4, 2048]);
+
+        // Call forward() directly — it uses Causal mask, matching the reference
+        let our_output = match &mut model.layers[3].attn {
+            AttentionKind::Full(attn) => attn.forward(&ref_input, None).expect("forward failed"),
+            AttentionKind::Linear(_) => panic!("layer 3 should be full attention"),
+        };
+
+        let (max_diff, mean_diff) = compare_arrays(&our_output, &ref_output);
+        eprintln!("Full attention output vs Python reference:");
+        eprintln!("  max_abs_diff:  {max_diff:.6e}");
+        eprintln!("  mean_abs_diff: {mean_diff:.6e}");
+
+        assert!(
+            max_diff < 0.05,
+            "max diff {max_diff:.6e} exceeds tolerance 0.05 — implementation mismatch"
+        );
+        assert!(
+            mean_diff < 0.01,
+            "mean diff {mean_diff:.6e} exceeds tolerance 0.01 — implementation mismatch"
+        );
+    }
+
+    #[test]
+    fn test_generate_greedy() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        // "The capital of France is" → Python produces token 11751 (Paris) first
+        let prompt = &[760i32, 6511, 314, 9338, 369];
+
+        let eos = 248046;
+
+        // Layer-by-layer comparison with Python
+        {
+            let input = Array::from_slice(prompt, &[1, 5]);
+            let mut h = model.embed_tokens.forward(&input).unwrap();
+            for (i, layer) in model.layers.iter_mut().enumerate() {
+                h = layer.forward(&h, None).unwrap();
+                if [0,1,2,3,5,11,23].contains(&i) {
+                    let hf = h.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+                    let flat = hf.reshape(&[-1]).unwrap();
+                    let n = hf.shape().iter().product::<i32>();
+                    // last position (idx 4), first 3 dims: offset = 4*2048
+                    let off = 4 * 2048;
+                    let v: Vec<f32> = (off..off+3).map(|j| flat.index(j as i32).as_slice::<f32>()[0]).collect();
+                    eprintln!("layer {i:2}: {:?}", v);
+                }
+            }
+        }
+
+        // Reload model for clean forward
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("reload");
+
+        // First check logits match Python reference
+        let input = Array::from_slice(prompt, &[1, 5]);
+        let logits = model.forward_logits(&input).expect("forward failed");
+        let last_logits = logits.index((.., -1, ..)); // [1, vocab]
+        let argmax_token = mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)
+            .unwrap().as_dtype(mlx_rs::Dtype::Int32).unwrap();
+        let argmax_id: i32 = argmax_token.as_slice::<i32>()[0];
+        eprintln!("argmax token: {argmax_id} (expected 11751 = 'Paris')");
+
+        // Check top-5 logit values
+        let last_flat = last_logits.reshape(&[-1]).unwrap();
+        for &tid in &[11751i32, 279, 264, 3750, 13] {
+            let val: f32 = last_flat.index(tid).as_slice::<f32>()[0];
+            eprintln!("  token {tid}: logit {val:.4}");
+        }
+
+        eprintln!("\ngenerating (greedy, max 20 tokens)...");
+        let t0 = std::time::Instant::now();
+        let generated = model.generate(prompt, 20, 0.0, &[eos])
+            .expect("generation failed");
+        let elapsed = t0.elapsed();
+
+        eprintln!("generated {} tokens in {:.1}s ({:.0} ms/token)",
+            generated.len(), elapsed.as_secs_f64(),
+            elapsed.as_millis() as f64 / generated.len().max(1) as f64);
+        eprintln!("tokens: {:?}", generated);
+
+        assert!(!generated.is_empty(), "should generate at least one token");
+        assert_eq!(generated[0], 11751,
+            "first generated token should be 11751 (Paris), got {}", generated[0]);
+    }
+
+    #[test]
+    fn test_tokenizer_roundtrip() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let tok = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
+
+        // Encode/decode roundtrip
+        let text = "The capital of France is Paris.";
+        let ids = tok.encode(text).expect("encode failed");
+        eprintln!("encoded '{}' -> {:?} ({} tokens)", text, ids, ids.len());
+        assert!(!ids.is_empty());
+
+        let decoded = tok.decode(&ids).expect("decode failed");
+        eprintln!("decoded -> '{}'", decoded);
+        assert_eq!(decoded, text);
+
+        // Verify known prompt matches hardcoded tokens from test_generate_greedy
+        let prompt = "The capital of France is";
+        let prompt_ids = tok.encode(prompt).expect("encode failed");
+        eprintln!("prompt '{}' -> {:?}", prompt, prompt_ids);
+        assert_eq!(prompt_ids, vec![760, 6511, 314, 9338, 369],
+            "tokenizer should match hardcoded prompt tokens");
+
+        // EOS token
+        let eos = tok.eos_token_id();
+        eprintln!("eos_token_id: {:?}", eos);
+        assert!(eos.is_some(), "should find an EOS token");
+    }
+
+    #[test]
+    fn test_generate_text_e2e() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+        let tok = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
+
+        let t0 = std::time::Instant::now();
+        let response = model.generate_text(&tok, "The capital of France is", 10, 0.0)
+            .expect("generate_text failed");
+        let elapsed = t0.elapsed();
+
+        eprintln!("generate_text: '{}' ({:.1}s)", response, elapsed.as_secs_f64());
+        assert!(response.contains("Paris"),
+            "response should mention Paris, got: '{}'", response);
     }
 }
