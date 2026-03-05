@@ -18,12 +18,41 @@ mod inner {
     use crate::agent::mlx_server::ModelRequest;
     use crate::providers::base::{LLMProvider, LLMResponse};
 
+    /// Strip thinking content from model output. Handles two cases:
+    /// 1. `<think>...</think>` blocks (full tags in output)
+    /// 2. `...</think>` at start (opening tag was in prompt prefill)
+    fn strip_think_blocks(text: &str) -> String {
+        let mut result = String::new();
+        let mut rest = text;
+
+        // Case 2: output starts mid-think (opening <think> was in prompt prefill)
+        if !rest.contains("<think>") {
+            if let Some(end) = rest.find("</think>") {
+                rest = &rest[end + "</think>".len()..];
+            }
+        }
+
+        // Case 1: full <think>...</think> blocks
+        while let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed think block — discard the rest
+                return result.trim().to_string();
+            }
+        }
+        result.push_str(rest);
+        result.trim().to_string()
+    }
+
     /// In-process MLX provider. Owns the channel to the model worker thread.
     pub struct MlxProvider {
         tx: std::sync::mpsc::SyncSender<ModelRequest>,
         tokenizer: Arc<MlxTokenizer>,
         model_name: String,
         api_base: String,
+        thinking_model: bool,
     }
 
     impl MlxProvider {
@@ -46,6 +75,7 @@ mod inner {
             let train_state = Arc::new(crate::agent::mlx_server::TrainState::new());
             let (tx, rx) = std::sync::mpsc::sync_channel::<ModelRequest>(4);
 
+            let thinking_model = model_config.thinking_model;
             let dir = model_dir.clone();
             let cfg = model_config;
             let lora_cfg = lora_config;
@@ -62,6 +92,7 @@ mod inner {
                 tokenizer: Arc::new(tokenizer),
                 model_name,
                 api_base: "mlx://in-process".to_string(),
+                thinking_model,
             })
         }
 
@@ -156,7 +187,11 @@ mod inner {
                 })
                 .collect();
 
-            let prompt = crate::agent::mlx_server::apply_chat_template(&chat_messages);
+            let prompt = if self.thinking_model {
+                crate::agent::mlx_server::apply_chat_template_nothink(&chat_messages)
+            } else {
+                crate::agent::mlx_server::apply_chat_template(&chat_messages)
+            };
 
             let (reply_tx, reply_rx) = oneshot::channel();
             self.tx
@@ -168,10 +203,17 @@ mod inner {
                 })
                 .map_err(|_| anyhow::anyhow!("model worker died"))?;
 
-            let (text, prompt_tokens, completion_tokens) = reply_rx
+            let (raw_text, prompt_tokens, completion_tokens) = reply_rx
                 .await
                 .map_err(|_| anyhow::anyhow!("model worker dropped reply"))?
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            // Strip <think>...</think> blocks from thinking models
+            let text = if self.thinking_model {
+                strip_think_blocks(&raw_text)
+            } else {
+                raw_text
+            };
 
             let mut usage = HashMap::new();
             usage.insert("prompt_tokens".to_string(), prompt_tokens as i64);
@@ -353,5 +395,67 @@ mod tests {
         provider.train(convos, 1).await.expect("train should not error");
 
         eprintln!("Closed loop complete: inference → perplexity → train");
+    }
+
+    // --- Qwen3-4B tests ---
+
+    fn model_dir_4b() -> PathBuf {
+        dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/lmstudio-community/Qwen3-4B-Thinking-2507-MLX-4bit")
+    }
+
+    fn skip_if_no_4b() -> bool {
+        !model_dir_4b().join("tokenizer.json").exists()
+    }
+
+    /// E2E: Qwen3-4B closed loop — inference, perplexity, train.
+    #[tokio::test]
+    async fn test_mlx_qwen3_4b_closed_loop() {
+        if skip_if_no_4b() {
+            eprintln!("SKIP: Qwen3-4B not found at {:?}", model_dir_4b());
+            return;
+        }
+
+        let provider = MlxProvider::start(
+            model_dir_4b(),
+            ModelConfig::qwen3_4b(),
+            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
+        ).expect("MlxProvider::start failed (4B)");
+
+        // 1. Inference
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "What is 2+2? Answer with just the number."
+        })];
+        // Thinking models need more tokens: ~100 for reasoning + answer
+        let resp = provider.chat(&messages, None, None, 256, 0.0, None, None)
+            .await
+            .expect("chat failed");
+        let answer = resp.content.unwrap_or_default();
+        eprintln!("4B Inference: {answer:?}");
+        assert!(!answer.is_empty(), "response empty after think-strip (raw may have had thinking)");
+
+        // 2. Perplexity
+        let loss = provider.perplexity("What is 2+2?", &answer)
+            .await
+            .expect("perplexity failed");
+        eprintln!("4B Perplexity: {loss}");
+        assert!(loss > 0.0);
+
+        // 3. Train
+        let convos = vec![vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: "What is 2+2?".into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: answer.clone(),
+            },
+        ]];
+        provider.train(convos, 1).await.expect("train should not error");
+
+        eprintln!("4B closed loop complete: inference → perplexity → train");
     }
 }

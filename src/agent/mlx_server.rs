@@ -30,21 +30,41 @@ use super::mlx_lora::{LoraConfig, ModelConfig, MlxLoraModel, MlxTokenizer};
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
 
+/// Apply ChatML template with empty think-block prefill (Qwen3.5 style).
 pub fn apply_chat_template(messages: &[ChatMessage]) -> String {
+    apply_chat_template_with_think(messages, true)
+}
+
+/// Apply ChatML template for thinking models: prefill `<think>\n` (matching
+/// Qwen3's Jinja template), append `/no_think` to suppress reasoning.
+/// Output is stripped of `<think>...</think>` blocks by the provider.
+pub fn apply_chat_template_nothink(messages: &[ChatMessage]) -> String {
+    apply_chat_template_with_think(messages, false)
+}
+
+fn apply_chat_template_with_think(messages: &[ChatMessage], close_think: bool) -> String {
     let mut prompt = String::new();
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         prompt.push_str(IM_START);
         prompt.push_str(&msg.role);
         prompt.push('\n');
         prompt.push_str(&msg.content);
+        // For nothink mode, append /no_think to last user message
+        if !close_think && msg.role == "user" && i == messages.len() - 1 {
+            prompt.push_str(" /no_think");
+        }
         prompt.push_str(IM_END);
         prompt.push('\n');
     }
     prompt.push_str(IM_START);
     prompt.push_str("assistant\n");
-    // Prefill empty think block so Qwen3.5 skips reasoning and answers directly.
-    // Qwen3.5 lacks /nothink support — this is the standard prefill approach.
-    prompt.push_str("<think>\n\n</think>\n\n");
+    if close_think {
+        // Qwen3.5: empty think block prefill closes reasoning immediately
+        prompt.push_str("<think>\n\n</think>\n\n");
+    } else {
+        // Qwen3 thinking: open think block (matches Jinja template)
+        prompt.push_str("<think>\n");
+    }
     prompt
 }
 
@@ -213,10 +233,24 @@ pub fn run_model_worker(
         .sum();
     train_state.trainable_params.store(total_trainable, Ordering::Relaxed);
 
-    let im_end_id = 248046i32;
-    let eos_id = 248044i32;
-    let think_id = 248068i32; // <think> — prevent re-entering thinking after prefill
-    let stop_tokens = [im_end_id, eos_id, think_id];
+    // Resolve stop tokens from tokenizer (works across Qwen3/3.5 vocab sizes)
+    let resolve_token = |text: &str| -> i32 {
+        tokenizer.encode(text).ok()
+            .and_then(|ids| ids.first().copied())
+            .unwrap_or(-1)
+    };
+    let im_end_id = resolve_token("<|im_end|>");
+    let eos_id = tokenizer.eos_token_id().map(|id| id as i32).unwrap_or(-1);
+    let mut stop_tokens: Vec<i32> = [im_end_id, eos_id]
+        .iter().copied().filter(|&id| id >= 0).collect();
+    // For non-thinking models (Qwen3.5), also stop on <think> to prevent re-entering
+    // thinking after the empty prefill. Thinking models need <think> to flow through.
+    if !cfg.thinking_model {
+        let think_id = resolve_token("<think>");
+        if think_id >= 0 {
+            stop_tokens.push(think_id);
+        }
+    }
 
     eprintln!("model worker ready ({total_trainable} trainable params)");
 

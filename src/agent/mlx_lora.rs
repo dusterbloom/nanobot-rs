@@ -417,6 +417,8 @@ pub struct ModelConfig {
     pub linear_n_heads: usize,
     pub linear_head_dim: usize,
     pub conv_kernel_size: usize,
+    /// Thinking model: use /nothink system instruction instead of empty think prefill
+    pub thinking_model: bool,
 }
 
 impl ModelConfig {
@@ -432,6 +434,23 @@ impl ModelConfig {
             attn_output_gate: false,
             linear_attn_indices: vec![],
             linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            thinking_model: false,
+        }
+    }
+
+    pub fn qwen3_4b() -> Self {
+        ModelConfig {
+            dim: 2560, hidden_dim: 9728,
+            n_heads: 32, n_kv_heads: 8, n_layers: 36,
+            vocab_size: 151936, head_dim: 128,
+            rope_theta: 5_000_000.0, rms_eps: 1e-6,
+            group_size: 64, bits: 4,
+            weight_prefix: "model",
+            partial_rotary_factor: 1.0,
+            attn_output_gate: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            thinking_model: true,
         }
     }
 
@@ -451,6 +470,7 @@ impl ModelConfig {
             attn_output_gate: true,
             linear_attn_indices: linear_indices,
             linear_n_heads: 16, linear_head_dim: 128, conv_kernel_size: 4,
+            thinking_model: false,
         }
     }
 

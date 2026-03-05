@@ -276,6 +276,7 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     let model_dir = resolve_mlx_model_dir(config);
     let model_config = match config.agents.defaults.mlx_preset.as_str() {
         "qwen3-1.7b" => ModelConfig::qwen3_1_7b(),
+        "qwen3-4b" => ModelConfig::qwen3_4b(),
         _ => ModelConfig::qwen3_5_2b(),
     };
     let lora_config = LoraConfig {
