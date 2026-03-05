@@ -26,7 +26,7 @@ impl ReplContext {
         let ch = self.core_handle.clone();
         println!("\n  Scan the QR code when it appears");
         let handle = tokio::spawn(async move {
-            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
+            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx), None).await;
         });
         self.active_channels.push(super::super::ActiveChannel {
             name: "whatsapp".to_string(),
@@ -94,7 +94,7 @@ impl ReplContext {
         let dtx = self.display_tx.clone();
         let ch = self.core_handle.clone();
         let handle = tokio::spawn(async move {
-            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
+            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx), None).await;
         });
         self.active_channels.push(super::super::ActiveChannel {
             name: "telegram".to_string(),
@@ -133,7 +133,7 @@ impl ReplContext {
         let dtx = self.display_tx.clone();
         let ch = self.core_handle.clone();
         let handle = tokio::spawn(async move {
-            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx)).await;
+            cli::run_gateway_async(gw_config, ch, Some(stop2), Some(dtx), None).await;
         });
         self.active_channels.push(super::super::ActiveChannel {
             name: "email".to_string(),

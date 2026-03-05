@@ -87,6 +87,13 @@ pub(crate) struct AgentLoopShared {
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     /// Knowledge store for proactive grounding retrieval.
     pub(crate) knowledge_store: Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
+    /// Experience buffer for perplexity gate (online learning).
+    pub(crate) experience_buffer: Option<Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>>,
+    /// Perplexity gate configuration.
+    pub(crate) perplexity_gate_config: crate::config::schema::PerplexityGateConfig,
+    /// In-process MLX provider for direct perplexity scoring + training (no HTTP).
+    #[cfg(feature = "mlx")]
+    pub(crate) mlx_provider: Option<std::sync::Arc<crate::providers::mlx::MlxProvider>>,
 }
 
 /// Per-message state that flows through the three processing phases.

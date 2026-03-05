@@ -105,6 +105,40 @@ Hands-free conversation with VAD-based turn detection. No keys needed -- just sp
 
 Switch to push-to-talk with `--mode ptt` (hold Space to record).
 
+### MLX inference (Apple Silicon)
+
+Run a language model directly on your Mac's GPU -- no server, no HTTP, no separate process. The model lives in nanobot's memory and serves inference, perplexity scoring, and LoRA fine-tuning from the same worker thread.
+
+```bash
+cargo build --release --features mlx
+```
+
+Set `inferenceEngine` to `"mlx"` in `~/.nanobot/config.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "inferenceEngine": "mlx",
+      "mlxModelDir": "~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit",
+      "mlxPreset": "qwen3.5-2b"
+    }
+  }
+}
+```
+
+Default model: **Qwen3.5-2B** (8-bit, ~2GB). The model loads once at startup and stays in GPU memory. All entry points (REPL, gateway, voice, channels) use the same in-process provider.
+
+**Online learning**: When MLX is active, the perplexity gate auto-enables. Each conversation turn is scored for surprise (cross-entropy loss). Surprising exchanges accumulate in an experience buffer; once enough gather, a LoRA training pass fires in the background. The model learns from its mistakes -- next inference uses updated weights. No manual training step needed.
+
+**MLX server** (standalone, OpenAI-compatible):
+
+```bash
+nanobot mlx-serve --port 8766
+```
+
+Exposes `/v1/chat/completions` (OpenAI) + Ex0bit protocol (`/chat` SSE, `/train`, `/status`, `/reset`).
+
 ### Tools
 
 The agent has hands. It can read and write files, run shell commands, search the web, spawn sub-agents, and schedule recurring tasks:
@@ -217,6 +251,7 @@ In gateway mode, messages from different chats are processed in parallel (up to 
 | `nanobot cron add` | Add a scheduled job |
 | `nanobot realtime` | Realtime voice session (continuous mode) |
 | `nanobot realtime --mode ptt` | Realtime voice with push-to-talk |
+| `nanobot mlx-serve` | Start MLX model server (OpenAI-compat + Ex0bit) |
 
 ## Building
 
@@ -226,6 +261,9 @@ cargo build --release
 
 # With voice mode (requires jack-voice + pocket-tts)
 cargo build --release --features voice
+
+# With MLX in-process inference (Apple Silicon only)
+cargo build --release --features mlx
 
 # Debug with logging
 RUST_LOG=debug cargo run -- agent -m "Hello"
@@ -243,6 +281,9 @@ Key agent settings in `config.json`:
 | `agents.defaults.maxTokens` | `8192` | Max response tokens |
 | `agents.defaults.maxContextTokens` | `128000` | Context window size |
 | `agents.defaults.maxConcurrentChats` | `4` | Parallel chat limit (gateway) |
+| `agents.defaults.inferenceEngine` | `auto` | Engine: `auto`, `lms`, or `mlx` |
+| `agents.defaults.mlxModelDir` | (auto-detected) | Path to MLX model directory |
+| `agents.defaults.mlxPreset` | `qwen3.5-2b` | Model config preset |
 
 For local mode, install [LM Studio](https://lmstudio.ai/) and its CLI (`lms`). Models are managed through LM Studio.
 

@@ -3,6 +3,7 @@ pub mod base;
 pub mod constants;
 pub mod factory;
 pub mod jit_gate;
+pub mod mlx;
 pub mod oauth;
 pub mod openai_compat;
 pub mod retry;

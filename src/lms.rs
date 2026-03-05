@@ -550,12 +550,83 @@ async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
 }
 
 // ============================================================================
+// Jinja probe — detect --jinja support for native function calling
+// ============================================================================
+
+/// Probe an LM Studio endpoint to detect whether `--jinja` (native tool_calls)
+/// is likely supported.
+///
+/// Strategy: send a minimal chat completion with `tools` parameter.  If the
+/// server returns a 200 with valid JSON (even if no tool_calls), jinja is
+/// available.  If it returns 400/422 or an error mentioning "tools", jinja
+/// is not enabled.
+///
+/// Returns `true` if jinja appears supported, `false` otherwise.
+/// Timeout: 3 seconds to avoid blocking startup.
+pub(crate) async fn probe_jinja_support(api_base: &str) -> bool {
+    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": "probe",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "test",
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                tracing::info!("jinja_probe: tools accepted (status {status})");
+                return true;
+            }
+            // 4xx with error about tools → jinja not enabled
+            let text = resp.text().await.unwrap_or_default();
+            let no_jinja = text.contains("tools") || text.contains("jinja")
+                || text.contains("not supported") || text.contains("unknown field");
+            if no_jinja {
+                tracing::warn!("jinja_probe: tools rejected — --jinja likely not enabled");
+            }
+            !no_jinja
+        }
+        Err(e) => {
+            tracing::debug!("jinja_probe: connection failed: {e}");
+            false
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_jinja_probe_unreachable_returns_false() {
+        // Probe against a port nothing listens on → should return false, not panic.
+        let result = probe_jinja_support("http://127.0.0.1:19999/v1").await;
+        assert!(!result, "unreachable server should return false");
+    }
+
+    #[tokio::test]
+    async fn test_jinja_probe_bad_url_returns_false() {
+        let result = probe_jinja_support("not-a-url").await;
+        assert!(!result, "invalid URL should return false");
+    }
 
     async fn fetch_loaded_context_length(port: u16, model: &str) -> Option<usize> {
         let url = format!("{}/api/v1/models", rest_base("", port));

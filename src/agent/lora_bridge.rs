@@ -186,6 +186,24 @@ impl ExperienceBuffer {
         })
     }
 
+    /// Record a new experience with an explicit surprise score (e.g. CE loss).
+    pub fn record_with_surprise(
+        &self,
+        prompt: &str,
+        tool_trace: &str,
+        response: &str,
+        success: bool,
+        quality: f64,
+        model: &str,
+        surprise: f64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO experiences (prompt, tool_trace, response, success, quality, model, surprise) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![prompt, tool_trace, response, success as i32, quality, model, surprise],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Get buffer statistics.
     pub fn stats(&self) -> Result<BufferStats> {
         let total: i64 = self
@@ -945,6 +963,62 @@ fn find_model_recursive(root: &Path, needle: &str) -> Option<PathBuf> {
 }
 
 // =============================================================================
+// Perplexity Gate: trigger training on MLX server
+// =============================================================================
+
+/// Export high-surprise experiences and POST them to the MLX server's /train endpoint.
+///
+/// Returns the number of experiences sent, or an error.
+pub async fn trigger_training(
+    buffer: &ExperienceBuffer,
+    server_url: &str,
+    limit: usize,
+    epochs: usize,
+) -> Result<usize> {
+    let experiences = buffer.top_unexported(limit)?;
+    if experiences.is_empty() {
+        return Ok(0);
+    }
+
+    // Build Ex0bit training format: messages is Vec<Vec<{role, content}>>
+    let mut conversations = Vec::new();
+    let mut ids = Vec::new();
+    for exp in &experiences {
+        conversations.push(serde_json::json!([
+            {"role": "user", "content": exp.prompt},
+            {"role": "assistant", "content": exp.response}
+        ]));
+        ids.push(exp.id);
+    }
+
+    let body = serde_json::json!({
+        "messages": conversations,
+        "epochs": epochs,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let url = format!("{}/train", server_url);
+
+    let resp = client.post(&url).json(&body).send().await
+        .context("Failed to POST /train to MLX server")?;
+
+    if resp.status().is_success() {
+        buffer.mark_exported(&ids)?;
+        info!(
+            "Perplexity gate: sent {} experiences to {} for training ({} epochs)",
+            ids.len(), server_url, epochs
+        );
+        Ok(ids.len())
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("MLX server /train returned {}: {}", status, text)
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1376,6 +1450,57 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["name"], "read_file");
         assert_eq!(parsed[1]["name"], "exec_command");
+    }
+
+    #[test]
+    fn test_record_with_explicit_surprise() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        let id = buffer
+            .record_with_surprise(
+                "What is the capital?",
+                r#"[{"name":"web_search"}]"#,
+                "Paris",
+                true,
+                0.9,
+                "qwen3.5",
+                4.2, // explicit CE loss as surprise
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let exps = buffer.top_unexported(10).unwrap();
+        assert_eq!(exps.len(), 1);
+        assert!((exps[0].surprise - 4.2).abs() < 1e-6, "explicit surprise should be preserved");
+        assert_eq!(exps[0].model, "qwen3.5");
+    }
+
+    #[tokio::test]
+    async fn test_query_perplexity_unreachable() {
+        // query_perplexity should return None when server is unreachable.
+        let result = super::super::finalize_response::query_perplexity(
+            "http://127.0.0.1:19999",
+            "hello",
+            "world",
+        ).await;
+        assert!(result.is_none(), "should return None for unreachable server");
+    }
+
+    #[tokio::test]
+    async fn test_trigger_training_no_server() {
+        // Trigger training against a non-existent server — should fail gracefully.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        buffer.record_with_surprise("q", "[]", "a", true, 1.0, "m", 5.0).unwrap();
+
+        let result = trigger_training(&buffer, "http://127.0.0.1:19999", 10, 3).await;
+        assert!(result.is_err(), "should fail when server is unreachable");
+        // Experience should NOT be marked as exported on failure.
+        assert_eq!(buffer.stats().unwrap().unexported, 1);
     }
 
     #[test]

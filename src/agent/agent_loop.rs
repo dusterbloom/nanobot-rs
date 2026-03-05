@@ -208,6 +208,11 @@ impl AgentLoop {
             cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default().ok()
                 .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
+            experience_buffer: crate::agent::lora_bridge::ExperienceBuffer::open_default().ok()
+                .map(|eb| Arc::new(parking_lot::Mutex::new(eb))),
+            perplexity_gate_config: Default::default(),
+            #[cfg(feature = "mlx")]
+            mlx_provider: None,
         });
 
         Self {
@@ -217,6 +222,23 @@ impl AgentLoop {
             max_concurrent_chats,
             reflection_spawned: AtomicBool::new(false),
         }
+    }
+
+    /// Configure the perplexity gate for automatic online learning.
+    ///
+    /// Must be called before `run()` or `process_direct()` to take effect.
+    pub fn set_perplexity_gate(&mut self, config: crate::config::schema::PerplexityGateConfig) {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_perplexity_gate called after shared Arc was cloned");
+        shared.perplexity_gate_config = config;
+    }
+
+    /// Set the in-process MLX provider for direct perplexity + training.
+    #[cfg(feature = "mlx")]
+    pub fn set_mlx_provider(&mut self, provider: Arc<crate::providers::mlx::MlxProvider>) {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_mlx_provider called after shared Arc was cloned");
+        shared.mlx_provider = Some(provider);
     }
 
     /// Set the cluster router for distributed inference routing.
@@ -232,6 +254,18 @@ impl AgentLoop {
         let subagents = Arc::get_mut(&mut shared.subagents)
             .expect("set_cluster_router: subagents Arc already shared");
         subagents.cluster_router = Some(router);
+    }
+
+    /// Check whether the perplexity gate is enabled on this agent loop.
+    #[cfg(test)]
+    pub fn has_perplexity_gate(&self) -> bool {
+        self.shared.perplexity_gate_config.enabled
+    }
+
+    /// Check whether the in-process MLX provider is set.
+    #[cfg(all(test, feature = "mlx"))]
+    pub fn has_mlx_provider(&self) -> bool {
+        self.shared.mlx_provider.is_some()
     }
 
     /// Spawn a periodic bulletin refresh task (compaction model, when idle).

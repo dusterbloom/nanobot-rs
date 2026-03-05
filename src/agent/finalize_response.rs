@@ -59,6 +59,151 @@ impl AgentLoopShared {
             }
         }
 
+        // Perplexity gate: record experience and optionally trigger training.
+        // Must run before audit write which moves turn_tool_entries.
+        if self.perplexity_gate_config.enabled
+            && !ctx.used_tools.is_empty()
+            && !ctx.final_content.is_empty()
+        {
+            if let Some(ref eb_mutex) = self.experience_buffer {
+                let tool_entries: Vec<serde_json::Value> = ctx
+                    .turn_tool_entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "ok": e.ok,
+                            "duration_ms": e.duration_ms,
+                        })
+                    })
+                    .collect();
+                let trace_json =
+                    serde_json::to_string(&tool_entries).unwrap_or_else(|_| "[]".into());
+
+                // Try in-process MLX perplexity first, then HTTP, then heuristic.
+                let surprise = 'surprise: {
+                    #[cfg(feature = "mlx")]
+                    if let Some(ref mlx) = self.mlx_provider {
+                        if let Ok(loss) = mlx.perplexity(&ctx.user_content, &ctx.final_content).await {
+                            break 'surprise loss as f64;
+                        }
+                    }
+                    match query_perplexity(
+                        &self.perplexity_gate_config.mlx_server_url,
+                        &ctx.user_content,
+                        &ctx.final_content,
+                    ).await {
+                        Some(loss) => loss as f64,
+                        None => crate::agent::lora_bridge::compute_surprise(
+                            &ctx.user_content, &trace_json,
+                        ),
+                    }
+                };
+
+                let threshold = self.perplexity_gate_config.surprise_threshold as f64;
+                if surprise > threshold {
+                    // Record under lock, then release before any async work.
+                    let should_train = {
+                        let eb = eb_mutex.lock();
+                        match eb.record_with_surprise(
+                            &ctx.user_content,
+                            &trace_json,
+                            &ctx.final_content,
+                            true,
+                            1.0,
+                            &ctx.core.model,
+                            surprise,
+                        ) {
+                            Ok(id) => {
+                                debug!(
+                                    experience_id = id,
+                                    surprise = format!("{:.3}", surprise),
+                                    "perplexity_gate: recorded surprising experience"
+                                );
+                            }
+                            Err(e) => {
+                                debug!("perplexity_gate: record failed: {}", e);
+                            }
+                        }
+                        let min_exp = self.perplexity_gate_config.min_experiences;
+                        eb.stats().map(|s| s.unexported as usize >= min_exp).unwrap_or(false)
+                    }; // lock released
+
+                    if should_train {
+                        let epochs = self.perplexity_gate_config.train_epochs;
+                        let min_exp = self.perplexity_gate_config.min_experiences;
+                        let eb_arc = eb_mutex.clone();
+
+                        // Prefer in-process MLX training (no HTTP), fall back to server.
+                        #[cfg(feature = "mlx")]
+                        let mlx_provider = self.mlx_provider.clone();
+                        #[cfg(not(feature = "mlx"))]
+                        let mlx_provider: Option<()> = None;
+
+                        let server_url = self.perplexity_gate_config.mlx_server_url.clone();
+                        tokio::spawn(async move {
+                            // Collect experiences under lock.
+                            let (exps_data, ids) = {
+                                let eb = eb_arc.lock();
+                                let exps = match eb.top_unexported(min_exp) {
+                                    Ok(e) => e,
+                                    Err(_) => return,
+                                };
+                                if exps.is_empty() { return; }
+                                let data: Vec<(String, String)> = exps.iter()
+                                    .map(|e| (e.prompt.clone(), e.response.clone()))
+                                    .collect();
+                                let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
+                                (data, ids)
+                            };
+
+                            // Try in-process MLX training first.
+                            #[cfg(feature = "mlx")]
+                            if let Some(ref mlx) = mlx_provider {
+                                let convos: Vec<Vec<crate::agent::mlx_server::ChatMessage>> =
+                                    exps_data.iter().map(|(p, r)| vec![
+                                        crate::agent::mlx_server::ChatMessage { role: "user".into(), content: p.clone() },
+                                        crate::agent::mlx_server::ChatMessage { role: "assistant".into(), content: r.clone() },
+                                    ]).collect();
+                                match mlx.train(convos, epochs).await {
+                                    Ok(()) => {
+                                        let eb = eb_arc.lock();
+                                        let _ = eb.mark_exported(&ids);
+                                        info!("perplexity_gate: in-process training with {} experiences", ids.len());
+                                        return;
+                                    }
+                                    Err(e) => debug!("perplexity_gate: in-process train failed: {e}"),
+                                }
+                            }
+
+                            // Fall back to HTTP /train.
+                            let conversations: Vec<serde_json::Value> = exps_data.iter().map(|(p, r)| {
+                                serde_json::json!([
+                                    {"role": "user", "content": p},
+                                    {"role": "assistant", "content": r}
+                                ])
+                            }).collect();
+                            let body = serde_json::json!({"messages": conversations, "epochs": epochs});
+                            let url = format!("{}/train", server_url);
+                            let client = match reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5)).build() {
+                                Ok(c) => c, Err(_) => return,
+                            };
+                            match client.post(&url).json(&body).send().await {
+                                Ok(resp) if resp.status().is_success() => {
+                                    let eb = eb_arc.lock();
+                                    let _ = eb.mark_exported(&ids);
+                                    info!("perplexity_gate: triggered training with {} experiences", ids.len());
+                                }
+                                Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
+                                Err(e) => debug!("perplexity_gate: training trigger failed: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
         // Write per-turn audit summary.
         if ctx.core.provenance_config.enabled && ctx.core.provenance_config.audit_log {
             let summary = crate::agent::audit::TurnSummary {
@@ -294,4 +439,28 @@ impl AgentLoopShared {
             Some(outbound)
         }
     }
+}
+
+/// Query the MLX server's `/perplexity` endpoint for real CE-loss surprise.
+///
+/// Returns `Some(loss)` on success, `None` if the server is unreachable or errors.
+/// Uses a short timeout (2s) to avoid blocking the response path.
+pub(crate) async fn query_perplexity(server_url: &str, user_content: &str, assistant_content: &str) -> Option<f32> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let url = format!("{}/perplexity", server_url);
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content}
+        ]
+    });
+    let resp = client.post(&url).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("loss").and_then(|v| v.as_f64()).map(|v| v as f32)
 }

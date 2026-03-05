@@ -286,10 +286,17 @@ pub struct AgentDefaults {
     /// Port for the LM Studio server when managed by lms CLI (default: 1234).
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
-    /// Inference engine preference: "auto" | "lms".
-    /// Currently only LM Studio ("lms") is supported.
+    /// Inference engine preference: "auto" | "lms" | "mlx".
+    /// "mlx" uses the in-process MLX provider for Apple Silicon GPU inference.
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
+    /// Path to MLX model directory (containing .safetensors + tokenizer.json).
+    /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlx_model_dir: Option<String>,
+    /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
+    #[serde(default = "default_mlx_preset")]
+    pub mlx_preset: String,
     /// Path to a YAML instruction profiles file for model-specific prompt
     /// engineering. When set, profiles are loaded at startup and applied to
     /// every LLM call based on the active model name and task kind.
@@ -385,6 +392,10 @@ fn default_inference_engine() -> String {
     "auto".to_string()
 }
 
+fn default_mlx_preset() -> String {
+    "qwen3.5-2b".to_string()
+}
+
 fn default_local_thinking_reserve_tokens() -> u32 {
     512
 }
@@ -435,6 +446,8 @@ impl Default for AgentDefaults {
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
             inference_engine: default_inference_engine(),
+            mlx_model_dir: None,
+            mlx_preset: default_mlx_preset(),
             instructions_path: None,
             skip_jit_gate: false,
             local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),
@@ -2030,6 +2043,52 @@ pub struct MonitoringConfig {
     pub tool_heartbeat_secs: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Perplexity gate config
+// ---------------------------------------------------------------------------
+
+/// Configuration for the perplexity gate — automatic online learning from
+/// surprising conversations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerplexityGateConfig {
+    /// Whether the perplexity gate is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// CE-loss threshold above which a conversation is considered "surprising"
+    /// and worth recording for LoRA training. Default: 3.0.
+    #[serde(default = "default_surprise_threshold")]
+    pub surprise_threshold: f32,
+    /// Minimum number of unexported high-surprise experiences before triggering
+    /// a training run. Default: 5.
+    #[serde(default = "default_min_experiences")]
+    pub min_experiences: usize,
+    /// URL of the MLX LoRA training server (Ex0bit /train endpoint).
+    /// Default: "http://127.0.0.1:8766".
+    #[serde(default = "default_mlx_server_url")]
+    pub mlx_server_url: String,
+    /// Number of training epochs when triggering. Default: 15.
+    #[serde(default = "default_train_epochs")]
+    pub train_epochs: usize,
+}
+
+fn default_surprise_threshold() -> f32 { 3.0 }
+fn default_min_experiences() -> usize { 5 }
+fn default_mlx_server_url() -> String { "http://127.0.0.1:8766".to_string() }
+fn default_train_epochs() -> usize { 15 }
+
+impl Default for PerplexityGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            surprise_threshold: default_surprise_threshold(),
+            min_experiences: default_min_experiences(),
+            mlx_server_url: default_mlx_server_url(),
+            train_epochs: default_train_epochs(),
+        }
+    }
+}
+
 fn default_degraded_threshold() -> u32 {
     3
 }
@@ -2104,6 +2163,8 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub perplexity_gate: PerplexityGateConfig,
 }
 
 impl Config {

@@ -2,7 +2,7 @@
 //!
 //! Exposes both protocols:
 //!   - OpenAI: `/v1/chat/completions` (JSON)
-//!   - Ex0bit: `/chat` (SSE), `/train`, `/reset`, `/status`, `/config`
+//!   - Ex0bit: `/chat` (SSE), `/train`, `/perplexity`, `/reset`, `/status`, `/config`
 //!
 //! Model lives on a dedicated thread (mlx-rs uses Rc, so !Send).
 //! HTTP handlers communicate via mpsc channels.
@@ -30,7 +30,7 @@ use super::mlx_lora::{LoraConfig, ModelConfig, MlxLoraModel, MlxTokenizer};
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
 
-fn apply_chat_template(messages: &[ChatMessage]) -> String {
+pub fn apply_chat_template(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
         prompt.push_str(IM_START);
@@ -126,6 +126,12 @@ pub struct SimpleTrainRequest {
     pub patience: usize,
 }
 
+/// `/perplexity` request: compute mean CE loss for a conversation.
+#[derive(Debug, Deserialize)]
+pub struct PerplexityRequest {
+    pub messages: Vec<ChatMessage>,
+}
+
 fn default_early_stop() -> f32 { 0.5 }
 fn default_patience() -> usize { 10 }
 
@@ -139,7 +145,7 @@ pub struct SimpleTrainSample {
 // Model worker (runs on dedicated thread, owns the !Send model)
 // ---------------------------------------------------------------------------
 
-enum ModelRequest {
+pub enum ModelRequest {
     Chat {
         prompt: String,
         max_tokens: usize,
@@ -157,10 +163,16 @@ enum ModelRequest {
     Reset {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Forward pass only — return mean CE loss (perplexity = exp(loss)).
+    Perplexity {
+        tokens: Vec<i32>,
+        targets: Vec<i32>,
+        reply: oneshot::Sender<Result<f32, String>>,
+    },
 }
 
 /// Shared training state visible to status endpoint.
-struct TrainState {
+pub struct TrainState {
     training: AtomicBool,
     total_steps: AtomicU32,
     last_loss: Mutex<f32>,
@@ -169,7 +181,7 @@ struct TrainState {
 }
 
 impl TrainState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         TrainState {
             training: AtomicBool::new(false),
             total_steps: AtomicU32::new(0),
@@ -180,7 +192,7 @@ impl TrainState {
     }
 }
 
-fn run_model_worker(
+pub fn run_model_worker(
     model_dir: PathBuf,
     cfg: ModelConfig,
     lora_cfg: LoraConfig,
@@ -269,6 +281,20 @@ fn run_model_worker(
                     let _ = reply.send(result);
                 }
             }
+            ModelRequest::Perplexity { tokens, targets, reply } => {
+                let result = (|| {
+                    use mlx_rs::Array;
+                    let tok_arr = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
+                    let tgt_arr = Array::from_slice(&targets, &[1, targets.len() as i32]);
+                    let logits = model.forward_logits(&tok_arr)
+                        .map_err(|e| format!("forward: {e}"))?;
+                    let loss = super::mlx_lora::cross_entropy_loss(&logits, &tgt_arr)
+                        .map_err(|e| format!("ce_loss: {e}"))?;
+                    let loss_val: f32 = loss.item();
+                    Ok(loss_val)
+                })();
+                let _ = reply.send(result);
+            }
             ModelRequest::Reset { reply } => {
                 train_state.total_steps.store(0, Ordering::Relaxed);
                 *train_state.last_loss.lock() = 0.0;
@@ -307,7 +333,7 @@ struct AppState {
 // Helper: tokenize message pairs for training
 // ---------------------------------------------------------------------------
 
-fn tokenize_conversation(
+pub fn tokenize_conversation(
     tokenizer: &MlxTokenizer,
     messages: &[ChatMessage],
 ) -> Result<(Vec<i32>, Vec<i32>), String> {
@@ -507,6 +533,34 @@ async fn config_put() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// `/perplexity` — compute mean CE loss for a conversation (forward pass only).
+/// Returns `{"loss": f32, "perplexity": f32, "tokens": usize}`.
+async fn perplexity(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PerplexityRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (tokens, targets) = tokenize_conversation(&state.tokenizer, &req.messages)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let n_tokens = tokens.len();
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.tx.send(ModelRequest::Perplexity {
+        tokens,
+        targets,
+        reply: reply_tx,
+    }).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "model worker died".into()))?;
+
+    let loss = reply_rx.await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "model worker dropped reply".into()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "loss": loss,
+        "perplexity": (loss as f64).exp(),
+        "tokens": n_tokens,
+    })))
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
@@ -587,6 +641,7 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
         // Ex0bit daemon compat
         .route("/chat", post(chat_sse))
         .route("/train", post(train_exobit))
+        .route("/perplexity", post(perplexity))
         .route("/reset", post(reset))
         .route("/status", get(status_exobit))
         .route("/config", put(config_put))
@@ -599,7 +654,7 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
     eprintln!("  model: {model_name}");
     eprintln!("  endpoints:");
     eprintln!("    OpenAI:  POST /v1/chat/completions");
-    eprintln!("    Ex0bit:  POST /chat (SSE), /train, /reset | GET /status | PUT /config");
+    eprintln!("    Ex0bit:  POST /chat (SSE), /train, /perplexity, /reset | GET /status | PUT /config");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

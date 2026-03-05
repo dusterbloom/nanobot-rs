@@ -78,6 +78,9 @@ pub(crate) struct ReplContext {
     /// Cluster state for /cluster command (peer discovery, model listing).
     #[cfg(feature = "cluster")]
     pub cluster_state: Option<Arc<crate::cluster::state::ClusterState>>,
+    /// In-process MLX provider handle (kept alive so the model worker persists).
+    #[cfg(feature = "mlx")]
+    pub mlx_handle: Option<cli::MlxHandle>,
 }
 
 // ============================================================================
@@ -123,7 +126,22 @@ impl ReplContext {
     /// Rebuild the agent loop after a server or config change.
     ///
     /// Replaces the 8x copy-pasted `agent_loop = cli::create_agent_loop(...)` pattern.
+    /// When an MLX handle is active, the rebuilt loop inherits the in-process
+    /// provider and auto-enabled perplexity gate.
     pub fn rebuild_agent_loop(&mut self) {
+        #[cfg(feature = "mlx")]
+        if let Some(ref mlx) = self.mlx_handle {
+            self.agent_loop = cli::create_agent_loop_mlx(
+                self.core_handle.clone(),
+                &self.config,
+                Some(self.cron_service.clone()),
+                self.email_config.clone(),
+                Some(self.display_tx.clone()),
+                self.health_registry.clone(),
+                mlx,
+            );
+            return;
+        }
         self.agent_loop = cli::create_agent_loop(
             self.core_handle.clone(),
             &self.config,

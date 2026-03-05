@@ -1368,6 +1368,36 @@ pub(crate) fn cmd_agent(
             "delegation_config_at_core_build"
         );
 
+        // When inference_engine is "mlx", start the in-process MLX provider
+        // which serves as both the main LLM and the perplexity/training backend.
+        #[cfg(feature = "mlx")]
+        let mlx_handle: Option<cli::MlxHandle> =
+            if config.agents.defaults.inference_engine == "mlx" {
+                match cli::start_mlx_provider(&config) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        eprintln!("⚠ MLX provider failed to start: {e}");
+                        eprintln!("  Falling back to default provider");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        #[cfg(feature = "mlx")]
+        let core_handle = if let Some(ref mlx) = mlx_handle {
+            cli::build_core_handle_mlx(&config, mlx)
+        } else {
+            cli::build_core_handle(
+                &config,
+                &srv.local_port,
+                Some(&local_model_name),
+                None, None, None,
+                is_local,
+            )
+        };
+        #[cfg(not(feature = "mlx"))]
         let core_handle = cli::build_core_handle(
             &config,
             &srv.local_port,
@@ -1395,6 +1425,28 @@ pub(crate) fn cmd_agent(
 
         let health_registry = std::sync::Arc::new(crate::heartbeat::health::build_registry(&config));
 
+        #[cfg(feature = "mlx")]
+        let mut agent_loop = if let Some(ref mlx) = mlx_handle {
+            cli::create_agent_loop_mlx(
+                core_handle.clone(),
+                &config,
+                Some(cron_service.clone()),
+                email_config.clone(),
+                Some(display_tx.clone()),
+                Some(health_registry.clone()),
+                mlx,
+            )
+        } else {
+            cli::create_agent_loop(
+                core_handle.clone(),
+                &config,
+                Some(cron_service.clone()),
+                email_config.clone(),
+                Some(display_tx.clone()),
+                Some(health_registry.clone()),
+            )
+        };
+        #[cfg(not(feature = "mlx"))]
         let mut agent_loop = cli::create_agent_loop(
             core_handle.clone(),
             &config,
@@ -1478,6 +1530,8 @@ pub(crate) fn cmd_agent(
                 voice_session: None,
                 #[cfg(feature = "cluster")]
                 cluster_state,
+                #[cfg(feature = "mlx")]
+                mlx_handle,
             };
 
             let _ = ctx.rl.as_mut().unwrap().load_history(&history_path);

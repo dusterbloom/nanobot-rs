@@ -78,7 +78,37 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
     } else {
         Some(nanobot_config.agents.defaults.local_model.as_str())
     };
+
+    #[cfg(feature = "mlx")]
+    let mlx_handle: Option<super::MlxHandle> =
+        if nanobot_config.agents.defaults.inference_engine == "mlx" {
+            match super::start_mlx_provider(&nanobot_config) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("⚠ MLX provider failed to start: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    #[cfg(feature = "mlx")]
+    let core_handle = if let Some(ref mlx) = mlx_handle {
+        super::build_core_handle_mlx(&nanobot_config, mlx)
+    } else {
+        build_core_handle(&nanobot_config, "8080", local_model, None, None, None, is_local)
+    };
+    #[cfg(not(feature = "mlx"))]
     let core_handle = build_core_handle(&nanobot_config, "8080", local_model, None, None, None, is_local);
+
+    #[cfg(feature = "mlx")]
+    let agent_loop = if let Some(ref mlx) = mlx_handle {
+        super::create_agent_loop_mlx(core_handle, &nanobot_config, None, None, None, None, mlx)
+    } else {
+        create_agent_loop(core_handle, &nanobot_config, None, None, None, None)
+    };
+    #[cfg(not(feature = "mlx"))]
     let agent_loop = create_agent_loop(core_handle, &nanobot_config, None, None, None, None);
     let agent_loop = Arc::new(agent_loop);
 

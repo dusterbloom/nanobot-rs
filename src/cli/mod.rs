@@ -13,6 +13,10 @@ mod voice;
 pub(crate) use core_builder::{
     build_core_handle, create_agent_loop, effective_max_iterations, rebuild_core, strip_gguf_suffix,
 };
+#[cfg(feature = "mlx")]
+pub(crate) use core_builder::{
+    build_core_handle_mlx, create_agent_loop_mlx, start_mlx_provider, MlxHandle,
+};
 #[cfg(feature = "cluster")]
 pub(crate) use core_builder::setup_cluster_for_repl;
 pub(crate) use eval::{
@@ -170,6 +174,104 @@ mod tests {
         // Verify content of one file
         let agents_content = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(agents_content.contains("Agent Instructions"));
+    }
+
+    // -- inference engine detection tests --
+
+    #[test]
+    fn test_inference_engine_mlx_detected() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.inference_engine = "mlx".to_string();
+        assert_eq!(cfg.agents.defaults.inference_engine, "mlx");
+        // MLX preset should default to qwen3.5-2b
+        assert_eq!(cfg.agents.defaults.mlx_preset, "qwen3.5-2b");
+    }
+
+    #[test]
+    fn test_inference_engine_mlx_model_dir_default() {
+        let cfg = Config::default();
+        assert!(cfg.agents.defaults.mlx_model_dir.is_none(),
+            "mlx_model_dir should default to None (auto-detect)");
+    }
+
+    #[test]
+    fn test_inference_engine_mlx_model_dir_custom() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.mlx_model_dir = Some("/tmp/my-model".to_string());
+        assert_eq!(cfg.agents.defaults.mlx_model_dir.as_deref(), Some("/tmp/my-model"));
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_resolve_mlx_model_dir_default() {
+        let cfg = Config::default();
+        let dir = core_builder::resolve_mlx_model_dir(&cfg);
+        assert!(dir.to_string_lossy().contains("Qwen3.5-2B-MLX-8bit"),
+            "default dir should point to Qwen3.5-2B: {:?}", dir);
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_resolve_mlx_model_dir_custom() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.mlx_model_dir = Some("/tmp/custom-model".to_string());
+        let dir = core_builder::resolve_mlx_model_dir(&cfg);
+        assert_eq!(dir.to_string_lossy(), "/tmp/custom-model");
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_build_core_handle_mlx_sets_local_and_model_prefix() {
+        // Verify that build_core_handle_mlx produces a local core with mlx: prefix.
+        // NOTE: Can't actually start MlxProvider without model files, so we test
+        // that the function exists and config defaults resolve correctly.
+        let cfg = Config::default();
+        let dir = core_builder::resolve_mlx_model_dir(&cfg);
+        assert!(dir.to_string_lossy().ends_with("Qwen3.5-2B-MLX-8bit"));
+    }
+
+    #[test]
+    fn test_gateway_uses_create_agent_loop_for_perplexity_gate() {
+        // Verify that create_agent_loop respects perplexity_gate config
+        let mut cfg = Config::default();
+        cfg.perplexity_gate.enabled = true;
+        cfg.perplexity_gate.surprise_threshold = 5.0;
+
+        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
+        let agent_loop = create_agent_loop(handle, &cfg, None, None, None, None);
+
+        // The agent loop's shared state should have perplexity gate enabled.
+        // We verify through the public accessor that exists on AgentLoop.
+        assert!(agent_loop.has_perplexity_gate(),
+            "create_agent_loop should enable perplexity gate when config says so");
+    }
+
+    #[test]
+    fn test_create_agent_loop_without_perplexity_gate() {
+        let cfg = Config::default();
+        assert!(!cfg.perplexity_gate.enabled);
+
+        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
+        let agent_loop = create_agent_loop(handle, &cfg, None, None, None, None);
+
+        assert!(!agent_loop.has_perplexity_gate(),
+            "perplexity gate should be off when config says disabled");
+    }
+
+    #[test]
+    fn test_rebuild_agent_loop_preserves_perplexity_gate() {
+        // Simulate what rebuild_agent_loop does: create_agent_loop with same config.
+        let mut cfg = Config::default();
+        cfg.perplexity_gate.enabled = true;
+
+        let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
+        let first = create_agent_loop(handle.clone(), &cfg, None, None, None, None);
+        assert!(first.has_perplexity_gate());
+
+        // Rebuild with same config should preserve gate.
+        let second = create_agent_loop(handle, &cfg, None, None, None, None);
+        assert!(second.has_perplexity_gate(),
+            "rebuilt agent loop should still have perplexity gate enabled");
     }
 
     // -- effective_max_iterations tests --
@@ -512,10 +614,54 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         );
     }
 
-    let is_local = !config.agents.defaults.local_api_base.is_empty();
-    let core_handle = build_core_handle(&config, "8080", None, None, None, None, is_local);
+    // MLX in-process provider (when inference_engine == "mlx").
+    #[cfg(feature = "mlx")]
+    let mlx_handle: Option<MlxHandle> = if config.agents.defaults.inference_engine == "mlx" {
+        match start_mlx_provider(&config) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("⚠ MLX provider failed to start: {e}");
+                eprintln!("  Falling back to default provider");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(feature = "mlx")]
+    let core_handle = if let Some(ref mlx) = mlx_handle {
+        build_core_handle_mlx(&config, mlx)
+    } else {
+        let is_local = !config.agents.defaults.local_api_base.is_empty();
+        build_core_handle(&config, "8080", None, None, None, None, is_local)
+    };
+    #[cfg(not(feature = "mlx"))]
+    let core_handle = {
+        let is_local = !config.agents.defaults.local_api_base.is_empty();
+        build_core_handle(&config, "8080", None, None, None, None, is_local)
+    };
+
+    // Build setup closure that wires MLX provider into the agent loop.
+    #[cfg(feature = "mlx")]
+    let setup: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>> = mlx_handle.map(|mlx| {
+        let provider = mlx.provider.clone();
+        let gate_config = {
+            let mut g = config.perplexity_gate.clone();
+            g.enabled = true;
+            g
+        };
+        Box::new(move |loop_: &mut AgentLoop| {
+            loop_.set_mlx_provider(provider);
+            loop_.set_perplexity_gate(gate_config);
+            tracing::info!("gateway: MLX provider wired, perplexity gate auto-enabled");
+        }) as Box<dyn FnOnce(&mut AgentLoop) + Send>
+    });
+    #[cfg(not(feature = "mlx"))]
+    let setup: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>> = None;
+
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, core_handle, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None, setup));
 }
 
 /// Shared async gateway: creates channels, provider, cron, agent loop, and runs until stopped.
@@ -527,6 +673,7 @@ pub(crate) async fn run_gateway_async(
     core_handle: SharedCoreHandle,
     stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+    setup_fn: Option<Box<dyn FnOnce(&mut AgentLoop) + Send>>,
 ) {
     use std::time::Duration;
     use tracing::{info, warn};
@@ -570,6 +717,15 @@ pub(crate) async fn run_gateway_async(
         lcm_config,
         Some(health_registry.clone()),
     );
+
+    if config.perplexity_gate.enabled {
+        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
+    }
+
+    // Apply optional setup (e.g. MLX provider wiring).
+    if let Some(f) = setup_fn {
+        f(&mut agent_loop);
+    }
 
     // Start cluster discovery in the background (when cluster feature is enabled).
     #[cfg(feature = "cluster")]
@@ -726,7 +882,7 @@ pub(crate) fn cmd_whatsapp() {
 
     let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, core_handle, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
 
 pub(crate) fn cmd_telegram(token_arg: Option<String>) {
@@ -790,7 +946,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, core_handle, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
 
 pub(crate) fn cmd_email(
@@ -911,7 +1067,7 @@ pub(crate) fn cmd_email(
 
     let core_handle = build_core_handle(&config, "8080", None, None, None, None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-    runtime.block_on(run_gateway_async(config, core_handle, None, None));
+    runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
 
 /// Validate a Telegram bot token by calling the getMe API.

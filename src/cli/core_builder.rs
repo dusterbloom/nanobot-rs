@@ -17,6 +17,13 @@ use crate::providers::base::LLMProvider;
 use crate::providers::factory;
 use crate::providers::jit_gate::JitGate;
 
+/// MLX provider handle, kept alive alongside the agent loop so the model worker
+/// thread persists and can be shared with the perplexity gate.
+#[cfg(feature = "mlx")]
+pub(crate) struct MlxHandle {
+    pub provider: Arc<crate::providers::mlx::MlxProvider>,
+}
+
 /// Return the appropriate context window size for a cloud model.
 ///
 /// Scale max tool iterations with context size.
@@ -248,6 +255,46 @@ pub(super) fn make_local_providers(
     }
 }
 
+/// Resolve the MLX model directory from config or default location.
+#[cfg(feature = "mlx")]
+pub(crate) fn resolve_mlx_model_dir(config: &Config) -> std::path::PathBuf {
+    if let Some(ref dir) = config.agents.defaults.mlx_model_dir {
+        std::path::PathBuf::from(dir)
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
+    }
+}
+
+/// Start the in-process MLX provider. Returns the handle and an Arc provider
+/// for use as the main LLM provider.
+#[cfg(feature = "mlx")]
+pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
+    use crate::agent::mlx_lora::{LoraConfig, ModelConfig};
+
+    let model_dir = resolve_mlx_model_dir(config);
+    let model_config = match config.agents.defaults.mlx_preset.as_str() {
+        "qwen3-1.7b" => ModelConfig::qwen3_1_7b(),
+        _ => ModelConfig::qwen3_5_2b(),
+    };
+    let lora_config = LoraConfig {
+        lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
+        ..LoraConfig::default()
+    };
+
+    tracing::info!(
+        model_dir = %model_dir.display(),
+        preset = %config.agents.defaults.mlx_preset,
+        "starting in-process MLX provider"
+    );
+
+    let provider = crate::providers::mlx::MlxProvider::start(model_dir, model_config, lora_config)?;
+    Ok(MlxHandle {
+        provider: Arc::new(provider),
+    })
+}
+
 pub(crate) fn build_core_handle(
     config: &Config,
     local_port: &str,
@@ -335,6 +382,69 @@ pub(crate) fn build_core_handle(
             .suppress_thinking_in_tts
             .store(true, Ordering::Relaxed);
     }
+    AgentHandle::new(core, counters)
+}
+
+/// Build a core handle using the in-process MLX provider as the main LLM.
+///
+/// The MLX provider runs inference on Apple Silicon GPU via the same model
+/// that serves perplexity scoring and LoRA training. Context is limited to
+/// 32K tokens (local model default).
+#[cfg(feature = "mlx")]
+pub(crate) fn build_core_handle_mlx(
+    config: &Config,
+    mlx: &MlxHandle,
+) -> SharedCoreHandle {
+    let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
+    let model = format!("mlx:{}", provider.get_default_model());
+    let max_context_tokens = config.agents.defaults.local_max_context_tokens;
+
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
+
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        true, // MLX is a local model
+    );
+
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace: config.workspace_path(),
+        model,
+        max_iterations: max_iters,
+        max_continuations: config.agents.defaults.max_continuations,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
+        max_context_tokens,
+        brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
+        is_local: true,
+        compaction_provider: None,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
+    });
+    let counters = Arc::new(RuntimeCounters::new_with_config(
+        max_context_tokens,
+        &config.trio.circuit_breaker,
+    ));
     AgentHandle::new(core, counters)
 }
 
@@ -445,6 +555,36 @@ pub(crate) fn create_agent_loop(
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
     health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 ) -> AgentLoop {
+    create_agent_loop_inner(core_handle, config, cron_service, email_config, repl_display_tx, health_registry, None)
+}
+
+/// Create an agent loop wired to an in-process MLX provider.
+///
+/// The MLX provider is set as the perplexity + training backend on the agent
+/// loop, and the perplexity gate is auto-enabled.
+#[cfg(feature = "mlx")]
+pub(crate) fn create_agent_loop_mlx(
+    core_handle: SharedCoreHandle,
+    config: &Config,
+    cron_service: Option<Arc<CronService>>,
+    email_config: Option<crate::config::schema::EmailConfig>,
+    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    mlx: &MlxHandle,
+) -> AgentLoop {
+    create_agent_loop_inner(core_handle, config, cron_service, email_config, repl_display_tx, health_registry, Some(mlx))
+}
+
+fn create_agent_loop_inner(
+    core_handle: SharedCoreHandle,
+    config: &Config,
+    cron_service: Option<Arc<CronService>>,
+    email_config: Option<crate::config::schema::EmailConfig>,
+    repl_display_tx: Option<mpsc::UnboundedSender<String>>,
+    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
+    #[cfg(feature = "mlx")] mlx: Option<&MlxHandle>,
+    #[cfg(not(feature = "mlx"))] _mlx: Option<&()>,
+) -> AgentLoop {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
@@ -454,7 +594,7 @@ pub(crate) fn create_agent_loop(
         lcm_config.enabled = true;
     }
 
-    let agent_loop = AgentLoop::new(
+    let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
         outbound_tx,
@@ -468,6 +608,24 @@ pub(crate) fn create_agent_loop(
         lcm_config,
         health_registry,
     );
+
+    // Wire MLX provider for in-process perplexity + training.
+    #[cfg(feature = "mlx")]
+    if let Some(mlx) = mlx {
+        agent_loop.set_mlx_provider(mlx.provider.clone());
+        // Auto-enable perplexity gate when using MLX engine.
+        let mut gate_config = config.perplexity_gate.clone();
+        gate_config.enabled = true;
+        agent_loop.set_perplexity_gate(gate_config);
+        tracing::info!("MLX provider wired: perplexity gate auto-enabled");
+    } else if config.perplexity_gate.enabled {
+        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
+    }
+
+    #[cfg(not(feature = "mlx"))]
+    if config.perplexity_gate.enabled {
+        agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
+    }
 
     agent_loop
 }

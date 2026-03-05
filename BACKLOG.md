@@ -75,7 +75,7 @@
 - [x] **Phase 2:** Credential redaction (custom Debug impls), removed dead `needs_user_continuation`
 - [x] **Phase 3:** ToolError retryability + `execute_with_retry()` with exponential backoff
 - [x] **Phase 4:** File splits — `tool_runner.rs` tests extracted, `cli.rs` → `src/cli/` module (6 files), `agent_loop.rs` → 3 files via `#[path]`, `commands.rs` → 7 files via `#[path]`. All 4117 tests pass.
-- [ ] **Phase 5 (next):** Shell injection adversarial tests, LM Studio `--jinja` probe
+- [x] **Phase 5:** Shell injection adversarial tests (15 evasion patterns), LM Studio `--jinja` probe, **MLX in-process provider wiring** — `MlxProvider` connected to all 4 entry points (REPL, gateway, voice, rebuild). Config: `inferenceEngine: "mlx"`. Perplexity gate auto-enabled when MLX active. 4 E2E tests (chat, perplexity, train, closed-loop). 4157 tests pass.
 
 ### 🟡 Important — do soon
 

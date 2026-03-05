@@ -48,7 +48,7 @@
 
 **cli/** - Agent/config command implementations (split into module, 2026-03-04):
 - `mod.rs` - Onboard, gateway, channels, status, cron, tune, tests
-- `core_builder.rs` - `build_core_handle()`, `rebuild_core()`, `create_agent_loop()`, `make_local_providers()`
+- `core_builder.rs` - `build_core_handle()`, `rebuild_core()`, `create_agent_loop()`, `make_local_providers()`, `start_mlx_provider()`, `build_core_handle_mlx()`, `create_agent_loop_mlx()` (feature = "mlx")
 - `provider.rs` - `create_provider()`, `load_oauth_provider()`, `is_claude_model()`
 - `eval.rs` - All `cmd_eval_*` benchmark commands
 - `voice.rs` - All `#[cfg(feature="voice")]` commands
@@ -150,6 +150,8 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `system_state.rs` | System state introspection |
 | `agent_profiles.rs` | Subagent profile loading and management |
 | `lora_bridge.rs` | LoRA adapter hot-swap bridge (Phase 3) |
+| `mlx_lora.rs` | MLX model loading, tokenizer, LoRA config, Gated Delta Net, attention (feature = "mlx") |
+| `mlx_server.rs` | Model worker thread, chat template, tokenization, training loop (feature = "mlx") |
 | `process_tree.rs` | Persistent execution tree for multi-step processes (Phase 2) |
 | `step_voter.rs` | MAKER voting for step validation (Phase 2) |
 | `reflector.rs` | Self-reflection and learning extraction |
@@ -175,9 +177,16 @@ AnthropicProvider (native Anthropic Messages API)
 ├── Used exclusively for OAuth/Claude Max flows
 └── Speaks native Anthropic API, not OpenAI-compat
 
+MlxProvider (in-process Apple Silicon GPU inference, feature = "mlx")
+├── Owns channel to model worker thread (no HTTP, no separate process)
+├── Same model serves: chat(), perplexity(), train()
+├── Qwen3.5-2B-MLX-8bit default (~2GB, 8-bit quantized)
+└── LoRA training updates live weights — next inference uses them
+
 factory.rs        - Provider instantiation from config
 oauth.rs          - OAuth token management for Anthropic
 transcription.rs  - Audio transcription provider
+mlx.rs            - In-process MLX provider (feature-gated)
 ```
 
 **Provider Selection Priority:**
@@ -383,7 +392,8 @@ Config {
         defaults: AgentDefaults {
             workspace, model, local_model, local_api_base,
             max_tokens, temperature, max_tool_iterations,
-            max_context_tokens, max_concurrent_chats
+            max_context_tokens, max_concurrent_chats,
+            inference_engine, mlx_model_dir, mlx_preset
         }
     },
     providers: ProvidersConfig {
@@ -723,6 +733,8 @@ VoiceAgent event loop (pure state machine)
 
 - `default` - Core functionality
 - `voice` - Voice mode + realtime pipeline (requires jack-voice, crossterm, lingua). Enables `/voice` REPL mode and `nanobot realtime` continuous/PTT voice sessions.
+- `mlx` - In-process Apple Silicon GPU inference via MLX. Loads Qwen3.5-2B (8-bit) into GPU memory, serves chat/perplexity/LoRA training from the same model worker thread. No HTTP server needed. Perplexity gate auto-enables for online learning. Requires: `mlx-rs`, `tokenizers`, Apple Silicon Mac. Config: `inferenceEngine: "mlx"`.
+- `ane` - Apple Neural Engine kernels for attention, RoPE, LoRA (experimental). Requires Apple Silicon.
 
 ---
 
