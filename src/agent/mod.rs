@@ -85,3 +85,5 @@ pub mod ane_backward;
 pub mod ane_train;
 #[cfg(feature = "ane")]
 pub mod ane_lora;
+#[cfg(feature = "mlx")]
+pub mod mlx_lora;
