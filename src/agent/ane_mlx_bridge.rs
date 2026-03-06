@@ -642,7 +642,7 @@ mod tests {
             .spawn(move || {
                 let cfg = ModelConfig::qwen3_1_7b();
                 let lora_cfg = MlxLoraConfig { lr: 1e-5, ..MlxLoraConfig::default() };
-                crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx);
+                crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx, None);
             })
             .expect("failed to spawn model worker");
 

@@ -15,7 +15,8 @@ pub(crate) use core_builder::{
 };
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
-    build_core_handle_mlx, create_agent_loop_mlx, start_mlx_provider, MlxHandle,
+    build_core_handle_mlx, rebuild_core_mlx, create_agent_loop_mlx, start_mlx_provider, MlxHandle,
+    preset_from_model_dir, resolve_mlx_model_dir,
 };
 #[cfg(feature = "cluster")]
 pub(crate) use core_builder::setup_cluster_for_repl;

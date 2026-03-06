@@ -161,6 +161,19 @@ impl ReplContext {
         disk_cfg.agents.defaults.local_max_context_tokens = new_ctx;
         save_config(&disk_cfg, None);
 
+        // MLX mode: no LMS server to reload — just rebuild with new context cap.
+        #[cfg(feature = "mlx")]
+        if self.mlx_handle.is_some() {
+            self.apply_and_rebuild();
+            println!(
+                "\n  Context size set to {}{}K{}.\n",
+                tui::BOLD,
+                new_ctx / 1024,
+                tui::RESET,
+            );
+            return;
+        }
+
         // Reload model in LMS with new context
         if self.srv.lms_managed {
             let lms_port = self.config.agents.defaults.lms_port;
@@ -277,6 +290,7 @@ impl ReplContext {
                     { let _ = peer_type; format!("{}", short) }
                 }
                 ModelSource::File { .. } => "~/models/".to_string(),
+                ModelSource::Mlx { .. } => "MLX (Apple Silicon GPU)".to_string(),
             };
             if group != current_group {
                 if !current_group.is_empty() {
@@ -298,6 +312,10 @@ impl ReplContext {
                     .map(|m| m.len() / 1_048_576)
                     .unwrap_or(0);
                 println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
+            } else if let ModelSource::Mlx { ref path } = entry.source {
+                let has_lora = path.join("adapters/adapters.safetensors").exists();
+                let lora_tag = if has_lora { format!(" {}(trained){}", tui::DIM, tui::RESET) } else { String::new() };
+                println!("    [{}] {}{}{}", i + 1, entry.id, lora_tag, marker);
             } else {
                 println!("    [{}] {}{}", i + 1, entry.id, marker);
             }
@@ -400,6 +418,53 @@ impl ReplContext {
                 disk_cfg.agents.defaults.local_model = name;
                 save_config(&disk_cfg, None);
                 self.apply_and_rebuild();
+            }
+            #[cfg(feature = "mlx")]
+            ModelSource::Mlx { ref path } => {
+                let dir_str = path.to_string_lossy().to_string();
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                // Update config first
+                self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
+                self.config.agents.defaults.inference_engine = "mlx".to_string();
+                self.config.agents.defaults.local_backend = "mlx".to_string();
+                let preset = cli::preset_from_model_dir(path).to_string();
+                self.config.agents.defaults.mlx_preset = preset;
+
+                // Persist
+                let mut disk_cfg = load_config(None);
+                disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
+                disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
+                disk_cfg.agents.defaults.local_backend = "mlx".to_string();
+                disk_cfg.agents.defaults.mlx_preset = self.config.agents.defaults.mlx_preset.clone();
+                save_config(&disk_cfg, None);
+
+                // Kill the old managed mlx-lm server to free port 8090 before starting new one
+                if let Some(ref old_handle) = self.mlx_handle {
+                    old_handle.provider.kill_managed_server();
+                }
+                self.mlx_handle = None;
+
+                // Rebuild MLX provider from scratch with the new model
+                print!("  Loading {}... ", name);
+                io::stdout().flush().ok();
+                match cli::start_mlx_provider(&self.config) {
+                    Ok(h) => {
+                        self.mlx_handle = Some(h);
+                        println!("{}OK{}", tui::GREEN, tui::RESET);
+                    }
+                    Err(e) => {
+                        println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                        return;
+                    }
+                }
+                self.apply_and_rebuild();
+            }
+            #[cfg(not(feature = "mlx"))]
+            ModelSource::Mlx { .. } => {
+                println!("  MLX support not compiled in (--features mlx).");
             }
         }
 

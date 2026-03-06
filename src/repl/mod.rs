@@ -1159,12 +1159,15 @@ pub(crate) fn cmd_agent(
         let mut srv = ServerState::new(local_port.clone());
         let mut config = config; // shadow to allow mutation
         let is_interactive = message.is_none();
+        #[cfg(feature = "mlx")]
         if is_interactive && use_mlx_local {
             tui::register_resize_handler();
-            println!(
-                "  {}{}MLX{} local backend — in-process Apple Silicon GPU inference",
-                tui::BOLD, tui::YELLOW, tui::RESET,
-            );
+            let mlx_dir = cli::resolve_mlx_model_dir(&config);
+            let mlx_model = mlx_dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| config.agents.defaults.mlx_preset.clone());
+            let mlx_lm_mode = config.agents.defaults.mlx_lm_url.as_deref();
+            tui::print_mlx_splash(&mlx_model, mlx_lm_mode);
         }
         if is_interactive && is_local && !use_mlx_local && !has_remote_local {
             tui::register_resize_handler();

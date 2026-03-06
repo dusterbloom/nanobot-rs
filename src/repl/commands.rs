@@ -103,6 +103,8 @@ enum ModelSource {
     },
     /// Filesystem GGUF file.
     File { path: PathBuf },
+    /// MLX model directory (safetensors, served via managed mlx-lm server).
+    Mlx { path: PathBuf },
 }
 
 /// A model entry from any source, used by the unified model picker.
@@ -310,6 +312,14 @@ impl ReplContext {
     /// Like `apply_and_rebuild` but with an explicit `is_local` override.
     /// Use when toggling between local and cloud mode.
     pub fn apply_and_rebuild_with(&mut self, is_local: bool) {
+        // MLX mode: rebuild core via rebuild_core_mlx, not make_local_providers
+        #[cfg(feature = "mlx")]
+        if let Some(ref mlx) = self.mlx_handle {
+            cli::rebuild_core_mlx(&self.core_handle, &self.config, mlx);
+            self.rebuild_agent_loop();
+            return;
+        }
+
         super::apply_server_change(
             &self.srv,
             &self.current_model_path,
@@ -506,6 +516,24 @@ impl ReplContext {
                 entries.push(ModelEntry {
                     id: name,
                     source: ModelSource::File { path: path.clone() },
+                    is_active,
+                    is_loaded: false,
+                });
+            }
+        }
+
+        // 4. MLX models (safetensors dirs, served via managed mlx-lm server)
+        #[cfg(feature = "mlx")]
+        {
+            let mlx_models = crate::agent::mlx_lm::discover_mlx_models();
+            let mlx_active = self.config.agents.defaults.mlx_model_dir.clone()
+                .unwrap_or_default();
+            for m in mlx_models {
+                let is_active = mlx_active.ends_with(&m.name)
+                    || m.path.to_string_lossy() == mlx_active;
+                entries.push(ModelEntry {
+                    id: m.name.clone(),
+                    source: ModelSource::Mlx { path: m.path },
                     is_active,
                     is_loaded: false,
                 });

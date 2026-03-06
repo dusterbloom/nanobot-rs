@@ -312,30 +312,9 @@ fn find_mlx_dir_recursive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Check if a directory contains tokenizer.json + *.safetensors and no *.gguf.
+/// Re-export from mlx_lm — single canonical check for MLX model directories.
 #[cfg(feature = "mlx")]
-fn is_mlx_model_dir(dir: &std::path::Path) -> bool {
-    let has_tokenizer = dir.join("tokenizer.json").is_file();
-    if !has_tokenizer {
-        return false;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    let mut has_safetensors = false;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".gguf") {
-            return false; // GGUF, not MLX
-        }
-        if name.ends_with(".safetensors") {
-            has_safetensors = true;
-        }
-    }
-    has_safetensors
-}
+use crate::agent::mlx_lm::is_mlx_model_dir;
 
 /// Infer the MLX preset name from a model directory path.
 ///
@@ -344,13 +323,20 @@ fn is_mlx_model_dir(dir: &std::path::Path) -> bool {
 pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
     let s = dir.to_string_lossy();
     let s_lower = s.to_lowercase();
-    if s_lower.contains("qwen3-1.7b") || s_lower.contains("qwen3-1_7b") {
-        "qwen3-1.7b"
+    if s_lower.contains("qwen3.5") {
+        "qwen3.5-2b"
+    } else if s_lower.contains("qwen3-8b") || s_lower.contains("qwen3-8_b") {
+        "qwen3-8b"
     } else if s_lower.contains("qwen3-4b") || s_lower.contains("qwen3-4_b") {
         "qwen3-4b"
+    } else if s_lower.contains("qwen3-1.7b") || s_lower.contains("qwen3-1_7b") {
+        "qwen3-1.7b"
+    } else if s_lower.contains("qwen3-0.6b") || s_lower.contains("qwen3-0_6b") {
+        "qwen3-1.7b" // closest architecture (standard Qwen3 transformer)
     } else {
-        // Default to Qwen3.5-2B (most common MLX model)
-        "qwen3.5-2b"
+        // Non-Qwen or unknown model — in-process loading will fail gracefully,
+        // mlx-lm server handles inference for any model.
+        "unknown"
     }
 }
 
@@ -361,18 +347,18 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     use crate::agent::mlx_lora::{LoraConfig, ModelConfig};
 
     let model_dir = resolve_mlx_model_dir(config);
-    // Use explicit preset, or auto-detect from dir name when mlxModelDir is "auto"
-    let effective_preset = if config.agents.defaults.mlx_model_dir.as_deref() == Some("auto")
-        && config.agents.defaults.mlx_preset == "qwen3.5-2b"
-    {
-        preset_from_model_dir(&model_dir).to_string()
-    } else {
-        config.agents.defaults.mlx_preset.clone()
-    };
+    // Always auto-detect preset from model dir name to avoid stale config mismatches.
+    let effective_preset = preset_from_model_dir(&model_dir).to_string();
     let model_config = match effective_preset.as_str() {
         "qwen3-1.7b" => ModelConfig::qwen3_1_7b(),
         "qwen3-4b" => ModelConfig::qwen3_4b(),
-        _ => ModelConfig::qwen3_5_2b(),
+        "qwen3-8b" => ModelConfig::qwen3_8b(),
+        "qwen3.5-2b" => ModelConfig::qwen3_5_2b(),
+        _ => {
+            // Unknown model — use Qwen3-1.7B as a placeholder; in-process load
+            // will fail gracefully and mlx-lm server handles inference.
+            ModelConfig::qwen3_1_7b()
+        }
     };
     let lora_config = LoraConfig {
         lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
@@ -392,6 +378,74 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     Ok(MlxHandle {
         provider: Arc::new(provider),
     })
+}
+
+/// Build a `SwappableCoreConfig` from shared config + per-call overrides.
+///
+/// Centralises the 25-field struct construction that was previously copy-pasted
+/// across `build_core_handle`, `build_core_handle_mlx`, `rebuild_core`, and
+/// `rebuild_core_mlx`.
+fn core_config_from(
+    config: &Config,
+    provider: Arc<dyn LLMProvider>,
+    model: String,
+    max_context_tokens: usize,
+    is_local: bool,
+    compaction: Option<Arc<dyn LLMProvider>>,
+    delegation: Option<Arc<dyn LLMProvider>>,
+    specialist: Option<Arc<dyn LLMProvider>>,
+) -> SwappableCoreConfig {
+    let brave_key = if config.tools.web.search.api_key.is_empty() {
+        None
+    } else {
+        Some(config.tools.web.search.api_key.clone())
+    };
+    let max_iters = effective_max_iterations(
+        config.agents.defaults.max_tool_iterations,
+        max_context_tokens,
+        is_local,
+    );
+    SwappableCoreConfig {
+        provider,
+        workspace: config.workspace_path(),
+        model,
+        max_iterations: max_iters,
+        max_continuations: config.agents.defaults.max_continuations,
+        max_tokens: config.agents.defaults.max_tokens,
+        temperature: config.agents.defaults.temperature,
+        max_context_tokens,
+        brave_api_key: brave_key,
+        search_provider: config.tools.web.search.provider.clone(),
+        searxng_url: config.tools.web.search.searxng_url.clone(),
+        search_max_results: config.tools.web.search.max_results,
+        exec_timeout: config.tools.exec_.timeout,
+        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
+        memory_config: config.memory.clone(),
+        is_local,
+        compaction_provider: compaction,
+        tool_delegation: config.tool_delegation.clone(),
+        provenance: config.provenance.clone(),
+        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
+        delegation_provider: delegation,
+        specialist_provider: specialist,
+        trio_config: config.trio.clone(),
+        model_capabilities_overrides: config.model_capabilities.clone(),
+        reasoning_config: config.reasoning.clone(),
+        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
+        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
+        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
+    }
+}
+
+/// Resolve MLX context cap: full config value when mlx-lm server handles
+/// inference, capped to 4K for in-process (GDN recurrence is slow).
+#[cfg(feature = "mlx")]
+fn mlx_max_context(config: &Config) -> usize {
+    if config.agents.defaults.mlx_lm_url.is_some() {
+        config.agents.defaults.local_max_context_tokens
+    } else {
+        config.agents.defaults.local_max_context_tokens.min(4096)
+    }
 }
 
 pub(crate) fn build_core_handle(
@@ -428,48 +482,9 @@ pub(crate) fn build_core_handle(
         (provider, model, ctx, None, None, None)
     };
 
-    let brave_key = if config.tools.web.search.api_key.is_empty() {
-        None
-    } else {
-        Some(config.tools.web.search.api_key.clone())
-    };
-
-    let max_iters = effective_max_iterations(
-        config.agents.defaults.max_tool_iterations,
-        max_context_tokens,
-        is_local,
-    );
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider,
-        workspace: config.workspace_path(),
-        model,
-        max_iterations: max_iters,
-        max_continuations: config.agents.defaults.max_continuations,
-        max_tokens: config.agents.defaults.max_tokens,
-        temperature: config.agents.defaults.temperature,
-        max_context_tokens,
-        brave_api_key: brave_key,
-        search_provider: config.tools.web.search.provider.clone(),
-        searxng_url: config.tools.web.search.searxng_url.clone(),
-        search_max_results: config.tools.web.search.max_results,
-        exec_timeout: config.tools.exec_.timeout,
-        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: config.memory.clone(),
-        is_local,
-        compaction_provider: cp,
-        tool_delegation: config.tool_delegation.clone(),
-        provenance: config.provenance.clone(),
-        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
-        delegation_provider: dp,
-        specialist_provider: sp,
-        trio_config: config.trio.clone(),
-        model_capabilities_overrides: config.model_capabilities.clone(),
-        reasoning_config: config.reasoning.clone(),
-        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
-        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
-        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
-    });
+    let core = build_swappable_core(core_config_from(
+        config, provider, model, max_context_tokens, is_local, cp, dp, sp,
+    ));
     let counters = Arc::new(RuntimeCounters::new_with_config(
         max_context_tokens,
         &config.trio.circuit_breaker,
@@ -499,58 +514,35 @@ pub(crate) fn build_core_handle_mlx(
 ) -> SharedCoreHandle {
     let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
     let model = format!("mlx:{}", provider.get_default_model());
-    // MLX in-process models use GDN with per-token recurrence —
-    // large contexts (19K+) cause multi-minute prefills.
-    // Cap at 4096 tokens for practical response times (~10-15s prefill).
-    let max_context_tokens = config.agents.defaults.local_max_context_tokens.min(4096);
+    let max_context_tokens = mlx_max_context(config);
 
-    let brave_key = if config.tools.web.search.api_key.is_empty() {
-        None
-    } else {
-        Some(config.tools.web.search.api_key.clone())
-    };
-
-    let max_iters = effective_max_iterations(
-        config.agents.defaults.max_tool_iterations,
-        max_context_tokens,
-        true, // MLX is a local model
-    );
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider,
-        workspace: config.workspace_path(),
-        model,
-        max_iterations: max_iters,
-        max_continuations: config.agents.defaults.max_continuations,
-        max_tokens: config.agents.defaults.max_tokens,
-        temperature: config.agents.defaults.temperature,
-        max_context_tokens,
-        brave_api_key: brave_key,
-        search_provider: config.tools.web.search.provider.clone(),
-        searxng_url: config.tools.web.search.searxng_url.clone(),
-        search_max_results: config.tools.web.search.max_results,
-        exec_timeout: config.tools.exec_.timeout,
-        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: config.memory.clone(),
-        is_local: true, // local model — lite context, but uses CloudProtocol (not LocalProtocol)
-        compaction_provider: None,
-        tool_delegation: config.tool_delegation.clone(),
-        provenance: config.provenance.clone(),
-        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
-        delegation_provider: None,
-        specialist_provider: None,
-        trio_config: config.trio.clone(),
-        model_capabilities_overrides: config.model_capabilities.clone(),
-        reasoning_config: config.reasoning.clone(),
-        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
-        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
-        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
-    });
+    let core = build_swappable_core(core_config_from(
+        config, provider, model, max_context_tokens, true, None, None, None,
+    ));
     let counters = Arc::new(RuntimeCounters::new_with_config(
         max_context_tokens,
         &config.trio.circuit_breaker,
     ));
     AgentHandle::new(core, counters)
+}
+
+/// Rebuild the shared core for MLX mode (e.g. `/ctx` or `/model` changes).
+///
+/// Like `rebuild_core` but uses the MLX provider instead of LM Studio.
+#[cfg(feature = "mlx")]
+pub(crate) fn rebuild_core_mlx(
+    handle: &SharedCoreHandle,
+    config: &Config,
+    mlx: &MlxHandle,
+) {
+    let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
+    let model = format!("mlx:{}", provider.get_default_model());
+    let max_context_tokens = mlx_max_context(config);
+
+    let new_core = build_swappable_core(core_config_from(
+        config, provider, model, max_context_tokens, true, None, None, None,
+    ));
+    handle.swap_core(new_core);
 }
 
 /// Rebuild the shared core for `/local` toggle or `/model` swap.
@@ -591,48 +583,9 @@ pub(crate) fn rebuild_core(
         (provider, model, ctx, None, None, None)
     };
 
-    let brave_key = if config.tools.web.search.api_key.is_empty() {
-        None
-    } else {
-        Some(config.tools.web.search.api_key.clone())
-    };
-
-    let max_iters = effective_max_iterations(
-        config.agents.defaults.max_tool_iterations,
-        max_context_tokens,
-        is_local,
-    );
-
-    let new_core = build_swappable_core(SwappableCoreConfig {
-        provider,
-        workspace: config.workspace_path(),
-        model,
-        max_iterations: max_iters,
-        max_continuations: config.agents.defaults.max_continuations,
-        max_tokens: config.agents.defaults.max_tokens,
-        temperature: config.agents.defaults.temperature,
-        max_context_tokens,
-        brave_api_key: brave_key,
-        search_provider: config.tools.web.search.provider.clone(),
-        searxng_url: config.tools.web.search.searxng_url.clone(),
-        search_max_results: config.tools.web.search.max_results,
-        exec_timeout: config.tools.exec_.timeout,
-        restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
-        memory_config: config.memory.clone(),
-        is_local,
-        compaction_provider: cp,
-        tool_delegation: config.tool_delegation.clone(),
-        provenance: config.provenance.clone(),
-        max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
-        delegation_provider: dp,
-        specialist_provider: sp,
-        trio_config: config.trio.clone(),
-        model_capabilities_overrides: config.model_capabilities.clone(),
-        reasoning_config: config.reasoning.clone(),
-        tool_heartbeat_secs: config.monitoring.tool_heartbeat_secs,
-        health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
-        adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
-    });
+    let new_core = build_swappable_core(core_config_from(
+        config, provider, model, max_context_tokens, is_local, cp, dp, sp,
+    ));
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
     // Update max context since the new model may have a different size.

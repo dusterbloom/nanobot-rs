@@ -29,6 +29,9 @@ impl MlxLmServer {
     }
 
     fn spawn_process(&mut self) -> Result<(), String> {
+        // Kill any stale process on the port from a previous run.
+        Self::kill_stale_on_port(self.port);
+
         let mut cmd = Command::new("python3");
         cmd.args(["-m", "mlx_lm.server"])
             .arg("--model").arg(&self.model_dir)
@@ -41,14 +44,23 @@ impl MlxLmServer {
             }
         }
 
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // Redirect both stdout and stderr to null. Piping stderr can cause
+        // the subprocess to block if the pipe buffer fills (64KB on macOS),
+        // which happens with larger models that produce verbose load output.
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let child = cmd.spawn().map_err(|e| format!("failed to spawn mlx_lm.server: {e}"))?;
         self.child = Some(child);
 
-        // Wait for server to be ready (poll /health or /v1/models)
+        // Wait for server to be ready by polling TCP connect + simple HTTP GET.
+        // Uses raw TcpStream + manual HTTP instead of reqwest::blocking to avoid
+        // panicking inside a tokio async runtime context.
         let deadline = Instant::now() + Duration::from_secs(60);
-        let url = format!("http://127.0.0.1:{}/v1/models", self.port);
+        let addr = format!("127.0.0.1:{}", self.port);
+        let http_req = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            self.port,
+        );
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(500));
             // Check if process died
@@ -57,9 +69,21 @@ impl MlxLmServer {
                     return Err(format!("mlx_lm.server exited with {status}"));
                 }
             }
-            if let Ok(resp) = reqwest::blocking::get(&url) {
-                if resp.status().is_success() {
-                    return Ok(());
+            // Try raw TCP connect + HTTP GET to check readiness
+            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                Duration::from_millis(500),
+            ) {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                if stream.write_all(http_req.as_bytes()).is_ok() {
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        let resp = String::from_utf8_lossy(&buf[..n]);
+                        if resp.contains("200 OK") || resp.contains("200") {
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -83,6 +107,22 @@ impl MlxLmServer {
 
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Kill any stale mlx_lm.server process on the given port.
+    fn kill_stale_on_port(port: u16) {
+        if let Ok(output) = Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid_str in pids.split_whitespace() {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGTERM); }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     pub fn kill(&mut self) {
@@ -161,7 +201,7 @@ fn discover_recursive(dir: &Path, out: &mut Vec<MlxModelInfo>) {
     }
 }
 
-fn is_mlx_model_dir(dir: &Path) -> bool {
+pub fn is_mlx_model_dir(dir: &Path) -> bool {
     // Must have tokenizer.json
     if !dir.join("tokenizer.json").exists() {
         return false;

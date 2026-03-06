@@ -229,20 +229,32 @@ pub fn run_model_worker(
     lora_cfg: LoraConfig,
     train_state: Arc<TrainState>,
     rx: std::sync::mpsc::Receiver<ModelRequest>,
+    post_train_hook: Option<Box<dyn Fn() + Send>>,
 ) {
     use mlx_rs::module::ModuleParameters;
 
     let tokenizer = MlxTokenizer::load(&model_dir)
         .expect("Failed to load tokenizer");
-    let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-        .expect("Failed to load model");
+
+    // Try to load the model; may fail for unsupported architectures.
+    // When mlx-lm server handles inference, the in-process model is only
+    // needed for training/perplexity — so we can still serve requests.
+    let mut model: Option<MlxLoraModel> = match MlxLoraModel::load(&model_dir, &cfg, &lora_cfg) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!("in-process model load failed: {e} (training unavailable, mlx-lm inference still works)");
+            None
+        }
+    };
 
     // Count trainable params
-    let trainable = model.trainable_parameters().flatten();
-    let total_trainable: u32 = trainable.values()
-        .map(|a| a.shape().iter().product::<i32>() as u32)
-        .sum();
-    train_state.trainable_params.store(total_trainable, Ordering::Relaxed);
+    if let Some(ref m) = model {
+        let trainable = m.trainable_parameters().flatten();
+        let total_trainable: u32 = trainable.values()
+            .map(|a| a.shape().iter().product::<i32>() as u32)
+            .sum();
+        train_state.trainable_params.store(total_trainable, Ordering::Relaxed);
+    }
 
     // Resolve stop tokens from tokenizer (works across Qwen3/3.5 vocab sizes)
     let resolve_token = |text: &str| -> i32 {
@@ -263,25 +275,28 @@ pub fn run_model_worker(
         }
     }
 
-    eprintln!("model worker ready ({total_trainable} trainable params)");
+    tracing::info!(model_loaded = model.is_some(), "model worker ready");
 
     while let Ok(req) = rx.recv() {
         match req {
             ModelRequest::Chat { prompt, max_tokens, temperature, reply } => {
                 let result = (|| {
+                    let m = model.as_mut().ok_or("in-process model not loaded (use mlx-lm server for inference)")?;
                     let prompt_tokens = tokenizer.encode(&prompt)
                         .map_err(|e| format!("encode: {e}"))?;
                     let prompt_len = prompt_tokens.len();
-                    eprintln!("generate: prompt_len={prompt_len} max_tokens={max_tokens} temp={temperature}");
+                    tracing::debug!(prompt_len, max_tokens, temperature, "generate");
                     let t0 = std::time::Instant::now();
-                    let generated = model.generate(
+                    let generated = m.generate(
                         &prompt_tokens, max_tokens, temperature, &stop_tokens,
                     ).map_err(|e| format!("generate: {e}"))?;
                     let elapsed = t0.elapsed();
                     let gen_len = generated.len();
-                    eprintln!("generate: {gen_len} tokens in {:.1}s ({:.0} ms/tok, prefill {prompt_len} toks)",
-                        elapsed.as_secs_f64(),
-                        elapsed.as_millis() as f64 / gen_len.max(1) as f64);
+                    tracing::debug!(
+                        gen_len, secs = format!("{:.1}", elapsed.as_secs_f64()),
+                        ms_per_tok = format!("{:.0}", elapsed.as_millis() as f64 / gen_len.max(1) as f64),
+                        prefill = prompt_len, "generate done"
+                    );
                     let text = tokenizer.decode(&generated)
                         .map_err(|e| format!("decode: {e}"))?;
                     Ok((text, prompt_len, gen_len))
@@ -295,10 +310,10 @@ pub fn run_model_worker(
                 *train_state.last_loss.lock() = 0.0;
 
                 let result = (|| {
+                    let m = model.as_mut().ok_or_else(|| "in-process model not loaded (training unavailable for this model)".to_string())?;
                     use mlx_rs::Array;
                     for (i, (toks, tgts)) in samples.iter().enumerate() {
-                        eprintln!("  sample {i}: tokens={}, targets={}, first_5_toks={:?}",
-                            toks.len(), tgts.len(), &toks[..toks.len().min(5)]);
+                        tracing::debug!(sample = i, tokens = toks.len(), targets = tgts.len(), "training sample");
                     }
                     let token_batches: Vec<Array> = samples.iter()
                         .map(|(toks, _)| Array::from_slice(toks, &[1, toks.len() as i32]))
@@ -318,7 +333,7 @@ pub fn run_model_worker(
                     });
 
                     let losses = super::mlx_lora::train_loop_with_callback(
-                        &mut model, &token_batches, &target_batches,
+                        m, &token_batches, &target_batches,
                         &lora_cfg, epochs, early_stop_loss, patience,
                         Some(callback),
                     ).map_err(|e| format!("train: {e}"))?;
@@ -329,9 +344,13 @@ pub fn run_model_worker(
 
                 // Auto-export adapters after successful training
                 if result.is_ok() {
-                    let adapter_dir = model_dir.join("adapters");
-                    if let Err(e) = super::mlx_lora::export_adapters(&model, &lora_cfg, &cfg, &adapter_dir) {
-                        eprintln!("auto-export adapters failed: {e}");
+                    if let Some(ref m) = model {
+                        let adapter_dir = model_dir.join("adapters");
+                        if let Err(e) = super::mlx_lora::export_adapters(m, &lora_cfg, &cfg, &adapter_dir) {
+                            tracing::warn!("auto-export adapters failed: {e}");
+                        } else if let Some(ref hook) = post_train_hook {
+                            hook();
+                        }
                     }
                 }
 
@@ -342,10 +361,11 @@ pub fn run_model_worker(
             }
             ModelRequest::Perplexity { tokens, targets, reply } => {
                 let result = (|| {
+                    let m = model.as_mut().ok_or("in-process model not loaded")?;
                     use mlx_rs::Array;
                     let tok_arr = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
                     let tgt_arr = Array::from_slice(&targets, &[1, targets.len() as i32]);
-                    let logits = model.forward_logits(&tok_arr)
+                    let logits = m.forward_logits(&tok_arr)
                         .map_err(|e| format!("forward: {e}"))?;
                     let loss = super::mlx_lora::cross_entropy_loss(&logits, &tgt_arr)
                         .map_err(|e| format!("ce_loss: {e}"))?;
@@ -360,38 +380,49 @@ pub fn run_model_worker(
                 *train_state.initial_loss.lock() = 0.0;
 
                 let result = (|| {
-                    model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-                        .map_err(|e| format!("reload: {e}"))?;
-                    // Recount trainable params
-                    let trainable = model.trainable_parameters().flatten();
-                    let total: u32 = trainable.values()
-                        .map(|a| a.shape().iter().product::<i32>() as u32)
-                        .sum();
-                    train_state.trainable_params.store(total, Ordering::Relaxed);
-                    Ok(())
+                    match MlxLoraModel::load(&model_dir, &cfg, &lora_cfg) {
+                        Ok(m) => {
+                            let trainable = m.trainable_parameters().flatten();
+                            let total: u32 = trainable.values()
+                                .map(|a| a.shape().iter().product::<i32>() as u32)
+                                .sum();
+                            train_state.trainable_params.store(total, Ordering::Relaxed);
+                            model = Some(m);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            model = None;
+                            Err(format!("reload: {e}"))
+                        }
+                    }
                 })();
                 let _ = reply.send(result);
             }
             ModelRequest::ExportAdapters { output_dir, reply } => {
-                let result = super::mlx_lora::export_adapters(&model, &lora_cfg, &cfg, &output_dir)
-                    .map_err(|e| format!("export: {e}"));
+                let result = if let Some(ref m) = model {
+                    super::mlx_lora::export_adapters(m, &lora_cfg, &cfg, &output_dir)
+                        .map_err(|e| format!("export: {e}"))
+                } else {
+                    Err("in-process model not loaded".into())
+                };
                 let _ = reply.send(result);
             }
             #[cfg(feature = "ane")]
             ModelRequest::ApplyLoraDeltas { deltas, reply } => {
                 use mlx_rs::Array;
                 let result: Result<usize, String> = (|| {
+                    let m = model.as_mut().ok_or("in-process model not loaded")?;
                     let mut applied = 0usize;
                     for delta in &deltas.layers {
-                        if delta.layer_idx >= model.layers.len() {
+                        if delta.layer_idx >= m.layers.len() {
                             return Err(format!(
-                                "layer {} out of range ({})", delta.layer_idx, model.layers.len()
+                                "layer {} out of range ({})", delta.layer_idx, m.layers.len()
                             ));
                         }
                         let d = &delta.delta;
                         let new_a = Array::from_slice(&d.a, &[d.rank as i32, d.d_in as i32]);
                         let new_b = Array::from_slice(&d.b, &[d.d_out as i32, d.rank as i32]);
-                        if model.layers[delta.layer_idx].apply_lora_weights(
+                        if m.layers[delta.layer_idx].apply_lora_weights(
                             delta.target.mlx_name(), new_a, new_b,
                         ) {
                             applied += 1;
@@ -400,7 +431,7 @@ pub fn run_model_worker(
                     Ok(applied)
                 })();
                 if let Ok(n) = &result {
-                    eprintln!("applied {n} LoRA deltas from ANE");
+                    tracing::info!(deltas = n, "applied LoRA deltas from ANE");
                 }
                 if let Some(tx) = reply {
                     let _ = tx.send(result);
@@ -732,19 +763,13 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
 
     let model_dir = config.model_dir.clone();
     let cfg = config.model_config;
-    let lora_cfg_worker = LoraConfig {
-        rank: config.lora_config.rank,
-        alpha: config.lora_config.alpha,
-        lr: config.lora_config.lr,
-        weight_decay: config.lora_config.weight_decay,
-        grad_clip: config.lora_config.grad_clip,
-    };
+    let lora_cfg_worker = config.lora_config.clone();
     let ts_clone = Arc::clone(&train_state);
 
     std::thread::Builder::new()
         .name("mlx-model-worker".into())
         .spawn(move || {
-            run_model_worker(model_dir, cfg, lora_cfg_worker, ts_clone, rx);
+            run_model_worker(model_dir, cfg, lora_cfg_worker, ts_clone, rx, None);
         })?;
 
     let state = Arc::new(AppState {

@@ -16,7 +16,63 @@ mod inner {
 
     use crate::agent::mlx_lora::{LoraConfig, MlxLoraModel, MlxTokenizer, ModelConfig};
     use crate::agent::mlx_server::ModelRequest;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{LLMProvider, LLMResponse, ToolCallRequest};
+
+    /// Parse tool calls from model text output when the model doesn't generate
+    /// proper tool_calls JSON. Detects `{"name": "...", "arguments": {...}}` blocks.
+    /// Returns (parsed_tool_calls, remaining_text_with_blocks_removed).
+    fn parse_tool_calls_from_text(text: &str) -> (Vec<ToolCallRequest>, String) {
+        let mut tool_calls = Vec::new();
+        let mut remaining = text.to_string();
+
+        // Try to find JSON objects with "name" and "arguments" keys
+        let mut search_from = 0;
+        while let Some(start) = remaining[search_from..].find('{') {
+            let start = search_from + start;
+            // Try to find matching closing brace by counting nesting
+            let mut depth = 0i32;
+            let mut end = None;
+            for (i, ch) in remaining[start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(start + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                search_from = start + 1;
+                continue;
+            };
+
+            let candidate = &remaining[start..end];
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if let (Some(name), Some(args)) = (
+                    obj.get("name").and_then(|v| v.as_str()),
+                    obj.get("arguments"),
+                ) {
+                    let arguments: HashMap<String, serde_json::Value> = match args {
+                        serde_json::Value::Object(m) => m.iter().map(|(k,v)| (k.clone(), v.clone())).collect(),
+                        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+                        _ => HashMap::new(),
+                    };
+                    let id = format!("call_{}", tool_calls.len());
+                    tool_calls.push(ToolCallRequest { id, name: name.to_string(), arguments });
+                    // Remove the JSON block from remaining text
+                    remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+                    continue; // don't advance search_from since we removed text
+                }
+            }
+            search_from = start + 1;
+        }
+
+        (tool_calls, remaining)
+    }
 
     /// Strip thinking content from model output. Handles two cases:
     /// 1. `<think>...</think>` blocks (full tags in output)
@@ -54,6 +110,8 @@ mod inner {
         tx: std::sync::mpsc::SyncSender<ModelRequest>,
         tokenizer: Arc<MlxTokenizer>,
         model_name: String,
+        /// Full model directory path — used as the "model" field in mlx-lm requests.
+        model_path: String,
         api_base: String,
         thinking_model: bool,
         /// When set, chat() delegates to this mlx-lm server URL.
@@ -95,23 +153,16 @@ mod inner {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "mlx-model".into());
+            // Full path needed for mlx-lm server requests — it matches by path, not leaf name.
+            let model_path_str = model_dir.to_string_lossy().to_string();
 
             let train_state = Arc::new(crate::agent::mlx_server::TrainState::new());
             let (tx, rx) = std::sync::mpsc::sync_channel::<ModelRequest>(4);
 
             let thinking_model = model_config.thinking_model;
-            let dir = model_dir.clone();
-            let cfg = model_config;
-            let lora_cfg = lora_config;
-            let ts = train_state;
-            std::thread::Builder::new()
-                .name("mlx-model-worker".into())
-                .spawn(move || {
-                    crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx);
-                })
-                .context("Failed to spawn model worker thread")?;
 
-            // Auto-start managed mlx-lm server when "auto"
+            // Start managed mlx-lm server BEFORE model worker so we can pass
+            // a post-train hook that reloads adapters on the managed server.
             let (resolved_url, managed_server) = match mlx_lm_url.as_deref() {
                 Some("auto") => {
                     let port = 8090u16;
@@ -121,26 +172,50 @@ mod inner {
                     } else {
                         None
                     };
-                    eprintln!("starting managed mlx-lm server on port {port}...");
-                    match crate::agent::mlx_lm::MlxLmServer::start(model_dir, adapter, port) {
+                    tracing::info!(port, "starting managed mlx-lm server");
+                    match crate::agent::mlx_lm::MlxLmServer::start(model_dir.clone(), adapter, port) {
                         Ok(srv) => {
                             let url = srv.base_url();
-                            eprintln!("mlx-lm server ready at {url}");
+                            tracing::info!(url = %url, "mlx-lm server ready");
                             (Some(url), Some(std::sync::Arc::new(parking_lot::Mutex::new(srv))))
                         }
                         Err(e) => {
-                            eprintln!("warning: mlx-lm server failed to start: {e}");
-                            eprintln!("falling back to in-process inference");
+                            tracing::warn!("mlx-lm server failed to start: {e}, falling back to in-process");
                             (None, None)
                         }
                     }
                 }
                 Some(url) => {
-                    eprintln!("MLX inference delegated to mlx-lm server at {url}");
+                    tracing::info!(url, "MLX inference delegated to mlx-lm server");
                     (Some(url.to_string()), None)
                 }
                 None => (None, None),
             };
+
+            // Build post-train hook that reloads adapters on the managed server.
+            let post_train_hook: Option<Box<dyn Fn() + Send>> = managed_server.as_ref().map(|srv| {
+                let srv = Arc::clone(srv);
+                let adapter_dir = model_dir.join("adapters");
+                Box::new(move || {
+                    if adapter_dir.join("adapters.safetensors").exists() {
+                        match srv.lock().reload_adapters(adapter_dir.clone()) {
+                            Ok(()) => tracing::info!("mlx-lm: adapters reloaded after training"),
+                            Err(e) => tracing::warn!("mlx-lm: adapter reload failed: {e}"),
+                        }
+                    }
+                }) as Box<dyn Fn() + Send>
+            });
+
+            let dir = model_dir.clone();
+            let cfg = model_config;
+            let lora_cfg = lora_config;
+            let ts = train_state;
+            std::thread::Builder::new()
+                .name("mlx-model-worker".into())
+                .spawn(move || {
+                    crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx, post_train_hook);
+                })
+                .context("Failed to spawn model worker thread")?;
 
             let api_base = resolved_url.as_deref()
                 .unwrap_or("mlx://in-process")
@@ -150,6 +225,7 @@ mod inner {
                 tx,
                 tokenizer: Arc::new(tokenizer),
                 model_name,
+                model_path: model_path_str,
                 api_base,
                 thinking_model,
                 mlx_lm_url: resolved_url,
@@ -220,21 +296,63 @@ mod inner {
             self.managed_server.as_ref()
         }
 
+        /// Kill the managed mlx-lm server subprocess if one is running.
+        /// Call before starting a new provider to free the port.
+        pub fn kill_managed_server(&self) {
+            if let Some(ref srv) = self.managed_server {
+                srv.lock().kill();
+            }
+        }
+
+        /// Inject `/nothink` into system message for thinking models.
+        /// This tells Qwen3 to skip the `<think>` block, dramatically reducing
+        /// output tokens (200+ thinking tokens → 0).
+        fn inject_nothink(&self, messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+            if !self.thinking_model {
+                return messages.to_vec();
+            }
+            let mut msgs = messages.to_vec();
+            // Find system message and append /nothink
+            if let Some(sys) = msgs.iter_mut().find(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("system")
+            }) {
+                if let Some(content) = sys.get("content").and_then(|c| c.as_str()) {
+                    if !content.contains("/nothink") {
+                        sys["content"] = serde_json::json!(format!("{content}\n/nothink"));
+                    }
+                }
+            } else {
+                // No system message — prepend one
+                msgs.insert(0, serde_json::json!({
+                    "role": "system",
+                    "content": "/nothink"
+                }));
+            }
+            msgs
+        }
+
         /// Delegate inference to an external mlx-lm server via OpenAI-compat API.
         async fn chat_via_mlx_lm(
             &self,
             base_url: &str,
             messages: &[serde_json::Value],
+            tools: Option<&[serde_json::Value]>,
             max_tokens: u32,
             temperature: f64,
         ) -> Result<LLMResponse> {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-            let body = serde_json::json!({
-                "model": &self.model_name,
-                "messages": messages,
+            let msgs = self.inject_nothink(messages);
+            let mut body = serde_json::json!({
+                "model": &self.model_path,
+                "messages": msgs,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
             });
+            if let Some(tools) = tools {
+                if !tools.is_empty() {
+                    body["tools"] = serde_json::json!(tools);
+                }
+            }
 
             let resp = self.http_client
                 .post(&url)
@@ -252,7 +370,11 @@ mod inner {
             let json: serde_json::Value = resp.json().await
                 .context("mlx-lm server returned invalid JSON")?;
 
-            let content = json.pointer("/choices/0/message/content")
+            let message = json.pointer("/choices/0/message")
+                .cloned()
+                .unwrap_or_default();
+
+            let content = message.get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -268,6 +390,42 @@ mod inner {
                 .unwrap_or("stop")
                 .to_string();
 
+            // Parse tool_calls from response (same format as OpenAI)
+            let mut tool_calls = Vec::new();
+            if let Some(tc_array) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tc_array {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let function = tc.get("function").cloned().unwrap_or_default();
+                    let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let arguments_raw = function.get("arguments").cloned()
+                        .unwrap_or(serde_json::Value::String("{}".into()));
+                    let arguments: HashMap<String, serde_json::Value> =
+                        if let Some(s) = arguments_raw.as_str() {
+                            serde_json::from_str(s).unwrap_or_default()
+                        } else if let Some(obj) = arguments_raw.as_object() {
+                            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        } else {
+                            HashMap::new()
+                        };
+                    tool_calls.push(ToolCallRequest { id, name, arguments });
+                }
+            }
+
+            // Fallback: parse tool calls from text when model doesn't generate
+            // proper tool_calls JSON (e.g. models without tool-calling templates).
+            // Looks for {"name": "...", "arguments": {...}} blocks in content.
+            let (tool_calls, text) = if tool_calls.is_empty() {
+                parse_tool_calls_from_text(&text)
+            } else {
+                (tool_calls, text)
+            };
+
+            let finish_reason = if !tool_calls.is_empty() && finish_reason == "stop" {
+                "tool_calls".to_string()
+            } else {
+                finish_reason
+            };
+
             let mut usage = HashMap::new();
             if let Some(u) = json.get("usage") {
                 if let Some(n) = u.get("prompt_tokens").and_then(|v| v.as_i64()) {
@@ -282,8 +440,8 @@ mod inner {
             }
 
             Ok(LLMResponse {
-                content: Some(text),
-                tool_calls: Vec::new(),
+                content: if text.trim().is_empty() && !tool_calls.is_empty() { None } else { Some(text) },
+                tool_calls,
                 finish_reason,
                 usage,
             })
@@ -348,7 +506,7 @@ mod inner {
         async fn chat(
             &self,
             messages: &[serde_json::Value],
-            _tools: Option<&[serde_json::Value]>,
+            tools: Option<&[serde_json::Value]>,
             _model: Option<&str>,
             max_tokens: u32,
             temperature: f64,
@@ -357,7 +515,7 @@ mod inner {
         ) -> Result<LLMResponse> {
             // Delegate to mlx-lm server when configured
             if let Some(ref url) = self.mlx_lm_url {
-                return self.chat_via_mlx_lm(url, messages, max_tokens, temperature).await;
+                return self.chat_via_mlx_lm(url, messages, tools, max_tokens, temperature).await;
             }
 
             // In-process: apply chat template and generate
@@ -412,6 +570,211 @@ mod inner {
                 finish_reason: "stop".to_string(),
                 usage,
             })
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[serde_json::Value],
+            tools: Option<&[serde_json::Value]>,
+            _model: Option<&str>,
+            max_tokens: u32,
+            temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> Result<crate::providers::base::StreamHandle> {
+            use crate::providers::base::{StreamChunk, StreamHandle};
+            use futures_util::StreamExt;
+
+            // Only stream when delegating to mlx-lm server
+            let Some(ref base_url) = self.mlx_lm_url else {
+                // In-process: fall back to buffered default
+                let response = self.chat(messages, tools, None, max_tokens, temperature, None, None).await?;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                if let Some(ref content) = response.content {
+                    let _ = tx.send(StreamChunk::TextDelta(content.clone()));
+                }
+                let _ = tx.send(StreamChunk::Done(response));
+                return Ok(StreamHandle { rx });
+            };
+
+            let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+            let msgs = self.inject_nothink(messages);
+            let mut body = serde_json::json!({
+                "model": &self.model_path,
+                "messages": msgs,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "stream": true,
+            });
+            if let Some(tools) = tools {
+                if !tools.is_empty() {
+                    body["tools"] = serde_json::json!(tools);
+                }
+            }
+
+            let resp = self.http_client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .context("mlx-lm server stream request failed")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("mlx-lm server returned {status}: {text}");
+            }
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let thinking_model = self.thinking_model;
+
+            // Spawn task to parse SSE stream from mlx-lm server
+            let byte_stream = resp.bytes_stream();
+            tokio::spawn(async move {
+                let mut stream = Box::pin(byte_stream);
+                let mut line_buffer = String::new();
+                let mut full_content = String::new();
+                let mut finish_reason = "stop".to_string();
+                let mut usage: HashMap<String, i64> = HashMap::new();
+                let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
+                let mut in_think = false;
+
+                while let Some(result) = stream.next().await {
+                    let bytes = match result {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!("mlx-lm SSE error: {e}");
+                            break;
+                        }
+                    };
+
+                    line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                    while let Some(newline_pos) = line_buffer.find('\n') {
+                        let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+                        line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                        if line.is_empty() || !line.starts_with("data: ") {
+                            continue;
+                        }
+                        let data = &line[6..];
+                        if data == "[DONE]" {
+                            break;
+                        }
+
+                        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+                            continue;
+                        };
+
+                        // Extract text delta
+                        if let Some(delta) = chunk.pointer("/choices/0/delta/content")
+                            .and_then(|v| v.as_str())
+                        {
+                            if !delta.is_empty() {
+                                // For thinking models, skip content inside <think>...</think>
+                                if thinking_model {
+                                    let mut visible = String::new();
+                                    let mut rest = delta;
+                                    while !rest.is_empty() {
+                                        if in_think {
+                                            if let Some(end) = rest.find("</think>") {
+                                                in_think = false;
+                                                rest = &rest[end + "</think>".len()..];
+                                            } else {
+                                                break; // still in think block
+                                            }
+                                        } else if let Some(start) = rest.find("<think>") {
+                                            visible.push_str(&rest[..start]);
+                                            in_think = true;
+                                            rest = &rest[start + "<think>".len()..];
+                                        } else {
+                                            visible.push_str(rest);
+                                            break;
+                                        }
+                                    }
+                                    if !visible.is_empty() {
+                                        full_content.push_str(&visible);
+                                        let _ = tx.send(StreamChunk::TextDelta(visible));
+                                    }
+                                } else {
+                                    full_content.push_str(delta);
+                                    let _ = tx.send(StreamChunk::TextDelta(delta.to_string()));
+                                }
+                            }
+                        }
+
+                        // Accumulate tool calls from deltas
+                        if let Some(tc_array) = chunk.pointer("/choices/0/delta/tool_calls")
+                            .and_then(|v| v.as_array())
+                        {
+                            for tc in tc_array {
+                                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let entry = tool_calls_acc.entry(idx)
+                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                                        entry.1 = name.to_string();
+                                    }
+                                    if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
+                                        entry.2.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(fr) = chunk.pointer("/choices/0/finish_reason")
+                            .and_then(|v| v.as_str())
+                        {
+                            finish_reason = fr.to_string();
+                        }
+
+                        // Usage in final chunk
+                        if let Some(u) = chunk.get("usage") {
+                            for key in &["prompt_tokens", "completion_tokens", "total_tokens"] {
+                                if let Some(n) = u.get(*key).and_then(|v| v.as_i64()) {
+                                    usage.insert(key.to_string(), n);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Build tool calls
+                let mut tool_calls = Vec::new();
+                let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
+                indices.sort();
+                for idx in indices {
+                    let (id, name, args_json) = tool_calls_acc.remove(&idx).unwrap();
+                    let arguments: HashMap<String, serde_json::Value> =
+                        serde_json::from_str(&args_json).unwrap_or_default();
+                    tool_calls.push(ToolCallRequest { id, name, arguments });
+                }
+
+                // Fallback: parse tool calls from text
+                let (tool_calls, text) = if tool_calls.is_empty() {
+                    parse_tool_calls_from_text(&full_content)
+                } else {
+                    (tool_calls, full_content)
+                };
+
+                let finish_reason = if !tool_calls.is_empty() && finish_reason == "stop" {
+                    "tool_calls".to_string()
+                } else {
+                    finish_reason
+                };
+
+                let _ = tx.send(StreamChunk::Done(LLMResponse {
+                    content: if text.trim().is_empty() && !tool_calls.is_empty() { None } else { Some(text) },
+                    tool_calls,
+                    finish_reason,
+                    usage,
+                }));
+            });
+
+            Ok(StreamHandle { rx })
         }
 
         fn get_default_model(&self) -> &str {

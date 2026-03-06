@@ -70,6 +70,7 @@ impl MlxTokenizer {
 // LoRA configuration
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct LoraConfig {
     pub rank: i32,
     pub alpha: f32,
@@ -460,6 +461,22 @@ impl ModelConfig {
             n_heads: 32, n_kv_heads: 8, n_layers: 36,
             vocab_size: 151936, head_dim: 128,
             rope_theta: 5_000_000.0, rms_eps: 1e-6,
+            group_size: 64, bits: 4,
+            weight_prefix: "model",
+            partial_rotary_factor: 1.0,
+            attn_output_gate: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            thinking_model: true,
+        }
+    }
+
+    pub fn qwen3_8b() -> Self {
+        ModelConfig {
+            dim: 4096, hidden_dim: 12288,
+            n_heads: 32, n_kv_heads: 8, n_layers: 36,
+            vocab_size: 151936, head_dim: 128,
+            rope_theta: 1_000_000.0, rms_eps: 1e-6,
             group_size: 64, bits: 4,
             weight_prefix: "model",
             partial_rotary_factor: 1.0,
@@ -1434,10 +1451,10 @@ impl MlxLoraModel {
         cfg: &ModelConfig,
         lora_cfg: &LoraConfig,
     ) -> Result<Self, anyhow::Error> {
-        eprintln!("loading weights from {}...", model_dir.display());
+        tracing::info!(path = %model_dir.display(), "loading MLX weights");
         let t0 = std::time::Instant::now();
         let mut weights = load_weights(model_dir)?;
-        eprintln!("loaded {} tensors in {}ms", weights.len(), t0.elapsed().as_millis());
+        tracing::info!(tensors = weights.len(), ms = t0.elapsed().as_millis(), "weights loaded");
 
         let pfx = cfg.weight_prefix;
 
@@ -1823,7 +1840,7 @@ pub fn train_step(
             .update(model, &owned_grads)
             .map_err(|e| anyhow::anyhow!("optimizer update: {e}"))?;
     } else {
-        eprintln!("    [skipped NaN gradient update]");
+        tracing::warn!("skipped NaN gradient update");
     }
 
     // Evaluate loss, model parameters, AND optimizer state — matching Python mlx_lm.
@@ -1881,7 +1898,7 @@ pub fn train_loop_with_callback(
         )?;
 
         let ms = t0.elapsed().as_millis();
-        eprintln!("  step {step}: loss={loss:.4}, grad_norm={grad_norm:.4}, time={ms}ms");
+        tracing::debug!(step, loss = format!("{loss:.4}"), grad_norm = format!("{grad_norm:.4}"), ms, "train step");
         losses.push(loss);
 
         if let Some(ref mut cb) = on_step {
@@ -1896,12 +1913,12 @@ pub fn train_loop_with_callback(
         }
 
         if loss < early_stop_loss {
-            eprintln!("  early stop: loss {loss:.4} < threshold {early_stop_loss:.4}");
+            tracing::info!(loss = format!("{loss:.4}"), threshold = format!("{early_stop_loss:.4}"), "early stop: loss below threshold");
             break;
         }
 
         if steps_without_improvement >= patience {
-            eprintln!("  early stop: no improvement for {patience} steps");
+            tracing::info!(patience, "early stop: no improvement");
             break;
         }
     }
@@ -1976,10 +1993,7 @@ pub fn export_adapters(
     let config_path = output_dir.join("adapter_config.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
 
-    eprintln!(
-        "exported {n_params} adapter tensors to {}",
-        output_dir.display()
-    );
+    tracing::info!(tensors = n_params, path = %output_dir.display(), "exported adapter tensors");
 
     Ok(n_params)
 }
