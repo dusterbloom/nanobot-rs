@@ -385,7 +385,10 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
         "starting in-process MLX provider"
     );
 
-    let provider = crate::providers::mlx::MlxProvider::start(model_dir, model_config, lora_config)?;
+    let mlx_lm_url = config.agents.defaults.mlx_lm_url.clone();
+    let provider = crate::providers::mlx::MlxProvider::start_with_mlx_lm(
+        model_dir, model_config, lora_config, mlx_lm_url,
+    )?;
     Ok(MlxHandle {
         provider: Arc::new(provider),
     })

@@ -290,6 +290,10 @@ pub struct AgentDefaults {
     /// "mlx" uses the in-process MLX provider for Apple Silicon GPU inference.
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
+    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio)
+    /// or "mlx" (in-process MLX inference on Apple Silicon GPU).
+    #[serde(default = "default_local_backend")]
+    pub local_backend: String,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +301,11 @@ pub struct AgentDefaults {
     /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
+    /// URL of an external mlx-lm server for inference (e.g. "http://localhost:8080").
+    /// When set with `localBackend: "mlx"`, inference goes to this server via
+    /// OpenAI-compat API while training/perplexity stays in-process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlx_lm_url: Option<String>,
     /// Path to a YAML instruction profiles file for model-specific prompt
     /// engineering. When set, profiles are loaded at startup and applied to
     /// every LLM call based on the active model name and task kind.
@@ -392,6 +401,10 @@ fn default_inference_engine() -> String {
     "auto".to_string()
 }
 
+fn default_local_backend() -> String {
+    "lmstudio".to_string()
+}
+
 fn default_mlx_preset() -> String {
     "qwen3.5-2b".to_string()
 }
@@ -446,8 +459,10 @@ impl Default for AgentDefaults {
             lms_main_model: String::new(),
             lms_port: default_lms_port(),
             inference_engine: default_inference_engine(),
+            local_backend: default_local_backend(),
             mlx_model_dir: None,
             mlx_preset: default_mlx_preset(),
+            mlx_lm_url: None,
             instructions_path: None,
             skip_jit_gate: false,
             local_thinking_reserve_tokens: default_local_thinking_reserve_tokens(),

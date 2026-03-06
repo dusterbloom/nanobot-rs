@@ -250,7 +250,11 @@ impl AgentLoopShared {
 
         // Select conversation protocol based on whether we're talking to a local model.
         // Protocol correctness is enforced at render time — no repair needed.
-        let protocol: Arc<dyn ConversationProtocol> = if core.is_local {
+        // MLX models are in-process and speak cloud protocol (proper tool_calls),
+        // so they use CloudProtocol even though is_local=true for context sizing.
+        let protocol: Arc<dyn ConversationProtocol> = if core.is_local
+            && !core.model.starts_with("mlx:")
+        {
             Arc::new(LocalProtocol::auto_for_model(&core.model))
         } else {
             Arc::new(CloudProtocol)

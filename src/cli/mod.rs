@@ -230,6 +230,35 @@ mod tests {
         assert!(dir.to_string_lossy().ends_with("Qwen3.5-2B-MLX-8bit"));
     }
 
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_preset_from_model_dir() {
+        use std::path::Path;
+        assert_eq!(
+            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3-1.7B-MLX-8bit")),
+            "qwen3-1.7b"
+        );
+        assert_eq!(
+            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3-4B-MLX-4bit")),
+            "qwen3-4b"
+        );
+        assert_eq!(
+            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3.5-2B-MLX-8bit")),
+            "qwen3.5-2b"
+        );
+        // Unknown defaults to qwen3.5-2b
+        assert_eq!(
+            core_builder::preset_from_model_dir(Path::new("/models/some-unknown-model")),
+            "qwen3.5-2b"
+        );
+    }
+
+    #[test]
+    fn test_local_backend_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.defaults.local_backend, "lmstudio");
+    }
+
     #[test]
     fn test_gateway_uses_create_agent_loop_for_perplexity_gate() {
         // Verify that create_agent_loop respects perplexity_gate config
@@ -614,9 +643,11 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         );
     }
 
-    // MLX in-process provider (when inference_engine == "mlx").
+    // MLX in-process provider (when inference_engine == "mlx" or localBackend == "mlx").
     #[cfg(feature = "mlx")]
-    let mlx_handle: Option<MlxHandle> = if config.agents.defaults.inference_engine == "mlx" {
+    let mlx_handle: Option<MlxHandle> = if config.agents.defaults.inference_engine == "mlx"
+        || config.agents.defaults.local_backend == "mlx"
+    {
         match start_mlx_provider(&config) {
             Ok(h) => Some(h),
             Err(e) => {

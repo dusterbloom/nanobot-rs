@@ -47,12 +47,20 @@ mod inner {
     }
 
     /// In-process MLX provider. Owns the channel to the model worker thread.
+    ///
+    /// When `mlx_lm_url` is set, inference is delegated to an external mlx-lm
+    /// server via OpenAI-compat HTTP. Training and perplexity remain in-process.
     pub struct MlxProvider {
         tx: std::sync::mpsc::SyncSender<ModelRequest>,
         tokenizer: Arc<MlxTokenizer>,
         model_name: String,
         api_base: String,
         thinking_model: bool,
+        /// When set, chat() delegates to this mlx-lm server URL.
+        mlx_lm_url: Option<String>,
+        http_client: reqwest::Client,
+        /// Managed mlx-lm subprocess (when mlxLmUrl is "auto").
+        managed_server: Option<Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>>,
     }
 
     impl MlxProvider {
@@ -60,10 +68,26 @@ mod inner {
         ///
         /// The model is loaded once (~2GB for 8-bit Qwen3.5-2B) and serves
         /// all inference, perplexity, and training requests.
+        ///
+        /// When `mlx_lm_url` is set, inference is delegated to the external
+        /// mlx-lm server while training/perplexity stay in-process.
         pub fn start(
             model_dir: PathBuf,
             model_config: ModelConfig,
             lora_config: LoraConfig,
+        ) -> Result<Self> {
+            Self::start_with_mlx_lm(model_dir, model_config, lora_config, None)
+        }
+
+        /// Start with optional mlx-lm server URL for inference delegation.
+        ///
+        /// When `mlx_lm_url` is `Some("auto")`, spawns a managed `mlx_lm.server`
+        /// subprocess on port 8090. Any other `Some(url)` connects to that URL.
+        pub fn start_with_mlx_lm(
+            model_dir: PathBuf,
+            model_config: ModelConfig,
+            lora_config: LoraConfig,
+            mlx_lm_url: Option<String>,
         ) -> Result<Self> {
             let tokenizer = MlxTokenizer::load(&model_dir)
                 .context("Failed to load tokenizer")?;
@@ -87,12 +111,50 @@ mod inner {
                 })
                 .context("Failed to spawn model worker thread")?;
 
+            // Auto-start managed mlx-lm server when "auto"
+            let (resolved_url, managed_server) = match mlx_lm_url.as_deref() {
+                Some("auto") => {
+                    let port = 8090u16;
+                    let adapter_path = model_dir.join("adapters");
+                    let adapter = if adapter_path.join("adapters.safetensors").exists() {
+                        Some(adapter_path)
+                    } else {
+                        None
+                    };
+                    eprintln!("starting managed mlx-lm server on port {port}...");
+                    match crate::agent::mlx_lm::MlxLmServer::start(model_dir, adapter, port) {
+                        Ok(srv) => {
+                            let url = srv.base_url();
+                            eprintln!("mlx-lm server ready at {url}");
+                            (Some(url), Some(std::sync::Arc::new(parking_lot::Mutex::new(srv))))
+                        }
+                        Err(e) => {
+                            eprintln!("warning: mlx-lm server failed to start: {e}");
+                            eprintln!("falling back to in-process inference");
+                            (None, None)
+                        }
+                    }
+                }
+                Some(url) => {
+                    eprintln!("MLX inference delegated to mlx-lm server at {url}");
+                    (Some(url.to_string()), None)
+                }
+                None => (None, None),
+            };
+
+            let api_base = resolved_url.as_deref()
+                .unwrap_or("mlx://in-process")
+                .to_string();
+
             Ok(Self {
                 tx,
                 tokenizer: Arc::new(tokenizer),
                 model_name,
-                api_base: "mlx://in-process".to_string(),
+                api_base,
                 thinking_model,
+                mlx_lm_url: resolved_url,
+                http_client: reqwest::Client::new(),
+                managed_server,
             })
         }
 
@@ -132,6 +194,116 @@ mod inner {
         /// Used by the ANE training thread to send ApplyLoraDeltas directly.
         pub fn model_tx(&self) -> std::sync::mpsc::SyncSender<ModelRequest> {
             self.tx.clone()
+        }
+
+        /// Switch the managed mlx-lm server to a different model.
+        /// Returns the new model name, or error if no managed server.
+        pub fn switch_model(&self, model_dir: PathBuf) -> Result<String> {
+            let srv = self.managed_server.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no managed mlx-lm server"))?;
+            let adapter_path = model_dir.join("adapters");
+            let adapter = if adapter_path.join("adapters.safetensors").exists() {
+                Some(adapter_path)
+            } else {
+                None
+            };
+            let name = model_dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            srv.lock().switch_model(model_dir, adapter)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(name)
+        }
+
+        /// Get reference to the managed server (for REPL model switching).
+        pub fn managed_server(&self) -> Option<&Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>> {
+            self.managed_server.as_ref()
+        }
+
+        /// Delegate inference to an external mlx-lm server via OpenAI-compat API.
+        async fn chat_via_mlx_lm(
+            &self,
+            base_url: &str,
+            messages: &[serde_json::Value],
+            max_tokens: u32,
+            temperature: f64,
+        ) -> Result<LLMResponse> {
+            let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+            let body = serde_json::json!({
+                "model": &self.model_name,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            });
+
+            let resp = self.http_client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .context("mlx-lm server request failed")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("mlx-lm server returned {status}: {text}");
+            }
+
+            let json: serde_json::Value = resp.json().await
+                .context("mlx-lm server returned invalid JSON")?;
+
+            let content = json.pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let text = if self.thinking_model {
+                strip_think_blocks(&content)
+            } else {
+                content
+            };
+
+            let finish_reason = json.pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stop")
+                .to_string();
+
+            let mut usage = HashMap::new();
+            if let Some(u) = json.get("usage") {
+                if let Some(n) = u.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                    usage.insert("prompt_tokens".to_string(), n);
+                }
+                if let Some(n) = u.get("completion_tokens").and_then(|v| v.as_i64()) {
+                    usage.insert("completion_tokens".to_string(), n);
+                }
+                if let Some(n) = u.get("total_tokens").and_then(|v| v.as_i64()) {
+                    usage.insert("total_tokens".to_string(), n);
+                }
+            }
+
+            Ok(LLMResponse {
+                content: Some(text),
+                tool_calls: Vec::new(),
+                finish_reason,
+                usage,
+            })
+        }
+
+        /// Export LoRA adapters to disk in mlx-lm safetensors format.
+        /// Returns the number of adapter tensors exported.
+        pub async fn export_adapters(&self, output_dir: std::path::PathBuf) -> Result<usize> {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.tx
+                .send(ModelRequest::ExportAdapters {
+                    output_dir,
+                    reply: reply_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("model worker died"))?;
+
+            reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("model worker dropped reply"))?
+                .map_err(|e| anyhow::anyhow!("{}", e))
         }
 
         /// Trigger LoRA training on the model worker.
@@ -183,7 +355,12 @@ mod inner {
             _thinking_budget: Option<u32>,
             _top_p: Option<f64>,
         ) -> Result<LLMResponse> {
-            // Convert JSON messages to ChatMessage format and apply template.
+            // Delegate to mlx-lm server when configured
+            if let Some(ref url) = self.mlx_lm_url {
+                return self.chat_via_mlx_lm(url, messages, max_tokens, temperature).await;
+            }
+
+            // In-process: apply chat template and generate
             let chat_messages: Vec<crate::agent::mlx_server::ChatMessage> = messages
                 .iter()
                 .filter_map(|m| {

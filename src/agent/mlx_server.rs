@@ -189,6 +189,11 @@ pub enum ModelRequest {
         targets: Vec<i32>,
         reply: oneshot::Sender<Result<f32, String>>,
     },
+    /// Export trained LoRA adapters to disk in mlx-lm safetensors format.
+    ExportAdapters {
+        output_dir: std::path::PathBuf,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
     /// Hot-swap LoRA weights from ANE training into the live model.
     #[cfg(feature = "ane")]
     ApplyLoraDeltas {
@@ -322,6 +327,14 @@ pub fn run_model_worker(
                     Ok((losses, steps))
                 })();
 
+                // Auto-export adapters after successful training
+                if result.is_ok() {
+                    let adapter_dir = model_dir.join("adapters");
+                    if let Err(e) = super::mlx_lora::export_adapters(&model, &lora_cfg, &cfg, &adapter_dir) {
+                        eprintln!("auto-export adapters failed: {e}");
+                    }
+                }
+
                 train_state.training.store(false, Ordering::Relaxed);
                 if let Some(reply) = reply {
                     let _ = reply.send(result);
@@ -357,6 +370,11 @@ pub fn run_model_worker(
                     train_state.trainable_params.store(total, Ordering::Relaxed);
                     Ok(())
                 })();
+                let _ = reply.send(result);
+            }
+            ModelRequest::ExportAdapters { output_dir, reply } => {
+                let result = super::mlx_lora::export_adapters(&model, &lora_cfg, &cfg, &output_dir)
+                    .map_err(|e| format!("export: {e}"));
                 let _ = reply.send(result);
             }
             #[cfg(feature = "ane")]
@@ -636,6 +654,33 @@ async fn perplexity(
     })))
 }
 
+/// `/export` POST — export LoRA adapters to disk in mlx-lm format.
+/// Body: `{"output_dir": "/path/to/adapter_dir"}` (optional, defaults to model_dir/adapters).
+async fn export_adapters(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let output_dir = req.get("output_dir")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&state.model_dir).join("adapters"));
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.tx.send(ModelRequest::ExportAdapters {
+        output_dir: output_dir.clone(),
+        reply: reply_tx,
+    }).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "model worker died".into()))?;
+
+    let n = reply_rx.await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "model worker dropped reply".into()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "exported": n,
+        "output_dir": output_dir.display().to_string(),
+    })))
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
@@ -720,6 +765,7 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
         .route("/reset", post(reset))
         .route("/status", get(status_exobit))
         .route("/config", put(config_put))
+        .route("/export", post(export_adapters))
         // Common
         .route("/health", get(health))
         .with_state(state);
@@ -729,7 +775,7 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
     eprintln!("  model: {model_name}");
     eprintln!("  endpoints:");
     eprintln!("    OpenAI:  POST /v1/chat/completions");
-    eprintln!("    Ex0bit:  POST /chat (SSE), /train, /perplexity, /reset | GET /status | PUT /config");
+    eprintln!("    Ex0bit:  POST /chat (SSE), /train, /perplexity, /export, /reset | GET /status | PUT /config");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

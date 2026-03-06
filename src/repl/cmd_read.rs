@@ -10,9 +10,18 @@ impl ReplContext {
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
         let is_local = core.is_local;
+        let is_mlx = core.model.starts_with("mlx:");
         let model_name = &core.model;
-        let mode_label = if is_local { "local" } else { "cloud" };
-        let lane_label = if is_local {
+        let mode_label = if is_mlx {
+            "mlx"
+        } else if is_local {
+            "local"
+        } else {
+            "cloud"
+        };
+        let lane_label = if is_mlx {
+            "in-process"
+        } else if is_local {
             if self.config.trio.enabled {
                 "trio"
             } else {

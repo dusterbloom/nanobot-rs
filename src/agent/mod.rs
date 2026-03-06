@@ -88,6 +88,8 @@ pub mod ane_lora;
 #[cfg(all(feature = "ane", feature = "mlx"))]
 pub mod ane_mlx_bridge;
 #[cfg(feature = "mlx")]
+pub mod mlx_lm;
+#[cfg(feature = "mlx")]
 pub mod mlx_lora;
 #[cfg(feature = "mlx")]
 pub mod mlx_server;

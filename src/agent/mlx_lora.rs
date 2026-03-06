@@ -1910,6 +1910,81 @@ pub fn train_loop_with_callback(
 }
 
 // ---------------------------------------------------------------------------
+// Adapter export (mlx-lm compatible safetensors)
+// ---------------------------------------------------------------------------
+
+/// LoRA target keys as they appear in mlx-lm adapter_config.json.
+const LORA_KEYS: &[&str] = &[
+    "self_attn.q_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.down_proj",
+];
+
+/// Export trained LoRA adapters in mlx-lm format.
+///
+/// Produces two files in `output_dir`:
+///   - `adapters.safetensors` — trainable weights with mlx-lm key paths
+///   - `adapter_config.json` — LoRA config for `mlx_lm.server --adapter-path`
+///
+/// The weight keys are prefixed with `weight_prefix` so mlx-lm's
+/// `model.load_weights()` can match them to the right layers.
+pub fn export_adapters(
+    model: &MlxLoraModel,
+    config: &LoraConfig,
+    model_config: &ModelConfig,
+    output_dir: &Path,
+) -> Result<usize, anyhow::Error> {
+    use mlx_rs::module::ModuleParameters;
+    use std::collections::HashMap;
+
+    std::fs::create_dir_all(output_dir)?;
+
+    // Get trainable params: keys like "layers.0.self_attn.q_proj.lora_a.weight"
+    let trainable = model.trainable_parameters().flatten();
+
+    // Eval all arrays to materialize lazy computation graphs
+    mlx_rs::transforms::eval(trainable.values().copied())
+        .map_err(|e| anyhow::anyhow!("eval trainable params: {e}"))?;
+
+    // Prefix keys with model weight_prefix for mlx-lm compatibility
+    let pfx = model_config.weight_prefix;
+    let prefixed: HashMap<String, &Array> = trainable
+        .iter()
+        .map(|(k, v)| (format!("{pfx}.{k}"), *v))
+        .collect();
+
+    let n_params = prefixed.len();
+    let safetensors_path = output_dir.join("adapters.safetensors");
+    Array::save_safetensors(prefixed.iter().map(|(k, v)| (k.as_str(), *v)), None, &safetensors_path)
+        .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
+
+    // Count LoRA layers (layers that have at least one trainable param)
+    let lora_layers = (0..model_config.n_layers)
+        .filter(|i| !model_config.is_linear_attn_layer(*i))
+        .count();
+
+    // Write adapter_config.json
+    let adapter_config = serde_json::json!({
+        "alpha": config.alpha,
+        "dropout": 0.0,
+        "keys": LORA_KEYS,
+        "lora_layers": lora_layers,
+        "rank": config.rank,
+        "num_layers": model_config.n_layers,
+    });
+    let config_path = output_dir.join("adapter_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+
+    eprintln!(
+        "exported {n_params} adapter tensors to {}",
+        output_dir.display()
+    );
+
+    Ok(n_params)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2017,6 +2092,42 @@ mod tests {
     }
 
     #[test]
+    fn test_trainable_param_keys_match_mlx_lm() {
+        // Verify that flattened trainable param keys follow mlx-lm naming convention.
+        let ql = QuantizedLinear::new(128, 64).unwrap();
+        let lora = LoraLinear::new(ql, 4, 1.0).unwrap();
+        let trainable = lora.trainable_parameters().flatten();
+        let keys: Vec<String> = trainable.keys().map(|k| k.to_string()).collect();
+        assert!(keys.contains(&"lora_a.weight".to_string()), "expected lora_a.weight, got {keys:?}");
+        assert!(keys.contains(&"lora_b.weight".to_string()), "expected lora_b.weight, got {keys:?}");
+    }
+
+    #[test]
+    fn test_adapter_config_json_format() {
+        let config = LoraConfig::default();
+        let model_config = ModelConfig::qwen3_1_7b();
+
+        let adapter_config = serde_json::json!({
+            "alpha": config.alpha,
+            "dropout": 0.0,
+            "keys": LORA_KEYS,
+            "lora_layers": model_config.n_layers,
+            "rank": config.rank,
+            "num_layers": model_config.n_layers,
+        });
+
+        let json_str = serde_json::to_string_pretty(&adapter_config).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["alpha"], 32.0);
+        assert_eq!(parsed["rank"], 32);
+        assert_eq!(parsed["lora_layers"], 28);
+        let keys: Vec<String> = parsed["keys"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(keys.contains(&"self_attn.q_proj".to_string()));
+        assert!(keys.contains(&"mlp.down_proj".to_string()));
+    }
+
+    #[test]
     fn test_lora_linear_grad() {
         let ql = QuantizedLinear::new(128, 64).unwrap();
         let mut lora = LoraLinear::new(ql, 4, 1.0).unwrap();
@@ -2072,6 +2183,59 @@ mod tests {
     }
 
     #[test]
+    fn test_e2e_export_adapters_qwen3() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-1.7B-MLX-8bit not found, skipping export test");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_1_7b();
+        let lora_cfg = LoraConfig::default();
+
+        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path())
+            .expect("export failed");
+
+        assert!(n > 0, "should export at least 1 tensor");
+        assert_eq!(n, 224, "Qwen3-1.7B has 224 trainable tensors");
+
+        // Verify safetensors file exists and can be loaded back
+        let st_path = tmpdir.path().join("adapters.safetensors");
+        assert!(st_path.exists(), "adapters.safetensors not found");
+        let loaded = Array::load_safetensors(&st_path).expect("load back failed");
+        assert_eq!(loaded.len(), n);
+
+        // Verify keys have the correct prefix
+        for key in loaded.keys() {
+            assert!(
+                key.starts_with("model.layers."),
+                "key should start with 'model.layers.', got: {key}"
+            );
+            assert!(
+                key.ends_with(".weight"),
+                "key should end with '.weight', got: {key}"
+            );
+        }
+
+        // Verify adapter_config.json
+        let config_path = tmpdir.path().join("adapter_config.json");
+        assert!(config_path.exists(), "adapter_config.json not found");
+        let config_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).unwrap()
+        ).unwrap();
+        assert_eq!(config_json["rank"], 32);
+        assert_eq!(config_json["alpha"], 32.0);
+        assert_eq!(config_json["lora_layers"], 28);
+
+        eprintln!("exported {} adapter tensors to {}", n, tmpdir.path().display());
+    }
+
+    #[test]
     fn test_e2e_qwen3_5_2b_lora_mlx() {
         let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
             .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
@@ -2116,6 +2280,49 @@ mod tests {
         eprintln!("loss: {first:.4} -> {last:.4}");
         assert!(first.is_finite(), "first loss should be finite");
         assert!(last < first, "loss should decrease: {first:.4} -> {last:.4}");
+    }
+
+    #[test]
+    fn test_e2e_export_adapters_qwen3_5_2b() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping export test");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+
+        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
+            .expect("model load failed");
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path())
+            .expect("export failed");
+
+        // Qwen3.5-2B: 84 trainable tensors (6 full-attn × 3 LoRA + 24 × 1 MLP)
+        assert_eq!(n, 84, "Qwen3.5-2B has 84 trainable tensors");
+
+        let st_path = tmpdir.path().join("adapters.safetensors");
+        let loaded = Array::load_safetensors(&st_path).expect("load back failed");
+
+        // Verify language_model.model prefix for Qwen3.5
+        for key in loaded.keys() {
+            assert!(
+                key.starts_with("language_model.model.layers."),
+                "key should start with 'language_model.model.layers.', got: {key}"
+            );
+        }
+
+        // Verify lora_layers count (only full-attn layers have all 4 LoRA targets)
+        let config_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap()
+        ).unwrap();
+        assert_eq!(config_json["lora_layers"], 6, "only 6 full-attn layers");
+        assert_eq!(config_json["num_layers"], 24);
+
+        eprintln!("exported {} adapter tensors (Qwen3.5-2B)", n);
     }
 
     /// Regression test: train on a real-length tokenized sequence (64 tokens)
