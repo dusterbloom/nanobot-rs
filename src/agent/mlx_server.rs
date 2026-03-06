@@ -189,6 +189,12 @@ pub enum ModelRequest {
         targets: Vec<i32>,
         reply: oneshot::Sender<Result<f32, String>>,
     },
+    /// Hot-swap LoRA weights from ANE training into the live model.
+    #[cfg(feature = "ane")]
+    ApplyLoraDeltas {
+        deltas: super::ane_mlx_bridge::LoraDeltas,
+        reply: Option<oneshot::Sender<Result<usize, String>>>,
+    },
 }
 
 /// Shared training state visible to status endpoint.
@@ -346,6 +352,35 @@ pub fn run_model_worker(
                     Ok(())
                 })();
                 let _ = reply.send(result);
+            }
+            #[cfg(feature = "ane")]
+            ModelRequest::ApplyLoraDeltas { deltas, reply } => {
+                use mlx_rs::Array;
+                let result: Result<usize, String> = (|| {
+                    let mut applied = 0usize;
+                    for delta in &deltas.layers {
+                        if delta.layer_idx >= model.layers.len() {
+                            return Err(format!(
+                                "layer {} out of range ({})", delta.layer_idx, model.layers.len()
+                            ));
+                        }
+                        let d = &delta.delta;
+                        let new_a = Array::from_slice(&d.a, &[d.rank as i32, d.d_in as i32]);
+                        let new_b = Array::from_slice(&d.b, &[d.d_out as i32, d.rank as i32]);
+                        if model.layers[delta.layer_idx].apply_lora_weights(
+                            delta.target.mlx_name(), new_a, new_b,
+                        ) {
+                            applied += 1;
+                        }
+                    }
+                    Ok(applied)
+                })();
+                if let Ok(n) = &result {
+                    eprintln!("applied {n} LoRA deltas from ANE");
+                }
+                if let Some(tx) = reply {
+                    let _ = tx.send(result);
+                }
             }
         }
     }

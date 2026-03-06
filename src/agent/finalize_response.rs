@@ -157,47 +157,62 @@ impl AgentLoopShared {
                                 (data, ids)
                             };
 
-                            // Try in-process MLX training first.
-                            #[cfg(feature = "mlx")]
+                            // ANE split-silicon training: train on CPU/ANE thread,
+                            // hot-swap weights into MLX GPU model when done.
+                            // GPU continues serving inference uninterrupted.
+                            #[cfg(all(feature = "ane", feature = "mlx"))]
                             if let Some(ref mlx) = mlx_provider {
-                                let convos: Vec<Vec<crate::agent::mlx_server::ChatMessage>> =
-                                    exps_data.iter().map(|(p, r)| vec![
-                                        crate::agent::mlx_server::ChatMessage { role: "user".into(), content: p.clone() },
-                                        crate::agent::mlx_server::ChatMessage { role: "assistant".into(), content: r.clone() },
-                                    ]).collect();
-                                match mlx.train(convos, epochs).await {
-                                    Ok(()) => {
+                                if let Some(ane_cfg) = build_ane_training_config() {
+                                    let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
+                                        std::path::Path::new(&ane_cfg.model_dir),
+                                    ) {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            debug!("perplexity_gate: ANE tokenizer load failed: {e}");
+                                            // Fall through to MLX GPU training below
+                                            return try_mlx_or_http_train(
+                                                &mlx_provider, &exps_data, &ids, &eb_arc,
+                                                epochs, &server_url,
+                                            ).await;
+                                        }
+                                    };
+                                    let mut samples = Vec::new();
+                                    for (prompt, response) in &exps_data {
+                                        let messages = vec![
+                                            crate::agent::mlx_server::ChatMessage {
+                                                role: "user".into(), content: prompt.clone(),
+                                            },
+                                            crate::agent::mlx_server::ChatMessage {
+                                                role: "assistant".into(), content: response.clone(),
+                                            },
+                                        ];
+                                        if let Ok(pair) = crate::agent::mlx_server::tokenize_conversation(
+                                            &tokenizer, &messages,
+                                        ) {
+                                            samples.push(pair);
+                                        }
+                                    }
+                                    if !samples.is_empty() {
+                                        let mlx_tx = mlx.model_tx();
+                                        let _handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
+                                            ane_cfg, samples, mlx_tx,
+                                        );
                                         let eb = eb_arc.lock();
                                         let _ = eb.mark_exported(&ids);
-                                        info!("perplexity_gate: in-process training with {} experiences", ids.len());
+                                        info!(
+                                            "perplexity_gate: ANE split-silicon training spawned ({} experiences)",
+                                            ids.len()
+                                        );
                                         return;
                                     }
-                                    Err(e) => debug!("perplexity_gate: in-process train failed: {e}"),
                                 }
                             }
 
-                            // Fall back to HTTP /train.
-                            let conversations: Vec<serde_json::Value> = exps_data.iter().map(|(p, r)| {
-                                serde_json::json!([
-                                    {"role": "user", "content": p},
-                                    {"role": "assistant", "content": r}
-                                ])
-                            }).collect();
-                            let body = serde_json::json!({"messages": conversations, "epochs": epochs});
-                            let url = format!("{}/train", server_url);
-                            let client = match reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(5)).build() {
-                                Ok(c) => c, Err(_) => return,
-                            };
-                            match client.post(&url).json(&body).send().await {
-                                Ok(resp) if resp.status().is_success() => {
-                                    let eb = eb_arc.lock();
-                                    let _ = eb.mark_exported(&ids);
-                                    info!("perplexity_gate: triggered training with {} experiences", ids.len());
-                                }
-                                Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
-                                Err(e) => debug!("perplexity_gate: training trigger failed: {e}"),
-                            }
+                            // Try in-process MLX GPU training, then HTTP fallback.
+                            try_mlx_or_http_train(
+                                &mlx_provider, &exps_data, &ids, &eb_arc,
+                                epochs, &server_url,
+                            ).await;
                         });
                     }
                 }
@@ -463,4 +478,98 @@ pub(crate) async fn query_perplexity(server_url: &str, user_content: &str, assis
     }
     let json: serde_json::Value = resp.json().await.ok()?;
     json.get("loss").and_then(|v| v.as_f64()).map(|v| v as f32)
+}
+
+/// Build ANE training config from the local model directory.
+///
+/// Returns `None` if no ANE-compatible model is available.
+/// Currently only Qwen3-1.7B (standard transformer) is ANE-trainable.
+/// Qwen3.5-2B (hybrid GDN) requires GDN support in ANE forward — future work.
+#[cfg(all(feature = "ane", feature = "mlx"))]
+fn build_ane_training_config() -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
+    use crate::agent::ane_mil::MilConfig;
+
+    let home = dirs::home_dir()?;
+    let models_dir = home.join(".cache/lm-studio/models");
+
+    // Try Qwen3-1.7B (standard transformer — fully ANE-compatible)
+    let qwen3_1_7b = models_dir.join("lmstudio-community/Qwen3-1.7B-MLX-8bit");
+    if qwen3_1_7b.join("tokenizer.json").exists() {
+        return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
+            model_dir: qwen3_1_7b,
+            mil_config: MilConfig {
+                dim: 2048,
+                hidden_dim: 6144,
+                n_heads: 16,
+                seq_len: 64,
+                n_kv_heads: 8,
+                rope_theta: 1_000_000.0,
+                rms_eps: 1e-6,
+                has_lm_head: false,
+            },
+            epochs: 3,
+            lr: 1e-5,
+            linear_attn_indices: vec![], // standard transformer, no GDN
+            kv_dim: 8 * 128, // n_kv_heads=8, head_dim=128
+        });
+    }
+
+    None
+}
+
+/// Try in-process MLX GPU training, then fall back to HTTP /train endpoint.
+#[allow(unused_variables)]
+async fn try_mlx_or_http_train(
+    #[cfg(feature = "mlx")]
+    mlx_provider: &Option<std::sync::Arc<crate::providers::mlx::MlxProvider>>,
+    #[cfg(not(feature = "mlx"))]
+    mlx_provider: &Option<()>,
+    exps_data: &[(String, String)],
+    ids: &[i64],
+    eb_arc: &std::sync::Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>,
+    epochs: usize,
+    server_url: &str,
+) {
+    use tracing::{debug, info};
+
+    #[cfg(feature = "mlx")]
+    if let Some(ref mlx) = mlx_provider {
+        let convos: Vec<Vec<crate::agent::mlx_server::ChatMessage>> =
+            exps_data.iter().map(|(p, r)| vec![
+                crate::agent::mlx_server::ChatMessage { role: "user".into(), content: p.clone() },
+                crate::agent::mlx_server::ChatMessage { role: "assistant".into(), content: r.clone() },
+            ]).collect();
+        match mlx.train(convos, epochs).await {
+            Ok(()) => {
+                let eb = eb_arc.lock();
+                let _ = eb.mark_exported(ids);
+                info!("perplexity_gate: in-process training with {} experiences", ids.len());
+                return;
+            }
+            Err(e) => debug!("perplexity_gate: in-process train failed: {e}"),
+        }
+    }
+
+    // Fall back to HTTP /train.
+    let conversations: Vec<serde_json::Value> = exps_data.iter().map(|(p, r)| {
+        serde_json::json!([
+            {"role": "user", "content": p},
+            {"role": "assistant", "content": r}
+        ])
+    }).collect();
+    let body = serde_json::json!({"messages": conversations, "epochs": epochs});
+    let url = format!("{}/train", server_url);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c, Err(_) => return,
+    };
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let eb = eb_arc.lock();
+            let _ = eb.mark_exported(ids);
+            info!("perplexity_gate: triggered training with {} experiences", ids.len());
+        }
+        Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
+        Err(e) => debug!("perplexity_gate: training trigger failed: {e}"),
+    }
 }

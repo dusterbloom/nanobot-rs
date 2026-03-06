@@ -1029,6 +1029,39 @@ impl MlxLoraDecoderLayer {
         }
     }
 
+    /// Apply LoRA weight arrays to a specific target in this layer.
+    /// Returns true if applied, false if the target doesn't exist (e.g. attention on GDN layer).
+    pub fn apply_lora_weights(
+        &mut self,
+        target: &str,
+        new_a: Array,
+        new_b: Array,
+    ) -> bool {
+        match target {
+            "q_proj" | "v_proj" | "o_proj" => {
+                let attn = match &mut self.attn {
+                    AttentionKind::Full(a) => a,
+                    AttentionKind::Linear(_) => return false,
+                };
+                let ll = match target {
+                    "q_proj" => &mut attn.q_proj,
+                    "v_proj" => &mut attn.v_proj,
+                    "o_proj" => &mut attn.o_proj,
+                    _ => unreachable!(),
+                };
+                *ll.lora_a.weight = new_a;
+                *ll.lora_b.weight = new_b;
+                true
+            }
+            "down_proj" => {
+                *self.mlp.down_proj.lora_a.weight = new_a;
+                *self.mlp.down_proj.lora_b.weight = new_b;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;

@@ -128,6 +128,12 @@ mod inner {
                 .map_err(|e| anyhow::anyhow!("{}", e))
         }
 
+        /// Get a clone of the model worker channel sender.
+        /// Used by the ANE training thread to send ApplyLoraDeltas directly.
+        pub fn model_tx(&self) -> std::sync::mpsc::SyncSender<ModelRequest> {
+            self.tx.clone()
+        }
+
         /// Trigger LoRA training on the model worker.
         /// Training updates the live model weights — next inference uses them.
         pub async fn train(

@@ -223,7 +223,15 @@ pub struct LoraModel {
 
 impl LoraModel {
     /// Initialize LoRA adapters for all layers based on config.
+    /// Create LoRA adapters for all layers.
+    ///
+    /// `kv_dim`: KV projection output dim. For MHA, `kv_dim == dim`.
+    /// For GQA (e.g. Qwen3 with 8 KV heads), `kv_dim = n_kv_heads * head_dim`.
     pub fn new(cfg: LoraConfig, n_layers: usize, dim: usize, hidden_dim: usize) -> Self {
+        Self::with_kv_dim(cfg, n_layers, dim, dim, hidden_dim)
+    }
+
+    pub fn with_kv_dim(cfg: LoraConfig, n_layers: usize, dim: usize, kv_dim: usize, hidden_dim: usize) -> Self {
         let rank = cfg.rank;
         let targets = &cfg.target_modules;
 
@@ -233,7 +241,7 @@ impl LoraModel {
                     Some(LoraAdapter::new(rank, dim, dim))
                 } else { None },
                 wv: if targets.iter().any(|t| t == "wv") {
-                    Some(LoraAdapter::new(rank, dim, dim))
+                    Some(LoraAdapter::new(rank, dim, kv_dim))
                 } else { None },
                 wo: if targets.iter().any(|t| t == "wo") {
                     Some(LoraAdapter::new(rank, dim, dim))
