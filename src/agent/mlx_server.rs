@@ -267,10 +267,16 @@ pub fn run_model_worker(
                     let prompt_tokens = tokenizer.encode(&prompt)
                         .map_err(|e| format!("encode: {e}"))?;
                     let prompt_len = prompt_tokens.len();
+                    eprintln!("generate: prompt_len={prompt_len} max_tokens={max_tokens} temp={temperature}");
+                    let t0 = std::time::Instant::now();
                     let generated = model.generate(
                         &prompt_tokens, max_tokens, temperature, &stop_tokens,
                     ).map_err(|e| format!("generate: {e}"))?;
+                    let elapsed = t0.elapsed();
                     let gen_len = generated.len();
+                    eprintln!("generate: {gen_len} tokens in {:.1}s ({:.0} ms/tok, prefill {prompt_len} toks)",
+                        elapsed.as_secs_f64(),
+                        elapsed.as_millis() as f64 / gen_len.max(1) as f64);
                     let text = tokenizer.decode(&generated)
                         .map_err(|e| format!("decode: {e}"))?;
                     Ok((text, prompt_len, gen_len))

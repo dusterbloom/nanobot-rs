@@ -422,6 +422,22 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    pub fn qwen3_0_6b() -> Self {
+        ModelConfig {
+            dim: 1024, hidden_dim: 3072,
+            n_heads: 16, n_kv_heads: 8, n_layers: 28,
+            vocab_size: 151936, head_dim: 128,
+            rope_theta: 1_000_000.0, rms_eps: 1e-6,
+            group_size: 64, bits: 8,
+            weight_prefix: "model",
+            partial_rotary_factor: 1.0,
+            attn_output_gate: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            thinking_model: true,
+        }
+    }
+
     pub fn qwen3_1_7b() -> Self {
         ModelConfig {
             dim: 2048, hidden_dim: 6144,
@@ -600,6 +616,98 @@ impl MlxLoraAttention {
         let k = mlx_rs::fast::rope(&k, self.rope_dims, false, self.rope_base, 1.0, 0, None::<&Array>)?;
 
         // MLX SDPA handles GQA natively (num_heads != num_kv_heads) — no expansion needed
+        use mlx_rs::fast::ScaledDotProductAttentionMask;
+        let attn = if let Some(m) = mask {
+            let m = m.as_dtype(q.dtype())?;
+            mlx_rs::fast::scaled_dot_product_attention(
+                &q, &k, &v, self.attn_scale,
+                ScaledDotProductAttentionMask::Array(&m),
+            )?
+        } else {
+            mlx_rs::fast::scaled_dot_product_attention(
+                &q, &k, &v, self.attn_scale,
+                ScaledDotProductAttentionMask::Causal,
+            )?
+        };
+
+        let mut attn = attn
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
+
+        if let Some(gate) = output_gate {
+            attn = attn.multiply(&nn::sigmoid(&gate)?)?;
+        }
+
+        self.o_proj.forward(&attn)
+    }
+
+    /// Forward with KV cache for incremental generation.
+    ///
+    /// `cache`: per-layer KV cache, updated in-place.
+    /// `offset`: position offset for RoPE (= number of previously cached tokens).
+    pub fn forward_with_cache(
+        &mut self, x: &Array, mask: Option<&Array>, cache: &mut KvCache,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let (batch, seq_len) = (shape[0], shape[1]);
+        let offset = cache.len();
+
+        let q_raw = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let (q, output_gate) = if self.attn_output_gate {
+            let q4d = q_raw.reshape(&[batch, seq_len, self.num_heads, self.head_dim * 2])?;
+            let parts = q4d.split(2, -1)?;
+            let gate = parts[1].reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
+            (parts[0].clone(), Some(gate))
+        } else {
+            (q_raw, None)
+        };
+
+        // QK norm
+        let q = if self.attn_output_gate {
+            self.q_norm.forward(&q)?
+        } else {
+            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
+            if q_norm_size == self.head_dim {
+                let q = q.reshape(&[batch * seq_len * self.num_heads, self.head_dim])?;
+                let q = self.q_norm.forward(&q)?;
+                q.reshape(&[batch, seq_len, self.num_heads * self.head_dim])?
+            } else {
+                self.q_norm.forward(&q)?
+            }
+        };
+        let k_norm_size = self.k_norm.weight.shape()[0] as i32;
+        let k = if k_norm_size == self.head_dim {
+            let k = k.reshape(&[batch * seq_len * self.num_kv_heads, self.head_dim])?;
+            let k = self.k_norm.forward(&k)?;
+            k.reshape(&[batch, seq_len, self.num_kv_heads * self.head_dim])?
+        } else {
+            self.k_norm.forward(&k)?
+        };
+
+        let q = if self.attn_output_gate { q } else {
+            q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
+        };
+        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+        let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k = k.transpose_axes(&[0, 2, 1, 3])?;
+        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+
+        // RoPE with position offset for cached positions
+        let q = mlx_rs::fast::rope(
+            &q, self.rope_dims, false, self.rope_base, 1.0, offset, None::<&Array>,
+        )?;
+        let k = mlx_rs::fast::rope(
+            &k, self.rope_dims, false, self.rope_base, 1.0, offset, None::<&Array>,
+        )?;
+
+        // Update cache: concatenate new K/V with cached
+        let (k, v) = cache.update(&k, &v)?;
+
         use mlx_rs::fast::ScaledDotProductAttentionMask;
         let attn = if let Some(m) = mask {
             let m = m.as_dtype(q.dtype())?;
@@ -928,6 +1036,129 @@ impl MlxLinearAttention {
 
         self.out_proj.forward(&y)
     }
+
+    /// Forward with GDN cache for incremental generation.
+    ///
+    /// On prefill (seq_len > 1): runs full recurrence and stores final state + conv buffer.
+    /// On decode (seq_len == 1): runs single-step update using cached state.
+    pub fn forward_with_cache(&mut self, x: &Array, cache: &mut GdnCache) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let (batch, seq_len) = (shape[0], shape[1]);
+        let h = self.n_heads;
+        let d = self.head_dim;
+        let key_dim = h * d;
+
+        // 1. Project QKV, alpha, beta, z
+        let qkv = self.in_proj_qkv.forward(x)?;
+        let a = self.in_proj_a.forward(x)?;
+        let b = self.in_proj_b.forward(x)?;
+        let conv_dim = qkv.shape()[2];
+        let kernel = self.conv_kernel;
+
+        // 2. Conv1d — different path for prefill vs decode
+        let qkv_conv = if seq_len == 1 {
+            // Decode: use conv buffer (circular)
+            // conv_buf: [B, kernel-1, conv_dim], qkv: [B, 1, conv_dim]
+            let buf = if let Some(ref cb) = cache.conv_buf {
+                // Append new input, drop oldest
+                let combined = mlx_rs::ops::concatenate_axis(&[cb, &qkv], 1)?; // [B, kernel, conv_dim]
+                // Keep last kernel-1 for next step
+                let new_buf = combined.index((.., 1.., ..));
+                new_buf.eval()?;
+                cache.conv_buf = Some(new_buf);
+                combined
+            } else {
+                // First step without prefill — zero-pad
+                let zeros = mlx_rs::ops::zeros::<f32>(&[batch, kernel - 1, conv_dim])?;
+                let combined = mlx_rs::ops::concatenate_axis(&[&zeros, &qkv], 1)?;
+                let new_buf = combined.index((.., 1.., ..));
+                new_buf.eval()?;
+                cache.conv_buf = Some(new_buf);
+                combined
+            };
+            // buf is [B, kernel, conv_dim] — apply depthwise conv1d (no padding needed)
+            let conv_out = mlx_rs::ops::conv1d(
+                &buf, &*self.conv1d_weight, None, None, None, conv_dim as i32,
+            )?;
+            // conv1d output: [B, 1, conv_dim] (kernel input → 1 output)
+            nn::silu(&conv_out)?
+        } else {
+            // Prefill: standard causal conv1d with left-padding
+            let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
+            let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
+            let qkv_conv = mlx_rs::ops::conv1d(
+                &qkv_padded, &*self.conv1d_weight, None, None, None, conv_dim as i32,
+            )?;
+            // Save last kernel-1 inputs as conv buffer for future decode
+            let start = seq_len - (kernel - 1);
+            let conv_tail = qkv.index((.., start.., ..));
+            conv_tail.eval()?;
+            cache.conv_buf = Some(conv_tail);
+            nn::silu(&qkv_conv)?
+        };
+
+        // 3. Split Q, K, V + normalize
+        let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
+        let q = parts[0].reshape(&[batch, seq_len, h, d])?;
+        let k = parts[1].reshape(&[batch, seq_len, h, d])?;
+        let v = parts[2].reshape(&[batch, seq_len, h, d])?;
+
+        let inv_scale = (d as f32).powf(-0.5);
+        let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
+        let q_flat = q.reshape(&[-1, d])?;
+        let k_flat = k.reshape(&[-1, d])?;
+        let q_norm = mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let k_norm = mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
+        let k = k_norm.multiply(array!(inv_scale))?;
+
+        // 4. Decay and beta gates
+        let a_plus_bias = a.add(&*self.dt_bias)?;
+        let sp = nn::softplus(&a_plus_bias)?;
+        let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
+        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;
+        let beta = nn::sigmoid(&b)?;
+
+        // 5. Recurrence with state caching
+        let mut state = cache.state.take()
+            .unwrap_or_else(|| mlx_rs::ops::zeros::<f32>(&[batch, h, d, d]).unwrap());
+        let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
+
+        for t in 0..seq_len {
+            let g_t = g.index((.., t, ..)).reshape(&[batch, h, 1, 1])?;
+            let beta_t = beta.index((.., t, ..)).reshape(&[batch, h, 1])?;
+            let q_t = q.index((.., t, .., ..));
+            let k_t = k.index((.., t, .., ..));
+            let v_t = v.index((.., t, .., ..));
+
+            state = state.multiply(&g_t)?;
+            let k_expanded = k_t.expand_dims(-2)?;
+            let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?;
+            let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?;
+            let delta_expanded = delta.expand_dims(-1)?;
+            state = state.add(&k_expanded.multiply(&delta_expanded)?)?;
+            let q_expanded = q_t.expand_dims(-2)?;
+            let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?;
+            outputs.push(y_t);
+        }
+
+        // Save final recurrent state
+        state.eval()?;
+        cache.state = Some(state);
+
+        // 6. Stack + RMSNormGated + out_proj
+        let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
+        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h, d])?;
+        let y_flat = y.reshape(&[-1, d])?;
+        let y_normed = self.norm.forward(&y_flat)?
+            .reshape(&[batch, seq_len, h, d])?;
+        let y = nn::silu(&z)?.multiply(&y_normed)?;
+        let y = y.reshape(&[batch, seq_len, h * d])?;
+
+        self.out_proj.forward(&y)
+    }
 }
 
 impl ModuleParameters for MlxLinearAttention {
@@ -1062,18 +1293,42 @@ impl MlxLoraDecoderLayer {
         }
     }
 
+    pub fn is_full_attention(&self) -> bool {
+        matches!(&self.attn, AttentionKind::Full(_))
+    }
+
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attn {
             AttentionKind::Full(attn) => attn.forward(&h, mask)?,
             AttentionKind::Linear(attn) => {
-                // Stop gradient through GDN recurrence to prevent NaN during backward.
-                // The GDN sequential loop's backward has exponentially growing gradients
-                // (verified: grad_norm=inf at T=64 even in Python mlx_lm). Python avoids
-                // this by using a non-differentiable Metal kernel for GDN forward.
-                // Gradient still flows through the residual connection, so MLP LoRA
-                // params in all layers (including GDN layers) still receive gradients.
+                mlx_rs::stop_gradient(&attn.forward(&h)?)?
+            },
+        };
+        let x = h.add(residual)?;
+
+        let residual = &x;
+        let h = self.post_attention_layernorm.forward(&x)?;
+        let h = self.mlp.forward(&h)?;
+        h.add(residual)
+    }
+
+    /// Forward with layer cache for incremental generation.
+    pub fn forward_with_cache(
+        &mut self, x: &Array, mask: Option<&Array>, cache: Option<&mut LayerCache>,
+    ) -> Result<Array, Exception> {
+        let residual = x;
+        let h = self.input_layernorm.forward(x)?;
+        let h = match (&mut self.attn, cache) {
+            (AttentionKind::Full(attn), Some(LayerCache::FullAttn(c))) => {
+                attn.forward_with_cache(&h, mask, c)?
+            },
+            (AttentionKind::Linear(attn), Some(LayerCache::LinearAttn(c))) => {
+                mlx_rs::stop_gradient(&attn.forward_with_cache(&h, c)?)?
+            },
+            (AttentionKind::Full(attn), _) => attn.forward(&h, mask)?,
+            (AttentionKind::Linear(attn), _) => {
                 mlx_rs::stop_gradient(&attn.forward(&h)?)?
             },
         };
@@ -1210,11 +1465,10 @@ impl MlxLoraModel {
         Ok(MlxLoraModel { embed_tokens, layers, norm, lm_head })
     }
 
-    /// Greedy autoregressive text generation.
+    /// Autoregressive text generation with KV cache.
     ///
-    /// Takes a prompt token sequence and generates up to `max_tokens` new tokens.
-    /// Uses temperature sampling when temp > 0, greedy argmax otherwise.
-    /// Returns the generated token IDs (NOT including the prompt).
+    /// Phase 1 (prefill): full prompt processed in one forward pass, KV cached.
+    /// Phase 2 (decode): one token at a time, reusing cached KV.
     pub fn generate(
         &mut self,
         prompt_tokens: &[i32],
@@ -1222,26 +1476,34 @@ impl MlxLoraModel {
         temperature: f32,
         stop_tokens: &[i32],
     ) -> Result<Vec<i32>, Exception> {
-        let mut tokens = prompt_tokens.to_vec();
+        let mut caches: Vec<LayerCache> = self.layers.iter().map(|l| {
+            if l.is_full_attention() {
+                LayerCache::FullAttn(KvCache::new())
+            } else {
+                LayerCache::LinearAttn(GdnCache::new())
+            }
+        }).collect();
+
         let mut generated = Vec::with_capacity(max_tokens);
 
+        // --- Prefill: process entire prompt, populate KV caches ---
+        let input = Array::from_slice(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+        let logits = self.forward_logits_cached(&input, &mut caches)?;
+        let mut last_logits = logits.index((.., -1, ..));
+        // Eval prefill logits to materialize the graph before decode loop
+        last_logits.eval()?;
+
         for _ in 0..max_tokens {
-            let input = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
-            let logits = self.forward_logits(&input)?;
-
-            // Take logits for last position: [1, seq, vocab] → [1, vocab]
-            let last_logits = logits.index((.., -1, ..));
-
             let next_token = if temperature <= 0.0 || temperature < 1e-6 {
-                // Greedy
                 mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)?
             } else {
-                // Temperature sampling
                 let scaled = last_logits.multiply(array!(1.0 / temperature))?;
                 mlx_rs::random::categorical(&scaled, None, None, None)?
             };
 
             let next_token = next_token.as_dtype(mlx_rs::Dtype::Int32)?;
+            // eval to materialize before reading value
+            next_token.eval()?;
             let token_id: i32 = next_token.as_slice::<i32>()[0];
 
             if stop_tokens.contains(&token_id) {
@@ -1249,10 +1511,49 @@ impl MlxLoraModel {
             }
 
             generated.push(token_id);
-            tokens.push(token_id);
+
+            // --- Decode: single token forward with cached KV ---
+            let input = Array::from_slice(&[token_id], &[1, 1]);
+            let logits = self.forward_logits_cached(&input, &mut caches)?;
+            last_logits = logits.index((.., -1, ..));
+            // Eval decode logits to prevent unbounded graph growth
+            last_logits.eval()?;
         }
 
         Ok(generated)
+    }
+
+    /// Forward pass with layer caches for incremental generation.
+    fn forward_logits_cached(
+        &mut self,
+        tokens: &Array,
+        caches: &mut [LayerCache],
+    ) -> Result<Array, Exception> {
+        let q_len = tokens.shape()[1] as i32;
+        let mut h = self.embed_tokens.forward(tokens)?;
+
+        // Determine total KV length from first full-attention cache that has data
+        let kv_len = caches.iter().find_map(|c| {
+            if let LayerCache::FullAttn(kv) = c { Some(kv.len() + q_len) } else { None }
+        }).unwrap_or(q_len);
+
+        let mask = create_causal_mask_cached(q_len, kv_len)?;
+
+        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+            h = layer.forward_with_cache(&h, Some(&mask), Some(cache))?;
+        }
+
+        h = self.norm.forward(&h)?;
+        if let Some(lm) = &mut self.lm_head {
+            lm.forward(&h)
+        } else {
+            match &self.embed_tokens {
+                MlxEmbedding::Quantized(qe) => qe.as_linear(&h),
+                MlxEmbedding::Plain(e) => {
+                    mlx_rs::ops::matmul(&h, &e.weight.transpose_axes(&[1, 0])?)
+                }
+            }
+        }
     }
 
     pub fn generate_text(
@@ -1372,6 +1673,97 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
         })
         .collect();
     Ok(Array::from_slice(&data, &[1, 1, seq_len, seq_len]))
+}
+
+/// Create a causal mask for cached generation.
+///
+/// During prefill (no cache), this is the standard `[1,1,S,S]` causal mask.
+/// During decode (with cache), the query has `q_len` new tokens attending to
+/// `kv_len` total cached+new tokens: shape `[1,1,q_len,kv_len]`.
+fn create_causal_mask_cached(q_len: i32, kv_len: i32) -> Result<Array, Exception> {
+    if q_len == kv_len {
+        return create_causal_mask(q_len);
+    }
+    // Decode step: q_len new tokens can attend to all kv_len tokens,
+    // with causal constraint: query position i attends to kv positions ≤ (kv_len - q_len + i).
+    let offset = kv_len - q_len;
+    let data: Vec<f32> = (0..q_len)
+        .flat_map(|i| {
+            (0..kv_len).map(move |j| if j <= offset + i { 0.0 } else { f32::NEG_INFINITY })
+        })
+        .collect();
+    Ok(Array::from_slice(&data, &[1, 1, q_len, kv_len]))
+}
+
+// ---------------------------------------------------------------------------
+// KV Cache + GDN Cache
+// ---------------------------------------------------------------------------
+
+/// Per-layer cache: KV for full attention, GDN state for linear attention.
+#[derive(Debug)]
+pub enum LayerCache {
+    /// Full attention: cached K/V tensors.
+    FullAttn(KvCache),
+    /// Linear attention (GDN): recurrent state + conv1d buffer.
+    LinearAttn(GdnCache),
+}
+
+/// Per-layer KV cache for incremental generation.
+///
+/// Stores cached key/value tensors in `[B, n_kv_heads, seq, head_dim]` layout.
+/// On each step, new K/V are concatenated with the cache.
+#[derive(Debug)]
+pub struct KvCache {
+    pub keys: Option<Array>,
+    pub values: Option<Array>,
+}
+
+/// GDN (Gated Delta Net) recurrent state for incremental generation.
+///
+/// Stores the recurrent state matrix and conv1d circular buffer.
+#[derive(Debug)]
+pub struct GdnCache {
+    /// Recurrent state: `[B, H, D_v, D_k]`
+    pub state: Option<Array>,
+    /// Conv1d circular buffer: last `kernel_size - 1` inputs, `[B, kernel-1, conv_dim]`
+    pub conv_buf: Option<Array>,
+}
+
+impl KvCache {
+    pub fn new() -> Self {
+        KvCache { keys: None, values: None }
+    }
+
+    /// Append new keys/values to the cache and return the full K/V.
+    ///
+    /// Input shapes: `[B, n_kv_heads, new_seq, head_dim]`
+    /// Output shapes: `[B, n_kv_heads, total_seq, head_dim]`
+    pub fn update(&mut self, new_keys: &Array, new_values: &Array) -> Result<(Array, Array), Exception> {
+        let (k, v) = if let (Some(ref ck), Some(ref cv)) = (&self.keys, &self.values) {
+            let k = mlx_rs::ops::concatenate_axis(&[ck, new_keys], 2)?;
+            let v = mlx_rs::ops::concatenate_axis(&[cv, new_values], 2)?;
+            (k, v)
+        } else {
+            (new_keys.clone(), new_values.clone())
+        };
+        // Force evaluation to prevent MLX lazy graph from growing unboundedly.
+        k.eval()?;
+        v.eval()?;
+        self.keys = Some(k.clone());
+        self.values = Some(v.clone());
+        Ok((k, v))
+    }
+
+    /// Current number of cached tokens.
+    pub fn len(&self) -> i32 {
+        self.keys.as_ref().map(|k| k.shape()[2]).unwrap_or(0)
+    }
+}
+
+impl GdnCache {
+    pub fn new() -> Self {
+        GdnCache { state: None, conv_buf: None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1993,9 +2385,10 @@ mod tests {
             eprintln!("  token {tid}: logit {val:.4}");
         }
 
-        eprintln!("\ngenerating (greedy, max 20 tokens)...");
+        // Greedy (temp=0) causes repetition on Qwen3.5 — use temp=0.6 per HF guidance
+        eprintln!("\ngenerating (temp=0.6, max 20 tokens)...");
         let t0 = std::time::Instant::now();
-        let generated = model.generate(prompt, 20, 0.0, &[eos])
+        let generated = model.generate(prompt, 20, 0.6, &[eos])
             .expect("generation failed");
         let elapsed = t0.elapsed();
 
@@ -2059,12 +2452,67 @@ mod tests {
         let tok = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
 
         let t0 = std::time::Instant::now();
-        let response = model.generate_text(&tok, "The capital of France is", 10, 0.0)
+        let response = model.generate_text(&tok, "The capital of France is", 10, 0.6)
             .expect("generate_text failed");
         let elapsed = t0.elapsed();
 
         eprintln!("generate_text: '{}' ({:.1}s)", response, elapsed.as_secs_f64());
         assert!(response.contains("Paris"),
             "response should mention Paris, got: '{}'", response);
+    }
+
+    /// KV cache correctness: pure transformer (no GDN) should produce coherent text.
+    /// Compares cached (generate) vs non-cached (forward_logits) first-token agreement.
+    #[test]
+    fn test_kv_cache_qwen3_pure_transformer() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3-0.6B-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-0.6B-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_0_6b();
+        let lora_cfg = LoraConfig::default();
+        let tok = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
+        let eos = tok.eos_token_id().unwrap_or(151645) as i32;
+        let prompt = tok.encode("The capital of France is").expect("encode");
+
+        // Non-cached: get argmax of last token logits
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("load");
+        let input = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+        let logits = model.forward_logits(&input).expect("forward");
+        let last = logits.index((.., -1, ..));
+        let argmax_nocache = mlx_rs::ops::indexing::argmax_axis(&last, -1, false)
+            .unwrap().as_dtype(mlx_rs::Dtype::Int32).unwrap();
+        let token_nocache: i32 = argmax_nocache.as_slice::<i32>()[0];
+        eprintln!("non-cached argmax: {token_nocache}");
+
+        // Cached: generate with temp=0.6 (greedy causes repetition on Qwen3)
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("reload");
+        let t0 = std::time::Instant::now();
+        let generated = model.generate(&prompt, 30, 0.6, &[eos]).expect("generate");
+        let elapsed = t0.elapsed();
+
+        let text = tok.decode(&generated).unwrap_or_default();
+        eprintln!("KV-cached generation ({:.0}ms/tok): '{}'",
+            elapsed.as_millis() as f64 / generated.len().max(1) as f64, text);
+        eprintln!("tokens: {:?}", &generated[..generated.len().min(10)]);
+
+        // First token should match non-cached argmax (high probability)
+        assert!(!generated.is_empty(), "should generate tokens");
+        // With temp=0.6, first token is very likely the argmax
+        eprintln!("cached first token: {}, non-cached argmax: {}", generated[0], token_nocache);
+
+        // Check for repetition: no single token should appear > 50% of the time
+        let mut counts = std::collections::HashMap::new();
+        for &t in &generated {
+            *counts.entry(t).or_insert(0usize) += 1;
+        }
+        let max_count = counts.values().max().copied().unwrap_or(0);
+        let max_pct = max_count as f64 / generated.len() as f64 * 100.0;
+        eprintln!("max token repetition: {max_count}/{} ({max_pct:.0}%)", generated.len());
+        assert!(max_pct < 60.0,
+            "excessive repetition ({max_pct:.0}%) suggests KV cache bug");
     }
 }

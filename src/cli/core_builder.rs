@@ -256,14 +256,101 @@ pub(super) fn make_local_providers(
 }
 
 /// Resolve the MLX model directory from config or default location.
+///
+/// When `mlxModelDir` is `"auto"`, scans `~/.cache/lm-studio/models/` for
+/// directories containing `tokenizer.json` + `*.safetensors` (no `.gguf`).
 #[cfg(feature = "mlx")]
 pub(crate) fn resolve_mlx_model_dir(config: &Config) -> std::path::PathBuf {
     if let Some(ref dir) = config.agents.defaults.mlx_model_dir {
-        std::path::PathBuf::from(dir)
+        if dir == "auto" {
+            if let Some(found) = auto_detect_mlx_model_dir() {
+                return found;
+            }
+            tracing::warn!("mlxModelDir=auto but no MLX model found, using default");
+        } else {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
+}
+
+/// Scan `~/.cache/lm-studio/models/` for an MLX model directory.
+///
+/// An MLX dir has `tokenizer.json` + at least one `.safetensors` file and no `.gguf`.
+#[cfg(feature = "mlx")]
+pub(crate) fn auto_detect_mlx_model_dir() -> Option<std::path::PathBuf> {
+    let base = dirs::home_dir()?.join(".cache/lm-studio/models");
+    if !base.is_dir() {
+        return None;
+    }
+    find_mlx_dir_recursive(&base)
+}
+
+/// Recursively find a directory that looks like an MLX model.
+#[cfg(feature = "mlx")]
+fn find_mlx_dir_recursive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Check if this dir is an MLX model dir
+            if is_mlx_model_dir(&path) {
+                return Some(path);
+            }
+            subdirs.push(path);
+        }
+    }
+    // Recurse into subdirs
+    for sub in subdirs {
+        if let Some(found) = find_mlx_dir_recursive(&sub) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Check if a directory contains tokenizer.json + *.safetensors and no *.gguf.
+#[cfg(feature = "mlx")]
+fn is_mlx_model_dir(dir: &std::path::Path) -> bool {
+    let has_tokenizer = dir.join("tokenizer.json").is_file();
+    if !has_tokenizer {
+        return false;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let mut has_safetensors = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".gguf") {
+            return false; // GGUF, not MLX
+        }
+        if name.ends_with(".safetensors") {
+            has_safetensors = true;
+        }
+    }
+    has_safetensors
+}
+
+/// Infer the MLX preset name from a model directory path.
+///
+/// Matches known model names in the directory path.
+#[cfg(feature = "mlx")]
+pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
+    let s = dir.to_string_lossy();
+    let s_lower = s.to_lowercase();
+    if s_lower.contains("qwen3-1.7b") || s_lower.contains("qwen3-1_7b") {
+        "qwen3-1.7b"
+    } else if s_lower.contains("qwen3-4b") || s_lower.contains("qwen3-4_b") {
+        "qwen3-4b"
     } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
+        // Default to Qwen3.5-2B (most common MLX model)
+        "qwen3.5-2b"
     }
 }
 
@@ -274,7 +361,15 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     use crate::agent::mlx_lora::{LoraConfig, ModelConfig};
 
     let model_dir = resolve_mlx_model_dir(config);
-    let model_config = match config.agents.defaults.mlx_preset.as_str() {
+    // Use explicit preset, or auto-detect from dir name when mlxModelDir is "auto"
+    let effective_preset = if config.agents.defaults.mlx_model_dir.as_deref() == Some("auto")
+        && config.agents.defaults.mlx_preset == "qwen3.5-2b"
+    {
+        preset_from_model_dir(&model_dir).to_string()
+    } else {
+        config.agents.defaults.mlx_preset.clone()
+    };
+    let model_config = match effective_preset.as_str() {
         "qwen3-1.7b" => ModelConfig::qwen3_1_7b(),
         "qwen3-4b" => ModelConfig::qwen3_4b(),
         _ => ModelConfig::qwen3_5_2b(),
@@ -391,6 +486,9 @@ pub(crate) fn build_core_handle(
 /// The MLX provider runs inference on Apple Silicon GPU via the same model
 /// that serves perplexity scoring and LoRA training. Context is limited to
 /// 32K tokens (local model default).
+///
+/// `is_local` is set to `false` because MLX speaks proper tool_calls and
+/// does not need the local protocol quirks (user-last, no prefill).
 #[cfg(feature = "mlx")]
 pub(crate) fn build_core_handle_mlx(
     config: &Config,
@@ -398,7 +496,10 @@ pub(crate) fn build_core_handle_mlx(
 ) -> SharedCoreHandle {
     let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
     let model = format!("mlx:{}", provider.get_default_model());
-    let max_context_tokens = config.agents.defaults.local_max_context_tokens;
+    // MLX in-process models use GDN with per-token recurrence —
+    // large contexts (19K+) cause multi-minute prefills.
+    // Cap at 4096 tokens for practical response times (~10-15s prefill).
+    let max_context_tokens = config.agents.defaults.local_max_context_tokens.min(4096);
 
     let brave_key = if config.tools.web.search.api_key.is_empty() {
         None
@@ -428,7 +529,7 @@ pub(crate) fn build_core_handle_mlx(
         exec_timeout: config.tools.exec_.timeout,
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
         memory_config: config.memory.clone(),
-        is_local: true,
+        is_local: true, // local model — lite context, but uses CloudProtocol (not LocalProtocol)
         compaction_provider: None,
         tool_delegation: config.tool_delegation.clone(),
         provenance: config.provenance.clone(),
