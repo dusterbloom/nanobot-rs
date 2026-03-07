@@ -2,26 +2,26 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: in_progress
-stopped_at: Completed 02-01-PLAN.md
-last_updated: "2026-03-07T14:35:00.000Z"
-last_activity: 2026-03-07 — Completed 02-01-PLAN.md (Tool Gate & Response Types)
+status: executing
+stopped_at: Completed 03-01-PLAN.md (Memory Ladder)
+last_updated: "2026-03-07T15:35:09Z"
+last_activity: 2026-03-07 — Completed 03-01-PLAN.md (Memory Ladder)
 progress:
   total_phases: 5
-  completed_phases: 1
-  total_plans: 4
-  completed_plans: 3
+  completed_phases: 3
+  total_plans: 5
+  completed_plans: 5
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Phase: Phase 2 — Tool Gate & Response Types
-Plan: 1 of 2 complete
-Status: In progress
-Progress: [=====-----] 1/2 plans
-Last activity: 2026-03-07 — Completed 02-01-PLAN.md (Tool Gate & Response Types)
+Phase: Phase 3 — Memory Ladder
+Plan: 1 of 1 complete
+Status: Executing
+Progress: [==========] 1/1 plans
+Last activity: 2026-03-07 — Completed 03-01-PLAN.md (Memory Ladder)
 
 ## Project Reference
 
@@ -49,6 +49,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 - ToolGate is a unit struct with static filter() -- no instance state needed
 - Config override takes precedence over size class for all tiers including Large
 - ParsedAction is Debug + Clone but not Serialize -- internal dispatch type only
+- MemoryLadder::query() is synchronous to avoid Send issues with parking_lot MutexGuard across await
+- Tool patterns separated into own PromptSection::ToolPatterns (not merged into memory layers)
+- Scratch layer uses block_in_place for async session search
 
 ## Performance Metrics
 
@@ -57,8 +60,10 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 | 01 | 01 | 7min | 2 | 3 |
 | 01 | 02 | 8min | 3 | 3 |
 | 02 | 01 | 5min | 2 | 6 |
+| 02 | 02 | 3min | 1 | 1 |
+| 03 | 01 | 8min | 2 | 3 |
 
 ## Last Session
 
-- **Stopped at:** Completed 02-01-PLAN.md
-- **Timestamp:** 2026-03-07T14:35:00Z
+- **Stopped at:** Completed 03-01-PLAN.md (Memory Ladder)
+- **Timestamp:** 2026-03-07T15:35:09Z

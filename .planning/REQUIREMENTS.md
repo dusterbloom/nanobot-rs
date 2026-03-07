@@ -21,9 +21,9 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 ### Memory Ladder
 
-- [ ] **MEM-01**: 5 named memory layers (Scratch, WorkingSession, DurablePersonal, SearchIndex, GroundTruth) with priority ordering
-- [ ] **MEM-02**: Memory queries stop pulling from lower-priority layers when token budget exhausted
-- [ ] **MEM-03**: available_layers() respects feature gates (no KG layer without knowledge-graph feature)
+- [x] **MEM-01**: 5 named memory layers (Scratch, WorkingSession, DurablePersonal, SearchIndex, GroundTruth) with priority ordering
+- [x] **MEM-02**: Memory queries stop pulling from lower-priority layers when token budget exhausted
+- [x] **MEM-03**: available_layers() respects feature gates (no KG layer without knowledge-graph feature)
 
 ### Learn Loop
 
@@ -91,9 +91,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | GATE-01 | Phase 2 | Complete |
 | GATE-02 | Phase 2 | Complete |
 | PARSE-01 | Phase 2 | Complete |
-| MEM-01 | Phase 3 | Pending |
-| MEM-02 | Phase 3 | Pending |
-| MEM-03 | Phase 3 | Pending |
+| MEM-01 | Phase 3 | Complete |
+| MEM-02 | Phase 3 | Complete |
+| MEM-03 | Phase 3 | Complete |
 | LEARN-01 | Phase 4 | Pending |
 | LEARN-02 | Phase 4 | Pending |
 | LEARN-03 | Phase 4 | Pending |
