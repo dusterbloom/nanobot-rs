@@ -90,6 +90,11 @@ impl PromptBlock {
             self.title.trim().to_string()
         }
     }
+
+    /// Returns a reference to the raw content string.
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
