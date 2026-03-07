@@ -577,6 +577,16 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
 impl ReplContext {
     /// Dispatch a slash command. Returns `true` if the input was a recognized command.
     pub async fn dispatch(&mut self, input: &str) -> bool {
+        // Reset scroll region and ensure cooked terminal mode before printing
+        // command output.  render_input_bar() sets a scroll region and various
+        // code paths may leave the terminal in raw mode — without this guard
+        // every println!() inside a command handler would staircase (\n without
+        // \r) or be constrained to the scroll region.
+        crate::tui::reset_scroll_region();
+        crate::tui::clear_input_bar();
+        crate::tui::force_exit_raw_mode();
+        crate::tui::ensure_cooked_output();
+
         let (cmd, arg) = input
             .split_once(' ')
             .map(|(c, a)| (c, a.trim()))

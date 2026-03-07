@@ -131,6 +131,27 @@ pub fn force_exit_raw_mode() {
     }
 }
 
+/// Ensure the terminal has OPOST set (output post-processing, including
+/// ONLCR which translates `\n` to `\r\n`).  This is needed because rustyline
+/// manages terminal state via `nix::sys::termios` independently from crossterm,
+/// and may leave OPOST cleared after `readline()` returns.
+#[cfg(unix)]
+pub fn ensure_cooked_output() {
+    use libc::{OPOST, STDOUT_FILENO, TCSANOW};
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(STDOUT_FILENO, &mut termios) == 0 {
+            if termios.c_oflag & OPOST == 0 {
+                termios.c_oflag |= OPOST;
+                libc::tcsetattr(STDOUT_FILENO, TCSANOW, &termios);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn ensure_cooked_output() {}
+
 // ============================================================================
 // SIGWINCH / Terminal Resize Handling
 // ============================================================================
@@ -391,6 +412,21 @@ pub(crate) fn render_input_bar(
 
 // Status Bar & Banners
 // ============================================================================
+
+/// Clear the input bar rows at the bottom of the terminal so command output
+/// can use the full screen without colliding with stale bar content.
+pub(crate) fn clear_input_bar() {
+    use std::io::Write as _;
+    let height = terminal_height();
+    let bar_lines = 5usize;
+    let bar_row = height.saturating_sub(bar_lines) + 1;
+    for row in bar_row..=height {
+        print!("\x1b[{};1H\x1b[2K", row);
+    }
+    // Move cursor to top-left of where the bar was so subsequent output flows naturally.
+    print!("\x1b[{};1H", bar_row);
+    std::io::stdout().flush().ok();
+}
 
 /// Reset the terminal scroll region to the full screen.
 /// Call this before AI output starts streaming so text can use all rows.

@@ -121,10 +121,6 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
-        if !*BINARY_AVAILABLE.get_or_init(check_binary) {
-            return format!("Error: {}", INSTALL_HINT);
-        }
-
         let action = match params.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
             None => return "Error: 'action' parameter is required".to_string(),
@@ -160,9 +156,10 @@ impl Tool for BrowserTool {
 
 impl BrowserTool {
     async fn run_cmd(&self, args: &[&str]) -> Result<String, String> {
-        let output = Command::new("agent-browser")
-            .args(args)
-            .output();
+        if !*BINARY_AVAILABLE.get_or_init(check_binary) {
+            return Err(INSTALL_HINT.to_string());
+        }
+        let output = Command::new("agent-browser").args(args).output();
 
         let output = tokio::time::timeout(self.timeout, output)
             .await
@@ -176,7 +173,11 @@ impl BrowserTool {
             Ok(if stdout.is_empty() { stderr } else { stdout })
         } else {
             let msg = if stderr.is_empty() { &stdout } else { &stderr };
-            Err(format!("agent-browser exited with {}: {}", output.status, msg.trim()))
+            Err(format!(
+                "agent-browser exited with {}: {}",
+                output.status,
+                msg.trim()
+            ))
         }
     }
 
@@ -184,7 +185,11 @@ impl BrowserTool {
         params.get(key).and_then(|v| v.as_str())
     }
 
-    fn require_str<'a>(params: &'a HashMap<String, Value>, key: &str, action: &str) -> Result<&'a str, String> {
+    fn require_str<'a>(
+        params: &'a HashMap<String, Value>,
+        key: &str,
+        action: &str,
+    ) -> Result<&'a str, String> {
         Self::get_str(params, key)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("'{}' action requires '{}' parameter", action, key))
@@ -201,7 +206,10 @@ impl BrowserTool {
     }
 
     async fn do_snapshot(&self, params: &HashMap<String, Value>) -> Result<String, String> {
-        let interactive = params.get("interactive").and_then(|v| v.as_bool()).unwrap_or(true);
+        let interactive = params
+            .get("interactive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         if interactive {
             self.run_cmd(&["snapshot", "-i"]).await
         } else {
@@ -249,7 +257,11 @@ impl BrowserTool {
     }
 
     /// Actions that take a single `ref` param: hover, etc.
-    async fn do_ref_action(&self, params: &HashMap<String, Value>, action: &str) -> Result<String, String> {
+    async fn do_ref_action(
+        &self,
+        params: &HashMap<String, Value>,
+        action: &str,
+    ) -> Result<String, String> {
         let r = Self::require_str(params, "ref", action)?;
         self.run_cmd(&[action, r]).await
     }
@@ -286,7 +298,11 @@ fn truncate_output(output: &str, max_chars: usize) -> String {
         output.to_string()
     } else {
         let truncated = &output[..max_chars];
-        format!("{}\n\n[Output truncated — {} chars total]", truncated, output.len())
+        format!(
+            "{}\n\n[Output truncated — {} chars total]",
+            truncated,
+            output.len()
+        )
     }
 }
 
@@ -391,7 +407,10 @@ mod tests {
         let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
         let mut params = HashMap::new();
         params.insert("action".to_string(), Value::String("scroll".to_string()));
-        params.insert("direction".to_string(), Value::String("diagonal".to_string()));
+        params.insert(
+            "direction".to_string(),
+            Value::String("diagonal".to_string()),
+        );
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
         assert!(result.contains("up") || result.contains("down"));
