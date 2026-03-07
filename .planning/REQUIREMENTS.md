@@ -27,9 +27,9 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 ### Learn Loop
 
-- [ ] **LEARN-01**: TurnOutcome struct captures tool outcomes, response meta, budget, model, and lane per turn
-- [ ] **LEARN-02**: Immediate observers run synchronously, async observers spawned as tokio tasks
-- [ ] **LEARN-03**: finalize_response.rs constructs TurnOutcome and calls LearnLoop — zero direct store writes
+- [x] **LEARN-01**: TurnOutcome struct captures tool outcomes, response meta, budget, model, and lane per turn
+- [x] **LEARN-02**: Immediate observers run synchronously, async observers spawned as tokio tasks
+- [x] **LEARN-03**: finalize_response.rs constructs TurnOutcome and calls LearnLoop — zero direct store writes
 
 ### Parser Canon
 
@@ -94,9 +94,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | MEM-01 | Phase 3 | Complete |
 | MEM-02 | Phase 3 | Complete |
 | MEM-03 | Phase 3 | Complete |
-| LEARN-01 | Phase 4 | Pending |
-| LEARN-02 | Phase 4 | Pending |
-| LEARN-03 | Phase 4 | Pending |
+| LEARN-01 | Phase 4 | Complete |
+| LEARN-02 | Phase 4 | Complete |
+| LEARN-03 | Phase 4 | Complete |
 | LANE-01 | Phase 5 | Pending |
 | LANE-02 | Phase 5 | Pending |
 

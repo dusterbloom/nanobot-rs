@@ -3,25 +3,25 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-01-PLAN.md (Memory Ladder)
-last_updated: "2026-03-07T15:43:58.623Z"
-last_activity: 2026-03-07 — Completed 03-01-PLAN.md (Memory Ladder)
+stopped_at: Completed 04-01-PLAN.md (LearnLoop)
+last_updated: "2026-03-07T16:33:47.000Z"
+last_activity: 2026-03-07 — Completed 04-01-PLAN.md (LearnLoop)
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 5
-  completed_plans: 5
+  completed_phases: 4
+  total_plans: 6
+  completed_plans: 6
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Phase: Phase 3 — Memory Ladder
+Phase: Phase 4 — Learn Loop
 Plan: 1 of 1 complete
 Status: Executing
 Progress: [==========] 1/1 plans
-Last activity: 2026-03-07 — Completed 03-01-PLAN.md (Memory Ladder)
+Last activity: 2026-03-07 — Completed 04-01-PLAN.md (LearnLoop)
 
 ## Project Reference
 
@@ -52,6 +52,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 - MemoryLadder::query() is synchronous to avoid Send issues with parking_lot MutexGuard across await
 - Tool patterns separated into own PromptSection::ToolPatterns (not merged into memory layers)
 - Scratch layer uses block_in_place for async session search
+- Pre-compute cost_usd in finalize_response (async context) and pass via TurnOutcome
+- Calibrator field changed to Arc<Mutex<...>> for shared ownership between AgentLoopShared and LearnLoop
+- LearnLoop rebuilt on set_perplexity_gate/set_mlx_provider to capture updated config
 
 ## Performance Metrics
 
@@ -62,8 +65,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 | 02 | 01 | 5min | 2 | 6 |
 | 02 | 02 | 3min | 1 | 1 |
 | 03 | 01 | 8min | 2 | 3 |
+| 04 | 01 | 8min | 2 | 6 |
 
 ## Last Session
 
-- **Stopped at:** Completed 03-01-PLAN.md (Memory Ladder)
-- **Timestamp:** 2026-03-07T15:35:09Z
+- **Stopped at:** Completed 04-01-PLAN.md (LearnLoop)
+- **Timestamp:** 2026-03-07T16:33:47Z
