@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! TUI-related functions: ANSI constants, status bars, banners, and voice helpers.
 
+use parking_lot::Mutex;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::OnceLock;
-use parking_lot::Mutex;
 #[cfg(feature = "voice")]
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -53,7 +53,8 @@ impl TerminalWriter {
 
     /// Write a string to stdout under the lock, then flush.
     pub fn write_str(&self, s: &str) {
-        { let mut w = self.inner.lock();
+        {
+            let mut w = self.inner.lock();
             let _ = w.write_all(s.as_bytes());
             let _ = w.flush();
         }
@@ -61,7 +62,8 @@ impl TerminalWriter {
 
     /// Write a string followed by newline.
     pub fn writeln(&self, s: &str) {
-        { let mut w = self.inner.lock();
+        {
+            let mut w = self.inner.lock();
             let _ = w.write_all(s.as_bytes());
             let _ = w.write_all(b"\n");
             let _ = w.flush();
@@ -74,7 +76,8 @@ impl TerminalWriter {
     where
         F: FnOnce(&mut BufWriter<io::Stdout>),
     {
-        { let mut w = self.inner.lock();
+        {
+            let mut w = self.inner.lock();
             f(&mut w);
             let _ = w.flush();
         }
@@ -167,11 +170,13 @@ pub(crate) fn take_resize_pending() -> bool {
 }
 
 /// Print the nanobot demoscene-style ASCII logo.
+/// Uses explicit `\r\n` so the logo renders correctly even if the terminal
+/// is in raw mode (where `\n` is LF-only without carriage return).
 pub fn print_logo() {
-    println!("  {BOLD}{CYAN} _____             _       _   {RESET}");
-    println!("  {BOLD}{WHITE}|   | |___ ___ ___| |_ ___| |_ {RESET}");
-    println!("  {BOLD}{WHITE}| | | | .'|   | . | . | . |  _|{RESET}");
-    println!("  {BOLD}{CYAN}|_|___|__,|_|_|___|___|___|_|  {RESET}");
+    print!("  {BOLD}{CYAN} _____             _       _   {RESET}\r\n");
+    print!("  {BOLD}{WHITE}|   | |___ ___ ___| |_ ___| |_ {RESET}\r\n");
+    print!("  {BOLD}{WHITE}| | | | .'|   | . | . | . |  _|{RESET}\r\n");
+    print!("  {BOLD}{CYAN}|_|___|__,|_|_|___|___|___|_|  {RESET}\r\n");
 }
 
 /// Animated loading sequence.
@@ -444,10 +449,7 @@ pub(crate) fn print_status_bar(
     parts.push(format!("msgs:{}", msg_count));
 
     // Tools called this turn
-    let tools_called: Vec<String> = counters
-        .last_tools_called
-        .lock()
-        .clone();
+    let tools_called: Vec<String> = counters.last_tools_called.lock().clone();
     if !tools_called.is_empty() {
         let mut sorted = tools_called.clone();
         sorted.sort();
@@ -547,12 +549,12 @@ pub(crate) fn print_mlx_splash(model_name: &str, mlx_lm_mode: Option<&str>) {
         Some(_) => "mlx-lm (external)",
         None => "in-process GPU",
     };
-    println!("  {BOLD}{YELLOW}MLX{RESET} {DIM}{model_name} · {mode_hint}{RESET}");
-    println!(
-        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}",
+    print!("  {BOLD}{YELLOW}MLX{RESET} {DIM}{model_name} · {mode_hint}{RESET}\r\n");
+    print!(
+        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",
         env!("CARGO_PKG_VERSION")
     );
-    println!();
+    print!("\r\n");
 
     loading_animation("Loading model");
 }

@@ -522,6 +522,10 @@ impl ReplContext {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
+                // Snapshot old config so we can restore on failure
+                let old_model_dir = self.config.agents.defaults.mlx_model_dir.clone();
+                let old_preset = self.config.agents.defaults.mlx_preset.clone();
+
                 // Update config first
                 self.config.agents.defaults.mlx_model_dir = Some(dir_str.clone());
                 self.config.agents.defaults.inference_engine = "mlx".to_string();
@@ -529,31 +533,50 @@ impl ReplContext {
                 let preset = cli::preset_from_model_dir(path).to_string();
                 self.config.agents.defaults.mlx_preset = preset;
 
-                // Persist
-                let mut disk_cfg = load_config(None);
-                disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
-                disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
-                disk_cfg.agents.defaults.local_backend = "mlx".to_string();
-                disk_cfg.agents.defaults.mlx_preset =
-                    self.config.agents.defaults.mlx_preset.clone();
-                save_config(&disk_cfg, None);
-
                 // Kill the old managed mlx-lm server to free port 8090 before starting new one
-                if let Some(ref old_handle) = self.mlx_handle {
-                    old_handle.provider.kill_managed_server();
+                let old_handle = self.mlx_handle.take();
+                if let Some(ref h) = old_handle {
+                    h.provider.kill_managed_server();
                 }
-                self.mlx_handle = None;
 
                 // Rebuild MLX provider from scratch with the new model
                 print!("  Loading {}... ", name);
                 io::stdout().flush().ok();
                 match cli::start_mlx_provider(&self.config) {
                     Ok(h) => {
+                        // Success — persist config to disk now
+                        let mut disk_cfg = load_config(None);
+                        disk_cfg.agents.defaults.mlx_model_dir = Some(dir_str);
+                        disk_cfg.agents.defaults.inference_engine = "mlx".to_string();
+                        disk_cfg.agents.defaults.local_backend = "mlx".to_string();
+                        disk_cfg.agents.defaults.mlx_preset =
+                            self.config.agents.defaults.mlx_preset.clone();
+                        save_config(&disk_cfg, None);
                         self.mlx_handle = Some(h);
                         println!("{}OK{}", tui::GREEN, tui::RESET);
                     }
                     Err(e) => {
                         println!("{}FAILED: {}{}", tui::RED, e, tui::RESET);
+                        // Restore previous config
+                        self.config.agents.defaults.mlx_model_dir = old_model_dir;
+                        self.config.agents.defaults.mlx_preset = old_preset;
+                        // Try to restore the old provider
+                        match old_handle {
+                            Some(_) => {
+                                print!("  Restoring previous model... ");
+                                io::stdout().flush().ok();
+                                match cli::start_mlx_provider(&self.config) {
+                                    Ok(h) => {
+                                        self.mlx_handle = Some(h);
+                                        println!("{}OK{}", tui::GREEN, tui::RESET);
+                                    }
+                                    Err(e2) => {
+                                        println!("{}FAILED: {}{}", tui::RED, e2, tui::RESET);
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
                         return;
                     }
                 }

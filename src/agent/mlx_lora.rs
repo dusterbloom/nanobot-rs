@@ -17,13 +17,31 @@ use std::rc::Rc;
 
 use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
-use mlx_rs::module::{Module, ModuleParameters, ModuleParamMut, ModuleParamRef, Param};
+use mlx_rs::losses::{CrossEntropyBuilder, LossReduction};
+use mlx_rs::module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param};
 use mlx_rs::nested::{NestedHashMap, NestedValue};
 use mlx_rs::nn::{self, Embedding, Linear, QuantizedEmbedding, QuantizedLinear, RmsNorm};
+use mlx_rs::ops::indexing::{put_along_axis, IndexOp, TryIndexMutOp};
 use mlx_rs::optimizers::{AdamW, Optimizer};
-use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::losses::{CrossEntropyBuilder, LossReduction};
-use mlx_rs::{array, Array};
+use mlx_rs::transforms::compile::{clear_cache, compile_with_state};
+use mlx_rs::transforms::{async_eval, eval};
+use mlx_rs::utils::Updatable;
+use mlx_rs::{array, Array, Dtype};
+
+const KV_CACHE_MATERIALIZE_INTERVAL: usize = 32;
+
+fn compiled_decode_enabled() -> bool {
+    std::env::var("NANOBOT_MLX_COMPILED_DECODE")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim();
+            raw == "1"
+                || raw.eq_ignore_ascii_case("true")
+                || raw.eq_ignore_ascii_case("yes")
+                || raw.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
 
 // ---------------------------------------------------------------------------
 // Tokenizer wrapper (reads tokenizer.json from model directory)
@@ -36,20 +54,25 @@ pub struct MlxTokenizer {
 impl MlxTokenizer {
     pub fn load(model_dir: &Path) -> Result<Self, anyhow::Error> {
         let path = model_dir.join("tokenizer.json");
-        let inner = tokenizers::Tokenizer::from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", path.display()))?;
+        let inner = tokenizers::Tokenizer::from_file(&path).map_err(|e| {
+            anyhow::anyhow!("Failed to load tokenizer from {}: {e}", path.display())
+        })?;
         Ok(MlxTokenizer { inner })
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i32>, anyhow::Error> {
-        let encoding = self.inner.encode(text, false)
+        let encoding = self
+            .inner
+            .encode(text, false)
             .map_err(|e| anyhow::anyhow!("Tokenizer encode failed: {e}"))?;
         Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
     }
 
     pub fn decode(&self, ids: &[i32]) -> Result<String, anyhow::Error> {
         let u32_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-        let text = self.inner.decode(&u32_ids, true)
+        let text = self
+            .inner
+            .decode(&u32_ids, true)
             .map_err(|e| anyhow::anyhow!("Tokenizer decode failed: {e}"))?;
         Ok(text)
     }
@@ -208,10 +231,7 @@ impl ModuleParameters for LoraLinear {
     }
 
     fn all_frozen(&self) -> Option<bool> {
-        Some(
-            self.lora_a.all_frozen().unwrap_or(true)
-                && self.lora_b.all_frozen().unwrap_or(true),
-        )
+        Some(self.lora_a.all_frozen().unwrap_or(true) && self.lora_b.all_frozen().unwrap_or(true))
     }
 
     fn any_frozen(&self) -> Option<bool> {
@@ -337,28 +357,52 @@ impl MlxEmbedding {
 
 impl ModuleParameters for MlxEmbedding {
     fn num_parameters(&self) -> usize {
-        match self { MlxEmbedding::Plain(e) => e.num_parameters(), MlxEmbedding::Quantized(e) => e.num_parameters() }
+        match self {
+            MlxEmbedding::Plain(e) => e.num_parameters(),
+            MlxEmbedding::Quantized(e) => e.num_parameters(),
+        }
     }
     fn parameters(&self) -> ModuleParamRef<'_> {
-        match self { MlxEmbedding::Plain(e) => e.parameters(), MlxEmbedding::Quantized(e) => e.parameters() }
+        match self {
+            MlxEmbedding::Plain(e) => e.parameters(),
+            MlxEmbedding::Quantized(e) => e.parameters(),
+        }
     }
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        match self { MlxEmbedding::Plain(e) => e.parameters_mut(), MlxEmbedding::Quantized(e) => e.parameters_mut() }
+        match self {
+            MlxEmbedding::Plain(e) => e.parameters_mut(),
+            MlxEmbedding::Quantized(e) => e.parameters_mut(),
+        }
     }
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        match self { MlxEmbedding::Plain(e) => e.trainable_parameters(), MlxEmbedding::Quantized(e) => e.trainable_parameters() }
+        match self {
+            MlxEmbedding::Plain(e) => e.trainable_parameters(),
+            MlxEmbedding::Quantized(e) => e.trainable_parameters(),
+        }
     }
     fn freeze_parameters(&mut self, r: bool) {
-        match self { MlxEmbedding::Plain(e) => e.freeze_parameters(r), MlxEmbedding::Quantized(e) => e.freeze_parameters(r) }
+        match self {
+            MlxEmbedding::Plain(e) => e.freeze_parameters(r),
+            MlxEmbedding::Quantized(e) => e.freeze_parameters(r),
+        }
     }
     fn unfreeze_parameters(&mut self, r: bool) {
-        match self { MlxEmbedding::Plain(e) => e.unfreeze_parameters(r), MlxEmbedding::Quantized(e) => e.unfreeze_parameters(r) }
+        match self {
+            MlxEmbedding::Plain(e) => e.unfreeze_parameters(r),
+            MlxEmbedding::Quantized(e) => e.unfreeze_parameters(r),
+        }
     }
     fn all_frozen(&self) -> Option<bool> {
-        match self { MlxEmbedding::Plain(e) => e.all_frozen(), MlxEmbedding::Quantized(e) => e.all_frozen() }
+        match self {
+            MlxEmbedding::Plain(e) => e.all_frozen(),
+            MlxEmbedding::Quantized(e) => e.all_frozen(),
+        }
     }
     fn any_frozen(&self) -> Option<bool> {
-        match self { MlxEmbedding::Plain(e) => e.any_frozen(), MlxEmbedding::Quantized(e) => e.any_frozen() }
+        match self {
+            MlxEmbedding::Plain(e) => e.any_frozen(),
+            MlxEmbedding::Quantized(e) => e.any_frozen(),
+        }
     }
 }
 
@@ -372,9 +416,12 @@ fn load_embedding(
     if weights.contains_key(&format!("{prefix}.scales")) {
         let scales = take(weights, &format!("{prefix}.scales"))?;
         let biases = take(weights, &format!("{prefix}.biases"))?;
-        let inner = Embedding { weight: Param::new(weight) };
+        let inner = Embedding {
+            weight: Param::new(weight),
+        };
         let mut qe = QuantizedEmbedding {
-            group_size, bits,
+            group_size,
+            bits,
             scales: Param::new(scales),
             biases: Param::new(biases),
             inner,
@@ -382,7 +429,9 @@ fn load_embedding(
         qe.freeze_parameters(true);
         Ok(MlxEmbedding::Quantized(qe))
     } else {
-        let mut emb = Embedding { weight: Param::new(weight) };
+        let mut emb = Embedding {
+            weight: Param::new(weight),
+        };
         emb.freeze_parameters(true);
         Ok(MlxEmbedding::Plain(emb))
     }
@@ -425,86 +474,290 @@ pub struct ModelConfig {
 impl ModelConfig {
     pub fn qwen3_0_6b() -> Self {
         ModelConfig {
-            dim: 1024, hidden_dim: 3072,
-            n_heads: 16, n_kv_heads: 8, n_layers: 28,
-            vocab_size: 151936, head_dim: 128,
-            rope_theta: 1_000_000.0, rms_eps: 1e-6,
-            group_size: 64, bits: 8,
+            dim: 1024,
+            hidden_dim: 3072,
+            n_heads: 16,
+            n_kv_heads: 8,
+            n_layers: 28,
+            vocab_size: 151936,
+            head_dim: 128,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 8,
             weight_prefix: "model",
             partial_rotary_factor: 1.0,
             attn_output_gate: false,
             linear_attn_indices: vec![],
-            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel_size: 0,
             thinking_model: true,
         }
     }
 
     pub fn qwen3_1_7b() -> Self {
         ModelConfig {
-            dim: 2048, hidden_dim: 6144,
-            n_heads: 16, n_kv_heads: 8, n_layers: 28,
-            vocab_size: 151936, head_dim: 128,
-            rope_theta: 1_000_000.0, rms_eps: 1e-6,
-            group_size: 64, bits: 8,
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 16,
+            n_kv_heads: 8,
+            n_layers: 28,
+            vocab_size: 151936,
+            head_dim: 128,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 8,
             weight_prefix: "model",
             partial_rotary_factor: 1.0,
             attn_output_gate: false,
             linear_attn_indices: vec![],
-            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel_size: 0,
             thinking_model: false,
         }
     }
 
     pub fn qwen3_4b() -> Self {
         ModelConfig {
-            dim: 2560, hidden_dim: 9728,
-            n_heads: 32, n_kv_heads: 8, n_layers: 36,
-            vocab_size: 151936, head_dim: 128,
-            rope_theta: 5_000_000.0, rms_eps: 1e-6,
-            group_size: 64, bits: 4,
+            dim: 2560,
+            hidden_dim: 9728,
+            n_heads: 32,
+            n_kv_heads: 8,
+            n_layers: 36,
+            vocab_size: 151936,
+            head_dim: 128,
+            rope_theta: 5_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 4,
             weight_prefix: "model",
             partial_rotary_factor: 1.0,
             attn_output_gate: false,
             linear_attn_indices: vec![],
-            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel_size: 0,
             thinking_model: true,
         }
     }
 
     pub fn qwen3_8b() -> Self {
         ModelConfig {
-            dim: 4096, hidden_dim: 12288,
-            n_heads: 32, n_kv_heads: 8, n_layers: 36,
-            vocab_size: 151936, head_dim: 128,
-            rope_theta: 1_000_000.0, rms_eps: 1e-6,
-            group_size: 64, bits: 4,
+            dim: 4096,
+            hidden_dim: 12288,
+            n_heads: 32,
+            n_kv_heads: 8,
+            n_layers: 36,
+            vocab_size: 151936,
+            head_dim: 128,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 4,
             weight_prefix: "model",
             partial_rotary_factor: 1.0,
             attn_output_gate: false,
             linear_attn_indices: vec![],
-            linear_n_heads: 0, linear_head_dim: 0, conv_kernel_size: 0,
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel_size: 0,
             thinking_model: true,
         }
     }
 
     pub fn qwen3_5_2b() -> Self {
         // Hybrid Mamba-Transformer: 18 linear_attn + 6 full_attn (every 4th)
-        let linear_indices: Vec<usize> = (0..24)
-            .filter(|i| i % 4 != 3)
-            .collect();
+        let linear_indices: Vec<usize> = (0..24).filter(|i| i % 4 != 3).collect();
         ModelConfig {
-            dim: 2048, hidden_dim: 6144,
-            n_heads: 8, n_kv_heads: 2, n_layers: 24,
-            vocab_size: 248320, head_dim: 256,
-            rope_theta: 10_000_000.0, rms_eps: 1e-6,
-            group_size: 64, bits: 8,
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 8,
+            n_kv_heads: 2,
+            n_layers: 24,
+            vocab_size: 248320,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 8,
             weight_prefix: "language_model.model",
             partial_rotary_factor: 0.25,
             attn_output_gate: true,
             linear_attn_indices: linear_indices,
-            linear_n_heads: 16, linear_head_dim: 128, conv_kernel_size: 4,
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            conv_kernel_size: 4,
             thinking_model: false,
         }
+    }
+
+    /// Build `ModelConfig` by reading the model's `config.json` from disk.
+    ///
+    /// Supports both Qwen3 (pure transformer) and Qwen3.5 (hybrid GDN) models.
+    /// Falls back gracefully: if `config.json` is missing or unparseable,
+    /// returns `None` so callers can fall back to a preset.
+    pub fn from_config_json(model_dir: &Path) -> Option<Self> {
+        let config_path = model_dir.join("config.json");
+        let data = std::fs::read_to_string(&config_path).ok()?;
+        let root: serde_json::Value = serde_json::from_str(&data).ok()?;
+
+        // Qwen3.5 nests architecture under "text_config"; Qwen3 puts it at root.
+        let tc = root.get("text_config").unwrap_or(&root);
+
+        let model_type = root
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_qwen35 = model_type.starts_with("qwen3_5")
+            || model_type.starts_with("qwen3.5")
+            || root
+                .get("architectures")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .any(|v| v.as_str().map(|s| s.contains("Qwen3_5")).unwrap_or(false))
+                })
+                .unwrap_or(false);
+
+        let dim = tc.get("hidden_size")?.as_u64()? as usize;
+        let hidden_dim = tc.get("intermediate_size")?.as_u64()? as usize;
+        let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
+        let n_kv_heads = tc
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(n_heads as u64) as usize;
+        let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
+        let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
+        let head_dim = tc
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or((dim / n_heads) as u64) as usize;
+
+        // RoPE theta: try text_config.rope_parameters.rope_theta first,
+        // then text_config.rope_theta, then root.rope_theta
+        let rope_theta = tc
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()))
+            .or_else(|| root.get("rope_theta").and_then(|v| v.as_f64()))
+            .unwrap_or(1_000_000.0) as f32;
+
+        let rms_eps = tc
+            .get("rms_norm_eps")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-6) as f32;
+
+        // Quantization: check root.quantization or root.quantization_config
+        let quant = root
+            .get("quantization")
+            .or_else(|| root.get("quantization_config"));
+        let group_size = quant
+            .and_then(|q| q.get("group_size"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(64) as i32;
+        let bits = quant
+            .and_then(|q| q.get("bits"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(4) as i32;
+
+        // Qwen3.5 hybrid architecture
+        let partial_rotary_factor = if is_qwen35 {
+            tc.get("rope_parameters")
+                .and_then(|rp| rp.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+                .or_else(|| tc.get("partial_rotary_factor").and_then(|v| v.as_f64()))
+                .unwrap_or(0.25) as f32
+        } else {
+            1.0
+        };
+
+        let attn_output_gate = tc
+            .get("attn_output_gate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Linear attention layers (Qwen3.5 hybrid)
+        let layer_types: Vec<String> = tc
+            .get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let linear_attn_indices: Vec<usize> = layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention")
+            .map(|(i, _)| i)
+            .collect();
+
+        let linear_n_heads = tc
+            .get("linear_num_key_heads")
+            .or_else(|| tc.get("linear_num_value_heads"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_head_dim = tc
+            .get("linear_key_head_dim")
+            .or_else(|| tc.get("linear_value_head_dim"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let conv_kernel_size = tc
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let weight_prefix = if is_qwen35 {
+            "language_model.model"
+        } else {
+            "model"
+        };
+
+        // Detect thinking model: name-based heuristic (Thinking/thinking in dir name)
+        let dir_name = model_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let thinking_model = dir_name.contains("thinking");
+
+        tracing::info!(
+            model_type,
+            dim,
+            n_layers,
+            n_heads,
+            bits,
+            is_qwen35,
+            linear_layers = linear_attn_indices.len(),
+            "auto-detected model config from config.json"
+        );
+
+        Some(ModelConfig {
+            dim,
+            hidden_dim,
+            n_heads,
+            n_kv_heads,
+            n_layers,
+            vocab_size,
+            head_dim,
+            rope_theta,
+            rms_eps,
+            group_size,
+            bits,
+            weight_prefix,
+            partial_rotary_factor,
+            attn_output_gate,
+            linear_attn_indices,
+            linear_n_heads,
+            linear_head_dim,
+            conv_kernel_size,
+            thinking_model,
+        })
     }
 
     pub fn rope_dims(&self) -> i32 {
@@ -513,6 +766,38 @@ impl ModelConfig {
 
     pub fn is_linear_attn_layer(&self, idx: usize) -> bool {
         self.linear_attn_indices.contains(&idx)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KvCacheConfig {
+    pub bits: Option<i32>,
+    pub group_size: i32,
+    pub quantized_start: i32,
+}
+
+impl Default for KvCacheConfig {
+    fn default() -> Self {
+        let bits = std::env::var("NANOBOT_MLX_KV_BITS")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|bits| *bits > 0);
+        let group_size = std::env::var("NANOBOT_MLX_KV_GROUP_SIZE")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|group_size| *group_size > 0)
+            .unwrap_or(64);
+        let quantized_start = std::env::var("NANOBOT_MLX_KV_START")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|start| *start >= 0)
+            .unwrap_or(0);
+
+        KvCacheConfig {
+            bits,
+            group_size,
+            quantized_start,
+        }
     }
 }
 
@@ -535,6 +820,197 @@ pub struct MlxLoraAttention {
     pub attn_output_gate: bool,
 }
 
+fn dense_scaled_dot_product_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    offset: i32,
+    seq_len: i32,
+) -> Result<Array, Exception> {
+    use mlx_rs::fast::ScaledDotProductAttentionMask;
+
+    if let Some(mask) = mask {
+        let mask = mask.as_dtype(queries.dtype())?;
+        mlx_rs::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            ScaledDotProductAttentionMask::Array(&mask),
+        )
+    } else if offset == 0 {
+        mlx_rs::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            ScaledDotProductAttentionMask::Causal,
+        )
+    } else if seq_len == 1 {
+        mlx_rs::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            None::<ScaledDotProductAttentionMask<'_>>,
+        )
+    } else {
+        debug_assert!(
+            false,
+            "multi-token cached decode requires an explicit rectangular mask"
+        );
+        mlx_rs::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            ScaledDotProductAttentionMask::Causal,
+        )
+    }
+}
+
+fn quantized_scaled_dot_product_attention(
+    queries: &Array,
+    keys: &QuantizedArray,
+    values: &QuantizedArray,
+    scale: f32,
+    mask: Option<&Array>,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array, Exception> {
+    let shape = queries.shape();
+    let (batch, n_q_heads, seq_len, head_dim) = (shape[0], shape[1], shape[2], shape[3]);
+    let n_kv_heads = keys.packed.shape()[1];
+    let n_repeats = n_q_heads / n_kv_heads;
+
+    let queries = queries.multiply(array!(scale))?;
+    let (queries, keys, values) = if n_repeats > 1 {
+        (
+            queries.reshape(&[batch, n_kv_heads, n_repeats, seq_len, head_dim])?,
+            keys.expand_dims(-3)?,
+            values.expand_dims(-3)?,
+        )
+    } else {
+        (queries, keys.clone(), values.clone())
+    };
+
+    let mut scores = mlx_rs::ops::quantized_matmul(
+        &queries,
+        &keys.packed,
+        &keys.scales,
+        &keys.biases,
+        true,
+        group_size,
+        bits,
+    )?;
+
+    if let Some(mask) = mask {
+        if mask.dtype() == Dtype::Bool {
+            let fill = array!(f32::NEG_INFINITY).as_dtype(scores.dtype())?;
+            scores = mlx_rs::ops::r#where(mask, &scores, &fill)?;
+        } else {
+            let mask = mask.as_dtype(scores.dtype())?;
+            scores = scores.add(&mask)?;
+        }
+    }
+
+    let scores = mlx_rs::ops::softmax_axis(&scores, -1, true)?;
+    let mut out = mlx_rs::ops::quantized_matmul(
+        &scores,
+        &values.packed,
+        &values.scales,
+        &values.biases,
+        false,
+        group_size,
+        bits,
+    )?;
+
+    if n_repeats > 1 {
+        out = out.reshape(&[batch, n_q_heads, seq_len, head_dim])?;
+    }
+
+    Ok(out)
+}
+
+type CompiledPlainKvDecodeFn = dyn for<'a> FnMut(
+    &mut PlainKvCache,
+    (&'a Array, &'a Array, &'a Array),
+) -> Result<Array, Exception>;
+
+fn make_compiled_plain_kv_decode(attn_scale: f32) -> Box<CompiledPlainKvDecodeFn> {
+    Box::new(compile_with_state(
+        move |cache: &mut PlainKvCache, (q, k, v): (&Array, &Array, &Array)| {
+            compiled_plain_kv_decode_step(cache, q, k, v, attn_scale)
+        },
+        true,
+    ))
+}
+
+fn compiled_plain_kv_decode_step(
+    cache: &mut PlainKvCache,
+    queries: &Array,
+    new_keys: &Array,
+    new_values: &Array,
+    attn_scale: f32,
+) -> Result<Array, Exception> {
+    let storage_keys = cache
+        .keys
+        .as_ref()
+        .ok_or_else(|| Exception::custom("compiled decode requires initialized KV keys"))?;
+    let storage_values = cache
+        .values
+        .as_ref()
+        .ok_or_else(|| Exception::custom("compiled decode requires initialized KV values"))?;
+    let len = cache
+        .len_array
+        .as_ref()
+        .ok_or_else(|| Exception::custom("compiled decode requires initialized KV length state"))?;
+    let positions = cache.positions.as_ref().ok_or_else(|| {
+        Exception::custom("compiled decode requires initialized KV position state")
+    })?;
+
+    let index = len.reshape(&[1, 1, 1, 1])?.as_dtype(Dtype::Int32)?;
+    let index = mlx_rs::ops::broadcast_to(&index, new_keys.shape())?;
+    let keys = put_along_axis(storage_keys, &index, new_keys, 2)?;
+    let values = put_along_axis(storage_values, &index, new_values, 2)?;
+
+    let next_len = len.add(&array!(1).as_dtype(Dtype::Int32)?)?;
+    let next_len = next_len.as_dtype(Dtype::Int32)?;
+    let active = positions.lt(&next_len.reshape(&[1, 1, 1, 1])?)?;
+    let zeros = array!(0.0).as_dtype(queries.dtype())?;
+    let neg_inf = array!(f32::NEG_INFINITY).as_dtype(queries.dtype())?;
+    let mask = mlx_rs::ops::r#where(&active, &zeros, &neg_inf)?;
+
+    // compile_with_state only persists arrays that are written back into the
+    // tracked state object. Keep KV storage and length in the cache so the
+    // next compiled step sees the updated prefix instead of the stale inputs.
+    *cache
+        .keys
+        .as_mut()
+        .ok_or_else(|| Exception::custom("compiled decode requires initialized KV keys"))? =
+        keys.clone();
+    *cache
+        .values
+        .as_mut()
+        .ok_or_else(|| Exception::custom("compiled decode requires initialized KV values"))? =
+        values.clone();
+    *cache.len_array.as_mut().ok_or_else(|| {
+        Exception::custom("compiled decode requires initialized KV length state")
+    })? = next_len.clone();
+
+    dense_scaled_dot_product_attention(
+        queries,
+        &keys,
+        &values,
+        attn_scale,
+        Some(&mask),
+        0,
+        queries.shape()[2],
+    )
+}
+
 impl MlxLoraAttention {
     pub fn load(
         weights: &mut HashMap<String, Array>,
@@ -550,17 +1026,23 @@ impl MlxLoraAttention {
         Ok(MlxLoraAttention {
             q_proj: LoraLinear::new(
                 load_quantized_linear(weights, &format!("{prefix}.q_proj"), gs, bits)?,
-                rank, scale,
-            ).map_err(|e| anyhow::anyhow!("LoRA q_proj: {e}"))?,
+                rank,
+                scale,
+            )
+            .map_err(|e| anyhow::anyhow!("LoRA q_proj: {e}"))?,
             k_proj: load_quantized_linear(weights, &format!("{prefix}.k_proj"), gs, bits)?,
             v_proj: LoraLinear::new(
                 load_quantized_linear(weights, &format!("{prefix}.v_proj"), gs, bits)?,
-                rank, scale,
-            ).map_err(|e| anyhow::anyhow!("LoRA v_proj: {e}"))?,
+                rank,
+                scale,
+            )
+            .map_err(|e| anyhow::anyhow!("LoRA v_proj: {e}"))?,
             o_proj: LoraLinear::new(
                 load_quantized_linear(weights, &format!("{prefix}.o_proj"), gs, bits)?,
-                rank, scale,
-            ).map_err(|e| anyhow::anyhow!("LoRA o_proj: {e}"))?,
+                rank,
+                scale,
+            )
+            .map_err(|e| anyhow::anyhow!("LoRA o_proj: {e}"))?,
             q_norm: load_rms_norm(weights, &format!("{prefix}.q_norm"), cfg.rms_eps)?,
             k_norm: load_rms_norm(weights, &format!("{prefix}.k_norm"), cfg.rms_eps)?,
             num_heads: cfg.n_heads as i32,
@@ -578,7 +1060,7 @@ impl MlxLoraAttention {
         let (batch, seq_len) = (shape[0], shape[1]);
 
         let q_raw = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
+        let k_raw = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         // When attn_output_gate is enabled, q_proj outputs [Q, gate] interleaved per-head.
@@ -590,7 +1072,19 @@ impl MlxLoraAttention {
             let gate = parts[1].reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
             (parts[0].clone(), Some(gate))
         } else {
-            (q_raw, None)
+            let q4d = q_raw.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
+            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
+            let q = if q_norm_size == self.head_dim {
+                self.q_norm.forward(&q4d)?
+            } else {
+                self.q_norm.forward(&q_raw)?.reshape(&[
+                    batch,
+                    seq_len,
+                    self.num_heads,
+                    self.head_dim,
+                ])?
+            };
+            (q, None)
         };
 
         // QK norm — when gated, q is already [B, S, H, D] from the per-head split
@@ -598,58 +1092,61 @@ impl MlxLoraAttention {
             // q is [B, S, H, D] — RMSNorm applies on last dim (head_dim), which matches weight shape
             self.q_norm.forward(&q)?
         } else {
-            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
-            if q_norm_size == self.head_dim {
-                let q = q.reshape(&[batch * seq_len * self.num_heads, self.head_dim])?;
-                let q = self.q_norm.forward(&q)?;
-                q.reshape(&[batch, seq_len, self.num_heads * self.head_dim])?
-            } else {
-                self.q_norm.forward(&q)?
-            }
+            q
         };
+        let k4d = k_raw.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
         let k_norm_size = self.k_norm.weight.shape()[0] as i32;
         let k = if k_norm_size == self.head_dim {
-            let k = k.reshape(&[batch * seq_len * self.num_kv_heads, self.head_dim])?;
-            let k = self.k_norm.forward(&k)?;
-            k.reshape(&[batch, seq_len, self.num_kv_heads * self.head_dim])?
+            self.k_norm.forward(&k4d)?
         } else {
-            self.k_norm.forward(&k)?
+            self.k_norm.forward(&k_raw)?.reshape(&[
+                batch,
+                seq_len,
+                self.num_kv_heads,
+                self.head_dim,
+            ])?
         };
 
         // Reshape to [B, S, H, D] — q may already be 4D if gated
         let q = if self.attn_output_gate {
             q // already [B, S, H, D]
         } else {
-            q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
+            q
         };
-        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+        let k = k;
         let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
 
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
-        let q = mlx_rs::fast::rope(&q, self.rope_dims, false, self.rope_base, 1.0, 0, None::<&Array>)?;
-        let k = mlx_rs::fast::rope(&k, self.rope_dims, false, self.rope_base, 1.0, 0, None::<&Array>)?;
+        let q = mlx_rs::fast::rope(
+            &q,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            0,
+            None::<&Array>,
+        )?;
+        let k = mlx_rs::fast::rope(
+            &k,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            0,
+            None::<&Array>,
+        )?;
 
-        // MLX SDPA handles GQA natively (num_heads != num_kv_heads) — no expansion needed
-        use mlx_rs::fast::ScaledDotProductAttentionMask;
-        let attn = if let Some(m) = mask {
-            let m = m.as_dtype(q.dtype())?;
-            mlx_rs::fast::scaled_dot_product_attention(
-                &q, &k, &v, self.attn_scale,
-                ScaledDotProductAttentionMask::Array(&m),
-            )?
-        } else {
-            mlx_rs::fast::scaled_dot_product_attention(
-                &q, &k, &v, self.attn_scale,
-                ScaledDotProductAttentionMask::Causal,
-            )?
-        };
+        let attn =
+            dense_scaled_dot_product_attention(&q, &k, &v, self.attn_scale, mask, 0, seq_len)?;
 
-        let mut attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
+        let mut attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ])?;
 
         if let Some(gate) = output_gate {
             attn = attn.multiply(&nn::sigmoid(&gate)?)?;
@@ -663,14 +1160,18 @@ impl MlxLoraAttention {
     /// `cache`: per-layer KV cache, updated in-place.
     /// `offset`: position offset for RoPE (= number of previously cached tokens).
     pub fn forward_with_cache(
-        &mut self, x: &Array, mask: Option<&Array>, cache: &mut KvCache,
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut KvCache,
+        compiled_plain_kv_decode: Option<&mut CompiledPlainKvDecodeFn>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
         let offset = cache.len();
 
         let q_raw = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
+        let k_raw = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         let (q, output_gate) = if self.attn_output_gate {
@@ -679,35 +1180,42 @@ impl MlxLoraAttention {
             let gate = parts[1].reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
             (parts[0].clone(), Some(gate))
         } else {
-            (q_raw, None)
+            let q4d = q_raw.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
+            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
+            let q = if q_norm_size == self.head_dim {
+                self.q_norm.forward(&q4d)?
+            } else {
+                self.q_norm.forward(&q_raw)?.reshape(&[
+                    batch,
+                    seq_len,
+                    self.num_heads,
+                    self.head_dim,
+                ])?
+            };
+            (q, None)
         };
 
         // QK norm
         let q = if self.attn_output_gate {
             self.q_norm.forward(&q)?
         } else {
-            let q_norm_size = self.q_norm.weight.shape()[0] as i32;
-            if q_norm_size == self.head_dim {
-                let q = q.reshape(&[batch * seq_len * self.num_heads, self.head_dim])?;
-                let q = self.q_norm.forward(&q)?;
-                q.reshape(&[batch, seq_len, self.num_heads * self.head_dim])?
-            } else {
-                self.q_norm.forward(&q)?
-            }
+            q
         };
+        let k4d = k_raw.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
         let k_norm_size = self.k_norm.weight.shape()[0] as i32;
         let k = if k_norm_size == self.head_dim {
-            let k = k.reshape(&[batch * seq_len * self.num_kv_heads, self.head_dim])?;
-            let k = self.k_norm.forward(&k)?;
-            k.reshape(&[batch, seq_len, self.num_kv_heads * self.head_dim])?
+            self.k_norm.forward(&k4d)?
         } else {
-            self.k_norm.forward(&k)?
+            self.k_norm.forward(&k_raw)?.reshape(&[
+                batch,
+                seq_len,
+                self.num_kv_heads,
+                self.head_dim,
+            ])?
         };
 
-        let q = if self.attn_output_gate { q } else {
-            q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?
-        };
-        let k = k.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
+        let q = if self.attn_output_gate { q } else { q };
+        let k = k;
         let v = v.reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?;
 
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
@@ -716,32 +1224,142 @@ impl MlxLoraAttention {
 
         // RoPE with position offset for cached positions
         let q = mlx_rs::fast::rope(
-            &q, self.rope_dims, false, self.rope_base, 1.0, offset, None::<&Array>,
+            &q,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            offset,
+            None::<&Array>,
         )?;
         let k = mlx_rs::fast::rope(
-            &k, self.rope_dims, false, self.rope_base, 1.0, offset, None::<&Array>,
+            &k,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            offset,
+            None::<&Array>,
         )?;
 
-        // Update cache: concatenate new K/V with cached
-        let (k, v) = cache.update(&k, &v)?;
-
-        use mlx_rs::fast::ScaledDotProductAttentionMask;
-        let attn = if let Some(m) = mask {
-            let m = m.as_dtype(q.dtype())?;
-            mlx_rs::fast::scaled_dot_product_attention(
-                &q, &k, &v, self.attn_scale,
-                ScaledDotProductAttentionMask::Array(&m),
-            )?
+        let attn = if seq_len == 1 && mask.is_none() {
+            if let Some(compiled) = compiled_plain_kv_decode {
+                if let KvCache::Plain(plain) = cache {
+                    if plain.compiled_decode_ready() {
+                        let attn = compiled(plain, (&q, &k, &v))?;
+                        plain.finish_compiled_decode_step(1)?;
+                        attn
+                    } else {
+                        let (keys, values) = plain.update(&k, &v)?;
+                        dense_scaled_dot_product_attention(
+                            &q,
+                            &keys,
+                            &values,
+                            self.attn_scale,
+                            None,
+                            offset,
+                            seq_len,
+                        )?
+                    }
+                } else {
+                    let kv_view = cache.update(&k, &v)?;
+                    match kv_view {
+                        KvCacheView::Plain { keys, values } => dense_scaled_dot_product_attention(
+                            &q,
+                            &keys,
+                            &values,
+                            self.attn_scale,
+                            None,
+                            offset,
+                            seq_len,
+                        )?,
+                        KvCacheView::Quantized(view) => quantized_scaled_dot_product_attention(
+                            &q,
+                            &view.keys,
+                            &view.values,
+                            self.attn_scale,
+                            None,
+                            view.group_size,
+                            view.bits,
+                        )?,
+                    }
+                }
+            } else {
+                let kv_view = cache.update(&k, &v)?;
+                match kv_view {
+                    KvCacheView::Plain { keys, values } => dense_scaled_dot_product_attention(
+                        &q,
+                        &keys,
+                        &values,
+                        self.attn_scale,
+                        None,
+                        offset,
+                        seq_len,
+                    )?,
+                    KvCacheView::Quantized(view) => quantized_scaled_dot_product_attention(
+                        &q,
+                        &view.keys,
+                        &view.values,
+                        self.attn_scale,
+                        None,
+                        view.group_size,
+                        view.bits,
+                    )?,
+                }
+            }
         } else {
-            mlx_rs::fast::scaled_dot_product_attention(
-                &q, &k, &v, self.attn_scale,
-                ScaledDotProductAttentionMask::Causal,
-            )?
+            let kv_view = cache.update(&k, &v)?;
+            match kv_view {
+                KvCacheView::Plain { keys, values } => dense_scaled_dot_product_attention(
+                    &q,
+                    &keys,
+                    &values,
+                    self.attn_scale,
+                    mask,
+                    offset,
+                    seq_len,
+                )?,
+                KvCacheView::Quantized(view) => {
+                    if offset == 0 {
+                        dense_scaled_dot_product_attention(
+                            &q,
+                            &k,
+                            &v,
+                            self.attn_scale,
+                            mask,
+                            offset,
+                            seq_len,
+                        )?
+                    } else {
+                        let resolved_mask = if let Some(mask) = mask {
+                            Some(mask.clone())
+                        } else if seq_len > 1 {
+                            Some(create_causal_mask_cached(
+                                seq_len,
+                                view.keys.packed.shape()[2],
+                            )?)
+                        } else {
+                            None
+                        };
+                        quantized_scaled_dot_product_attention(
+                            &q,
+                            &view.keys,
+                            &view.values,
+                            self.attn_scale,
+                            resolved_mask.as_ref(),
+                            view.group_size,
+                            view.bits,
+                        )?
+                    }
+                }
+            }
         };
 
-        let mut attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
+        let mut attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ])?;
 
         if let Some(gate) = output_gate {
             attn = attn.multiply(&nn::sigmoid(&gate)?)?;
@@ -753,9 +1371,12 @@ impl MlxLoraAttention {
 
 impl ModuleParameters for MlxLoraAttention {
     fn num_parameters(&self) -> usize {
-        self.q_proj.num_parameters() + self.k_proj.num_parameters()
-            + self.v_proj.num_parameters() + self.o_proj.num_parameters()
-            + self.q_norm.num_parameters() + self.k_norm.num_parameters()
+        self.q_proj.num_parameters()
+            + self.k_proj.num_parameters()
+            + self.v_proj.num_parameters()
+            + self.o_proj.num_parameters()
+            + self.q_norm.num_parameters()
+            + self.k_norm.num_parameters()
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -840,8 +1461,10 @@ impl MlxLoraMLP {
             up_proj: load_quantized_linear(weights, &format!("{prefix}.up_proj"), gs, bits)?,
             down_proj: LoraLinear::new(
                 load_quantized_linear(weights, &format!("{prefix}.down_proj"), gs, bits)?,
-                lora_cfg.rank, lora_cfg.scale(),
-            ).map_err(|e| anyhow::anyhow!("LoRA down_proj: {e}"))?,
+                lora_cfg.rank,
+                lora_cfg.scale(),
+            )
+            .map_err(|e| anyhow::anyhow!("LoRA down_proj: {e}"))?,
         })
     }
 
@@ -856,7 +1479,8 @@ impl MlxLoraMLP {
 
 impl ModuleParameters for MlxLoraMLP {
     fn num_parameters(&self) -> usize {
-        self.gate_proj.num_parameters() + self.up_proj.num_parameters()
+        self.gate_proj.num_parameters()
+            + self.up_proj.num_parameters()
             + self.down_proj.num_parameters()
     }
 
@@ -877,9 +1501,7 @@ impl ModuleParameters for MlxLoraMLP {
     }
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        nested_ref_from(vec![
-            ("down_proj", self.down_proj.trainable_parameters()),
-        ])
+        nested_ref_from(vec![("down_proj", self.down_proj.trainable_parameters())])
     }
 
     fn freeze_parameters(&mut self, r: bool) {
@@ -929,7 +1551,12 @@ impl MlxLinearAttention {
         let bits = cfg.bits;
 
         let mut attn = MlxLinearAttention {
-            in_proj_qkv: load_quantized_linear(weights, &format!("{prefix}.in_proj_qkv"), gs, bits)?,
+            in_proj_qkv: load_quantized_linear(
+                weights,
+                &format!("{prefix}.in_proj_qkv"),
+                gs,
+                bits,
+            )?,
             in_proj_a: load_quantized_linear(weights, &format!("{prefix}.in_proj_a"), gs, bits)?,
             in_proj_b: load_quantized_linear(weights, &format!("{prefix}.in_proj_b"), gs, bits)?,
             in_proj_z: load_quantized_linear(weights, &format!("{prefix}.in_proj_z"), gs, bits)?,
@@ -958,23 +1585,28 @@ impl MlxLinearAttention {
         let (batch, seq_len) = (shape[0], shape[1]);
         let h = self.n_heads;
         let d = self.head_dim;
-        let key_dim = h * d;  // 2048 for Qwen3.5-2B
+        let key_dim = h * d; // 2048 for Qwen3.5-2B
 
         // 1. Project QKV, alpha, beta, z
-        let qkv = self.in_proj_qkv.forward(x)?;     // [B, L, key_dim*2 + value_dim]
-        let a = self.in_proj_a.forward(x)?;           // [B, L, H]
-        let b = self.in_proj_b.forward(x)?;           // [B, L, H]
+        let qkv = self.in_proj_qkv.forward(x)?; // [B, L, key_dim*2 + value_dim]
+        let a = self.in_proj_a.forward(x)?; // [B, L, H]
+        let b = self.in_proj_b.forward(x)?; // [B, L, H]
 
         // 2. Causal depthwise conv1d on QKV
         //    Weight shape from safetensors: [conv_dim, kernel, 1] (depthwise: groups=conv_dim)
-        let conv_dim = qkv.shape()[2];  // key_dim*2 + value_dim
+        let conv_dim = qkv.shape()[2]; // key_dim*2 + value_dim
         let kernel = self.conv_kernel;
         // Left-pad for causal convolution (kernel-1 on left, 0 on right)
         let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
         let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
         // Depthwise conv1d: groups = conv_dim, weight [conv_dim, kernel, 1]
         let qkv_conv = mlx_rs::ops::conv1d(
-            &qkv_padded, &*self.conv1d_weight, None, None, None, conv_dim as i32,
+            &qkv_padded,
+            &*self.conv1d_weight,
+            None,
+            None,
+            None,
+            conv_dim as i32,
         )?;
         let qkv_conv = nn::silu(&qkv_conv)?;
 
@@ -989,20 +1621,20 @@ impl MlxLinearAttention {
         let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
         let q_flat = q.reshape(&[-1, d])?;
         let k_flat = k.reshape(&[-1, d])?;
-        let q_norm = mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?
-            .reshape(&[batch, seq_len, h, d])?;
-        let k_norm = mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?
-            .reshape(&[batch, seq_len, h, d])?;
+        let q_norm =
+            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
+        let k_norm =
+            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
         let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
         let k = k_norm.multiply(array!(inv_scale))?;
 
         // 5. Compute decay g and write gate beta
         //    g = exp(-exp(A_log) * softplus(a + dt_bias))
-        let a_plus_bias = a.add(&*self.dt_bias)?;           // [B, L, H]
+        let a_plus_bias = a.add(&*self.dt_bias)?; // [B, L, H]
         let sp = nn::softplus(&a_plus_bias)?;
         let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
-        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;  // [B, L, H]
-        let beta = nn::sigmoid(&b)?;                          // [B, L, H]
+        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?; // [B, L, H]
+        let beta = nn::sigmoid(&b)?; // [B, L, H]
 
         // 6. Gated delta recurrence
         //    State: [B, H, D_v, D_k] — we accumulate outer products
@@ -1011,18 +1643,18 @@ impl MlxLinearAttention {
 
         for t in 0..seq_len {
             // Slice [B, H] for this timestep
-            let g_t = g.index((.., t, ..));       // [B, H]
+            let g_t = g.index((.., t, ..)); // [B, H]
             let beta_t = beta.index((.., t, ..)); // [B, H]
-            let q_t = q.index((.., t, .., ..));   // [B, H, D]
-            let k_t = k.index((.., t, .., ..));   // [B, H, D]
-            let v_t = v.index((.., t, .., ..));   // [B, H, D]
+            let q_t = q.index((.., t, .., ..)); // [B, H, D]
+            let k_t = k.index((.., t, .., ..)); // [B, H, D]
+            let v_t = v.index((.., t, .., ..)); // [B, H, D]
 
             // state *= g (broadcast [B, H, 1, 1])
             let g_t = g_t.reshape(&[batch, h, 1, 1])?;
             state = state.multiply(&g_t)?;
 
             // kv_mem = (state * k[..., None, :]).sum(-1) → [B, H, D_v]
-            let k_expanded = k_t.expand_dims(-2)?;  // [B, H, 1, D_k]
+            let k_expanded = k_t.expand_dims(-2)?; // [B, H, 1, D_k]
             let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
 
             // delta = (v - kv_mem) * beta[..., None]
@@ -1030,23 +1662,28 @@ impl MlxLinearAttention {
             let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?; // [B, H, D_v]
 
             // state += k[..., None, :] * delta[..., :, None]  (outer product update)
-            let delta_expanded = delta.expand_dims(-1)?;   // [B, H, D_v, 1]
+            let delta_expanded = delta.expand_dims(-1)?; // [B, H, D_v, 1]
             state = state.add(&k_expanded.multiply(&delta_expanded)?)?;
 
             // y_t = (state * q[..., None, :]).sum(-1) → [B, H, D_v]
-            let q_expanded = q_t.expand_dims(-2)?;  // [B, H, 1, D_k]
+            let q_expanded = q_t.expand_dims(-2)?; // [B, H, 1, D_k]
             let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
             outputs.push(y_t);
         }
 
         // Stack: [B, H, D_v] * L → [B, L, H, D_v]
-        let y = mlx_rs::ops::stack_axis(&outputs, 1)?;  // [B, L, H, D]
+        let y = mlx_rs::ops::stack_axis(&outputs, 1)?; // [B, L, H, D]
 
         // 7. RMSNormGated: rms_norm(out) on last dim (D), then silu(z) * normed
         //    z is [B, L, H, D], norm weight is [D=128]
-        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h, d])?;
+        let z = self
+            .in_proj_z
+            .forward(x)?
+            .reshape(&[batch, seq_len, h, d])?;
         let y_flat = y.reshape(&[-1, d])?;
-        let y_normed = self.norm.forward(&y_flat)?
+        let y_normed = self
+            .norm
+            .forward(&y_flat)?
             .reshape(&[batch, seq_len, h, d])?;
         let y = nn::silu(&z)?.multiply(&y_normed)?;
         let y = y.reshape(&[batch, seq_len, h * d])?;
@@ -1058,7 +1695,11 @@ impl MlxLinearAttention {
     ///
     /// On prefill (seq_len > 1): runs full recurrence and stores final state + conv buffer.
     /// On decode (seq_len == 1): runs single-step update using cached state.
-    pub fn forward_with_cache(&mut self, x: &Array, cache: &mut GdnCache) -> Result<Array, Exception> {
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        cache: &mut GdnCache,
+    ) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
         let h = self.n_heads;
@@ -1079,7 +1720,7 @@ impl MlxLinearAttention {
             let buf = if let Some(ref cb) = cache.conv_buf {
                 // Append new input, drop oldest
                 let combined = mlx_rs::ops::concatenate_axis(&[cb, &qkv], 1)?; // [B, kernel, conv_dim]
-                // Keep last kernel-1 for next step
+                                                                               // Keep last kernel-1 for next step
                 let new_buf = combined.index((.., 1.., ..));
                 new_buf.eval()?;
                 cache.conv_buf = Some(new_buf);
@@ -1095,7 +1736,12 @@ impl MlxLinearAttention {
             };
             // buf is [B, kernel, conv_dim] — apply depthwise conv1d (no padding needed)
             let conv_out = mlx_rs::ops::conv1d(
-                &buf, &*self.conv1d_weight, None, None, None, conv_dim as i32,
+                &buf,
+                &*self.conv1d_weight,
+                None,
+                None,
+                None,
+                conv_dim as i32,
             )?;
             // conv1d output: [B, 1, conv_dim] (kernel input → 1 output)
             nn::silu(&conv_out)?
@@ -1104,7 +1750,12 @@ impl MlxLinearAttention {
             let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
             let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
             let qkv_conv = mlx_rs::ops::conv1d(
-                &qkv_padded, &*self.conv1d_weight, None, None, None, conv_dim as i32,
+                &qkv_padded,
+                &*self.conv1d_weight,
+                None,
+                None,
+                None,
+                conv_dim as i32,
             )?;
             // Save last kernel-1 inputs as conv buffer for future decode
             let start = seq_len - (kernel - 1);
@@ -1124,10 +1775,10 @@ impl MlxLinearAttention {
         let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
         let q_flat = q.reshape(&[-1, d])?;
         let k_flat = k.reshape(&[-1, d])?;
-        let q_norm = mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?
-            .reshape(&[batch, seq_len, h, d])?;
-        let k_norm = mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?
-            .reshape(&[batch, seq_len, h, d])?;
+        let q_norm =
+            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
+        let k_norm =
+            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
         let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
         let k = k_norm.multiply(array!(inv_scale))?;
 
@@ -1139,7 +1790,9 @@ impl MlxLinearAttention {
         let beta = nn::sigmoid(&b)?;
 
         // 5. Recurrence with state caching
-        let mut state = cache.state.take()
+        let mut state = cache
+            .state
+            .take()
             .unwrap_or_else(|| mlx_rs::ops::zeros::<f32>(&[batch, h, d, d]).unwrap());
         let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
 
@@ -1167,9 +1820,14 @@ impl MlxLinearAttention {
 
         // 6. Stack + RMSNormGated + out_proj
         let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
-        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h, d])?;
+        let z = self
+            .in_proj_z
+            .forward(x)?
+            .reshape(&[batch, seq_len, h, d])?;
         let y_flat = y.reshape(&[-1, d])?;
-        let y_normed = self.norm.forward(&y_flat)?
+        let y_normed = self
+            .norm
+            .forward(&y_flat)?
             .reshape(&[batch, seq_len, h, d])?;
         let y = nn::silu(&z)?.multiply(&y_normed)?;
         let y = y.reshape(&[batch, seq_len, h * d])?;
@@ -1180,9 +1838,13 @@ impl MlxLinearAttention {
 
 impl ModuleParameters for MlxLinearAttention {
     fn num_parameters(&self) -> usize {
-        self.in_proj_qkv.num_parameters() + self.in_proj_a.num_parameters()
-            + self.in_proj_b.num_parameters() + self.in_proj_z.num_parameters()
-            + self.out_proj.num_parameters() + self.norm.num_parameters() + 3
+        self.in_proj_qkv.num_parameters()
+            + self.in_proj_a.num_parameters()
+            + self.in_proj_b.num_parameters()
+            + self.in_proj_z.num_parameters()
+            + self.out_proj.num_parameters()
+            + self.norm.num_parameters()
+            + 3
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1221,8 +1883,12 @@ impl ModuleParameters for MlxLinearAttention {
     }
 
     fn unfreeze_parameters(&mut self, _r: bool) {}
-    fn all_frozen(&self) -> Option<bool> { Some(true) }
-    fn any_frozen(&self) -> Option<bool> { Some(true) }
+    fn all_frozen(&self) -> Option<bool> {
+        Some(true)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        Some(true)
+    }
 }
 
 // --- Decoder layer ---
@@ -1252,19 +1918,32 @@ impl MlxLoraDecoderLayer {
     ) -> Result<Self, anyhow::Error> {
         let attn = if cfg.is_linear_attn_layer(layer_idx) {
             AttentionKind::Linear(MlxLinearAttention::load(
-                weights, &format!("{prefix}.linear_attn"), cfg,
+                weights,
+                &format!("{prefix}.linear_attn"),
+                cfg,
             )?)
         } else {
             AttentionKind::Full(MlxLoraAttention::load(
-                weights, &format!("{prefix}.self_attn"), cfg, lora_cfg,
+                weights,
+                &format!("{prefix}.self_attn"),
+                cfg,
+                lora_cfg,
             )?)
         };
 
         Ok(MlxLoraDecoderLayer {
             attn,
             mlp: MlxLoraMLP::load(weights, &format!("{prefix}.mlp"), cfg, lora_cfg)?,
-            input_layernorm: load_rms_norm(weights, &format!("{prefix}.input_layernorm"), cfg.rms_eps)?,
-            post_attention_layernorm: load_rms_norm(weights, &format!("{prefix}.post_attention_layernorm"), cfg.rms_eps)?,
+            input_layernorm: load_rms_norm(
+                weights,
+                &format!("{prefix}.input_layernorm"),
+                cfg.rms_eps,
+            )?,
+            post_attention_layernorm: load_rms_norm(
+                weights,
+                &format!("{prefix}.post_attention_layernorm"),
+                cfg.rms_eps,
+            )?,
         })
     }
 
@@ -1279,12 +1958,7 @@ impl MlxLoraDecoderLayer {
 
     /// Apply LoRA weight arrays to a specific target in this layer.
     /// Returns true if applied, false if the target doesn't exist (e.g. attention on GDN layer).
-    pub fn apply_lora_weights(
-        &mut self,
-        target: &str,
-        new_a: Array,
-        new_b: Array,
-    ) -> bool {
+    pub fn apply_lora_weights(&mut self, target: &str, new_a: Array, new_b: Array) -> bool {
         match target {
             "q_proj" | "v_proj" | "o_proj" => {
                 let attn = match &mut self.attn {
@@ -1319,9 +1993,7 @@ impl MlxLoraDecoderLayer {
         let h = self.input_layernorm.forward(x)?;
         let h = match &mut self.attn {
             AttentionKind::Full(attn) => attn.forward(&h, mask)?,
-            AttentionKind::Linear(attn) => {
-                mlx_rs::stop_gradient(&attn.forward(&h)?)?
-            },
+            AttentionKind::Linear(attn) => mlx_rs::stop_gradient(&attn.forward(&h)?)?,
         };
         let x = h.add(residual)?;
 
@@ -1333,21 +2005,23 @@ impl MlxLoraDecoderLayer {
 
     /// Forward with layer cache for incremental generation.
     pub fn forward_with_cache(
-        &mut self, x: &Array, mask: Option<&Array>, cache: Option<&mut LayerCache>,
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        compiled_plain_kv_decode: Option<&mut CompiledPlainKvDecodeFn>,
     ) -> Result<Array, Exception> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = match (&mut self.attn, cache) {
             (AttentionKind::Full(attn), Some(LayerCache::FullAttn(c))) => {
-                attn.forward_with_cache(&h, mask, c)?
-            },
+                attn.forward_with_cache(&h, mask, c, compiled_plain_kv_decode)?
+            }
             (AttentionKind::Linear(attn), Some(LayerCache::LinearAttn(c))) => {
                 mlx_rs::stop_gradient(&attn.forward_with_cache(&h, c)?)?
-            },
+            }
             (AttentionKind::Full(attn), _) => attn.forward(&h, mask)?,
-            (AttentionKind::Linear(attn), _) => {
-                mlx_rs::stop_gradient(&attn.forward(&h)?)?
-            },
+            (AttentionKind::Linear(attn), _) => mlx_rs::stop_gradient(&attn.forward(&h)?)?,
         };
         let x = h.add(residual)?;
 
@@ -1364,8 +2038,10 @@ impl ModuleParameters for MlxLoraDecoderLayer {
             AttentionKind::Full(a) => a.num_parameters(),
             AttentionKind::Linear(a) => a.num_parameters(),
         };
-        attn_params + self.mlp.num_parameters()
-            + self.input_layernorm.num_parameters() + self.post_attention_layernorm.num_parameters()
+        attn_params
+            + self.mlp.num_parameters()
+            + self.input_layernorm.num_parameters()
+            + self.post_attention_layernorm.num_parameters()
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1377,7 +2053,10 @@ impl ModuleParameters for MlxLoraDecoderLayer {
             attn_key,
             ("mlp", self.mlp.parameters()),
             ("input_layernorm", self.input_layernorm.parameters()),
-            ("post_attention_layernorm", self.post_attention_layernorm.parameters()),
+            (
+                "post_attention_layernorm",
+                self.post_attention_layernorm.parameters(),
+            ),
         ])
     }
 
@@ -1390,14 +2069,15 @@ impl ModuleParameters for MlxLoraDecoderLayer {
             attn_key,
             ("mlp", self.mlp.parameters_mut()),
             ("input_layernorm", self.input_layernorm.parameters_mut()),
-            ("post_attention_layernorm", self.post_attention_layernorm.parameters_mut()),
+            (
+                "post_attention_layernorm",
+                self.post_attention_layernorm.parameters_mut(),
+            ),
         ])
     }
 
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        let mut entries = vec![
-            ("mlp", self.mlp.trainable_parameters()),
-        ];
+        let mut entries = vec![("mlp", self.mlp.trainable_parameters())];
         if let AttentionKind::Full(a) = &self.attn {
             entries.push(("self_attn", a.trainable_parameters()));
         }
@@ -1443,6 +2123,7 @@ pub struct MlxLoraModel {
     pub norm: RmsNorm,
     /// None = tied to embed_tokens (use QuantizedEmbedding::as_linear)
     pub lm_head: Option<QuantizedLinear>,
+    pub kv_cache_config: KvCacheConfig,
 }
 
 impl MlxLoraModel {
@@ -1454,24 +2135,46 @@ impl MlxLoraModel {
         tracing::info!(path = %model_dir.display(), "loading MLX weights");
         let t0 = std::time::Instant::now();
         let mut weights = load_weights(model_dir)?;
-        tracing::info!(tensors = weights.len(), ms = t0.elapsed().as_millis(), "weights loaded");
+        tracing::info!(
+            tensors = weights.len(),
+            ms = t0.elapsed().as_millis(),
+            "weights loaded"
+        );
 
         let pfx = cfg.weight_prefix;
 
-        let embed_tokens = load_embedding(&mut weights, &format!("{pfx}.embed_tokens"), cfg.group_size, cfg.bits)?;
+        let embed_tokens = load_embedding(
+            &mut weights,
+            &format!("{pfx}.embed_tokens"),
+            cfg.group_size,
+            cfg.bits,
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             layers.push(MlxLoraDecoderLayer::load(
-                &mut weights, &format!("{pfx}.layers.{i}"), i, cfg, lora_cfg,
+                &mut weights,
+                &format!("{pfx}.layers.{i}"),
+                i,
+                cfg,
+                lora_cfg,
             )?);
         }
 
         let norm = load_rms_norm(&mut weights, &format!("{pfx}.norm"), cfg.rms_eps)?;
 
-        let lm_head_key = if pfx == "model" { "lm_head" } else { "language_model.lm_head" };
+        let lm_head_key = if pfx == "model" {
+            "lm_head"
+        } else {
+            "language_model.lm_head"
+        };
         let lm_head = if weights.contains_key(&format!("{lm_head_key}.weight")) {
-            Some(load_quantized_linear(&mut weights, lm_head_key, cfg.group_size, cfg.bits)?)
+            Some(load_quantized_linear(
+                &mut weights,
+                lm_head_key,
+                cfg.group_size,
+                cfg.bits,
+            )?)
         } else {
             None // tied to embed_tokens
         };
@@ -1479,7 +2182,180 @@ impl MlxLoraModel {
         // Filter out vision_tower weights (not needed for text LoRA)
         weights.retain(|k, _| !k.starts_with("vision_tower"));
 
-        Ok(MlxLoraModel { embed_tokens, layers, norm, lm_head })
+        Ok(MlxLoraModel {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            kv_cache_config: KvCacheConfig::default(),
+        })
+    }
+
+    fn build_layer_caches(&self, capacity: i32) -> Vec<LayerCache> {
+        self.layers
+            .iter()
+            .map(|l| {
+                if l.is_full_attention() {
+                    if let Some(bits) = self.kv_cache_config.bits {
+                        if self.kv_cache_config.quantized_start > 0 {
+                            LayerCache::FullAttn(KvCache::new_promotable(
+                                capacity,
+                                self.kv_cache_config.group_size,
+                                bits,
+                                self.kv_cache_config.quantized_start,
+                            ))
+                        } else {
+                            LayerCache::FullAttn(KvCache::new_quantized(
+                                capacity,
+                                self.kv_cache_config.group_size,
+                                bits,
+                            ))
+                        }
+                    } else {
+                        LayerCache::FullAttn(KvCache::new(capacity))
+                    }
+                } else {
+                    LayerCache::LinearAttn(GdnCache::new())
+                }
+            })
+            .collect()
+    }
+
+    pub fn prefill(
+        &mut self,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+    ) -> Result<PrefillState, Exception> {
+        let capacity = (prompt_tokens.len().saturating_add(max_tokens)) as i32;
+        let mut caches = self.build_layer_caches(capacity);
+        let input = Array::from_slice(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+        let logits = self.forward_logits_cached(&input, &mut caches)?;
+        let last_logits = logits.index((.., -1, ..));
+        last_logits.eval()?;
+        Ok(PrefillState {
+            caches,
+            last_logits,
+            prompt_len: prompt_tokens.len(),
+        })
+    }
+
+    pub fn ensure_prefill_capacity(
+        &mut self,
+        state: &mut PrefillState,
+        max_tokens: usize,
+    ) -> Result<(), Exception> {
+        let required_capacity = (state.prompt_len.saturating_add(max_tokens)) as i32;
+        for cache in &mut state.caches {
+            if let LayerCache::FullAttn(kv) = cache {
+                kv.reserve(required_capacity)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn generate_from_prefill(
+        &mut self,
+        state: PrefillState,
+        max_tokens: usize,
+        temperature: f32,
+        stop_tokens: &[i32],
+    ) -> Result<Vec<i32>, Exception> {
+        self.decode_from_prefill(state, max_tokens, temperature, stop_tokens, |_| true)
+    }
+
+    pub fn generate_stream_from_prefill<F>(
+        &mut self,
+        state: PrefillState,
+        max_tokens: usize,
+        temperature: f32,
+        stop_tokens: &[i32],
+        on_token: F,
+    ) -> Result<Vec<i32>, Exception>
+    where
+        F: FnMut(i32) -> bool,
+    {
+        self.decode_from_prefill(state, max_tokens, temperature, stop_tokens, on_token)
+    }
+
+    fn decode_from_prefill<F>(
+        &mut self,
+        mut state: PrefillState,
+        max_tokens: usize,
+        temperature: f32,
+        stop_tokens: &[i32],
+        mut on_token: F,
+    ) -> Result<Vec<i32>, Exception>
+    where
+        F: FnMut(i32) -> bool,
+    {
+        self.ensure_prefill_capacity(&mut state, max_tokens)?;
+        let compiled_decode = compiled_decode_enabled();
+        if compiled_decode {
+            for cache in &mut state.caches {
+                if let LayerCache::FullAttn(KvCache::Plain(kv)) = cache {
+                    kv.prepare_compiled_decode_state()?;
+                }
+            }
+        }
+        let mut caches = state.caches;
+        let mut generated = Vec::with_capacity(max_tokens);
+        if max_tokens == 0 {
+            return Ok(generated);
+        }
+
+        let first_full_attn_scale = self.layers.iter().find_map(|layer| match &layer.attn {
+            AttentionKind::Full(attn) => Some(attn.attn_scale),
+            AttentionKind::Linear(_) => None,
+        });
+        let mut compiled_plain_kv_decode = if compiled_decode && first_full_attn_scale.is_some() {
+            Some(make_compiled_plain_kv_decode(
+                first_full_attn_scale.unwrap(),
+            ))
+        } else {
+            None
+        };
+
+        let mut current_token = sample_next_token(&state.last_logits, temperature)?;
+
+        for step in 0..max_tokens {
+            let next_token = if step + 1 < max_tokens {
+                let input = current_token.reshape(&[1, 1])?;
+                let logits = self.forward_logits_cached_with_compiled(
+                    &input,
+                    &mut caches,
+                    &mut compiled_plain_kv_decode,
+                )?;
+                let last_logits = logits.index((.., -1, ..));
+                let token = sample_next_token(&last_logits, temperature)?;
+                async_eval([&token])?;
+                Some(token)
+            } else {
+                None
+            };
+
+            let token_id: i32 = current_token.as_slice::<i32>()[0];
+
+            if stop_tokens.contains(&token_id) {
+                break;
+            }
+
+            generated.push(token_id);
+            if !on_token(token_id) {
+                break;
+            }
+
+            if let Some(token) = next_token {
+                current_token = token;
+            } else {
+                break;
+            }
+
+            if step > 0 && step % 256 == 0 {
+                clear_cache();
+            }
+        }
+
+        Ok(generated)
     }
 
     /// Autoregressive text generation with KV cache.
@@ -1493,51 +2369,8 @@ impl MlxLoraModel {
         temperature: f32,
         stop_tokens: &[i32],
     ) -> Result<Vec<i32>, Exception> {
-        let mut caches: Vec<LayerCache> = self.layers.iter().map(|l| {
-            if l.is_full_attention() {
-                LayerCache::FullAttn(KvCache::new())
-            } else {
-                LayerCache::LinearAttn(GdnCache::new())
-            }
-        }).collect();
-
-        let mut generated = Vec::with_capacity(max_tokens);
-
-        // --- Prefill: process entire prompt, populate KV caches ---
-        let input = Array::from_slice(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits = self.forward_logits_cached(&input, &mut caches)?;
-        let mut last_logits = logits.index((.., -1, ..));
-        // Eval prefill logits to materialize the graph before decode loop
-        last_logits.eval()?;
-
-        for _ in 0..max_tokens {
-            let next_token = if temperature <= 0.0 || temperature < 1e-6 {
-                mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)?
-            } else {
-                let scaled = last_logits.multiply(array!(1.0 / temperature))?;
-                mlx_rs::random::categorical(&scaled, None, None, None)?
-            };
-
-            let next_token = next_token.as_dtype(mlx_rs::Dtype::Int32)?;
-            // eval to materialize before reading value
-            next_token.eval()?;
-            let token_id: i32 = next_token.as_slice::<i32>()[0];
-
-            if stop_tokens.contains(&token_id) {
-                break;
-            }
-
-            generated.push(token_id);
-
-            // --- Decode: single token forward with cached KV ---
-            let input = Array::from_slice(&[token_id], &[1, 1]);
-            let logits = self.forward_logits_cached(&input, &mut caches)?;
-            last_logits = logits.index((.., -1, ..));
-            // Eval decode logits to prevent unbounded graph growth
-            last_logits.eval()?;
-        }
-
-        Ok(generated)
+        let state = self.prefill(prompt_tokens, max_tokens)?;
+        self.generate_from_prefill(state, max_tokens, temperature, stop_tokens)
     }
 
     /// Forward pass with layer caches for incremental generation.
@@ -1546,18 +2379,43 @@ impl MlxLoraModel {
         tokens: &Array,
         caches: &mut [LayerCache],
     ) -> Result<Array, Exception> {
+        self.forward_logits_cached_with_compiled(tokens, caches, &mut None)
+    }
+
+    fn forward_logits_cached_with_compiled(
+        &mut self,
+        tokens: &Array,
+        caches: &mut [LayerCache],
+        compiled_plain_kv_decode: &mut Option<Box<CompiledPlainKvDecodeFn>>,
+    ) -> Result<Array, Exception> {
         let q_len = tokens.shape()[1] as i32;
         let mut h = self.embed_tokens.forward(tokens)?;
 
         // Determine total KV length from first full-attention cache that has data
-        let kv_len = caches.iter().find_map(|c| {
-            if let LayerCache::FullAttn(kv) = c { Some(kv.len() + q_len) } else { None }
-        }).unwrap_or(q_len);
+        let kv_len = caches
+            .iter()
+            .find_map(|c| {
+                if let LayerCache::FullAttn(kv) = c {
+                    Some(kv.len() + q_len)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(q_len);
 
-        let mask = create_causal_mask_cached(q_len, kv_len)?;
+        let mask = if needs_explicit_cached_mask(q_len, kv_len) {
+            Some(create_causal_mask_cached(q_len, kv_len)?)
+        } else {
+            None
+        };
 
         for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
-            h = layer.forward_with_cache(&h, Some(&mask), Some(cache))?;
+            h = layer.forward_with_cache(
+                &h,
+                mask.as_ref(),
+                Some(cache),
+                compiled_plain_kv_decode.as_deref_mut(),
+            )?;
         }
 
         h = self.norm.forward(&h)?;
@@ -1582,7 +2440,8 @@ impl MlxLoraModel {
     ) -> Result<String, anyhow::Error> {
         let prompt_tokens = tokenizer.encode(prompt)?;
         let eos = tokenizer.eos_token_id().unwrap_or(248046) as i32;
-        let generated = self.generate(&prompt_tokens, max_tokens, temperature, &[eos])
+        let generated = self
+            .generate(&prompt_tokens, max_tokens, temperature, &[eos])
             .map_err(|e| anyhow::anyhow!("Generation failed: {e}"))?;
         tokenizer.decode(&generated)
     }
@@ -1614,14 +2473,21 @@ impl MlxLoraModel {
 impl ModuleParameters for MlxLoraModel {
     fn num_parameters(&self) -> usize {
         self.embed_tokens.num_parameters()
-            + self.layers.iter().map(|l| l.num_parameters()).sum::<usize>()
+            + self
+                .layers
+                .iter()
+                .map(|l| l.num_parameters())
+                .sum::<usize>()
             + self.norm.num_parameters()
             + self.lm_head.as_ref().map_or(0, |l| l.num_parameters())
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut map = NestedHashMap::new();
-        map.insert(Rc::from("embed_tokens"), self.embed_tokens.parameters().into());
+        map.insert(
+            Rc::from("embed_tokens"),
+            self.embed_tokens.parameters().into(),
+        );
         let mut layers_entries = HashMap::new();
         for (i, l) in self.layers.iter().enumerate() {
             layers_entries.insert(Rc::from(i.to_string().as_str()), l.parameters().into());
@@ -1636,7 +2502,10 @@ impl ModuleParameters for MlxLoraModel {
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut map = NestedHashMap::new();
-        map.insert(Rc::from("embed_tokens"), self.embed_tokens.parameters_mut().into());
+        map.insert(
+            Rc::from("embed_tokens"),
+            self.embed_tokens.parameters_mut().into(),
+        );
         let mut layers_entries = HashMap::new();
         for (i, l) in self.layers.iter_mut().enumerate() {
             layers_entries.insert(Rc::from(i.to_string().as_str()), l.parameters_mut().into());
@@ -1653,7 +2522,10 @@ impl ModuleParameters for MlxLoraModel {
         let mut map = NestedHashMap::new();
         let mut layers_entries = HashMap::new();
         for (i, l) in self.layers.iter().enumerate() {
-            layers_entries.insert(Rc::from(i.to_string().as_str()), l.trainable_parameters().into());
+            layers_entries.insert(
+                Rc::from(i.to_string().as_str()),
+                l.trainable_parameters().into(),
+            );
         }
         map.insert(Rc::from("layers"), NestedValue::Map(layers_entries));
         map
@@ -1661,13 +2533,19 @@ impl ModuleParameters for MlxLoraModel {
 
     fn freeze_parameters(&mut self, r: bool) {
         self.embed_tokens.freeze_parameters(r);
-        for l in &mut self.layers { l.freeze_parameters(r); }
+        for l in &mut self.layers {
+            l.freeze_parameters(r);
+        }
         self.norm.freeze_parameters(r);
-        if let Some(lm) = &mut self.lm_head { lm.freeze_parameters(r); }
+        if let Some(lm) = &mut self.lm_head {
+            lm.freeze_parameters(r);
+        }
     }
 
     fn unfreeze_parameters(&mut self, r: bool) {
-        for l in &mut self.layers { l.unfreeze_parameters(r); }
+        for l in &mut self.layers {
+            l.unfreeze_parameters(r);
+        }
     }
 
     fn all_frozen(&self) -> Option<bool> {
@@ -1685,11 +2563,13 @@ impl ModuleParameters for MlxLoraModel {
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
     let data: Vec<f32> = (0..seq_len)
-        .flat_map(|i| {
-            (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY })
-        })
+        .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::NEG_INFINITY }))
         .collect();
     Ok(Array::from_slice(&data, &[1, 1, seq_len, seq_len]))
+}
+
+fn needs_explicit_cached_mask(q_len: i32, kv_len: i32) -> bool {
+    q_len > 1 && q_len != kv_len
 }
 
 /// Create a causal mask for cached generation.
@@ -1706,7 +2586,13 @@ fn create_causal_mask_cached(q_len: i32, kv_len: i32) -> Result<Array, Exception
     let offset = kv_len - q_len;
     let data: Vec<f32> = (0..q_len)
         .flat_map(|i| {
-            (0..kv_len).map(move |j| if j <= offset + i { 0.0 } else { f32::NEG_INFINITY })
+            (0..kv_len).map(move |j| {
+                if j <= offset + i {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
         })
         .collect();
     Ok(Array::from_slice(&data, &[1, 1, q_len, kv_len]))
@@ -1717,7 +2603,7 @@ fn create_causal_mask_cached(q_len: i32, kv_len: i32) -> Result<Array, Exception
 // ---------------------------------------------------------------------------
 
 /// Per-layer cache: KV for full attention, GDN state for linear attention.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum LayerCache {
     /// Full attention: cached K/V tensors.
     FullAttn(KvCache),
@@ -1725,20 +2611,68 @@ pub enum LayerCache {
     LinearAttn(GdnCache),
 }
 
-/// Per-layer KV cache for incremental generation.
-///
-/// Stores cached key/value tensors in `[B, n_kv_heads, seq, head_dim]` layout.
-/// On each step, new K/V are concatenated with the cache.
-#[derive(Debug)]
-pub struct KvCache {
+#[derive(Clone, Debug)]
+pub enum KvCacheView {
+    Plain { keys: Array, values: Array },
+    Quantized(QuantizedKvView),
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizedKvView {
+    pub keys: QuantizedArray,
+    pub values: QuantizedArray,
+    pub group_size: i32,
+    pub bits: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizedArray {
+    pub packed: Array,
+    pub scales: Array,
+    pub biases: Array,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuantizedKvPromotionConfig {
+    group_size: i32,
+    bits: i32,
+    start: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlainKvCache {
     pub keys: Option<Array>,
     pub values: Option<Array>,
+    len: i32,
+    capacity: i32,
+    pending_updates: usize,
+    promotion: Option<QuantizedKvPromotionConfig>,
+    len_array: Option<Array>,
+    positions: Option<Array>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizedKvCache {
+    pub keys: Option<QuantizedArray>,
+    pub values: Option<QuantizedArray>,
+    len: i32,
+    capacity: i32,
+    pending_updates: usize,
+    group_size: i32,
+    bits: i32,
+}
+
+/// Per-layer KV cache for incremental generation.
+#[derive(Clone, Debug)]
+pub enum KvCache {
+    Plain(PlainKvCache),
+    Quantized(QuantizedKvCache),
 }
 
 /// GDN (Gated Delta Net) recurrent state for incremental generation.
 ///
 /// Stores the recurrent state matrix and conv1d circular buffer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GdnCache {
     /// Recurrent state: `[B, H, D_v, D_k]`
     pub state: Option<Array>,
@@ -1746,41 +2680,706 @@ pub struct GdnCache {
     pub conv_buf: Option<Array>,
 }
 
-impl KvCache {
-    pub fn new() -> Self {
-        KvCache { keys: None, values: None }
+fn quantized_layout_dims(
+    head_dim: i32,
+    group_size: i32,
+    bits: i32,
+) -> Result<(i32, i32), Exception> {
+    if !(bits == 2 || bits == 4 || bits == 8) {
+        return Err(Exception::custom(format!(
+            "unsupported quantized KV bit-width {bits}; expected 2, 4, or 8"
+        )));
+    }
+    let el_per_int = 32 / bits;
+    if head_dim % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "head_dim {head_dim} must be divisible by KV group_size {group_size}"
+        )));
+    }
+    if head_dim % el_per_int != 0 {
+        return Err(Exception::custom(format!(
+            "head_dim {head_dim} must be divisible by packed width {el_per_int}"
+        )));
+    }
+    Ok((head_dim / el_per_int, head_dim / group_size))
+}
+
+impl QuantizedArray {
+    fn zeros_storage(
+        batch: i32,
+        heads: i32,
+        seq: i32,
+        head_dim: i32,
+        value_dtype: Dtype,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, Exception> {
+        let (packed_dim, scale_dim) = quantized_layout_dims(head_dim, group_size, bits)?;
+        Ok(QuantizedArray {
+            packed: mlx_rs::ops::zeros_dtype(&[batch, heads, seq, packed_dim], Dtype::Uint32)?,
+            scales: mlx_rs::ops::zeros_dtype(&[batch, heads, seq, scale_dim], value_dtype)?,
+            biases: mlx_rs::ops::zeros_dtype(&[batch, heads, seq, scale_dim], value_dtype)?,
+        })
     }
 
-    /// Append new keys/values to the cache and return the full K/V.
-    ///
-    /// Input shapes: `[B, n_kv_heads, new_seq, head_dim]`
-    /// Output shapes: `[B, n_kv_heads, total_seq, head_dim]`
-    pub fn update(&mut self, new_keys: &Array, new_values: &Array) -> Result<(Array, Array), Exception> {
-        let (k, v) = if let (Some(ref ck), Some(ref cv)) = (&self.keys, &self.values) {
-            let k = mlx_rs::ops::concatenate_axis(&[ck, new_keys], 2)?;
-            let v = mlx_rs::ops::concatenate_axis(&[cv, new_values], 2)?;
-            (k, v)
-        } else {
-            (new_keys.clone(), new_values.clone())
-        };
-        // Force evaluation to prevent MLX lazy graph from growing unboundedly.
-        k.eval()?;
-        v.eval()?;
-        self.keys = Some(k.clone());
-        self.values = Some(v.clone());
-        Ok((k, v))
+    fn from_dense(dense: &Array, group_size: i32, bits: i32) -> Result<Self, Exception> {
+        let shape = dense.shape();
+        if shape.len() != 4 {
+            return Err(Exception::custom(format!(
+                "quantized KV expects a 4D tensor, got shape {:?}",
+                shape
+            )));
+        }
+
+        let (batch, heads, seq, head_dim) = (shape[0], shape[1], shape[2], shape[3]);
+        let (packed_dim, scale_dim) = quantized_layout_dims(head_dim, group_size, bits)?;
+        let flat = dense.reshape(&[-1, head_dim])?;
+        let (packed, scales, biases) = mlx_rs::ops::quantize(&flat, group_size, bits)?;
+
+        Ok(QuantizedArray {
+            packed: packed.reshape(&[batch, heads, seq, packed_dim])?,
+            scales: scales.reshape(&[batch, heads, seq, scale_dim])?,
+            biases: biases.reshape(&[batch, heads, seq, scale_dim])?,
+        })
     }
 
-    /// Current number of cached tokens.
+    fn with_capacity(&self, capacity: i32) -> Result<Self, Exception> {
+        let packed_shape = self.packed.shape();
+        let scale_shape = self.scales.shape();
+        Ok(QuantizedArray {
+            packed: mlx_rs::ops::zeros_dtype(
+                &[packed_shape[0], packed_shape[1], capacity, packed_shape[3]],
+                self.packed.dtype(),
+            )?,
+            scales: mlx_rs::ops::zeros_dtype(
+                &[scale_shape[0], scale_shape[1], capacity, scale_shape[3]],
+                self.scales.dtype(),
+            )?,
+            biases: mlx_rs::ops::zeros_dtype(
+                &[scale_shape[0], scale_shape[1], capacity, scale_shape[3]],
+                self.biases.dtype(),
+            )?,
+        })
+    }
+
+    fn view_prefix(&self, len: i32) -> Self {
+        QuantizedArray {
+            packed: self.packed.index((.., .., ..len, ..)),
+            scales: self.scales.index((.., .., ..len, ..)),
+            biases: self.biases.index((.., .., ..len, ..)),
+        }
+    }
+
+    fn expand_dims(&self, axis: i32) -> Result<Self, Exception> {
+        Ok(QuantizedArray {
+            packed: self.packed.expand_dims(axis)?,
+            scales: self.scales.expand_dims(axis)?,
+            biases: self.biases.expand_dims(axis)?,
+        })
+    }
+
+    fn write_range(&mut self, start: i32, end: i32, src: &QuantizedArray) -> Result<(), Exception> {
+        self.packed
+            .try_index_mut((.., .., start..end, ..), &src.packed)?;
+        self.scales
+            .try_index_mut((.., .., start..end, ..), &src.scales)?;
+        self.biases
+            .try_index_mut((.., .., start..end, ..), &src.biases)?;
+        Ok(())
+    }
+
+    fn copy_prefix_to(&self, dst: &mut QuantizedArray, len: i32) -> Result<(), Exception> {
+        let packed = self.packed.index((.., .., ..len, ..));
+        let scales = self.scales.index((.., .., ..len, ..));
+        let biases = self.biases.index((.., .., ..len, ..));
+        dst.packed.try_index_mut((.., .., ..len, ..), &packed)?;
+        dst.scales.try_index_mut((.., .., ..len, ..), &scales)?;
+        dst.biases.try_index_mut((.., .., ..len, ..), &biases)?;
+        Ok(())
+    }
+
+    fn eval_all(&self) -> Result<(), Exception> {
+        eval([&self.packed, &self.scales, &self.biases])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn dequantize(&self, group_size: i32, bits: i32) -> Result<Array, Exception> {
+        let packed_shape = self.packed.shape();
+        let rows = packed_shape[0] * packed_shape[1] * packed_shape[2];
+        let head_dim = self.scales.shape()[3] * group_size;
+        let packed = self.packed.reshape(&[rows, packed_shape[3]])?;
+        let scales = self.scales.reshape(&[rows, self.scales.shape()[3]])?;
+        let biases = self.biases.reshape(&[rows, self.biases.shape()[3]])?;
+        let dense = mlx_rs::ops::dequantize(&packed, &scales, &biases, group_size, bits)?;
+        dense.reshape(&[packed_shape[0], packed_shape[1], packed_shape[2], head_dim])
+    }
+}
+
+impl PlainKvCache {
+    pub fn new(capacity: i32) -> Self {
+        Self::new_with_promotion(capacity, None)
+    }
+
+    pub fn new_promotable(capacity: i32, group_size: i32, bits: i32, start: i32) -> Self {
+        Self::new_with_promotion(
+            capacity,
+            Some(QuantizedKvPromotionConfig {
+                group_size,
+                bits,
+                start,
+            }),
+        )
+    }
+
+    fn new_with_promotion(capacity: i32, promotion: Option<QuantizedKvPromotionConfig>) -> Self {
+        PlainKvCache {
+            keys: None,
+            values: None,
+            len: 0,
+            capacity: capacity.max(1),
+            pending_updates: 0,
+            promotion,
+            len_array: None,
+            positions: None,
+        }
+    }
+
+    fn sync_len_array(&mut self) -> Result<(), Exception> {
+        if let Some(len_array) = self.len_array.as_mut() {
+            *len_array = Array::from_int(self.len).as_dtype(Dtype::Int32)?;
+            len_array.eval()?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_positions(&mut self) -> Result<(), Exception> {
+        if self.positions.is_some() {
+            let positions = Array::arange::<_, i32>(0, self.capacity, None)?.reshape(&[
+                1,
+                1,
+                1,
+                self.capacity,
+            ])?;
+            positions.eval()?;
+            self.positions = Some(positions);
+        }
+        Ok(())
+    }
+
+    fn prepare_compiled_forward_state(&mut self) -> Result<(), Exception> {
+        if self.keys.is_none() || self.values.is_none() || self.promotion.is_some() {
+            return Ok(());
+        }
+        if self.len_array.is_none() {
+            self.len_array = Some(Array::from_int(self.len).as_dtype(Dtype::Int32)?);
+        }
+        if let Some(len_array) = self.len_array.as_ref() {
+            len_array.eval()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_compiled_decode_state(&mut self) -> Result<(), Exception> {
+        self.prepare_compiled_forward_state()?;
+        if self.positions.is_none() {
+            self.positions = Some(Array::arange::<_, i32>(0, self.capacity, None)?.reshape(&[
+                1,
+                1,
+                1,
+                self.capacity,
+            ])?);
+        }
+        if let Some(positions) = self.positions.as_ref() {
+            positions.eval()?;
+        }
+        Ok(())
+    }
+
+    fn compiled_decode_ready(&self) -> bool {
+        self.keys.is_some()
+            && self.values.is_some()
+            && self.promotion.is_none()
+            && self.len_array.is_some()
+            && self.positions.is_some()
+    }
+
+    fn finish_compiled_decode_step(&mut self, added: i32) -> Result<(), Exception> {
+        let next_len = self.len + added;
+        if next_len > self.capacity {
+            return Err(Exception::custom(format!(
+                "compiled KV cache overflow: need {next_len} slots, capacity {}",
+                self.capacity
+            )));
+        }
+        self.len += added;
+        self.pending_updates = 0;
+        Ok(())
+    }
+
+    fn ensure_storage(&mut self, new_keys: &Array, new_values: &Array) -> Result<(), Exception> {
+        if self.keys.is_some() && self.values.is_some() {
+            return Ok(());
+        }
+
+        let shape = new_keys.shape();
+        let alloc_len = self.capacity.max(shape[2]);
+        let alloc_shape = [shape[0], shape[1], alloc_len, shape[3]];
+        let keys = mlx_rs::ops::zeros_dtype(&alloc_shape, new_keys.dtype())?;
+        let values = mlx_rs::ops::zeros_dtype(&alloc_shape, new_values.dtype())?;
+        eval([&keys, &values])?;
+
+        self.capacity = alloc_len;
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.rebuild_positions()?;
+        self.sync_len_array()?;
+        Ok(())
+    }
+
+    pub fn reserve(&mut self, required_capacity: i32) -> Result<(), Exception> {
+        if required_capacity <= self.capacity {
+            return Ok(());
+        }
+        self.capacity = required_capacity.max(1);
+        if self.len == 0 {
+            self.keys = None;
+            self.values = None;
+            return Ok(());
+        }
+
+        let old_keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache keys missing during reserve"))?;
+        let old_values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache values missing during reserve"))?;
+        let old_shape = old_keys.shape();
+        let alloc_shape = [old_shape[0], old_shape[1], self.capacity, old_shape[3]];
+
+        let mut keys = mlx_rs::ops::zeros_dtype(&alloc_shape, old_keys.dtype())?;
+        let mut values = mlx_rs::ops::zeros_dtype(&alloc_shape, old_values.dtype())?;
+        let active_keys = old_keys.index((.., .., ..self.len, ..));
+        let active_values = old_values.index((.., .., ..self.len, ..));
+        keys.try_index_mut((.., .., ..self.len, ..), &active_keys)?;
+        values.try_index_mut((.., .., ..self.len, ..), &active_values)?;
+        eval([&keys, &values])?;
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.pending_updates = 0;
+        self.rebuild_positions()?;
+        self.sync_len_array()?;
+        Ok(())
+    }
+
+    fn current_views(&self) -> Result<(Array, Array), Exception> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache keys not initialized"))?;
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache values not initialized"))?;
+        Ok((
+            keys.index((.., .., ..self.len, ..)),
+            values.index((.., .., ..self.len, ..)),
+        ))
+    }
+
+    pub fn update(
+        &mut self,
+        new_keys: &Array,
+        new_values: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        self.ensure_storage(new_keys, new_values)?;
+
+        let new_seq = new_keys.shape()[2];
+        let next_len = self.len + new_seq;
+        if next_len > self.capacity {
+            return Err(Exception::custom(format!(
+                "KV cache overflow: need {next_len} slots, capacity {}",
+                self.capacity
+            )));
+        }
+
+        {
+            let keys = self
+                .keys
+                .as_mut()
+                .ok_or_else(|| Exception::custom("KV cache keys not allocated"))?;
+            keys.try_index_mut((.., .., self.len..next_len, ..), new_keys)?;
+        }
+        {
+            let values = self
+                .values
+                .as_mut()
+                .ok_or_else(|| Exception::custom("KV cache values not allocated"))?;
+            values.try_index_mut((.., .., self.len..next_len, ..), new_values)?;
+        }
+
+        self.len = next_len;
+        self.pending_updates += 1;
+        let should_materialize =
+            new_seq > 1 || self.pending_updates >= KV_CACHE_MATERIALIZE_INTERVAL;
+        if should_materialize {
+            let keys = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("KV cache keys missing during eval"))?;
+            let values = self
+                .values
+                .as_ref()
+                .ok_or_else(|| Exception::custom("KV cache values missing during eval"))?;
+            eval([keys, values])?;
+            self.pending_updates = 0;
+        }
+        self.sync_len_array()?;
+
+        self.current_views()
+    }
+
     pub fn len(&self) -> i32 {
-        self.keys.as_ref().map(|k| k.shape()[2]).unwrap_or(0)
+        self.len
+    }
+
+    fn promotion_config(&self) -> Option<QuantizedKvPromotionConfig> {
+        self.promotion
+            .filter(|promotion| self.len >= promotion.start)
+    }
+
+    fn to_quantized(&self, group_size: i32, bits: i32) -> Result<QuantizedKvCache, Exception> {
+        let mut quantized = QuantizedKvCache::new(self.capacity, group_size, bits);
+        if self.len == 0 {
+            return Ok(quantized);
+        }
+
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache keys missing during promotion"))?
+            .index((.., .., ..self.len, ..));
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("KV cache values missing during promotion"))?
+            .index((.., .., ..self.len, ..));
+
+        quantized.ensure_storage(&keys, &values)?;
+        let q_keys = QuantizedArray::from_dense(&keys, group_size, bits)?;
+        let q_values = QuantizedArray::from_dense(&values, group_size, bits)?;
+        {
+            let storage = quantized.keys.as_mut().ok_or_else(|| {
+                Exception::custom("quantized KV cache keys not allocated during promotion")
+            })?;
+            storage.write_range(0, self.len, &q_keys)?;
+        }
+        {
+            let storage = quantized.values.as_mut().ok_or_else(|| {
+                Exception::custom("quantized KV cache values not allocated during promotion")
+            })?;
+            storage.write_range(0, self.len, &q_values)?;
+        }
+        quantized.len = self.len;
+        if let Some(keys) = quantized.keys.as_ref() {
+            keys.eval_all()?;
+        }
+        if let Some(values) = quantized.values.as_ref() {
+            values.eval_all()?;
+        }
+        Ok(quantized)
+    }
+}
+
+impl Updatable for PlainKvCache {
+    fn updatable_states_len(&self) -> usize {
+        usize::from(self.keys.is_some())
+            + usize::from(self.values.is_some())
+            + usize::from(self.len_array.is_some())
+            + usize::from(self.positions.is_some())
+    }
+
+    fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+        let mut states = Vec::with_capacity(self.updatable_states_len());
+        if let Some(keys) = self.keys.as_ref() {
+            states.push(keys);
+        }
+        if let Some(values) = self.values.as_ref() {
+            states.push(values);
+        }
+        if let Some(len_array) = self.len_array.as_ref() {
+            states.push(len_array);
+        }
+        if let Some(positions) = self.positions.as_ref() {
+            states.push(positions);
+        }
+        states
+    }
+
+    fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+        let mut states = Vec::with_capacity(self.updatable_states_len());
+        if let Some(keys) = self.keys.as_mut() {
+            states.push(keys);
+        }
+        if let Some(values) = self.values.as_mut() {
+            states.push(values);
+        }
+        if let Some(len_array) = self.len_array.as_mut() {
+            states.push(len_array);
+        }
+        if let Some(positions) = self.positions.as_mut() {
+            states.push(positions);
+        }
+        states
+    }
+}
+
+impl QuantizedKvCache {
+    pub fn new(capacity: i32, group_size: i32, bits: i32) -> Self {
+        QuantizedKvCache {
+            keys: None,
+            values: None,
+            len: 0,
+            capacity: capacity.max(1),
+            pending_updates: 0,
+            group_size,
+            bits,
+        }
+    }
+
+    fn ensure_storage(&mut self, new_keys: &Array, new_values: &Array) -> Result<(), Exception> {
+        if self.keys.is_some() && self.values.is_some() {
+            return Ok(());
+        }
+
+        let shape = new_keys.shape();
+        let alloc_len = self.capacity.max(shape[2]);
+        let keys = QuantizedArray::zeros_storage(
+            shape[0],
+            shape[1],
+            alloc_len,
+            shape[3],
+            new_keys.dtype(),
+            self.group_size,
+            self.bits,
+        )?;
+        let values = QuantizedArray::zeros_storage(
+            shape[0],
+            shape[1],
+            alloc_len,
+            new_values.shape()[3],
+            new_values.dtype(),
+            self.group_size,
+            self.bits,
+        )?;
+        keys.eval_all()?;
+        values.eval_all()?;
+
+        self.capacity = alloc_len;
+        self.keys = Some(keys);
+        self.values = Some(values);
+        Ok(())
+    }
+
+    pub fn reserve(&mut self, required_capacity: i32) -> Result<(), Exception> {
+        if required_capacity <= self.capacity {
+            return Ok(());
+        }
+        self.capacity = required_capacity.max(1);
+        if self.len == 0 {
+            self.keys = None;
+            self.values = None;
+            return Ok(());
+        }
+
+        let old_keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized KV cache keys missing during reserve"))?;
+        let old_values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized KV cache values missing during reserve"))?;
+        let mut keys = old_keys.with_capacity(self.capacity)?;
+        let mut values = old_values.with_capacity(self.capacity)?;
+        old_keys.copy_prefix_to(&mut keys, self.len)?;
+        old_values.copy_prefix_to(&mut values, self.len)?;
+        keys.eval_all()?;
+        values.eval_all()?;
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.pending_updates = 0;
+        Ok(())
+    }
+
+    fn current_views(&self) -> Result<QuantizedKvView, Exception> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized KV cache keys not initialized"))?;
+        let values = self
+            .values
+            .as_ref()
+            .ok_or_else(|| Exception::custom("quantized KV cache values not initialized"))?;
+        Ok(QuantizedKvView {
+            keys: keys.view_prefix(self.len),
+            values: values.view_prefix(self.len),
+            group_size: self.group_size,
+            bits: self.bits,
+        })
+    }
+
+    pub fn update(
+        &mut self,
+        new_keys: &Array,
+        new_values: &Array,
+    ) -> Result<QuantizedKvView, Exception> {
+        self.ensure_storage(new_keys, new_values)?;
+
+        let new_seq = new_keys.shape()[2];
+        let next_len = self.len + new_seq;
+        if next_len > self.capacity {
+            return Err(Exception::custom(format!(
+                "quantized KV cache overflow: need {next_len} slots, capacity {}",
+                self.capacity
+            )));
+        }
+
+        let q_keys = QuantizedArray::from_dense(new_keys, self.group_size, self.bits)?;
+        let q_values = QuantizedArray::from_dense(new_values, self.group_size, self.bits)?;
+
+        {
+            let keys = self
+                .keys
+                .as_mut()
+                .ok_or_else(|| Exception::custom("quantized KV cache keys not allocated"))?;
+            keys.write_range(self.len, next_len, &q_keys)?;
+        }
+        {
+            let values = self
+                .values
+                .as_mut()
+                .ok_or_else(|| Exception::custom("quantized KV cache values not allocated"))?;
+            values.write_range(self.len, next_len, &q_values)?;
+        }
+
+        self.len = next_len;
+        self.pending_updates += 1;
+        let should_materialize =
+            new_seq > 1 || self.pending_updates >= KV_CACHE_MATERIALIZE_INTERVAL;
+        if should_materialize {
+            let keys = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("quantized KV cache keys missing during eval"))?;
+            let values = self.values.as_ref().ok_or_else(|| {
+                Exception::custom("quantized KV cache values missing during eval")
+            })?;
+            keys.eval_all()?;
+            values.eval_all()?;
+            self.pending_updates = 0;
+        }
+
+        self.current_views()
+    }
+
+    pub fn len(&self) -> i32 {
+        self.len
+    }
+}
+
+impl KvCache {
+    pub fn new(capacity: i32) -> Self {
+        KvCache::Plain(PlainKvCache::new(capacity))
+    }
+
+    pub fn new_promotable(capacity: i32, group_size: i32, bits: i32, start: i32) -> Self {
+        KvCache::Plain(PlainKvCache::new_promotable(
+            capacity, group_size, bits, start,
+        ))
+    }
+
+    pub fn new_quantized(capacity: i32, group_size: i32, bits: i32) -> Self {
+        KvCache::Quantized(QuantizedKvCache::new(capacity, group_size, bits))
+    }
+
+    pub fn reserve(&mut self, required_capacity: i32) -> Result<(), Exception> {
+        match self {
+            KvCache::Plain(cache) => cache.reserve(required_capacity),
+            KvCache::Quantized(cache) => cache.reserve(required_capacity),
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        new_keys: &Array,
+        new_values: &Array,
+    ) -> Result<KvCacheView, Exception> {
+        match self {
+            KvCache::Plain(cache) => {
+                let (keys, values, promoted) = {
+                    let (keys, values) = cache.update(new_keys, new_values)?;
+                    let promoted = if let Some(promotion) = cache.promotion_config() {
+                        Some(cache.to_quantized(promotion.group_size, promotion.bits)?)
+                    } else {
+                        None
+                    };
+                    (keys, values, promoted)
+                };
+
+                if let Some(quantized) = promoted {
+                    let view = quantized.current_views()?;
+                    *self = KvCache::Quantized(quantized);
+                    Ok(KvCacheView::Quantized(view))
+                } else {
+                    Ok(KvCacheView::Plain { keys, values })
+                }
+            }
+            KvCache::Quantized(cache) => {
+                Ok(KvCacheView::Quantized(cache.update(new_keys, new_values)?))
+            }
+        }
+    }
+
+    pub fn len(&self) -> i32 {
+        match self {
+            KvCache::Plain(cache) => cache.len(),
+            KvCache::Quantized(cache) => cache.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_quantized(&self) -> bool {
+        matches!(self, KvCache::Quantized(_))
     }
 }
 
 impl GdnCache {
     pub fn new() -> Self {
-        GdnCache { state: None, conv_buf: None }
+        GdnCache {
+            state: None,
+            conv_buf: None,
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefillState {
+    pub caches: Vec<LayerCache>,
+    pub last_logits: Array,
+    pub prompt_len: usize,
+}
+
+fn sample_next_token(logits: &Array, temperature: f32) -> Result<Array, Exception> {
+    let token = if temperature <= 0.0 || temperature < 1e-6 {
+        mlx_rs::ops::indexing::argmax_axis(logits, -1, false)?
+    } else {
+        let scaled = logits.multiply(array!(1.0 / temperature))?;
+        mlx_rs::random::categorical(&scaled, None, None, None)?
+    };
+    token.as_dtype(mlx_rs::Dtype::Int32)
 }
 
 // ---------------------------------------------------------------------------
@@ -1825,16 +3424,18 @@ pub fn train_step(
 
     let mut vg = nn::value_and_grad(loss_fn);
 
-    let (loss, grads) = vg(model, (tokens, targets))
-        .map_err(|e| anyhow::anyhow!("value_and_grad: {e}"))?;
+    let (loss, grads) =
+        vg(model, (tokens, targets)).map_err(|e| anyhow::anyhow!("value_and_grad: {e}"))?;
 
     let (clipped, total_norm) = mlx_rs::optimizers::clip_grad_norm(&grads, grad_clip)
         .map_err(|e| anyhow::anyhow!("clip_grad_norm: {e}"))?;
 
     // Skip optimizer update if gradient is NaN (prevents permanent weight corruption).
     if total_norm.is_finite() {
-        let owned_grads: HashMap<Rc<str>, Array> =
-            clipped.into_iter().map(|(k, v)| (k, v.into_owned())).collect();
+        let owned_grads: HashMap<Rc<str>, Array> = clipped
+            .into_iter()
+            .map(|(k, v)| (k, v.into_owned()))
+            .collect();
 
         optimizer
             .update(model, &owned_grads)
@@ -1847,8 +3448,7 @@ pub fn train_step(
     let params = model.parameters().flatten();
     let mut eval_targets: Vec<&Array> = vec![&loss];
     eval_targets.extend(params.values());
-    mlx_rs::transforms::eval(eval_targets.into_iter())
-        .map_err(|e| anyhow::anyhow!("eval: {e}"))?;
+    mlx_rs::transforms::eval(eval_targets.into_iter()).map_err(|e| anyhow::anyhow!("eval: {e}"))?;
 
     let loss_val: f32 = loss.as_slice::<f32>()[0];
     Ok((loss_val, total_norm))
@@ -1866,7 +3466,16 @@ pub fn train_loop(
     early_stop_loss: f32,
     patience: usize,
 ) -> Result<Vec<f32>, anyhow::Error> {
-    train_loop_with_callback(model, tokens_list, targets_list, config, max_steps, early_stop_loss, patience, None)
+    train_loop_with_callback(
+        model,
+        tokens_list,
+        targets_list,
+        config,
+        max_steps,
+        early_stop_loss,
+        patience,
+        None,
+    )
 }
 
 pub fn train_loop_with_callback(
@@ -1892,13 +3501,21 @@ pub fn train_loop_with_callback(
         let t0 = std::time::Instant::now();
 
         let (loss, grad_norm) = train_step(
-            model, &mut optimizer,
-            &tokens_list[idx], &targets_list[idx],
+            model,
+            &mut optimizer,
+            &tokens_list[idx],
+            &targets_list[idx],
             config.grad_clip,
         )?;
 
         let ms = t0.elapsed().as_millis();
-        tracing::debug!(step, loss = format!("{loss:.4}"), grad_norm = format!("{grad_norm:.4}"), ms, "train step");
+        tracing::debug!(
+            step,
+            loss = format!("{loss:.4}"),
+            grad_norm = format!("{grad_norm:.4}"),
+            ms,
+            "train step"
+        );
         losses.push(loss);
 
         if let Some(ref mut cb) = on_step {
@@ -1913,7 +3530,11 @@ pub fn train_loop_with_callback(
         }
 
         if loss < early_stop_loss {
-            tracing::info!(loss = format!("{loss:.4}"), threshold = format!("{early_stop_loss:.4}"), "early stop: loss below threshold");
+            tracing::info!(
+                loss = format!("{loss:.4}"),
+                threshold = format!("{early_stop_loss:.4}"),
+                "early stop: loss below threshold"
+            );
             break;
         }
 
@@ -1973,8 +3594,12 @@ pub fn export_adapters(
 
     let n_params = prefixed.len();
     let safetensors_path = output_dir.join("adapters.safetensors");
-    Array::save_safetensors(prefixed.iter().map(|(k, v)| (k.as_str(), *v)), None, &safetensors_path)
-        .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
+    Array::save_safetensors(
+        prefixed.iter().map(|(k, v)| (k.as_str(), *v)),
+        None,
+        &safetensors_path,
+    )
+    .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
 
     // Count LoRA layers (layers that have at least one trainable param)
     let lora_layers = (0..model_config.n_layers)
@@ -2007,6 +3632,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_from_config_json_qwen3() {
+        // Auto-detect from Qwen3-4B config.json if available
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/lmstudio-community/Qwen3-4B-Thinking-2507-MLX-4bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3-4B not found, skipping from_config_json test");
+            return;
+        }
+        let cfg = ModelConfig::from_config_json(&model_dir).expect("should parse config.json");
+        assert_eq!(cfg.dim, 2560);
+        assert_eq!(cfg.hidden_dim, 9728);
+        assert_eq!(cfg.n_heads, 32);
+        assert_eq!(cfg.n_kv_heads, 8);
+        assert_eq!(cfg.n_layers, 36);
+        assert_eq!(cfg.vocab_size, 151936);
+        assert_eq!(cfg.bits, 4);
+        assert!(cfg.linear_attn_indices.is_empty(), "Qwen3 has no linear attention");
+        assert_eq!(cfg.weight_prefix, "model");
+        assert!(cfg.thinking_model, "name contains 'Thinking'");
+    }
+
+    #[test]
+    fn test_from_config_json_qwen3_5() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B not found, skipping from_config_json test");
+            return;
+        }
+        let cfg = ModelConfig::from_config_json(&model_dir).expect("should parse config.json");
+        assert_eq!(cfg.dim, 2048);
+        assert_eq!(cfg.n_layers, 24);
+        assert_eq!(cfg.bits, 8);
+        assert_eq!(cfg.weight_prefix, "language_model.model");
+        assert!(cfg.attn_output_gate);
+        assert_eq!(cfg.linear_attn_indices.len(), 18, "18 of 24 layers are linear");
+        assert_eq!(cfg.linear_n_heads, 16);
+        assert_eq!(cfg.conv_kernel_size, 4);
+    }
+
+    #[test]
     fn test_causal_mask() {
         let mask = create_causal_mask(3).unwrap();
         assert_eq!(mask.shape(), &[1, 1, 3, 3]);
@@ -2016,6 +3682,340 @@ mod tests {
         assert_eq!(data[3], 0.0);
         assert_eq!(data[4], 0.0);
         assert!(data[5].is_infinite());
+    }
+
+    #[test]
+    fn test_kv_cache_preallocated_append() {
+        let mut cache = KvCache::new(4);
+        let keys1 = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]);
+        let values1 = Array::from_slice(&[10.0f32, 20.0], &[1, 1, 2, 1]);
+        let (k1, v1) = match cache.update(&keys1, &values1).unwrap() {
+            KvCacheView::Plain { keys, values } => (keys, values),
+            KvCacheView::Quantized(_) => panic!("expected plain KV cache"),
+        };
+        k1.eval().unwrap();
+        v1.eval().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(k1.shape(), &[1, 1, 2, 1]);
+        assert_eq!(v1.shape(), &[1, 1, 2, 1]);
+        assert_eq!(k1.as_slice::<f32>(), &[1.0, 2.0]);
+        assert_eq!(v1.as_slice::<f32>(), &[10.0, 20.0]);
+
+        let keys2 = Array::from_slice(&[3.0f32], &[1, 1, 1, 1]);
+        let values2 = Array::from_slice(&[30.0f32], &[1, 1, 1, 1]);
+        let (k2, v2) = match cache.update(&keys2, &values2).unwrap() {
+            KvCacheView::Plain { keys, values } => (keys, values),
+            KvCacheView::Quantized(_) => panic!("expected plain KV cache"),
+        };
+        k2.eval().unwrap();
+        v2.eval().unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(k2.shape(), &[1, 1, 3, 1]);
+        assert_eq!(v2.shape(), &[1, 1, 3, 1]);
+        assert_eq!(k2.as_slice::<f32>(), &[1.0, 2.0, 3.0]);
+        assert_eq!(v2.as_slice::<f32>(), &[10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_preallocated_append_round_trip() {
+        let mut cache = KvCache::new_quantized(4, 64, 8);
+        let keys1: Vec<f32> = (0..128).map(|i| i as f32 / 32.0).collect();
+        let values1: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) / 24.0).collect();
+        let keys1 = Array::from_slice(&keys1, &[1, 1, 2, 64]);
+        let values1 = Array::from_slice(&values1, &[1, 1, 2, 64]);
+
+        let view = match cache.update(&keys1, &values1).unwrap() {
+            KvCacheView::Quantized(view) => view,
+            KvCacheView::Plain { .. } => panic!("expected quantized KV cache"),
+        };
+
+        let dense_keys = view.keys.dequantize(view.group_size, view.bits).unwrap();
+        let dense_values = view.values.dequantize(view.group_size, view.bits).unwrap();
+        assert_eq!(dense_keys.shape(), &[1, 1, 2, 64]);
+        assert_eq!(dense_values.shape(), &[1, 1, 2, 64]);
+
+        let key_diff = dense_keys
+            .subtract(&keys1)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let value_diff = dense_values
+            .subtract(&values1)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            key_diff < 0.05,
+            "quantized key max diff too large: {key_diff}"
+        );
+        assert!(
+            value_diff < 0.05,
+            "quantized value max diff too large: {value_diff}"
+        );
+
+        let keys2: Vec<f32> = (0..64).map(|i| (i as f32 + 7.0) / 19.0).collect();
+        let values2: Vec<f32> = (0..64).map(|i| (32.0 - i as f32) / 11.0).collect();
+        let keys2 = Array::from_slice(&keys2, &[1, 1, 1, 64]);
+        let values2 = Array::from_slice(&values2, &[1, 1, 1, 64]);
+        let view = match cache.update(&keys2, &values2).unwrap() {
+            KvCacheView::Quantized(view) => view,
+            KvCacheView::Plain { .. } => panic!("expected quantized KV cache"),
+        };
+        let dense_keys = view.keys.dequantize(view.group_size, view.bits).unwrap();
+        let dense_values = view.values.dequantize(view.group_size, view.bits).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(dense_keys.shape(), &[1, 1, 3, 64]);
+        assert_eq!(dense_values.shape(), &[1, 1, 3, 64]);
+    }
+
+    #[test]
+    fn test_kv_cache_promotes_to_quantized_after_threshold() {
+        let mut cache = KvCache::new_promotable(6, 64, 8, 3);
+
+        let keys1: Vec<f32> = (0..128).map(|i| i as f32 / 41.0).collect();
+        let values1: Vec<f32> = (0..128).map(|i| (i as f32 - 23.0) / 17.0).collect();
+        let keys1 = Array::from_slice(&keys1, &[1, 1, 2, 64]);
+        let values1 = Array::from_slice(&values1, &[1, 1, 2, 64]);
+        let view1 = cache.update(&keys1, &values1).unwrap();
+        assert!(matches!(view1, KvCacheView::Plain { .. }));
+        assert!(!cache.is_quantized());
+
+        let keys2: Vec<f32> = (0..64).map(|i| (i as f32 + 5.0) / 13.0).collect();
+        let values2: Vec<f32> = (0..64).map(|i| (31.0 - i as f32) / 9.0).collect();
+        let keys2 = Array::from_slice(&keys2, &[1, 1, 1, 64]);
+        let values2 = Array::from_slice(&values2, &[1, 1, 1, 64]);
+        let view2 = cache.update(&keys2, &values2).unwrap();
+        let view2 = match view2 {
+            KvCacheView::Quantized(view) => view,
+            KvCacheView::Plain { .. } => panic!("expected promotion to quantized cache"),
+        };
+        assert!(cache.is_quantized());
+        assert_eq!(cache.len(), 3);
+
+        let dense_keys = view2.keys.dequantize(view2.group_size, view2.bits).unwrap();
+        let dense_values = view2
+            .values
+            .dequantize(view2.group_size, view2.bits)
+            .unwrap();
+        assert_eq!(dense_keys.shape(), &[1, 1, 3, 64]);
+        assert_eq!(dense_values.shape(), &[1, 1, 3, 64]);
+    }
+
+    #[test]
+    fn test_compiled_plain_kv_decode_matches_dense_step() {
+        let mut regular = PlainKvCache::new(6);
+        let mut compiled = PlainKvCache::new(6);
+
+        let init_keys: Vec<f32> = (0..128).map(|i| (i as f32 - 32.0) / 29.0).collect();
+        let init_values: Vec<f32> = (0..128).map(|i| (i as f32 + 11.0) / 23.0).collect();
+        let init_keys = Array::from_slice(&init_keys, &[1, 1, 2, 64]);
+        let init_values = Array::from_slice(&init_values, &[1, 1, 2, 64]);
+        regular.update(&init_keys, &init_values).unwrap();
+        compiled.update(&init_keys, &init_values).unwrap();
+        compiled.prepare_compiled_decode_state().unwrap();
+
+        let queries: Vec<f32> = (0..64).map(|i| ((i % 17) as f32 - 8.0) / 13.0).collect();
+        let new_keys: Vec<f32> = (0..64).map(|i| ((i % 19) as f32 - 9.0) / 11.0).collect();
+        let new_values: Vec<f32> = (0..64).map(|i| ((i % 23) as f32 - 11.0) / 7.0).collect();
+        let queries = Array::from_slice(&queries, &[1, 1, 1, 64]);
+        let new_keys = Array::from_slice(&new_keys, &[1, 1, 1, 64]);
+        let new_values = Array::from_slice(&new_values, &[1, 1, 1, 64]);
+        let scale = 1.0 / (64.0f32).sqrt();
+
+        let offset = regular.len();
+        let (expected_keys, expected_values) = regular.update(&new_keys, &new_values).unwrap();
+        let expected = dense_scaled_dot_product_attention(
+            &queries,
+            &expected_keys,
+            &expected_values,
+            scale,
+            None,
+            offset,
+            1,
+        )
+        .unwrap();
+
+        let mut compiled_step = make_compiled_plain_kv_decode(scale);
+        let actual = compiled_step(&mut compiled, (&queries, &new_keys, &new_values)).unwrap();
+        compiled.finish_compiled_decode_step(1).unwrap();
+
+        let max_diff = actual
+            .subtract(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            max_diff < 1e-4,
+            "compiled decode drift too large: {max_diff}"
+        );
+
+        let (compiled_keys, compiled_values) = compiled.current_views().unwrap();
+        let key_diff = compiled_keys
+            .subtract(&expected_keys)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let value_diff = compiled_values
+            .subtract(&expected_values)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(key_diff < 1e-6, "compiled keys diverged: {key_diff}");
+        assert!(value_diff < 1e-6, "compiled values diverged: {value_diff}");
+        assert_eq!(compiled.len(), 3);
+    }
+
+    #[test]
+    fn test_compiled_plain_kv_decode_matches_dense_multiple_steps() {
+        let mut regular = PlainKvCache::new(8);
+        let mut compiled = PlainKvCache::new(8);
+
+        let init_keys: Vec<f32> = (0..128).map(|i| (i as f32 - 41.0) / 17.0).collect();
+        let init_values: Vec<f32> = (0..128).map(|i| (i as f32 + 7.0) / 13.0).collect();
+        let init_keys = Array::from_slice(&init_keys, &[1, 1, 2, 64]);
+        let init_values = Array::from_slice(&init_values, &[1, 1, 2, 64]);
+        regular.update(&init_keys, &init_values).unwrap();
+        compiled.update(&init_keys, &init_values).unwrap();
+        compiled.prepare_compiled_decode_state().unwrap();
+
+        let scale = 1.0 / (64.0f32).sqrt();
+        let mut compiled_step = make_compiled_plain_kv_decode(scale);
+
+        for step in 0..3 {
+            let queries: Vec<f32> = (0..64)
+                .map(|i| (((i + step * 3) % 17) as f32 - 8.0) / 9.0)
+                .collect();
+            let new_keys: Vec<f32> = (0..64)
+                .map(|i| (((i + step * 5) % 19) as f32 - 9.0) / 7.0)
+                .collect();
+            let new_values: Vec<f32> = (0..64)
+                .map(|i| (((i + step * 7) % 23) as f32 - 11.0) / 5.0)
+                .collect();
+            let queries = Array::from_slice(&queries, &[1, 1, 1, 64]);
+            let new_keys = Array::from_slice(&new_keys, &[1, 1, 1, 64]);
+            let new_values = Array::from_slice(&new_values, &[1, 1, 1, 64]);
+
+            let offset = regular.len();
+            let (expected_keys, expected_values) = regular.update(&new_keys, &new_values).unwrap();
+            let expected = dense_scaled_dot_product_attention(
+                &queries,
+                &expected_keys,
+                &expected_values,
+                scale,
+                None,
+                offset,
+                1,
+            )
+            .unwrap();
+
+            let actual = compiled_step(&mut compiled, (&queries, &new_keys, &new_values)).unwrap();
+            compiled.finish_compiled_decode_step(1).unwrap();
+
+            let max_diff = actual
+                .subtract(&expected)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(
+                max_diff < 1e-4,
+                "compiled multi-step decode drift too large at step {step}: {max_diff}"
+            );
+
+            let (compiled_keys, compiled_values) = compiled.current_views().unwrap();
+            let key_diff = compiled_keys
+                .subtract(&expected_keys)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            let value_diff = compiled_values
+                .subtract(&expected_values)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>();
+            assert!(
+                key_diff < 1e-6,
+                "compiled keys diverged at step {step}: {key_diff}"
+            );
+            assert!(
+                value_diff < 1e-6,
+                "compiled values diverged at step {step}: {value_diff}"
+            );
+        }
+
+        assert_eq!(compiled.len(), regular.len());
+    }
+
+    #[test]
+    fn test_quantized_attention_matches_dense_attention() {
+        let scale = 1.0 / (64.0f32).sqrt();
+        let queries: Vec<f32> = (0..512).map(|i| ((i % 37) as f32 - 18.0) / 23.0).collect();
+        let keys: Vec<f32> = (0..384).map(|i| ((i % 29) as f32 - 14.0) / 19.0).collect();
+        let values: Vec<f32> = (0..384).map(|i| ((i % 31) as f32 - 15.0) / 17.0).collect();
+        let queries = Array::from_slice(&queries, &[1, 4, 2, 64]);
+        let keys = Array::from_slice(&keys, &[1, 2, 3, 64]);
+        let values = Array::from_slice(&values, &[1, 2, 3, 64]);
+        let q_keys = QuantizedArray::from_dense(&keys, 64, 8).unwrap();
+        let q_values = QuantizedArray::from_dense(&values, 64, 8).unwrap();
+        let zero_mask = mlx_rs::ops::zeros::<f32>(&[1, 1, 2, 3]).unwrap();
+
+        let dense = dense_scaled_dot_product_attention(
+            &queries,
+            &keys,
+            &values,
+            scale,
+            Some(&zero_mask),
+            0,
+            2,
+        )
+        .unwrap();
+        let quantized = quantized_scaled_dot_product_attention(
+            &queries,
+            &q_keys,
+            &q_values,
+            scale,
+            Some(&zero_mask),
+            64,
+            8,
+        )
+        .unwrap();
+        assert_eq!(dense.shape(), quantized.shape());
+
+        let max_diff = quantized
+            .subtract(&dense)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            max_diff < 0.08,
+            "quantized attention drift too large: {max_diff}"
+        );
     }
 
     #[test]
@@ -2042,17 +4042,23 @@ mod tests {
         let x = Array::from_slice(&vec![1.0f32; 128], &[1, 128]);
         let base_out = lora.base.forward(&x).unwrap();
         let lora_out = lora.forward(&x).unwrap();
-        let diff = lora_out.subtract(&base_out).unwrap().abs().unwrap().sum(None).unwrap();
+        let diff = lora_out
+            .subtract(&base_out)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum(None)
+            .unwrap();
         let diff_val: f32 = diff.as_slice::<f32>()[0];
-        assert!(diff_val < 1e-6, "LoRA should not change output when B=0, got diff={diff_val}");
+        assert!(
+            diff_val < 1e-6,
+            "LoRA should not change output when B=0, got diff={diff_val}"
+        );
     }
 
     #[test]
     fn test_cross_entropy_loss() {
-        let logits = Array::from_slice(
-            &[0.0f32, 0.0, 10.0, 0.0,  10.0, 0.0, 0.0, 0.0],
-            &[1, 2, 4],
-        );
+        let logits = Array::from_slice(&[0.0f32, 0.0, 10.0, 0.0, 10.0, 0.0, 0.0, 0.0], &[1, 2, 4]);
         let targets = Array::from_slice(&[2i32, 0], &[1, 2]);
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         let loss_val: f32 = loss.as_slice::<f32>()[0];
@@ -2068,32 +4074,31 @@ mod tests {
         let vocab = 248320i32;
         let seq_len = 64;
         // Random logits in a realistic range
-        let logits = mlx_rs::random::normal::<f32>(
-            &[1, seq_len, vocab],
-            None, None, None,
-        ).unwrap();
+        let logits = mlx_rs::random::normal::<f32>(&[1, seq_len, vocab], None, None, None).unwrap();
         // Random target indices in [0, vocab)
-        let targets = mlx_rs::random::randint::<_, i32>(
-            0, vocab, &[1, seq_len], None,
-        ).unwrap();
+        let targets = mlx_rs::random::randint::<_, i32>(0, vocab, &[1, seq_len], None).unwrap();
 
         // Forward: loss must be finite
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         mlx_rs::transforms::eval(std::iter::once(&loss)).unwrap();
         let loss_val: f32 = loss.as_slice::<f32>()[0];
-        assert!(loss_val.is_finite(), "loss should be finite, got {loss_val}");
+        assert!(
+            loss_val.is_finite(),
+            "loss should be finite, got {loss_val}"
+        );
         eprintln!("large vocab CE loss = {loss_val:.4}");
 
         // Backward: gradient via grad() must be finite
-        let mut grad_fn = mlx_rs::transforms::grad(
-            |logits: &Array| -> Result<Array, Exception> {
-                cross_entropy_loss(logits, &targets)
-            },
-        );
+        let mut grad_fn = mlx_rs::transforms::grad(|logits: &Array| -> Result<Array, Exception> {
+            cross_entropy_loss(logits, &targets)
+        });
         let grad = grad_fn(&logits).unwrap();
         mlx_rs::transforms::eval(std::iter::once(&grad)).unwrap();
         let grad_sum: f32 = grad.sum(None).unwrap().as_slice::<f32>()[0];
-        assert!(grad_sum.is_finite(), "gradient should be finite, got {grad_sum}");
+        assert!(
+            grad_sum.is_finite(),
+            "gradient should be finite, got {grad_sum}"
+        );
         eprintln!("large vocab CE grad_sum = {grad_sum:.6}");
     }
 
@@ -2102,7 +4107,12 @@ mod tests {
         let ql = QuantizedLinear::new(128, 64).unwrap();
         let lora = LoraLinear::new(ql, 4, 1.0).unwrap();
         let trainable = lora.trainable_parameters().flatten();
-        assert_eq!(trainable.len(), 2, "expected 2 trainable params, got {:?}", trainable.keys().collect::<Vec<_>>());
+        assert_eq!(
+            trainable.len(),
+            2,
+            "expected 2 trainable params, got {:?}",
+            trainable.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2112,8 +4122,14 @@ mod tests {
         let lora = LoraLinear::new(ql, 4, 1.0).unwrap();
         let trainable = lora.trainable_parameters().flatten();
         let keys: Vec<String> = trainable.keys().map(|k| k.to_string()).collect();
-        assert!(keys.contains(&"lora_a.weight".to_string()), "expected lora_a.weight, got {keys:?}");
-        assert!(keys.contains(&"lora_b.weight".to_string()), "expected lora_b.weight, got {keys:?}");
+        assert!(
+            keys.contains(&"lora_a.weight".to_string()),
+            "expected lora_a.weight, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"lora_b.weight".to_string()),
+            "expected lora_b.weight, got {keys:?}"
+        );
     }
 
     #[test]
@@ -2135,8 +4151,12 @@ mod tests {
         assert_eq!(parsed["alpha"], 32.0);
         assert_eq!(parsed["rank"], 32);
         assert_eq!(parsed["lora_layers"], 28);
-        let keys: Vec<String> = parsed["keys"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let keys: Vec<String> = parsed["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert!(keys.contains(&"self_attn.q_proj".to_string()));
         assert!(keys.contains(&"mlp.down_proj".to_string()));
     }
@@ -2154,8 +4174,15 @@ mod tests {
         let mut vg = nn::value_and_grad(loss_fn);
         let (val, grads) = vg(&mut lora, &x).unwrap();
 
-        assert!(val.as_slice::<f32>()[0].is_finite(), "loss should be finite");
-        assert!(grads.len() >= 2, "should have grads for LoRA A and B, got {}", grads.len());
+        assert!(
+            val.as_slice::<f32>()[0].is_finite(),
+            "loss should be finite"
+        );
+        assert!(
+            grads.len() >= 2,
+            "should have grads for LoRA A and B, got {}",
+            grads.len()
+        );
     }
 
     #[test]
@@ -2170,11 +4197,11 @@ mod tests {
         let cfg = ModelConfig::qwen3_1_7b();
         let lora_cfg = LoraConfig::default();
 
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let trainable = model.trainable_parameters().flatten();
-        let total_trainable: usize = trainable.values()
+        let total_trainable: usize = trainable
+            .values()
             .map(|a| a.shape().iter().product::<i32>() as usize)
             .sum();
         eprintln!("trainable parameters: {total_trainable}");
@@ -2183,17 +4210,18 @@ mod tests {
         let tokens = Array::from_slice(&[100i32, 101, 102, 103], &[1, 4]);
         let targets = Array::from_slice(&[101i32, 102, 103, 104], &[1, 4]);
 
-        let losses = train_loop(
-            &mut model, &[tokens], &[targets],
-            &lora_cfg, 3, 0.5, 10,
-        ).expect("training failed");
+        let losses = train_loop(&mut model, &[tokens], &[targets], &lora_cfg, 3, 0.5, 10)
+            .expect("training failed");
 
         assert!(losses.len() >= 2);
         let first = losses[0];
         let last = losses[losses.len() - 1];
         eprintln!("loss: {first:.4} -> {last:.4}");
         assert!(first.is_finite());
-        assert!(last < first, "loss should decrease: {first:.4} -> {last:.4}");
+        assert!(
+            last < first,
+            "loss should decrease: {first:.4} -> {last:.4}"
+        );
     }
 
     #[test]
@@ -2208,12 +4236,10 @@ mod tests {
         let cfg = ModelConfig::qwen3_1_7b();
         let lora_cfg = LoraConfig::default();
 
-        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path())
-            .expect("export failed");
+        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path()).expect("export failed");
 
         assert!(n > 0, "should export at least 1 tensor");
         assert_eq!(n, 224, "Qwen3-1.7B has 224 trainable tensors");
@@ -2239,14 +4265,17 @@ mod tests {
         // Verify adapter_config.json
         let config_path = tmpdir.path().join("adapter_config.json");
         assert!(config_path.exists(), "adapter_config.json not found");
-        let config_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&config_path).unwrap()
-        ).unwrap();
+        let config_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(config_json["rank"], 32);
         assert_eq!(config_json["alpha"], 32.0);
         assert_eq!(config_json["lora_layers"], 28);
 
-        eprintln!("exported {} adapter tensors to {}", n, tmpdir.path().display());
+        eprintln!(
+            "exported {} adapter tensors to {}",
+            n,
+            tmpdir.path().display()
+        );
     }
 
     #[test]
@@ -2262,38 +4291,44 @@ mod tests {
         let lora_cfg = LoraConfig::default();
 
         eprintln!("loading Qwen3.5-2B hybrid model (18 linear + 6 full attn layers)...");
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let trainable = model.trainable_parameters().flatten();
-        let total_trainable: usize = trainable.values()
+        let total_trainable: usize = trainable
+            .values()
             .map(|a| a.shape().iter().product::<i32>() as usize)
             .sum();
-        eprintln!("trainable parameters: {total_trainable} ({} param tensors)", trainable.len());
+        eprintln!(
+            "trainable parameters: {total_trainable} ({} param tensors)",
+            trainable.len()
+        );
 
         // 6 full-attn layers × 3 LoRA targets (q, v, o) × 2 (A+B) = 36
         // 24 layers × 1 LoRA target (down_proj) × 2 (A+B) = 48
         // Total: 84
         let expected_lora_params = 84;
         assert_eq!(
-            trainable.len(), expected_lora_params,
-            "expected {expected_lora_params} trainable params, got {}", trainable.len()
+            trainable.len(),
+            expected_lora_params,
+            "expected {expected_lora_params} trainable params, got {}",
+            trainable.len()
         );
 
         let tokens = Array::from_slice(&[100i32, 101, 102, 103], &[1, 4]);
         let targets = Array::from_slice(&[101i32, 102, 103, 104], &[1, 4]);
 
-        let losses = train_loop(
-            &mut model, &[tokens], &[targets],
-            &lora_cfg, 3, 0.5, 10,
-        ).expect("training failed");
+        let losses = train_loop(&mut model, &[tokens], &[targets], &lora_cfg, 3, 0.5, 10)
+            .expect("training failed");
 
         assert!(losses.len() >= 2, "expected at least 2 training steps");
         let first = losses[0];
         let last = losses[losses.len() - 1];
         eprintln!("loss: {first:.4} -> {last:.4}");
         assert!(first.is_finite(), "first loss should be finite");
-        assert!(last < first, "loss should decrease: {first:.4} -> {last:.4}");
+        assert!(
+            last < first,
+            "loss should decrease: {first:.4} -> {last:.4}"
+        );
     }
 
     #[test]
@@ -2308,12 +4343,10 @@ mod tests {
         let cfg = ModelConfig::qwen3_5_2b();
         let lora_cfg = LoraConfig::default();
 
-        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let tmpdir = tempfile::tempdir().unwrap();
-        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path())
-            .expect("export failed");
+        let n = export_adapters(&model, &lora_cfg, &cfg, tmpdir.path()).expect("export failed");
 
         // Qwen3.5-2B: 84 trainable tensors (6 full-attn × 3 LoRA + 24 × 1 MLP)
         assert_eq!(n, 84, "Qwen3.5-2B has 84 trainable tensors");
@@ -2331,8 +4364,9 @@ mod tests {
 
         // Verify lora_layers count (only full-attn layers have all 4 LoRA targets)
         let config_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap()
-        ).unwrap();
+            &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(config_json["lora_layers"], 6, "only 6 full-attn layers");
         assert_eq!(config_json["num_layers"], 24);
 
@@ -2351,21 +4385,23 @@ mod tests {
         }
 
         let cfg = ModelConfig::qwen3_5_2b();
-        let lora_cfg = LoraConfig { lr: 1e-5, ..LoraConfig::default() };
+        let lora_cfg = LoraConfig {
+            lr: 1e-5,
+            ..LoraConfig::default()
+        };
 
         eprintln!("loading model for long-sequence NaN regression test...");
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         // Simulate a real conversation: 64 random token IDs in valid vocab range
-        let seq: Vec<i32> = (0..65).map(|i| ((i * 7919 + 1337) % 248320) as i32).collect();
+        let seq: Vec<i32> = (0..65)
+            .map(|i| ((i * 7919 + 1337) % 248320) as i32)
+            .collect();
         let tokens = Array::from_slice(&seq[..64], &[1, 64]);
         let targets = Array::from_slice(&seq[1..65], &[1, 64]);
 
-        let losses = train_loop(
-            &mut model, &[tokens], &[targets],
-            &lora_cfg, 3, 0.5, 10,
-        ).expect("training failed — likely NaN gradient regression");
+        let losses = train_loop(&mut model, &[tokens], &[targets], &lora_cfg, 3, 0.5, 10)
+            .expect("training failed — likely NaN gradient regression");
 
         for (i, l) in losses.iter().enumerate() {
             eprintln!("  step {i}: loss={l:.4}");
@@ -2389,11 +4425,13 @@ mod tests {
         }
 
         let cfg = ModelConfig::qwen3_5_2b();
-        let lora_cfg = LoraConfig { lr: 1e-5, ..LoraConfig::default() };
+        let lora_cfg = LoraConfig {
+            lr: 1e-5,
+            ..LoraConfig::default()
+        };
 
         eprintln!("loading model for ChatML NaN regression test...");
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let tokenizer = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
 
@@ -2404,22 +4442,32 @@ mod tests {
                     <|im_start|>user\nWhat about Germany?<|im_end|>\n\
                     <|im_start|>assistant\nThe capital of Germany is Berlin.<|im_end|>\n";
         let all_tokens = tokenizer.encode(text).expect("tokenize failed");
-        eprintln!("  ChatML tokens: {}, first 10: {:?}", all_tokens.len(), &all_tokens[..10.min(all_tokens.len())]);
+        eprintln!(
+            "  ChatML tokens: {}, first 10: {:?}",
+            all_tokens.len(),
+            &all_tokens[..10.min(all_tokens.len())]
+        );
 
-        let input = Array::from_slice(&all_tokens[..all_tokens.len() - 1], &[1, (all_tokens.len() - 1) as i32]);
+        let input = Array::from_slice(
+            &all_tokens[..all_tokens.len() - 1],
+            &[1, (all_tokens.len() - 1) as i32],
+        );
         let target = Array::from_slice(&all_tokens[1..], &[1, (all_tokens.len() - 1) as i32]);
 
-        let losses = train_loop(
-            &mut model, &[input], &[target],
-            &lora_cfg, 3, 0.5, 10,
-        ).expect("training failed — likely NaN gradient regression");
+        let losses = train_loop(&mut model, &[input], &[target], &lora_cfg, 3, 0.5, 10)
+            .expect("training failed — likely NaN gradient regression");
 
         for (i, l) in losses.iter().enumerate() {
             eprintln!("  step {i}: loss={l:.4}");
             assert!(l.is_finite(), "step {i} loss is NaN/Inf: {l}");
         }
         assert!(losses.len() >= 2);
-        assert!(losses.last().unwrap() < &losses[0], "loss should decrease: {:.4} -> {:.4}", losses[0], losses.last().unwrap());
+        assert!(
+            losses.last().unwrap() < &losses[0],
+            "loss should decrease: {:.4} -> {:.4}",
+            losses[0],
+            losses.last().unwrap()
+        );
     }
 
     /// Load a raw f32 binary tensor from a reference directory under tests/
@@ -2427,9 +4475,14 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(dir)
             .join(format!("{name}.bin"));
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}\nRun the appropriate reference script", path.display()));
-        let floats: Vec<f32> = bytes.chunks_exact(4)
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}\nRun the appropriate reference script",
+                path.display()
+            )
+        });
+        let floats: Vec<f32> = bytes
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Array::from_slice(&floats, shape)
@@ -2447,8 +4500,8 @@ mod tests {
     #[test]
     fn test_gdn_numerical_vs_python_reference() {
         // Check reference files exist
-        let ref_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/gdn_reference_raw");
+        let ref_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/gdn_reference_raw");
         if !ref_dir.join("manifest.json").exists() {
             eprintln!("Reference tensors not found. Run: python3 tests/gdn_reference.py");
             return;
@@ -2464,17 +4517,19 @@ mod tests {
         // Load model (same weights as Python reference)
         let cfg = ModelConfig::qwen3_5_2b();
         let lora_cfg = LoraConfig::default();
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         // Load reference input [1, 4, 2048] and expected output [1, 4, 2048]
-        let ref_input = load_reference_tensor_from("tests/gdn_reference_raw","input", &[1, 4, 2048]);
-        let ref_output = load_reference_tensor_from("tests/gdn_reference_raw","output", &[1, 4, 2048]);
+        let ref_input =
+            load_reference_tensor_from("tests/gdn_reference_raw", "input", &[1, 4, 2048]);
+        let ref_output =
+            load_reference_tensor_from("tests/gdn_reference_raw", "output", &[1, 4, 2048]);
 
         // Run our forward on layer 0 (which is a linear_attn layer)
         // The reference was computed on raw input (before layernorm), so we must
         // call the linear_attn sub-module directly
-        let our_output = model.layers[0].forward_linear_attn(&ref_input)
+        let our_output = model.layers[0]
+            .forward_linear_attn(&ref_input)
             .expect("forward failed");
 
         // Compare
@@ -2498,16 +4553,22 @@ mod tests {
         eprintln!("PASS: Gated Delta Net matches Python reference within tolerance");
 
         // Also compare intermediate tensors for debugging
-        let ref_recurrence = load_reference_tensor_from("tests/gdn_reference_raw","recurrence_out", &[1, 4, 16, 128]);
+        let ref_recurrence = load_reference_tensor_from(
+            "tests/gdn_reference_raw",
+            "recurrence_out",
+            &[1, 4, 16, 128],
+        );
         eprintln!("\nIntermediate reference tensors (for debugging):");
-        eprintln!("  recurrence_out sample: {:?}",
-            &ref_recurrence.as_slice::<f32>()[..8]);
+        eprintln!(
+            "  recurrence_out sample: {:?}",
+            &ref_recurrence.as_slice::<f32>()[..8]
+        );
     }
 
     #[test]
     fn test_full_attn_numerical_vs_python_reference() {
-        let ref_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/full_attn_reference_raw");
+        let ref_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/full_attn_reference_raw");
         if !ref_dir.join("manifest.json").exists() {
             eprintln!("Reference tensors not found. Run: python3 tests/full_attn_reference.py");
             return;
@@ -2522,8 +4583,7 @@ mod tests {
 
         let cfg = ModelConfig::qwen3_5_2b();
         let lora_cfg = LoraConfig::default();
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         let d = "tests/full_attn_reference_raw";
         let ref_input = load_reference_tensor_from(d, "attn_input", &[1, 4, 2048]);
@@ -2561,8 +4621,7 @@ mod tests {
 
         let cfg = ModelConfig::qwen3_5_2b();
         let lora_cfg = LoraConfig::default();
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
 
         // "The capital of France is" → Python produces token 11751 (Paris) first
         let prompt = &[760i32, 6511, 314, 9338, 369];
@@ -2575,13 +4634,15 @@ mod tests {
             let mut h = model.embed_tokens.forward(&input).unwrap();
             for (i, layer) in model.layers.iter_mut().enumerate() {
                 h = layer.forward(&h, None).unwrap();
-                if [0,1,2,3,5,11,23].contains(&i) {
+                if [0, 1, 2, 3, 5, 11, 23].contains(&i) {
                     let hf = h.as_dtype(mlx_rs::Dtype::Float32).unwrap();
                     let flat = hf.reshape(&[-1]).unwrap();
                     let n = hf.shape().iter().product::<i32>();
                     // last position (idx 4), first 3 dims: offset = 4*2048
                     let off = 4 * 2048;
-                    let v: Vec<f32> = (off..off+3).map(|j| flat.index(j as i32).as_slice::<f32>()[0]).collect();
+                    let v: Vec<f32> = (off..off + 3)
+                        .map(|j| flat.index(j as i32).as_slice::<f32>()[0])
+                        .collect();
                     eprintln!("layer {i:2}: {:?}", v);
                 }
             }
@@ -2595,7 +4656,9 @@ mod tests {
         let logits = model.forward_logits(&input).expect("forward failed");
         let last_logits = logits.index((.., -1, ..)); // [1, vocab]
         let argmax_token = mlx_rs::ops::indexing::argmax_axis(&last_logits, -1, false)
-            .unwrap().as_dtype(mlx_rs::Dtype::Int32).unwrap();
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Int32)
+            .unwrap();
         let argmax_id: i32 = argmax_token.as_slice::<i32>()[0];
         eprintln!("argmax token: {argmax_id} (expected 11751 = 'Paris')");
 
@@ -2609,18 +4672,25 @@ mod tests {
         // Greedy (temp=0) causes repetition on Qwen3.5 — use temp=0.6 per HF guidance
         eprintln!("\ngenerating (temp=0.6, max 20 tokens)...");
         let t0 = std::time::Instant::now();
-        let generated = model.generate(prompt, 20, 0.6, &[eos])
+        let generated = model
+            .generate(prompt, 20, 0.6, &[eos])
             .expect("generation failed");
         let elapsed = t0.elapsed();
 
-        eprintln!("generated {} tokens in {:.1}s ({:.0} ms/token)",
-            generated.len(), elapsed.as_secs_f64(),
-            elapsed.as_millis() as f64 / generated.len().max(1) as f64);
+        eprintln!(
+            "generated {} tokens in {:.1}s ({:.0} ms/token)",
+            generated.len(),
+            elapsed.as_secs_f64(),
+            elapsed.as_millis() as f64 / generated.len().max(1) as f64
+        );
         eprintln!("tokens: {:?}", generated);
 
         assert!(!generated.is_empty(), "should generate at least one token");
-        assert_eq!(generated[0], 11751,
-            "first generated token should be 11751 (Paris), got {}", generated[0]);
+        assert_eq!(
+            generated[0], 11751,
+            "first generated token should be 11751 (Paris), got {}",
+            generated[0]
+        );
     }
 
     #[test]
@@ -2648,8 +4718,11 @@ mod tests {
         let prompt = "The capital of France is";
         let prompt_ids = tok.encode(prompt).expect("encode failed");
         eprintln!("prompt '{}' -> {:?}", prompt, prompt_ids);
-        assert_eq!(prompt_ids, vec![760, 6511, 314, 9338, 369],
-            "tokenizer should match hardcoded prompt tokens");
+        assert_eq!(
+            prompt_ids,
+            vec![760, 6511, 314, 9338, 369],
+            "tokenizer should match hardcoded prompt tokens"
+        );
 
         // EOS token
         let eos = tok.eos_token_id();
@@ -2668,18 +4741,25 @@ mod tests {
 
         let cfg = ModelConfig::qwen3_5_2b();
         let lora_cfg = LoraConfig::default();
-        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg)
-            .expect("model load failed");
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
         let tok = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
 
         let t0 = std::time::Instant::now();
-        let response = model.generate_text(&tok, "The capital of France is", 10, 0.6)
+        let response = model
+            .generate_text(&tok, "The capital of France is", 10, 0.6)
             .expect("generate_text failed");
         let elapsed = t0.elapsed();
 
-        eprintln!("generate_text: '{}' ({:.1}s)", response, elapsed.as_secs_f64());
-        assert!(response.contains("Paris"),
-            "response should mention Paris, got: '{}'", response);
+        eprintln!(
+            "generate_text: '{}' ({:.1}s)",
+            response,
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            response.contains("Paris"),
+            "response should mention Paris, got: '{}'",
+            response
+        );
     }
 
     /// KV cache correctness: pure transformer (no GDN) should produce coherent text.
@@ -2705,7 +4785,9 @@ mod tests {
         let logits = model.forward_logits(&input).expect("forward");
         let last = logits.index((.., -1, ..));
         let argmax_nocache = mlx_rs::ops::indexing::argmax_axis(&last, -1, false)
-            .unwrap().as_dtype(mlx_rs::Dtype::Int32).unwrap();
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Int32)
+            .unwrap();
         let token_nocache: i32 = argmax_nocache.as_slice::<i32>()[0];
         eprintln!("non-cached argmax: {token_nocache}");
 
@@ -2716,14 +4798,20 @@ mod tests {
         let elapsed = t0.elapsed();
 
         let text = tok.decode(&generated).unwrap_or_default();
-        eprintln!("KV-cached generation ({:.0}ms/tok): '{}'",
-            elapsed.as_millis() as f64 / generated.len().max(1) as f64, text);
+        eprintln!(
+            "KV-cached generation ({:.0}ms/tok): '{}'",
+            elapsed.as_millis() as f64 / generated.len().max(1) as f64,
+            text
+        );
         eprintln!("tokens: {:?}", &generated[..generated.len().min(10)]);
 
         // First token should match non-cached argmax (high probability)
         assert!(!generated.is_empty(), "should generate tokens");
         // With temp=0.6, first token is very likely the argmax
-        eprintln!("cached first token: {}, non-cached argmax: {}", generated[0], token_nocache);
+        eprintln!(
+            "cached first token: {}, non-cached argmax: {}",
+            generated[0], token_nocache
+        );
 
         // Check for repetition: no single token should appear > 50% of the time
         let mut counts = std::collections::HashMap::new();
@@ -2732,8 +4820,13 @@ mod tests {
         }
         let max_count = counts.values().max().copied().unwrap_or(0);
         let max_pct = max_count as f64 / generated.len() as f64 * 100.0;
-        eprintln!("max token repetition: {max_count}/{} ({max_pct:.0}%)", generated.len());
-        assert!(max_pct < 60.0,
-            "excessive repetition ({max_pct:.0}%) suggests KV cache bug");
+        eprintln!(
+            "max token repetition: {max_count}/{} ({max_pct:.0}%)",
+            generated.len()
+        );
+        assert!(
+            max_pct < 60.0,
+            "excessive repetition ({max_pct:.0}%) suggests KV cache bug"
+        );
     }
 }

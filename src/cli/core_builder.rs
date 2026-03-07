@@ -364,11 +364,13 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     let model_dir = resolve_mlx_model_dir(config);
     // Always auto-detect preset from model dir name to avoid stale config mismatches.
     let effective_preset = preset_from_model_dir(&model_dir).to_string();
-    let model_config = model_config_from_preset(&effective_preset).unwrap_or_else(|| {
-        // Unknown model — use Qwen3-1.7B as a placeholder; in-process load
-        // will fail gracefully and mlx-lm server handles inference.
-        ModelConfig::qwen3_1_7b()
-    });
+    // Try auto-detecting from config.json first, then fall back to preset.
+    let model_config = ModelConfig::from_config_json(&model_dir)
+        .or_else(|| model_config_from_preset(&effective_preset))
+        .unwrap_or_else(|| {
+            tracing::warn!("no config.json and no matching preset, using qwen3-1.7b placeholder");
+            ModelConfig::qwen3_1_7b()
+        });
     let lora_config = LoraConfig {
         lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
         ..LoraConfig::default()
