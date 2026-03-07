@@ -28,16 +28,16 @@ use crate::tui;
 // Submodule declarations
 // ============================================================================
 
-#[path = "cmd_read.rs"]
-mod cmd_read;
-#[path = "cmd_mutation.rs"]
-mod cmd_mutation;
-#[path = "cmd_lifecycle.rs"]
-mod cmd_lifecycle;
 #[path = "cmd_channels.rs"]
 mod cmd_channels;
 #[path = "cmd_cluster.rs"]
 mod cmd_cluster;
+#[path = "cmd_lifecycle.rs"]
+mod cmd_lifecycle;
+#[path = "cmd_mutation.rs"]
+mod cmd_mutation;
+#[path = "cmd_read.rs"]
+mod cmd_read;
 #[path = "trio_helpers.rs"]
 mod trio_helpers;
 
@@ -383,13 +383,11 @@ impl ReplContext {
                 if name.to_lowercase().contains("embedding") {
                     continue;
                 }
-                let is_loaded = loaded.iter().any(|l| {
-                    l.contains(name.as_str()) || name.contains(l.as_str())
-                });
-                let is_active = crate::lms::is_model_available(
-                    std::slice::from_ref(name),
-                    &current_model,
-                );
+                let is_loaded = loaded
+                    .iter()
+                    .any(|l| l.contains(name.as_str()) || name.contains(l.as_str()));
+                let is_active =
+                    crate::lms::is_model_available(std::slice::from_ref(name), &current_model);
                 entries.push(ModelEntry {
                     id: name.clone(),
                     source: ModelSource::LocalLms { port: lms_port },
@@ -414,10 +412,7 @@ impl ReplContext {
                 // added models from it via the remote-server branch in step 1
                 for model in &peer.models {
                     let is_active = peer.endpoint == *current_base
-                        && crate::lms::is_model_available(
-                            &[model.id.clone()],
-                            &current_model,
-                        );
+                        && crate::lms::is_model_available(&[model.id.clone()], &current_model);
                     entries.push(ModelEntry {
                         id: model.id.clone(),
                         source: ModelSource::Remote {
@@ -484,10 +479,8 @@ impl ReplContext {
                                 if id.is_empty() || id.to_lowercase().contains("embedding") {
                                     continue;
                                 }
-                                let is_active = crate::lms::is_model_available(
-                                    &[id.clone()],
-                                    &current_model,
-                                );
+                                let is_active =
+                                    crate::lms::is_model_available(&[id.clone()], &current_model);
                                 entries.push(ModelEntry {
                                     id,
                                     source: ModelSource::Remote {
@@ -526,11 +519,16 @@ impl ReplContext {
         #[cfg(feature = "mlx")]
         {
             let mlx_models = crate::agent::mlx_lm::discover_mlx_models();
-            let mlx_active = self.config.agents.defaults.mlx_model_dir.clone()
+            let mlx_active = self
+                .config
+                .agents
+                .defaults
+                .mlx_model_dir
+                .clone()
                 .unwrap_or_default();
             for m in mlx_models {
-                let is_active = mlx_active.ends_with(&m.name)
-                    || m.path.to_string_lossy() == mlx_active;
+                let is_active =
+                    mlx_active.ends_with(&m.name) || m.path.to_string_lossy() == mlx_active;
                 entries.push(ModelEntry {
                     id: m.name.clone(),
                     source: ModelSource::Mlx { path: m.path },
@@ -598,7 +596,7 @@ impl ReplContext {
                 self.cmd_status().await;
             }
             "/context" => {
-                self.cmd_context();
+                self.cmd_context().await;
             }
             "/memory" => {
                 self.cmd_memory();
@@ -651,6 +649,9 @@ impl ReplContext {
             }
             "/trio" => {
                 self.cmd_trio(arg).await;
+            }
+            "/lane" => {
+                self.cmd_lane(arg);
             }
             "/sessions" => {
                 self.cmd_sessions(arg);
@@ -715,25 +716,23 @@ impl ReplContext {
             )
         };
 
-        let router_profile = if self.config.trio.enabled
-            && !self.config.trio.router_model.is_empty()
-        {
-            Some(server::estimate_model_profile_from_name(
-                &self.config.trio.router_model,
-            ))
-        } else {
-            None
-        };
+        let router_profile =
+            if self.config.trio.enabled && !self.config.trio.router_model.is_empty() {
+                Some(server::estimate_model_profile_from_name(
+                    &self.config.trio.router_model,
+                ))
+            } else {
+                None
+            };
 
-        let specialist_profile = if self.config.trio.enabled
-            && !self.config.trio.specialist_model.is_empty()
-        {
-            Some(server::estimate_model_profile_from_name(
-                &self.config.trio.specialist_model,
-            ))
-        } else {
-            None
-        };
+        let specialist_profile =
+            if self.config.trio.enabled && !self.config.trio.specialist_model.is_empty() {
+                Some(server::estimate_model_profile_from_name(
+                    &self.config.trio.specialist_model,
+                ))
+            } else {
+                None
+            };
 
         let input = crate::server::VramBudgetInput {
             available_memory: available,
@@ -849,7 +848,10 @@ mod tests {
 
         assert!(cfg.trio.enabled);
         assert_eq!(cfg.tool_delegation.mode, DelegationMode::Trio);
-        assert!(cfg.tool_delegation.enabled, "delegation must stay on for trio");
+        assert!(
+            cfg.tool_delegation.enabled,
+            "delegation must stay on for trio"
+        );
         assert!(cfg.tool_delegation.strict_no_tools_main);
         assert!(cfg.tool_delegation.strict_router_schema);
         assert!(cfg.tool_delegation.role_scoped_context_packs);
@@ -1023,8 +1025,14 @@ mod tests {
 
         persist_trio_fields(&live, &mut disk);
 
-        assert_eq!(disk.agents.defaults.model, "custom-cloud-model", "should not clobber model");
-        assert_eq!(disk.providers.openrouter.api_key, "my-key", "should not clobber api key");
+        assert_eq!(
+            disk.agents.defaults.model, "custom-cloud-model",
+            "should not clobber model"
+        );
+        assert_eq!(
+            disk.providers.openrouter.api_key, "my-key",
+            "should not clobber api key"
+        );
     }
 
     // ---- roundtrip: enable → disable → enable preserves full config ----
@@ -1048,7 +1056,10 @@ mod tests {
         trio_enable(&mut cfg);
         assert!(cfg.trio.enabled);
         assert!(cfg.tool_delegation.strict_no_tools_main);
-        assert_eq!(cfg.trio.router_model, "qwen3-1.7b", "models survive roundtrip");
+        assert_eq!(
+            cfg.trio.router_model, "qwen3-1.7b",
+            "models survive roundtrip"
+        );
     }
 
     // ---- apply_trio_param tests ----
@@ -1194,7 +1205,10 @@ mod tests {
         let output = format_vram_budget(&result);
         assert!(output.contains("MAIN"), "Should contain MAIN role");
         assert!(output.contains("ROUTER"), "Should contain ROUTER role");
-        assert!(output.contains("SPECIALIST"), "Should contain SPECIALIST role");
+        assert!(
+            output.contains("SPECIALIST"),
+            "Should contain SPECIALIST role"
+        );
         assert!(output.contains("OK"), "Should show OK when fits=true");
         assert!(output.contains("TOTAL"), "Should contain TOTAL line");
     }
@@ -1208,16 +1222,14 @@ mod tests {
             total_vram_bytes: 20_000_000_000,
             effective_limit_bytes: 16_000_000_000,
             fits: false,
-            breakdown: vec![
-                crate::server::VramModelBreakdown {
-                    role: "main".to_string(),
-                    name: "big-model".to_string(),
-                    weights_bytes: 10_000_000_000,
-                    kv_cache_bytes: 500_000_000,
-                    context_tokens: 4096,
-                    overhead_bytes: 512_000_000,
-                },
-            ],
+            breakdown: vec![crate::server::VramModelBreakdown {
+                role: "main".to_string(),
+                name: "big-model".to_string(),
+                weights_bytes: 10_000_000_000,
+                kv_cache_bytes: 500_000_000,
+                context_tokens: 4096,
+                overhead_bytes: 512_000_000,
+            }],
         };
         let output = format_vram_budget(&result);
         assert!(output.contains("OVER"), "Should show OVER when fits=false");
@@ -1322,15 +1334,30 @@ mod tests {
         use crate::config::schema::DelegationMode;
         // Empty GGUF model names but explicit endpoints → should activate
         assert!(should_auto_activate_trio(
-            true, "", "", true, true, &DelegationMode::Delegated,
+            true,
+            "",
+            "",
+            true,
+            true,
+            &DelegationMode::Delegated,
         ));
         // Neither GGUF nor endpoints → should NOT activate
         assert!(!should_auto_activate_trio(
-            true, "", "", false, false, &DelegationMode::Delegated,
+            true,
+            "",
+            "",
+            false,
+            false,
+            &DelegationMode::Delegated,
         ));
         // GGUF models (no endpoint) → still activates (existing behavior preserved)
         assert!(should_auto_activate_trio(
-            true, "router.gguf", "spec.gguf", false, false, &DelegationMode::Delegated,
+            true,
+            "router.gguf",
+            "spec.gguf",
+            false,
+            false,
+            &DelegationMode::Delegated,
         ));
     }
 
@@ -1350,9 +1377,7 @@ mod tests {
 
     #[test]
     fn test_pick_trio_models_skips_main() {
-        let available = vec![
-            "Nemotron-Orchestrator-8B".to_string(),
-        ];
+        let available = vec!["Nemotron-Orchestrator-8B".to_string()];
         // Main model matches the only orchestrator — no router picked
         let (router, specialist) = pick_trio_models(&available, "Nemotron-Orchestrator-8B");
         assert!(router.is_none());

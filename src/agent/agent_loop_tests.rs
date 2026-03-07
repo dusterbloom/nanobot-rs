@@ -5,12 +5,18 @@
 //! `use super::*` continues to resolve against the agent_loop module.
 
 use super::*;
-use backon::BackoffBuilder;
-use crate::agent::router::{extract_json_object, parse_lenient_router_decision, request_strict_router_decision};
-use crate::config::schema::{AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig, TrioConfig};
+use crate::agent::lane::Lane;
+use crate::agent::router::{
+    extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
+};
+use crate::config::schema::{
+    AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ProviderConfig, ToolDelegationConfig,
+    TrioConfig,
+};
 use crate::providers::base::LLMProvider;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
+use backon::BackoffBuilder;
 
 /// Minimal mock LLM provider for wiring tests.
 struct MockLLM {
@@ -121,6 +127,7 @@ fn build_test_core(
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -144,7 +151,8 @@ fn test_provenance_warning_role_local_safe() {
 
 #[test]
 fn test_extract_json_object_from_markdown_fence() {
-    let raw = "```json\n{\"action\":\"tool\",\"target\":\"exec\",\"args\":{},\"confidence\":0.9}\n```";
+    let raw =
+        "```json\n{\"action\":\"tool\",\"target\":\"exec\",\"args\":{},\"confidence\":0.9}\n```";
     let obj = extract_json_object(raw).expect("json object");
     assert!(obj.starts_with('{'));
     assert!(obj.ends_with('}'));
@@ -215,8 +223,8 @@ async fn test_real_providers_trio_probe() {
         .unwrap_or_else(|_| "http://127.0.0.1:8094/v1".to_string());
     let specialist_base = std::env::var("NANOBOT_REAL_SPECIALIST_BASE")
         .unwrap_or_else(|_| "http://127.0.0.1:8095/v1".to_string());
-    let main_model = std::env::var("NANOBOT_REAL_MAIN_MODEL")
-        .unwrap_or_else(|_| "local-model".to_string());
+    let main_model =
+        std::env::var("NANOBOT_REAL_MAIN_MODEL").unwrap_or_else(|_| "local-model".to_string());
     let router_model = std::env::var("NANOBOT_REAL_ROUTER_MODEL")
         .unwrap_or_else(|_| "local-delegation".to_string());
     let specialist_model = std::env::var("NANOBOT_REAL_SPECIALIST_MODEL")
@@ -231,7 +239,10 @@ async fn test_real_providers_trio_probe() {
 
     // Router: force each action in a constrained prompt and verify strict parsing.
     let router_cases = vec![
-        ("tool", "Return action=tool target=read_file args={\"path\":\"README.md\"}."),
+        (
+            "tool",
+            "Return action=tool target=read_file args={\"path\":\"README.md\"}.",
+        ),
         (
             "subagent",
             "Return action=subagent target=builder args={\"task\":\"diagnose issue\"}.",
@@ -247,7 +258,18 @@ async fn test_real_providers_trio_probe() {
     ];
     for (expected_action, directive) in router_cases {
         let pack = format!("{}\nFollow schema strictly.", directive);
-        match request_strict_router_decision(&router, &router_model, &pack, false, 0.6, 1.0, "", 256).await {
+        match request_strict_router_decision(
+            &router,
+            &router_model,
+            &pack,
+            false,
+            0.6,
+            1.0,
+            "",
+            256,
+        )
+        .await
+        {
             Ok(d) => {
                 if d.action != expected_action {
                     failures.push(format!(
@@ -450,6 +472,7 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: false,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -513,6 +536,7 @@ fn test_delegation_with_is_local_true() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -569,6 +593,7 @@ fn test_delegation_with_compaction_and_delegation_providers() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: Some(compaction),
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -616,15 +641,17 @@ async fn test_real_lcm_e2e_compact_and_expand() {
 
     let api_base = std::env::var("NANOBOT_LCM_TEST_BASE")
         .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model_name = std::env::var("NANOBOT_LCM_TEST_MODEL")
-        .unwrap_or_else(|_| "local-model".to_string());
+    let model_name =
+        std::env::var("NANOBOT_LCM_TEST_MODEL").unwrap_or_else(|_| "local-model".to_string());
 
     eprintln!("LCM E2E: using {} model={}", api_base, model_name);
 
     // Real provider pointing at local LLM.
-    let provider: Arc<dyn LLMProvider> = Arc::new(
-        OpenAICompatProvider::new("local", Some(&api_base), Some(&model_name)),
-    );
+    let provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+        "local",
+        Some(&api_base),
+        Some(&model_name),
+    ));
 
     // Warm up: verify the model is responding.
     let warmup = provider
@@ -639,7 +666,10 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         )
         .await;
     match warmup {
-        Ok(r) => eprintln!("LCM E2E warmup: {}", r.content.as_deref().unwrap_or("(empty)")),
+        Ok(r) => eprintln!(
+            "LCM E2E warmup: {}",
+            r.content.as_deref().unwrap_or("(empty)")
+        ),
         Err(e) => panic!("LCM E2E: model not responding at {}: {}", api_base, e),
     }
 
@@ -663,6 +693,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         restrict_to_workspace: false,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: Some(provider.clone()),
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
@@ -684,7 +715,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
 
     let lcm_config = LcmSchemaConfig {
         enabled: true,
-        tau_soft: 0.3,  // Trigger early.
+        tau_soft: 0.3, // Trigger early.
         tau_hard: 0.6,
         deterministic_target: 128,
         ..Default::default()
@@ -899,12 +930,12 @@ async fn test_compaction_timeout_resets_in_flight() {
 fn trio_e2e_env() -> (String, String, String, String) {
     let base = std::env::var("NANOBOT_TRIO_BASE")
         .unwrap_or_else(|_| "http://192.168.1.22:1234/v1".to_string());
-    let main_model = std::env::var("NANOBOT_TRIO_MAIN_MODEL")
-        .unwrap_or_else(|_| "gemma-3n-e4b-it".to_string());
+    let main_model =
+        std::env::var("NANOBOT_TRIO_MAIN_MODEL").unwrap_or_else(|_| "gemma-3n-e4b-it".to_string());
     let router_model = std::env::var("NANOBOT_TRIO_ROUTER_MODEL")
         .unwrap_or_else(|_| "nvidia_orchestrator-8b".to_string());
-    let specialist_model = std::env::var("NANOBOT_TRIO_SPECIALIST_MODEL")
-        .unwrap_or_else(|_| "qwen3-1.7b".to_string());
+    let specialist_model =
+        std::env::var("NANOBOT_TRIO_SPECIALIST_MODEL").unwrap_or_else(|_| "qwen3-1.7b".to_string());
     (base, main_model, router_model, specialist_model)
 }
 
@@ -918,9 +949,9 @@ fn build_trio_e2e_harness(
     router_model: &str,
     specialist_model: &str,
 ) -> (AgentLoop, std::path::PathBuf) {
+    use crate::config::schema::LcmSchemaConfig;
     use crate::providers::factory;
     use crate::providers::jit_gate::JitGate;
-    use crate::config::schema::LcmSchemaConfig;
 
     let jit_gate = std::sync::Arc::new(JitGate::new());
 
@@ -969,6 +1000,7 @@ fn build_trio_e2e_harness(
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -1008,11 +1040,7 @@ fn build_trio_e2e_harness(
 }
 
 /// Warmup a provider with backon retries (models may need JIT loading time).
-async fn warmup_trio_provider(
-    provider: &dyn LLMProvider,
-    model: &str,
-    role: &str,
-) {
+async fn warmup_trio_provider(provider: &dyn LLMProvider, model: &str, role: &str) {
     use backon::ConstantBuilder;
 
     let messages = vec![serde_json::json!({"role": "user", "content": "Reply with: ok"})];
@@ -1021,7 +1049,10 @@ async fn warmup_trio_provider(
         .with_max_times(10)
         .build();
     loop {
-        match provider.chat(&messages, None, Some(model), 32, 0.0, None, None).await {
+        match provider
+            .chat(&messages, None, Some(model), 32, 0.0, None, None)
+            .await
+        {
             Ok(resp) => {
                 let text = resp.content.unwrap_or_default();
                 if !text.trim().is_empty() {
@@ -1053,7 +1084,10 @@ async fn test_trio_e2e_preflight() {
     eprintln!("trio E2E preflight: base={}", base);
 
     // 1. Verify LM Studio /models endpoint is reachable
-    let models_url = format!("{}/models", base.trim_end_matches("/v1").trim_end_matches('/'));
+    let models_url = format!(
+        "{}/models",
+        base.trim_end_matches("/v1").trim_end_matches('/')
+    );
     // Try the /v1/models path first (standard OpenAI-compat)
     let models_url_v1 = format!("{}/models", base.trim_end_matches('/'));
     let client = reqwest::Client::new();
@@ -1112,7 +1146,10 @@ async fn test_trio_e2e_preflight() {
         if model_ids.iter().any(|id| id.contains(name.as_str())) {
             eprintln!("  {} model '{}' found in /models", role, name);
         } else {
-            eprintln!("  {} model '{}' NOT listed (may JIT-load on demand)", role, name);
+            eprintln!(
+                "  {} model '{}' NOT listed (may JIT-load on demand)",
+                role, name
+            );
         }
     }
 
@@ -1145,22 +1182,42 @@ async fn test_trio_e2e_respond() {
     let (base, main_model, router_model, specialist_model) = trio_e2e_env();
     eprintln!("trio E2E respond: base={}", base);
 
-    let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+    let (agent_loop, workspace) =
+        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
 
     // Warmup all 3 models
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
-    warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
+    warmup_trio_provider(
+        core.specialist_provider.as_ref().unwrap().as_ref(),
+        &specialist_model,
+        "specialist",
+    )
+    .await;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(180),
-        agent_loop.process_direct("Hello, what is 2 + 2?", "trio-e2e-respond", "test", "trio-e2e"),
+        agent_loop.process_direct(
+            "Hello, what is 2 + 2?",
+            "trio-e2e-respond",
+            "test",
+            "trio-e2e",
+        ),
     )
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E respond: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+    eprintln!(
+        "trio E2E respond: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
     assert!(!resp.is_empty(), "response should be non-empty");
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1172,15 +1229,30 @@ async fn test_trio_e2e_tool_dispatch() {
     let (base, main_model, router_model, specialist_model) = trio_e2e_env();
     eprintln!("trio E2E tool dispatch: base={}", base);
 
-    let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+    let (agent_loop, workspace) =
+        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
 
     // Write a known file to workspace
-    std::fs::write(workspace.join("README.md"), "Nanobot is a lightweight AI assistant framework written in Rust.").unwrap();
+    std::fs::write(
+        workspace.join("README.md"),
+        "Nanobot is a lightweight AI assistant framework written in Rust.",
+    )
+    .unwrap();
 
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
-    warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
+    warmup_trio_provider(
+        core.specialist_provider.as_ref().unwrap().as_ref(),
+        &specialist_model,
+        "specialist",
+    )
+    .await;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(180),
@@ -1194,16 +1266,24 @@ async fn test_trio_e2e_tool_dispatch() {
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E tool dispatch: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+    eprintln!(
+        "trio E2E tool dispatch: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
     assert!(!resp.is_empty(), "response should be non-empty");
 
     // Check TrioMetrics
     let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
     eprintln!(
         "  metrics: preflight={} action={:?} specialist={} tool={:?}",
-        metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .router_preflight_fired
+            .load(std::sync::atomic::Ordering::Relaxed),
         metrics.router_action.lock(),
-        metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .specialist_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed),
         metrics.tool_dispatched.lock(),
     );
 
@@ -1216,12 +1296,23 @@ async fn test_trio_e2e_specialist_dispatch() {
     let (base, main_model, router_model, specialist_model) = trio_e2e_env();
     eprintln!("trio E2E specialist: base={}", base);
 
-    let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+    let (agent_loop, workspace) =
+        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
 
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
-    warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
+    warmup_trio_provider(
+        core.specialist_provider.as_ref().unwrap().as_ref(),
+        &specialist_model,
+        "specialist",
+    )
+    .await;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(180),
@@ -1235,9 +1326,16 @@ async fn test_trio_e2e_specialist_dispatch() {
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E specialist: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+    eprintln!(
+        "trio E2E specialist: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
     assert!(!resp.is_empty(), "response should be non-empty");
-    assert!(resp.len() > 50, "specialist response should be substantive (>50 chars)");
+    assert!(
+        resp.len() > 50,
+        "specialist response should be substantive (>50 chars)"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -1248,12 +1346,23 @@ async fn test_trio_e2e_ask_user() {
     let (base, main_model, router_model, specialist_model) = trio_e2e_env();
     eprintln!("trio E2E ask_user: base={}", base);
 
-    let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+    let (agent_loop, workspace) =
+        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
 
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
-    warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
+    warmup_trio_provider(
+        core.specialist_provider.as_ref().unwrap().as_ref(),
+        &specialist_model,
+        "specialist",
+    )
+    .await;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(180),
@@ -1267,7 +1376,11 @@ async fn test_trio_e2e_ask_user() {
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E ask_user: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+    eprintln!(
+        "trio E2E ask_user: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
     assert!(!resp.is_empty(), "response should be non-empty");
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1293,9 +1406,9 @@ async fn test_trio_e2e_router_unreachable() {
     drop(agent_loop);
     let _ = std::fs::remove_dir_all(&workspace);
 
+    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
     use crate::providers::factory;
     use crate::providers::jit_gate::JitGate;
-    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
 
     let jit_gate = std::sync::Arc::new(JitGate::new());
     let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
@@ -1303,9 +1416,11 @@ async fn test_trio_e2e_router_unreachable() {
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     // Router points to dead port
-    let router_provider: Arc<dyn LLMProvider> = Arc::new(
-        OpenAICompatProvider::new("local", Some("http://127.0.0.1:19999/v1"), Some("dead-router")),
-    );
+    let router_provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+        "local",
+        Some("http://127.0.0.1:19999/v1"),
+        Some("dead-router"),
+    ));
     let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
         factory::ProviderSpec::local(&base, Some(&specialist_model))
             .with_jit_gate_opt(Some(jit_gate.clone())),
@@ -1342,6 +1457,7 @@ async fn test_trio_e2e_router_unreachable() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -1387,7 +1503,11 @@ async fn test_trio_e2e_router_unreachable() {
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E router unreachable: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
+    eprintln!(
+        "trio E2E router unreachable: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
     assert!(!resp.is_empty(), "should get error response, not panic");
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1399,9 +1519,9 @@ async fn test_trio_e2e_specialist_unreachable() {
     let (base, main_model, router_model, _specialist_model) = trio_e2e_env();
     eprintln!("trio E2E specialist unreachable: base={}", base);
 
+    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
     use crate::providers::factory;
     use crate::providers::jit_gate::JitGate;
-    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
 
     let jit_gate = std::sync::Arc::new(JitGate::new());
     let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
@@ -1413,9 +1533,11 @@ async fn test_trio_e2e_specialist_unreachable() {
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     // Specialist points to dead port
-    let specialist_provider: Arc<dyn LLMProvider> = Arc::new(
-        OpenAICompatProvider::new("local", Some("http://127.0.0.1:19999/v1"), Some("dead-specialist")),
-    );
+    let specialist_provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
+        "local",
+        Some("http://127.0.0.1:19999/v1"),
+        Some("dead-specialist"),
+    ));
 
     let workspace = tempfile::tempdir().unwrap().into_path();
     let mut td = ToolDelegationConfig {
@@ -1448,6 +1570,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -1484,7 +1607,12 @@ async fn test_trio_e2e_specialist_unreachable() {
 
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(180),
@@ -1498,8 +1626,15 @@ async fn test_trio_e2e_specialist_unreachable() {
     .await
     .expect("test timed out");
 
-    eprintln!("trio E2E specialist unreachable: response ({} chars): {}", resp.len(), &resp[..resp.len().min(200)]);
-    assert!(!resp.is_empty(), "should get response despite dead specialist");
+    eprintln!(
+        "trio E2E specialist unreachable: response ({} chars): {}",
+        resp.len(),
+        &resp[..resp.len().min(200)]
+    );
+    assert!(
+        !resp.is_empty(),
+        "should get response despite dead specialist"
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -1510,15 +1645,30 @@ async fn test_trio_e2e_multi_turn() {
     let (base, main_model, router_model, specialist_model) = trio_e2e_env();
     eprintln!("trio E2E multi-turn: base={}", base);
 
-    let (agent_loop, workspace) = build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
+    let (agent_loop, workspace) =
+        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
 
     // Write test file
-    std::fs::write(workspace.join("README.md"), "Nanobot is a lightweight AI assistant.").unwrap();
+    std::fs::write(
+        workspace.join("README.md"),
+        "Nanobot is a lightweight AI assistant.",
+    )
+    .unwrap();
 
     let core = agent_loop.shared.core_handle.swappable();
     warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(core.router_provider.as_ref().unwrap().as_ref(), &router_model, "router").await;
-    warmup_trio_provider(core.specialist_provider.as_ref().unwrap().as_ref(), &specialist_model, "specialist").await;
+    warmup_trio_provider(
+        core.router_provider.as_ref().unwrap().as_ref(),
+        &router_model,
+        "router",
+    )
+    .await;
+    warmup_trio_provider(
+        core.specialist_provider.as_ref().unwrap().as_ref(),
+        &specialist_model,
+        "specialist",
+    )
+    .await;
 
     let session_key = "trio-e2e-multi";
 
@@ -1529,7 +1679,11 @@ async fn test_trio_e2e_multi_turn() {
     )
     .await
     .expect("turn 1 timed out");
-    eprintln!("turn 1 ({} chars): {}", resp1.len(), &resp1[..resp1.len().min(100)]);
+    eprintln!(
+        "turn 1 ({} chars): {}",
+        resp1.len(),
+        &resp1[..resp1.len().min(100)]
+    );
     assert!(!resp1.is_empty(), "turn 1 should be non-empty");
 
     // Turn 2: tool path
@@ -1539,7 +1693,11 @@ async fn test_trio_e2e_multi_turn() {
     )
     .await
     .expect("turn 2 timed out");
-    eprintln!("turn 2 ({} chars): {}", resp2.len(), &resp2[..resp2.len().min(100)]);
+    eprintln!(
+        "turn 2 ({} chars): {}",
+        resp2.len(),
+        &resp2[..resp2.len().min(100)]
+    );
     assert!(!resp2.is_empty(), "turn 2 should be non-empty");
 
     // Turn 3: follow-up (tests session state persistence)
@@ -1549,7 +1707,11 @@ async fn test_trio_e2e_multi_turn() {
     )
     .await
     .expect("turn 3 timed out");
-    eprintln!("turn 3 ({} chars): {}", resp3.len(), &resp3[..resp3.len().min(100)]);
+    eprintln!(
+        "turn 3 ({} chars): {}",
+        resp3.len(),
+        &resp3[..resp3.len().min(100)]
+    );
     assert!(!resp3.is_empty(), "turn 3 should be non-empty");
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1596,25 +1758,57 @@ fn test_should_strip_tools_both_degraded() {
 
 #[test]
 fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, Some(512), &AdaptiveTokenConfig::default());
+    let out = adaptive_max_tokens(
+        4096,
+        false,
+        "What time is it?",
+        0,
+        true,
+        Some(512),
+        &AdaptiveTokenConfig::default(),
+    );
     assert_eq!(out, 3584);
 }
 
 #[test]
 fn test_adaptive_max_tokens_no_reserve_without_thinking() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, true, None, &AdaptiveTokenConfig::default());
+    let out = adaptive_max_tokens(
+        4096,
+        false,
+        "What time is it?",
+        0,
+        true,
+        None,
+        &AdaptiveTokenConfig::default(),
+    );
     assert_eq!(out, 4096);
 }
 
 #[test]
 fn test_adaptive_max_tokens_no_reserve_for_cloud() {
-    let out = adaptive_max_tokens(4096, false, "What time is it?", 0, false, Some(512), &AdaptiveTokenConfig::default());
+    let out = adaptive_max_tokens(
+        4096,
+        false,
+        "What time is it?",
+        0,
+        false,
+        Some(512),
+        &AdaptiveTokenConfig::default(),
+    );
     assert_eq!(out, 4096);
 }
 
 #[test]
 fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
-    let out = adaptive_max_tokens(512, false, "short", 0, true, Some(128), &AdaptiveTokenConfig::default());
+    let out = adaptive_max_tokens(
+        512,
+        false,
+        "short",
+        0,
+        true,
+        Some(128),
+        &AdaptiveTokenConfig::default(),
+    );
     assert_eq!(out, 256);
 }
 
@@ -1777,6 +1971,7 @@ fn build_trio_offline_harness(
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -1794,10 +1989,8 @@ fn build_trio_offline_harness(
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
 
-    let (inbound_tx, inbound_rx) =
-        tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) =
-        tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
 
     let agent_loop = AgentLoop::new(
         core_handle,
@@ -1836,8 +2029,7 @@ async fn test_trio_offline_e2e_respond() {
         "specialist unused",
     ));
 
-    let (agent_loop, workspace) =
-        build_trio_offline_harness(main, router, specialist);
+    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
 
     let resp = agent_loop
         .process_direct("What is 2+2?", "trio-offline-respond", "test", "offline")
@@ -1853,7 +2045,9 @@ async fn test_trio_offline_e2e_respond() {
     let metrics = &counters.trio_metrics;
 
     assert!(
-        metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .router_preflight_fired
+            .load(std::sync::atomic::Ordering::Relaxed),
         "router preflight should have fired"
     );
     assert_eq!(
@@ -1862,7 +2056,9 @@ async fn test_trio_offline_e2e_respond() {
         "router_action should be 'respond'"
     );
     assert!(
-        !metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        !metrics
+            .specialist_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed),
         "specialist should NOT have been dispatched for a 'respond' decision"
     );
     assert!(!resp.is_empty(), "response should be non-empty");
@@ -1879,10 +2075,8 @@ async fn test_local_thinking_reserves_max_tokens_end_to_end() {
     ));
     let main = Arc::new(RecordingProvider::new("offline-main", "ok"));
     let main_dyn: Arc<dyn LLMProvider> = main.clone();
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "unused",
-    ));
+    let specialist: Arc<dyn LLMProvider> =
+        Arc::new(StaticResponseLLM::new("offline-specialist", "unused"));
 
     let (agent_loop, workspace) = build_trio_offline_harness(main_dyn, router, specialist);
     agent_loop
@@ -1893,7 +2087,12 @@ async fn test_local_thinking_reserves_max_tokens_end_to_end() {
         .store(128, std::sync::atomic::Ordering::Relaxed);
 
     let _ = agent_loop
-        .process_direct("What is the current date?", "reserve-max-tokens", "test", "offline")
+        .process_direct(
+            "What is the current date?",
+            "reserve-max-tokens",
+            "test",
+            "offline",
+        )
         .await;
 
     assert_eq!(
@@ -1917,15 +2116,13 @@ async fn test_trio_offline_e2e_specialist_dispatch() {
         "offline-router",
         vec![router_resp, router_resp, router_resp],
     ));
-    let main: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
+    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
     let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
         "offline-specialist",
         "Here is the specialist answer.",
     ));
 
-    let (agent_loop, workspace) =
-        build_trio_offline_harness(main, router, specialist);
+    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
 
     let resp = agent_loop
         .process_direct(
@@ -1950,7 +2147,9 @@ async fn test_trio_offline_e2e_specialist_dispatch() {
         "router_action should be 'specialist'"
     );
     assert!(
-        metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .specialist_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed),
         "specialist should have been dispatched"
     );
     assert!(!resp.is_empty(), "response should be non-empty");
@@ -1985,11 +2184,12 @@ async fn test_trio_offline_e2e_circuit_breaker_cascade() {
         "offline-main",
         "main fallback response",
     ));
-    let specialist: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-specialist", "specialist unused"));
+    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+        "offline-specialist",
+        "specialist unused",
+    ));
 
-    let (agent_loop, workspace) =
-        build_trio_offline_harness(main, router, specialist);
+    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
 
     // Send 4 messages — each failure increments the CB counter.
     // After 3 failures (default threshold) the CB is tripped.
@@ -2065,8 +2265,8 @@ async fn test_trio_offline_e2e_circuit_breaker_cascade() {
 
 #[tokio::test]
 async fn test_trio_offline_e2e_health_gate() {
-    use crate::heartbeat::health::{HealthProbe, HealthRegistry, ProbeResult};
     use crate::config::schema::LcmSchemaConfig;
+    use crate::heartbeat::health::{HealthProbe, HealthRegistry, ProbeResult};
 
     // A mock probe that always returns unhealthy (simulates router being down).
     struct AlwaysUnhealthyProbe;
@@ -2112,8 +2312,10 @@ async fn test_trio_offline_e2e_health_gate() {
     let router: Arc<dyn LLMProvider> = router_seq.clone();
     let main: Arc<dyn LLMProvider> =
         Arc::new(StaticResponseLLM::new("offline-main", "main answer"));
-    let specialist: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-specialist", "specialist unused"));
+    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
+        "offline-specialist",
+        "specialist unused",
+    ));
 
     // Build harness manually so we can wire in the health registry.
     let workspace = tempfile::tempdir().unwrap().into_path();
@@ -2149,6 +2351,7 @@ async fn test_trio_offline_e2e_health_gate() {
         restrict_to_workspace: true,
         memory_config: MemoryConfig::default(),
         is_local: true,
+        lane: Lane::default(),
         compaction_provider: None,
         tool_delegation: td,
         provenance: ProvenanceConfig::default(),
@@ -2166,10 +2369,8 @@ async fn test_trio_offline_e2e_health_gate() {
     let counters = Arc::new(crate::agent::agent_core::RuntimeCounters::new(4096));
     let core_handle = AgentHandle::new(core, counters);
 
-    let (inbound_tx, inbound_rx) =
-        tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) =
-        tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
 
     let agent_loop = AgentLoop::new(
         core_handle,
@@ -2187,12 +2388,7 @@ async fn test_trio_offline_e2e_health_gate() {
     );
 
     let resp = agent_loop
-        .process_direct(
-            "Hello",
-            "trio-offline-health-gate",
-            "test",
-            "offline",
-        )
+        .process_direct("Hello", "trio-offline-health-gate", "test", "offline")
         .await;
 
     eprintln!(
@@ -2202,11 +2398,7 @@ async fn test_trio_offline_e2e_health_gate() {
     );
 
     // When the health gate fires, router_preflight returns Passthrough and sets Degraded.
-    let state = agent_loop
-        .shared
-        .core_handle
-        .counters
-        .get_trio_state();
+    let state = agent_loop.shared.core_handle.counters.get_trio_state();
     eprintln!("trio_state after health gate: {:?}", state);
     assert_eq!(
         state,
@@ -2215,18 +2407,25 @@ async fn test_trio_offline_e2e_health_gate() {
     );
 
     // Response must come from main (non-empty).
-    assert!(!resp.is_empty(), "response should come from main, not be empty");
+    assert!(
+        !resp.is_empty(),
+        "response should come from main, not be empty"
+    );
 
     // router_preflight_fired should be true (we entered preflight but returned Passthrough).
     let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
     assert!(
-        metrics.router_preflight_fired.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .router_preflight_fired
+            .load(std::sync::atomic::Ordering::Relaxed),
         "router_preflight_fired should be true (preflight was entered)"
     );
 
     // Specialist must not have been dispatched.
     assert!(
-        !metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        !metrics
+            .specialist_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed),
         "specialist should not be dispatched when health gate is active"
     );
 
@@ -2258,8 +2457,7 @@ async fn test_trio_offline_e2e_parse_fallback_lenient() {
         "offline-router",
         vec![router_resp, router_resp, router_resp],
     ));
-    let main: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
+    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
     let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
         "offline-specialist",
         "lenient parse worked",
@@ -2278,8 +2476,7 @@ async fn test_trio_offline_e2e_parse_fallback_lenient() {
         "lenient decision action should be 'specialist'"
     );
 
-    let (agent_loop, workspace) =
-        build_trio_offline_harness(main, router, specialist);
+    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
 
     let resp = agent_loop
         .process_direct(
@@ -2304,14 +2501,15 @@ async fn test_trio_offline_e2e_parse_fallback_lenient() {
         "router_action should be 'specialist' after lenient parse"
     );
     assert!(
-        metrics.specialist_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+        metrics
+            .specialist_dispatched
+            .load(std::sync::atomic::Ordering::Relaxed),
         "specialist should have been dispatched after lenient parse"
     );
     assert!(!resp.is_empty(), "response should be non-empty");
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
-
 
 // ============================================================================
 // appears_incomplete heuristic tests
@@ -2354,7 +2552,9 @@ mod continuation_tests {
     #[test]
     fn test_appears_incomplete_mid_sentence() {
         // Text ending mid-word (no terminal punctuation, long enough to trigger)
-        assert!(appears_incomplete("The configuration requires setting the correc"));
+        assert!(appears_incomplete(
+            "The configuration requires setting the correc"
+        ));
         assert!(appears_incomplete("You can use this approach to implemen"));
     }
 
@@ -2369,7 +2569,9 @@ mod continuation_tests {
     #[test]
     fn test_trailing_emoji_not_flagged() {
         // Period before emoji — response is complete, must not trigger continuation
-        assert!(!appears_incomplete("Why cross the road? To avoid borrows. 🦀"));
+        assert!(!appears_incomplete(
+            "Why cross the road? To avoid borrows. 🦀"
+        ));
         // Period before multiple emojis
         assert!(!appears_incomplete("The answer is 42. 🎉✨"));
     }
@@ -2416,7 +2618,8 @@ mod universal_textual_parse_tests {
     fn test_universal_parse_non_textual_replay() {
         // parse_textual_tool_calls should work on any content string regardless
         // of protocol mode — the function itself is protocol-agnostic.
-        let content = "I will run the command now.\n[I called: exec({\"command\": \"echo hello\"})]";
+        let content =
+            "I will run the command now.\n[I called: exec({\"command\": \"echo hello\"})]";
         let parsed = parse_textual_tool_calls(content);
         assert_eq!(
             parsed.len(),
@@ -2447,9 +2650,7 @@ mod nudge_tests {
     /// Verify that the 80%-ceiling formula produces the expected nudge thresholds.
     #[test]
     fn test_nudge_threshold_80_percent() {
-        let nudge_at = |max: u32| -> u32 {
-            ((max as f64) * 0.8).ceil() as u32
-        };
+        let nudge_at = |max: u32| -> u32 { ((max as f64) * 0.8).ceil() as u32 };
 
         // 10 * 0.8 = 8.0, ceil = 8
         assert_eq!(nudge_at(10), 8, "max=10 → nudge_at=8");
@@ -2476,7 +2677,9 @@ mod nudge_tests {
         // Simulate the rescue logic from finalize_response.rs
         let final_content = String::new();
         let result = if final_content.is_empty() && messages.len() > 2 {
-            let last_assistant = messages.iter().rev()
+            let last_assistant = messages
+                .iter()
+                .rev()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                 .and_then(|m| m.get("content").and_then(|c| c.as_str()))
                 .unwrap_or("");
@@ -2513,7 +2716,9 @@ mod nudge_tests {
 
         let final_content = String::new();
         let result = if final_content.is_empty() && messages.len() > 2 {
-            let last_assistant = messages.iter().rev()
+            let last_assistant = messages
+                .iter()
+                .rev()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                 .and_then(|m| m.get("content").and_then(|c| c.as_str()))
                 .unwrap_or("");
@@ -2545,19 +2750,19 @@ mod nudge_tests {
     #[test]
     fn test_cost_tracking_calculates_from_tokens() {
         use crate::agent::model_prices::ModelPrices;
-        
+
         let mut prices = ModelPrices::empty();
         // Add a test model: $0.01 per 1M prompt tokens, $0.03 per 1M completion tokens
         prices.prices.insert(
             "test-model".to_string(),
             (0.01 / 1_000_000.0, 0.03 / 1_000_000.0),
         );
-        
+
         // 10,000 prompt tokens * $0.01/1M = $0.0001
         // 5,000 completion tokens * $0.03/1M = $0.00015
         // Total: $0.00025
         let cost = prices.cost_of("test-model", 10_000, 5_000);
-        
+
         let expected = 0.0001 + 0.00015;
         assert!(
             (cost - expected).abs() < 0.0000001,
@@ -2574,15 +2779,15 @@ mod nudge_tests {
         // This test will fail until we wire cost tracking in finalize_response.rs:231
         // The TODO currently hardcodes cost_usd: 0.0
         // After wiring, this should record actual costs based on token usage
-        
+
         // For now, just verify the infrastructure exists
         use crate::agent::model_prices::ModelPrices;
         let prices = ModelPrices::empty();
-        
+
         // Verify cost_of returns 0.0 for unknown models
         let unknown_cost = prices.cost_of("unknown-model", 1000, 500);
         assert_eq!(unknown_cost, 0.0, "unknown models should return 0.0 cost");
-        
+
         // This assertion documents the TODO - it will pass once we wire cost tracking
         // Currently finalize_response hardcodes cost_usd: 0.0
         // TODO: Update this test to verify actual cost recording after wiring

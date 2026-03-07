@@ -826,7 +826,11 @@ impl AgentLoopShared {
         }
         // Apply ToolGate size-class filtering (main agent loop only;
         // subagents handle their own tools_filter in SubagentManager).
-        if let Some(allowed) = ToolGate::filter(ctx.core.model_capabilities.size_class, None) {
+        // Lane policy can override the effective size class (e.g. Answer
+        // lane forces Small/tiny tier regardless of actual model size).
+        let effective_size = ctx.core.lane.policy().tools
+            .effective_size_class(ctx.core.model_capabilities.size_class);
+        if let Some(allowed) = ToolGate::filter(effective_size, None) {
             let allowed_set: std::collections::HashSet<&str> =
                 allowed.iter().map(|s| s.as_str()).collect();
             tool_defs.retain(|def| {

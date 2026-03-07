@@ -2,6 +2,8 @@
 
 use std::sync::atomic::Ordering;
 
+use crate::agent::context::PromptBlockKind;
+
 use super::*;
 
 impl ReplContext {
@@ -33,11 +35,12 @@ impl ReplContext {
 
         println!();
         println!(
-            "  {}MODE{}      {} ({}, {})",
+            "  {}MODE{}      {} ({}, {}, {})",
             tui::BOLD,
             tui::RESET,
             mode_label,
             lane_label,
+            core.lane,
             model_name
         );
 
@@ -160,7 +163,11 @@ impl ReplContext {
             if is_local {
                 if has_remote_local {
                     // Remote local server (e.g. LM Studio): check the remote URL.
-                    let health = crate::server::check_health(remote_base, self.config.monitoring.health_check_timeout_secs).await;
+                    let health = crate::server::check_health(
+                        remote_base,
+                        self.config.monitoring.health_check_timeout_secs,
+                    )
+                    .await;
                     let (color, label) = if health {
                         (tui::GREEN, "healthy")
                     } else {
@@ -168,13 +175,16 @@ impl ReplContext {
                     };
                     servers.push(format!(
                         "LM Studio ({}{}{}{})",
-                        color, tui::BOLD, label, tui::RESET
+                        color,
+                        tui::BOLD,
+                        label,
+                        tui::RESET
                     ));
                 } else {
-                    let main_health = crate::server::check_health(&format!(
-                        "http://localhost:{}/v1",
-                        self.srv.local_port
-                    ), self.config.monitoring.health_check_timeout_secs)
+                    let main_health = crate::server::check_health(
+                        &format!("http://localhost:{}/v1", self.srv.local_port),
+                        self.config.monitoring.health_check_timeout_secs,
+                    )
                     .await;
                     let (color, label) = if main_health {
                         (tui::GREEN, "healthy")
@@ -192,7 +202,6 @@ impl ReplContext {
                 }
             }
 
-
             if !servers.is_empty() {
                 println!(
                     "  {}SERVERS{}   {}",
@@ -207,32 +216,51 @@ impl ReplContext {
         if let Some(ref registry) = self.health_registry {
             let states = registry.all_states();
             if !states.is_empty() {
-                let probe_labels: Vec<String> = states.iter().map(|s| {
-                    use crate::heartbeat::health::ProbeStatus;
-                    let (indicator, label) = match s.status {
-                        ProbeStatus::Healthy => {
-                            let ms = s.last_result.as_ref()
-                                .map(|r| format!(" ({}ms)", r.latency_ms))
-                                .unwrap_or_default();
-                            (format!("{}{}●{}", tui::GREEN, tui::BOLD, tui::RESET), format!("{}{}", s.name, ms))
-                        }
-                        ProbeStatus::Degraded => {
-                            let ago = s.last_healthy.map(|t| {
-                                let secs = t.elapsed().as_secs();
-                                if secs < 60 { format!(" ({}s ago)", secs) }
-                                else { format!(" ({}m ago)", secs / 60) }
-                            }).unwrap_or_default();
-                            (format!("{}{}●{}", tui::RED, tui::BOLD, tui::RESET), format!("{}: DOWN{}", s.name, ago))
-                        }
-                        ProbeStatus::Unknown => {
-                            (format!("{}{}●{}", tui::YELLOW, tui::BOLD, tui::RESET), format!("{}: pending", s.name))
-                        }
-                    };
-                    format!("{} {}", indicator, label)
-                }).collect();
+                let probe_labels: Vec<String> = states
+                    .iter()
+                    .map(|s| {
+                        use crate::heartbeat::health::ProbeStatus;
+                        let (indicator, label) = match s.status {
+                            ProbeStatus::Healthy => {
+                                let ms = s
+                                    .last_result
+                                    .as_ref()
+                                    .map(|r| format!(" ({}ms)", r.latency_ms))
+                                    .unwrap_or_default();
+                                (
+                                    format!("{}{}●{}", tui::GREEN, tui::BOLD, tui::RESET),
+                                    format!("{}{}", s.name, ms),
+                                )
+                            }
+                            ProbeStatus::Degraded => {
+                                let ago = s
+                                    .last_healthy
+                                    .map(|t| {
+                                        let secs = t.elapsed().as_secs();
+                                        if secs < 60 {
+                                            format!(" ({}s ago)", secs)
+                                        } else {
+                                            format!(" ({}m ago)", secs / 60)
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                (
+                                    format!("{}{}●{}", tui::RED, tui::BOLD, tui::RESET),
+                                    format!("{}: DOWN{}", s.name, ago),
+                                )
+                            }
+                            ProbeStatus::Unknown => (
+                                format!("{}{}●{}", tui::YELLOW, tui::BOLD, tui::RESET),
+                                format!("{}: pending", s.name),
+                            ),
+                        };
+                        format!("{} {}", indicator, label)
+                    })
+                    .collect();
                 println!(
                     "  {}HEALTH{}    {}",
-                    tui::BOLD, tui::RESET,
+                    tui::BOLD,
+                    tui::RESET,
                     probe_labels.join("  ")
                 );
             }
@@ -241,12 +269,20 @@ impl ReplContext {
         // TRIO section — only shown when trio mode is active.
         if self.config.trio.enabled {
             let router_health = if let Some(ref hr) = self.health_registry {
-                if hr.is_healthy("trio_router") { "healthy" } else { "degraded" }
+                if hr.is_healthy("trio_router") {
+                    "healthy"
+                } else {
+                    "degraded"
+                }
             } else {
                 "n/a"
             };
             let specialist_health = if let Some(ref hr) = self.health_registry {
-                if hr.is_healthy("trio_specialist") { "healthy" } else { "degraded" }
+                if hr.is_healthy("trio_specialist") {
+                    "healthy"
+                } else {
+                    "degraded"
+                }
             } else {
                 "n/a"
             };
@@ -280,7 +316,7 @@ impl ReplContext {
     }
 
     /// /context — show context breakdown (tokens, messages, memory).
-    pub(super) fn cmd_context(&self) {
+    pub(super) async fn cmd_context(&self) {
         let core = self.core_handle.swappable();
         let counters = &self.core_handle.counters;
         let used = counters.last_context_used.load(Ordering::Relaxed) as usize;
@@ -294,73 +330,174 @@ impl ReplContext {
             0.0
         };
 
-        // Estimate system prompt size from an empty message build.
-        let system_prompt = core.context.build_messages(
-            &[],
-            "",
-            None,
-            None,
-            Some("cli"),
-            Some("repl"),
-            false,
-            None,
-        );
-        let system_tokens = if let Some(sys) = system_prompt.first() {
-            crate::agent::token_budget::TokenBudget::estimate_message_tokens_pub(sys)
-        } else {
-            0
-        };
-
         println!();
         println!("  {}Context Breakdown{}", tui::BOLD, tui::RESET);
-        // System prompt component breakdown.
-        let identity_tokens = {
-            let identity = core.context.build_system_prompt(None, None);
-            crate::agent::token_budget::TokenBudget::estimate_str_tokens(&identity)
+        let block_kind = |kind: PromptBlockKind| match kind {
+            PromptBlockKind::Prefix => "prefix",
+            PromptBlockKind::Static => "static",
+            PromptBlockKind::Runtime => "runtime",
         };
-        let bootstrap_budget = core.context.bootstrap_budget;
-        let ltm_budget = core.context.long_term_memory_budget;
 
-        println!(
-            "  {}System prompt:    {} {:>6} tokens{}",
-            tui::DIM,
-            tui::RESET,
-            tui::format_thousands(system_tokens),
-            tui::RESET
-        );
-        println!(
-            "  {}  identity:       {} {:>6}{}",
-            tui::DIM,
-            tui::RESET,
-            tui::format_thousands(identity_tokens),
-            tui::RESET
-        );
-        println!(
-            "  {}  bootstrap cap:  {} {:>6}{}",
-            tui::DIM,
-            tui::RESET,
-            tui::format_thousands(bootstrap_budget),
-            tui::RESET
-        );
-        println!(
-            "  {}  memory cap:     {} {:>6}{}",
-            tui::DIM,
-            tui::RESET,
-            tui::format_thousands(ltm_budget),
-            tui::RESET
-        );
+        if core.context.local_prompt_mode {
+            let runtime_blocks = self
+                .agent_loop
+                .local_prompt_runtime_blocks(&self.session_id)
+                .await;
+            let report = core.context.describe_local_system_prompt(
+                None,
+                Some("cli"),
+                Some("repl"),
+                false,
+                None,
+                &runtime_blocks,
+            );
+            let wm_in_prompt = report
+                .blocks
+                .iter()
+                .find(|b| b.title == "Working Memory" && b.included)
+                .map(|b| b.tokens)
+                .unwrap_or(0);
+
+            println!(
+                "  {}Prompt mode:      {} local lean{}",
+                tui::DIM,
+                tui::RESET,
+                tui::RESET
+            );
+            match report.cap_tokens {
+                Some(cap) => println!(
+                    "  {}System prompt:    {} {:>6} tokens (cap {}){}",
+                    tui::DIM,
+                    tui::RESET,
+                    tui::format_thousands(report.total_tokens),
+                    tui::format_thousands(cap),
+                    tui::RESET
+                ),
+                None => println!(
+                    "  {}System prompt:    {} {:>6} tokens{}",
+                    tui::DIM,
+                    tui::RESET,
+                    tui::format_thousands(report.total_tokens),
+                    tui::RESET
+                ),
+            }
+            println!("  {}  included:{}", tui::DIM, tui::RESET,);
+            for block in report.blocks.iter().filter(|b| b.included) {
+                println!(
+                    "  {}    {:<7} {:<18}{} {:>6}{}",
+                    tui::DIM,
+                    block_kind(block.kind),
+                    block.title,
+                    tui::RESET,
+                    tui::format_thousands(block.tokens),
+                    tui::RESET
+                );
+            }
+            let dropped: Vec<_> = report.blocks.iter().filter(|b| !b.included).collect();
+            if !dropped.is_empty() {
+                println!("  {}  dropped by cap:{}", tui::DIM, tui::RESET);
+                for block in dropped {
+                    println!(
+                        "  {}    {:<7} {:<18}{} {:>6}{}",
+                        tui::DIM,
+                        block_kind(block.kind),
+                        block.title,
+                        tui::RESET,
+                        tui::format_thousands(block.tokens),
+                        tui::RESET
+                    );
+                }
+            }
+            println!(
+                "  {}Working memory:   {} {:>6} stored / {:>6} in prompt{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(wm_tokens),
+                tui::format_thousands(wm_in_prompt),
+                tui::RESET
+            );
+        } else {
+            let messages = core.context.build_messages(
+                &[],
+                "",
+                None,
+                None,
+                Some("cli"),
+                Some("repl"),
+                false,
+                None,
+            );
+            let system_tokens = messages
+                .iter()
+                .find(|m| m["role"] == "system")
+                .map(crate::agent::token_budget::TokenBudget::estimate_message_tokens_pub)
+                .unwrap_or(0);
+            let developer_tokens = messages
+                .iter()
+                .find(|m| m["role"] == "developer")
+                .map(crate::agent::token_budget::TokenBudget::estimate_message_tokens_pub)
+                .unwrap_or(0);
+            let identity_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(
+                &core.context.build_identity_prompt(),
+            );
+
+            println!(
+                "  {}Prompt mode:      {} cloud split{}",
+                tui::DIM,
+                tui::RESET,
+                tui::RESET
+            );
+            println!(
+                "  {}System role:      {} {:>6} tokens{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(system_tokens),
+                tui::RESET
+            );
+            println!(
+                "  {}  identity:       {} {:>6}{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(identity_tokens),
+                tui::RESET
+            );
+            if developer_tokens > 0 {
+                println!(
+                    "  {}Developer role:   {} {:>6} tokens{}",
+                    tui::DIM,
+                    tui::RESET,
+                    tui::format_thousands(developer_tokens),
+                    tui::RESET
+                );
+            }
+            println!(
+                "  {}  bootstrap cap:  {} {:>6}{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(core.context.bootstrap_budget),
+                tui::RESET
+            );
+            println!(
+                "  {}  memory cap:     {} {:>6}{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(core.context.long_term_memory_budget),
+                tui::RESET
+            );
+            println!(
+                "  {}Working memory:   {} {:>6} tokens{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(wm_tokens),
+                tui::RESET
+            );
+        }
+
         println!(
             "  {}History:          {} {:>6} messages{}",
             tui::DIM,
             tui::RESET,
             msg_count,
-            tui::RESET
-        );
-        println!(
-            "  {}Working memory:   {} {:>6} tokens{}",
-            tui::DIM,
-            tui::RESET,
-            tui::format_thousands(wm_tokens),
             tui::RESET
         );
         println!(
@@ -377,6 +514,28 @@ impl ReplContext {
             .last_estimated_prompt_tokens
             .load(Ordering::Relaxed);
         let act = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
+        let completion = counters
+            .last_actual_completion_tokens
+            .load(Ordering::Relaxed);
+        if est > 0 {
+            println!(
+                "  {}Last prompt est:  {} {:>6} tokens{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(est as usize),
+                tui::RESET
+            );
+        }
+        if act > 0 {
+            println!(
+                "  {}Provider usage:   {} {:>6} prompt / {:>6} completion{}",
+                tui::DIM,
+                tui::RESET,
+                tui::format_thousands(act as usize),
+                tui::format_thousands(completion as usize),
+                tui::RESET
+            );
+        }
         if act > 0 && est > 0 {
             let drift_pct = (act as f64 - est as f64) / act as f64 * 100.0;
             println!(
@@ -459,7 +618,10 @@ impl ReplContext {
         self.agent_loop.clear_lcm_engine(&self.session_id).await;
         self.agent_loop.clear_bulletin_cache();
         if had_content {
-            println!("\n  Working memory and conversation cleared for session: {}\n", self.session_id);
+            println!(
+                "\n  Working memory and conversation cleared for session: {}\n",
+                self.session_id
+            );
         } else {
             println!("\n  Conversation history cleared.\n");
         }

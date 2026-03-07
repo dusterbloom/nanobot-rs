@@ -15,6 +15,7 @@ use crate::agent::agent_profiles;
 use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
+use crate::agent::lane::Lane;
 use crate::agent::learning::LearningStore;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
@@ -59,6 +60,7 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    pub lane: Lane,
     /// Whether the current main provider is a cluster peer (feature-gated).
     #[cfg(feature = "cluster")]
     pub is_cluster_peer: bool,
@@ -326,6 +328,7 @@ pub struct SwappableCoreConfig {
     pub restrict_to_workspace: bool,
     pub memory_config: MemoryConfig,
     pub is_local: bool,
+    pub lane: Lane,
     pub compaction_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_delegation: ToolDelegationConfig,
     pub provenance: ProvenanceConfig,
@@ -369,6 +372,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         memory_config,
         is_local,
+        lane,
         compaction_provider,
         tool_delegation,
         provenance,
@@ -580,6 +584,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        lane,
         #[cfg(feature = "cluster")]
         is_cluster_peer: false,
         anti_drift: trio_config.anti_drift.clone(),

@@ -3,25 +3,25 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-01-PLAN.md (LearnLoop)
-last_updated: "2026-03-07T16:41:08.295Z"
-last_activity: 2026-03-07 — Completed 04-01-PLAN.md (LearnLoop)
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-03-07T17:24:51.561Z"
+last_activity: 2026-03-07 — Completed 05-01-PLAN.md (Lane Types)
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 8
+  completed_plans: 7
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Phase: Phase 4 — Learn Loop
-Plan: 1 of 1 complete
+Phase: Phase 5 — Lane Split
+Plan: 1 of 2 complete
 Status: Executing
-Progress: [==========] 1/1 plans
-Last activity: 2026-03-07 — Completed 04-01-PLAN.md (LearnLoop)
+Progress: [=====-----] 1/2 plans
+Last activity: 2026-03-07 — Completed 05-01-PLAN.md (Lane Types)
 
 ## Project Reference
 
@@ -55,6 +55,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 - Pre-compute cost_usd in finalize_response (async context) and pass via TurnOutcome
 - Calibrator field changed to Arc<Mutex<...>> for shared ownership between AgentLoopShared and LearnLoop
 - LearnLoop rebuilt on set_perplexity_gate/set_mlx_provider to capture updated config
+- [Phase 05]: Lane::Action is default (action-oriented assistant behavior)
+- [Phase 05]: ToolGateProfile::ReadOnly forces Small size class via effective_size_class()
+- [Phase 05]: default_lane is Option<String> in config to keep schema decoupled from agent types
 
 ## Performance Metrics
 
@@ -66,8 +69,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 | 02 | 02 | 3min | 1 | 1 |
 | 03 | 01 | 8min | 2 | 3 |
 | 04 | 01 | 8min | 2 | 6 |
+| 05 | 01 | 2min | 2 | 3 |
 
 ## Last Session
 
-- **Stopped at:** Completed 04-01-PLAN.md (LearnLoop)
+- **Stopped at:** Completed 05-01-PLAN.md
 - **Timestamp:** 2026-03-07T16:33:47Z

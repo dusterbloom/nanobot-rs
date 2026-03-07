@@ -91,6 +91,11 @@ impl PromptBlock {
         }
     }
 
+    /// Returns a reference to the block title.
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
     /// Returns a reference to the raw content string.
     pub(crate) fn content(&self) -> &str {
         &self.content
@@ -711,10 +716,7 @@ impl ContextBuilder {
         if !long_term.is_empty() {
             sections.push(SectionEntry {
                 section: PromptSection::MemoryBriefing,
-                block: PromptBlock::new(
-                    "Memory",
-                    &format!("## Long-term Memory\n{}", long_term),
-                ),
+                block: PromptBlock::new("Memory", &format!("## Long-term Memory\n{}", long_term)),
                 allocated_tokens: 0,
                 actual_tokens: 0,
                 source: SectionSource::File("MEMORY.md".to_string()),
@@ -778,8 +780,7 @@ impl ContextBuilder {
 
         // --- Subagent profiles (part of Skills/OnDemandContext area) ---
         if !self.agent_profiles.is_empty() {
-            let capped =
-                Self::_truncate_to_budget_head(&self.agent_profiles, self.profiles_budget);
+            let capped = Self::_truncate_to_budget_head(&self.agent_profiles, self.profiles_budget);
             if !capped.is_empty() {
                 sections.push(SectionEntry {
                     section: PromptSection::OnDemandContext,
@@ -1011,19 +1012,12 @@ impl ContextBuilder {
         let suffix = rendered_parts.join("\n\n---\n\n");
 
         // Find and extend the developer message, or create one.
-        if let Some(dev_msg) = messages
-            .iter_mut()
-            .find(|m| m["role"] == "developer")
-        {
-            let existing = dev_msg["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+        if let Some(dev_msg) = messages.iter_mut().find(|m| m["role"] == "developer") {
+            let existing = dev_msg["content"].as_str().unwrap_or("").to_string();
             if existing.is_empty() {
                 dev_msg["content"] = Value::String(suffix);
             } else {
-                dev_msg["content"] =
-                    Value::String(format!("{}\n\n---\n\n{}", existing, suffix));
+                dev_msg["content"] = Value::String(format!("{}\n\n---\n\n{}", existing, suffix));
             }
         } else {
             // No developer message exists -- insert one after the system message.

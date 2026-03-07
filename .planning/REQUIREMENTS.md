@@ -37,8 +37,8 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 ### Lane Split
 
-- [ ] **LANE-01**: Lane enum (Answer/Action) with LanePolicy struct configuring all contracts
-- [ ] **LANE-02**: Per-contract profile types (PromptProfile, ToolGateProfile, MemoryProfile, LearnProfile, ParserProfile)
+- [x] **LANE-01**: Lane enum (Answer/Action) with LanePolicy struct configuring all contracts
+- [x] **LANE-02**: Per-contract profile types (PromptProfile, ToolGateProfile, MemoryProfile, LearnProfile, ParserProfile)
 
 ## v0.2.0 Requirements
 
@@ -97,8 +97,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LEARN-01 | Phase 4 | Complete |
 | LEARN-02 | Phase 4 | Complete |
 | LEARN-03 | Phase 4 | Complete |
-| LANE-01 | Phase 5 | Pending |
-| LANE-02 | Phase 5 | Pending |
+| LANE-01 | Phase 5 | Complete |
+| LANE-02 | Phase 5 | Complete |
 
 **Coverage:**
 - v0.1.1 requirements: 15 total

@@ -10,6 +10,9 @@ use crate::agent::agent_loop::{
     build_swappable_core, AgentHandle, AgentLoop, RuntimeCounters, SharedCoreHandle,
     SwappableCoreConfig,
 };
+use crate::agent::lane::Lane;
+#[cfg(feature = "mlx")]
+use crate::agent::mlx_lora::ModelConfig;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{AdaptiveTokenConfig, Config};
 use crate::cron::service::CronService;
@@ -323,7 +326,7 @@ use crate::agent::mlx_lm::is_mlx_model_dir;
 pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
     let s = dir.to_string_lossy();
     let s_lower = s.to_lowercase();
-    if s_lower.contains("qwen3.5") {
+    if s_lower.contains("qwen3.5-2b") || s_lower.contains("qwen3_5-2b") {
         "qwen3.5-2b"
     } else if s_lower.contains("qwen3-8b") || s_lower.contains("qwen3-8_b") {
         "qwen3-8b"
@@ -332,7 +335,7 @@ pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
     } else if s_lower.contains("qwen3-1.7b") || s_lower.contains("qwen3-1_7b") {
         "qwen3-1.7b"
     } else if s_lower.contains("qwen3-0.6b") || s_lower.contains("qwen3-0_6b") {
-        "qwen3-1.7b" // closest architecture (standard Qwen3 transformer)
+        "qwen3-0.6b"
     } else {
         // Non-Qwen or unknown model — in-process loading will fail gracefully,
         // mlx-lm server handles inference for any model.
@@ -340,26 +343,32 @@ pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
     }
 }
 
+#[cfg(feature = "mlx")]
+pub(crate) fn model_config_from_preset(preset: &str) -> Option<ModelConfig> {
+    match preset {
+        "qwen3-0.6b" => Some(ModelConfig::qwen3_0_6b()),
+        "qwen3-1.7b" => Some(ModelConfig::qwen3_1_7b()),
+        "qwen3-4b" => Some(ModelConfig::qwen3_4b()),
+        "qwen3-8b" => Some(ModelConfig::qwen3_8b()),
+        "qwen3.5-2b" => Some(ModelConfig::qwen3_5_2b()),
+        _ => None,
+    }
+}
+
 /// Start the in-process MLX provider. Returns the handle and an Arc provider
 /// for use as the main LLM provider.
 #[cfg(feature = "mlx")]
 pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
-    use crate::agent::mlx_lora::{LoraConfig, ModelConfig};
+    use crate::agent::mlx_lora::LoraConfig;
 
     let model_dir = resolve_mlx_model_dir(config);
     // Always auto-detect preset from model dir name to avoid stale config mismatches.
     let effective_preset = preset_from_model_dir(&model_dir).to_string();
-    let model_config = match effective_preset.as_str() {
-        "qwen3-1.7b" => ModelConfig::qwen3_1_7b(),
-        "qwen3-4b" => ModelConfig::qwen3_4b(),
-        "qwen3-8b" => ModelConfig::qwen3_8b(),
-        "qwen3.5-2b" => ModelConfig::qwen3_5_2b(),
-        _ => {
-            // Unknown model — use Qwen3-1.7B as a placeholder; in-process load
-            // will fail gracefully and mlx-lm server handles inference.
-            ModelConfig::qwen3_1_7b()
-        }
-    };
+    let model_config = model_config_from_preset(&effective_preset).unwrap_or_else(|| {
+        // Unknown model — use Qwen3-1.7B as a placeholder; in-process load
+        // will fail gracefully and mlx-lm server handles inference.
+        ModelConfig::qwen3_1_7b()
+    });
     let lora_config = LoraConfig {
         lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
         ..LoraConfig::default()
@@ -373,7 +382,10 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
 
     let mlx_lm_url = config.agents.defaults.mlx_lm_url.clone();
     let provider = crate::providers::mlx::MlxProvider::start_with_mlx_lm(
-        model_dir, model_config, lora_config, mlx_lm_url,
+        model_dir,
+        model_config,
+        lora_config,
+        mlx_lm_url,
     )?;
     Ok(MlxHandle {
         provider: Arc::new(provider),
@@ -395,6 +407,12 @@ fn core_config_from(
     delegation: Option<Arc<dyn LLMProvider>>,
     specialist: Option<Arc<dyn LLMProvider>>,
 ) -> SwappableCoreConfig {
+    let lane = config
+        .agents
+        .default_lane
+        .as_deref()
+        .and_then(|s| s.parse::<Lane>().ok())
+        .unwrap_or_default();
     let brave_key = if config.tools.web.search.api_key.is_empty() {
         None
     } else {
@@ -422,6 +440,7 @@ fn core_config_from(
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
         memory_config: config.memory.clone(),
         is_local,
+        lane,
         compaction_provider: compaction,
         tool_delegation: config.tool_delegation.clone(),
         provenance: config.provenance.clone(),
@@ -483,7 +502,14 @@ pub(crate) fn build_core_handle(
     };
 
     let core = build_swappable_core(core_config_from(
-        config, provider, model, max_context_tokens, is_local, cp, dp, sp,
+        config,
+        provider,
+        model,
+        max_context_tokens,
+        is_local,
+        cp,
+        dp,
+        sp,
     ));
     let counters = Arc::new(RuntimeCounters::new_with_config(
         max_context_tokens,
@@ -508,16 +534,20 @@ pub(crate) fn build_core_handle(
 /// `is_local` is set to `false` because MLX speaks proper tool_calls and
 /// does not need the local protocol quirks (user-last, no prefill).
 #[cfg(feature = "mlx")]
-pub(crate) fn build_core_handle_mlx(
-    config: &Config,
-    mlx: &MlxHandle,
-) -> SharedCoreHandle {
+pub(crate) fn build_core_handle_mlx(config: &Config, mlx: &MlxHandle) -> SharedCoreHandle {
     let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
     let model = format!("mlx:{}", provider.get_default_model());
     let max_context_tokens = mlx_max_context(config);
 
     let core = build_swappable_core(core_config_from(
-        config, provider, model, max_context_tokens, true, None, None, None,
+        config,
+        provider,
+        model,
+        max_context_tokens,
+        true,
+        None,
+        None,
+        None,
     ));
     let counters = Arc::new(RuntimeCounters::new_with_config(
         max_context_tokens,
@@ -530,17 +560,20 @@ pub(crate) fn build_core_handle_mlx(
 ///
 /// Like `rebuild_core` but uses the MLX provider instead of LM Studio.
 #[cfg(feature = "mlx")]
-pub(crate) fn rebuild_core_mlx(
-    handle: &SharedCoreHandle,
-    config: &Config,
-    mlx: &MlxHandle,
-) {
+pub(crate) fn rebuild_core_mlx(handle: &SharedCoreHandle, config: &Config, mlx: &MlxHandle) {
     let provider: Arc<dyn LLMProvider> = mlx.provider.clone();
     let model = format!("mlx:{}", provider.get_default_model());
     let max_context_tokens = mlx_max_context(config);
 
     let new_core = build_swappable_core(core_config_from(
-        config, provider, model, max_context_tokens, true, None, None, None,
+        config,
+        provider,
+        model,
+        max_context_tokens,
+        true,
+        None,
+        None,
+        None,
     ));
     handle.swap_core(new_core);
 }
@@ -584,7 +617,14 @@ pub(crate) fn rebuild_core(
     };
 
     let new_core = build_swappable_core(core_config_from(
-        config, provider, model, max_context_tokens, is_local, cp, dp, sp,
+        config,
+        provider,
+        model,
+        max_context_tokens,
+        is_local,
+        cp,
+        dp,
+        sp,
     ));
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
@@ -613,7 +653,15 @@ pub(crate) fn create_agent_loop(
     repl_display_tx: Option<mpsc::UnboundedSender<String>>,
     health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 ) -> AgentLoop {
-    create_agent_loop_inner(core_handle, config, cron_service, email_config, repl_display_tx, health_registry, None)
+    create_agent_loop_inner(
+        core_handle,
+        config,
+        cron_service,
+        email_config,
+        repl_display_tx,
+        health_registry,
+        None,
+    )
 }
 
 /// Create an agent loop wired to an in-process MLX provider.
@@ -630,7 +678,15 @@ pub(crate) fn create_agent_loop_mlx(
     health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     mlx: &MlxHandle,
 ) -> AgentLoop {
-    create_agent_loop_inner(core_handle, config, cron_service, email_config, repl_display_tx, health_registry, Some(mlx))
+    create_agent_loop_inner(
+        core_handle,
+        config,
+        cron_service,
+        email_config,
+        repl_display_tx,
+        health_registry,
+        Some(mlx),
+    )
 }
 
 fn create_agent_loop_inner(
@@ -714,4 +770,66 @@ pub(crate) fn setup_cluster_for_repl(
     ));
     agent_loop.set_cluster_router(router);
     Some(Arc::new(cluster_state))
+}
+
+#[cfg(all(test, feature = "mlx"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preset_from_model_dir_recognizes_supported_qwen_variants() {
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new("/tmp/mlx-community/Qwen3-0.6B-8bit")),
+            "qwen3-0.6b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/lmstudio-community/Qwen3-1.7B-MLX-8bit"
+            )),
+            "qwen3-1.7b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/qwen/Qwen3-4B-Thinking-2507-MLX-4bit"
+            )),
+            "qwen3-4b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new("/tmp/qwen/Qwen3-8B-MLX-4bit")),
+            "qwen3-8b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/mlx-community/Qwen3.5-2B-MLX-8bit"
+            )),
+            "qwen3.5-2b"
+        );
+    }
+
+    #[test]
+    fn test_preset_from_model_dir_keeps_unknown_qwen35_variants_unknown() {
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/mlx-community/Qwen3.5-9B-MLX-4bit"
+            )),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn test_model_config_from_preset_supports_full_mlx_server_matrix() {
+        for preset in [
+            "qwen3-0.6b",
+            "qwen3-1.7b",
+            "qwen3-4b",
+            "qwen3-8b",
+            "qwen3.5-2b",
+        ] {
+            assert!(
+                model_config_from_preset(preset).is_some(),
+                "expected preset {preset} to resolve"
+            );
+        }
+        assert!(model_config_from_preset("unknown").is_none());
+    }
 }

@@ -37,11 +37,13 @@ impl AgentLoopShared {
                 None,
                 &core.sessions,
             );
+            let memory_multiplier = core.lane.policy().memory.budget_multiplier;
+            let adjusted_budget = ((core.working_memory_budget as f64 * memory_multiplier) as usize).min(200);
             let results = ladder
                 .query(&MemoryQuery {
                     session_key,
                     query: "",
-                    total_budget: core.working_memory_budget.min(200),
+                    total_budget: adjusted_budget,
                 });
             for result in results {
                 if !result.content.is_empty() {
@@ -76,6 +78,18 @@ impl AgentLoopShared {
             ));
         }
 
+        // Filter blocks by lane prompt profile (e.g. Answer lane excludes
+        // ToolPatterns and BackgroundTasks).
+        let prompt_profile = core.lane.policy().prompt;
+        blocks.retain(|block| {
+            let section = match block.title() {
+                "Tool Patterns" => PromptSection::ToolPatterns,
+                "Background Tasks" => PromptSection::BackgroundTasks,
+                _ => return true, // unknown title => keep
+            };
+            prompt_profile.includes(section)
+        });
+
         blocks
     }
 
@@ -105,11 +119,13 @@ impl AgentLoopShared {
                 ks_ref,
                 &core.sessions,
             );
+            let memory_multiplier = core.lane.policy().memory.budget_multiplier;
+            let adjusted_budget = (core.working_memory_budget as f64 * memory_multiplier) as usize;
             let results = ladder
                 .query(&MemoryQuery {
                     session_key,
                     query: "",
-                    total_budget: core.working_memory_budget,
+                    total_budget: adjusted_budget,
                 });
 
             for result in results {
@@ -187,6 +203,11 @@ impl AgentLoopShared {
         }
 
         // 4. Memory bulletin/briefing — replaced by GroundTruth layer in MemoryLadder above.
+
+        // Filter sections by lane prompt profile (e.g. Answer lane excludes
+        // ToolPatterns and BackgroundTasks).
+        let prompt_profile = core.lane.policy().prompt;
+        sections.retain(|entry| prompt_profile.includes(entry.section));
 
         sections
     }
