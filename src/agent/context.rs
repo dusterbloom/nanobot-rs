@@ -59,12 +59,76 @@ pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
 /// Well-known files that are loaded from the workspace root when present.
 const BOOTSTRAP_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"];
 
+#[derive(Debug, Clone)]
+pub struct PromptBlock {
+    title: String,
+    content: String,
+}
+
+impl PromptBlock {
+    pub(crate) fn new(title: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            content: content.into(),
+        }
+    }
+
+    pub(crate) fn render(&self) -> String {
+        if self.content.trim().is_empty() {
+            String::new()
+        } else if self.title.trim().is_empty() {
+            self.content.trim().to_string()
+        } else {
+            format!("## {}\n\n{}", self.title.trim(), self.content.trim())
+        }
+    }
+
+    pub(crate) fn report_title(&self) -> String {
+        if self.title.trim().is_empty() {
+            "Session Metadata".to_string()
+        } else {
+            self.title.trim().to_string()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptBlockKind {
+    Prefix,
+    Static,
+    Runtime,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptBlockReport {
+    pub kind: PromptBlockKind,
+    pub title: String,
+    pub tokens: usize,
+    pub included: bool,
+    /// Tokens allocated by the budget (0 = legacy/untracked).
+    pub allocated_tokens: usize,
+    /// Source descriptor (empty string = legacy/untracked).
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptAssemblyReport {
+    pub prompt: String,
+    pub total_tokens: usize,
+    pub cap_tokens: Option<usize>,
+    pub blocks: Vec<PromptBlockReport>,
+}
+
 /// Builds the context (system prompt + messages) for the agent.
 pub struct ContextBuilder {
     pub workspace: PathBuf,
     pub memory: MemoryStore,
     pub skills: SkillsLoader,
     pub model_name: String,
+    /// When true, build a compact local-style prompt instead of the cloud
+    /// system+developer split. This is driven by runtime locality, not by the
+    /// model name prefix alone, so MLX local inference can use the lean path.
+    pub local_prompt_mode: bool,
     /// Max tokens for bootstrap instruction files in the system prompt.
     pub bootstrap_budget: usize,
     /// Max tokens for long-term memory (`MEMORY.md`) in the system prompt.
@@ -105,6 +169,7 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
+            local_prompt_mode: false,
             bootstrap_budget: 1500,
             long_term_memory_budget: 400,
             skills_budget: 1000,
@@ -129,6 +194,7 @@ impl ContextBuilder {
             memory: MemoryStore::new(workspace),
             skills: SkillsLoader::new(workspace, None),
             model_name: String::new(),
+            local_prompt_mode: true,
             bootstrap_budget: 500,
             long_term_memory_budget: 200,
             skills_budget: 300,
@@ -150,7 +216,7 @@ impl ContextBuilder {
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(100, 1_000); // 1%
         self.skills_budget = (max_context_tokens / 50).clamp(200, 1_500); // 2%
         self.profiles_budget = (max_context_tokens / 100).clamp(100, 800); // 1%
-        // Hard cap: 30% of context for system prompt, leaving 70% for conversation.
+                                                                           // Hard cap: 30% of context for system prompt, leaving 70% for conversation.
         self.system_prompt_cap = (max_context_tokens * 3 / 10).clamp(500, 4_000);
     }
 
@@ -163,7 +229,7 @@ impl ContextBuilder {
         self.long_term_memory_budget = (max_context_tokens / 100).clamp(200, 10_000); // 1%
         self.skills_budget = (max_context_tokens / 25).clamp(500, 20_000); // 4%
         self.profiles_budget = (max_context_tokens / 50).clamp(300, 10_000); // 2%
-        // Cloud models: generous cap (40% of context), or 0 to disable.
+                                                                             // Cloud models: generous cap (40% of context), or 0 to disable.
         self.system_prompt_cap = max_context_tokens * 2 / 5; // 40%
     }
 
@@ -250,7 +316,9 @@ impl ContextBuilder {
         // `lazy_skills` is kept for backward compat and treated as "xml" disclosure.
         let effective_disclosure = if self.skill_disclosure == "eager" {
             "eager"
-        } else if self.skill_disclosure == "xml" || (!self.skill_disclosure.is_empty() && self.skill_disclosure != "compact") {
+        } else if self.skill_disclosure == "xml"
+            || (!self.skill_disclosure.is_empty() && self.skill_disclosure != "compact")
+        {
             "xml"
         } else {
             // "compact" is default; also applied when lazy_skills=true (unless overridden)
@@ -317,10 +385,7 @@ impl ContextBuilder {
         // Subagent profiles â€” tells the model what agents exist and when to delegate.
         // Capped at profiles_budget to avoid blowing context for small models.
         if !self.agent_profiles.is_empty() {
-            let capped = Self::_truncate_to_budget_head(
-                &self.agent_profiles,
-                self.profiles_budget,
-            );
+            let capped = Self::_truncate_to_budget_head(&self.agent_profiles, self.profiles_budget);
             if !capped.is_empty() {
                 parts.push(capped);
             }
@@ -383,6 +448,50 @@ impl ContextBuilder {
         }
     }
 
+    /// Build a compact local system prompt from a stable prefix plus optional
+    /// static and runtime blocks. The final result is capped end-to-end.
+    pub fn build_local_system_prompt(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+        runtime_blocks: &[PromptBlock],
+    ) -> String {
+        let prefix = self._get_local_identity();
+        let static_blocks = self.build_local_static_blocks(
+            skill_names,
+            channel,
+            chat_id,
+            is_voice_message,
+            detected_language,
+        );
+        self.assemble_local_prompt_report(&prefix, &static_blocks, runtime_blocks)
+            .prompt
+    }
+
+    /// Describe the compact local prompt assembly with per-block token counts.
+    pub fn describe_local_system_prompt(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+        runtime_blocks: &[PromptBlock],
+    ) -> PromptAssemblyReport {
+        let prefix = self._get_local_identity();
+        let static_blocks = self.build_local_static_blocks(
+            skill_names,
+            channel,
+            chat_id,
+            is_voice_message,
+            detected_language,
+        );
+        self.assemble_local_prompt_report(&prefix, &static_blocks, runtime_blocks)
+    }
+
     /// Build the complete message list for an LLM call.
     pub fn build_messages(
         &self,
@@ -398,21 +507,19 @@ impl ContextBuilder {
         let mut messages: Vec<Value> = Vec::new();
 
         // Determine whether to use the `developer` role for injected context.
-        // Local models (model_name starts with "local:") only understand `system`.
-        let is_local = self.model_name.starts_with("local:");
+        // Local prompt mode is driven by runtime locality. Keep the model-name
+        // prefix fallback for older callers/tests.
+        let is_local = self.local_prompt_mode || self.model_name.starts_with("local:");
 
         if is_local {
-            let mut system_prompt = self.build_system_prompt(skill_names, channel);
-            system_prompt.push_str(&_session_metadata_suffix(channel, chat_id, is_voice_message, detected_language));
-            system_prompt.push_str(concat!(
-                "\n\n## Tool Usage (IMPORTANT for Local Models)\n",
-                "1. AFTER getting tool results, SYNTHESIZE and ANSWER the user's question directly.\n",
-                "2. Do NOT call more tools after you have the information you need.\n",
-                "3. Do NOT use tools for simple conversational queries (e.g., greetings, opinions).\n",
-                "4. When you see [VERBATIM TOOL OUTPUT], use that information to answer.\n",
-                "5. If the user asks for a summary, summarize the tool results in your own words.\n",
-                "6. One tool call at a time. Wait for results before deciding next action.\n",
-            ));
+            let system_prompt = self.build_local_system_prompt(
+                skill_names,
+                channel,
+                chat_id,
+                is_voice_message,
+                detected_language,
+                &[],
+            );
             messages.push(json!({"role": "system", "content": system_prompt}));
         } else {
             // Cloud model: emit `system` for core identity, then `developer` for
@@ -421,7 +528,12 @@ impl ContextBuilder {
             let mut developer = self.build_developer_context(skill_names, channel);
 
             // Append session/voice metadata to the developer context block.
-            developer.push_str(&_session_metadata_suffix(channel, chat_id, is_voice_message, detected_language));
+            developer.push_str(&_session_metadata_suffix(
+                channel,
+                chat_id,
+                is_voice_message,
+                detected_language,
+            ));
 
             messages.push(json!({"role": "system", "content": identity}));
             if !developer.is_empty() {
@@ -503,17 +615,17 @@ impl ContextBuilder {
     /// Core identity section including current time, time awareness, and workspace info.
     fn _get_identity(&self) -> String {
         let now = Local::now();
-        let workspace_path = self
-            .workspace
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace.clone())
-            .to_string_lossy()
-            .to_string();
+        let workspace_path = Self::display_path(
+            &self
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace.clone()),
+        );
         let home_dir = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| Self::display_path(&p))
             .unwrap_or_else(|| "~".to_string());
         let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| Self::display_path(&p))
             .unwrap_or_else(|_| ".".to_string());
 
         let model_section = if self.model_name.is_empty() {
@@ -580,6 +692,190 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
         )
     }
 
+    fn _get_local_identity(&self) -> String {
+        let now = Local::now();
+        let workspace_path = Self::display_path(
+            &self
+                .workspace
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace.clone()),
+        );
+        let cwd = std::env::current_dir()
+            .map(|p| Self::display_path(&p))
+            .unwrap_or_else(|_| ".".to_string());
+
+        let model_line = if self.model_name.is_empty() {
+            "Model: local".to_string()
+        } else {
+            format!("Model: {}", self.model_name)
+        };
+
+        let local_mode_hint = if self.model_name.starts_with("local:")
+            || self.model_name.starts_with("mlx:")
+        {
+            "\n- This is a local session. Do not claim to be Claude, GPT, or another cloud model."
+        } else {
+            ""
+        };
+
+        format!(
+            r#"# nanobot
+
+You are nanobot, a local tool-using assistant.
+Time: {now}
+{model_line}
+Project: {cwd}
+Workspace: {workspace_path}
+
+Rules:
+- Use tools to inspect files, commands, and memory. Never invent outputs, paths, or results.
+- Keep replies short unless the user asks for detail.
+- User files live under Project. Internal memory and skills live under Workspace.
+- Use `recall` for memory and `read_skill` for skills only when needed.{local_mode_hint}"#
+        )
+    }
+
+    fn display_path(path: &Path) -> String {
+        let rendered = path.to_string_lossy().to_string();
+        if let Some(home) = dirs::home_dir() {
+            let home = home.to_string_lossy().to_string();
+            if rendered == home {
+                return "~".to_string();
+            }
+            if let Some(stripped) = rendered.strip_prefix(&(home.clone() + "/")) {
+                return format!("~/{}", stripped);
+            }
+        }
+        rendered
+    }
+
+    fn build_local_static_blocks(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+    ) -> Vec<PromptBlock> {
+        let mut blocks = Vec::new();
+
+        if self.provenance_enabled {
+            blocks.push(PromptBlock::new(
+                "Verification",
+                "Use tool output as ground truth. Do not invent file contents, command output, or paths.",
+            ));
+        }
+
+        let bootstrap_files = self._available_bootstrap_files();
+        if !bootstrap_files.is_empty() {
+            blocks.push(PromptBlock::new(
+                "Workspace Context",
+                format!(
+                    "Bootstrap files are available on demand via `read_file`: {}.",
+                    bootstrap_files.join(", ")
+                ),
+            ));
+        }
+
+        blocks.push(PromptBlock::new(
+            "On-Demand Context",
+            concat!(
+                "Use `recall` to load memory only when needed. ",
+                "Use `read_skill __list__` to discover skills and `read_skill <name>` to load one."
+            ),
+        ));
+
+        let skill_index = self.skills.build_name_index(12);
+        if !skill_index.is_empty() {
+            blocks.push(PromptBlock::new("Skills", skill_index));
+        }
+
+        if let Some(names) = skill_names {
+            if !names.is_empty() {
+                let requested = self.skills.load_skills_for_context(names);
+                if !requested.is_empty() {
+                    blocks.push(PromptBlock::new("Requested Skills", requested));
+                }
+            }
+        }
+
+        let session_meta =
+            _session_metadata_suffix(channel, chat_id, is_voice_message, detected_language);
+        if !session_meta.trim().is_empty() {
+            blocks.push(PromptBlock::new(String::new(), session_meta));
+        }
+
+        blocks.push(PromptBlock::new(
+            "Tool Use",
+            concat!(
+                "Use tools only when they change the answer. ",
+                "After tool results, answer directly. ",
+                "One tool call at a time."
+            ),
+        ));
+
+        blocks
+    }
+
+    fn assemble_local_prompt_report(
+        &self,
+        prefix: &str,
+        static_blocks: &[PromptBlock],
+        runtime_blocks: &[PromptBlock],
+    ) -> PromptAssemblyReport {
+        let mut assembled = prefix.trim().to_string();
+        let max_tokens = if self.system_prompt_cap > 0 {
+            self.system_prompt_cap
+        } else {
+            usize::MAX
+        };
+        let mut blocks = vec![PromptBlockReport {
+            kind: PromptBlockKind::Prefix,
+            title: "Identity".to_string(),
+            tokens: TokenBudget::estimate_str_tokens(&assembled),
+            included: true,
+            allocated_tokens: 0,
+            source: String::new(),
+        }];
+
+        for (kind, block) in static_blocks
+            .iter()
+            .map(|b| (PromptBlockKind::Static, b))
+            .chain(runtime_blocks.iter().map(|b| (PromptBlockKind::Runtime, b)))
+        {
+            let rendered = block.render();
+            if rendered.is_empty() {
+                continue;
+            }
+            let block_tokens = TokenBudget::estimate_str_tokens(&rendered);
+            let candidate = format!("{}\n\n---\n\n{}", assembled, rendered);
+            let included = max_tokens == usize::MAX
+                || TokenBudget::estimate_str_tokens(&candidate) <= max_tokens;
+            if included {
+                assembled = candidate;
+            }
+            blocks.push(PromptBlockReport {
+                kind,
+                title: block.report_title(),
+                tokens: block_tokens,
+                included,
+                allocated_tokens: 0,
+                source: String::new(),
+            });
+        }
+
+        PromptAssemblyReport {
+            total_tokens: TokenBudget::estimate_str_tokens(&assembled),
+            cap_tokens: if max_tokens == usize::MAX {
+                None
+            } else {
+                Some(max_tokens)
+            },
+            prompt: assembled,
+            blocks,
+        }
+    }
+
     /// Load bootstrap files within budget using progressive line-level inclusion.
     ///
     /// If a file fits fully within the remaining budget it is included in full.
@@ -641,11 +937,7 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
                 if partial_lines.is_empty() {
                     skipped.push(filename);
                 } else {
-                    included.push(format!(
-                        "{}{}",
-                        header,
-                        partial_lines.join("\n")
-                    ));
+                    included.push(format!("{}{}", header, partial_lines.join("\n")));
                     skipped.push(filename); // full file still available via read_file
                 }
             }
@@ -664,6 +956,20 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
         }
 
         included.join("\n\n")
+    }
+
+    fn _available_bootstrap_files(&self) -> Vec<String> {
+        BOOTSTRAP_FILES
+            .iter()
+            .filter_map(|filename| {
+                let path = self.workspace.join(filename);
+                if path.exists() {
+                    Some((*filename).to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Build user message content with optional base64-encoded images.
@@ -1010,7 +1316,10 @@ mod tests {
             "last line should be absent when budget is tight"
         );
         // The AGENTS.md section header should be present.
-        assert!(result.contains("AGENTS.md"), "file header should appear in partial section");
+        assert!(
+            result.contains("AGENTS.md"),
+            "file header should appear in partial section"
+        );
     }
 
     #[test]
@@ -1022,11 +1331,23 @@ mod tests {
         fs::write(tmp.path().join("USER.md"), "User directive gamma").unwrap();
         let cb = ContextBuilder::new(tmp.path());
         let result = cb._load_bootstrap_files_within_budget(10_000);
-        assert!(result.contains("Agent directive alpha"), "AGENTS.md fully included");
-        assert!(result.contains("Soul directive beta"), "SOUL.md fully included");
-        assert!(result.contains("User directive gamma"), "USER.md fully included");
+        assert!(
+            result.contains("Agent directive alpha"),
+            "AGENTS.md fully included"
+        );
+        assert!(
+            result.contains("Soul directive beta"),
+            "SOUL.md fully included"
+        );
+        assert!(
+            result.contains("User directive gamma"),
+            "USER.md fully included"
+        );
         // No skipped-file note should appear since all files fit.
-        assert!(!result.contains("read_file"), "no skipped files when budget is generous");
+        assert!(
+            !result.contains("read_file"),
+            "no skipped files when budget is generous"
+        );
     }
 
     #[test]
@@ -1287,8 +1608,7 @@ mod tests {
     #[test]
     fn test_sanitize_base64_detection() {
         // Create a string that's >50% base64 characters and >1000 chars
-        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-            .repeat(20);
+        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(20);
         let result = sanitize_tool_result(&b64, 30000);
         assert!(result.starts_with("[Base64 data,"), "got: {}", result);
     }
@@ -1345,10 +1665,7 @@ mod tests {
             result.contains("SKILL 0"),
             "beginning should survive head truncation"
         );
-        assert!(
-            !result.contains("SKILL 499"),
-            "end should be dropped"
-        );
+        assert!(!result.contains("SKILL 499"), "end should be dropped");
     }
 
     #[test]
@@ -1409,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_developer_role_local_model_uses_system_only() {
-        // Local model: everything goes into a single `system` message.
+        // Local model: everything goes into a single lean `system` message.
         let tmp = TempDir::new().unwrap();
         let memory_dir = tmp.path().join("memory");
         fs::create_dir_all(&memory_dir).unwrap();
@@ -1417,6 +1734,7 @@ mod tests {
 
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "local:Qwen3-8B.gguf".to_string(); // local model
+        cb.local_prompt_mode = true;
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 
@@ -1426,11 +1744,89 @@ mod tests {
             "local model should not emit a developer message"
         );
 
-        // Both identity and memory must be in the `system` message.
+        // Identity stays in system, but memory/skills become on-demand.
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
         assert!(system_content.contains("You are nanobot"));
-        assert!(system_content.contains("User prefers dark mode"));
+        assert!(!system_content.contains("User prefers dark mode"));
+        assert!(system_content.contains("Use `recall` to load memory"));
+        assert!(system_content.contains("read_skill __list__"));
+    }
+
+    #[test]
+    fn test_local_prompt_mode_applies_to_mlx_style_models() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), "User prefers Rust").unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "mlx:Qwen3-8B-MLX-4bit".to_string();
+        cb.local_prompt_mode = true;
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+
+        assert!(
+            messages.iter().all(|m| m["role"] != "developer"),
+            "MLX local mode should use the lean local prompt path"
+        );
+
+        let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
+        let system_content = system_msg["content"].as_str().unwrap();
+        assert!(system_content.contains("Model: mlx:Qwen3-8B-MLX-4bit"));
+        assert!(system_content.contains("local tool-using assistant"));
+        assert!(!system_content.contains("User prefers Rust"));
+        assert!(system_content.contains("read_skill __list__"));
+    }
+
+    #[test]
+    fn test_local_prompt_mode_uses_on_demand_workspace_context() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let skill_dir = tmp.path().join("skills").join("radio");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            tmp.path().join("AGENTS.md"),
+            format!("Bootstrap directive\n{}\n", "VERY IMPORTANT ".repeat(400)),
+        )
+        .unwrap();
+        fs::write(
+            memory_dir.join("MEMORY.md"),
+            format!("Persistent fact\n{}\n", "LONG TERM MEMORY ".repeat(300)),
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            concat!(
+                "---\n",
+                "description: Stream and manage local radio playback with rich controls\n",
+                "---\n",
+                "Full skill body that should not be injected into the lean local prompt.\n"
+            ),
+        )
+        .unwrap();
+
+        let mut cb = ContextBuilder::new(tmp.path());
+        cb.model_name = "mlx:Qwen3-8B-MLX-4bit".to_string();
+        cb.local_prompt_mode = true;
+
+        let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
+        let total_tokens = TokenBudget::estimate_tokens(&messages);
+        let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
+        let system_content = system_msg["content"].as_str().unwrap();
+
+        assert!(
+            total_tokens < 550,
+            "lean local prompt should stay compact even with large workspace context, got {} tokens",
+            total_tokens
+        );
+        assert!(system_content.contains("AGENTS.md"));
+        assert!(system_content.contains("radio"));
+        assert!(!system_content.contains("VERY IMPORTANT VERY IMPORTANT"));
+        assert!(!system_content.contains("LONG TERM MEMORY LONG TERM MEMORY"));
+        assert!(!system_content.contains("Stream and manage local radio playback"));
     }
 
     #[test]
@@ -1478,9 +1874,8 @@ task_profiles:
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "qwen-2.5-coder-32b".to_string();
         cb.task_kind = "main".to_string();
-        cb.instruction_profiles = Some(
-            crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap(),
-        );
+        cb.instruction_profiles =
+            Some(crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap());
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 
@@ -1532,9 +1927,8 @@ model_profiles:
         let mut cb = ContextBuilder::new(tmp.path());
         cb.model_name = "deepseek-r1".to_string(); // doesn't match llama*
         cb.task_kind = "main".to_string();
-        cb.instruction_profiles = Some(
-            crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap(),
-        );
+        cb.instruction_profiles =
+            Some(crate::agent::instructions::InstructionProfiles::load(&profiles_path).unwrap());
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 
@@ -1567,7 +1961,10 @@ model_profiles:
         let cb = ContextBuilder::new(tmp.path());
         let ctx = cb.build_developer_context(None, None);
 
-        assert!(ctx.contains("User prefers Rust"), "Memory should be present");
+        assert!(
+            ctx.contains("User prefers Rust"),
+            "Memory should be present"
+        );
 
         // Without the feature flag, no KG section should appear.
         // (On knowledge-graph builds, it could appear if open_default finds data.)
