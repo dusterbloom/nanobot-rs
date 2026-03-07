@@ -398,6 +398,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         context.scale_budgets(max_context_tokens);
     }
     context.model_name = model.clone();
+    context.local_prompt_mode = is_local;
     // Inject provenance verification rules when enabled.
     if provenance.enabled && provenance.system_prompt_rules {
         context.provenance_enabled = true;
@@ -655,6 +656,10 @@ pub(crate) fn apply_compaction_result(messages: &mut Vec<Value>, pending: Pendin
 }
 
 /// Append a suffix to the first (system) message's content.
+///
+/// Sole remaining caller: agent_shared.rs trio orchestration (Phase 5 scope).
+/// All prepare_context.rs calls have been replaced with typed SectionEntry
+/// values that flow through the PromptAssembler pipeline.
 pub(crate) fn append_to_system_prompt(messages: &mut [Value], suffix: &str) {
     if let Some(sys) = messages
         .first()

@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::agent::agent_core::{append_to_system_prompt, history_limit};
+use crate::agent::agent_core::{history_limit, SwappableCore};
 use crate::agent::agent_loop::{AgentLoopShared, CompactionHandle, FlowControl, TurnContext};
 use crate::agent::audit::AuditLog;
+use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
 use crate::agent::policy;
+use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
 use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
 use crate::agent::taint::TaintState;
 use crate::agent::token_budget::TokenBudget;
@@ -20,6 +22,141 @@ use crate::agent::tool_guard::ToolGuard;
 use crate::bus::events::InboundMessage;
 
 impl AgentLoopShared {
+    pub(crate) async fn build_local_runtime_blocks(
+        &self,
+        core: &Arc<SwappableCore>,
+        session_key: &str,
+    ) -> Vec<crate::agent::context::PromptBlock> {
+        let mut blocks = Vec::new();
+
+        if core.memory_enabled {
+            let wm = core
+                .working_memory
+                .get_context(&session_key, core.working_memory_budget.min(200));
+            if !wm.is_empty() {
+                blocks.push(crate::agent::context::PromptBlock::new(
+                    "Working Memory",
+                    wm,
+                ));
+            }
+        }
+
+        let learning_ctx = core.learning.get_learning_context();
+        if !learning_ctx.is_empty() {
+            blocks.push(crate::agent::context::PromptBlock::new(
+                "Tool Patterns",
+                learning_ctx,
+            ));
+        }
+
+        let running = self.subagents.list_running().await;
+        let recent =
+            crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
+        let status = crate::agent::subagent::format_status_block(&running, &recent);
+        if !status.is_empty() {
+            blocks.push(crate::agent::context::PromptBlock::new(
+                "Background Tasks",
+                status,
+            ));
+        }
+
+        blocks
+    }
+
+    /// Collect runtime sections for the cloud prompt path as typed `SectionEntry` values.
+    ///
+    /// Replaces the 4 former `append_to_system_prompt()` calls. Content is
+    /// pre-fetched here; the assembler handles ordering, budgeting, and overflow.
+    pub(crate) async fn collect_cloud_runtime_sections(
+        &self,
+        core: &Arc<SwappableCore>,
+        session_key: &str,
+    ) -> Vec<SectionEntry> {
+        let mut sections = Vec::new();
+
+        // 1. Working memory + tool patterns (merged into a single WorkingMemory section).
+        if core.memory_enabled {
+            let mut wm = core
+                .working_memory
+                .get_context(session_key, core.working_memory_budget);
+            let learning_ctx = core.learning.get_learning_context();
+            if !learning_ctx.is_empty() {
+                wm.push_str("\n\n## Tool Patterns\n\n");
+                wm.push_str(&learning_ctx);
+            }
+            if !wm.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::WorkingMemory,
+                    block: PromptBlock::new(
+                        "Working Memory (Current Session)",
+                        &wm,
+                    ),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Runtime("session working memory".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::WorkingMemory.shrinkable(),
+                });
+            }
+        }
+
+        // 2. Recent daily notes (cloud mode, local-backend only).
+        if core.is_local && core.memory_enabled {
+            let memory_store = crate::agent::memory::MemoryStore::new(&core.workspace);
+            let notes = memory_store.read_recent_daily_notes(3);
+            if !notes.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::RecentNotes,
+                    block: PromptBlock::new("Recent Notes", &notes),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::File("daily notes".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::RecentNotes.shrinkable(),
+                });
+            }
+        }
+
+        // 3. Background task status (subagent status).
+        {
+            let running = self.subagents.list_running().await;
+            let recent = crate::agent::subagent::SubagentManager::read_recent_completed(
+                &core.workspace,
+                5,
+            );
+            let status = crate::agent::subagent::format_status_block(&running, &recent);
+            if !status.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::BackgroundTasks,
+                    block: PromptBlock::new("Background Tasks", &status),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Runtime("subagent status".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::BackgroundTasks.shrinkable(),
+                });
+            }
+        }
+
+        // 4. Memory bulletin/briefing.
+        {
+            let bulletin = self.bulletin_cache.load_full();
+            if !bulletin.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::MemoryBriefing,
+                    block: PromptBlock::new("Memory Briefing", &*bulletin),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Runtime("memory bulletin".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::MemoryBriefing.shrinkable(),
+                });
+            }
+        }
+
+        sections
+    }
+
     /// Phase 1: Build the [`TurnContext`] from the inbound message.
     ///
     /// Snapshots the swappable core, extracts session info, builds tools,
@@ -163,57 +300,36 @@ impl AgentLoopShared {
             detected_language.as_deref(),
         );
 
-        // Inject per-session working memory into the system message.
-        if core.memory_enabled {
-            let mut wm = core
-                .working_memory
-                .get_context(&session_key, core.working_memory_budget);
-            // Append learning context (tool patterns) if available.
-            let learning_ctx = core.learning.get_learning_context();
-            if !learning_ctx.is_empty() {
-                wm.push_str("\n\n## Tool Patterns\n\n");
-                wm.push_str(&learning_ctx);
-            }
-            if !wm.is_empty() {
-                append_to_system_prompt(
-                    &mut messages,
-                    &format!("\n\n---\n\n# Working Memory (Current Session)\n\n{}", wm),
-                );
+        let local_runtime_blocks = if core.context.local_prompt_mode {
+            self.build_local_runtime_blocks(&core, &session_key).await
+        } else {
+            Vec::new()
+        };
+
+        // Collect runtime sections and inject into the developer message.
+        // All 4 former append_to_system_prompt() calls are now pre-fetched as
+        // typed SectionEntry values and appended to the developer content block.
+        if !core.context.local_prompt_mode {
+            let runtime_sections = self
+                .collect_cloud_runtime_sections(&core, &session_key)
+                .await;
+            if !runtime_sections.is_empty() {
+                core.context
+                    .inject_runtime_sections(&mut messages, &runtime_sections);
             }
         }
 
-        // Inject recent daily notes for local mode continuity.
-        if core.is_local && core.memory_enabled {
-            let memory_store = crate::agent::memory::MemoryStore::new(&core.workspace);
-            let notes = memory_store.read_recent_daily_notes(3);
-            if !notes.is_empty() {
-                append_to_system_prompt(
-                    &mut messages,
-                    &format!("\n\n## Recent Notes\n\n{}", notes),
-                );
-            }
-        }
-
-        // Auto-inject background task status into system prompt so the agent
-        // is naturally aware of running/completed subagents without explicit tool calls.
-        {
-            let running = self.subagents.list_running().await;
-            let recent =
-                crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
-            let status = crate::agent::subagent::format_status_block(&running, &recent);
-            if !status.is_empty() {
-                append_to_system_prompt(&mut messages, &status);
-            }
-        }
-
-        // Inject memory bulletin if available (zero-cost Arc load).
-        {
-            let bulletin = self.bulletin_cache.load_full();
-            if !bulletin.is_empty() {
-                append_to_system_prompt(
-                    &mut messages,
-                    &format!("\n\n## Memory Briefing\n\n{}", &*bulletin),
-                );
+        if core.context.local_prompt_mode {
+            let rebuilt = core.context.build_local_system_prompt(
+                None,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                is_voice_message,
+                detected_language.as_deref(),
+                &local_runtime_blocks,
+            );
+            if let Some(first) = messages.first_mut() {
+                first["content"] = json!(rebuilt);
             }
         }
 
@@ -224,15 +340,13 @@ impl AgentLoopShared {
         }
 
         // Background compaction state.
-        let compaction_slot: Arc<tokio::sync::Mutex<Option<crate::agent::agent_core::PendingCompaction>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let compaction_slot: Arc<
+            tokio::sync::Mutex<Option<crate::agent::agent_core::PendingCompaction>>,
+        > = Arc::new(tokio::sync::Mutex::new(None));
         let compaction_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Context gate: budget-aware content sizing for this turn.
-        let mut content_gate = ContentGate::new(
-            core.token_budget.max_context(),
-            0.20,
-        );
+        let mut content_gate = ContentGate::new(core.token_budget.max_context(), 0.20);
         // Pre-consume the tokens already used by system prompt + history.
         let initial_tokens = TokenBudget::estimate_tokens(&messages);
         content_gate.budget.consume(initial_tokens);
@@ -252,13 +366,12 @@ impl AgentLoopShared {
         // Protocol correctness is enforced at render time — no repair needed.
         // MLX models are in-process and speak cloud protocol (proper tool_calls),
         // so they use CloudProtocol even though is_local=true for context sizing.
-        let protocol: Arc<dyn ConversationProtocol> = if core.is_local
-            && !core.model.starts_with("mlx:")
-        {
-            Arc::new(LocalProtocol::auto_for_model(&core.model))
-        } else {
-            Arc::new(CloudProtocol)
-        };
+        let protocol: Arc<dyn ConversationProtocol> =
+            if core.is_local && !core.model.starts_with("mlx:") {
+                Arc::new(LocalProtocol::auto_for_model(&core.model))
+            } else {
+                Arc::new(CloudProtocol)
+            };
 
         TurnContext {
             core,

@@ -556,6 +556,65 @@ impl ContextBuilder {
         messages
     }
 
+    /// Inject pre-fetched runtime sections into the developer message.
+    ///
+    /// For cloud prompts, runtime sections (working memory, daily notes,
+    /// subagent status, bulletin) are rendered and appended to the existing
+    /// `developer` role message. If no developer message exists, one is created.
+    ///
+    /// This replaces the former `append_to_system_prompt()` calls in
+    /// `prepare_context.rs` -- all runtime content now flows through typed
+    /// `SectionEntry` values rather than ad-hoc string concatenation.
+    pub fn inject_runtime_sections(
+        &self,
+        messages: &mut Vec<Value>,
+        sections: &[crate::agent::prompt_contract::SectionEntry],
+    ) {
+        if sections.is_empty() {
+            return;
+        }
+
+        // Render each section's block content with separators.
+        let rendered_parts: Vec<String> = sections
+            .iter()
+            .filter(|s| s.included)
+            .map(|s| s.block.render())
+            .filter(|r| !r.is_empty())
+            .collect();
+
+        if rendered_parts.is_empty() {
+            return;
+        }
+
+        let suffix = rendered_parts.join("\n\n---\n\n");
+
+        // Find and extend the developer message, or create one.
+        if let Some(dev_msg) = messages
+            .iter_mut()
+            .find(|m| m["role"] == "developer")
+        {
+            let existing = dev_msg["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if existing.is_empty() {
+                dev_msg["content"] = Value::String(suffix);
+            } else {
+                dev_msg["content"] =
+                    Value::String(format!("{}\n\n---\n\n{}", existing, suffix));
+            }
+        } else {
+            // No developer message exists -- insert one after the system message.
+            let dev_msg = json!({"role": "developer", "content": suffix});
+            // Insert at position 1 (after system message, before history).
+            if messages.len() > 1 {
+                messages.insert(1, dev_msg);
+            } else {
+                messages.push(dev_msg);
+            }
+        }
+    }
+
     /// Add a tool result to the message list and return the updated list.
     pub fn add_tool_result(
         messages: &mut Vec<Value>,
