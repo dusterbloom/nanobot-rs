@@ -122,13 +122,23 @@ Plans:
 
 **Key files:**
 - `agent/lane.rs` — **New.** Lane enum, LanePolicy struct, profile types
-- `agent/agent_loop.rs` — Pass lane.policy() to PromptAssembler, ToolGate, MemoryLadder, LearnLoop
+- `agent/agent_core.rs` — Lane field on SwappableCore
+- `agent/agent_shared.rs` — ToolGate call site uses lane policy
+- `agent/prepare_context.rs` — Section filtering and memory budget by lane
 - `agent/mod.rs` — Add pub mod lane
+- `config/schema.rs` — defaultLane config field
+- `repl/cmd_lifecycle.rs` — /lane command
 
 **Success criteria:**
 1. Lane enum (Answer/Action) with LanePolicy struct configuring all contracts
 2. Per-contract profile types (PromptProfile, ToolGateProfile, MemoryProfile, LearnProfile, ParserProfile) produce measurably different pipelines
 3. Lane::Answer produces fewer prompt sections, fewer tools, lighter learning than Lane::Action
+
+**Plans:** 2 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Lane enum, LanePolicy, 5 profile types, config schema
+- [ ] 05-02-PLAN.md — Wire lane into SwappableCore, ToolGate, PromptAssembler, MemoryLadder, REPL
 
 ---
 
@@ -156,4 +166,4 @@ Plans:
 
 ---
 *Roadmap created: 2026-03-07*
-*Last updated: 2026-03-07 after initial creation*
+*Last updated: 2026-03-07 after Phase 5 planning*

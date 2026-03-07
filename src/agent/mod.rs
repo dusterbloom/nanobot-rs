@@ -46,6 +46,7 @@ pub(crate) mod gateway_commands;
 pub mod instructions;
 pub mod knowledge_graph;
 pub mod knowledge_store;
+pub mod lane;
 pub mod lcm;
 pub mod learn_loop;
 pub mod learning;
