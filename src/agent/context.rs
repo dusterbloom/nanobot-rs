@@ -455,6 +455,8 @@ impl ContextBuilder {
 
     /// Build a compact local system prompt from a stable prefix plus optional
     /// static and runtime blocks. The final result is capped end-to-end.
+    ///
+    /// Delegates to `LocalAssembler` for budget-aware section assembly.
     pub fn build_local_system_prompt(
         &self,
         skill_names: Option<&[String]>,
@@ -464,19 +466,56 @@ impl ContextBuilder {
         detected_language: Option<&str>,
         runtime_blocks: &[PromptBlock],
     ) -> String {
-        let prefix = self._get_local_identity();
-        let static_blocks = self.build_local_static_blocks(
+        use crate::agent::prompt_contract::{
+            AssemblyContext, LocalAssembler, PromptAssembler, PromptSection, SectionEntry,
+            SectionSource,
+        };
+
+        let mut sections = self._collect_local_sections(
             skill_names,
             channel,
             chat_id,
             is_voice_message,
             detected_language,
         );
-        self.assemble_local_prompt_report(&prefix, &static_blocks, runtime_blocks)
-            .prompt
+
+        // Convert runtime PromptBlocks to SectionEntry values.
+        for block in runtime_blocks {
+            let title = block.report_title();
+            let section = match title.as_str() {
+                "Working Memory" => PromptSection::WorkingMemory,
+                "Tool Patterns" => PromptSection::ToolPatterns,
+                "Background Tasks" => PromptSection::BackgroundTasks,
+                _ => PromptSection::MemoryBriefing,
+            };
+            sections.push(SectionEntry {
+                section,
+                block: block.clone(),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Runtime(title),
+                included: true,
+                shrinkable: section.shrinkable(),
+            });
+        }
+
+        let context_window = if self.system_prompt_cap > 0 {
+            (self.system_prompt_cap as f64 / 0.3).round() as usize
+        } else {
+            16_000 // default local context
+        };
+
+        let ctx = AssemblyContext {
+            context_window,
+            system_prompt_cap_pct: 0.3,
+            sections,
+        };
+        LocalAssembler.assemble(&ctx).system_content
     }
 
     /// Describe the compact local prompt assembly with per-block token counts.
+    ///
+    /// Uses `LocalAssembler` for consistent assembly with `build_local_system_prompt()`.
     pub fn describe_local_system_prompt(
         &self,
         skill_names: Option<&[String]>,
@@ -486,7 +525,83 @@ impl ContextBuilder {
         detected_language: Option<&str>,
         runtime_blocks: &[PromptBlock],
     ) -> PromptAssemblyReport {
-        let prefix = self._get_local_identity();
+        use crate::agent::prompt_contract::{
+            AssemblyContext, LocalAssembler, PromptAssembler, PromptSection, SectionEntry,
+            SectionSource,
+        };
+
+        let mut sections = self._collect_local_sections(
+            skill_names,
+            channel,
+            chat_id,
+            is_voice_message,
+            detected_language,
+        );
+
+        for block in runtime_blocks {
+            let title = block.report_title();
+            let section = match title.as_str() {
+                "Working Memory" => PromptSection::WorkingMemory,
+                "Tool Patterns" => PromptSection::ToolPatterns,
+                "Background Tasks" => PromptSection::BackgroundTasks,
+                _ => PromptSection::MemoryBriefing,
+            };
+            sections.push(SectionEntry {
+                section,
+                block: block.clone(),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Runtime(title),
+                included: true,
+                shrinkable: section.shrinkable(),
+            });
+        }
+
+        let context_window = if self.system_prompt_cap > 0 {
+            (self.system_prompt_cap as f64 / 0.3).round() as usize
+        } else {
+            16_000
+        };
+
+        let ctx = AssemblyContext {
+            context_window,
+            system_prompt_cap_pct: 0.3,
+            sections,
+        };
+        LocalAssembler.assemble(&ctx).report
+    }
+
+    /// Collect local prompt sections as `SectionEntry` values.
+    ///
+    /// Converts the local identity prefix and static blocks into typed entries
+    /// for consumption by `LocalAssembler`.
+    fn _collect_local_sections(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+    ) -> Vec<crate::agent::prompt_contract::SectionEntry> {
+        use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
+
+        let mut sections = Vec::new();
+
+        // Identity prefix.
+        let identity = self._get_local_identity();
+        if !identity.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::Identity,
+                block: PromptBlock::new("", &identity),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Static("local identity"),
+                included: true,
+                shrinkable: PromptSection::Identity.shrinkable(),
+            });
+        }
+
+        // Static blocks from the existing local builder.
         let static_blocks = self.build_local_static_blocks(
             skill_names,
             channel,
@@ -494,10 +609,303 @@ impl ContextBuilder {
             is_voice_message,
             detected_language,
         );
-        self.assemble_local_prompt_report(&prefix, &static_blocks, runtime_blocks)
+
+        for block in &static_blocks {
+            let title = block.report_title();
+            let section = match title.as_str() {
+                "Verification" => PromptSection::Verification,
+                "Workspace Context" => PromptSection::WorkspaceContext,
+                "On-Demand Context" => PromptSection::OnDemandContext,
+                "Skills" => PromptSection::Skills,
+                "Requested Skills" => PromptSection::RequestedSkills,
+                "Session Metadata" => PromptSection::SessionMetadata,
+                "Tool Use" => PromptSection::ToolUse,
+                _ => PromptSection::SessionMetadata,
+            };
+            sections.push(SectionEntry {
+                section,
+                block: block.clone(),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Static("local static"),
+                included: true,
+                shrinkable: section.shrinkable(),
+            });
+        }
+
+        sections
+    }
+
+    /// Collect all static prompt sections as typed `SectionEntry` values.
+    ///
+    /// Converts existing `build_identity_prompt()` and `build_developer_context()`
+    /// content into the `PromptSection` taxonomy for assembler consumption.
+    pub fn collect_static_sections(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        is_voice_message: bool,
+        detected_language: Option<&str>,
+    ) -> Vec<crate::agent::prompt_contract::SectionEntry> {
+        use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
+
+        let mut sections = Vec::new();
+
+        // --- Identity section (core identity text) ---
+        let identity_text = self._get_identity();
+        if !identity_text.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::Identity,
+                block: PromptBlock::new("", &identity_text),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Static("core identity"),
+                included: true,
+                shrinkable: PromptSection::Identity.shrinkable(),
+            });
+        }
+
+        // --- Verification section (provenance rules) ---
+        if self.provenance_enabled {
+            let verification_text =
+                "## Verification Protocol\n\n\
+                 Tool calls are audit-logged and mechanically verified. Unverified claims are redacted.\n\
+                 1. QUOTE VERBATIM — exact tool output, no paraphrasing.\n\
+                 2. NEVER FABRICATE — no invented paths, outputs, or numbers.\n\
+                 3. REPORT ERRORS — exact error messages from tools.\n\
+                 4. NO PHANTOM ACTIONS — only claim actions with matching tool calls.\n\
+                 5. STATE UNCERTAINTY — say \"truncated\" or \"timed out\" when applicable.\n\
+                 6. USE [VERBATIM TOOL OUTPUT] markers — quote from these blocks directly.\n\
+                 Every \"let me\" is a PROMISE requiring an immediate tool call.";
+            sections.push(SectionEntry {
+                section: PromptSection::Verification,
+                block: PromptBlock::new("Verification Protocol", verification_text),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Static("provenance rules"),
+                included: true,
+                shrinkable: PromptSection::Verification.shrinkable(),
+            });
+        }
+
+        // --- Workspace context (bootstrap files) ---
+        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget);
+        if !bootstrap.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::WorkspaceContext,
+                block: PromptBlock::new("Workspace Context", &bootstrap),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::File("bootstrap files".to_string()),
+                included: true,
+                shrinkable: PromptSection::WorkspaceContext.shrinkable(),
+            });
+        }
+
+        // --- Long-term memory (MemoryBriefing section) ---
+        let long_term = Self::_truncate_to_budget_tail(
+            &self.memory.read_long_term(),
+            self.long_term_memory_budget,
+        );
+        if !long_term.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::MemoryBriefing,
+                block: PromptBlock::new(
+                    "Memory",
+                    &format!("## Long-term Memory\n{}", long_term),
+                ),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::File("MEMORY.md".to_string()),
+                included: true,
+                shrinkable: PromptSection::MemoryBriefing.shrinkable(),
+            });
+        }
+
+        // --- Knowledge graph context ---
+        #[cfg(feature = "knowledge-graph")]
+        {
+            if let Ok(kg) = crate::agent::knowledge_graph::KnowledgeGraph::open_default() {
+                let kg_ctx = kg.export_context(30);
+                if !kg_ctx.is_empty() {
+                    // Append to MemoryBriefing if it exists, otherwise create a new entry.
+                    if let Some(mem_entry) = sections
+                        .iter_mut()
+                        .find(|s| s.section == PromptSection::MemoryBriefing)
+                    {
+                        let existing = mem_entry.block.content().to_string();
+                        mem_entry.block = PromptBlock::new(
+                            "Memory",
+                            &format!("{}\n\n## Knowledge Graph\n{}", existing, kg_ctx),
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- Skills ---
+        let skills_content = self._build_skills_content(skill_names);
+        if !skills_content.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::Skills,
+                block: PromptBlock::new("Skills", &skills_content),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Computed("skills loader".to_string()),
+                included: true,
+                shrinkable: PromptSection::Skills.shrinkable(),
+            });
+        }
+
+        // --- Requested skills (explicit, always full content) ---
+        if let Some(names) = skill_names {
+            if !names.is_empty() {
+                let requested = self.skills.load_skills_for_context(names);
+                if !requested.is_empty() {
+                    sections.push(SectionEntry {
+                        section: PromptSection::RequestedSkills,
+                        block: PromptBlock::new("Requested Skills", &requested),
+                        allocated_tokens: 0,
+                        actual_tokens: 0,
+                        source: SectionSource::Computed("requested skills".to_string()),
+                        included: true,
+                        shrinkable: PromptSection::RequestedSkills.shrinkable(),
+                    });
+                }
+            }
+        }
+
+        // --- Subagent profiles (part of Skills/OnDemandContext area) ---
+        if !self.agent_profiles.is_empty() {
+            let capped =
+                Self::_truncate_to_budget_head(&self.agent_profiles, self.profiles_budget);
+            if !capped.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::OnDemandContext,
+                    block: PromptBlock::new("Agent Profiles", &capped),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Computed("agent profiles".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::OnDemandContext.shrinkable(),
+                });
+            }
+        }
+
+        // --- Session metadata ---
+        let session_meta =
+            _session_metadata_suffix(channel, chat_id, is_voice_message, detected_language);
+        if !session_meta.trim().is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::SessionMetadata,
+                block: PromptBlock::new("", &session_meta),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Runtime("session metadata".to_string()),
+                included: true,
+                shrinkable: PromptSection::SessionMetadata.shrinkable(),
+            });
+        }
+
+        // --- Instruction profiles ---
+        if let Some(ref profiles) = self.instruction_profiles {
+            let messages = profiles.resolve(&self.model_name, &self.task_kind);
+            let instruction_parts: Vec<String> = messages
+                .iter()
+                .filter(|m| !m.content.is_empty())
+                .map(|m| {
+                    format!(
+                        "<!-- instruction-profile role={} -->\n{}",
+                        m.role, m.content
+                    )
+                })
+                .collect();
+            if !instruction_parts.is_empty() {
+                sections.push(SectionEntry {
+                    section: PromptSection::ToolUse,
+                    block: PromptBlock::new("Instructions", &instruction_parts.join("\n\n")),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Computed("instruction profiles".to_string()),
+                    included: true,
+                    shrinkable: PromptSection::ToolUse.shrinkable(),
+                });
+            }
+        }
+
+        sections
+    }
+
+    /// Build the skills content string based on the disclosure mode.
+    fn _build_skills_content(&self, _skill_names: Option<&[String]>) -> String {
+        let effective_disclosure = if self.skill_disclosure == "eager" {
+            "eager"
+        } else if self.skill_disclosure == "xml"
+            || (!self.skill_disclosure.is_empty() && self.skill_disclosure != "compact")
+        {
+            "xml"
+        } else {
+            "compact"
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+
+        match effective_disclosure {
+            "eager" => {
+                let always_skills = self.skills.get_always_skills();
+                if !always_skills.is_empty() {
+                    let always_content = self.skills.load_skills_for_context(&always_skills);
+                    if !always_content.is_empty() {
+                        parts.push(format!("# Active Skills\n\n{}", always_content));
+                    }
+                }
+                let skills_summary = self.skills.build_skills_summary();
+                if !skills_summary.is_empty() {
+                    parts.push(format!(
+                        "The following skills extend your capabilities. \
+                         To use a skill, read its SKILL.md file using the read_file tool.\n\
+                         Skills with available=\"false\" need dependencies installed first \
+                         - you can try installing them with apt/brew.\n\n\
+                         {}",
+                        skills_summary
+                    ));
+                }
+            }
+            "xml" => {
+                let skills_summary = self.skills.build_skills_summary();
+                if !skills_summary.is_empty() {
+                    parts.push(format!(
+                        "The following skills extend your capabilities. \
+                         Use the read_skill tool to load a skill's full instructions.\n\
+                         Skills with available=\"false\" need dependencies installed first \
+                         - you can try installing them with apt/brew.\n\n\
+                         {}",
+                        skills_summary
+                    ));
+                }
+            }
+            _ => {
+                let index = self.skills.build_compact_index();
+                if !index.is_empty() {
+                    parts.push(index);
+                }
+            }
+        }
+
+        let combined = parts.join("\n\n");
+        if combined.is_empty() {
+            String::new()
+        } else {
+            Self::_truncate_to_budget_head(&combined, self.skills_budget)
+        }
     }
 
     /// Build the complete message list for an LLM call.
+    ///
+    /// For cloud models, delegates to `CloudAssembler` for system+developer
+    /// message construction with budget-aware section ordering.
+    /// For local models, delegates to `build_local_system_prompt()`.
     pub fn build_messages(
         &self,
         history: &[Value],
@@ -509,6 +917,8 @@ impl ContextBuilder {
         is_voice_message: bool,
         detected_language: Option<&str>,
     ) -> Vec<Value> {
+        use crate::agent::prompt_contract::{AssemblyContext, CloudAssembler, PromptAssembler};
+
         let mut messages: Vec<Value> = Vec::new();
 
         // Determine whether to use the `developer` role for injected context.
@@ -527,22 +937,34 @@ impl ContextBuilder {
             );
             messages.push(json!({"role": "system", "content": system_prompt}));
         } else {
-            // Cloud model: emit `system` for core identity, then `developer` for
-            // injected context (memory, skills, profiles).
-            let identity = self.build_identity_prompt();
-            let mut developer = self.build_developer_context(skill_names, channel);
-
-            // Append session/voice metadata to the developer context block.
-            developer.push_str(&_session_metadata_suffix(
+            // Cloud model: collect static sections and use CloudAssembler for
+            // budget-aware system+developer message construction.
+            let static_sections = self.collect_static_sections(
+                skill_names,
                 channel,
                 chat_id,
                 is_voice_message,
                 detected_language,
-            ));
+            );
 
-            messages.push(json!({"role": "system", "content": identity}));
-            if !developer.is_empty() {
-                messages.push(json!({"role": "developer", "content": developer}));
+            let context_window = if self.system_prompt_cap > 0 {
+                // Reverse-engineer context window from the cap (cap = 40% of window).
+                (self.system_prompt_cap as f64 / 0.4).round() as usize
+            } else {
+                // Default: 128K context window.
+                128_000
+            };
+
+            let ctx = AssemblyContext {
+                context_window,
+                system_prompt_cap_pct: 0.4,
+                sections: static_sections,
+            };
+            let result = CloudAssembler.assemble(&ctx);
+
+            messages.push(json!({"role": "system", "content": result.system_content}));
+            if !result.developer_content.is_empty() {
+                messages.push(json!({"role": "developer", "content": result.developer_content}));
             }
         }
 
