@@ -483,6 +483,9 @@ impl Default for AgentDefaults {
 pub struct AgentsConfig {
     #[serde(default)]
     pub defaults: AgentDefaults,
+    /// Default lane: "answer" or "action". None defaults to action.
+    #[serde(default)]
+    pub default_lane: Option<String>,
 }
 
 /// Token budget tuning for adaptive max_tokens and local-thinking behaviour.
@@ -2087,10 +2090,18 @@ pub struct PerplexityGateConfig {
     pub train_epochs: usize,
 }
 
-fn default_surprise_threshold() -> f32 { 3.0 }
-fn default_min_experiences() -> usize { 5 }
-fn default_mlx_server_url() -> String { "http://127.0.0.1:8766".to_string() }
-fn default_train_epochs() -> usize { 15 }
+fn default_surprise_threshold() -> f32 {
+    3.0
+}
+fn default_min_experiences() -> usize {
+    5
+}
+fn default_mlx_server_url() -> String {
+    "http://127.0.0.1:8766".to_string()
+}
+fn default_train_epochs() -> usize {
+    15
+}
 
 impl Default for PerplexityGateConfig {
     fn default() -> Self {
