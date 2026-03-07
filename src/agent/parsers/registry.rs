@@ -7,6 +7,18 @@ pub struct ParsedToolCall {
     pub arguments: Value,
 }
 
+/// Canonical output from response parsing.
+/// Wraps raw ParsedToolCall results into actionable variants.
+#[derive(Debug, Clone)]
+pub enum ParsedAction {
+    /// Model produced a final text response -- turn complete.
+    Final(String),
+    /// Model requested tool calls -- execute and continue.
+    Call(Vec<ParsedToolCall>),
+    /// Model needs clarification from user -- turn paused.
+    Ask(String),
+}
+
 /// Trait for model-family-specific tool call parsers
 pub trait ToolCallParser: Send + Sync {
     /// Parser identifier (e.g., "hermes", "qwen", "llama", "deepseek")
@@ -37,7 +49,11 @@ impl ParserRegistry {
     }
 
     /// Select parser by config override, model name substring match, or fallback to hermes
-    pub fn select_for_model(&self, model_name: &str, config_override: Option<&str>) -> &dyn ToolCallParser {
+    pub fn select_for_model(
+        &self,
+        model_name: &str,
+        config_override: Option<&str>,
+    ) -> &dyn ToolCallParser {
         // 1. Config override
         if let Some(override_name) = config_override {
             if let Some(p) = self.parsers.iter().find(|p| p.name() == override_name) {
@@ -48,13 +64,28 @@ impl ParserRegistry {
         // 2. Model name substring match
         let lower = model_name.to_lowercase();
         if lower.contains("qwen") {
-            return self.parsers.iter().find(|p| p.name() == "qwen").unwrap().as_ref();
+            return self
+                .parsers
+                .iter()
+                .find(|p| p.name() == "qwen")
+                .unwrap()
+                .as_ref();
         }
         if lower.contains("llama") || lower.contains("nemotron") {
-            return self.parsers.iter().find(|p| p.name() == "llama").unwrap().as_ref();
+            return self
+                .parsers
+                .iter()
+                .find(|p| p.name() == "llama")
+                .unwrap()
+                .as_ref();
         }
         if lower.contains("deepseek") {
-            return self.parsers.iter().find(|p| p.name() == "deepseek").unwrap().as_ref();
+            return self
+                .parsers
+                .iter()
+                .find(|p| p.name() == "deepseek")
+                .unwrap()
+                .as_ref();
         }
 
         // 3. Fallback to hermes (last in list)
@@ -120,5 +151,51 @@ mod tests {
         let reg = ParserRegistry::new();
         let p = reg.select_for_model("Qwen2.5-72B", Some("nonexistent-parser"));
         assert_eq!(p.name(), "qwen"); // model name match wins after bad override
+    }
+
+    // ----- ParsedAction -----
+
+    #[test]
+    fn test_parsed_action_final() {
+        let action = ParsedAction::Final("done".into());
+        match &action {
+            ParsedAction::Final(s) => assert_eq!(s, "done"),
+            _ => panic!("expected Final"),
+        }
+    }
+
+    #[test]
+    fn test_parsed_action_call() {
+        let calls = vec![ParsedToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/tmp/x"}),
+        }];
+        let action = ParsedAction::Call(calls);
+        match &action {
+            ParsedAction::Call(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].name, "read_file");
+            }
+            _ => panic!("expected Call"),
+        }
+    }
+
+    #[test]
+    fn test_parsed_action_ask() {
+        let action = ParsedAction::Ask("what file?".into());
+        match &action {
+            ParsedAction::Ask(s) => assert_eq!(s, "what file?"),
+            _ => panic!("expected Ask"),
+        }
+    }
+
+    #[test]
+    fn test_parsed_action_clone() {
+        let action = ParsedAction::Final("hello".into());
+        let cloned = action.clone();
+        match cloned {
+            ParsedAction::Final(s) => assert_eq!(s, "hello"),
+            _ => panic!("clone should preserve variant"),
+        }
     }
 }
