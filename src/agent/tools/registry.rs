@@ -282,14 +282,11 @@ impl ToolRegistry {
             self.register(Box::new(ListDirTool));
         }
         if should_include("exec") {
-            let exec_cwd = config
-                .exec_working_dir
-                .clone()
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| config.workspace.to_string_lossy().to_string())
-                });
+            let exec_cwd = config.exec_working_dir.clone().unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| config.workspace.to_string_lossy().to_string())
+            });
             self.register(Box::new(ExecTool::new(
                 config.exec_timeout,
                 Some(exec_cwd),
@@ -371,6 +368,24 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|tool| tool.is_available())
+            .map(|tool| tool.to_schema())
+            .collect();
+        if self.condensed {
+            Self::condense_definitions(&mut defs);
+        }
+        defs
+    }
+
+    /// Get tool definitions for only the named tools, in OpenAI format.
+    ///
+    /// Tools not in the registry or where [`Tool::is_available`] returns `false`
+    /// are silently skipped.
+    pub fn definitions_for(&self, names: &[String]) -> Vec<serde_json::Value> {
+        let name_set: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
+            .values()
+            .filter(|tool| tool.is_available() && name_set.contains(tool.name()))
             .map(|tool| tool.to_schema())
             .collect();
         if self.condensed {
@@ -473,12 +488,8 @@ impl ToolRegistry {
     ];
 
     /// Minimal tool set for local models — saves context tokens.
-    const LOCAL_CORE_TOOLS: &'static [&'static str] = &[
-        "read_file",
-        "write_file",
-        "list_dir",
-        "exec",
-    ];
+    const LOCAL_CORE_TOOLS: &'static [&'static str] =
+        &["read_file", "write_file", "list_dir", "exec"];
 
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
@@ -487,7 +498,9 @@ impl ToolRegistry {
             "web_search",
         ),
         (
-            &["browser", "browse", "click", "navigate", "http", "url", "website", "webpage"],
+            &[
+                "browser", "browse", "click", "navigate", "http", "url", "website", "webpage",
+            ],
             "browser",
         ),
         (&["schedule", "cron", "every", "timer", "periodic"], "cron"),
@@ -510,10 +523,7 @@ impl ToolRegistry {
             ],
             "recall",
         ),
-        (
-            &["remember", "save", "store", "note this"],
-            "remember",
-        ),
+        (&["remember", "save", "store", "note this"], "remember"),
         (
             &["skill", "capability", "how to", "technique", "method"],
             "read_skill",
@@ -727,9 +737,7 @@ impl ToolRegistry {
                 let allowed: HashSet<&str> = phase_tools.iter().copied().collect();
                 self.tools
                     .iter()
-                    .filter(|(name, tool)| {
-                        allowed.contains(name.as_str()) && tool.is_available()
-                    })
+                    .filter(|(name, tool)| allowed.contains(name.as_str()) && tool.is_available())
                     .map(|(_, tool)| tool.to_schema())
                     .collect()
             }
@@ -804,7 +812,13 @@ pub fn resolve_toolset(
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut visited = HashSet::new();
-    resolve_toolset_inner(name, custom_sets, available_tools, &mut result, &mut visited)?;
+    resolve_toolset_inner(
+        name,
+        custom_sets,
+        available_tools,
+        &mut result,
+        &mut visited,
+    )?;
     // Dedup while preserving insertion order.
     let mut seen = HashSet::new();
     result.retain(|t| seen.insert(t.clone()));
@@ -1406,13 +1420,19 @@ mod tests {
     #[test]
     fn test_condense_description_with_period() {
         let desc = "Read a file from disk. Supports binary and text files. Very useful.";
-        assert_eq!(ToolRegistry::condense_description(desc), "Read a file from disk.");
+        assert_eq!(
+            ToolRegistry::condense_description(desc),
+            "Read a file from disk."
+        );
     }
 
     #[test]
     fn test_condense_description_without_period() {
         let desc = "A mock tool for testing";
-        assert_eq!(ToolRegistry::condense_description(desc), "A mock tool for testing");
+        assert_eq!(
+            ToolRegistry::condense_description(desc),
+            "A mock tool for testing"
+        );
     }
 
     #[test]
@@ -1691,7 +1711,7 @@ mod tests {
             .collect();
 
         assert!(names.contains("web_search")); // keyword-triggered
-        assert!(names.contains("read_file"));  // local core
+        assert!(names.contains("read_file")); // local core
     }
 
     #[test]
@@ -1948,7 +1968,10 @@ mod tests {
             "base".to_string(),
             vec!["tool_a".to_string(), "tool_b".to_string()],
         );
-        custom.insert("extended".to_string(), vec!["@base".to_string(), "tool_c".to_string()]);
+        custom.insert(
+            "extended".to_string(),
+            vec!["@base".to_string(), "tool_c".to_string()],
+        );
         let result = resolve_toolset("extended", &custom, &[]).unwrap();
         assert!(result.contains(&"tool_a".to_string()));
         assert!(result.contains(&"tool_b".to_string()));
@@ -2020,7 +2043,10 @@ mod tests {
         assert!(!result.contains(&"web_search".to_string()));
         assert!(!result.contains(&"browser".to_string()));
         // Each tool appears exactly once despite @core + explicit recall.
-        assert_eq!(result.iter().filter(|t| t.as_str() == "read_file").count(), 1);
+        assert_eq!(
+            result.iter().filter(|t| t.as_str() == "read_file").count(),
+            1
+        );
     }
 
     /// Test 3: Full chain — profile capabilities -> resolved tools -> no forbidden tools.
@@ -2071,7 +2097,8 @@ mod tests {
         ];
 
         // Child inherits but denies Write and Execute.
-        let child_caps = inherit_capabilities(&parent_caps, &[Capability::Write, Capability::Execute]);
+        let child_caps =
+            inherit_capabilities(&parent_caps, &[Capability::Write, Capability::Execute]);
         let child_tools = resolve_capabilities(&child_caps);
 
         // Child should have read, http, and memory tools.
@@ -2107,7 +2134,13 @@ mod tests {
         // Registry gating: disabled execute_code must not appear in definitions.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(CodeExecutionTool::new(false, 30, 20, vec![], None)));
+        registry.register(Box::new(CodeExecutionTool::new(
+            false,
+            30,
+            20,
+            vec![],
+            None,
+        )));
 
         let defs = registry.get_definitions();
         let def_names: Vec<String> = defs
@@ -2129,5 +2162,34 @@ mod tests {
             .collect();
 
         assert!(def_names2.contains(&"execute_code".to_string()));
+    }
+
+    #[test]
+    fn test_definitions_for_filters_by_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("alpha")));
+        registry.register(Box::new(MockTool::new("beta")));
+        registry.register(Box::new(MockTool::new("gamma")));
+
+        let names = vec!["alpha".to_string(), "gamma".to_string()];
+        let defs = registry.definitions_for(&names);
+        let def_names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+        assert_eq!(def_names.len(), 2);
+        assert!(def_names.contains(&"alpha".to_string()));
+        assert!(def_names.contains(&"gamma".to_string()));
+        assert!(!def_names.contains(&"beta".to_string()));
+    }
+
+    #[test]
+    fn test_definitions_for_missing_tool_skipped() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("alpha")));
+
+        let names = vec!["alpha".to_string(), "nonexistent".to_string()];
+        let defs = registry.definitions_for(&names);
+        assert_eq!(defs.len(), 1);
     }
 }
