@@ -47,6 +47,7 @@ pub mod instructions;
 pub mod knowledge_graph;
 pub mod knowledge_store;
 pub mod lcm;
+pub mod learn_loop;
 pub mod learning;
 pub mod lora_bridge;
 pub mod markers;

@@ -103,6 +103,11 @@
 2. Immediate observers run synchronously; async observers (LoRA, Reflector) spawned as tokio tasks
 3. finalize_response.rs constructs TurnOutcome and calls LearnLoop — zero direct store writes remain
 
+**Plans:** 1 plan
+
+Plans:
+- [ ] 04-01-PLAN.md — TurnOutcome + LearnLoop trait + wire into finalize_response
+
 ---
 
 ## Phase 5: Lane Split
