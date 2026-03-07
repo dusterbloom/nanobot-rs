@@ -522,7 +522,8 @@ pub fn build_t2l_description(buffer: &ExperienceBuffer) -> String {
     }
 
     // Aggregate tool usage patterns.
-    let mut tool_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut tool_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut total_quality = 0.0;
     let mut count = 0;
 
@@ -589,8 +590,7 @@ pub async fn regenerate_adapters(
     use qlora_rs::QLoraTrainingConfig;
 
     let output_dir = adapters_dir();
-    std::fs::create_dir_all(&output_dir)
-        .context("Failed to create adapters directory")?;
+    std::fs::create_dir_all(&output_dir).context("Failed to create adapters directory")?;
 
     // Build input documents.
     let d2l_doc = build_d2l_document(workspace);
@@ -651,7 +651,14 @@ pub async fn regenerate_adapters(
     // Train personality adapter from D2L document.
     if !d2l_doc.is_empty() {
         let out_path = output_dir.join("personality.gguf");
-        match train_adapter(&d2l_doc, &base_model_path, &out_path, &qlora_cfg, &training_cfg, &device) {
+        match train_adapter(
+            &d2l_doc,
+            &base_model_path,
+            &out_path,
+            &qlora_cfg,
+            &training_cfg,
+            &device,
+        ) {
             Ok(()) => {
                 info!("D2L adapter generated: {}", out_path.display());
                 d2l_result = Some(out_path);
@@ -663,7 +670,14 @@ pub async fn regenerate_adapters(
     // Train behavioral adapter from T2L description.
     if !t2l_desc.is_empty() {
         let out_path = output_dir.join("behavior.gguf");
-        match train_adapter(&t2l_desc, &base_model_path, &out_path, &qlora_cfg, &training_cfg, &device) {
+        match train_adapter(
+            &t2l_desc,
+            &base_model_path,
+            &out_path,
+            &qlora_cfg,
+            &training_cfg,
+            &device,
+        ) {
             Ok(()) => {
                 info!("T2L adapter generated: {}", out_path.display());
                 t2l_result = Some(out_path);
@@ -697,8 +711,16 @@ pub async fn regenerate_adapters(
         success,
         message: format!(
             "Generated adapters: D2L={}, T2L={}",
-            if success && d2l_doc.len() > 0 { "yes" } else { "no" },
-            if success && t2l_desc.len() > 0 { "yes" } else { "no" }
+            if success && d2l_doc.len() > 0 {
+                "yes"
+            } else {
+                "no"
+            },
+            if success && t2l_desc.len() > 0 {
+                "yes"
+            } else {
+                "no"
+            }
         ),
     })
 }
@@ -739,25 +761,29 @@ fn train_adapter(
 ) -> Result<()> {
     use candle_core::Tensor;
     use qlora_rs::{
-        ExportConfig, ExportFormat, QLoraLayer, QuantizedLinear,
-        QLoraTrainer, export_model,
+        export_model, ExportConfig, ExportFormat, QLoraLayer, QLoraTrainer, QuantizedLinear,
     };
 
     // Tokenize input text to token IDs using tiktoken (cl100k_base).
-    let bpe = tiktoken_rs::cl100k_base()
-        .context("Failed to load cl100k_base tokenizer")?;
-    let token_ids: Vec<u32> = bpe.encode_with_special_tokens(text)
+    let bpe = tiktoken_rs::cl100k_base().context("Failed to load cl100k_base tokenizer")?;
+    let token_ids: Vec<u32> = bpe
+        .encode_with_special_tokens(text)
         .into_iter()
         .map(|t| t as u32)
         .collect();
 
     if token_ids.len() < 2 {
-        anyhow::bail!("Input text too short for training ({} tokens)", token_ids.len());
+        anyhow::bail!(
+            "Input text too short for training ({} tokens)",
+            token_ids.len()
+        );
     }
 
     info!(
         "Training adapter: {} tokens, rank={}, alpha={}",
-        token_ids.len(), qlora_cfg.lora.r, qlora_cfg.lora.alpha
+        token_ids.len(),
+        qlora_cfg.lora.r,
+        qlora_cfg.lora.alpha
     );
 
     // Create trainer and build a single quantized linear layer.
@@ -778,7 +804,8 @@ fn train_adapter(
             .map_err(|e| anyhow::anyhow!("Failed to create quantized LoRA layer: {}", e))?
     };
 
-    trainer.init_optimizer(&[&layer])
+    trainer
+        .init_optimizer(&[&layer])
         .map_err(|e| anyhow::anyhow!("Failed to init optimizer: {}", e))?;
 
     // Prepare training data: sliding window of token embeddings.
@@ -796,7 +823,8 @@ fn train_adapter(
             .map(|&t| t as f32 / 100000.0) // Normalize to small range
             .collect();
         // Reshape to [batch=1, seq_len, hidden] by repeating across hidden dim.
-        let input_data: Vec<f32> = input_slice.iter()
+        let input_data: Vec<f32> = input_slice
+            .iter()
             .flat_map(|&v| std::iter::repeat(v).take(hidden_size))
             .collect();
         let input = Tensor::from_vec(input_data, (1, window_size, hidden_size), device)
@@ -827,11 +855,8 @@ fn train_adapter(
         model_type: "qlora".to_string(),
     };
 
-    export_model(
-        &[("adapter.weight", quantized)],
-        export_cfg,
-        output_path,
-    ).map_err(|e| anyhow::anyhow!("Failed to export adapter as GGUF: {}", e))?;
+    export_model(&[("adapter.weight", quantized)], export_cfg, output_path)
+        .map_err(|e| anyhow::anyhow!("Failed to export adapter as GGUF: {}", e))?;
 
     info!("Adapter exported: {}", output_path.display());
     Ok(())
@@ -858,7 +883,10 @@ async fn find_base_model_path(server_url: &str, local_model: &str) -> Result<Pat
                 info!("Found base model via local_model hint: {}", path.display());
                 return Ok(path);
             }
-            info!("No model matching '{}' found locally, trying server API", local_model);
+            info!(
+                "No model matching '{}' found locally, trying server API",
+                local_model
+            );
         }
     }
 
@@ -866,14 +894,19 @@ async fn find_base_model_path(server_url: &str, local_model: &str) -> Result<Pat
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/models", server_url);
 
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .context("Failed to query local model server")?;
 
     if !resp.status().is_success() {
         anyhow::bail!("Model server returned {}", resp.status());
     }
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .context("Failed to parse model list response")?;
 
     // LM Studio format: { "data": [{ "id": "publisher/model-name" }] }
@@ -1001,14 +1034,20 @@ pub async fn trigger_training(
         .build()?;
     let url = format!("{}/train", server_url);
 
-    let resp = client.post(&url).json(&body).send().await
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
         .context("Failed to POST /train to MLX server")?;
 
     if resp.status().is_success() {
         buffer.mark_exported(&ids)?;
         info!(
             "Perplexity gate: sent {} experiences to {} for training ({} epochs)",
-            ids.len(), server_url, epochs
+            ids.len(),
+            server_url,
+            epochs
         );
         Ok(ids.len())
     } else {
@@ -1411,7 +1450,10 @@ mod tests {
             .unwrap();
         // On non-lora builds: stub returns feature-missing message.
         // On lora builds: fails because no local server / no data.
-        assert!(!result.success, "should not succeed without data or lora feature");
+        assert!(
+            !result.success,
+            "should not succeed without data or lora feature"
+        );
         // The message should be informative either way.
         assert!(!result.message.is_empty());
     }
@@ -1432,7 +1474,14 @@ mod tests {
         let trace_json = serde_json::to_string(&entries).unwrap();
 
         let id = buffer
-            .record("summarize the config", &trace_json, "Here is the config summary.", true, 1.0, "gpt-4")
+            .record(
+                "summarize the config",
+                &trace_json,
+                "Here is the config summary.",
+                true,
+                1.0,
+                "gpt-4",
+            )
             .unwrap();
         assert!(id > 0);
 
@@ -1442,7 +1491,10 @@ mod tests {
         assert_eq!(experiences[0].prompt, "summarize the config");
         assert_eq!(experiences[0].response, "Here is the config summary.");
         assert_eq!(experiences[0].model, "gpt-4");
-        assert!(experiences[0].surprise > 0.0, "should have non-zero surprise for multi-tool trace");
+        assert!(
+            experiences[0].surprise > 0.0,
+            "should have non-zero surprise for multi-tool trace"
+        );
 
         // Verify the trace parses back correctly.
         let parsed: Vec<serde_json::Value> =
@@ -1473,19 +1525,26 @@ mod tests {
 
         let exps = buffer.top_unexported(10).unwrap();
         assert_eq!(exps.len(), 1);
-        assert!((exps[0].surprise - 4.2).abs() < 1e-6, "explicit surprise should be preserved");
+        assert!(
+            (exps[0].surprise - 4.2).abs() < 1e-6,
+            "explicit surprise should be preserved"
+        );
         assert_eq!(exps[0].model, "qwen3.5");
     }
 
     #[tokio::test]
     async fn test_query_perplexity_unreachable() {
         // query_perplexity should return None when server is unreachable.
-        let result = super::super::finalize_response::query_perplexity(
+        let result = super::super::learn_loop::query_perplexity(
             "http://127.0.0.1:19999",
             "hello",
             "world",
-        ).await;
-        assert!(result.is_none(), "should return None for unreachable server");
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "should return None for unreachable server"
+        );
     }
 
     #[tokio::test]
@@ -1495,7 +1554,9 @@ mod tests {
         let db_path = dir.path().join("experience.db");
         let buffer = ExperienceBuffer::open(&db_path).unwrap();
 
-        buffer.record_with_surprise("q", "[]", "a", true, 1.0, "m", 5.0).unwrap();
+        buffer
+            .record_with_surprise("q", "[]", "a", true, 1.0, "m", 5.0)
+            .unwrap();
 
         let result = trigger_training(&buffer, "http://127.0.0.1:19999", 10, 3).await;
         assert!(result.is_err(), "should fail when server is unreachable");
@@ -1515,23 +1576,48 @@ mod tests {
         let used_tools_empty_content = true; // used_tools.is_empty() == false
         let final_content_empty = "";
         if used_tools_empty_content && !final_content_empty.is_empty() {
-            buffer.record("prompt", "[]", final_content_empty, true, 1.0, "m").unwrap();
+            buffer
+                .record("prompt", "[]", final_content_empty, true, 1.0, "m")
+                .unwrap();
         }
-        assert_eq!(buffer.stats().unwrap().total, 0, "should not record with empty content");
+        assert_eq!(
+            buffer.stats().unwrap().total,
+            0,
+            "should not record with empty content"
+        );
 
         // Simulate: no tools used — should NOT record.
         let used_tools_is_empty = true;
         if !used_tools_is_empty {
-            buffer.record("prompt", "[]", "response", true, 1.0, "m").unwrap();
+            buffer
+                .record("prompt", "[]", "response", true, 1.0, "m")
+                .unwrap();
         }
-        assert_eq!(buffer.stats().unwrap().total, 0, "should not record without tools");
+        assert_eq!(
+            buffer.stats().unwrap().total,
+            0,
+            "should not record without tools"
+        );
 
         // Simulate: tools used AND non-empty content — SHOULD record.
         let has_tools = true;
         let has_content = "Got it done.";
         if has_tools && !has_content.is_empty() {
-            buffer.record("do the thing", r#"[{"name":"shell"}]"#, has_content, true, 1.0, "m").unwrap();
+            buffer
+                .record(
+                    "do the thing",
+                    r#"[{"name":"shell"}]"#,
+                    has_content,
+                    true,
+                    1.0,
+                    "m",
+                )
+                .unwrap();
         }
-        assert_eq!(buffer.stats().unwrap().total, 1, "should record when both tools and content present");
+        assert_eq!(
+            buffer.stats().unwrap().total,
+            1,
+            "should record when both tools and content present"
+        );
     }
 }

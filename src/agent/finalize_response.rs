@@ -2,24 +2,28 @@
 //!
 //! Extracted from `agent_loop.rs` to keep that file focused on the iteration
 //! state machine. This module contains only the response-finalization logic.
+//!
+//! All learning/metrics observations are dispatched through [`LearnLoop`]
+//! (see `learn_loop.rs`). Zero direct audit/calibrator/perplexity writes here.
 
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
 use serde_json::json;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::agent::agent_core::provenance_warning_role;
 use crate::agent::agent_loop::{AgentLoopShared, TurnContext};
+use crate::agent::learn_loop::TurnOutcome;
 use crate::agent::token_budget::TokenBudget;
 use crate::bus::events::OutboundMessage;
 
 impl AgentLoopShared {
-    /// Phase 3: Finalize the response — persist session, build outbound message.
+    /// Phase 3: Finalize the response -- persist session, build outbound message.
     ///
     /// Consumes the `TurnContext` (by value) since this is the terminal phase.
-    /// Stores context stats, writes audit summaries, verifies claims, and
-    /// constructs the `OutboundMessage`.
+    /// Stores context stats, dispatches learning observations via LearnLoop,
+    /// verifies claims, and constructs the `OutboundMessage`.
     #[instrument(name = "finalize_response", skip(self, ctx), fields(
         session = %ctx.session_key,
         model = %ctx.core.model,
@@ -35,15 +39,19 @@ impl AgentLoopShared {
         counters
             .last_context_used
             .store(final_tokens, Ordering::Relaxed);
-        counters
-            .last_context_max
-            .store(ctx.core.token_budget.max_context() as u64, Ordering::Relaxed);
+        counters.last_context_max.store(
+            ctx.core.token_budget.max_context() as u64,
+            Ordering::Relaxed,
+        );
         counters
             .last_message_count
             .store(ctx.messages.len() as u64, Ordering::Relaxed);
         // Store working memory token count.
         let wm_tokens = if ctx.core.memory_enabled {
-            let wm_text = ctx.core.working_memory.get_context(&ctx.session_key, usize::MAX);
+            let wm_text = ctx
+                .core
+                .working_memory
+                .get_context(&ctx.session_key, usize::MAX);
             TokenBudget::estimate_str_tokens(&wm_text) as u64
         } else {
             0
@@ -54,190 +62,63 @@ impl AgentLoopShared {
         // Store tools called this turn.
         {
             let tools_list: Vec<String> = ctx.used_tools.iter().cloned().collect();
-            { let mut guard = counters.last_tools_called.lock();
+            {
+                let mut guard = counters.last_tools_called.lock();
                 *guard = tools_list;
             }
         }
 
-        // Perplexity gate: record experience and optionally trigger training.
-        // Must run before audit write which moves turn_tool_entries.
-        if self.perplexity_gate_config.enabled
-            && !ctx.used_tools.is_empty()
-            && !ctx.final_content.is_empty()
-        {
-            if let Some(ref eb_mutex) = self.experience_buffer {
-                let tool_entries: Vec<serde_json::Value> = ctx
-                    .turn_tool_entries
-                    .iter()
-                    .map(|e| {
-                        serde_json::json!({
-                            "name": e.name,
-                            "ok": e.ok,
-                            "duration_ms": e.duration_ms,
-                        })
-                    })
-                    .collect();
-                let trace_json =
-                    serde_json::to_string(&tool_entries).unwrap_or_else(|_| "[]".into());
+        // Pre-compute cost from token counters (async ModelPrices::load).
+        let prompt_tokens = counters.last_actual_prompt_tokens.load(Ordering::Relaxed) as i64;
+        let completion_tokens = counters
+            .last_actual_completion_tokens
+            .load(Ordering::Relaxed) as i64;
+        let cost_usd = if prompt_tokens > 0 || completion_tokens > 0 {
+            let prices = crate::agent::model_prices::ModelPrices::load().await;
+            prices.cost_of(&ctx.core.model, prompt_tokens, completion_tokens)
+        } else {
+            0.0
+        };
 
-                // Try in-process MLX perplexity first, then HTTP, then heuristic.
-                let surprise = 'surprise: {
-                    #[cfg(feature = "mlx")]
-                    if let Some(ref mlx) = self.mlx_provider {
-                        if let Ok(loss) = mlx.perplexity(&ctx.user_content, &ctx.final_content).await {
-                            break 'surprise loss as f64;
-                        }
-                    }
-                    match query_perplexity(
-                        &self.perplexity_gate_config.mlx_server_url,
-                        &ctx.user_content,
-                        &ctx.final_content,
-                    ).await {
-                        Some(loss) => loss as f64,
-                        None => crate::agent::lora_bridge::compute_surprise(
-                            &ctx.user_content, &trace_json,
-                        ),
-                    }
-                };
+        // Construct TurnOutcome and dispatch through LearnLoop.
+        let outcome = TurnOutcome {
+            user_content: ctx.user_content.clone(),
+            final_content: ctx.final_content.clone(),
+            model: ctx.core.model.clone(),
+            session_key: ctx.session_key.clone(),
+            workspace: ctx.core.workspace.clone(),
+            used_tools: ctx.used_tools.clone(),
+            turn_tool_entries: std::mem::take(&mut ctx.turn_tool_entries),
+            iterations_used: ctx.iterations_used,
+            max_iterations: ctx.core.max_iterations,
+            turn_count: ctx.turn_count,
+            turn_start_elapsed_ms: ctx.turn_start.elapsed().as_millis() as u64,
+            context_tokens: final_tokens,
+            message_count: ctx.messages.len(),
+            working_memory_tokens: wm_tokens,
+            provenance_audit_enabled: ctx.core.provenance_config.enabled
+                && ctx.core.provenance_config.audit_log,
+            is_local: ctx.core.is_local,
+            cost_usd,
+            prompt_tokens,
+            completion_tokens,
+        };
 
-                let threshold = self.perplexity_gate_config.surprise_threshold as f64;
-                if surprise > threshold {
-                    // Record under lock, then release before any async work.
-                    let should_train = {
-                        let eb = eb_mutex.lock();
-                        match eb.record_with_surprise(
-                            &ctx.user_content,
-                            &trace_json,
-                            &ctx.final_content,
-                            true,
-                            1.0,
-                            &ctx.core.model,
-                            surprise,
-                        ) {
-                            Ok(id) => {
-                                debug!(
-                                    experience_id = id,
-                                    surprise = format!("{:.3}", surprise),
-                                    "perplexity_gate: recorded surprising experience"
-                                );
-                            }
-                            Err(e) => {
-                                debug!("perplexity_gate: record failed: {}", e);
-                            }
-                        }
-                        let min_exp = self.perplexity_gate_config.min_experiences;
-                        eb.stats().map(|s| s.unexported as usize >= min_exp).unwrap_or(false)
-                    }; // lock released
+        // Synchronous observers: audit log, budget calibrator, structured logging.
+        self.learn_loop.observe_immediate(&outcome);
 
-                    if should_train {
-                        let epochs = self.perplexity_gate_config.train_epochs;
-                        let min_exp = self.perplexity_gate_config.min_experiences;
-                        let eb_arc = eb_mutex.clone();
-
-                        // Prefer in-process MLX training (no HTTP), fall back to server.
-                        #[cfg(feature = "mlx")]
-                        let mlx_provider = self.mlx_provider.clone();
-                        #[cfg(not(feature = "mlx"))]
-                        let mlx_provider: Option<()> = None;
-
-                        let server_url = self.perplexity_gate_config.mlx_server_url.clone();
-                        tokio::spawn(async move {
-                            // Collect experiences under lock.
-                            let (exps_data, ids) = {
-                                let eb = eb_arc.lock();
-                                let exps = match eb.top_unexported(min_exp) {
-                                    Ok(e) => e,
-                                    Err(_) => return,
-                                };
-                                if exps.is_empty() { return; }
-                                let data: Vec<(String, String)> = exps.iter()
-                                    .map(|e| (e.prompt.clone(), e.response.clone()))
-                                    .collect();
-                                let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
-                                (data, ids)
-                            };
-
-                            // ANE split-silicon training: train on CPU/ANE thread,
-                            // hot-swap weights into MLX GPU model when done.
-                            // GPU continues serving inference uninterrupted.
-                            #[cfg(all(feature = "ane", feature = "mlx"))]
-                            if let Some(ref mlx) = mlx_provider {
-                                if let Some(ane_cfg) = build_ane_training_config() {
-                                    let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
-                                        std::path::Path::new(&ane_cfg.model_dir),
-                                    ) {
-                                        Ok(t) => t,
-                                        Err(e) => {
-                                            debug!("perplexity_gate: ANE tokenizer load failed: {e}");
-                                            // Fall through to MLX GPU training below
-                                            return try_mlx_or_http_train(
-                                                &mlx_provider, &exps_data, &ids, &eb_arc,
-                                                epochs, &server_url,
-                                            ).await;
-                                        }
-                                    };
-                                    let mut samples = Vec::new();
-                                    for (prompt, response) in &exps_data {
-                                        let messages = vec![
-                                            crate::agent::mlx_server::ChatMessage {
-                                                role: "user".into(), content: prompt.clone(),
-                                            },
-                                            crate::agent::mlx_server::ChatMessage {
-                                                role: "assistant".into(), content: response.clone(),
-                                            },
-                                        ];
-                                        if let Ok(pair) = crate::agent::mlx_server::tokenize_conversation(
-                                            &tokenizer, &messages,
-                                        ) {
-                                            samples.push(pair);
-                                        }
-                                    }
-                                    if !samples.is_empty() {
-                                        let mlx_tx = mlx.model_tx();
-                                        let _handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
-                                            ane_cfg, samples, mlx_tx,
-                                        );
-                                        let eb = eb_arc.lock();
-                                        let _ = eb.mark_exported(&ids);
-                                        info!(
-                                            "perplexity_gate: ANE split-silicon training spawned ({} experiences)",
-                                            ids.len()
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-
-                            // Try in-process MLX GPU training, then HTTP fallback.
-                            try_mlx_or_http_train(
-                                &mlx_provider, &exps_data, &ids, &eb_arc,
-                                epochs, &server_url,
-                            ).await;
-                        });
-                    }
-                }
-            }
-        }
-
-        // Write per-turn audit summary.
-        if ctx.core.provenance_config.enabled && ctx.core.provenance_config.audit_log {
-            let summary = crate::agent::audit::TurnSummary {
-                turn: ctx.turn_count,
-                timestamp: Utc::now().to_rfc3339(),
-                context_tokens: final_tokens as usize,
-                message_count: ctx.messages.len(),
-                tools_called: ctx.turn_tool_entries,
-                working_memory_tokens: wm_tokens as usize,
-            };
-            crate::agent::audit::write_turn_summary(&ctx.core.workspace, &ctx.session_key, &summary);
-        }
+        // Async observers: perplexity gate, LoRA training (fire-and-forget).
+        self.learn_loop.observe_async(outcome);
 
         if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
             // Try to surface the last meaningful assistant message as a rescue
             // rather than emitting a generic fallback. This happens when the
             // model exhausted iterations without producing a text-only response
             // (e.g. ended on a tool result with no follow-up assistant turn).
-            let last_assistant = ctx.messages.iter().rev()
+            let last_assistant = ctx
+                .messages
+                .iter()
+                .rev()
                 .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
                 .and_then(|m| m.get("content").and_then(|c| c.as_str()))
                 .unwrap_or("");
@@ -317,21 +198,28 @@ impl AgentLoopShared {
         // assistant message into a plain text assistant message, merging here
         // prevents two consecutive assistant messages from being persisted.
         if !ctx.final_content.is_empty() {
-            let last_is_assistant = ctx.messages.last()
+            let last_is_assistant = ctx
+                .messages
+                .last()
                 .and_then(|m| m.get("role").and_then(|r| r.as_str()))
                 .map(|r| r == "assistant")
                 .unwrap_or(false);
             if last_is_assistant {
                 if let Some(last) = ctx.messages.last_mut() {
-                    let existing = last.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let existing = last
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     last["content"] = json!(format!("{}\n\n{}", existing, ctx.final_content));
                 }
             } else {
-                ctx.messages.push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
+                ctx.messages
+                    .push(json!({"role": "assistant", "content": ctx.final_content.clone()}));
             }
         }
 
-        // Update session history — persist full message array including tool calls.
+        // Update session history -- persist full message array including tool calls.
         // Skip system prompt (index 0) and pre-existing history.
         let new_messages: Vec<serde_json::Value> = if ctx.new_start < ctx.messages.len() {
             ctx.messages[ctx.new_start..].to_vec()
@@ -343,7 +231,8 @@ impl AgentLoopShared {
             vec![]
         };
         if !new_messages.is_empty() {
-            ctx.core.sessions
+            ctx.core
+                .sessions
                 .add_messages(&ctx.session_id, &new_messages)
                 .await;
         }
@@ -365,7 +254,8 @@ impl AgentLoopShared {
                 let current = ctx.core.working_memory.get_or_create(&ctx.session_key);
                 if !current.content.is_empty()
                     && current.last_updated_turn > 0
-                    && ctx.turn_count.saturating_sub(current.last_updated_turn) > ctx.core.stale_memory_turn_threshold
+                    && ctx.turn_count.saturating_sub(current.last_updated_turn)
+                        > ctx.core.stale_memory_turn_threshold
                 {
                     ctx.core.working_memory.clear(&ctx.session_key);
                     debug!(
@@ -376,64 +266,7 @@ impl AgentLoopShared {
             }
         }
 
-        // Record execution stats for budget calibration (append-only, errors silently logged).
-        if let Some(ref cal_mutex) = self.calibrator {
-            let task_type = if ctx.used_tools.contains("exec_command") {
-                "shell"
-            } else if ctx.used_tools.contains("web_search") {
-                "web_search"
-            } else if ctx.used_tools.contains("spawn_agent") {
-                "delegate"
-            } else if ctx.used_tools.is_empty() {
-                "chat"
-            } else {
-                "tool_use"
-            };
-            
-            // Calculate actual cost from token usage.
-            let prompt_tokens = counters.last_actual_prompt_tokens.load(Ordering::Relaxed) as i64;
-            let completion_tokens = counters.last_actual_completion_tokens.load(Ordering::Relaxed) as i64;
-            let cost_usd = if prompt_tokens > 0 || completion_tokens > 0 {
-                let prices = crate::agent::model_prices::ModelPrices::load().await;
-                prices.cost_of(&ctx.core.model, prompt_tokens, completion_tokens)
-            } else {
-                0.0
-            };
-            
-            // Structured log for observability.
-            info!(
-                task_type = %task_type,
-                iterations = ctx.iterations_used,
-                tool_calls = ctx.used_tools.len(),
-                prompt_tokens = prompt_tokens,
-                completion_tokens = completion_tokens,
-                cost_usd = format!("{:.6}", cost_usd),
-                duration_ms = ctx.turn_start.elapsed().as_millis() as u64,
-                success = !ctx.final_content.is_empty(),
-                "turn_completed"
-            );
-            
-            let record = crate::agent::budget_calibrator::ExecutionRecord {
-                task_type: task_type.to_string(),
-                model: ctx.core.model.clone(),
-                iterations_used: ctx.iterations_used,
-                max_iterations: ctx.core.max_iterations,
-                success: !ctx.final_content.is_empty(),
-                cost_usd,
-                duration_ms: ctx.turn_start.elapsed().as_millis() as u64,
-                depth: 0,
-                tool_calls: ctx.used_tools.len() as u32,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            };
-            { let cal = cal_mutex.lock();
-                if let Err(e) = cal.record(&record) {
-                    tracing::debug!("BudgetCalibrator record failed: {}", e);
-                }
-            }
-        }
-
-        ctx.final_content =
-            crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
+        ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 
         if ctx.final_content.is_empty() {
             None
@@ -453,123 +286,5 @@ impl AgentLoopShared {
             }
             Some(outbound)
         }
-    }
-}
-
-/// Query the MLX server's `/perplexity` endpoint for real CE-loss surprise.
-///
-/// Returns `Some(loss)` on success, `None` if the server is unreachable or errors.
-/// Uses a short timeout (2s) to avoid blocking the response path.
-pub(crate) async fn query_perplexity(server_url: &str, user_content: &str, assistant_content: &str) -> Option<f32> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let url = format!("{}/perplexity", server_url);
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": assistant_content}
-        ]
-    });
-    let resp = client.post(&url).json(&body).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("loss").and_then(|v| v.as_f64()).map(|v| v as f32)
-}
-
-/// Build ANE training config from the local model directory.
-///
-/// Returns `None` if no ANE-compatible model is available.
-/// Currently only Qwen3-1.7B (standard transformer) is ANE-trainable.
-/// Qwen3.5-2B (hybrid GDN) requires GDN support in ANE forward — future work.
-#[cfg(all(feature = "ane", feature = "mlx"))]
-fn build_ane_training_config() -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
-    use crate::agent::ane_mil::MilConfig;
-
-    let home = dirs::home_dir()?;
-    let models_dir = home.join(".cache/lm-studio/models");
-
-    // Try Qwen3-1.7B (standard transformer — fully ANE-compatible)
-    let qwen3_1_7b = models_dir.join("lmstudio-community/Qwen3-1.7B-MLX-8bit");
-    if qwen3_1_7b.join("tokenizer.json").exists() {
-        return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
-            model_dir: qwen3_1_7b,
-            mil_config: MilConfig {
-                dim: 2048,
-                hidden_dim: 6144,
-                n_heads: 16,
-                seq_len: 64,
-                n_kv_heads: 8,
-                rope_theta: 1_000_000.0,
-                rms_eps: 1e-6,
-                has_lm_head: false,
-            },
-            epochs: 3,
-            lr: 1e-5,
-            linear_attn_indices: vec![], // standard transformer, no GDN
-            kv_dim: 8 * 128, // n_kv_heads=8, head_dim=128
-        });
-    }
-
-    None
-}
-
-/// Try in-process MLX GPU training, then fall back to HTTP /train endpoint.
-#[allow(unused_variables)]
-async fn try_mlx_or_http_train(
-    #[cfg(feature = "mlx")]
-    mlx_provider: &Option<std::sync::Arc<crate::providers::mlx::MlxProvider>>,
-    #[cfg(not(feature = "mlx"))]
-    mlx_provider: &Option<()>,
-    exps_data: &[(String, String)],
-    ids: &[i64],
-    eb_arc: &std::sync::Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>,
-    epochs: usize,
-    server_url: &str,
-) {
-    use tracing::{debug, info};
-
-    #[cfg(feature = "mlx")]
-    if let Some(ref mlx) = mlx_provider {
-        let convos: Vec<Vec<crate::agent::mlx_server::ChatMessage>> =
-            exps_data.iter().map(|(p, r)| vec![
-                crate::agent::mlx_server::ChatMessage { role: "user".into(), content: p.clone() },
-                crate::agent::mlx_server::ChatMessage { role: "assistant".into(), content: r.clone() },
-            ]).collect();
-        match mlx.train(convos, epochs).await {
-            Ok(()) => {
-                let eb = eb_arc.lock();
-                let _ = eb.mark_exported(ids);
-                info!("perplexity_gate: in-process training with {} experiences", ids.len());
-                return;
-            }
-            Err(e) => debug!("perplexity_gate: in-process train failed: {e}"),
-        }
-    }
-
-    // Fall back to HTTP /train.
-    let conversations: Vec<serde_json::Value> = exps_data.iter().map(|(p, r)| {
-        serde_json::json!([
-            {"role": "user", "content": p},
-            {"role": "assistant", "content": r}
-        ])
-    }).collect();
-    let body = serde_json::json!({"messages": conversations, "epochs": epochs});
-    let url = format!("{}/train", server_url);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5)).build() {
-        Ok(c) => c, Err(_) => return,
-    };
-    match client.post(&url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let eb = eb_arc.lock();
-            let _ = eb.mark_exported(ids);
-            info!("perplexity_gate: triggered training with {} experiences", ids.len());
-        }
-        Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
-        Err(e) => debug!("perplexity_gate: training trigger failed: {e}"),
     }
 }

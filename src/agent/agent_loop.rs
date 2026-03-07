@@ -18,10 +18,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info};
 
+use crate::agent::compaction::ContextCompactor;
 use crate::agent::reflector::Reflector;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::SystemState;
-use crate::agent::compaction::ContextCompactor;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
@@ -34,7 +34,7 @@ pub use crate::agent::agent_core::{
     SwappableCoreConfig,
 };
 // Re-export for test use (agent_loop_tests.rs uses `use super::*`).
-pub(crate) use crate::agent::agent_core::{provenance_warning_role, history_limit};
+pub(crate) use crate::agent::agent_core::{history_limit, provenance_warning_role};
 
 // ---------------------------------------------------------------------------
 // Submodules (loaded via #[path] because agent_loop is a file, not a dir)
@@ -50,8 +50,7 @@ pub(crate) use agent_heuristics::appears_incomplete;
 // Re-export remaining heuristic functions at module-private level for use
 // within this module and its submodules (agent_shared uses them via super::).
 use agent_heuristics::{
-    adaptive_max_tokens, last_user_message, render_via_protocol,
-    should_strip_tools_for_trio,
+    adaptive_max_tokens, last_user_message, render_via_protocol, should_strip_tools_for_trio,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,7 +60,6 @@ use agent_heuristics::{
 // Because `Arc<MessageTool>` etc. don't implement `Tool` directly (the trait
 // requires owned `Box<dyn Tool>`), we create thin proxy wrappers that
 // implement `Tool` by delegating to the inner `Arc`.
-
 
 // ---------------------------------------------------------------------------
 // AgentLoop (owns the receiver + orchestrates concurrency)
@@ -126,9 +124,8 @@ impl AgentLoop {
             core.tool_delegation_config.default_subagent_model.clone(),
         );
         // Wire up subagent tuning from config.
-        subagent_mgr = subagent_mgr.with_subagent_tuning(
-            core.tool_delegation_config.subagent.clone(),
-        );
+        subagent_mgr =
+            subagent_mgr.with_subagent_tuning(core.tool_delegation_config.subagent.clone());
         if let Some(ref dtx) = repl_display_tx {
             subagent_mgr = subagent_mgr.with_display_tx(dtx.clone());
         }
@@ -179,7 +176,7 @@ impl AgentLoop {
             ))
         });
 
-        let shared = Arc::new(AgentLoopShared {
+        let mut shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
             bus_outbound_tx,
@@ -197,23 +194,56 @@ impl AgentLoop {
             lcm_config,
             lcm_compactor,
             health_registry,
-            calibrator: match crate::agent::budget_calibrator::BudgetCalibrator::open_default() {
-                Ok(c) => Some(parking_lot::Mutex::new(c)),
-                Err(e) => {
-                    tracing::warn!("BudgetCalibrator init failed, recording disabled: {}", e);
-                    None
-                }
+            calibrator: {
+                let cal: Option<Arc<parking_lot::Mutex<_>>> =
+                    match crate::agent::budget_calibrator::BudgetCalibrator::open_default() {
+                        Ok(c) => Some(Arc::new(parking_lot::Mutex::new(c))),
+                        Err(e) => {
+                            tracing::warn!(
+                                "BudgetCalibrator init failed, recording disabled: {}",
+                                e
+                            );
+                            None
+                        }
+                    };
+                cal
+            },
+            learn_loop: {
+                // Placeholder -- rebuilt in set_perplexity_gate / after all fields are set.
+                // At construction time, calibrator and experience_buffer are not yet Arc-cloneable
+                // from the struct itself, so we initialize with empty observers.
+                Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+                    calibrator: None,
+                    experience_buffer: None,
+                    perplexity_gate_config: Default::default(),
+                    #[cfg(feature = "mlx")]
+                    mlx_provider: None,
+                })
             },
             #[cfg(feature = "cluster")]
             cluster_router: None,
-            knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default().ok()
+            knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default()
+                .ok()
                 .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
-            experience_buffer: crate::agent::lora_bridge::ExperienceBuffer::open_default().ok()
+            experience_buffer: crate::agent::lora_bridge::ExperienceBuffer::open_default()
+                .ok()
                 .map(|eb| Arc::new(parking_lot::Mutex::new(eb))),
             perplexity_gate_config: Default::default(),
             #[cfg(feature = "mlx")]
             mlx_provider: None,
         });
+        // Rebuild learn_loop now that shared fields are accessible.
+        {
+            let s = Arc::get_mut(&mut shared)
+                .expect("learn_loop init: shared Arc not yet cloned");
+            s.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+                calibrator: s.calibrator.clone(),
+                experience_buffer: s.experience_buffer.clone(),
+                perplexity_gate_config: s.perplexity_gate_config.clone(),
+                #[cfg(feature = "mlx")]
+                mlx_provider: s.mlx_provider.clone(),
+            });
+        }
 
         Self {
             shared,
@@ -231,6 +261,14 @@ impl AgentLoop {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_perplexity_gate called after shared Arc was cloned");
         shared.perplexity_gate_config = config;
+        // Rebuild learn_loop with updated config.
+        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+            calibrator: shared.calibrator.clone(),
+            experience_buffer: shared.experience_buffer.clone(),
+            perplexity_gate_config: shared.perplexity_gate_config.clone(),
+            #[cfg(feature = "mlx")]
+            mlx_provider: shared.mlx_provider.clone(),
+        });
     }
 
     /// Set the in-process MLX provider for direct perplexity + training.
@@ -238,7 +276,14 @@ impl AgentLoop {
     pub fn set_mlx_provider(&mut self, provider: Arc<crate::providers::mlx::MlxProvider>) {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_mlx_provider called after shared Arc was cloned");
-        shared.mlx_provider = Some(provider);
+        shared.mlx_provider = Some(provider.clone());
+        // Rebuild learn_loop with updated MLX provider.
+        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+            calibrator: shared.calibrator.clone(),
+            experience_buffer: shared.experience_buffer.clone(),
+            perplexity_gate_config: shared.perplexity_gate_config.clone(),
+            mlx_provider: Some(provider),
+        });
     }
 
     /// Set the cluster router for distributed inference routing.
@@ -441,8 +486,14 @@ impl AgentLoop {
 
             // Gateway slash command interception — handle before LLM processing.
             if msg.content.trim().starts_with('/') {
-                if let Some(response_text) = crate::agent::gateway_commands::dispatch(&self.shared, &msg).await {
-                    let outbound = crate::bus::events::OutboundMessage::new(&msg.channel, &msg.chat_id, &response_text);
+                if let Some(response_text) =
+                    crate::agent::gateway_commands::dispatch(&self.shared, &msg).await
+                {
+                    let outbound = crate::bus::events::OutboundMessage::new(
+                        &msg.channel,
+                        &msg.chat_id,
+                        &response_text,
+                    );
                     if let Err(e) = self.shared.bus_outbound_tx.send(outbound) {
                         tracing::error!("Failed to send command response: {}", e);
                     }
@@ -527,9 +578,8 @@ impl AgentLoop {
                             let mut dirty = false;
                             let mut interval =
                                 tokio::time::interval(std::time::Duration::from_millis(500));
-                            interval.set_missed_tick_behavior(
-                                tokio::time::MissedTickBehavior::Skip,
-                            );
+                            interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             loop {
                                 tokio::select! {
                                     delta = delta_rx.recv() => {
@@ -577,16 +627,16 @@ impl AgentLoop {
                     (None, false)
                 };
 
-                let response =
-                    shared.process_message(&msg, stream_tx, None, None, None).await;
+                let response = shared
+                    .process_message(&msg, stream_tx, None, None, None)
+                    .await;
 
                 let outbound = match response {
                     Some(mut outbound) => {
                         if stream_is_telegram {
-                            outbound.metadata.insert(
-                                "streaming_handled".to_string(),
-                                serde_json::json!(true),
-                            );
+                            outbound
+                                .metadata
+                                .insert("streaming_handled".to_string(), serde_json::json!(true));
                         }
                         outbound
                     }
@@ -632,6 +682,17 @@ impl AgentLoop {
     /// Return a handle to the subagent manager.
     pub fn subagent_manager(&self) -> Arc<SubagentManager> {
         self.shared.subagents.clone()
+    }
+
+    /// Build the current local prompt runtime blocks for inspection/debugging.
+    pub async fn local_prompt_runtime_blocks(
+        &self,
+        session_key: &str,
+    ) -> Vec<crate::agent::context::PromptBlock> {
+        let core = self.shared.core_handle.swappable();
+        self.shared
+            .build_local_runtime_blocks(&core, session_key)
+            .await
     }
 
     /// Clear the LCM engine for a session (e.g. on /clear command).

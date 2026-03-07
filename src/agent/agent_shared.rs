@@ -83,7 +83,9 @@ pub(crate) struct AgentLoopShared {
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Budget calibrator for recording execution stats (append-only SQLite).
     pub(crate) calibrator:
-        Option<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
+        Option<Arc<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>>,
+    /// Unified learning dispatch for turn observations.
+    pub(crate) learn_loop: Arc<dyn crate::agent::learn_loop::LearnLoop>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
