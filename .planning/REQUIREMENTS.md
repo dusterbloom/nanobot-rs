@@ -16,8 +16,8 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 ### Tool Gate
 
-- [ ] **GATE-01**: Tool definitions filtered by model size class (Small=5 tools, Medium=10, Large=all)
-- [ ] **GATE-02**: Explicit toolsFilter config overrides size-class gate
+- [x] **GATE-01**: Tool definitions filtered by model size class (Small=5 tools, Medium=10, Large=all)
+- [x] **GATE-02**: Explicit toolsFilter config overrides size-class gate
 
 ### Memory Ladder
 
@@ -33,7 +33,7 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 ### Parser Canon
 
-- [ ] **PARSE-01**: ParsedAction enum (Final/Call/Ask) is the canonical output type from response parsing
+- [x] **PARSE-01**: ParsedAction enum (Final/Call/Ask) is the canonical output type from response parsing
 
 ### Lane Split
 
@@ -88,9 +88,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PROMPT-02 | Phase 1 | Complete |
 | PROMPT-03 | Phase 1 | Complete |
 | PROMPT-04 | Phase 1 | Complete |
-| GATE-01 | Phase 2 | Pending |
-| GATE-02 | Phase 2 | Pending |
-| PARSE-01 | Phase 2 | Pending |
+| GATE-01 | Phase 2 | Complete |
+| GATE-02 | Phase 2 | Complete |
+| PARSE-01 | Phase 2 | Complete |
 | MEM-01 | Phase 3 | Pending |
 | MEM-02 | Phase 3 | Pending |
 | MEM-03 | Phase 3 | Pending |

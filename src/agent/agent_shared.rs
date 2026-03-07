@@ -13,32 +13,33 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::agent::audit::{AuditLog, ToolEvent};
-use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
-use crate::agent::tools::reasoning_tools::SharedEngine;
-use crate::errors::is_retryable_provider_error;
 use crate::agent::anti_drift;
+use crate::agent::audit::{AuditLog, ToolEvent};
+use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_hygiene;
+use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::protocol::{
     parse_textual_tool_calls, strip_textual_tool_calls, ConversationProtocol,
 };
+use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
-use crate::agent::compaction::ContextCompactor;
 use crate::agent::token_budget::TokenBudget;
+use crate::agent::tool_gate::ToolGate;
 use crate::agent::tool_guard::ToolGuard;
+use crate::agent::tools::reasoning_tools::SharedEngine;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::validation;
 use crate::bus::events::OutboundMessage;
-use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
+use crate::errors::is_retryable_provider_error;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolCallRequest};
 
 use crate::agent::agent_core::{
-    append_to_system_prompt, apply_compaction_result, PendingCompaction, SharedCoreHandle,
-    SwappableCore, RuntimeCounters,
+    append_to_system_prompt, apply_compaction_result, PendingCompaction, RuntimeCounters,
+    SharedCoreHandle, SwappableCore,
 };
 
 use super::{
@@ -81,14 +82,17 @@ pub(crate) struct AgentLoopShared {
     /// Health probe registry — used to gate LCM compaction when endpoint is degraded.
     pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Budget calibrator for recording execution stats (append-only SQLite).
-    pub(crate) calibrator: Option<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
+    pub(crate) calibrator:
+        Option<parking_lot::Mutex<crate::agent::budget_calibrator::BudgetCalibrator>>,
     /// Cluster router for distributed inference (feature-gated).
     #[cfg(feature = "cluster")]
     pub(crate) cluster_router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     /// Knowledge store for proactive grounding retrieval.
-    pub(crate) knowledge_store: Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
+    pub(crate) knowledge_store:
+        Option<Arc<parking_lot::Mutex<crate::agent::knowledge_store::KnowledgeStore>>>,
     /// Experience buffer for perplexity gate (online learning).
-    pub(crate) experience_buffer: Option<Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>>,
+    pub(crate) experience_buffer:
+        Option<Arc<parking_lot::Mutex<crate::agent::lora_bridge::ExperienceBuffer>>>,
     /// Perplexity gate configuration.
     pub(crate) perplexity_gate_config: crate::config::schema::PerplexityGateConfig,
     /// In-process MLX provider for direct perplexity scoring + training (no HTTP).
@@ -227,11 +231,17 @@ enum IterationPhase {
     /// router preflight, adaptive max_tokens.
     PreCall,
     /// Call LLM (streaming or blocking).
-    Calling { tool_defs: Vec<Value>, max_tokens: u32 },
+    Calling {
+        tool_defs: Vec<Value>,
+        max_tokens: u32,
+    },
     /// Validate response, rescue pass, error check, token telemetry.
     Processing { response: LLMResponse },
     /// Route and execute tool calls (delegated or inline).
-    Executing { response: LLMResponse, tool_calls: Vec<ToolCallRequest> },
+    Executing {
+        response: LLMResponse,
+        tool_calls: Vec<ToolCallRequest>,
+    },
 }
 
 /// Outcome of a single iteration, returned to the outer loop.
@@ -256,7 +266,6 @@ enum StepResult {
 }
 
 impl AgentLoopShared {
-
     /// Process an inbound message through the agent loop.
     ///
     /// When `text_delta_tx` is `Some`, text deltas are streamed to the sender
@@ -284,14 +293,23 @@ impl AgentLoopShared {
         );
         drop(core);
 
-        let mut ctx = self.prepare_context(msg, text_delta_tx, tool_event_tx, cancellation_token, priority_rx).await;
+        let mut ctx = self
+            .prepare_context(
+                msg,
+                text_delta_tx,
+                tool_event_tx,
+                cancellation_token,
+                priority_rx,
+            )
+            .await;
 
         // Bug 3 fix: eagerly persist the user message before the LLM call so
         // it is not lost if the agent crashes mid-turn. Bump new_start so
         // finalize_response does not double-persist it.
         if ctx.new_start < ctx.messages.len() {
             let user_msg = ctx.messages[ctx.new_start].clone();
-            ctx.core.sessions
+            ctx.core
+                .sessions
                 .add_message(&ctx.session_id, &user_msg)
                 .await;
             ctx.new_start += 1;
@@ -315,14 +333,18 @@ impl AgentLoopShared {
         // Auto-decompose: detect numbered steps in user message and build a plan.
         // This helps small models that can't call the plan tool themselves.
         if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
-            { let engine = ctx.reasoning.lock();
+            {
+                let engine = ctx.reasoning.lock();
                 // Only auto-decompose if no plan exists yet (Linear mode).
                 if *engine.mode() == ReasoningMode::Linear {
                     drop(engine); // Release lock before re-acquiring mutably
-                    if let Some(steps) = crate::agent::reasoning::parse_numbered_steps(&ctx.user_content) {
+                    if let Some(steps) =
+                        crate::agent::reasoning::parse_numbered_steps(&ctx.user_content)
+                    {
                         let step_budget = ctx.core.reasoning_config.step_budget;
                         let new_engine = ReasoningEngine::from_goals(&steps, step_budget);
-                        { let mut engine = ctx.reasoning.lock();
+                        {
+                            let mut engine = ctx.reasoning.lock();
                             *engine = new_engine;
                             info!(
                                 steps = steps.len(),
@@ -344,7 +366,11 @@ impl AgentLoopShared {
         let mut nudge_sent = false;
         while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
-            if ctx.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+            if ctx
+                .cancellation_token
+                .as_ref()
+                .map_or(false, |t| t.is_cancelled())
+            {
                 debug!("agent loop: cancelled before iteration {}", iteration);
                 break;
             }
@@ -369,7 +395,8 @@ impl AgentLoopShared {
 
             // Plan-guided: inject current step instruction into conversation.
             {
-                { let engine = ctx.reasoning.lock();
+                {
+                    let engine = ctx.reasoning.lock();
                     if let Some(instruction) = engine.step_instruction() {
                         ctx.messages.push(json!({
                             "role": "user",
@@ -389,7 +416,8 @@ impl AgentLoopShared {
             );
 
             // Sync messages to reasoning engine so CheckpointTool can capture them.
-            { let mut engine = ctx.reasoning.lock();
+            {
+                let mut engine = ctx.reasoning.lock();
                 engine.sync_messages(&ctx.messages);
             }
 
@@ -398,7 +426,8 @@ impl AgentLoopShared {
 
             // Check for pending backtrack (set by BacktrackTool during tool execution).
             {
-                { let mut engine = ctx.reasoning.lock();
+                {
+                    let mut engine = ctx.reasoning.lock();
                     if let Some(restored) = engine.take_pending_restore() {
                         ctx.messages = restored;
                         iteration += 1;
@@ -440,7 +469,8 @@ impl AgentLoopShared {
                     ctx.flow.validation_retries = 0;
                     iteration += 1;
                     // Consume step budget if plan-guided.
-                    { let mut engine = ctx.reasoning.lock();
+                    {
+                        let mut engine = ctx.reasoning.lock();
                         engine.consume_iteration();
                         if *engine.mode() != ReasoningMode::Linear
                             && engine.step_budget_remaining() == 0
@@ -531,16 +561,19 @@ impl AgentLoopShared {
         let mut phase = IterationPhase::Preparing;
         loop {
             match match phase {
-                IterationPhase::Preparing =>
-                    self.step_prepare(ctx, iteration).await,
-                IterationPhase::PreCall =>
-                    self.step_pre_call(ctx, iteration).await,
-                IterationPhase::Calling { tool_defs, max_tokens } =>
-                    self.step_call_llm(ctx, tool_defs, max_tokens).await,
-                IterationPhase::Processing { response } =>
-                    self.step_process_response(ctx, response).await,
-                IterationPhase::Executing { response, tool_calls } =>
-                    self.step_execute_tools(ctx, response, tool_calls).await,
+                IterationPhase::Preparing => self.step_prepare(ctx, iteration).await,
+                IterationPhase::PreCall => self.step_pre_call(ctx, iteration).await,
+                IterationPhase::Calling {
+                    tool_defs,
+                    max_tokens,
+                } => self.step_call_llm(ctx, tool_defs, max_tokens).await,
+                IterationPhase::Processing { response } => {
+                    self.step_process_response(ctx, response).await
+                }
+                IterationPhase::Executing {
+                    response,
+                    tool_calls,
+                } => self.step_execute_tools(ctx, response, tool_calls).await,
             } {
                 StepResult::Next(next_phase) => phase = next_phase,
                 StepResult::Done(outcome) => return outcome,
@@ -715,13 +748,16 @@ impl AgentLoopShared {
         // Local models get a minimal set to conserve context tokens.
         let current_phase = self.system_state.load_full().task_phase;
         let mut tool_defs = if ctx.core.is_local {
-            ctx.tools.get_local_definitions(&ctx.messages, &ctx.used_tools)
+            ctx.tools
+                .get_local_definitions(&ctx.messages, &ctx.used_tools)
         } else if self.proprioception_config.enabled
             && self.proprioception_config.dynamic_tool_scoping
         {
-            ctx.tools.get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
+            ctx.tools
+                .get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
         } else {
-            ctx.tools.get_relevant_definitions(&ctx.messages, &ctx.used_tools)
+            ctx.tools
+                .get_relevant_definitions(&ctx.messages, &ctx.used_tools)
         };
         // Save tool_defs before potential stripping so we can restore them if
         // the router preflight returns Passthrough (router said "respond") — in
@@ -731,16 +767,22 @@ impl AgentLoopShared {
             // Hard separation (local trio only): main model is conversation/orchestration only.
             // Cloud providers handle tools natively and must never have them stripped.
             // BUT: if trio routing is degraded, keep tools so main model can still act.
-            let router_probe_healthy = self.health_registry
+            let router_probe_healthy = self
+                .health_registry
                 .as_ref()
                 .map_or(false, |reg| reg.is_healthy("trio_router"));
             // Use the same key format as router.rs: "router:{model}".
             // Fallback to "trio_router" only when no router model is configured
             // (in which case trio won't run anyway).
-            let cb_key = ctx.core.router_model
+            let cb_key = ctx
+                .core
+                .router_model
                 .as_deref()
                 .map_or_else(|| "trio_router".to_string(), |m| format!("router:{}", m));
-            let cb_available = ctx.counters.trio_circuit_breaker.lock()
+            let cb_available = ctx
+                .counters
+                .trio_circuit_breaker
+                .lock()
                 .is_available(&cb_key);
             if should_strip_tools_for_trio(
                 ctx.core.is_local,
@@ -748,21 +790,26 @@ impl AgentLoopShared {
                 router_probe_healthy,
                 cb_available,
             ) {
-                ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Active);
+                ctx.counters
+                    .set_trio_state(crate::agent::agent_core::TrioState::Active);
                 tool_defs.clear();
                 // Tell the main model it's in orchestration mode (tools stripped).
-                append_to_system_prompt(&mut ctx.messages, concat!(
-                    "\n\n## Orchestration Mode (Active)\n",
-                    "A trio routing system handles tool execution on your behalf.\n",
-                    "- You do NOT have direct tool access in this mode.\n",
-                    "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
-                    "incorporate that result into your response.\n",
-                    "- If you need additional tool actions, describe them clearly ",
-                    "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
-                    "- Focus on reasoning, planning, and conversation.\n",
-                ));
+                append_to_system_prompt(
+                    &mut ctx.messages,
+                    concat!(
+                        "\n\n## Orchestration Mode (Active)\n",
+                        "A trio routing system handles tool execution on your behalf.\n",
+                        "- You do NOT have direct tool access in this mode.\n",
+                        "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
+                        "incorporate that result into your response.\n",
+                        "- If you need additional tool actions, describe them clearly ",
+                        "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
+                        "- Focus on reasoning, planning, and conversation.\n",
+                    ),
+                );
             } else {
-                ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
+                ctx.counters
+                    .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
                 debug!("trio degraded — keeping tools for main model fallback");
             }
         }
@@ -775,6 +822,17 @@ impl AgentLoopShared {
                 name != "exec" && name != "write_file"
             });
         }
+        // Apply ToolGate size-class filtering (main agent loop only;
+        // subagents handle their own tools_filter in SubagentManager).
+        if let Some(allowed) = ToolGate::filter(ctx.core.model_capabilities.size_class, None) {
+            let allowed_set: std::collections::HashSet<&str> =
+                allowed.iter().map(|s| s.as_str()).collect();
+            tool_defs.retain(|def| {
+                def.pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |name| allowed_set.contains(name))
+            });
+        }
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -782,8 +840,7 @@ impl AgentLoopShared {
         };
 
         // Trim messages to fit context budget.
-        let tool_def_tokens =
-            TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
             &ctx.messages,
             tool_def_tokens,
@@ -827,7 +884,10 @@ impl AgentLoopShared {
                         LcmEngine::new(config)
                     };
 
-                    engines.insert(ctx.session_key.clone(), Arc::new(tokio::sync::Mutex::new(engine)));
+                    engines.insert(
+                        ctx.session_key.clone(),
+                        Arc::new(tokio::sync::Mutex::new(engine)),
+                    );
                 }
                 engines.get(&ctx.session_key).cloned().unwrap()
             };
@@ -851,7 +911,8 @@ impl AgentLoopShared {
 
             // Check thresholds and spawn compaction if needed.
             // Pre-flight: skip LCM compaction if endpoint is degraded.
-            let lcm_healthy = self.health_registry
+            let lcm_healthy = self
+                .health_registry
                 .as_ref()
                 .map_or(true, |reg| reg.is_healthy("lcm_compaction"));
             if !lcm_healthy {
@@ -866,7 +927,11 @@ impl AgentLoopShared {
                 match action {
                     CompactionAction::Async | CompactionAction::Blocking => {
                         tracing::info!(
-                            compaction_type = if action == CompactionAction::Async { "lcm_async" } else { "lcm_blocking" },
+                            compaction_type = if action == CompactionAction::Async {
+                                "lcm_async"
+                            } else {
+                                "lcm_blocking"
+                            },
                             msg_count = ctx.messages.len(),
                             "lcm_compaction_triggered"
                         );
@@ -889,29 +954,29 @@ impl AgentLoopShared {
                         }
 
                         tokio::spawn(async move {
-                            let timeout_result = tokio::time::timeout(
-                                Duration::from_secs(30),
-                                async {
+                            let timeout_result =
+                                tokio::time::timeout(Duration::from_secs(30), async {
                                     // Use dedicated LCM compactor if configured,
                                     // otherwise fall back to the core memory compactor.
-                                    let compactor: &ContextCompactor = bg_lcm_compactor
-                                        .as_deref()
-                                        .unwrap_or(&bg_core.compactor);
+                                    let compactor: &ContextCompactor =
+                                        bg_lcm_compactor.as_deref().unwrap_or(&bg_core.compactor);
                                     let summary_turn = {
                                         let mut engine = bg_lcm.lock().await;
-                                        engine
-                                            .compact(compactor, &bg_core.token_budget, 0)
-                                            .await
+                                        engine.compact(compactor, &bg_core.token_budget, 0).await
                                     };
 
                                     // Extract text from Turn::Summary for working memory and result.
-                                    let observation: Option<String> = summary_turn.as_ref().and_then(|t| {
-                                        if let crate::agent::turn::Turn::Summary { text, .. } = t {
-                                            Some(text.clone())
-                                        } else {
-                                            None
-                                        }
-                                    });
+                                    let observation: Option<String> =
+                                        summary_turn.as_ref().and_then(|t| {
+                                            if let crate::agent::turn::Turn::Summary {
+                                                text, ..
+                                            } = t
+                                            {
+                                                Some(text.clone())
+                                            } else {
+                                                None
+                                            }
+                                        });
 
                                     // Persist Turn::Summary to session JSONL for lossless restart.
                                     if let Some(ref turn) = summary_turn {
@@ -920,16 +985,21 @@ impl AgentLoopShared {
                                                 session = %bg_session_key,
                                                 "LCM: persisting summary turn to session"
                                             );
-                                            bg_core.sessions.add_message(&bg_session_id, &summary_json).await;
+                                            bg_core
+                                                .sessions
+                                                .add_message(&bg_session_id, &summary_json)
+                                                .await;
                                         }
                                     }
 
                                     // Update working memory with compaction observation.
                                     if bg_core.memory_enabled {
                                         if let Some(ref summary_text) = observation {
-                                            bg_core
-                                                .working_memory
-                                                .update_from_compaction(&bg_session_key, summary_text, bg_turn_count);
+                                            bg_core.working_memory.update_from_compaction(
+                                                &bg_session_key,
+                                                summary_text,
+                                                bg_turn_count,
+                                            );
                                         }
                                     }
 
@@ -947,9 +1017,8 @@ impl AgentLoopShared {
                                         *slot.lock().await =
                                             Some(PendingCompaction { result, watermark });
                                     }
-                                },
-                            )
-                            .await;
+                                })
+                                .await;
                             if timeout_result.is_err() {
                                 warn!("LCM compaction timed out after 30s, resetting in_flight");
                             }
@@ -960,9 +1029,11 @@ impl AgentLoopShared {
                 }
             }
         } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)
-            && ctx.core
-                .compactor
-                .needs_compaction(&ctx.messages, &ctx.core.token_budget, tool_def_tokens)
+            && ctx.core.compactor.needs_compaction(
+                &ctx.messages,
+                &ctx.core.token_budget,
+                tool_def_tokens,
+            )
         {
             tracing::info!(
                 compaction_type = "core_async",
@@ -980,45 +1051,44 @@ impl AgentLoopShared {
 
             let bg_proprio = self.proprioception_config.clone();
             tokio::spawn(async move {
-                let timeout_result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    async {
-                        let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
-                            bg_core
-                                .compactor
-                                .compact_gradient(
-                                    &bg_messages,
-                                    &bg_core.token_budget,
-                                    0,
-                                    bg_proprio.raw_window,
-                                    bg_proprio.light_window,
-                                )
-                                .await
-                        } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
-                            let reader =
-                                crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
-                            bg_core
-                                .compactor
-                                .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
-                                .await
-                        } else {
-                            bg_core
-                                .compactor
-                                .compact(&bg_messages, &bg_core.token_budget, 0)
-                                .await
-                        };
-                        if bg_core.memory_enabled {
-                            if let Some(ref summary) = result.observation {
-                                bg_core
-                                    .working_memory
-                                    .update_from_compaction(&bg_session_key, summary, bg_turn_count);
-                            }
+                let timeout_result = tokio::time::timeout(Duration::from_secs(30), async {
+                    let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
+                        bg_core
+                            .compactor
+                            .compact_gradient(
+                                &bg_messages,
+                                &bg_core.token_budget,
+                                0,
+                                bg_proprio.raw_window,
+                                bg_proprio.light_window,
+                            )
+                            .await
+                    } else if bg_proprio.enabled && bg_proprio.audience_aware_compaction {
+                        let reader =
+                            crate::agent::compaction::ReaderProfile::from_model(&bg_core.model);
+                        bg_core
+                            .compactor
+                            .compact_for_reader(&bg_messages, &bg_core.token_budget, 0, &reader)
+                            .await
+                    } else {
+                        bg_core
+                            .compactor
+                            .compact(&bg_messages, &bg_core.token_budget, 0)
+                            .await
+                    };
+                    if bg_core.memory_enabled {
+                        if let Some(ref summary) = result.observation {
+                            bg_core.working_memory.update_from_compaction(
+                                &bg_session_key,
+                                summary,
+                                bg_turn_count,
+                            );
                         }
-                        if result.messages.len() < bg_messages.len() {
-                            *slot.lock().await = Some(PendingCompaction { result, watermark });
-                        }
-                    },
-                )
+                    }
+                    if result.messages.len() < bg_messages.len() {
+                        *slot.lock().await = Some(PendingCompaction { result, watermark });
+                    }
+                })
                 .await;
                 if timeout_result.is_err() {
                     warn!("Core compaction timed out after 30s, resetting in_flight");
@@ -1038,9 +1108,14 @@ impl AgentLoopShared {
                         let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
                         let ks_ref = ks_guard.as_deref();
                         let payload = crate::agent::proactive::retrieve_grounding(
-                            &intent, ks_ref, &learning_context, budget,
+                            &intent,
+                            ks_ref,
+                            &learning_context,
+                            budget,
                         );
-                        if let Some(text) = crate::agent::proactive::format_grounding_message(&payload) {
+                        if let Some(text) =
+                            crate::agent::proactive::format_grounding_message(&payload)
+                        {
                             debug!(
                                 category = ?intent.category,
                                 confidence = intent.confidence,
@@ -1112,18 +1187,25 @@ impl AgentLoopShared {
         let effective_max_tokens = {
             let base = ctx.core.max_tokens;
             // Check for /long override (temporary boost).
-            let had_long = counters.long_mode_turns
+            let had_long = counters
+                .long_mode_turns
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
+                    if v > 0 {
+                        Some(v - 1)
+                    } else {
+                        None
+                    }
                 })
                 .is_ok();
-            let user_text = ctx.messages
+            let user_text = ctx
+                .messages
                 .last()
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
             // Count recent tool calls: if tool-heavy, use smaller budget.
-            let recent_tool_calls = ctx.messages
+            let recent_tool_calls = ctx
+                .messages
                 .iter()
                 .rev()
                 .take(6)
@@ -1187,7 +1269,10 @@ impl AgentLoopShared {
             if stored > 0 {
                 // Small local models can burn the whole completion budget in reasoning.
                 // Hard-cap explicit thinking to keep them action-oriented.
-                if ctx.core.is_local && ctx.core.model_capabilities.size_class == crate::agent::model_capabilities::ModelSizeClass::Small {
+                if ctx.core.is_local
+                    && ctx.core.model_capabilities.size_class
+                        == crate::agent::model_capabilities::ModelSizeClass::Small
+                {
                     Some(stored.min(ctx.core.adaptive_tokens.local_thinking_small_model_cap))
                 } else {
                     Some(stored)
@@ -1211,7 +1296,8 @@ impl AgentLoopShared {
 
         let response = if let Some(ref delta_tx) = ctx.text_delta_tx {
             // Streaming path: forward text deltas as they arrive.
-            let mut stream = match ctx.core
+            let mut stream = match ctx
+                .core
                 .provider
                 .chat_stream(
                     &messages_for_llm,
@@ -1234,9 +1320,10 @@ impl AgentLoopShared {
                     }
                     counters.inference_active.store(false, Ordering::Relaxed);
                     error!(model = %ctx.core.model, error = %e, "llm_stream_call_failed");
-                    return StepResult::Done(IterationOutcome::Error(
-                        format!("I encountered an error: {}", e),
-                    ));
+                    return StepResult::Done(IterationOutcome::Error(format!(
+                        "I encountered an error: {}",
+                        e
+                    )));
                 }
             };
 
@@ -1298,7 +1385,8 @@ impl AgentLoopShared {
                 None => {
                     counters.inference_active.store(false, Ordering::Relaxed);
                     // Stream ended without Done — either cancelled or genuine error.
-                    if ctx.cancellation_token
+                    if ctx
+                        .cancellation_token
                         .as_ref()
                         .map_or(false, |t| t.is_cancelled())
                     {
@@ -1313,7 +1401,8 @@ impl AgentLoopShared {
             }
         } else {
             // Blocking path: single request/response.
-            match ctx.core
+            match ctx
+                .core
                 .provider
                 .chat(
                     &messages_for_llm,
@@ -1336,9 +1425,10 @@ impl AgentLoopShared {
                     }
                     counters.inference_active.store(false, Ordering::Relaxed);
                     error!(model = %ctx.core.model, error = %e, "llm_call_failed");
-                    return StepResult::Done(IterationOutcome::Error(
-                        format!("I encountered an error: {}", e),
-                    ));
+                    return StepResult::Done(IterationOutcome::Error(format!(
+                        "I encountered an error: {}",
+                        e
+                    )));
                 }
             }
         };
@@ -1419,13 +1509,22 @@ impl AgentLoopShared {
                 map.insert("name".to_string(), Value::String(tc.name.clone()));
                 map.insert(
                     "arguments".to_string(),
-                    Value::Object(tc.arguments.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                    Value::Object(
+                        tc.arguments
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    ),
                 );
                 map
             })
             .collect();
 
-        match validation::validate_response(content_str, &tool_calls_as_maps, ctx.protocol.is_textual_replay()) {
+        match validation::validate_response(
+            content_str,
+            &tool_calls_as_maps,
+            ctx.protocol.is_textual_replay(),
+        ) {
             validation::ValidationOutcome::Error(validation_err) => {
                 let retry_num = ctx.flow.validation_retries + 1;
                 warn!(
@@ -1435,10 +1534,7 @@ impl AgentLoopShared {
                     max_retries = validation::MAX_VALIDATION_RETRIES,
                     "response_validation_failed"
                 );
-                let hint = validation::generate_retry_prompt(
-                    &validation_err,
-                    retry_num as u8,
-                );
+                let hint = validation::generate_retry_prompt(&validation_err, retry_num as u8);
                 ctx.messages.push(json!({
                     "role": "assistant",
                     "content": content_str
@@ -1447,7 +1543,11 @@ impl AgentLoopShared {
                     "role": "user",
                     "content": hint
                 }));
-                debug!("Injected validation retry hint (retry {}/{})", retry_num, validation::MAX_VALIDATION_RETRIES);
+                debug!(
+                    "Injected validation retry hint (retry {}/{})",
+                    retry_num,
+                    validation::MAX_VALIDATION_RETRIES
+                );
                 return StepResult::Done(IterationOutcome::ValidationRetry);
             }
             validation::ValidationOutcome::StripHallucination => {
@@ -1492,7 +1592,8 @@ impl AgentLoopShared {
                 "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
             }));
             counters.inference_active.store(true, Ordering::Relaxed);
-            match ctx.core
+            match ctx
+                .core
                 .provider
                 .chat(
                     &rescue_messages,
@@ -1525,7 +1626,11 @@ impl AgentLoopShared {
                 .unwrap_or(false)
             && (response.finish_reason == "length"
                 || (response.finish_reason == "stop"
-                    && response.content.as_ref().map(|s| appears_incomplete(s)).unwrap_or(false)))
+                    && response
+                        .content
+                        .as_ref()
+                        .map(|s| appears_incomplete(s))
+                        .unwrap_or(false)))
             && ctx.flow.continuations_used < max_cont
         {
             ctx.flow.continuations_used += 1;
@@ -1554,20 +1659,25 @@ impl AgentLoopShared {
             }));
 
             // Check cancellation before LLM call
-            if ctx.cancellation_token.as_ref().map_or(false, |t| t.is_cancelled()) {
+            if ctx
+                .cancellation_token
+                .as_ref()
+                .map_or(false, |t| t.is_cancelled())
+            {
                 break;
             }
 
             counters.inference_active.store(true, Ordering::Relaxed);
-            let cont_result = ctx.core
+            let cont_result = ctx
+                .core
                 .provider
                 .chat(
                     &cont_messages,
-                    None,           // no tools during continuation
+                    None, // no tools during continuation
                     Some(&ctx.core.model),
                     ctx.core.max_tokens,
                     ctx.core.temperature,
-                    None,           // no thinking budget
+                    None, // no thinking budget
                     None,
                 )
                 .await;
@@ -1616,18 +1726,18 @@ impl AgentLoopShared {
             // In local mode, check if the server is still alive.
             if ctx.core.is_local {
                 if let Some(base) = ctx.core.provider.get_api_base() {
-                    if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await {
+                    if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await
+                    {
                         error!("Local LLM server is down!");
                         return StepResult::Done(IterationOutcome::Error(
-                            "[LLM Error] Local server crashed. Use /restart or /local to recover.".into(),
+                            "[LLM Error] Local server crashed. Use /restart or /local to recover."
+                                .into(),
                         ));
                     }
                 }
             }
 
-            return StepResult::Done(IterationOutcome::Error(
-                format!("[LLM Error] {}", err_msg),
-            ));
+            return StepResult::Done(IterationOutcome::Error(format!("[LLM Error] {}", err_msg)));
         }
 
         // Token telemetry: log actual vs estimated usage.
@@ -1667,7 +1777,10 @@ impl AgentLoopShared {
                 role: "main".into(),
                 model: ctx.core.model.clone(),
                 provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
-                elapsed_ms: ctx.flow.llm_call_start.map_or(0, |t| t.elapsed().as_millis() as u64),
+                elapsed_ms: ctx
+                    .flow
+                    .llm_call_start
+                    .map_or(0, |t| t.elapsed().as_millis() as u64),
                 prompt_tokens: actual_prompt.max(0) as u64,
                 completion_tokens: actual_completion.max(0) as u64,
                 status: "ok".into(),
@@ -1683,7 +1796,10 @@ impl AgentLoopShared {
         // Branch: tool calls → Executing, no tool calls → finished.
         if response.has_tool_calls() {
             let tool_calls = response.tool_calls.clone();
-            StepResult::Next(IterationPhase::Executing { response, tool_calls })
+            StepResult::Next(IterationPhase::Executing {
+                response,
+                tool_calls,
+            })
         } else {
             let mut content = response.content.unwrap_or_default();
             if content.trim().is_empty() {
@@ -1745,7 +1861,8 @@ impl AgentLoopShared {
             let deduped: Vec<_> = routed_tool_calls
                 .into_iter()
                 .filter(|tc| {
-                    let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
+                    let key =
+                        crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
                     seen.insert(key)
                 })
                 .collect();
@@ -1810,7 +1927,10 @@ impl AgentLoopShared {
                 );
                 delegation_alive = true; // try this one time
             } else {
-                debug!("Delegation provider unhealthy — inline execution ({}/10 until re-probe)", retries % 10);
+                debug!(
+                    "Delegation provider unhealthy — inline execution ({}/10 until re-probe)",
+                    retries % 10
+                );
             }
         }
         let should_delegate = ctx.core.tool_delegation_config.enabled && delegation_alive;
@@ -1836,11 +1956,12 @@ impl AgentLoopShared {
 
         // Auto-checkpoint before risky tools (exec, write_file) when enabled.
         if ctx.core.reasoning_config.auto_checkpoint_before_exec {
-            let should_checkpoint = routed_tool_calls.iter().any(|tc| {
-                tc.name == "exec" || tc.name == "write_file"
-            });
+            let should_checkpoint = routed_tool_calls
+                .iter()
+                .any(|tc| tc.name == "exec" || tc.name == "write_file");
             if should_checkpoint {
-                { let mut engine = ctx.reasoning.lock();
+                {
+                    let mut engine = ctx.reasoning.lock();
                     if *engine.mode() != crate::agent::reasoning::ReasoningMode::Linear {
                         engine.sync_messages(&ctx.messages);
                         engine.save_checkpoint("pre_exec", &ctx.messages, ctx.iterations_used);
@@ -1850,12 +1971,7 @@ impl AgentLoopShared {
         }
 
         // Inline path (default, unchanged): execute tools directly.
-        crate::agent::tool_engine::execute_tools_inline(
-            ctx,
-            &routed_tool_calls,
-            &response,
-        )
-        .await;
+        crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
 
         // Local models via --jinja require strict user/assistant alternation.
         // Tool results are folded into user messages by
@@ -1875,7 +1991,8 @@ impl AgentLoopShared {
         }
 
         // Check cancellation between tool call iterations.
-        if ctx.cancellation_token
+        if ctx
+            .cancellation_token
             .as_ref()
             .map_or(false, |t| t.is_cancelled())
         {

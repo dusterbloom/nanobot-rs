@@ -2,26 +2,26 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: completed
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-03-07T13:47:26.471Z"
-last_activity: 2026-03-07 — Completed 01-02-PLAN.md (Assembler Wiring)
+status: in_progress
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-03-07T14:35:00.000Z"
+last_activity: 2026-03-07 — Completed 02-01-PLAN.md (Tool Gate & Response Types)
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
+  total_plans: 4
+  completed_plans: 3
 ---
 
 # State: nanobot
 
 ## Current Position
 
-Phase: Phase 1 — Prompt Contract (COMPLETE)
-Plan: 2 of 2 complete
-Status: Phase complete
-Progress: [==========] 2/2 plans
-Last activity: 2026-03-07 — Completed 01-02-PLAN.md (Assembler Wiring)
+Phase: Phase 2 — Tool Gate & Response Types
+Plan: 1 of 2 complete
+Status: In progress
+Progress: [=====-----] 1/2 plans
+Last activity: 2026-03-07 — Completed 02-01-PLAN.md (Tool Gate & Response Types)
 
 ## Project Reference
 
@@ -46,6 +46,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 - Working memory and tool patterns merged into single WorkingMemory SectionEntry
 - Local path converts PromptBlock runtime_blocks to SectionEntry via title-based mapping
 - Context window reverse-engineered from system_prompt_cap for assembler budget calculation
+- ToolGate is a unit struct with static filter() -- no instance state needed
+- Config override takes precedence over size class for all tiers including Large
+- ParsedAction is Debug + Clone but not Serialize -- internal dispatch type only
 
 ## Performance Metrics
 
@@ -53,8 +56,9 @@ See: .planning/PROJECT.md (updated 2026-03-07)
 |-------|------|----------|-------|-------|
 | 01 | 01 | 7min | 2 | 3 |
 | 01 | 02 | 8min | 3 | 3 |
+| 02 | 01 | 5min | 2 | 6 |
 
 ## Last Session
 
-- **Stopped at:** Completed 01-02-PLAN.md
-- **Timestamp:** 2026-03-07T13:41:30Z
+- **Stopped at:** Completed 02-01-PLAN.md
+- **Timestamp:** 2026-03-07T14:35:00Z

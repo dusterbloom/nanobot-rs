@@ -9,7 +9,7 @@
 | # | Phase | Goal | Requirements | Depends On |
 |---|-------|------|--------------|------------|
 | 1 | Prompt Contract | Every prompt section has a name, budget, assembly order | PROMPT-01..04 | — |
-| 2 | Tool Gate + Response Types | Tool availability by model size; canonical ParsedAction type | GATE-01..02, PARSE-01 | — |
+| 2 | 1/2 | In Progress|  | — |
 | 3 | Memory Ladder | Single memory facade with named layers, priority, budget | MEM-01..03 | Phase 1 |
 | 4 | Learn Loop | One dispatch point for all turn observations | LEARN-01..03 | Phase 3 |
 | 5 | Lane Split | Answer/Action as parameter sets over all contracts | LANE-01..02 | Phases 1-4 |
