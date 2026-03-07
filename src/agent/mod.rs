@@ -51,6 +51,7 @@ pub mod learning;
 pub mod lora_bridge;
 pub mod markers;
 pub mod memory;
+pub mod memory_ladder;
 pub mod metrics;
 #[cfg(feature = "mlx")]
 pub mod mlx_lm;
