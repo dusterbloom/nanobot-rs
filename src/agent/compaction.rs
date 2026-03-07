@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::agent::token_budget::TokenBudget;
@@ -64,7 +64,8 @@ impl ReaderProfile {
     /// Delegates to the model capabilities registry for consistency.
     /// Use `from_capabilities()` when ModelCapabilities is already available.
     pub fn from_model(model: &str) -> Self {
-        let caps = crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new());
+        let caps =
+            crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new());
         Self::from_capabilities(&caps)
     }
 }
@@ -930,7 +931,8 @@ impl ContextCompactor {
         let budget = self.input_budget();
         let input_tokens = TokenBudget::estimate_str_tokens(input);
         let input = if input_tokens > budget && budget > 0 {
-            let max_chars = (input.len() as f64 * (budget as f64 / input_tokens as f64) * 0.7) as usize;
+            let max_chars =
+                (input.len() as f64 * (budget as f64 / input_tokens as f64) * 0.7) as usize;
             let truncated_end = max_chars.min(input.len());
             // Respect char boundaries.
             let safe_end = if input.is_char_boundary(truncated_end) {
@@ -1004,12 +1006,24 @@ impl ContextCompactor {
 pub fn strip_thinking_tags(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
-    while let Some(start) = remaining.find("<thinking>") {
+
+    // Strip both <thinking>...</thinking> and <think>...</think> blocks.
+    loop {
+        // Find the earliest opening tag of either variant.
+        let thinking_pos = remaining.find("<thinking>");
+        let think_pos = remaining.find("<think>");
+        let (start, open_tag, close_tag) = match (thinking_pos, think_pos) {
+            (Some(a), Some(b)) if a <= b => (a, "<thinking>", "</thinking>"),
+            (_, Some(b)) => (b, "<think>", "</think>"),
+            (Some(a), None) => (a, "<thinking>", "</thinking>"),
+            (None, None) => break,
+        };
         result.push_str(&remaining[..start]);
-        if let Some(end) = remaining[start..].find("</thinking>") {
-            remaining = &remaining[start + end + "</thinking>".len()..];
+        remaining = &remaining[start + open_tag.len()..];
+        if let Some(end) = remaining.find(close_tag) {
+            remaining = &remaining[end + close_tag.len()..];
         } else {
-            // Unclosed tag — drop everything after <thinking>
+            // Unclosed tag — drop everything after the opening tag
             return result.trim().to_string();
         }
     }
@@ -1303,6 +1317,20 @@ mod tests {
         assert_eq!(out, "before  after");
     }
 
+    #[test]
+    fn test_strip_thinking_tags_removes_think_blocks() {
+        let input = "before <think>internal reasoning</think> after";
+        let out = strip_thinking_tags(input);
+        assert_eq!(out, "before  after");
+    }
+
+    #[test]
+    fn test_strip_thinking_tags_handles_mixed_think_variants() {
+        let input = "<think>first</think>visible<thinking>second</thinking>end";
+        let out = strip_thinking_tags(input);
+        assert_eq!(out, "visibleend");
+    }
+
     #[tokio::test]
     async fn test_compact_summarizes_old_messages() {
         let provider = Arc::new(MockProvider::new("User discussed weather and cats."));
@@ -1593,7 +1621,11 @@ mod tests {
         // Small compaction context: 2000 tokens. input_budget() = 2000 - 200 - 1024 - 300 = 476.
         let compactor = ContextCompactor::new(provider, "test".into(), 2000);
         let budget = compactor.input_budget();
-        assert!(budget < 600, "Budget should be small for a 2000-token context, got {}", budget);
+        assert!(
+            budget < 600,
+            "Budget should be small for a 2000-token context, got {}",
+            budget
+        );
 
         // Create input that far exceeds the budget (~2000 tokens worth of text).
         let big_input = "word ".repeat(3000); // ~3000 tokens
@@ -1607,7 +1639,11 @@ mod tests {
 
         // summarize_text should succeed (truncates internally, not overflow).
         let result = compactor.summarize_text(&big_input, SUMMARIZE_PROMPT).await;
-        assert!(result.is_ok(), "summarize_text should succeed with oversized input: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "summarize_text should succeed with oversized input: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap(), "Truncated summary.");
     }
 }

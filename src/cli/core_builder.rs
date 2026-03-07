@@ -295,16 +295,21 @@ pub(crate) fn auto_detect_mlx_model_dir() -> Option<std::path::PathBuf> {
 #[cfg(feature = "mlx")]
 fn find_mlx_dir_recursive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Check if this dir is an MLX model dir
-            if is_mlx_model_dir(&path) {
-                return Some(path);
-            }
-            subdirs.push(path);
+    let mut subdirs: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Sort for deterministic selection across runs/machines.
+    subdirs.sort();
+    let mut mlx_dirs = Vec::new();
+    for path in &subdirs {
+        if is_mlx_model_dir(path) {
+            mlx_dirs.push(path.clone());
         }
+    }
+    if !mlx_dirs.is_empty() {
+        return Some(mlx_dirs.remove(0));
     }
     // Recurse into subdirs
     for sub in subdirs {
@@ -367,10 +372,15 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     // Try auto-detecting from config.json first, then fall back to preset.
     let model_config = ModelConfig::from_config_json(&model_dir)
         .or_else(|| model_config_from_preset(&effective_preset))
-        .unwrap_or_else(|| {
-            tracing::warn!("no config.json and no matching preset, using qwen3-1.7b placeholder");
-            ModelConfig::qwen3_1_7b()
-        });
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine model config for '{}'. \
+                 No config.json found and preset '{}' is unknown. \
+                 Supported presets: qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b.",
+                model_dir.display(),
+                effective_preset,
+            )
+        })?;
     let lora_config = LoraConfig {
         lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
         ..LoraConfig::default()

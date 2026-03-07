@@ -5,9 +5,9 @@
 //! Groq, vLLM, and any other provider that implements the OpenAI chat completions
 //! API format.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -201,7 +201,7 @@ const THINK_OPEN_TAGS: [&str; 2] = ["<thinking>", "<think>"];
 const THINK_CLOSE_TAGS: [&str; 2] = ["</thinking>", "</think>"];
 
 #[derive(Default)]
-struct ThinkSplitState {
+pub(crate) struct ThinkSplitState {
     in_think_block: bool,
     carry: String,
 }
@@ -443,12 +443,7 @@ async fn try_native_lms_chat(
         .json(&body)
         .send();
 
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        send_future,
-    )
-    .await
-    {
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(2), send_future).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::debug!("native LMS chat send error (will fall back): {}", e);
@@ -609,7 +604,7 @@ fn trailing_partial_tag_len(buffer: &str, tags: &[&str]) -> usize {
 
 /// Split one streamed content delta into visible text and reasoning text by
 /// extracting `<think>...</think>` / `<thinking>...</thinking>` blocks.
-fn split_thinking_from_content_delta(state: &mut ThinkSplitState, delta: &str) -> (String, String) {
+pub(crate) fn split_thinking_from_content_delta(state: &mut ThinkSplitState, delta: &str) -> (String, String) {
     state.carry.push_str(delta);
     let mut visible = String::new();
     let mut reasoning = String::new();
@@ -651,7 +646,7 @@ fn split_thinking_from_content_delta(state: &mut ThinkSplitState, delta: &str) -
     (visible, reasoning)
 }
 
-fn flush_thinking_split_state(state: &mut ThinkSplitState) -> (String, String) {
+pub(crate) fn flush_thinking_split_state(state: &mut ThinkSplitState) -> (String, String) {
     if state.carry.is_empty() {
         return (String::new(), String::new());
     }
@@ -697,7 +692,8 @@ impl LLMProvider for OpenAICompatProvider {
         // and "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://") {
+        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://")
+        {
             // OpenRouter: keep org/model for routing.
             // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
             stripped
@@ -734,7 +730,11 @@ impl LLMProvider for OpenAICompatProvider {
             {
                 let elapsed_ms = call_start.elapsed().as_millis() as u64;
                 let prompt_tokens = response.usage.get("prompt_tokens").copied().unwrap_or(0);
-                let completion_tokens = response.usage.get("completion_tokens").copied().unwrap_or(0);
+                let completion_tokens = response
+                    .usage
+                    .get("completion_tokens")
+                    .copied()
+                    .unwrap_or(0);
                 info!(
                     elapsed_ms = elapsed_ms,
                     model = %model,
@@ -769,7 +769,12 @@ impl LLMProvider for OpenAICompatProvider {
             body["top_p"] = serde_json::json!(tp);
         }
         let supports_thinking = model_supports_thinking(model);
-        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget, supports_thinking);
+        apply_local_reasoning_controls(
+            &mut body,
+            &self.api_base,
+            thinking_budget,
+            supports_thinking,
+        );
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -782,7 +787,12 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
-        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget, supports_thinking);
+        apply_local_thinking_prefill(
+            &mut body,
+            &self.api_base,
+            thinking_budget,
+            supports_thinking,
+        );
 
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
@@ -931,7 +941,8 @@ impl LLMProvider for OpenAICompatProvider {
         let normalized = model.map(|m| normalize_model_name(m));
         let raw_model = normalized.as_deref().unwrap_or(&self.default_model);
         let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
-        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://") {
+        let model = if self.api_base.contains("openrouter") || self.api_base.starts_with("http://")
+        {
             // OpenRouter: keep org/model for routing.
             // Local HTTP servers (LMS, vLLM): keep full identifier (e.g. "nvidia/nemotron-3-nano").
             stripped
@@ -994,7 +1005,12 @@ impl LLMProvider for OpenAICompatProvider {
             body["top_p"] = serde_json::json!(tp);
         }
         let supports_thinking = model_supports_thinking(model);
-        apply_local_reasoning_controls(&mut body, &self.api_base, thinking_budget, supports_thinking);
+        apply_local_reasoning_controls(
+            &mut body,
+            &self.api_base,
+            thinking_budget,
+            supports_thinking,
+        );
 
         if let Some(ref tool_defs) = cached_tools {
             if !tool_defs.is_empty() {
@@ -1007,7 +1023,12 @@ impl LLMProvider for OpenAICompatProvider {
                 body["tool_choice"] = serde_json::json!("auto");
             }
         }
-        apply_local_thinking_prefill(&mut body, &self.api_base, thinking_budget, supports_thinking);
+        apply_local_thinking_prefill(
+            &mut body,
+            &self.api_base,
+            thinking_budget,
+            supports_thinking,
+        );
 
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
@@ -1189,10 +1210,10 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
         .unwrap_or_default();
 
     if choices.is_empty() {
-        return Err(
-            crate::errors::ProviderError::JsonParseError("No choices in LLM response".into())
-                .into(),
-        );
+        return Err(crate::errors::ProviderError::JsonParseError(
+            "No choices in LLM response".into(),
+        )
+        .into());
     }
 
     let choice = &choices[0];
@@ -2044,13 +2065,23 @@ mod tests {
     #[test]
     fn test_apply_local_reasoning_controls_local_and_remote() {
         let mut local_body = serde_json::json!({"model": "qwen3-1.7b"});
-        apply_local_reasoning_controls(&mut local_body, "http://localhost:18080/v1", Some(4096), true);
+        apply_local_reasoning_controls(
+            &mut local_body,
+            "http://localhost:18080/v1",
+            Some(4096),
+            true,
+        );
         assert_eq!(local_body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(local_body["reasoning_budget"], 4096);
         assert_eq!(local_body["reasoning_format"], "deepseek");
 
         let mut remote_body = serde_json::json!({"model": "gpt-4o"});
-        apply_local_reasoning_controls(&mut remote_body, "https://api.openai.com/v1", Some(4096), true);
+        apply_local_reasoning_controls(
+            &mut remote_body,
+            "https://api.openai.com/v1",
+            Some(4096),
+            true,
+        );
         assert!(remote_body.get("chat_template_kwargs").is_none());
         assert!(remote_body.get("reasoning_budget").is_none());
         assert!(remote_body.get("reasoning_format").is_none());
@@ -2082,7 +2113,11 @@ mod tests {
         });
         apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", None, true);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2, "pre-closed think prefill works with tools too");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "pre-closed think prefill works with tools too"
+        );
         assert_eq!(msgs[1]["content"], "<think>\n</think>\n\n");
     }
 
@@ -2096,7 +2131,11 @@ mod tests {
         });
         apply_local_thinking_prefill(&mut body, "http://172.26.16.1:1234/v1", Some(4096), true);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1, "prefill should NOT be added when thinking is enabled");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "prefill should NOT be added when thinking is enabled"
+        );
     }
 
     #[test]
@@ -2136,8 +2175,14 @@ mod tests {
     fn test_reasoning_disabled_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
         apply_local_reasoning_controls(&mut body, "http://localhost:1234", None, true);
-        assert!(body.get("reasoning_budget").is_none(), "reasoning_budget should not be sent");
-        assert!(body.get("reasoning_format").is_none(), "reasoning_format should not be sent");
+        assert!(
+            body.get("reasoning_budget").is_none(),
+            "reasoning_budget should not be sent"
+        );
+        assert!(
+            body.get("reasoning_format").is_none(),
+            "reasoning_format should not be sent"
+        );
     }
 
     #[test]
@@ -2145,7 +2190,11 @@ mod tests {
         let mut body = serde_json::json!({"model": "nanbeige-16b", "messages": [{"role": "user", "content": "hi"}]});
         apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, false);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1, "prefill must not be added for non-thinking models");
+        assert_eq!(
+            messages.len(),
+            1,
+            "prefill must not be added for non-thinking models"
+        );
     }
 
     #[test]
@@ -2153,7 +2202,11 @@ mod tests {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": [{"role": "user", "content": "hi"}]});
         apply_local_thinking_prefill(&mut body, "http://localhost:1234", None, true);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2, "prefill must be added for thinking models");
+        assert_eq!(
+            messages.len(),
+            2,
+            "prefill must be added for thinking models"
+        );
         assert_eq!(messages[1]["content"], "<think>\n</think>\n\n");
     }
 
@@ -2232,7 +2285,9 @@ mod tests {
     #[test]
     fn test_needs_native_lms_api_nemotron() {
         assert!(needs_native_lms_api("nvidia/nemotron-3-nano"));
-        assert!(needs_native_lms_api("huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"));
+        assert!(needs_native_lms_api(
+            "huihui-nvidia-nemotron-nano-9b-v2-abliterated-i1"
+        ));
         assert!(needs_native_lms_api("nvidia_orchestrator-8b"));
     }
 
@@ -2285,14 +2340,20 @@ mod tests {
         // First tool: valid JSON → parsed normally.
         assert_eq!(resp.tool_calls[0].name, "read_file");
         assert_eq!(
-            resp.tool_calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            resp.tool_calls[0]
+                .arguments
+                .get("path")
+                .and_then(|v| v.as_str()),
             Some("/tmp/test")
         );
 
         // Second tool: malformed → wrapped in {"raw": ...}.
         assert_eq!(resp.tool_calls[1].name, "web_fetch");
         assert_eq!(
-            resp.tool_calls[1].arguments.get("raw").and_then(|v| v.as_str()),
+            resp.tool_calls[1]
+                .arguments
+                .get("raw")
+                .and_then(|v| v.as_str()),
             Some("the content is <html>...")
         );
         // Must NOT have the parsed keys from the first tool.
@@ -2323,7 +2384,10 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "wait");
         // Empty string is invalid JSON → wrapped in {"raw": ""}.
         assert_eq!(
-            resp.tool_calls[0].arguments.get("raw").and_then(|v| v.as_str()),
+            resp.tool_calls[0]
+                .arguments
+                .get("raw")
+                .and_then(|v| v.as_str()),
             Some("")
         );
     }
@@ -2427,7 +2491,10 @@ mod tests {
         }
 
         let resp = done_response.expect("should have received Done chunk");
-        assert_eq!(resp.finish_reason, "stop", "normal stream with [DONE] must keep finish_reason=stop");
+        assert_eq!(
+            resp.finish_reason, "stop",
+            "normal stream with [DONE] must keep finish_reason=stop"
+        );
     }
 
     #[tokio::test]
@@ -2453,7 +2520,10 @@ mod tests {
         }
 
         let resp = done_response.expect("should have received Done chunk");
-        assert_eq!(resp.finish_reason, "length", "token-limit response must keep finish_reason=length");
+        assert_eq!(
+            resp.finish_reason, "length",
+            "token-limit response must keep finish_reason=length"
+        );
     }
 
     #[tokio::test]
@@ -2517,7 +2587,10 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "read_file");
         // The accumulated args should be valid JSON: {"path":"/tmp/test"}
         assert_eq!(
-            resp.tool_calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            resp.tool_calls[0]
+                .arguments
+                .get("path")
+                .and_then(|v| v.as_str()),
             Some("/tmp/test")
         );
     }
@@ -2539,8 +2612,14 @@ mod tests {
         }
 
         let resp = done_response.expect("should produce Done even for empty stream");
-        assert!(resp.content.is_none(), "empty stream should have no content");
-        assert!(resp.tool_calls.is_empty(), "empty stream should have no tool calls");
+        assert!(
+            resp.content.is_none(),
+            "empty stream should have no content"
+        );
+        assert!(
+            resp.tool_calls.is_empty(),
+            "empty stream should have no tool calls"
+        );
     }
 
     // ── extract_unsupported_feature tests ────────────────────────────────────
@@ -2619,7 +2698,10 @@ mod tests {
         .await;
 
         let elapsed = start.elapsed();
-        assert!(result.is_none(), "should return None when server is unreachable");
+        assert!(
+            result.is_none(),
+            "should return None when server is unreachable"
+        );
         // Must fail fast — well under the 120s parent timeout.
         // We allow up to 11s to account for the 10s probe timeout plus OS latency.
         assert!(
@@ -2636,23 +2718,27 @@ mod tests {
     fn test_native_lms_cache_marks_unavailable() {
         let base = "http://127.0.0.1:29991";
         // Mark unavailable.
-        native_lms_cache()
-            .lock()
-            .insert(base.to_string(), false);
+        native_lms_cache().lock().insert(base.to_string(), false);
         // Verify the cache entry.
         let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(val, Some(false), "cache should hold false after marking unavailable");
+        assert_eq!(
+            val,
+            Some(false),
+            "cache should hold false after marking unavailable"
+        );
     }
 
     /// After marking a base URL as available, the cache returns true.
     #[test]
     fn test_native_lms_cache_marks_available() {
         let base = "http://127.0.0.1:29992";
-        native_lms_cache()
-            .lock()
-            .insert(base.to_string(), true);
+        native_lms_cache().lock().insert(base.to_string(), true);
         let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(val, Some(true), "cache should hold true after marking available");
+        assert_eq!(
+            val,
+            Some(true),
+            "cache should hold true after marking available"
+        );
     }
 
     /// An unprobed base URL is absent from the cache (None).
@@ -2661,7 +2747,10 @@ mod tests {
         let base = "http://127.0.0.1:29993";
         // Do NOT insert — just read.
         let val = native_lms_cache().lock().get(base).copied();
-        assert_eq!(val, None, "cache should return None for an un-probed endpoint");
+        assert_eq!(
+            val, None,
+            "cache should return None for an un-probed endpoint"
+        );
     }
 
     /// Second call with a cached-unavailable endpoint returns None instantly,
@@ -2696,7 +2785,10 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        assert!(result.is_none(), "should return None immediately for cached-unavailable endpoint");
+        assert!(
+            result.is_none(),
+            "should return None immediately for cached-unavailable endpoint"
+        );
         // Should complete in well under 100ms — the cache bypass is synchronous.
         assert!(
             elapsed.as_millis() < 100,

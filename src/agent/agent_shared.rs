@@ -1335,7 +1335,8 @@ impl AgentLoopShared {
 
             let mut streamed_response = None;
             let mut in_thinking = false;
-            let suppress_thinking = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+            let suppress_thinking_tts = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
+            let thinking_enabled = counters.thinking_budget.load(Ordering::Relaxed) > 0;
             loop {
                 tokio::select! {
                     biased;
@@ -1354,8 +1355,8 @@ impl AgentLoopShared {
                     chunk = stream.rx.recv() => {
                         match chunk {
                             Some(StreamChunk::ThinkingDelta(delta)) => {
-                                if suppress_thinking {
-                                    // Skip thinking tokens entirely (voice mode / /nothink)
+                                if !thinking_enabled || suppress_thinking_tts {
+                                    // /t off → hide from display; /nothink → hide from TTS
                                     continue;
                                 }
                                 // Render thinking tokens as dimmed text
@@ -1565,13 +1566,11 @@ impl AgentLoopShared {
             validation::ValidationOutcome::Ok => {}
         }
 
-        // --- Strip thinking tags leaked by small models (Qwen3, etc.) ---
-        if ctx.core.is_local {
-            if let Some(ref mut content) = response.content {
-                let cleaned = crate::agent::compaction::strip_thinking_tags(content);
-                if cleaned.len() != content.len() {
-                    *content = cleaned;
-                }
+        // --- Strip thinking tags leaked by models (Qwen3, MiniCPM, etc.) ---
+        if let Some(ref mut content) = response.content {
+            let cleaned = crate::agent::compaction::strip_thinking_tags(content);
+            if cleaned.len() != content.len() {
+                *content = cleaned;
             }
         }
 

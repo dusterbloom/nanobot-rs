@@ -57,12 +57,18 @@ mod inner {
                     obj.get("arguments"),
                 ) {
                     let arguments: HashMap<String, serde_json::Value> = match args {
-                        serde_json::Value::Object(m) => m.iter().map(|(k,v)| (k.clone(), v.clone())).collect(),
+                        serde_json::Value::Object(m) => {
+                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        }
                         serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
                         _ => HashMap::new(),
                     };
                     let id = format!("call_{}", tool_calls.len());
-                    tool_calls.push(ToolCallRequest { id, name: name.to_string(), arguments });
+                    tool_calls.push(ToolCallRequest {
+                        id,
+                        name: name.to_string(),
+                        arguments,
+                    });
                     // Remove the JSON block from remaining text
                     remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
                     continue; // don't advance search_from since we removed text
@@ -147,8 +153,7 @@ mod inner {
             lora_config: LoraConfig,
             mlx_lm_url: Option<String>,
         ) -> Result<Self> {
-            let tokenizer = MlxTokenizer::load(&model_dir)
-                .context("Failed to load tokenizer")?;
+            let tokenizer = MlxTokenizer::load(&model_dir).context("Failed to load tokenizer")?;
             let model_name = model_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -172,15 +177,35 @@ mod inner {
                     } else {
                         None
                     };
+                    let server_options = crate::agent::mlx_lm::MlxLmServerOptions {
+                        decode_concurrency: std::env::var("NANOBOT_MLX_LM_DECODE_CONCURRENCY")
+                            .ok()
+                            .and_then(|v| v.parse().ok()),
+                        prompt_concurrency: std::env::var("NANOBOT_MLX_LM_PROMPT_CONCURRENCY")
+                            .ok()
+                            .and_then(|v| v.parse().ok()),
+                        chat_template_args: thinking_model
+                            .then(|| r#"{"enable_thinking": false}"#.to_string()),
+                    };
                     tracing::info!(port, "starting managed mlx-lm server");
-                    match crate::agent::mlx_lm::MlxLmServer::start(model_dir.clone(), adapter, port) {
+                    match crate::agent::mlx_lm::MlxLmServer::start(
+                        model_dir.clone(),
+                        adapter,
+                        port,
+                        server_options,
+                    ) {
                         Ok(srv) => {
                             let url = srv.base_url();
                             tracing::info!(url = %url, "mlx-lm server ready");
-                            (Some(url), Some(std::sync::Arc::new(parking_lot::Mutex::new(srv))))
+                            (
+                                Some(url),
+                                Some(std::sync::Arc::new(parking_lot::Mutex::new(srv))),
+                            )
                         }
                         Err(e) => {
-                            tracing::warn!("mlx-lm server failed to start: {e}, falling back to in-process");
+                            tracing::warn!(
+                                "mlx-lm server failed to start: {e}, falling back to in-process"
+                            );
                             (None, None)
                         }
                     }
@@ -193,18 +218,21 @@ mod inner {
             };
 
             // Build post-train hook that reloads adapters on the managed server.
-            let post_train_hook: Option<Box<dyn Fn() + Send>> = managed_server.as_ref().map(|srv| {
-                let srv = Arc::clone(srv);
-                let adapter_dir = model_dir.join("adapters");
-                Box::new(move || {
-                    if adapter_dir.join("adapters.safetensors").exists() {
-                        match srv.lock().reload_adapters(adapter_dir.clone()) {
-                            Ok(()) => tracing::info!("mlx-lm: adapters reloaded after training"),
-                            Err(e) => tracing::warn!("mlx-lm: adapter reload failed: {e}"),
+            let post_train_hook: Option<Box<dyn Fn() + Send>> =
+                managed_server.as_ref().map(|srv| {
+                    let srv = Arc::clone(srv);
+                    let adapter_dir = model_dir.join("adapters");
+                    Box::new(move || {
+                        if adapter_dir.join("adapters.safetensors").exists() {
+                            match srv.lock().reload_adapters(adapter_dir.clone()) {
+                                Ok(()) => {
+                                    tracing::info!("mlx-lm: adapters reloaded after training")
+                                }
+                                Err(e) => tracing::warn!("mlx-lm: adapter reload failed: {e}"),
+                            }
                         }
-                    }
-                }) as Box<dyn Fn() + Send>
-            });
+                    }) as Box<dyn Fn() + Send>
+                });
 
             let dir = model_dir.clone();
             let cfg = model_config;
@@ -213,11 +241,19 @@ mod inner {
             std::thread::Builder::new()
                 .name("mlx-model-worker".into())
                 .spawn(move || {
-                    crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx, post_train_hook);
+                    crate::agent::mlx_server::run_model_worker(
+                        dir,
+                        cfg,
+                        lora_cfg,
+                        ts,
+                        rx,
+                        post_train_hook,
+                    );
                 })
                 .context("Failed to spawn model worker thread")?;
 
-            let api_base = resolved_url.as_deref()
+            let api_base = resolved_url
+                .as_deref()
                 .unwrap_or("mlx://in-process")
                 .to_string();
 
@@ -275,7 +311,9 @@ mod inner {
         /// Switch the managed mlx-lm server to a different model.
         /// Returns the new model name, or error if no managed server.
         pub fn switch_model(&self, model_dir: PathBuf) -> Result<String> {
-            let srv = self.managed_server.as_ref()
+            let srv = self
+                .managed_server
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no managed mlx-lm server"))?;
             let adapter_path = model_dir.join("adapters");
             let adapter = if adapter_path.join("adapters.safetensors").exists() {
@@ -283,16 +321,20 @@ mod inner {
             } else {
                 None
             };
-            let name = model_dir.file_name()
+            let name = model_dir
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            srv.lock().switch_model(model_dir, adapter)
+            srv.lock()
+                .switch_model(model_dir, adapter)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(name)
         }
 
         /// Get reference to the managed server (for REPL model switching).
-        pub fn managed_server(&self) -> Option<&Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>> {
+        pub fn managed_server(
+            &self,
+        ) -> Option<&Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>> {
             self.managed_server.as_ref()
         }
 
@@ -313,9 +355,10 @@ mod inner {
             }
             let mut msgs = messages.to_vec();
             // Find system message and append /nothink
-            if let Some(sys) = msgs.iter_mut().find(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("system")
-            }) {
+            if let Some(sys) = msgs
+                .iter_mut()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            {
                 if let Some(content) = sys.get("content").and_then(|c| c.as_str()) {
                     if !content.contains("/nothink") {
                         sys["content"] = serde_json::json!(format!("{content}\n/nothink"));
@@ -323,10 +366,13 @@ mod inner {
                 }
             } else {
                 // No system message — prepend one
-                msgs.insert(0, serde_json::json!({
-                    "role": "system",
-                    "content": "/nothink"
-                }));
+                msgs.insert(
+                    0,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": "/nothink"
+                    }),
+                );
             }
             msgs
         }
@@ -354,7 +400,8 @@ mod inner {
                 }
             }
 
-            let resp = self.http_client
+            let resp = self
+                .http_client
                 .post(&url)
                 .json(&body)
                 .send()
@@ -367,25 +414,26 @@ mod inner {
                 anyhow::bail!("mlx-lm server returned {status}: {text}");
             }
 
-            let json: serde_json::Value = resp.json().await
+            let json: serde_json::Value = resp
+                .json()
+                .await
                 .context("mlx-lm server returned invalid JSON")?;
 
-            let message = json.pointer("/choices/0/message")
+            let message = json
+                .pointer("/choices/0/message")
                 .cloned()
                 .unwrap_or_default();
 
-            let content = message.get("content")
+            let content = message
+                .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let text = if self.thinking_model {
-                strip_think_blocks(&content)
-            } else {
-                content
-            };
+            let text = strip_think_blocks(&content);
 
-            let finish_reason = json.pointer("/choices/0/finish_reason")
+            let finish_reason = json
+                .pointer("/choices/0/finish_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("stop")
                 .to_string();
@@ -394,10 +442,20 @@ mod inner {
             let mut tool_calls = Vec::new();
             if let Some(tc_array) = message.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tc_array {
-                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let function = tc.get("function").cloned().unwrap_or_default();
-                    let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let arguments_raw = function.get("arguments").cloned()
+                    let name = function
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments_raw = function
+                        .get("arguments")
+                        .cloned()
                         .unwrap_or(serde_json::Value::String("{}".into()));
                     let arguments: HashMap<String, serde_json::Value> =
                         if let Some(s) = arguments_raw.as_str() {
@@ -407,7 +465,11 @@ mod inner {
                         } else {
                             HashMap::new()
                         };
-                    tool_calls.push(ToolCallRequest { id, name, arguments });
+                    tool_calls.push(ToolCallRequest {
+                        id,
+                        name,
+                        arguments,
+                    });
                 }
             }
 
@@ -440,7 +502,11 @@ mod inner {
             }
 
             Ok(LLMResponse {
-                content: if text.trim().is_empty() && !tool_calls.is_empty() { None } else { Some(text) },
+                content: if text.trim().is_empty() && !tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                },
                 tool_calls,
                 finish_reason,
                 usage,
@@ -515,7 +581,9 @@ mod inner {
         ) -> Result<LLMResponse> {
             // Delegate to mlx-lm server when configured
             if let Some(ref url) = self.mlx_lm_url {
-                return self.chat_via_mlx_lm(url, messages, tools, max_tokens, temperature).await;
+                return self
+                    .chat_via_mlx_lm(url, messages, tools, max_tokens, temperature)
+                    .await;
             }
 
             // In-process: apply chat template and generate
@@ -549,12 +617,7 @@ mod inner {
                 .map_err(|_| anyhow::anyhow!("model worker dropped reply"))?
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            // Strip <think>...</think> blocks from thinking models
-            let text = if self.thinking_model {
-                strip_think_blocks(&raw_text)
-            } else {
-                raw_text
-            };
+            let text = strip_think_blocks(&raw_text);
 
             let mut usage = HashMap::new();
             usage.insert("prompt_tokens".to_string(), prompt_tokens as i64);
@@ -588,7 +651,9 @@ mod inner {
             // Only stream when delegating to mlx-lm server
             let Some(ref base_url) = self.mlx_lm_url else {
                 // In-process: fall back to buffered default
-                let response = self.chat(messages, tools, None, max_tokens, temperature, None, None).await?;
+                let response = self
+                    .chat(messages, tools, None, max_tokens, temperature, None, None)
+                    .await?;
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 if let Some(ref content) = response.content {
                     let _ = tx.send(StreamChunk::TextDelta(content.clone()));
@@ -612,7 +677,8 @@ mod inner {
                 }
             }
 
-            let resp = self.http_client
+            let resp = self
+                .http_client
                 .post(&url)
                 .json(&body)
                 .send()
@@ -626,7 +692,6 @@ mod inner {
             }
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let thinking_model = self.thinking_model;
 
             // Spawn task to parse SSE stream from mlx-lm server
             let byte_stream = resp.bytes_stream();
@@ -637,7 +702,7 @@ mod inner {
                 let mut finish_reason = "stop".to_string();
                 let mut usage: HashMap<String, i64> = HashMap::new();
                 let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
-                let mut in_think = false;
+                let mut think_split = crate::providers::openai_compat::ThinkSplitState::default();
 
                 while let Some(result) = stream.next().await {
                     let bytes = match result {
@@ -651,7 +716,9 @@ mod inner {
                     line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                     while let Some(newline_pos) = line_buffer.find('\n') {
-                        let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+                        let line = line_buffer[..newline_pos]
+                            .trim_end_matches('\r')
+                            .to_string();
                         line_buffer = line_buffer[newline_pos + 1..].to_string();
 
                         if line.is_empty() || !line.starts_with("data: ") {
@@ -667,50 +734,38 @@ mod inner {
                         };
 
                         // Extract text delta
-                        if let Some(delta) = chunk.pointer("/choices/0/delta/content")
+                        if let Some(delta) = chunk
+                            .pointer("/choices/0/delta/content")
                             .and_then(|v| v.as_str())
                         {
                             if !delta.is_empty() {
-                                // For thinking models, skip content inside <think>...</think>
-                                if thinking_model {
-                                    let mut visible = String::new();
-                                    let mut rest = delta;
-                                    while !rest.is_empty() {
-                                        if in_think {
-                                            if let Some(end) = rest.find("</think>") {
-                                                in_think = false;
-                                                rest = &rest[end + "</think>".len()..];
-                                            } else {
-                                                break; // still in think block
-                                            }
-                                        } else if let Some(start) = rest.find("<think>") {
-                                            visible.push_str(&rest[..start]);
-                                            in_think = true;
-                                            rest = &rest[start + "<think>".len()..];
-                                        } else {
-                                            visible.push_str(rest);
-                                            break;
-                                        }
-                                    }
-                                    if !visible.is_empty() {
-                                        full_content.push_str(&visible);
-                                        let _ = tx.send(StreamChunk::TextDelta(visible));
-                                    }
-                                } else {
-                                    full_content.push_str(delta);
-                                    let _ = tx.send(StreamChunk::TextDelta(delta.to_string()));
+                                // Split <think>/<thinking> blocks using the
+                                // tested splitter from openai_compat (handles
+                                // tags split across chunk boundaries).
+                                let (visible, thinking) =
+                                    crate::providers::openai_compat::split_thinking_from_content_delta(
+                                        &mut think_split, delta,
+                                    );
+                                if !thinking.is_empty() {
+                                    let _ = tx.send(StreamChunk::ThinkingDelta(thinking));
+                                }
+                                if !visible.is_empty() {
+                                    full_content.push_str(&visible);
+                                    let _ = tx.send(StreamChunk::TextDelta(visible));
                                 }
                             }
                         }
 
                         // Accumulate tool calls from deltas
-                        if let Some(tc_array) = chunk.pointer("/choices/0/delta/tool_calls")
+                        if let Some(tc_array) = chunk
+                            .pointer("/choices/0/delta/tool_calls")
                             .and_then(|v| v.as_array())
                         {
                             for tc in tc_array {
                                 let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let entry = tool_calls_acc.entry(idx)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                let entry = tool_calls_acc.entry(idx).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                });
                                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                     entry.0 = id.to_string();
                                 }
@@ -718,14 +773,16 @@ mod inner {
                                     if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
                                         entry.1 = name.to_string();
                                     }
-                                    if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
+                                    if let Some(args) = f.get("arguments").and_then(|v| v.as_str())
+                                    {
                                         entry.2.push_str(args);
                                     }
                                 }
                             }
                         }
 
-                        if let Some(fr) = chunk.pointer("/choices/0/finish_reason")
+                        if let Some(fr) = chunk
+                            .pointer("/choices/0/finish_reason")
                             .and_then(|v| v.as_str())
                         {
                             finish_reason = fr.to_string();
@@ -742,6 +799,17 @@ mod inner {
                     }
                 }
 
+                // Flush any carried-over content from the think splitter.
+                let (tail_visible, tail_thinking) =
+                    crate::providers::openai_compat::flush_thinking_split_state(&mut think_split);
+                if !tail_thinking.is_empty() {
+                    let _ = tx.send(StreamChunk::ThinkingDelta(tail_thinking));
+                }
+                if !tail_visible.is_empty() {
+                    full_content.push_str(&tail_visible);
+                    let _ = tx.send(StreamChunk::TextDelta(tail_visible));
+                }
+
                 // Build tool calls
                 let mut tool_calls = Vec::new();
                 let mut indices: Vec<u64> = tool_calls_acc.keys().copied().collect();
@@ -750,7 +818,11 @@ mod inner {
                     let (id, name, args_json) = tool_calls_acc.remove(&idx).unwrap();
                     let arguments: HashMap<String, serde_json::Value> =
                         serde_json::from_str(&args_json).unwrap_or_default();
-                    tool_calls.push(ToolCallRequest { id, name, arguments });
+                    tool_calls.push(ToolCallRequest {
+                        id,
+                        name,
+                        arguments,
+                    });
                 }
 
                 // Fallback: parse tool calls from text
@@ -767,7 +839,11 @@ mod inner {
                 };
 
                 let _ = tx.send(StreamChunk::Done(LLMResponse {
-                    content: if text.trim().is_empty() && !tool_calls.is_empty() { None } else { Some(text) },
+                    content: if text.trim().is_empty() && !tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(text)
+                    },
                     tool_calls,
                     finish_reason,
                     usage,
@@ -818,15 +894,20 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("MlxProvider::start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("MlxProvider::start failed");
 
         let messages = vec![serde_json::json!({
             "role": "user",
             "content": "What is 2+2? Answer with just the number."
         })];
 
-        let resp = provider.chat(&messages, None, None, 32, 0.0, None, None)
+        let resp = provider
+            .chat(&messages, None, None, 32, 0.0, None, None)
             .await
             .expect("chat failed");
 
@@ -850,13 +931,20 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("MlxProvider::start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("MlxProvider::start failed");
 
-        let loss = provider.perplexity(
-            "What is the capital of France?",
-            "The capital of France is Paris.",
-        ).await.expect("perplexity failed");
+        let loss = provider
+            .perplexity(
+                "What is the capital of France?",
+                "The capital of France is Paris.",
+            )
+            .await
+            .expect("perplexity failed");
 
         eprintln!("Perplexity (CE loss): {loss}");
         assert!(loss > 0.0, "CE loss should be positive");
@@ -874,8 +962,12 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("MlxProvider::start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("MlxProvider::start failed");
 
         let conversations = vec![vec![
             crate::agent::mlx_server::ChatMessage {
@@ -889,7 +981,8 @@ mod tests {
         ]];
 
         // Training is fire-and-forget but should not error on send.
-        provider.train(conversations, 2)
+        provider
+            .train(conversations, 2)
             .await
             .expect("train should not error");
     }
@@ -905,15 +998,20 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("MlxProvider::start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("MlxProvider::start failed");
 
         // 1. Inference
         let messages = vec![serde_json::json!({
             "role": "user",
             "content": "Capital of Japan?"
         })];
-        let resp = provider.chat(&messages, None, None, 16, 0.0, None, None)
+        let resp = provider
+            .chat(&messages, None, None, 16, 0.0, None, None)
             .await
             .expect("chat failed");
         let answer = resp.content.unwrap_or_default();
@@ -921,7 +1019,8 @@ mod tests {
         assert!(!answer.is_empty());
 
         // 2. Perplexity scoring
-        let loss = provider.perplexity("Capital of Japan?", &answer)
+        let loss = provider
+            .perplexity("Capital of Japan?", &answer)
             .await
             .expect("perplexity failed");
         eprintln!("Perplexity: {loss}");
@@ -938,7 +1037,10 @@ mod tests {
                 content: answer.clone(),
             },
         ]];
-        provider.train(convos, 1).await.expect("train should not error");
+        provider
+            .train(convos, 1)
+            .await
+            .expect("train should not error");
 
         eprintln!("Closed loop complete: inference → perplexity → train");
     }
@@ -966,8 +1068,12 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir_4b(),
             ModelConfig::qwen3_4b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("MlxProvider::start failed (4B)");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("MlxProvider::start failed (4B)");
 
         // 1. Inference
         let messages = vec![serde_json::json!({
@@ -975,15 +1081,20 @@ mod tests {
             "content": "What is 2+2? Answer with just the number."
         })];
         // Thinking models need more tokens: ~100 for reasoning + answer
-        let resp = provider.chat(&messages, None, None, 256, 0.0, None, None)
+        let resp = provider
+            .chat(&messages, None, None, 256, 0.0, None, None)
             .await
             .expect("chat failed");
         let answer = resp.content.unwrap_or_default();
         eprintln!("4B Inference: {answer:?}");
-        assert!(!answer.is_empty(), "response empty after think-strip (raw may have had thinking)");
+        assert!(
+            !answer.is_empty(),
+            "response empty after think-strip (raw may have had thinking)"
+        );
 
         // 2. Perplexity
-        let loss = provider.perplexity("What is 2+2?", &answer)
+        let loss = provider
+            .perplexity("What is 2+2?", &answer)
             .await
             .expect("perplexity failed");
         eprintln!("4B Perplexity: {loss}");
@@ -1000,7 +1111,10 @@ mod tests {
                 content: answer.clone(),
             },
         ]];
-        provider.train(convos, 1).await.expect("train should not error");
+        provider
+            .train(convos, 1)
+            .await
+            .expect("train should not error");
 
         eprintln!("4B closed loop complete: inference → perplexity → train");
     }
