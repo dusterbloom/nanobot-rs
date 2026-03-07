@@ -92,7 +92,11 @@ impl<'a> MemoryLadder<'a> {
     ///
     /// Iterates layers in priority order, allocating up to 50% of total budget
     /// per layer. When remaining budget reaches 0, lower layers are skipped.
-    pub async fn query(&self, q: &MemoryQuery<'_>) -> Vec<LayerResult> {
+    ///
+    /// Synchronous to avoid `Send` issues with `parking_lot::MutexGuard` held
+    /// across `.await` points in the caller. The only async layer (Scratch)
+    /// uses `block_in_place` internally when a query term is provided.
+    pub fn query(&self, q: &MemoryQuery<'_>) -> Vec<LayerResult> {
         let mut results = Vec::new();
         let mut remaining = q.total_budget;
 
@@ -110,7 +114,7 @@ impl<'a> MemoryLadder<'a> {
                 allocation
             };
 
-            let content = self.fetch_layer(layer, q.session_key, q.query, allocation).await;
+            let content = self.fetch_layer(layer, q.session_key, q.query, allocation);
 
             if !content.is_empty() {
                 let tokens_used = TokenBudget::estimate_str_tokens(&content);
@@ -127,7 +131,7 @@ impl<'a> MemoryLadder<'a> {
     }
 
     /// Fetch content from a single layer, truncated to the given token budget.
-    async fn fetch_layer(
+    fn fetch_layer(
         &self,
         layer: MemoryLayer,
         session_key: &str,
@@ -196,10 +200,13 @@ impl<'a> MemoryLadder<'a> {
                 if query.is_empty() {
                     return String::new();
                 }
-                let results = self
-                    .session_db
-                    .search_messages(query, 10, None)
-                    .await;
+                // session_db.search_messages is async; use block_in_place to
+                // call it from synchronous context without Send issues.
+                let results = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        self.session_db.search_messages(query, 10, None),
+                    )
+                });
                 if results.is_empty() {
                     return String::new();
                 }
@@ -288,8 +295,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_budget_waterfall_exhaustion() {
+    #[test]
+    fn test_budget_waterfall_exhaustion() {
         // Create a workspace with a large MEMORY.md that fills the budget.
         let tmp = TempDir::new().unwrap();
         let mem_dir = tmp.path().join("memory");
@@ -310,13 +317,11 @@ mod tests {
         let session_db = SessionDb::new(&db_path);
 
         let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
-        let results = ladder
-            .query(&MemoryQuery {
-                session_key: "test:session",
-                query: "",
-                total_budget: 20, // Very small budget -- GroundTruth should consume most of it
-            })
-            .await;
+        let results = ladder.query(&MemoryQuery {
+            session_key: "test:session",
+            query: "",
+            total_budget: 20, // Very small budget -- GroundTruth should consume most of it
+        });
 
         // GroundTruth should be present (it has content).
         assert!(
@@ -333,8 +338,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_soft_cap_enforcement() {
+    #[test]
+    fn test_soft_cap_enforcement() {
         // With total_budget=100, no single layer should get more than 50 tokens.
         let tmp = TempDir::new().unwrap();
         let mem_dir = tmp.path().join("memory");
@@ -354,13 +359,11 @@ mod tests {
         let session_db = SessionDb::new(&db_path);
 
         let ladder = MemoryLadder::new(tmp.path(), &wm, None, &session_db);
-        let results = ladder
-            .query(&MemoryQuery {
-                session_key: "test:session",
-                query: "",
-                total_budget: 100,
-            })
-            .await;
+        let results = ladder.query(&MemoryQuery {
+            session_key: "test:session",
+            query: "",
+            total_budget: 100,
+        });
 
         for result in &results {
             assert!(

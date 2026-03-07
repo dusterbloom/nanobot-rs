@@ -13,6 +13,7 @@ use crate::agent::agent_loop::{AgentLoopShared, CompactionHandle, FlowControl, T
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
+use crate::agent::memory_ladder::{MemoryLadder, MemoryLayer, MemoryQuery};
 use crate::agent::policy;
 use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
 use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
@@ -30,14 +31,29 @@ impl AgentLoopShared {
         let mut blocks = Vec::new();
 
         if core.memory_enabled {
-            let wm = core
-                .working_memory
-                .get_context(&session_key, core.working_memory_budget.min(200));
-            if !wm.is_empty() {
-                blocks.push(crate::agent::context::PromptBlock::new(
-                    "Working Memory",
-                    wm,
-                ));
+            let ladder = MemoryLadder::new(
+                &core.workspace,
+                &core.working_memory,
+                None,
+                &core.sessions,
+            );
+            let results = ladder
+                .query(&MemoryQuery {
+                    session_key,
+                    query: "",
+                    total_budget: core.working_memory_budget.min(200),
+                });
+            for result in results {
+                if !result.content.is_empty() {
+                    let title = match result.layer {
+                        MemoryLayer::WorkingSession => "Working Memory",
+                        _ => "Memory Briefing",
+                    };
+                    blocks.push(crate::agent::context::PromptBlock::new(
+                        title,
+                        &result.content,
+                    ));
+                }
             }
         }
 
@@ -74,28 +90,62 @@ impl AgentLoopShared {
     ) -> Vec<SectionEntry> {
         let mut sections = Vec::new();
 
-        // 1. Working memory + tool patterns (merged into a single WorkingMemory section).
+        // 1. Memory layers via MemoryLadder (replaces direct working memory + bulletin cache).
         if core.memory_enabled {
-            let mut wm = core
-                .working_memory
-                .get_context(session_key, core.working_memory_budget);
+            let ks_guard;
+            let ks_ref = if let Some(ref ks_arc) = self.knowledge_store {
+                ks_guard = ks_arc.lock();
+                Some(&*ks_guard)
+            } else {
+                None
+            };
+            let ladder = MemoryLadder::new(
+                &core.workspace,
+                &core.working_memory,
+                ks_ref,
+                &core.sessions,
+            );
+            let results = ladder
+                .query(&MemoryQuery {
+                    session_key,
+                    query: "",
+                    total_budget: core.working_memory_budget,
+                });
+
+            for result in results {
+                let (section, title) = match result.layer {
+                    MemoryLayer::WorkingSession => {
+                        (PromptSection::WorkingMemory, "Working Memory (Current Session)")
+                    }
+                    _ => (PromptSection::MemoryBriefing, "Memory Briefing"),
+                };
+                if !result.content.is_empty() {
+                    sections.push(SectionEntry {
+                        section,
+                        block: PromptBlock::new(title, &result.content),
+                        allocated_tokens: 0,
+                        actual_tokens: 0,
+                        source: SectionSource::Runtime(format!(
+                            "memory-ladder:{:?}",
+                            result.layer
+                        )),
+                        included: true,
+                        shrinkable: section.shrinkable(),
+                    });
+                }
+            }
+
+            // Tool patterns remain as a separate section (not a memory layer).
             let learning_ctx = core.learning.get_learning_context();
             if !learning_ctx.is_empty() {
-                wm.push_str("\n\n## Tool Patterns\n\n");
-                wm.push_str(&learning_ctx);
-            }
-            if !wm.is_empty() {
                 sections.push(SectionEntry {
-                    section: PromptSection::WorkingMemory,
-                    block: PromptBlock::new(
-                        "Working Memory (Current Session)",
-                        &wm,
-                    ),
+                    section: PromptSection::ToolPatterns,
+                    block: PromptBlock::new("Tool Patterns", &learning_ctx),
                     allocated_tokens: 0,
                     actual_tokens: 0,
-                    source: SectionSource::Runtime("session working memory".to_string()),
+                    source: SectionSource::Runtime("learning patterns".to_string()),
                     included: true,
-                    shrinkable: PromptSection::WorkingMemory.shrinkable(),
+                    shrinkable: PromptSection::ToolPatterns.shrinkable(),
                 });
             }
         }
@@ -120,10 +170,8 @@ impl AgentLoopShared {
         // 3. Background task status (subagent status).
         {
             let running = self.subagents.list_running().await;
-            let recent = crate::agent::subagent::SubagentManager::read_recent_completed(
-                &core.workspace,
-                5,
-            );
+            let recent =
+                crate::agent::subagent::SubagentManager::read_recent_completed(&core.workspace, 5);
             let status = crate::agent::subagent::format_status_block(&running, &recent);
             if !status.is_empty() {
                 sections.push(SectionEntry {
@@ -138,21 +186,7 @@ impl AgentLoopShared {
             }
         }
 
-        // 4. Memory bulletin/briefing.
-        {
-            let bulletin = self.bulletin_cache.load_full();
-            if !bulletin.is_empty() {
-                sections.push(SectionEntry {
-                    section: PromptSection::MemoryBriefing,
-                    block: PromptBlock::new("Memory Briefing", &*bulletin),
-                    allocated_tokens: 0,
-                    actual_tokens: 0,
-                    source: SectionSource::Runtime("memory bulletin".to_string()),
-                    included: true,
-                    shrinkable: PromptSection::MemoryBriefing.shrinkable(),
-                });
-            }
-        }
+        // 4. Memory bulletin/briefing — replaced by GroundTruth layer in MemoryLadder above.
 
         sections
     }
