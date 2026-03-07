@@ -9,8 +9,8 @@ mod incremental;
 
 pub(crate) use commands::{should_auto_activate_trio, trio_enable};
 
-use std::io::{self, IsTerminal, Write as _};
 use std::collections::BTreeSet;
+use std::io::{self, IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -191,7 +191,10 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     if config.lcm.enabled {
         if let Some(ref ep) = config.lcm.compaction_endpoint {
             if !ep.model.trim().is_empty() {
-                models.push((ep.model.trim().to_string(), Some(config.lcm.compaction_context_size)));
+                models.push((
+                    ep.model.trim().to_string(),
+                    Some(config.lcm.compaction_context_size),
+                ));
             }
         }
     }
@@ -217,7 +220,8 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
                             if instances.is_empty() {
                                 return None;
                             }
-                            let ctx = instances.first()
+                            let ctx = instances
+                                .first()
                                 .and_then(|inst| inst.get("config"))
                                 .and_then(|c| c.get("context_length"))
                                 .and_then(|v| v.as_u64())
@@ -237,7 +241,10 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
             continue;
         }
         // Skip if model is already loaded on the remote — don't force context reload
-        if loaded_map.keys().any(|k| crate::lms::model_matches(k, &model)) {
+        if loaded_map
+            .keys()
+            .any(|k| crate::lms::model_matches(k, &model))
+        {
             info!(model = %model, "remote_lms_prewarm_already_loaded");
             continue;
         }
@@ -288,7 +295,11 @@ async fn fetch_lms_loaded_models(native_base: &str) -> Vec<String> {
                 .and_then(|v| v.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            if loaded { Some(key) } else { None }
+            if loaded {
+                Some(key)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -377,6 +388,7 @@ pub(crate) fn print_help() {
     println!("\nCommands:");
     println!("  /local, /l      - Toggle between local and cloud mode");
     println!("  /model, /m [q]  - Pick model from all sources (LMS, cluster, ~/models/)");
+    println!("  /lane           - Toggle lane (answer/action) or /lane answer|action");
     println!("  /trio           - Toggle trio mode (router + specialist)");
     println!("  /trio budget    - Show VRAM budget breakdown");
     println!("  /trio cap <GB>  - Set VRAM cap (e.g. /trio cap 12)");
@@ -433,7 +445,6 @@ pub(crate) fn spawn_input_watcher(
     enter_interrupted: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     use termimad::crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    
 
     std::thread::spawn(move || {
         let owned = tui::enter_raw_mode();
@@ -508,7 +519,10 @@ pub(crate) fn spawn_input_watcher(
             }
         }
 
-        debug!("input_watcher: exiting, done={}", done.load(Ordering::Relaxed));
+        debug!(
+            "input_watcher: exiting, done={}",
+            done.load(Ordering::Relaxed)
+        );
         tui::exit_raw_mode(owned);
     })
 }
@@ -624,7 +638,8 @@ async fn stream_and_render_inner(
     let print_task = tokio::spawn(async move {
         use std::io::Write as _;
         #[cfg(feature = "voice")]
-        let mut tts_acc = tts_tx.map(|tx| crate::voice_pipeline::SentenceAccumulator::new_streaming(tx));
+        let mut tts_acc =
+            tts_tx.map(|tx| crate::voice_pipeline::SentenceAccumulator::new_streaming(tx));
         #[cfg(not(feature = "voice"))]
         let _ = tts_tx;
 
@@ -920,7 +935,9 @@ impl ServerState {
     /// Unload models from the current LMS-managed server.
     pub async fn kill_current(&mut self, lms_port: u16, unload_timeout_secs: u64) {
         if self.lms_managed {
-            crate::lms::unload_all("", lms_port, unload_timeout_secs).await.ok();
+            crate::lms::unload_all("", lms_port, unload_timeout_secs)
+                .await
+                .ok();
         }
         self.engine = InferenceEngine::None;
     }
@@ -1980,8 +1997,7 @@ fn index_sessions_background() {
     use std::process::Command;
 
     // Sanitize new/changed JSONL sessions before qmd re-indexes.
-    let script = dirs::home_dir()
-        .map(|h| h.join("Dev/nanobot/scripts/sanitize-sessions.sh"));
+    let script = dirs::home_dir().map(|h| h.join("Dev/nanobot/scripts/sanitize-sessions.sh"));
     if let Some(ref path) = script {
         if path.exists() {
             match Command::new("bash").arg(path).output() {
@@ -1990,7 +2006,11 @@ fn index_sessions_background() {
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!("session sanitizer exited with {}: {}", out.status, stderr.trim());
+                    warn!(
+                        "session sanitizer exited with {}: {}",
+                        out.status,
+                        stderr.trim()
+                    );
                 }
                 Err(e) => {
                     warn!("session sanitizer failed: {}", e);
@@ -2170,5 +2190,4 @@ mod tests {
         let result = truncate_output("", 40, 2000);
         assert_eq!(result, "");
     }
-
 }
