@@ -11,7 +11,7 @@ Requirements for Contract Architecture milestone. Each maps to roadmap phases.
 
 - [x] **PROMPT-01**: System prompt sections are typed variants of PromptSection enum with fixed ordering
 - [x] **PROMPT-02**: Each section has a PromptBudget with allocated tokens, actual tokens, and source
-- [ ] **PROMPT-03**: PromptAssembler performs single-pass assembly, replacing all append_to_system_prompt() calls
+- [x] **PROMPT-03**: PromptAssembler performs single-pass assembly, replacing all append_to_system_prompt() calls
 - [x] **PROMPT-04**: Total prompt cost enforced against context window cap, sections dropped tail-first
 
 ### Tool Gate
@@ -86,7 +86,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | PROMPT-01 | Phase 1 | Complete |
 | PROMPT-02 | Phase 1 | Complete |
-| PROMPT-03 | Phase 1 | Pending |
+| PROMPT-03 | Phase 1 | Complete |
 | PROMPT-04 | Phase 1 | Complete |
 | GATE-01 | Phase 2 | Pending |
 | GATE-02 | Phase 2 | Pending |
