@@ -151,6 +151,19 @@ impl LearnLoop for DefaultLearnLoop {
             return None;
         }
 
+        // Warn once if the threshold looks like a legacy CE-loss value.
+        if self.perplexity_gate_config.surprise_threshold > 1.0 {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "perplexity_gate: surpriseThreshold={:.1} exceeds heuristic range (0.0-1.0), \
+                     clamping to 1.0 — update config to a value like 0.3",
+                    self.perplexity_gate_config.surprise_threshold
+                );
+            }
+        }
+
         let eb_mutex = self.experience_buffer.as_ref()?.clone();
         let pg_config = self.perplexity_gate_config.clone();
         let train_counters = self.training_counters.clone();
@@ -184,7 +197,10 @@ impl LearnLoop for DefaultLearnLoop {
                 &trace_json,
             );
 
-            let threshold = pg_config.surprise_threshold as f64;
+            // Heuristic surprise is 0.0–1.0; clamp the threshold so legacy
+            // configs that still carry the old CE-loss default (3.0) don't
+            // silently disable training.
+            let threshold = (pg_config.surprise_threshold as f64).min(1.0);
             if surprise <= threshold {
                 return;
             }

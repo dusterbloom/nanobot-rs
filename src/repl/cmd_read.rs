@@ -778,10 +778,18 @@ impl ReplContext {
             if pg.enabled { "enabled" } else { "disabled" }
         );
         if pg.enabled {
-            println!(
-                "    Surprise threshold: {}, min experiences: {}",
-                pg.surprise_threshold, pg.min_experiences
-            );
+            let effective = (pg.surprise_threshold).min(1.0);
+            if pg.surprise_threshold > 1.0 {
+                println!(
+                    "    Surprise threshold: {} \x1b[33m→ clamped to {}\x1b[0m (heuristic range 0.0–1.0), min experiences: {}",
+                    pg.surprise_threshold, effective, pg.min_experiences
+                );
+            } else {
+                println!(
+                    "    Surprise threshold: {}, min experiences: {}",
+                    pg.surprise_threshold, pg.min_experiences
+                );
+            }
         }
         println!();
     }

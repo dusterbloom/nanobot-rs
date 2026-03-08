@@ -2076,8 +2076,9 @@ pub struct PerplexityGateConfig {
     /// Whether the perplexity gate is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// CE-loss threshold above which a conversation is considered "surprising"
-    /// and worth recording for LoRA training. Default: 3.0.
+    /// Heuristic surprise threshold (0.0–1.0) above which a conversation is
+    /// considered "surprising" and worth recording for LoRA training.
+    /// Default: 0.3. Higher = fewer but more novel experiences collected.
     #[serde(default = "default_surprise_threshold")]
     pub surprise_threshold: f32,
     /// Minimum number of unexported high-surprise experiences before triggering
@@ -2094,7 +2095,7 @@ pub struct PerplexityGateConfig {
 }
 
 fn default_surprise_threshold() -> f32 {
-    3.0
+    0.3
 }
 fn default_min_experiences() -> usize {
     5
