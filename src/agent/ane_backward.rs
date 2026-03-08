@@ -73,8 +73,7 @@ pub fn rmsnorm_bwd(
     for i in 0..dim {
         for t in 0..seq {
             // Correct derivative: rrms * (w[i]*dy[i,t] - x[i,t] * rrms^2/d * dot)
-            dx[i * seq + t] =
-                rrms[t] * (w[i] * dy[i * seq + t] - x[i * seq + t] * dot[t]);
+            dx[i * seq + t] = rrms[t] * (w[i] * dy[i * seq + t] - x[i * seq + t] * dot[t]);
         }
         // dw[i] += sum_t(dy[i,t] * x[i,t] * rrms[t])
         for t in 0..seq {
@@ -90,14 +89,7 @@ pub fn rmsnorm_bwd(
 ///   dh1[i] = dsilu[i] * h3[i] * silu'(h1[i])
 ///
 /// where silu(x) = x*sigmoid(x), silu'(x) = sigmoid(x)*(1 + x*(1-sigmoid(x)))
-pub fn silu_bwd(
-    dh1: &mut [f32],
-    dh3: &mut [f32],
-    dsilu: &[f32],
-    h1: &[f32],
-    h3: &[f32],
-    n: usize,
-) {
+pub fn silu_bwd(dh1: &mut [f32], dh3: &mut [f32], dsilu: &[f32], h1: &[f32], h3: &[f32], n: usize) {
     debug_assert_eq!(dh1.len(), n);
     debug_assert_eq!(dh3.len(), n);
     debug_assert_eq!(dsilu.len(), n);
@@ -162,7 +154,13 @@ pub fn classifier_bwd(
 /// Embedding backward: scatter gradient to embedding rows.
 ///
 /// dembed[tok*dim + d] += dy[d*seq + t] for each position t.
-pub fn embed_bwd<T: ane_forward::TokenId>(dembed: &mut [f32], dy: &[f32], tokens: &[T], dim: usize, seq: usize) {
+pub fn embed_bwd<T: ane_forward::TokenId>(
+    dembed: &mut [f32],
+    dy: &[f32],
+    tokens: &[T],
+    dim: usize,
+    seq: usize,
+) {
     debug_assert_eq!(dy.len(), dim * seq);
 
     for t in 0..seq {
@@ -284,25 +282,25 @@ impl BackwardKernels {
 
 /// Per-layer weight gradients.
 pub struct LayerGradients {
-    pub dwq: Vec<f32>,      // [dim, dim]
-    pub dwk: Vec<f32>,      // [kv_dim, dim] (= [dim, dim] for MHA)
-    pub dwv: Vec<f32>,      // [kv_dim, dim] (= [dim, dim] for MHA)
-    pub dwo: Vec<f32>,      // [dim, dim]
-    pub dw1: Vec<f32>,      // [hidden, dim]
-    pub dw2: Vec<f32>,      // [dim, hidden]
-    pub dw3: Vec<f32>,      // [hidden, dim]
-    pub drms_att: Vec<f32>, // [dim]
-    pub drms_ffn: Vec<f32>, // [dim]
-    pub dq_norm: Option<Vec<f32>>,  // [head_dim] per-head Q norm grad
-    pub dk_norm: Option<Vec<f32>>,  // [head_dim] per-head K norm grad
+    pub dwq: Vec<f32>,             // [dim, dim]
+    pub dwk: Vec<f32>,             // [kv_dim, dim] (= [dim, dim] for MHA)
+    pub dwv: Vec<f32>,             // [kv_dim, dim] (= [dim, dim] for MHA)
+    pub dwo: Vec<f32>,             // [dim, dim]
+    pub dw1: Vec<f32>,             // [hidden, dim]
+    pub dw2: Vec<f32>,             // [dim, hidden]
+    pub dw3: Vec<f32>,             // [hidden, dim]
+    pub drms_att: Vec<f32>,        // [dim]
+    pub drms_ffn: Vec<f32>,        // [dim]
+    pub dq_norm: Option<Vec<f32>>, // [head_dim] per-head Q norm grad
+    pub dk_norm: Option<Vec<f32>>, // [head_dim] per-head K norm grad
 }
 
 /// Full model gradients.
 pub struct ModelGradients {
     pub layers: Vec<LayerGradients>,
-    pub drms_final: Vec<f32>,  // [dim]
-    pub dembed: Vec<f32>,      // [vocab * dim]
-    pub dlm_head: Option<Vec<f32>>,  // [vocab * dim] untied classifier grad
+    pub drms_final: Vec<f32>,       // [dim]
+    pub dembed: Vec<f32>,           // [vocab * dim]
+    pub dlm_head: Option<Vec<f32>>, // [vocab * dim] untied classifier grad
 }
 
 impl ModelGradients {
@@ -325,10 +323,14 @@ impl ModelGradients {
                 drms_ffn: vec![0.0; dim],
                 dq_norm: if model.layers[i].q_norm.is_some() {
                     Some(vec![0.0; model.cfg.head_dim()])
-                } else { None },
+                } else {
+                    None
+                },
                 dk_norm: if model.layers[i].k_norm.is_some() {
                     Some(vec![0.0; model.cfg.head_dim()])
-                } else { None },
+                } else {
+                    None
+                },
             })
             .collect();
 
@@ -338,7 +340,9 @@ impl ModelGradients {
             dembed: vec![0.0; model.vocab_size * dim],
             dlm_head: if model.lm_head.is_some() {
                 Some(vec![0.0; model.vocab_size * dim])
-            } else { None },
+            } else {
+                None
+            },
         }
     }
 }
@@ -373,7 +377,14 @@ pub fn backward<T: ane_forward::TokenId>(
 
     // Reconstruct x_final (output of final rmsnorm) for classifier_bwd
     let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    ane_forward::rmsnorm(
+        &mut x_final,
+        &x_cur,
+        &model.rms_final,
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
 
     // 1. Classifier backward: dy = cls_w^T @ dlogits, dcls_w += dlogits @ x_final^T
     let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
@@ -427,7 +438,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
         kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
 
-        kernels.ffn_bwd_w2t.eval().map_err(|e| format!("ffn_bwd_w2t eval: {e}"))?;
+        kernels
+            .ffn_bwd_w2t
+            .eval()
+            .map_err(|e| format!("ffn_bwd_w2t eval: {e}"))?;
         let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
         kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
         let dsilu: Vec<f32> = w2t_out
@@ -448,7 +462,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
         kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
 
-        kernels.ffn_bwd_w13t.eval().map_err(|e| format!("ffn_bwd_w13t eval: {e}"))?;
+        kernels
+            .ffn_bwd_w13t
+            .eval()
+            .map_err(|e| format!("ffn_bwd_w13t eval: {e}"))?;
         let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
         kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
         let dx_ffn: Vec<f32> = w13t_out
@@ -488,7 +505,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
         kernels.wot_bwd.write_input(0, &wot_input);
 
-        kernels.wot_bwd.eval().map_err(|e| format!("wot_bwd eval: {e}"))?;
+        kernels
+            .wot_bwd
+            .eval()
+            .map_err(|e| format!("wot_bwd eval: {e}"))?;
         let mut wot_out = vec![0u8; wot_spec.output_bytes];
         kernels.wot_bwd.read_output(0, &mut wot_out);
         let da: Vec<f32> = wot_out
@@ -504,7 +524,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let bwd1_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd1);
         kernels.sdpa_bwd1.write_input(0, &bwd1_input);
 
-        kernels.sdpa_bwd1.eval().map_err(|e| format!("sdpa_bwd1 eval: {e}"))?;
+        kernels
+            .sdpa_bwd1
+            .eval()
+            .map_err(|e| format!("sdpa_bwd1 eval: {e}"))?;
         let mut bwd1_out = vec![0u8; bwd1_spec.output_bytes];
         kernels.sdpa_bwd1.read_output(0, &mut bwd1_out);
         let (dv, _probs_f32, _dp_f32) = ane_weights::unpack_sdpa_bwd1(&bwd1_out, cfg);
@@ -529,9 +552,7 @@ pub fn backward<T: ane_forward::TokenId>(
         let k_fp16 = f32_to_fp16_bytes(&ac.k);
 
         // Concatenate: [probs_raw | dp_raw | Q_fp16 | K_fp16]
-        let mut bwd2_input = Vec::with_capacity(
-            probs_dp_bytes + q_fp16.len() + k_fp16.len(),
-        );
+        let mut bwd2_input = Vec::with_capacity(probs_dp_bytes + q_fp16.len() + k_fp16.len());
         bwd2_input.extend_from_slice(probs_dp_raw);
         bwd2_input.extend_from_slice(&q_fp16);
         bwd2_input.extend_from_slice(&k_fp16);
@@ -539,7 +560,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let bwd2_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd2);
         kernels.sdpa_bwd2.write_input(0, &bwd2_input);
 
-        kernels.sdpa_bwd2.eval().map_err(|e| format!("sdpa_bwd2 eval: {e}"))?;
+        kernels
+            .sdpa_bwd2
+            .eval()
+            .map_err(|e| format!("sdpa_bwd2 eval: {e}"))?;
         let mut bwd2_out = vec![0u8; bwd2_spec.output_bytes];
         kernels.sdpa_bwd2.read_output(0, &mut bwd2_out);
         let (dq, dk) = ane_weights::unpack_sdpa_bwd2(&bwd2_out, cfg);
@@ -548,8 +572,12 @@ pub fn backward<T: ane_forward::TokenId>(
         let mut dq = dq;
         let mut dk = dk;
         ane_forward::rope_backward(
-            &mut dq, &mut dk,
-            cfg.n_heads, cfg.head_dim(), seq, cfg.rope_theta,
+            &mut dq,
+            &mut dk,
+            cfg.n_heads,
+            cfg.head_dim(),
+            seq,
+            cfg.rope_theta,
         );
 
         // l-pre2. QK-norm backward (if present)
@@ -557,16 +585,24 @@ pub fn backward<T: ane_forward::TokenId>(
             ane_forward::qk_rmsnorm_bwd(
                 &mut dq,
                 gr.dq_norm.as_mut().unwrap(),
-                q_pre, q_nw,
-                cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps,
+                q_pre,
+                q_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
             );
         }
         if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
             ane_forward::qk_rmsnorm_bwd(
                 &mut dk,
                 gr.dk_norm.as_mut().unwrap(),
-                k_pre, k_nw,
-                cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps,
+                k_pre,
+                k_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
             );
         }
 
@@ -584,7 +620,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
         kernels.qkv_bwd.write_input(0, &qkv_input);
 
-        kernels.qkv_bwd.eval().map_err(|e| format!("qkv_bwd eval: {e}"))?;
+        kernels
+            .qkv_bwd
+            .eval()
+            .map_err(|e| format!("qkv_bwd eval: {e}"))?;
         let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
         kernels.qkv_bwd.read_output(0, &mut qkv_out);
         let dx_attn: Vec<f32> = qkv_out
@@ -618,7 +657,10 @@ pub fn backward<T: ane_forward::TokenId>(
 
 /// Backward pass result including LoRA gradients.
 pub struct BackwardResultWithLora {
-    pub model_grads: ModelGradients,
+    /// Base model gradients.  `None` when using `backward_lora_cpu` (LoRA-only
+    /// training) because base weights are frozen and the 5.9 GB allocation was
+    /// pure waste.  Present when using `backward_with_lora` (ANE kernel path).
+    pub model_grads: Option<ModelGradients>,
     pub lora_grads: super::ane_lora::LoraModelGrads,
 }
 
@@ -747,17 +789,26 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
     lora: &super::ane_lora::LoraModel,
     tokens: &[T],
 ) -> BackwardResultWithLora {
+    backward_lora_cpu_generic(model, fwd, lora, tokens)
+}
+
+/// Backward pass generic over weight source (supports both full and quantized weights).
+pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::WeightSource>(
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    tokens: &[T],
+) -> BackwardResultWithLora {
     use super::ane_lora;
 
-    let cfg = &model.cfg;
+    let cfg = model.cfg();
     let dim = cfg.dim;
     let hidden = cfg.hidden_dim;
     let seq = cfg.seq_len;
-    let n_layers = model.layers.len();
+    let n_layers = model.n_layers();
     let scale = lora.scale();
 
-    // We don't compute base model gradients for LoRA training
-    let model_grads = ModelGradients::zeros(model);
+    // Base model weights are frozen — skip the 5.9 GB gradient allocation.
     let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
 
     // Reconstruct x_cur from last layer
@@ -766,35 +817,68 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
 
     let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    ane_forward::rmsnorm(
+        &mut x_final,
+        &x_cur,
+        model.rms_final(),
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
 
     // Classifier backward
-    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
+    let cls_w = model.lm_head().unwrap_or(model.embed());
     let mut dy = vec![0.0f32; dim * seq];
     let mut _dcls = vec![0.0f32; cls_w.len()];
-    classifier_bwd(&mut dy, &mut _dcls, &fwd.base.dlogits, cls_w, &x_final, model.vocab_size, dim, seq);
+    classifier_bwd(
+        &mut dy,
+        &mut _dcls,
+        &fwd.base.dlogits,
+        cls_w,
+        &x_final,
+        model.vocab_size(),
+        dim,
+        seq,
+    );
 
     // Final RMSNorm backward
     let mut dx_rms = vec![0.0f32; dim * seq];
-    rmsnorm_bwd(&mut dx_rms, &mut vec![0.0f32; dim], &dy, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    rmsnorm_bwd(
+        &mut dx_rms,
+        &mut vec![0.0f32; dim],
+        &dy,
+        &x_cur,
+        model.rms_final(),
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
     dy = dx_rms;
 
     // Per-layer backward (reverse)
     for l in (0..n_layers).rev() {
-        let lw = &model.layers[l];
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
         let ac = &fwd.base.layer_acts[l];
         let la = &fwd.lora_acts[l];
 
         let dffn = dy.clone();
 
         // LoRA W2 backward
-        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) =
-            (lora.layers[l].w2.as_ref(), la.w2_x.as_ref(), la.w2_h.as_ref(), lora_grads.layers[l].w2.as_mut())
-        {
+        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) = (
+            lora.layers[l].w2.as_ref(),
+            la.w2_x.as_ref(),
+            la.w2_h.as_ref(),
+            lora_grads.layers[l].w2.as_mut(),
+        ) {
             let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
             let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
-            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
-            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
         }
 
         // CPU: dsilu = dffn @ W2^T
@@ -816,17 +900,33 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
 
         // RMSNorm backward (FFN)
         let mut dx2 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(&mut dx2, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+        rmsnorm_bwd(
+            &mut dx2,
+            &mut vec![0.0f32; dim],
+            &dx_ffn,
+            &ac.x2,
+            &lw.rms_ffn,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
         ane_forward::vec_add_inplace(&mut dx2, &dy);
 
         // LoRA Wo backward
-        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) =
-            (lora.layers[l].wo.as_ref(), la.wo_x.as_ref(), la.wo_h.as_ref(), lora_grads.layers[l].wo.as_mut())
-        {
+        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
+            lora.layers[l].wo.as_ref(),
+            la.wo_x.as_ref(),
+            la.wo_h.as_ref(),
+            lora_grads.layers[l].wo.as_mut(),
+        ) {
             let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
             let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
-            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
-            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
         }
 
         // CPU: da = dx2 @ Wo^T
@@ -834,17 +934,43 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
         let da = ane_forward::cpu_matmul(&wot, &dx2, dim, dim, seq);
 
         // CPU SDPA backward
-        let (mut dq, mut dk, _dv) = cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
+        let (mut dq, mut dk, _dv) =
+            cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
 
         // RoPE backward
-        ane_forward::rope_backward(&mut dq, &mut dk, cfg.n_heads, cfg.head_dim(), seq, cfg.rope_theta);
+        ane_forward::rope_backward(
+            &mut dq,
+            &mut dk,
+            cfg.n_heads,
+            cfg.head_dim(),
+            seq,
+            cfg.rope_theta,
+        );
 
         // QK-norm backward
         if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
-            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; cfg.head_dim()], q_pre, q_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dq,
+                &mut vec![0.0f32; cfg.head_dim()],
+                q_pre,
+                q_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
         }
         if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
-            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; cfg.head_dim()], k_pre, k_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dk,
+                &mut vec![0.0f32; cfg.head_dim()],
+                k_pre,
+                k_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
         }
 
         // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
@@ -859,12 +985,24 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
 
         // RMSNorm backward (attention)
         let mut dx_rms1 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(&mut dx_rms1, &mut vec![0.0f32; dim], &dx_attn, &ac.layer_in, &lw.rms_att, dim, seq, cfg.rms_eps);
+        rmsnorm_bwd(
+            &mut dx_rms1,
+            &mut vec![0.0f32; dim],
+            &dx_attn,
+            &ac.layer_in,
+            &lw.rms_att,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
         dy = dx_rms1;
         ane_forward::vec_add_inplace(&mut dy, &dx2);
     }
 
-    BackwardResultWithLora { model_grads, lora_grads }
+    BackwardResultWithLora {
+        model_grads: None,
+        lora_grads,
+    }
 }
 
 /// Backward pass with LoRA gradient computation.
@@ -900,15 +1038,40 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
 
     let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    ane_forward::rmsnorm(
+        &mut x_final,
+        &x_cur,
+        &model.rms_final,
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
 
     let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
     let mut dy = vec![0.0f32; dim * seq];
     let mut _dcls = vec![0.0f32; cls_w.len()];
-    classifier_bwd(&mut dy, &mut _dcls, &fwd.base.dlogits, cls_w, &x_final, model.vocab_size, dim, seq);
+    classifier_bwd(
+        &mut dy,
+        &mut _dcls,
+        &fwd.base.dlogits,
+        cls_w,
+        &x_final,
+        model.vocab_size,
+        dim,
+        seq,
+    );
 
     let mut dx_rms = vec![0.0f32; dim * seq];
-    rmsnorm_bwd(&mut dx_rms, &mut vec![0.0f32; dim], &dy, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+    rmsnorm_bwd(
+        &mut dx_rms,
+        &mut vec![0.0f32; dim],
+        &dy,
+        &x_cur,
+        &model.rms_final,
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
     dy = dx_rms;
 
     let hidden = cfg.hidden_dim;
@@ -921,14 +1084,21 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let dffn = dy.clone();
 
         // LoRA W2 backward: compute weight grads using dffn
-        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) =
-            (lora.layers[l].w2.as_ref(), la.w2_x.as_ref(), la.w2_h.as_ref(), lora_grads.layers[l].w2.as_mut())
-        {
+        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) = (
+            lora.layers[l].w2.as_ref(),
+            la.w2_x.as_ref(),
+            la.w2_h.as_ref(),
+            lora_grads.layers[l].w2.as_mut(),
+        ) {
             // Scale dffn by LoRA scale for the LoRA path gradient
             let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
             let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
-            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
-            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
         }
 
         // Replay base backward to get dx2 (gradient at attention residual point)
@@ -936,10 +1106,16 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let w2t_input = ane_weights::pack_dyn_matmul(&dffn, &w2_for_pack, dim, hidden, seq);
         let w2t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW2t);
         kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
-        kernels.ffn_bwd_w2t.eval().map_err(|e| format!("lora ffn_bwd_w2t: {e}"))?;
+        kernels
+            .ffn_bwd_w2t
+            .eval()
+            .map_err(|e| format!("lora ffn_bwd_w2t: {e}"))?;
         let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
         kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
-        let dsilu: Vec<f32> = w2t_out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let dsilu: Vec<f32> = w2t_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
@@ -950,23 +1126,45 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let w13t_input = ane_weights::pack_ffn_bwd_w13t(&dh1, &dh3, &w1t, &w3t, cfg);
         let w13t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW13t);
         kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
-        kernels.ffn_bwd_w13t.eval().map_err(|e| format!("lora ffn_bwd_w13t: {e}"))?;
+        kernels
+            .ffn_bwd_w13t
+            .eval()
+            .map_err(|e| format!("lora ffn_bwd_w13t: {e}"))?;
         let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
         kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
-        let dx_ffn: Vec<f32> = w13t_out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let dx_ffn: Vec<f32> = w13t_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         let mut dx2 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(&mut dx2, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+        rmsnorm_bwd(
+            &mut dx2,
+            &mut vec![0.0f32; dim],
+            &dx_ffn,
+            &ac.x2,
+            &lw.rms_ffn,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
         ane_forward::vec_add_inplace(&mut dx2, &dy);
 
         // LoRA Wo backward: compute weight grads using dx2
-        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) =
-            (lora.layers[l].wo.as_ref(), la.wo_x.as_ref(), la.wo_h.as_ref(), lora_grads.layers[l].wo.as_mut())
-        {
+        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
+            lora.layers[l].wo.as_ref(),
+            la.wo_x.as_ref(),
+            la.wo_h.as_ref(),
+            lora_grads.layers[l].wo.as_mut(),
+        ) {
             let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
             let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
-            for (g, v) in lg.da.iter_mut().zip(da.iter()) { *g += v; }
-            for (g, v) in lg.db.iter_mut().zip(db.iter()) { *g += v; }
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
         }
 
         // Continue backward chain for next layer
@@ -974,16 +1172,25 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, dim, seq);
         let wot_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Wot);
         kernels.wot_bwd.write_input(0, &wot_input);
-        kernels.wot_bwd.eval().map_err(|e| format!("lora wot_bwd: {e}"))?;
+        kernels
+            .wot_bwd
+            .eval()
+            .map_err(|e| format!("lora wot_bwd: {e}"))?;
         let mut wot_out = vec![0u8; wot_spec.output_bytes];
         kernels.wot_bwd.read_output(0, &mut wot_out);
-        let da_vec: Vec<f32> = wot_out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let da_vec: Vec<f32> = wot_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         // SDPA backward (simplified — just propagate through attention for dy chain)
         let bwd1_input = ane_weights::pack_sdpa_bwd1(&ac.q, &ac.k, &ac.v, &da_vec, cfg);
         let bwd1_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::SdpaBwd1);
         kernels.sdpa_bwd1.write_input(0, &bwd1_input);
-        kernels.sdpa_bwd1.eval().map_err(|e| format!("lora sdpa_bwd1: {e}"))?;
+        kernels
+            .sdpa_bwd1
+            .eval()
+            .map_err(|e| format!("lora sdpa_bwd1: {e}"))?;
         let mut bwd1_out = vec![0u8; bwd1_spec.output_bytes];
         kernels.sdpa_bwd1.read_output(0, &mut bwd1_out);
         let (dv, _, _) = ane_weights::unpack_sdpa_bwd1(&bwd1_out, cfg);
@@ -1010,18 +1217,46 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         let bwd2_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::SdpaBwd2);
         kernels.sdpa_bwd2.write_input(0, &bwd2_input);
-        kernels.sdpa_bwd2.eval().map_err(|e| format!("lora sdpa_bwd2: {e}"))?;
+        kernels
+            .sdpa_bwd2
+            .eval()
+            .map_err(|e| format!("lora sdpa_bwd2: {e}"))?;
         let mut bwd2_out = vec![0u8; bwd2_spec.output_bytes];
         kernels.sdpa_bwd2.read_output(0, &mut bwd2_out);
         let (mut dq, mut dk) = ane_weights::unpack_sdpa_bwd2(&bwd2_out, cfg);
 
-        ane_forward::rope_backward(&mut dq, &mut dk, cfg.n_heads, cfg.head_dim(), seq, cfg.rope_theta);
+        ane_forward::rope_backward(
+            &mut dq,
+            &mut dk,
+            cfg.n_heads,
+            cfg.head_dim(),
+            seq,
+            cfg.rope_theta,
+        );
 
         if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
-            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; cfg.head_dim()], q_pre, q_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dq,
+                &mut vec![0.0f32; cfg.head_dim()],
+                q_pre,
+                q_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
         }
         if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
-            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; cfg.head_dim()], k_pre, k_nw, cfg.n_heads, cfg.head_dim(), seq, cfg.rms_eps);
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dk,
+                &mut vec![0.0f32; cfg.head_dim()],
+                k_pre,
+                k_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
         }
 
         let wqt = ane_weights::transpose_weight(&lw.wq, dim, dim);
@@ -1030,18 +1265,36 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &wqt, &wkt, &wvt, cfg);
         let qkv_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Qkvb);
         kernels.qkv_bwd.write_input(0, &qkv_input);
-        kernels.qkv_bwd.eval().map_err(|e| format!("lora qkv_bwd: {e}"))?;
+        kernels
+            .qkv_bwd
+            .eval()
+            .map_err(|e| format!("lora qkv_bwd: {e}"))?;
         let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
         kernels.qkv_bwd.read_output(0, &mut qkv_out);
-        let dx_attn: Vec<f32> = qkv_out.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        let dx_attn: Vec<f32> = qkv_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         let mut dx_rms1 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(&mut dx_rms1, &mut vec![0.0f32; dim], &dx_attn, &ac.layer_in, &lw.rms_att, dim, seq, cfg.rms_eps);
+        rmsnorm_bwd(
+            &mut dx_rms1,
+            &mut vec![0.0f32; dim],
+            &dx_attn,
+            &ac.layer_in,
+            &lw.rms_att,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
         dy = dx_rms1;
         ane_forward::vec_add_inplace(&mut dy, &dx2);
     }
 
-    Ok(BackwardResultWithLora { model_grads, lora_grads })
+    Ok(BackwardResultWithLora {
+        model_grads: Some(model_grads),
+        lora_grads,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,8 +1430,8 @@ mod tests {
             let gate = |h1v: f32, h3v: f32| silu(h1v) * h3v;
 
             // dh1[i] numerical
-            let num_dh1 = dsilu[i] * (gate(h1[i] + eps, h3[i]) - gate(h1[i] - eps, h3[i]))
-                / (2.0 * eps);
+            let num_dh1 =
+                dsilu[i] * (gate(h1[i] + eps, h3[i]) - gate(h1[i] - eps, h3[i])) / (2.0 * eps);
             let err = (dh1[i] - num_dh1).abs();
             assert!(
                 err < 0.01,
@@ -1189,8 +1442,8 @@ mod tests {
             );
 
             // dh3[i] numerical
-            let num_dh3 = dsilu[i] * (gate(h1[i], h3[i] + eps) - gate(h1[i], h3[i] - eps))
-                / (2.0 * eps);
+            let num_dh3 =
+                dsilu[i] * (gate(h1[i], h3[i] + eps) - gate(h1[i], h3[i] - eps)) / (2.0 * eps);
             let err = (dh3[i] - num_dh3).abs();
             assert!(
                 err < 0.01,
@@ -1210,7 +1463,9 @@ mod tests {
 
         let embed: Vec<f32> = (0..vocab * dim).map(|i| i as f32 * 0.1).collect();
         let x_final: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.2).sin()).collect();
-        let dlogits: Vec<f32> = (0..vocab * seq).map(|i| (i as f32 * 0.3).cos() * 0.1).collect();
+        let dlogits: Vec<f32> = (0..vocab * seq)
+            .map(|i| (i as f32 * 0.3).cos() * 0.1)
+            .collect();
 
         let mut dy = vec![0.0f32; dim * seq];
         let mut dembed = vec![0.0f32; vocab * dim];
@@ -1282,7 +1537,11 @@ mod tests {
 
         // Token 1 never appears — should be zero
         for d in 0..dim {
-            assert_eq!(dembed[1 * dim + d], 0.0, "embed_bwd tok=1 d={d} should be 0");
+            assert_eq!(
+                dembed[1 * dim + d],
+                0.0,
+                "embed_bwd tok=1 d={d} should be 0"
+            );
         }
     }
 
@@ -1348,6 +1607,7 @@ mod tests {
                 rms_ffn: vec![1.0; dim],
                 q_norm: None,
                 k_norm: None,
+                gdn: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
@@ -1359,12 +1619,11 @@ mod tests {
         let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
 
         // Forward pass
-        let fwd = ane_forward::forward(&fwd_kernels, &model, &tokens, &targets)
-            .expect("forward failed");
+        let fwd =
+            ane_forward::forward(&fwd_kernels, &model, &tokens, &targets).expect("forward failed");
 
         // Backward pass
-        let grads = backward(&bwd_kernels, &model, &fwd, &tokens)
-            .expect("backward failed");
+        let grads = backward(&bwd_kernels, &model, &fwd, &tokens).expect("backward failed");
 
         // Check shapes
         assert_eq!(grads.layers.len(), 1);
@@ -1409,10 +1668,17 @@ mod tests {
                 }
             }
         }
-        assert!(has_nonzero, "dembed should have nonzero entries at used tokens");
+        assert!(
+            has_nonzero,
+            "dembed should have nonzero entries at used tokens"
+        );
 
         // At least some weight gradients should be nonzero
-        let dw2_nonzero = grads.layers[0].dw2.iter().filter(|v| v.abs() > 1e-15).count();
+        let dw2_nonzero = grads.layers[0]
+            .dw2
+            .iter()
+            .filter(|v| v.abs() > 1e-15)
+            .count();
         assert!(dw2_nonzero > 0, "dw2 should have nonzero entries");
     }
 
@@ -1460,6 +1726,7 @@ mod tests {
                 rms_ffn: vec![1.0; dim],
                 q_norm: None,
                 k_norm: None,
+                gdn: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
@@ -1471,10 +1738,9 @@ mod tests {
         let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
 
         // Baseline forward + backward
-        let fwd = ane_forward::forward(&fwd_kernels, &model, &tokens, &targets)
-            .expect("forward failed");
-        let grads = backward(&bwd_kernels, &model, &fwd, &tokens)
-            .expect("backward failed");
+        let fwd =
+            ane_forward::forward(&fwd_kernels, &model, &tokens, &targets).expect("forward failed");
+        let grads = backward(&bwd_kernels, &model, &fwd, &tokens).expect("backward failed");
         let base_loss = fwd.loss;
 
         let epsilon = 1e-3f32;
@@ -1584,6 +1850,7 @@ mod tests {
                 rms_ffn: vec![1.0; dim],
                 q_norm: None,
                 k_norm: None,
+                gdn: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
@@ -1594,12 +1861,11 @@ mod tests {
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
         let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
 
-        let fwd = ane_forward::forward(&fwd_kernels, &model, &tokens, &targets)
-            .expect("forward failed");
+        let fwd =
+            ane_forward::forward(&fwd_kernels, &model, &tokens, &targets).expect("forward failed");
         assert!(fwd.loss.is_finite(), "loss not finite");
 
-        let grads = backward(&bwd_kernels, &model, &fwd, &tokens)
-            .expect("backward failed");
+        let grads = backward(&bwd_kernels, &model, &fwd, &tokens).expect("backward failed");
 
         // dlm_head should exist and have nonzero entries
         let dlm = grads.dlm_head.as_ref().expect("dlm_head should be Some");
@@ -1609,6 +1875,9 @@ mod tests {
 
         // dembed should still get gradients from embed_bwd (not from classifier)
         let dembed_nonzero = grads.dembed.iter().filter(|v| v.abs() > 1e-15).count();
-        assert!(dembed_nonzero > 0, "dembed should have nonzero entries from embed_bwd");
+        assert!(
+            dembed_nonzero > 0,
+            "dembed should have nonzero entries from embed_bwd"
+        );
     }
 }

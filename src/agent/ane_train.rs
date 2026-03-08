@@ -173,13 +173,7 @@ pub fn adam_update(
 ///
 /// - During warmup (step < warmup): linearly ramp from 0 to max_lr.
 /// - After warmup: cosine decay from max_lr to max_lr * min_lr_frac.
-pub fn cosine_lr(
-    step: usize,
-    warmup: usize,
-    total: usize,
-    max_lr: f32,
-    min_lr_frac: f32,
-) -> f32 {
+pub fn cosine_lr(step: usize, warmup: usize, total: usize, max_lr: f32, min_lr_frac: f32) -> f32 {
     if step < warmup {
         max_lr * (step as f32) / (warmup as f32)
     } else {
@@ -281,7 +275,17 @@ fn adam_one(
     lr: f32,
     cfg: &TrainingConfig,
 ) {
-    adam_update(w, g, st, t, lr, cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps, cfg.weight_decay);
+    adam_update(
+        w,
+        g,
+        st,
+        t,
+        lr,
+        cfg.adam_beta1,
+        cfg.adam_beta2,
+        cfg.adam_eps,
+        cfg.weight_decay,
+    );
 }
 
 /// Apply Adam to all model weights using corresponding gradients.
@@ -314,14 +318,7 @@ pub fn adam_update_all(
         lr,
         cfg,
     );
-    adam_one(
-        &mut model.embed,
-        &grads.dembed,
-        &mut adam.embed,
-        t,
-        lr,
-        cfg,
-    );
+    adam_one(&mut model.embed, &grads.dembed, &mut adam.embed, t, lr, cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +396,9 @@ impl TokenDataset {
 
     /// Alias for backward compat — used by tests that call `ds.tokens()`.
     #[cfg(test)]
-    fn tokens(&self) -> &[u16] { self.tokens_u16() }
+    fn tokens(&self) -> &[u16] {
+        self.tokens_u16()
+    }
 
     fn random_start(&self, seq_len: usize) -> usize {
         let max_start = self.n_tokens - seq_len - 1;
@@ -417,12 +416,21 @@ impl TokenDataset {
 
     /// Sample a random (input, target) pair of u16 tokens.
     pub fn sample(&self, seq_len: usize) -> (Vec<u16>, Vec<u16>) {
-        assert!(self.n_tokens >= seq_len + 1, "dataset too small for seq_len");
+        assert!(
+            self.n_tokens >= seq_len + 1,
+            "dataset too small for seq_len"
+        );
         let start = self.random_start(seq_len);
         if self.is_u32 {
             let all = self.tokens_u32();
-            let input: Vec<u16> = all[start..start + seq_len].iter().map(|&t| t as u16).collect();
-            let target: Vec<u16> = all[start + 1..start + 1 + seq_len].iter().map(|&t| t as u16).collect();
+            let input: Vec<u16> = all[start..start + seq_len]
+                .iter()
+                .map(|&t| t as u16)
+                .collect();
+            let target: Vec<u16> = all[start + 1..start + 1 + seq_len]
+                .iter()
+                .map(|&t| t as u16)
+                .collect();
             (input, target)
         } else {
             let all = self.tokens_u16();
@@ -434,15 +442,27 @@ impl TokenDataset {
 
     /// Sample a random (input, target) pair of u32 tokens.
     pub fn sample_u32(&self, seq_len: usize) -> (Vec<u32>, Vec<u32>) {
-        assert!(self.n_tokens >= seq_len + 1, "dataset too small for seq_len");
+        assert!(
+            self.n_tokens >= seq_len + 1,
+            "dataset too small for seq_len"
+        );
         let start = self.random_start(seq_len);
         if self.is_u32 {
             let all = self.tokens_u32();
-            (all[start..start + seq_len].to_vec(), all[start + 1..start + 1 + seq_len].to_vec())
+            (
+                all[start..start + seq_len].to_vec(),
+                all[start + 1..start + 1 + seq_len].to_vec(),
+            )
         } else {
             let all = self.tokens_u16();
-            let input: Vec<u32> = all[start..start + seq_len].iter().map(|&t| t as u32).collect();
-            let target: Vec<u32> = all[start + 1..start + 1 + seq_len].iter().map(|&t| t as u32).collect();
+            let input: Vec<u32> = all[start..start + seq_len]
+                .iter()
+                .map(|&t| t as u32)
+                .collect();
+            let target: Vec<u32> = all[start + 1..start + 1 + seq_len]
+                .iter()
+                .map(|&t| t as u32)
+                .collect();
             (input, target)
         }
     }
@@ -507,7 +527,13 @@ pub fn train(
             clip_gradients(&mut grads, cfg.grad_clip, norm);
 
             // LR schedule
-            let lr = cosine_lr(adam_t, cfg.warmup_steps, cfg.total_steps / cfg.accum_steps, cfg.max_lr, cfg.min_lr_frac);
+            let lr = cosine_lr(
+                adam_t,
+                cfg.warmup_steps,
+                cfg.total_steps / cfg.accum_steps,
+                cfg.max_lr,
+                cfg.min_lr_frac,
+            );
 
             // Adam update
             adam_update_all(model, &grads, &mut adam, adam_t, lr, cfg);
@@ -540,7 +566,10 @@ pub fn train(
             if cfg.early_stop_loss > 0.0 && last_loss < cfg.early_stop_loss {
                 patience_counter += 1;
                 if patience_counter >= cfg.early_stop_patience.max(1) {
-                    eprintln!("early stopping at step {adam_t}: loss {last_loss:.4} < {:.4}", cfg.early_stop_loss);
+                    eprintln!(
+                        "early stopping at step {adam_t}: loss {last_loss:.4} < {:.4}",
+                        cfg.early_stop_loss
+                    );
                     early_stopped = true;
                     break;
                 }
@@ -587,15 +616,13 @@ const CKPT_MAGIC: u32 = 0x424C5A54; // "BLZT"
 const CKPT_VERSION: u32 = 1;
 
 fn write_f32_slice(w: &mut impl io::Write, data: &[f32]) -> io::Result<()> {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     w.write_all(bytes)
 }
 
 fn read_f32_vec(r: &mut impl io::Read, n: usize) -> io::Result<Vec<f32>> {
     let mut buf = vec![0.0f32; n];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n * 4) };
     r.read_exact(bytes)?;
     Ok(buf)
 }
@@ -751,6 +778,7 @@ pub fn load_checkpoint(
             rms_ffn: read_f32_vec(&mut f, dim)?,
             q_norm: None,
             k_norm: None,
+            gdn: None,
         });
     }
 
@@ -829,6 +857,7 @@ mod tests {
             rms_ffn: vec![1.0; dim],
             q_norm: None,
             k_norm: None,
+            gdn: None,
         };
 
         ModelWeights {
@@ -862,19 +891,13 @@ mod tests {
         // m should be (1-b1)*g = 0.1*g
         for i in 0..3 {
             let expected_m = (1.0 - b1) * g[i];
-            assert!(
-                (state.m[i] - expected_m).abs() < 1e-7,
-                "m[{i}] mismatch"
-            );
+            assert!((state.m[i] - expected_m).abs() < 1e-7, "m[{i}] mismatch");
         }
 
         // v should be (1-b2)*g^2 = 0.001*g^2
         for i in 0..3 {
             let expected_v = (1.0 - b2) * g[i] * g[i];
-            assert!(
-                (state.v[i] - expected_v).abs() < 1e-10,
-                "v[{i}] mismatch"
-            );
+            assert!((state.v[i] - expected_v).abs() < 1e-10, "v[{i}] mismatch");
         }
 
         // Weights should have decreased (positive gradient → weight decrease)
@@ -918,8 +941,12 @@ mod tests {
 
         // With zero gradient and wd > 0, weights should shrink toward zero
         for i in 0..3 {
-            assert!(w[i].abs() < w_before[i].abs(),
-                "weight[{i}] should shrink: {:.6} → {:.6}", w_before[i], w[i]);
+            assert!(
+                w[i].abs() < w_before[i].abs(),
+                "weight[{i}] should shrink: {:.6} → {:.6}",
+                w_before[i],
+                w[i]
+            );
         }
     }
 
@@ -969,17 +996,11 @@ mod tests {
 
         // Step 0 (no warmup): max_lr
         let lr0 = cosine_lr(0, warmup, total, max_lr, 0.1);
-        assert!(
-            (lr0 - max_lr).abs() < 1e-7,
-            "step 0 no warmup: {lr0}"
-        );
+        assert!((lr0 - max_lr).abs() < 1e-7, "step 0 no warmup: {lr0}");
 
         // Step total: min_lr
         let lr_end = cosine_lr(total, warmup, total, max_lr, 0.1);
-        assert!(
-            (lr_end - min_lr).abs() < 1e-7,
-            "step end: {lr_end}"
-        );
+        assert!((lr_end - min_lr).abs() < 1e-7, "step end: {lr_end}");
 
         // Monotonically decreasing
         let mut prev = lr0;
@@ -1166,9 +1187,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.bin");
         let tokens: Vec<u16> = vec![10, 20, 30, 40, 50];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 2)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 2) };
         std::fs::write(&path, bytes).unwrap();
 
         let ds = TokenDataset::open(&path).unwrap();
@@ -1202,7 +1222,10 @@ mod tests {
     fn test_train_smoke() {
         // This test requires ANE hardware — skip if not available
         use super::super::ane_bridge;
-        use std::sync::{Once, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Once,
+        };
         static INIT: Once = Once::new();
         static ANE_OK: AtomicBool = AtomicBool::new(false);
         INIT.call_once(|| {
@@ -1237,9 +1260,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.bin");
         let tokens: Vec<u16> = (0..256).map(|i| (i % vocab) as u16).collect();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 2)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, tokens.len() * 2) };
         std::fs::write(&path, bytes).unwrap();
         let dataset = TokenDataset::open(&path).unwrap();
 

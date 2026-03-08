@@ -28,14 +28,21 @@ const MIL_HDR: &str = concat!(
 /// Model configuration for MIL generation.
 #[derive(Debug, Clone)]
 pub struct MilConfig {
-    pub dim: usize,            // hidden dimension (768, 1024, etc.)
-    pub hidden_dim: usize,     // FFN hidden (2048, etc.)
-    pub n_heads: usize,        // attention heads (12, etc.)
-    pub seq_len: usize,        // sequence length (256, etc.)
-    pub n_kv_heads: usize,     // KV heads for GQA (n_heads for MHA)
-    pub rope_theta: f64,       // RoPE frequency base (10000.0 for llama, 1e6 for Qwen)
-    pub rms_eps: f32,          // RMSNorm epsilon (1e-5 for llama, 1e-6 for Qwen)
-    pub has_lm_head: bool,     // true = untied lm_head, false = share embed
+    pub dim: usize,        // hidden dimension (768, 1024, etc.)
+    pub hidden_dim: usize, // FFN hidden (2048, etc.)
+    pub n_heads: usize,    // attention heads (12, etc.)
+    pub seq_len: usize,    // sequence length (256, etc.)
+    pub n_kv_heads: usize, // KV heads for GQA (n_heads for MHA)
+    pub rope_theta: f64,   // RoPE frequency base (10000.0 for llama, 1e6 for Qwen)
+    pub rms_eps: f32,      // RMSNorm epsilon (1e-5 for llama, 1e-6 for Qwen)
+    pub has_lm_head: bool, // true = untied lm_head, false = share embed
+    // Qwen3.5 GDN (Gated Delta Network) linear attention config
+    pub linear_attn_indices: Vec<usize>,  // layer indices using linear attention
+    pub linear_n_heads: usize,            // key/query heads for GDN
+    pub linear_head_dim: usize,           // key/query head dimension
+    pub linear_n_value_heads: usize,      // value heads (recurrence count)
+    pub linear_value_head_dim: usize,     // value head dimension
+    pub conv_kernel_size: usize,          // causal conv kernel size (usually 4)
 }
 
 impl MilConfig {
@@ -51,7 +58,18 @@ impl MilConfig {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
         }
+    }
+
+    /// Check if a layer index uses GDN linear attention.
+    pub fn is_linear_attn_layer(&self, idx: usize) -> bool {
+        self.linear_attn_indices.contains(&idx)
     }
 
     pub fn head_dim(&self) -> usize {
@@ -102,47 +120,127 @@ impl KernelSpec {
         let (mil_text, in_ch, in_sp, out_ch, out_sp, in_fp16, out_fp16) = match kt {
             KernelType::DynMatmul { ic, oc } => {
                 let sp = cfg.seq_len + oc;
-                (gen_dyn_matmul_mil(ic, oc, cfg.seq_len), ic, sp, oc, cfg.seq_len, false, false)
+                (
+                    gen_dyn_matmul_mil(ic, oc, cfg.seq_len),
+                    ic,
+                    sp,
+                    oc,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::SdpaFwd => {
                 let sp_in = cfg.seq_len + 4 * cfg.dim;
                 let out_ch = 6 * cfg.dim;
-                (gen_sdpa_fwd(cfg), cfg.dim, sp_in, out_ch, cfg.seq_len, false, false)
+                (
+                    gen_sdpa_fwd(cfg),
+                    cfg.dim,
+                    sp_in,
+                    out_ch,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::FfnW13 => {
                 let sp_in = cfg.seq_len + 2 * cfg.hidden_dim;
                 let out_ch = 3 * cfg.hidden_dim;
-                (gen_ffn_w13(cfg), cfg.dim, sp_in, out_ch, cfg.seq_len, false, false)
+                (
+                    gen_ffn_w13(cfg),
+                    cfg.dim,
+                    sp_in,
+                    out_ch,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::FfnW2 => {
                 let sp_in = cfg.seq_len + cfg.dim;
-                (gen_ffn_w2(cfg), cfg.hidden_dim, sp_in, cfg.dim, cfg.seq_len, false, false)
+                (
+                    gen_ffn_w2(cfg),
+                    cfg.hidden_dim,
+                    sp_in,
+                    cfg.dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::Wot => {
                 let sp_in = cfg.seq_len + cfg.dim;
-                (gen_wot(cfg), cfg.dim, sp_in, cfg.dim, cfg.seq_len, false, false)
+                (
+                    gen_wot(cfg),
+                    cfg.dim,
+                    sp_in,
+                    cfg.dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::FfnBwdW2t => {
                 let sp_in = cfg.seq_len + cfg.hidden_dim;
-                (gen_ffn_bwd_w2t(cfg), cfg.dim, sp_in, cfg.hidden_dim, cfg.seq_len, false, false)
+                (
+                    gen_ffn_bwd_w2t(cfg),
+                    cfg.dim,
+                    sp_in,
+                    cfg.hidden_dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::FfnBwdW13t => {
                 let sp_in = 2 * cfg.seq_len + 2 * cfg.dim;
-                (gen_ffn_bwd_w13t(cfg), cfg.hidden_dim, sp_in, cfg.dim, cfg.seq_len, false, false)
+                (
+                    gen_ffn_bwd_w13t(cfg),
+                    cfg.hidden_dim,
+                    sp_in,
+                    cfg.dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::Qkvb => {
                 let sp_in = 3 * cfg.seq_len + 3 * cfg.dim;
-                (gen_qkvb(cfg), cfg.dim, sp_in, cfg.dim, cfg.seq_len, false, false)
+                (
+                    gen_qkvb(cfg),
+                    cfg.dim,
+                    sp_in,
+                    cfg.dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
             }
             KernelType::SdpaBwd1 => {
                 let in_ch = 4 * cfg.dim;
                 let out_ch = cfg.dim + 2 * cfg.score_ch();
-                (gen_sdpa_bwd1(cfg), in_ch, cfg.seq_len, out_ch, cfg.seq_len, true, true)
+                (
+                    gen_sdpa_bwd1(cfg),
+                    in_ch,
+                    cfg.seq_len,
+                    out_ch,
+                    cfg.seq_len,
+                    true,
+                    true,
+                )
             }
             KernelType::SdpaBwd2 => {
                 let in_ch = 2 * cfg.score_ch() + 2 * cfg.dim;
                 let out_ch = 2 * cfg.dim;
-                (gen_sdpa_bwd2(cfg), in_ch, cfg.seq_len, out_ch, cfg.seq_len, true, true)
+                (
+                    gen_sdpa_bwd2(cfg),
+                    in_ch,
+                    cfg.seq_len,
+                    out_ch,
+                    cfg.seq_len,
+                    true,
+                    true,
+                )
             }
         };
         let bpe_in = if in_fp16 { 2 } else { 4 };
@@ -191,7 +289,10 @@ fn gen_dyn_matmul(
     let _ = writeln!(m, "        tensor<int32, [4]> {prefix}_rw = const()[name=string(\"{prefix}_rw\"), val=tensor<int32, [4]>([1,1,{ic},{oc}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{ic},{oc}]> {prefix}_W = reshape(shape={prefix}_rw,x={prefix}_wt)[name=string(\"{prefix}_W\")];");
     // matmul: [1,1,seq,ic] @ [1,1,ic,oc] → [1,1,seq,oc]
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{oc}]> {prefix}_yh = matmul(transpose_x=bF,transpose_y=bF,x={prefix}_a3,y={prefix}_W)[name=string(\"{prefix}_yh\")];");
     // Transpose back + reshape: [1,1,seq,oc] → [1,1,oc,seq] → [1,oc,1,seq]
     let _ = writeln!(m, "        tensor<fp16, [1,1,{oc},{seq}]> {prefix}_yt = transpose(perm={prefix}_pm,x={prefix}_yh)[name=string(\"{prefix}_yt\")];");
@@ -211,11 +312,23 @@ pub fn gen_dyn_matmul_mil(ic: usize, oc: usize, seq: usize) -> String {
     let sp = seq + oc;
     let mut m = String::with_capacity(4096);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {ic}, 1, {sp}]> x) {{");
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{ic},1,{sp}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {ic}, 1, {sp}]> x) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{ic},1,{sp}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];"
+    );
     gen_dyn_matmul(&mut m, "mm", ic, oc, seq, 0, seq, "xh");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
     let _ = writeln!(m, "        tensor<fp32, [1,{oc},1,{seq}]> y = cast(dtype=to32,x=mm_y)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
@@ -237,9 +350,15 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{"
+    );
     // Cast to fp16
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
 
     // Slice xnorm
@@ -278,8 +397,14 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{dim}]> Wo2 = reshape(shape=rw,x=Wo)[name=string(\"Wo2\")];");
 
     // QKV matmul
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
-    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> qm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wq2)[name=string(\"qm\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> km = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wk2)[name=string(\"km\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv2)[name=string(\"vm\")];");
@@ -289,9 +414,18 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> vt = transpose(perm=pm,x=vm)[name=string(\"vt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> qf = reshape(shape=os,x=qt)[name=string(\"qf\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> kf = reshape(shape=os,x=kt)[name=string(\"kf\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> vf = reshape(shape=os,x=vt)[name=string(\"vf\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> qf = reshape(shape=os,x=qt)[name=string(\"qf\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> kf = reshape(shape=os,x=kt)[name=string(\"kf\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> vf = reshape(shape=os,x=vt)[name=string(\"vf\")];"
+    );
 
     // SDPA: reshape to heads
     let _ = writeln!(m, "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
@@ -322,8 +456,14 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1s = mul(x=q1,y=rope_sin)[name=string(\"q1s\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2c = mul(x=q2,y=rope_cos)[name=string(\"q2c\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> qr2 = add(x=q1s,y=q2c)[name=string(\"qr2\")];");
-    let _ = writeln!(m, "        int32 rpax = const()[name=string(\"rpax\"), val=int32(-1)];");
-    let _ = writeln!(m, "        bool rpid = const()[name=string(\"rpid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 rpax = const()[name=string(\"rpax\"), val=int32(-1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool rpid = const()[name=string(\"rpid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q_rot = concat(axis=rpax,interleave=rpid,values=(qr1,qr2))[name=string(\"qrot\")];");
 
     // Same for K
@@ -339,15 +479,24 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
 
     // Q @ K^T (using rotated Q, K)
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q_rot,y=k_rot)[name=string(\"mm1\")];");
-    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
+    let _ = writeln!(
+        m,
+        "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];");
 
     // Causal mask (const BLOBFILE)
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+    );
 
     // Softmax
-    let _ = writeln!(m, "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];");
+    let _ = writeln!(
+        m,
+        "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];");
 
     // scores @ V
@@ -355,14 +504,20 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
 
     // Reshape back to [1,DIM,1,SEQ]
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> af = reshape(shape=os,x=at)[name=string(\"ra\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> af = reshape(shape=os,x=at)[name=string(\"ra\")];"
+    );
 
     // Wo matmul
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> af2 = reshape(shape=r2,x=af)[name=string(\"af2\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> aft = transpose(perm=pm,x=af2)[name=string(\"aft\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> om = matmul(transpose_x=bF,transpose_y=bF,x=aft,y=Wo2)[name=string(\"om\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ot = transpose(perm=pm,x=om)[name=string(\"ot\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];"
+    );
 
     // Reshape rotated Q, K back to [1, dim, 1, seq] for output
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> qrt = transpose(perm=pm,x=q_rot)[name=string(\"qrt\")];");
@@ -372,10 +527,19 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
 
     // Output: concat(o_out, qf_rotated, kf_rotated, vf, af, xn)
     let out_ch = 6 * dim;
-    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
-    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool cid = const()[name=string(\"cid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(oo,qrf,krf,vf,af,xn))[name=string(\"cat\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
     let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out32 = cast(dtype=to32,x=out)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (out32);");
     m.push_str("}\n");
@@ -395,8 +559,14 @@ pub fn gen_ffn_w13(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(4096);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{");
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
 
     // Slice xnorm
@@ -424,7 +594,10 @@ pub fn gen_ffn_w13(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W12 = reshape(shape=rw,x=W1)[name=string(\"W12\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W32 = reshape(shape=rw,x=W3)[name=string(\"W32\")];");
 
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{hidden}]> h1m = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=W12)[name=string(\"h1m\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{hidden}]> h3m = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=W32)[name=string(\"h3m\")];");
 
@@ -436,15 +609,33 @@ pub fn gen_ffn_w13(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h3 = reshape(shape=rh,x=h3t)[name=string(\"h3\")];");
 
     // SiLU + gate
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];"
+    );
 
     // Concat output: (h1, h3, gate)
-    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
-    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool cid = const()[name=string(\"cid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(h1,h3,gate))[name=string(\"cat\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
     let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out32 = cast(dtype=to32,x=out)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (out32);");
     m.push_str("}\n");
@@ -463,8 +654,14 @@ pub fn gen_ffn_w2(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(4096);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {hidden}, 1, {sp_in}]> x) {{");
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {hidden}, 1, {sp_in}]> x) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
 
     let _ = writeln!(m, "        tensor<int32, [4]> ba = const()[name=string(\"ba\"), val=tensor<int32, [4]>([0,0,0,0])];");
@@ -483,13 +680,25 @@ pub fn gen_ffn_w2(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,{hidden},{dim}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{dim}]> W22 = reshape(shape=rw,x=W2)[name=string(\"W22\")];");
 
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> ym = matmul(transpose_x=bF,transpose_y=bF,x=at,y=W22)[name=string(\"ym\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> yt = transpose(perm=pm,x=ym)[name=string(\"yt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> yr = reshape(shape=ro,x=yt)[name=string(\"yr\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=yr)[name=string(\"cout\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> yr = reshape(shape=ro,x=yt)[name=string(\"yr\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=yr)[name=string(\"cout\")];"
+    );
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
     m
@@ -517,8 +726,14 @@ pub fn gen_ffn_bwd_w13t(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(4096);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {hidden}, 1, {sp_in}]> x) {{");
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {hidden}, 1, {sp_in}]> x) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
 
     // Slice dh1
@@ -554,18 +769,30 @@ pub fn gen_ffn_bwd_w13t(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{dim}]> W1t2 = reshape(shape=rw,x=W1t)[name=string(\"W1t2\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{dim}]> W3t2 = reshape(shape=rw,x=W3t)[name=string(\"W3t2\")];");
 
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dx1m = matmul(transpose_x=bF,transpose_y=bF,x=dh1t,y=W1t2)[name=string(\"dx1m\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dx3m = matmul(transpose_x=bF,transpose_y=bF,x=dh3t,y=W3t2)[name=string(\"dx3m\")];");
 
     // Add
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dxm = add(x=dx1m,y=dx3m)[name=string(\"dxm\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{seq},{dim}]> dxm = add(x=dx1m,y=dx3m)[name=string(\"dxm\")];"
+    );
 
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dxt = transpose(perm=pm,x=dxm)[name=string(\"dxt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=dx)[name=string(\"cout\")];");
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=dx)[name=string(\"cout\")];"
+    );
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
     m
@@ -582,8 +809,14 @@ pub fn gen_qkvb(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{");
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
 
     // Slice dq, dk, dv
@@ -609,7 +842,10 @@ pub fn gen_qkvb(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{dim}]> Wvt = slice_by_size(x=xh,begin=b5,size=sw)[name=string(\"Wvt\")];");
 
     let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
 
     let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
     let _ = writeln!(m, "        tensor<int32, [4]> rw = const()[name=string(\"rw\"), val=tensor<int32, [4]>([1,1,{dim},{dim}])];");
@@ -633,14 +869,26 @@ pub fn gen_qkvb(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dxv = matmul(transpose_x=bF,transpose_y=bF,x=dvt,y=Wvt2)[name=string(\"dxv\")];");
 
     // Sum: dxq + dxk + dxv
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dxqk = add(x=dxq,y=dxk)[name=string(\"aqk\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dxall = add(x=dxqk,y=dxv)[name=string(\"aall\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{seq},{dim}]> dxqk = add(x=dxq,y=dxk)[name=string(\"aqk\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{seq},{dim}]> dxall = add(x=dxqk,y=dxv)[name=string(\"aall\")];"
+    );
 
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dxt = transpose(perm=pm,x=dxall)[name=string(\"dxt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=dx)[name=string(\"cout\")];");
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=dx)[name=string(\"cout\")];"
+    );
     let _ = writeln!(m, "    }} -> (y);");
     m.push_str("}\n");
     m
@@ -662,7 +910,10 @@ pub fn gen_sdpa_bwd1(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp16, [1, {in_ch}, 1, {seq}]> x) {{");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp16, [1, {in_ch}, 1, {seq}]> x) {{"
+    );
 
     // Slice Q,K,V,da (channel-wise)
     let _ = writeln!(m, "        tensor<int32, [4]> sz = const()[name=string(\"sz\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
@@ -690,14 +941,29 @@ pub fn gen_sdpa_bwd1(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dat = transpose(perm=pm,x=dr)[name=string(\"td\")];");
 
     // Forward attention scores (recompute)
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
-    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string(\"mm1\")];");
-    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
+    let _ = writeln!(
+        m,
+        "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];");
-    let _ = writeln!(m, "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> probs = softmax(axis=sax,x=ms)[name=string(\"sm\")];");
 
     // dV = probs^T @ da, dp = da @ V^T
@@ -714,8 +980,14 @@ pub fn gen_sdpa_bwd1(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{score_ch},1,{seq}]> pf = reshape(shape=scs,x=probs)[name=string(\"pf\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{score_ch},1,{seq}]> dpf = reshape(shape=scs,x=dp4)[name=string(\"dpf\")];");
 
-    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
-    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool cid = const()[name=string(\"cid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(dvf,pf,dpf))[name=string(\"cat\")];");
     let _ = writeln!(m, "    }} -> (out);");
     m.push_str("}\n");
@@ -738,7 +1010,10 @@ pub fn gen_sdpa_bwd2(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp16, [1, {in_ch}, 1, {seq}]> x) {{");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp16, [1, {in_ch}, 1, {seq}]> x) {{"
+    );
 
     // Slice probs, dp (channel-wise, score_ch each)
     let _ = writeln!(m, "        tensor<int32, [4]> sz_sc = const()[name=string(\"szsc\"), val=tensor<int32, [4]>([1,{score_ch},1,{seq}])];");
@@ -770,16 +1045,31 @@ pub fn gen_sdpa_bwd2(cfg: &MilConfig) -> String {
     // Softmax backward: ds = probs * (dp - sum(probs*dp, axis=-1))
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> pdp = mul(x=probs,y=dp)[name=string(\"pdp\")];");
     let _ = writeln!(m, "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];");
-    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(
+        m,
+        "        bool kd = const()[name=string(\"kd\"), val=bool(true)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> spdp = reduce_sum(x=pdp,axes=rax,keep_dims=kd)[name=string(\"rs\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> dps = sub(x=dp,y=spdp)[name=string(\"dps\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ds0 = mul(x=probs,y=dps)[name=string(\"ds0\")];");
-    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ds = mul(x=ds0,y=scv)[name=string(\"ds\")];");
+    let _ = writeln!(
+        m,
+        "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{heads},{seq},{seq}]> ds = mul(x=ds0,y=scv)[name=string(\"ds\")];"
+    );
 
     // dQ = ds @ K, dK = ds^T @ Q
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
-    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dq4 = matmul(transpose_x=bF,transpose_y=bF,x=ds,y=k)[name=string(\"dq\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dk4 = matmul(transpose_x=bT,transpose_y=bF,x=ds,y=q)[name=string(\"dk\")];");
 
@@ -789,8 +1079,14 @@ pub fn gen_sdpa_bwd2(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<int32, [4]> fs = const()[name=string(\"fs\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dqf = reshape(shape=fs,x=dqt)[name=string(\"dqf\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dkf = reshape(shape=fs,x=dkt)[name=string(\"dkf\")];");
-    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
-    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool cid = const()[name=string(\"cid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(dqf,dkf))[name=string(\"cat\")];");
     let _ = writeln!(m, "    }} -> (out);");
     m.push_str("}\n");
@@ -928,7 +1224,10 @@ mod tests {
             }
         }
         // fp32→fp16→matmul→fp16→fp32 should be reasonably accurate for small values
-        assert!(max_err < 0.05, "matmul identity max error {max_err} too large");
+        assert!(
+            max_err < 0.05,
+            "matmul identity max error {max_err} too large"
+        );
     }
 
     // ---- Round 2: gen_ffn_w13 + gen_ffn_w2 ----
@@ -1007,7 +1306,8 @@ mod tests {
 
         // Build causal mask blob and rope blobs
         let mask_blob = build_causal_mask_blob(cfg.seq_len);
-        let (rope_cos_blob, rope_sin_blob) = generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
+        let (rope_cos_blob, rope_sin_blob) =
+            generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
 
         let kernel = AneKernel::compile_multi_weights(
             &mil,
@@ -1281,9 +1581,15 @@ mod tests {
             rope_theta: 1e6,
             rms_eps: 1e-6,
             has_lm_head: true,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
         };
         assert_eq!(cfg.head_dim(), 64);
-        assert_eq!(cfg.kv_dim(), 512);      // 8 * 64
+        assert_eq!(cfg.kv_dim(), 512); // 8 * 64
         assert_eq!(cfg.heads_per_group(), 2); // 16 / 8
         assert_eq!(cfg.kv_score_ch(), 8 * 128);
         assert_eq!(cfg.score_ch(), 16 * 128);

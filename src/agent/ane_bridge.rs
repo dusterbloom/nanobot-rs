@@ -112,12 +112,7 @@ pub fn build_weight_blob(weights: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(weights.len(), rows * cols, "weight dimensions mismatch");
     let mut out_len: usize = 0;
     let ptr = unsafe {
-        ane_bridge_build_weight_blob(
-            weights.as_ptr(),
-            rows as c_int,
-            cols as c_int,
-            &mut out_len,
-        )
+        ane_bridge_build_weight_blob(weights.as_ptr(), rows as c_int, cols as c_int, &mut out_len)
     };
     assert!(!ptr.is_null(), "ane_bridge_build_weight_blob returned NULL");
     let blob = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
@@ -137,7 +132,10 @@ pub fn build_weight_blob_transposed(weights: &[f32], rows: usize, cols: usize) -
             &mut out_len,
         )
     };
-    assert!(!ptr.is_null(), "ane_bridge_build_weight_blob_transposed returned NULL");
+    assert!(
+        !ptr.is_null(),
+        "ane_bridge_build_weight_blob_transposed returned NULL"
+    );
     let blob = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
     unsafe { ane_bridge_free_blob(ptr as *mut c_void) };
     blob

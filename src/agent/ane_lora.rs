@@ -35,9 +35,7 @@ impl Default for LoraConfig {
         LoraConfig {
             rank: 32,
             alpha: 32.0,
-            target_modules: vec![
-                "wq".into(), "wv".into(), "wo".into(), "w2".into(),
-            ],
+            target_modules: vec!["wq".into(), "wv".into(), "wo".into(), "w2".into()],
         }
     }
 }
@@ -83,7 +81,13 @@ impl LoraAdapter {
             .collect();
         let b = vec![0.0f32; d_out * rank];
 
-        LoraAdapter { a, b, rank, d_in, d_out }
+        LoraAdapter {
+            a,
+            b,
+            rank,
+            d_in,
+            d_out,
+        }
     }
 
     /// Create adapter with all zeros (for testing).
@@ -91,7 +95,9 @@ impl LoraAdapter {
         LoraAdapter {
             a: vec![0.0; rank * d_in],
             b: vec![0.0; d_out * rank],
-            rank, d_in, d_out,
+            rank,
+            d_in,
+            d_out,
         }
     }
 
@@ -231,7 +237,13 @@ impl LoraModel {
         Self::with_kv_dim(cfg, n_layers, dim, dim, hidden_dim)
     }
 
-    pub fn with_kv_dim(cfg: LoraConfig, n_layers: usize, dim: usize, kv_dim: usize, hidden_dim: usize) -> Self {
+    pub fn with_kv_dim(
+        cfg: LoraConfig,
+        n_layers: usize,
+        dim: usize,
+        kv_dim: usize,
+        hidden_dim: usize,
+    ) -> Self {
         let rank = cfg.rank;
         let targets = &cfg.target_modules;
 
@@ -239,20 +251,31 @@ impl LoraModel {
             .map(|_| LoraLayerAdapters {
                 wq: if targets.iter().any(|t| t == "wq") {
                     Some(LoraAdapter::new(rank, dim, dim))
-                } else { None },
+                } else {
+                    None
+                },
                 wv: if targets.iter().any(|t| t == "wv") {
                     Some(LoraAdapter::new(rank, dim, kv_dim))
-                } else { None },
+                } else {
+                    None
+                },
                 wo: if targets.iter().any(|t| t == "wo") {
                     Some(LoraAdapter::new(rank, dim, dim))
-                } else { None },
+                } else {
+                    None
+                },
                 w2: if targets.iter().any(|t| t == "w2") {
                     Some(LoraAdapter::new(rank, hidden_dim, dim))
-                } else { None },
+                } else {
+                    None
+                },
             })
             .collect();
 
-        LoraModel { layers, config: cfg }
+        LoraModel {
+            layers,
+            config: cfg,
+        }
     }
 
     /// Scaling factor.
@@ -288,10 +311,14 @@ pub struct LoraLayerActivations {
 impl LoraLayerActivations {
     pub fn empty() -> Self {
         LoraLayerActivations {
-            wo_x: None, wo_h: None,
-            w2_x: None, w2_h: None,
-            wq_x: None, wq_h: None,
-            wv_x: None, wv_h: None,
+            wo_x: None,
+            wo_h: None,
+            w2_x: None,
+            w2_h: None,
+            wq_x: None,
+            wq_h: None,
+            wv_x: None,
+            wv_h: None,
         }
     }
 }
@@ -322,20 +349,24 @@ pub struct LoraModelGrads {
 impl LoraModelGrads {
     /// Create zero-initialized gradients matching LoRA model shape.
     pub fn zeros(lora: &LoraModel) -> Self {
-        let layers = lora.layers.iter().map(|la| {
-            let make_grads = |adapter: &Option<LoraAdapter>| -> Option<LoraAdapterGrads> {
-                adapter.as_ref().map(|a| LoraAdapterGrads {
-                    da: vec![0.0; a.rank * a.d_in],
-                    db: vec![0.0; a.d_out * a.rank],
-                })
-            };
-            LoraLayerGrads {
-                wq: make_grads(&la.wq),
-                wv: make_grads(&la.wv),
-                wo: make_grads(&la.wo),
-                w2: make_grads(&la.w2),
-            }
-        }).collect();
+        let layers = lora
+            .layers
+            .iter()
+            .map(|la| {
+                let make_grads = |adapter: &Option<LoraAdapter>| -> Option<LoraAdapterGrads> {
+                    adapter.as_ref().map(|a| LoraAdapterGrads {
+                        da: vec![0.0; a.rank * a.d_in],
+                        db: vec![0.0; a.d_out * a.rank],
+                    })
+                };
+                LoraLayerGrads {
+                    wq: make_grads(&la.wq),
+                    wv: make_grads(&la.wv),
+                    wo: make_grads(&la.wo),
+                    w2: make_grads(&la.w2),
+                }
+            })
+            .collect();
         LoraModelGrads { layers }
     }
 
@@ -382,20 +413,24 @@ pub struct LoraModelAdam {
 impl LoraModelAdam {
     /// Create zero-initialized Adam state matching LoRA model shape.
     pub fn zeros(lora: &LoraModel) -> Self {
-        let layers = lora.layers.iter().map(|la| {
-            let make_adam = |adapter: &Option<LoraAdapter>| -> Option<LoraAdapterAdam> {
-                adapter.as_ref().map(|a| LoraAdapterAdam {
-                    a: AdamState::zeros(a.rank * a.d_in),
-                    b: AdamState::zeros(a.d_out * a.rank),
-                })
-            };
-            LoraLayerAdam {
-                wq: make_adam(&la.wq),
-                wv: make_adam(&la.wv),
-                wo: make_adam(&la.wo),
-                w2: make_adam(&la.w2),
-            }
-        }).collect();
+        let layers = lora
+            .layers
+            .iter()
+            .map(|la| {
+                let make_adam = |adapter: &Option<LoraAdapter>| -> Option<LoraAdapterAdam> {
+                    adapter.as_ref().map(|a| LoraAdapterAdam {
+                        a: AdamState::zeros(a.rank * a.d_in),
+                        b: AdamState::zeros(a.d_out * a.rank),
+                    })
+                };
+                LoraLayerAdam {
+                    wq: make_adam(&la.wq),
+                    wv: make_adam(&la.wv),
+                    wo: make_adam(&la.wo),
+                    w2: make_adam(&la.w2),
+                }
+            })
+            .collect();
         LoraModelAdam { layers }
     }
 }
@@ -472,20 +507,34 @@ pub fn lora_adam_update(
     wd: f32,
 ) {
     for l in 0..lora.layers.len() {
-        let update_adapter = |
-            adapter: &mut Option<LoraAdapter>,
-            grad: &Option<LoraAdapterGrads>,
-            state: &mut Option<LoraAdapterAdam>,
-        | {
+        let update_adapter = |adapter: &mut Option<LoraAdapter>,
+                              grad: &Option<LoraAdapterGrads>,
+                              state: &mut Option<LoraAdapterAdam>| {
             if let (Some(a), Some(g), Some(s)) = (adapter.as_mut(), grad.as_ref(), state.as_mut()) {
                 ane_train::adam_update(&mut a.a, &g.da, &mut s.a, t, lr, b1, b2, eps, wd);
                 ane_train::adam_update(&mut a.b, &g.db, &mut s.b, t, lr, b1, b2, eps, wd);
             }
         };
-        update_adapter(&mut lora.layers[l].wq, &grads.layers[l].wq, &mut adam.layers[l].wq);
-        update_adapter(&mut lora.layers[l].wv, &grads.layers[l].wv, &mut adam.layers[l].wv);
-        update_adapter(&mut lora.layers[l].wo, &grads.layers[l].wo, &mut adam.layers[l].wo);
-        update_adapter(&mut lora.layers[l].w2, &grads.layers[l].w2, &mut adam.layers[l].w2);
+        update_adapter(
+            &mut lora.layers[l].wq,
+            &grads.layers[l].wq,
+            &mut adam.layers[l].wq,
+        );
+        update_adapter(
+            &mut lora.layers[l].wv,
+            &grads.layers[l].wv,
+            &mut adam.layers[l].wv,
+        );
+        update_adapter(
+            &mut lora.layers[l].wo,
+            &grads.layers[l].wo,
+            &mut adam.layers[l].wo,
+        );
+        update_adapter(
+            &mut lora.layers[l].w2,
+            &grads.layers[l].w2,
+            &mut adam.layers[l].w2,
+        );
     }
 }
 
@@ -502,16 +551,16 @@ pub fn lora_adam_update(
 /// For the typical case: dim→rank and rank→dim, plus hidden→rank and rank→dim.
 pub struct LoraKernels {
     // Attention LoRA (dim→rank→dim)
-    pub attn_a_fwd: AneKernel,    // [d_in=dim, rank]
-    pub attn_b_fwd: AneKernel,    // [rank, d_out=dim]
-    pub attn_bt_bwd: AneKernel,   // B^T: [d_out=dim, rank]
-    pub attn_at_bwd: AneKernel,   // A^T: [rank, d_in=dim]
+    pub attn_a_fwd: AneKernel,  // [d_in=dim, rank]
+    pub attn_b_fwd: AneKernel,  // [rank, d_out=dim]
+    pub attn_bt_bwd: AneKernel, // B^T: [d_out=dim, rank]
+    pub attn_at_bwd: AneKernel, // A^T: [rank, d_in=dim]
 
     // FFN LoRA (hidden→rank→dim)
-    pub ffn_a_fwd: AneKernel,     // [d_in=hidden, rank]
-    pub ffn_b_fwd: AneKernel,     // [rank, d_out=dim]
-    pub ffn_bt_bwd: AneKernel,    // B^T: [d_out=dim, rank]
-    pub ffn_at_bwd: AneKernel,    // A^T: [rank, d_in=hidden]
+    pub ffn_a_fwd: AneKernel,  // [d_in=hidden, rank]
+    pub ffn_b_fwd: AneKernel,  // [rank, d_out=dim]
+    pub ffn_bt_bwd: AneKernel, // B^T: [d_out=dim, rank]
+    pub ffn_at_bwd: AneKernel, // A^T: [rank, d_in=hidden]
 
     pub rank: usize,
     pub dim: usize,
@@ -523,13 +572,21 @@ impl LoraKernels {
     pub fn compile(cfg: &MilConfig, rank: usize) -> Result<Self, String> {
         // ANE requires all matmul dimensions to be multiples of 16
         if rank % 16 != 0 {
-            return Err(format!("LoRA rank must be a multiple of 16 for ANE (got {rank})"));
+            return Err(format!(
+                "LoRA rank must be a multiple of 16 for ANE (got {rank})"
+            ));
         }
         if cfg.dim % 16 != 0 {
-            return Err(format!("model dim must be a multiple of 16 for ANE (got {})", cfg.dim));
+            return Err(format!(
+                "model dim must be a multiple of 16 for ANE (got {})",
+                cfg.dim
+            ));
         }
         if cfg.hidden_dim % 16 != 0 {
-            return Err(format!("model hidden_dim must be a multiple of 16 for ANE (got {})", cfg.hidden_dim));
+            return Err(format!(
+                "model hidden_dim must be a multiple of 16 for ANE (got {})",
+                cfg.hidden_dim
+            ));
         }
 
         ane_bridge::ane_init()?;
@@ -539,60 +596,96 @@ impl LoraKernels {
         // Attention: dim→rank
         let attn_a_spec = KernelSpec::for_kernel(cfg, KernelType::DynMatmul { ic: dim, oc: rank });
         let attn_a_fwd = AneKernel::compile(
-            &attn_a_spec.mil_text, None,
-            &[attn_a_spec.input_bytes], &[attn_a_spec.output_bytes],
+            &attn_a_spec.mil_text,
+            None,
+            &[attn_a_spec.input_bytes],
+            &[attn_a_spec.output_bytes],
         )?;
 
         // Attention: rank→dim
         let attn_b_spec = KernelSpec::for_kernel(cfg, KernelType::DynMatmul { ic: rank, oc: dim });
         let attn_b_fwd = AneKernel::compile(
-            &attn_b_spec.mil_text, None,
-            &[attn_b_spec.input_bytes], &[attn_b_spec.output_bytes],
+            &attn_b_spec.mil_text,
+            None,
+            &[attn_b_spec.input_bytes],
+            &[attn_b_spec.output_bytes],
         )?;
 
         // Attention backward: B^T is dim→rank (same shape as a_fwd)
         let attn_bt_bwd = AneKernel::compile(
-            &attn_a_spec.mil_text, None,
-            &[attn_a_spec.input_bytes], &[attn_a_spec.output_bytes],
+            &attn_a_spec.mil_text,
+            None,
+            &[attn_a_spec.input_bytes],
+            &[attn_a_spec.output_bytes],
         )?;
 
         // Attention backward: A^T is rank→dim (same shape as b_fwd)
         let attn_at_bwd = AneKernel::compile(
-            &attn_b_spec.mil_text, None,
-            &[attn_b_spec.input_bytes], &[attn_b_spec.output_bytes],
+            &attn_b_spec.mil_text,
+            None,
+            &[attn_b_spec.input_bytes],
+            &[attn_b_spec.output_bytes],
         )?;
 
         // FFN: hidden→rank
-        let ffn_a_spec = KernelSpec::for_kernel(cfg, KernelType::DynMatmul { ic: hidden, oc: rank });
+        let ffn_a_spec = KernelSpec::for_kernel(
+            cfg,
+            KernelType::DynMatmul {
+                ic: hidden,
+                oc: rank,
+            },
+        );
         let ffn_a_fwd = AneKernel::compile(
-            &ffn_a_spec.mil_text, None,
-            &[ffn_a_spec.input_bytes], &[ffn_a_spec.output_bytes],
+            &ffn_a_spec.mil_text,
+            None,
+            &[ffn_a_spec.input_bytes],
+            &[ffn_a_spec.output_bytes],
         )?;
 
         // FFN: rank→dim
         let ffn_b_spec = KernelSpec::for_kernel(cfg, KernelType::DynMatmul { ic: rank, oc: dim });
         let ffn_b_fwd = AneKernel::compile(
-            &ffn_b_spec.mil_text, None,
-            &[ffn_b_spec.input_bytes], &[ffn_b_spec.output_bytes],
+            &ffn_b_spec.mil_text,
+            None,
+            &[ffn_b_spec.input_bytes],
+            &[ffn_b_spec.output_bytes],
         )?;
 
         // FFN backward: B^T is dim→rank (same as attn a_fwd shape)
         let ffn_bt_bwd = AneKernel::compile(
-            &attn_a_spec.mil_text, None,
-            &[attn_a_spec.input_bytes], &[attn_a_spec.output_bytes],
+            &attn_a_spec.mil_text,
+            None,
+            &[attn_a_spec.input_bytes],
+            &[attn_a_spec.output_bytes],
         )?;
 
         // FFN backward: A^T is rank→hidden
-        let ffn_at_spec = KernelSpec::for_kernel(cfg, KernelType::DynMatmul { ic: rank, oc: hidden });
+        let ffn_at_spec = KernelSpec::for_kernel(
+            cfg,
+            KernelType::DynMatmul {
+                ic: rank,
+                oc: hidden,
+            },
+        );
         let ffn_at_bwd = AneKernel::compile(
-            &ffn_at_spec.mil_text, None,
-            &[ffn_at_spec.input_bytes], &[ffn_at_spec.output_bytes],
+            &ffn_at_spec.mil_text,
+            None,
+            &[ffn_at_spec.input_bytes],
+            &[ffn_at_spec.output_bytes],
         )?;
 
         Ok(LoraKernels {
-            attn_a_fwd, attn_b_fwd, attn_bt_bwd, attn_at_bwd,
-            ffn_a_fwd, ffn_b_fwd, ffn_bt_bwd, ffn_at_bwd,
-            rank, dim, hidden_dim: hidden,
+            attn_a_fwd,
+            attn_b_fwd,
+            attn_bt_bwd,
+            attn_at_bwd,
+            ffn_a_fwd,
+            ffn_b_fwd,
+            ffn_bt_bwd,
+            ffn_at_bwd,
+            rank,
+            dim,
+            hidden_dim: hidden,
         })
     }
 }
@@ -628,7 +721,8 @@ pub fn lora_forward_ane(
     a_kernel.eval()?;
     let mut a_out = vec![0u8; a_out_bytes];
     a_kernel.read_output(0, &mut a_out);
-    let h: Vec<f32> = a_out.chunks_exact(4)
+    let h: Vec<f32> = a_out
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -643,7 +737,8 @@ pub fn lora_forward_ane(
     b_kernel.eval()?;
     let mut b_out = vec![0u8; b_out_bytes];
     b_kernel.read_output(0, &mut b_out);
-    let dy: Vec<f32> = b_out.chunks_exact(4)
+    let dy: Vec<f32> = b_out
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -679,7 +774,8 @@ pub fn lora_backward_ane(
     bt_kernel.eval()?;
     let mut bt_out = vec![0u8; dh_bytes];
     bt_kernel.read_output(0, &mut bt_out);
-    let dh: Vec<f32> = bt_out.chunks_exact(4)
+    let dh: Vec<f32> = bt_out
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -692,7 +788,8 @@ pub fn lora_backward_ane(
     at_kernel.eval()?;
     let mut at_out = vec![0u8; dx_bytes];
     at_kernel.read_output(0, &mut at_out);
-    let dx_lora: Vec<f32> = at_out.chunks_exact(4)
+    let dx_lora: Vec<f32> = at_out
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -739,20 +836,20 @@ pub fn vec_add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
 /// LoRA-specific training config with JIT LoRA defaults.
 pub fn lora_training_config() -> TrainingConfig {
     TrainingConfig {
-        total_steps: 200,          // Short cycles (JIT: 180 steps converges)
-        max_lr: 5e-4,              // 10x higher than standard (JIT LoRA finding)
+        total_steps: 200, // Short cycles (JIT: 180 steps converges)
+        max_lr: 5e-4,     // 10x higher than standard (JIT LoRA finding)
         adam_beta1: 0.9,
         adam_beta2: 0.999,
         adam_eps: 1e-8,
-        weight_decay: 0.01,        // Decoupled AdamW (standard LoRA practice)
-        accum_steps: 1,            // Batch size 1 optimal on Apple Silicon
-        warmup_steps: 20,          // ~10% warmup
-        grad_clip: 1.0,            // JIT LoRA default
-        min_lr_frac: 0.1,          // Cosine floor
+        weight_decay: 0.01, // Decoupled AdamW (standard LoRA practice)
+        accum_steps: 1,     // Batch size 1 optimal on Apple Silicon
+        warmup_steps: 20,   // ~10% warmup
+        grad_clip: 1.0,     // JIT LoRA default
+        min_lr_frac: 0.1,   // Cosine floor
         ckpt_interval: 50,
         log_interval: 10,
-        early_stop_loss: 0.8,      // JIT LoRA early stop threshold
-        early_stop_patience: 2,    // JIT LoRA patience
+        early_stop_loss: 0.8,   // JIT LoRA early stop threshold
+        early_stop_patience: 2, // JIT LoRA patience
     }
 }
 
@@ -814,18 +911,18 @@ pub fn load_lora_bin(path: &Path) -> io::Result<LoraModel> {
     let mut pos = 0;
 
     let read_u32 = |data: &[u8], pos: &mut usize| -> u32 {
-        let v = u32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]);
+        let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
         *pos += 4;
         v
     };
     let read_f32 = |data: &[u8], pos: &mut usize| -> f32 {
-        let v = f32::from_le_bytes([data[*pos], data[*pos+1], data[*pos+2], data[*pos+3]]);
+        let v = f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
         *pos += 4;
         v
     };
 
     // Magic
-    if &data[pos..pos+4] != b"LORA" {
+    if &data[pos..pos + 4] != b"LORA" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     pos += 4;
@@ -840,7 +937,9 @@ pub fn load_lora_bin(path: &Path) -> io::Result<LoraModel> {
         let read_adapter = |data: &[u8], pos: &mut usize| -> Option<LoraAdapter> {
             let present = data[*pos];
             *pos += 1;
-            if present == 0 { return None; }
+            if present == 0 {
+                return None;
+            }
             let r = read_u32(data, pos) as usize;
             let d_in = read_u32(data, pos) as usize;
             let d_out = read_u32(data, pos) as usize;
@@ -854,7 +953,13 @@ pub fn load_lora_bin(path: &Path) -> io::Result<LoraModel> {
             for i in 0..b_len {
                 b[i] = read_f32(data, pos);
             }
-            Some(LoraAdapter { a, b, rank: r, d_in, d_out })
+            Some(LoraAdapter {
+                a,
+                b,
+                rank: r,
+                d_in,
+                d_out,
+            })
         };
         layers.push(LoraLayerAdapters {
             wq: read_adapter(&data, &mut pos),
@@ -900,8 +1005,10 @@ mod tests {
         let adapter = LoraAdapter::new(4, 8, 8);
         let x = vec![1.0f32; 8 * 2]; // [d_in=8, seq=2]
         let (dy, _h) = adapter.forward_cpu(&x, 2);
-        assert!(dy.iter().all(|&v| v.abs() < 1e-10),
-            "with B=0, LoRA output should be zero");
+        assert!(
+            dy.iter().all(|&v| v.abs() < 1e-10),
+            "with B=0, LoRA output should be zero"
+        );
     }
 
     #[test]
@@ -910,7 +1017,7 @@ mod tests {
         // Set A = [[1,0,0,0],[0,1,0,0]] (rank=2, d_in=4)
         adapter.a[0] = 1.0; // A[0,0]
         adapter.a[5] = 1.0; // A[1,1]
-        // Set B = [[1,0],[0,1],[0,0],[0,0]] (d_out=4, rank=2)
+                            // Set B = [[1,0],[0,1],[0,0],[0,0]] (d_out=4, rank=2)
         adapter.b[0] = 1.0; // B[0,0]
         adapter.b[3] = 1.0; // B[1,1]
 
@@ -960,7 +1067,8 @@ mod tests {
             assert!(
                 (da[idx] - num).abs() < 0.01,
                 "dA[{idx}]: analytical={:.6}, numerical={:.6}",
-                da[idx], num
+                da[idx],
+                num
             );
         }
 
@@ -979,7 +1087,8 @@ mod tests {
             assert!(
                 (db[idx] - num).abs() < 0.01,
                 "dB[{idx}]: analytical={:.6}, numerical={:.6}",
-                db[idx], num
+                db[idx],
+                num
             );
         }
     }
@@ -987,7 +1096,9 @@ mod tests {
     #[test]
     fn test_lora_backward_produces_nonzero_grads() {
         let mut adapter = LoraAdapter::new(4, 8, 8);
-        for v in adapter.b.iter_mut() { *v = 0.05; }
+        for v in adapter.b.iter_mut() {
+            *v = 0.05;
+        }
         let seq = 3;
         let x: Vec<f32> = (0..8 * seq).map(|i| (i as f32 * 0.1).sin()).collect();
         let (_, h) = adapter.forward_cpu(&x, seq);
@@ -1012,7 +1123,11 @@ mod tests {
 
     #[test]
     fn test_lora_grads_zero() {
-        let cfg = LoraConfig { rank: 4, alpha: 4.0, target_modules: vec!["w2".into()] };
+        let cfg = LoraConfig {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["w2".into()],
+        };
         let lora = LoraModel::new(cfg, 2, 64, 128);
         let mut grads = LoraModelGrads::zeros(&lora);
         assert!(grads.layers[0].w2.is_some());
@@ -1027,7 +1142,11 @@ mod tests {
 
     #[test]
     fn test_lora_grad_norm() {
-        let cfg = LoraConfig { rank: 2, alpha: 2.0, target_modules: vec!["w2".into()] };
+        let cfg = LoraConfig {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["w2".into()],
+        };
         let lora = LoraModel::new(cfg, 1, 4, 8);
         let mut grads = LoraModelGrads::zeros(&lora);
         // Set one element to 3.0, another to 4.0 → norm = 5.0
@@ -1041,7 +1160,11 @@ mod tests {
 
     #[test]
     fn test_lora_save_load_roundtrip() {
-        let cfg = LoraConfig { rank: 4, alpha: 8.0, target_modules: vec!["w2".into(), "wo".into()] };
+        let cfg = LoraConfig {
+            rank: 4,
+            alpha: 8.0,
+            target_modules: vec!["w2".into(), "wo".into()],
+        };
         let lora = LoraModel::new(cfg, 2, 16, 32);
 
         let path = std::env::temp_dir().join("test_lora_roundtrip.bin");
@@ -1074,7 +1197,11 @@ mod tests {
 
     #[test]
     fn test_lora_config_scale() {
-        let cfg = LoraConfig { rank: 16, alpha: 32.0, target_modules: vec![] };
+        let cfg = LoraConfig {
+            rank: 16,
+            alpha: 32.0,
+            target_modules: vec![],
+        };
         assert_eq!(cfg.scale(), 2.0);
         let cfg2 = LoraConfig::default();
         assert_eq!(cfg2.scale(), 1.0);
@@ -1110,7 +1237,9 @@ mod tests {
 
         let mut adapter = LoraAdapter::new(16, 64, 64);
         // Set B nonzero for meaningful test
-        for v in adapter.b.iter_mut() { *v = 0.01; }
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
 
         let seq = 16;
         let x: Vec<f32> = (0..64 * seq).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -1119,16 +1248,19 @@ mod tests {
         let (dy_cpu, h_cpu) = adapter.forward_cpu(&x, seq);
 
         // ANE
-        let (dy_ane, h_ane) = lora_forward_ane(
-            &kernels.attn_a_fwd, &kernels.attn_b_fwd,
-            &adapter, &x, seq,
-        ).expect("ANE forward failed");
+        let (dy_ane, h_ane) =
+            lora_forward_ane(&kernels.attn_a_fwd, &kernels.attn_b_fwd, &adapter, &x, seq)
+                .expect("ANE forward failed");
 
         // Compare with tolerance (fp16 intermediate in ANE)
-        let max_h_err = h_cpu.iter().zip(h_ane.iter())
+        let max_h_err = h_cpu
+            .iter()
+            .zip(h_ane.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        let max_dy_err = dy_cpu.iter().zip(dy_ane.iter())
+        let max_dy_err = dy_cpu
+            .iter()
+            .zip(dy_ane.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -1148,32 +1280,44 @@ mod tests {
         };
 
         let mut adapter = LoraAdapter::new(16, 64, 64);
-        for v in adapter.b.iter_mut() { *v = 0.01; }
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
 
         let seq = 16;
         let x: Vec<f32> = (0..64 * seq).map(|i| (i as f32 * 0.01).sin()).collect();
         let (_, h) = adapter.forward_cpu(&x, seq);
 
-        let d_out_grad: Vec<f32> = (0..64 * seq)
-            .map(|i| (i as f32 * 0.03).cos())
-            .collect();
+        let d_out_grad: Vec<f32> = (0..64 * seq).map(|i| (i as f32 * 0.03).cos()).collect();
 
         // CPU reference
         let (dx_cpu, da_cpu, db_cpu) = adapter.backward_cpu(&d_out_grad, &x, &h, seq);
 
         // ANE
         let (dx_ane, da_ane, db_ane) = lora_backward_ane(
-            &kernels.attn_bt_bwd, &kernels.attn_at_bwd,
-            &adapter, &d_out_grad, &x, &h, seq,
-        ).expect("ANE backward failed");
+            &kernels.attn_bt_bwd,
+            &kernels.attn_at_bwd,
+            &adapter,
+            &d_out_grad,
+            &x,
+            &h,
+            seq,
+        )
+        .expect("ANE backward failed");
 
-        let max_dx_err = dx_cpu.iter().zip(dx_ane.iter())
+        let max_dx_err = dx_cpu
+            .iter()
+            .zip(dx_ane.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        let max_da_err = da_cpu.iter().zip(da_ane.iter())
+        let max_da_err = da_cpu
+            .iter()
+            .zip(da_ane.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        let max_db_err = db_cpu.iter().zip(db_ane.iter())
+        let max_db_err = db_cpu
+            .iter()
+            .zip(db_ane.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
@@ -1188,7 +1332,10 @@ mod tests {
     fn test_lora_compile_rejects_non_aligned_rank() {
         let mil_cfg = MilConfig::mha(64, 128, 4, 16);
         match LoraKernels::compile(&mil_cfg, 4) {
-            Err(e) => assert!(e.contains("multiple of 16"), "expected alignment error, got: {e}"),
+            Err(e) => assert!(
+                e.contains("multiple of 16"),
+                "expected alignment error, got: {e}"
+            ),
             Ok(_) => panic!("should reject rank=4"),
         }
     }
@@ -1199,7 +1346,10 @@ mod tests {
         // dim=40 is not a multiple of 16
         let mil_cfg = MilConfig::mha(40, 128, 4, 10);
         match LoraKernels::compile(&mil_cfg, 16) {
-            Err(e) => assert!(e.contains("multiple of 16"), "expected alignment error, got: {e}"),
+            Err(e) => assert!(
+                e.contains("multiple of 16"),
+                "expected alignment error, got: {e}"
+            ),
             Ok(_) => panic!("should reject dim=40"),
         }
     }
@@ -1217,17 +1367,24 @@ mod tests {
 
         let mut adapter = LoraAdapter::new(rank, dim, dim);
         // Initialize B to small nonzero for non-trivial forward
-        for v in adapter.b.iter_mut() { *v = 0.01; }
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
 
         let x: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.1).sin()).collect();
         // Target: the LoRA output should learn to match a specific signal
-        let target: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.2).cos() * 0.1).collect();
+        let target: Vec<f32> = (0..dim * seq)
+            .map(|i| (i as f32 * 0.2).cos() * 0.1)
+            .collect();
 
         // Compute initial loss (MSE between LoRA output and target)
         let (dy0, _) = adapter.forward_cpu(&x, seq);
-        let loss0: f32 = dy0.iter().zip(target.iter())
+        let loss0: f32 = dy0
+            .iter()
+            .zip(target.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / (dim * seq) as f32;
+            .sum::<f32>()
+            / (dim * seq) as f32;
 
         // Training loop: 50 gradient steps
         let lr = 1e-3;
@@ -1238,21 +1395,49 @@ mod tests {
             let (dy, h) = adapter.forward_cpu(&x, seq);
             // MSE gradient: d_out = 2 * (dy - target) / N
             let n = (dim * seq) as f32;
-            let d_out: Vec<f32> = dy.iter().zip(target.iter())
+            let d_out: Vec<f32> = dy
+                .iter()
+                .zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / n)
                 .collect();
             let (_dx, da, db) = adapter.backward_cpu(&d_out, &x, &h, seq);
-            ane_train::adam_update(&mut adapter.a, &da, &mut a_adam, step + 1, lr, 0.9, 0.999, 1e-8, 0.0);
-            ane_train::adam_update(&mut adapter.b, &db, &mut b_adam, step + 1, lr, 0.9, 0.999, 1e-8, 0.0);
+            ane_train::adam_update(
+                &mut adapter.a,
+                &da,
+                &mut a_adam,
+                step + 1,
+                lr,
+                0.9,
+                0.999,
+                1e-8,
+                0.0,
+            );
+            ane_train::adam_update(
+                &mut adapter.b,
+                &db,
+                &mut b_adam,
+                step + 1,
+                lr,
+                0.9,
+                0.999,
+                1e-8,
+                0.0,
+            );
         }
 
         // Final loss
         let (dy_final, _) = adapter.forward_cpu(&x, seq);
-        let loss_final: f32 = dy_final.iter().zip(target.iter())
+        let loss_final: f32 = dy_final
+            .iter()
+            .zip(target.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / (dim * seq) as f32;
+            .sum::<f32>()
+            / (dim * seq) as f32;
 
-        assert!(loss_final < loss0 * 0.5, "loss should decrease: {loss0:.6} → {loss_final:.6}");
+        assert!(
+            loss_final < loss0 * 0.5,
+            "loss should decrease: {loss0:.6} → {loss_final:.6}"
+        );
     }
 
     // --- Per-param gradient clipping ---
@@ -1307,7 +1492,10 @@ mod tests {
         eprintln!("LoRA kernel benchmark (dim=64, rank=32, seq=16):");
         eprintln!("  compile: {compile_ms}ms");
         eprintln!("  forward: {fwd_us:.1}µs/iter ({iters} iters)");
-        eprintln!("  throughput: {:.0} elements/s", (64.0 * seq as f64) / (fwd_us / 1e6));
+        eprintln!(
+            "  throughput: {:.0} elements/s",
+            (64.0 * seq as f64) / (fwd_us / 1e6)
+        );
     }
 
     #[test]
@@ -1319,10 +1507,14 @@ mod tests {
         let seq = 32;
 
         let mut adapter = LoraAdapter::new(rank, dim, dim);
-        for v in adapter.b.iter_mut() { *v = 0.01; }
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
 
         let x: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.01).sin()).collect();
-        let target: Vec<f32> = (0..dim * seq).map(|i| (i as f32 * 0.02).cos() * 0.1).collect();
+        let target: Vec<f32> = (0..dim * seq)
+            .map(|i| (i as f32 * 0.02).cos() * 0.1)
+            .collect();
         let mut a_adam = ane_train::AdamState::zeros(rank * dim);
         let mut b_adam = ane_train::AdamState::zeros(dim * rank);
 
@@ -1331,11 +1523,34 @@ mod tests {
         for step in 0..steps {
             let (dy, h) = adapter.forward_cpu(&x, seq);
             let n = (dim * seq) as f32;
-            let d_out: Vec<f32> = dy.iter().zip(target.iter())
-                .map(|(a, b)| 2.0 * (a - b) / n).collect();
+            let d_out: Vec<f32> = dy
+                .iter()
+                .zip(target.iter())
+                .map(|(a, b)| 2.0 * (a - b) / n)
+                .collect();
             let (_dx, da, db) = adapter.backward_cpu(&d_out, &x, &h, seq);
-            ane_train::adam_update(&mut adapter.a, &da, &mut a_adam, step + 1, 5e-4, 0.9, 0.999, 1e-8, 0.01);
-            ane_train::adam_update(&mut adapter.b, &db, &mut b_adam, step + 1, 5e-4, 0.9, 0.999, 1e-8, 0.01);
+            ane_train::adam_update(
+                &mut adapter.a,
+                &da,
+                &mut a_adam,
+                step + 1,
+                5e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
+            ane_train::adam_update(
+                &mut adapter.b,
+                &db,
+                &mut b_adam,
+                step + 1,
+                5e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
         }
         let total_ms = t0.elapsed().as_millis();
         let per_step_ms = total_ms as f64 / steps as f64;

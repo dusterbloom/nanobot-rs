@@ -62,10 +62,7 @@ pub struct LoraDeltas {
 ///
 /// If `linear_attn_indices` is provided, attention LoRA (wq/wv/wo) is skipped
 /// for those layers since GDN layers have stop_gradient on attention output.
-pub fn extract_lora_deltas(
-    lora: &LoraModel,
-    linear_attn_indices: Option<&[usize]>,
-) -> LoraDeltas {
+pub fn extract_lora_deltas(lora: &LoraModel, linear_attn_indices: Option<&[usize]>) -> LoraDeltas {
     let mut layers = Vec::new();
     let linear = linear_attn_indices.unwrap_or(&[]);
 
@@ -133,9 +130,7 @@ pub fn apply_lora_deltas(
         let new_a = Array::from_slice(&d.a, &[d.rank as i32, d.d_in as i32]);
         let new_b = Array::from_slice(&d.b, &[d.d_out as i32, d.rank as i32]);
 
-        if model.layers[delta.layer_idx].apply_lora_weights(
-            delta.target.mlx_name(), new_a, new_b,
-        ) {
+        if model.layers[delta.layer_idx].apply_lora_weights(delta.target.mlx_name(), new_a, new_b) {
             applied += 1;
         }
     }
@@ -181,32 +176,38 @@ pub fn spawn_ane_training(
             use super::ane_backward;
             use super::ane_forward;
             use super::ane_lora::{
-                self, LoraConfig, LoraModel, LoraModelAdam,
-                lora_adam_update, save_lora_bin, load_lora_bin,
+                self, load_lora_bin, lora_adam_update, save_lora_bin, LoraConfig, LoraModel,
+                LoraModelAdam,
             };
-            use super::ane_weights::ModelWeights;
+            use super::ane_weights::{QuantizedModelWeights, WeightSource};
 
             let t0 = std::time::Instant::now();
 
-            // 1. Load base model weights (CPU, f32)
-            let mut model = match ModelWeights::from_mlx_safetensors(&cfg.model_dir, &cfg.mil_config) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("ANE train: failed to load weights: {e}");
-                    return;
-                }
-            };
-            tracing::info!(
-                "ANE train: loaded base model in {}ms",
-                t0.elapsed().as_millis()
-            );
+            // 1. Load base model weights in quantized form (QLoRA: ~4x less memory).
+            // Layer weights stay in 8-bit and are dequantized per-layer during
+            // forward/backward, keeping only one layer's f32 weights in memory.
+            let mut model =
+                match QuantizedModelWeights::from_mlx_safetensors(&cfg.model_dir, &cfg.mil_config) {
+                    Ok(m) => {
+                        tracing::info!(
+                            "ANE train: loaded quantized model in {}ms ({:.1} MB)",
+                            t0.elapsed().as_millis(),
+                            m.quantized_memory_bytes() as f64 / 1_048_576.0,
+                        );
+                        m
+                    }
+                    Err(e) => {
+                        tracing::error!("ANE train: failed to load weights: {e}");
+                        return;
+                    }
+                };
 
             // 2. Initialize or restore LoRA
             let lora_dir = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".nanobot/workspace/lora");
             let lora_path = lora_dir.join("latest.bin");
-            let n_layers = model.layers.len();
+            let n_layers = model.n_layers();
             let dim = cfg.mil_config.dim;
             let hidden_dim = cfg.mil_config.hidden_dim;
 
@@ -218,7 +219,13 @@ pub fn spawn_ane_training(
                     }
                     _ => {
                         tracing::warn!("ANE train: stale LoRA file, reinitializing");
-                        LoraModel::with_kv_dim(LoraConfig::default(), n_layers, dim, cfg.kv_dim, hidden_dim)
+                        LoraModel::with_kv_dim(
+                            LoraConfig::default(),
+                            n_layers,
+                            dim,
+                            cfg.kv_dim,
+                            hidden_dim,
+                        )
                     }
                 }
             } else {
@@ -244,11 +251,14 @@ pub fn spawn_ane_training(
                     let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
                     let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
-                    // forward_cpu reads seq_len from model.cfg — update per sample
+                    // forward_cpu reads seq_len from cfg — update per sample
                     model.cfg.seq_len = tokens_u32.len();
 
-                    let fwd = ane_forward::forward_cpu(
-                        &model, Some(&lora), &tokens_u32, &targets_u32,
+                    let fwd = ane_forward::forward_cpu_generic(
+                        &model,
+                        Some(&lora),
+                        &tokens_u32,
+                        &targets_u32,
                     );
                     let loss = fwd.base.loss;
 
@@ -257,14 +267,21 @@ pub fn spawn_ane_training(
                         break 'outer;
                     }
 
-                    let bwd = ane_backward::backward_lora_cpu(
+                    let bwd = ane_backward::backward_lora_cpu_generic(
                         &model, &fwd, &lora, &tokens_u32,
                     );
 
                     step += 1;
                     lora_adam_update(
-                        &mut lora, &bwd.lora_grads, &mut adam,
-                        step, cfg.lr, 0.9, 0.999, 1e-8, 0.01,
+                        &mut lora,
+                        &bwd.lora_grads,
+                        &mut adam,
+                        step,
+                        cfg.lr,
+                        0.9,
+                        0.999,
+                        1e-8,
+                        0.01,
                     );
 
                     // Early stopping
@@ -339,12 +356,7 @@ mod tests {
             config: LoraConfig {
                 rank,
                 alpha: 4.0,
-                target_modules: vec![
-                    "wq".into(),
-                    "wv".into(),
-                    "wo".into(),
-                    "w2".into(),
-                ],
+                target_modules: vec!["wq".into(), "wv".into(), "wo".into(), "w2".into()],
             },
         }
     }
@@ -394,9 +406,13 @@ mod tests {
         // Verify no attention LoRA for GDN layers
         for d in &deltas.layers {
             if d.layer_idx < 3 {
-                assert_eq!(d.target, LoraTarget::DownProj,
+                assert_eq!(
+                    d.target,
+                    LoraTarget::DownProj,
                     "GDN layer {} should only have DownProj, got {:?}",
-                    d.layer_idx, d.target);
+                    d.layer_idx,
+                    d.target
+                );
             }
         }
     }
@@ -406,7 +422,11 @@ mod tests {
         let lora = make_test_lora(1, 8, 16);
         let deltas = extract_lora_deltas(&lora, None);
 
-        let q_delta = deltas.layers.iter().find(|d| d.target == LoraTarget::QProj).unwrap();
+        let q_delta = deltas
+            .layers
+            .iter()
+            .find(|d| d.target == LoraTarget::QProj)
+            .unwrap();
         let original = lora.layers[0].wq.as_ref().unwrap();
 
         assert_eq!(q_delta.delta.a, original.a);
@@ -428,10 +448,10 @@ mod tests {
     #[test]
     fn test_apply_lora_deltas_to_mlx_lora_linear() {
         // Build a LoraLinear, apply known weights via the bridge, verify forward changes.
-        use mlx_rs::nn::QuantizedLinear;
-        use mlx_rs::module::Module;
-        use mlx_rs::Array;
         use crate::agent::mlx_lora::LoraLinear;
+        use mlx_rs::module::Module;
+        use mlx_rs::nn::QuantizedLinear;
+        use mlx_rs::Array;
 
         let ql = QuantizedLinear::new(64, 32).unwrap();
         let mut ll = LoraLinear::new(ql, 4, 1.0).unwrap();
@@ -440,9 +460,18 @@ mod tests {
         let x = Array::from_slice(&vec![1.0f32; 64], &[1, 64]);
         let base_out = ll.base.forward(&x).unwrap();
         let before = ll.forward(&x).unwrap();
-        let diff_before: f32 = before.subtract(&base_out).unwrap().abs().unwrap()
-            .sum(None).unwrap().item();
-        assert!(diff_before < 1e-6, "before apply: LoRA should be zero, diff={diff_before}");
+        let diff_before: f32 = before
+            .subtract(&base_out)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item();
+        assert!(
+            diff_before < 1e-6,
+            "before apply: LoRA should be zero, diff={diff_before}"
+        );
 
         // Set B to non-zero via apply_lora_weights on a mock layer
         // (we test the method directly on LoraLinear instead of through DecoderLayer)
@@ -452,9 +481,18 @@ mod tests {
         *ll.lora_b.weight = Array::from_slice(&ones_b, &[32, 4]);
 
         let after = ll.forward(&x).unwrap();
-        let diff_after: f32 = after.subtract(&base_out).unwrap().abs().unwrap()
-            .sum(None).unwrap().item();
-        assert!(diff_after > 0.01, "after apply: LoRA should change output, diff={diff_after}");
+        let diff_after: f32 = after
+            .subtract(&base_out)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum(None)
+            .unwrap()
+            .item();
+        assert!(
+            diff_after > 0.01,
+            "after apply: LoRA should change output, diff={diff_after}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -462,7 +500,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn qwen3_1_7b_dir() -> std::path::PathBuf {
-        dirs::home_dir().unwrap()
+        dirs::home_dir()
+            .unwrap()
             .join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit")
     }
 
@@ -479,20 +518,26 @@ mod tests {
             return;
         }
 
-        use crate::agent::ane_forward;
         use crate::agent::ane_backward;
-        use crate::agent::ane_lora::{LoraConfig as AneLoraConfig, LoraModelAdam, lora_adam_update};
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{
+            lora_adam_update, LoraConfig as AneLoraConfig, LoraModelAdam,
+        };
         use crate::agent::ane_mil::MilConfig;
         use crate::agent::ane_weights::ModelWeights;
-        use crate::agent::mlx_lora::{
-            LoraConfig as MlxLoraConfig, ModelConfig, MlxLoraModel,
-        };
+        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, MlxLoraModel, ModelConfig};
         use mlx_rs::module::Module;
 
         let model_dir = qwen3_1_7b_dir();
         let mil_cfg = MilConfig {
-            dim: 2048, hidden_dim: 6144, n_heads: 16, seq_len: 4,
-            n_kv_heads: 8, rope_theta: 1_000_000.0, rms_eps: 1e-6, has_lm_head: false,
+            dim: 2048,
+            hidden_dim: 6144,
+            n_heads: 16,
+            seq_len: 4,
+            n_kv_heads: 8,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
         };
 
         // 1. Load ANE base weights and train LoRA (3 steps)
@@ -512,8 +557,17 @@ mod tests {
         for step in 0..3 {
             let fwd = ane_forward::forward_cpu(&ane_model, Some(&ane_lora), &tokens, &targets);
             let bwd = ane_backward::backward_lora_cpu(&ane_model, &fwd, &ane_lora, &tokens);
-            lora_adam_update(&mut ane_lora, &bwd.lora_grads, &mut adam,
-                step + 1, 5e-4, 0.9, 0.999, 1e-8, 0.01);
+            lora_adam_update(
+                &mut ane_lora,
+                &bwd.lora_grads,
+                &mut adam,
+                step + 1,
+                5e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
             eprintln!("  step {step}: loss={:.4}", fwd.base.loss);
         }
 
@@ -526,16 +580,15 @@ mod tests {
         eprintln!("loading MLX model...");
         let mlx_cfg = ModelConfig::qwen3_1_7b();
         let mlx_lora_cfg = MlxLoraConfig::default();
-        let mut mlx_model = MlxLoraModel::load(&model_dir, &mlx_cfg, &mlx_lora_cfg)
-            .expect("MLX model load failed");
+        let mut mlx_model =
+            MlxLoraModel::load(&model_dir, &mlx_cfg, &mlx_lora_cfg).expect("MLX model load failed");
 
         let input = mlx_rs::Array::from_slice(&[100i32, 101, 102, 103], &[1, 4]);
         let logits_before = mlx_model.forward_logits(&input).expect("forward failed");
         let before_sum: f32 = logits_before.sum(None).unwrap().item();
 
         // 4. Apply ANE deltas to MLX model
-        let applied = apply_lora_deltas(&mut mlx_model, &deltas)
-            .expect("apply_lora_deltas failed");
+        let applied = apply_lora_deltas(&mut mlx_model, &deltas).expect("apply_lora_deltas failed");
         eprintln!("applied {applied} deltas to MLX model");
         assert_eq!(applied, n_layers * 4);
 
@@ -545,8 +598,10 @@ mod tests {
 
         let diff = (after_sum - before_sum).abs();
         eprintln!("logits sum: before={before_sum:.4}, after={after_sum:.4}, diff={diff:.4}");
-        assert!(diff > 0.01,
-            "MLX output should change after applying ANE deltas, diff={diff}");
+        assert!(
+            diff > 0.01,
+            "MLX output should change after applying ANE deltas, diff={diff}"
+        );
     }
 
     /// E2E: spawn ANE training thread, verify it sends deltas to the model worker.
@@ -564,19 +619,21 @@ mod tests {
         let model_dir = qwen3_1_7b_dir();
 
         // Tokenize a simple sample
-        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&model_dir)
-            .expect("tokenizer load failed");
+        let tokenizer =
+            crate::agent::mlx_lora::MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
         let messages = vec![
             crate::agent::mlx_server::ChatMessage {
-                role: "user".into(), content: "What is 2+2?".into(),
+                role: "user".into(),
+                content: "What is 2+2?".into(),
             },
             crate::agent::mlx_server::ChatMessage {
-                role: "assistant".into(), content: "4".into(),
+                role: "assistant".into(),
+                content: "4".into(),
             },
         ];
-        let (tokens, targets) = crate::agent::mlx_server::tokenize_conversation(
-            &tokenizer, &messages,
-        ).expect("tokenize failed");
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize failed");
         let seq_len = tokens.len();
         eprintln!("tokenized to {seq_len} tokens");
 
@@ -586,8 +643,14 @@ mod tests {
         let cfg = AneTrainingConfig {
             model_dir,
             mil_config: MilConfig {
-                dim: 2048, hidden_dim: 6144, n_heads: 16, seq_len,
-                n_kv_heads: 8, rope_theta: 1_000_000.0, rms_eps: 1e-6, has_lm_head: false,
+                dim: 2048,
+                hidden_dim: 6144,
+                n_heads: 16,
+                seq_len,
+                n_kv_heads: 8,
+                rope_theta: 1_000_000.0,
+                rms_eps: 1e-6,
+                has_lm_head: false,
             },
             epochs: 1,
             lr: 1e-5,
@@ -605,7 +668,10 @@ mod tests {
         let msg = rx.try_recv().expect("should have received ApplyLoraDeltas");
         match msg {
             ModelRequest::ApplyLoraDeltas { deltas, reply } => {
-                eprintln!("received ApplyLoraDeltas with {} layer deltas", deltas.layers.len());
+                eprintln!(
+                    "received ApplyLoraDeltas with {} layer deltas",
+                    deltas.layers.len()
+                );
                 assert!(!deltas.layers.is_empty(), "deltas should not be empty");
                 assert!(reply.is_none(), "reply should be None (fire-and-forget)");
                 // 28 layers × 4 targets = 112
@@ -625,7 +691,7 @@ mod tests {
         }
 
         use crate::agent::ane_mil::MilConfig;
-        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, ModelConfig, MlxLoraModel};
+        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, MlxLoraModel, ModelConfig};
         use crate::agent::mlx_server::{ModelRequest, TrainState};
         use std::sync::Arc;
 
@@ -641,7 +707,10 @@ mod tests {
             .name("mlx-test-worker".into())
             .spawn(move || {
                 let cfg = ModelConfig::qwen3_1_7b();
-                let lora_cfg = MlxLoraConfig { lr: 1e-5, ..MlxLoraConfig::default() };
+                let lora_cfg = MlxLoraConfig {
+                    lr: 1e-5,
+                    ..MlxLoraConfig::default()
+                };
                 crate::agent::mlx_server::run_model_worker(dir, cfg, lora_cfg, ts, rx, None);
             })
             .expect("failed to spawn model worker");
@@ -653,35 +722,48 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reply: reply_tx,
-        }).expect("send failed");
+        })
+        .expect("send failed");
         let t0 = std::time::Instant::now();
         let baseline = reply_rx.blocking_recv().expect("recv failed");
         let baseline_ms = t0.elapsed().as_millis();
-        assert!(baseline.is_ok(), "baseline inference failed: {:?}", baseline);
+        assert!(
+            baseline.is_ok(),
+            "baseline inference failed: {:?}",
+            baseline
+        );
         eprintln!("baseline inference: {}ms", baseline_ms);
 
         // Start ANE training thread (runs concurrently)
-        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&model_dir)
-            .expect("tokenizer load failed");
+        let tokenizer =
+            crate::agent::mlx_lora::MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
         let messages = vec![
             crate::agent::mlx_server::ChatMessage {
-                role: "user".into(), content: "Capital of France?".into(),
+                role: "user".into(),
+                content: "Capital of France?".into(),
             },
             crate::agent::mlx_server::ChatMessage {
-                role: "assistant".into(), content: "Paris".into(),
+                role: "assistant".into(),
+                content: "Paris".into(),
             },
         ];
-        let (tokens, targets) = crate::agent::mlx_server::tokenize_conversation(
-            &tokenizer, &messages,
-        ).expect("tokenize failed");
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize failed");
 
         // ANE training sends ApplyLoraDeltas to same tx — won't block inference
         let ane_tx = tx.clone();
         let ane_cfg = AneTrainingConfig {
             model_dir: model_dir.clone(),
             mil_config: MilConfig {
-                dim: 2048, hidden_dim: 6144, n_heads: 16, seq_len: 64,
-                n_kv_heads: 8, rope_theta: 1_000_000.0, rms_eps: 1e-6, has_lm_head: false,
+                dim: 2048,
+                hidden_dim: 6144,
+                n_heads: 16,
+                seq_len: 64,
+                n_kv_heads: 8,
+                rope_theta: 1_000_000.0,
+                rms_eps: 1e-6,
+                has_lm_head: false,
             },
             epochs: 2,
             lr: 1e-5,
@@ -697,21 +779,33 @@ mod tests {
             max_tokens: 8,
             temperature: 0.0,
             reply: reply_tx2,
-        }).expect("send failed");
+        })
+        .expect("send failed");
         let t1 = std::time::Instant::now();
         let during = reply_rx2.blocking_recv().expect("recv failed");
         let during_ms = t1.elapsed().as_millis();
-        assert!(during.is_ok(), "inference during ANE training failed: {:?}", during);
+        assert!(
+            during.is_ok(),
+            "inference during ANE training failed: {:?}",
+            during
+        );
         eprintln!("inference during ANE training: {}ms", during_ms);
 
         // The inference during training should complete in reasonable time.
         // ANE trains on a separate thread (CPU), MLX infers on GPU — zero contention.
         // Allow 10x baseline as generous margin (accounts for model loading overhead).
         let max_allowed = baseline_ms.max(2000) * 10;
-        assert!(during_ms < max_allowed,
+        assert!(
+            during_ms < max_allowed,
             "inference during ANE training too slow: {}ms (baseline {}ms, max {}ms)",
-            during_ms, baseline_ms, max_allowed);
+            during_ms,
+            baseline_ms,
+            max_allowed
+        );
 
-        eprintln!("no contention verified: baseline={}ms, during_training={}ms", baseline_ms, during_ms);
+        eprintln!(
+            "no contention verified: baseline={}ms, during_training={}ms",
+            baseline_ms, during_ms
+        );
     }
 }
