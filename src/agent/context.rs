@@ -1246,15 +1246,13 @@ Rules:
             ));
         }
 
-        let bootstrap_files = self._available_bootstrap_files();
-        if !bootstrap_files.is_empty() {
-            blocks.push(PromptBlock::new(
-                "Workspace Context",
-                format!(
-                    "Bootstrap files are available on demand via `read_file`: {}.",
-                    bootstrap_files.join(", ")
-                ),
-            ));
+        // Load bootstrap file CONTENT (SOUL.md, USER.md, TOOLS.md, etc.)
+        // into the prompt so the agent knows its identity and user preferences.
+        // Previously this only listed file names as "available via read_file"
+        // which meant local agents started with zero context.
+        let bootstrap = self._load_bootstrap_files_within_budget(self.bootstrap_budget);
+        if !bootstrap.is_empty() {
+            blocks.push(PromptBlock::new("Workspace Context", bootstrap));
         }
 
         blocks.push(PromptBlock::new(
@@ -2297,16 +2295,19 @@ mod tests {
         let system_msg = messages.iter().find(|m| m["role"] == "system").unwrap();
         let system_content = system_msg["content"].as_str().unwrap();
 
+        // Local prompt now loads bootstrap file content (within budget)
+        // so the agent knows its identity. It should still stay under the
+        // system_prompt_cap and include at least some bootstrap content.
         assert!(
-            total_tokens < 550,
-            "lean local prompt should stay compact even with large workspace context, got {} tokens",
+            total_tokens < 1200,
+            "local prompt with bootstrap content should stay within budget, got {} tokens",
             total_tokens
         );
-        assert!(system_content.contains("AGENTS.md"));
+        // Bootstrap content should now be included (at least partially).
+        assert!(system_content.contains("Bootstrap directive"));
         assert!(system_content.contains("radio"));
-        assert!(!system_content.contains("VERY IMPORTANT VERY IMPORTANT"));
+        // Long-term memory is still excluded from local prompt (loaded via recall).
         assert!(!system_content.contains("LONG TERM MEMORY LONG TERM MEMORY"));
-        assert!(!system_content.contains("Stream and manage local radio playback"));
     }
 
     #[test]

@@ -1011,6 +1011,8 @@ pub(crate) fn cmd_agent(
     session_id: String,
     local_flag: bool,
     lang: Option<String>,
+    resume: Option<String>,
+    continue_session: bool,
 ) {
     let mut config = load_config(None);
 
@@ -1447,6 +1449,26 @@ pub(crate) fn cmd_agent(
             None,
             is_local,
         );
+        // Resolve --resume / --continue to a real session key.
+        let session_id = if let Some(ref id) = resume {
+            // --resume <id>: look up session by ID and use its session_key
+            let core = core_handle.swappable();
+            if let Some(meta) = core.sessions.get_session(id).await {
+                info!(session_id = %meta.id, session_key = %meta.session_key, "resuming session by ID");
+                meta.session_key
+            } else {
+                eprintln!("Warning: session '{}' not found, starting new session", id);
+                session_id
+            }
+        } else if continue_session {
+            // --continue: use latest session for the given key (default behavior
+            // of get_or_resume, so session_id as-is is correct)
+            info!(session_key = %session_id, "continuing latest session");
+            session_id
+        } else {
+            session_id
+        };
+
         let cron_store_path = get_data_dir().join("cron").join("jobs.json");
         let cron_service = Arc::new(CronService::new(cron_store_path));
 

@@ -20,6 +20,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use super::turn::{ToolCall, Turn};
 use crate::agent::model_capabilities::{lookup, ModelSizeClass};
@@ -416,6 +417,183 @@ pub fn parse_tool_calls_for_model(
         .into_iter()
         .map(|tc| (tc.name, tc.arguments))
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────
+// XML tool-call parsing (Qwen-style <tool_call> blocks)
+// ─────────────────────────────────────────────────────────────
+
+// Matches `<tool_call>...</tool_call>` blocks (possibly multiline).
+static XML_TOOL_CALL_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?si)<tool_call>\s*(.*?)\s*</tool_call>").expect("xml tool_call block regex")
+});
+
+// Extracts function name from `<function=NAME>` or `<function name="NAME">`.
+static XML_FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<function[= ]+"?([^">]+)"?>"#).expect("xml function name regex")
+});
+
+// Extracts `<parameter=KEY>VALUE</parameter>` pairs.
+static XML_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?si)<parameter=(\w+)>\s*(.*?)\s*</parameter>"#)
+        .expect("xml parameter regex")
+});
+
+/// Parse XML-style tool calls from response content.
+///
+/// Models like Qwen3.5-2B sometimes emit tool calls as:
+/// ```text
+/// <tool_call>
+///   <function=web_search>
+///   <parameter=query>latest news</parameter>
+///   <parameter=count>10</parameter>
+///   </function>
+/// </tool_call>
+/// ```
+///
+/// Returns a vec of `ParsedToolCall` with tool name and arguments as JSON.
+pub fn parse_xml_tool_calls(text: &str) -> Vec<ParsedToolCall> {
+    let mut result = Vec::new();
+
+    for block_cap in XML_TOOL_CALL_BLOCK_RE.captures_iter(text) {
+        let inner = match block_cap.get(1) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
+
+        let tool_name = match XML_FUNCTION_NAME_RE.captures(inner) {
+            Some(cap) => cap[1].trim().to_string(),
+            None => continue,
+        };
+
+        let mut args = serde_json::Map::new();
+        for param_cap in XML_PARAMETER_RE.captures_iter(inner) {
+            let key = param_cap[1].to_string();
+            let value = param_cap[2].trim().to_string();
+            // Try parsing as number/bool/null, fall back to string.
+            let json_val = serde_json::from_str::<Value>(&value)
+                .unwrap_or_else(|_| Value::String(value));
+            args.insert(key, json_val);
+        }
+
+        result.push(ParsedToolCall {
+            tool: tool_name,
+            args: Value::Object(args),
+        });
+    }
+
+    result
+}
+
+/// Strip XML tool call blocks from response content.
+pub fn strip_xml_tool_calls(content: &str) -> String {
+    XML_TOOL_CALL_BLOCK_RE
+        .replace_all(content, "")
+        .trim()
+        .to_string()
+}
+
+// ─────────────────────────────────────────────────────────────
+// Streaming XML tool-call filter
+// ─────────────────────────────────────────────────────────────
+
+/// State machine that suppresses `<tool_call>...</tool_call>` blocks from
+/// streaming text deltas so they don't render in the terminal.
+///
+/// Call `filter()` for each incoming delta. It returns the text to display
+/// (possibly empty if everything was buffered).
+pub struct XmlToolCallFilter {
+    state: XmlFilterState,
+    buf: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum XmlFilterState {
+    Normal,
+    /// We've seen a partial or full `<tool_call` prefix and are buffering
+    /// until `</tool_call>` closes the block.
+    Buffering,
+}
+
+impl XmlToolCallFilter {
+    pub fn new() -> Self {
+        Self {
+            state: XmlFilterState::Normal,
+            buf: String::new(),
+        }
+    }
+
+    /// Filter a streaming delta. Returns text safe to display.
+    pub fn filter(&mut self, delta: &str) -> String {
+        // In Buffering state, just accumulate until closing tag.
+        if self.state == XmlFilterState::Buffering {
+            self.buf.push_str(delta);
+            if self.buf.ends_with("</tool_call>")
+                || self.buf.contains("</tool_call>")
+            {
+                // Find text after the closing tag (if any).
+                let after = self
+                    .buf
+                    .find("</tool_call>")
+                    .map(|i| &self.buf[i + 12..])
+                    .unwrap_or("")
+                    .to_string();
+                self.buf.clear();
+                self.state = XmlFilterState::Normal;
+                if after.is_empty() {
+                    return String::new();
+                }
+                // Recursively filter the remainder (might have another tool_call).
+                return self.filter(&after);
+            }
+            return String::new();
+        }
+
+        // Normal state: if we have a pending partial buffer, prepend it.
+        let combined;
+        let text = if !self.buf.is_empty() {
+            combined = std::mem::take(&mut self.buf) + delta;
+            combined.as_str()
+        } else {
+            delta
+        };
+
+        // Look for `<tool_call` in the text.
+        if let Some(start) = text.find("<tool_call") {
+            let before = &text[..start];
+            let rest = &text[start..];
+
+            // Check if the closing tag is in this chunk too.
+            if let Some(end) = rest.find("</tool_call>") {
+                let after = &rest[end + 12..];
+                let mut out = before.to_string();
+                // Recursively filter remainder.
+                if !after.is_empty() {
+                    out.push_str(&self.filter(after));
+                }
+                return out;
+            }
+
+            // No closing tag yet — buffer the rest, return text before.
+            self.state = XmlFilterState::Buffering;
+            self.buf = rest.to_string();
+            return before.to_string();
+        }
+
+        // No `<tool_call` found. But the end of the text might be a partial
+        // prefix like `<tool_` that continues in the next delta.
+        const TAG: &str = "<tool_call";
+        for split in (1..TAG.len()).rev() {
+            if text.ends_with(&TAG[..split]) {
+                // Partial prefix — hold it back.
+                let safe = &text[..text.len() - split];
+                self.buf = text[text.len() - split..].to_string();
+                return safe.to_string();
+            }
+        }
+
+        text.to_string()
+    }
 }
 
 /// Convert a raw wire-format message array to a protocol-rendered wire format.
@@ -845,5 +1023,102 @@ mod tests {
     fn strip_leaves_plain_text_unchanged() {
         let text = "The answer is 42.";
         assert_eq!(strip_textual_tool_calls(text), text);
+    }
+
+    // ---- parse_xml_tool_calls() ----
+
+    #[test]
+    fn parse_xml_single_tool_call() {
+        let text = r#"<tool_call>
+  <function=web_search>
+  <parameter=query>Middle East latest news</parameter>
+  <parameter=count>10</parameter>
+  </function>
+  </tool_call>"#;
+        let calls = parse_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "web_search");
+        assert_eq!(calls[0].args["query"], "Middle East latest news");
+        assert_eq!(calls[0].args["count"], 10); // parsed as number
+    }
+
+    #[test]
+    fn parse_xml_multiple_tool_calls() {
+        let text = r#"Let me search for that.
+<tool_call>
+  <function=web_search>
+  <parameter=query>news</parameter>
+  </function>
+</tool_call>
+And also:
+<tool_call>
+  <function=read_file>
+  <parameter=path>/tmp/test.txt</parameter>
+  </function>
+</tool_call>"#;
+        let calls = parse_xml_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool, "web_search");
+        assert_eq!(calls[1].tool, "read_file");
+        assert_eq!(calls[1].args["path"], "/tmp/test.txt");
+    }
+
+    #[test]
+    fn parse_xml_no_match() {
+        let text = "No tool calls here. Just some <b>HTML</b>.";
+        assert!(parse_xml_tool_calls(text).is_empty());
+    }
+
+    #[test]
+    fn strip_xml_removes_blocks() {
+        let text = r#"Some text. <tool_call>
+  <function=web_search>
+  <parameter=query>test</parameter>
+  </function>
+  </tool_call> Done."#;
+        let stripped = strip_xml_tool_calls(text);
+        assert!(!stripped.contains("<tool_call>"));
+        assert!(stripped.contains("Some text."));
+        assert!(stripped.contains("Done."));
+    }
+
+    // ---- XmlToolCallFilter ----
+
+    #[test]
+    fn filter_passes_normal_text() {
+        let mut f = XmlToolCallFilter::new();
+        assert_eq!(f.filter("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn filter_suppresses_tool_call_single_chunk() {
+        let mut f = XmlToolCallFilter::new();
+        let out = f.filter("<tool_call><function=test><parameter=a>b</parameter></function></tool_call>");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_suppresses_tool_call_across_chunks() {
+        let mut f = XmlToolCallFilter::new();
+        assert_eq!(f.filter("Hi! "), "Hi! ");
+        assert_eq!(f.filter("<tool_cal"), "");
+        assert_eq!(f.filter("l><function=test>"), "");
+        assert_eq!(f.filter("<parameter=q>x</parameter></function>"), "");
+        assert_eq!(f.filter("</tool_call> bye"), " bye");
+    }
+
+    #[test]
+    fn filter_passes_non_toolcall_angle_bracket() {
+        let mut f = XmlToolCallFilter::new();
+        // <b> is not <tool_call, should pass through
+        assert_eq!(f.filter("some <b>bold</b> text"), "some <b>bold</b> text");
+    }
+
+    #[test]
+    fn filter_mixed_content_and_tool_call() {
+        let mut f = XmlToolCallFilter::new();
+        assert_eq!(f.filter("Before "), "Before ");
+        assert!(f.filter("<tool_call><function=x></function></tool_call>").is_empty());
+        assert_eq!(f.filter(" After"), " After");
     }
 }

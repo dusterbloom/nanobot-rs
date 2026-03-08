@@ -20,7 +20,8 @@ use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::protocol::{
-    parse_textual_tool_calls, strip_textual_tool_calls, ConversationProtocol,
+    parse_textual_tool_calls, parse_xml_tool_calls, strip_textual_tool_calls,
+    strip_xml_tool_calls, ConversationProtocol, XmlToolCallFilter,
 };
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::subagent::SubagentManager;
@@ -1341,6 +1342,7 @@ impl AgentLoopShared {
             let mut in_thinking = false;
             let suppress_thinking_tts = counters.suppress_thinking_in_tts.load(Ordering::Relaxed);
             let thinking_enabled = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+            let mut xml_filter = XmlToolCallFilter::new();
             loop {
                 tokio::select! {
                     biased;
@@ -1376,7 +1378,12 @@ impl AgentLoopShared {
                                     let _ = delta_tx.send("\x1b[0m\n\n".to_string());
                                 }
                                 ctx.flow.content_was_streamed = true;
-                                let _ = delta_tx.send(delta);
+                                // Filter out <tool_call>...</tool_call> XML
+                                // blocks so they don't render in the terminal.
+                                let filtered = xml_filter.filter(&delta);
+                                if !filtered.is_empty() {
+                                    let _ = delta_tx.send(filtered);
+                                }
                             }
                             Some(StreamChunk::Done(resp)) => {
                                 if in_thinking {
@@ -1480,11 +1487,20 @@ impl AgentLoopShared {
                 .unwrap_or(false)
         {
             let content_text = response.content.as_deref().unwrap_or("");
+            // Try bracket format first: [I called: tool(args)]
             let parsed = parse_textual_tool_calls(content_text);
+            // Then try XML format: <tool_call><function=name>...</tool_call>
+            let parsed = if parsed.is_empty() {
+                parse_xml_tool_calls(content_text)
+            } else {
+                parsed
+            };
             if !parsed.is_empty() {
+                let is_xml = content_text.contains("<tool_call>");
                 debug!(
                     n = parsed.len(),
-                    "universal_textual_parse: parsed {} tool call(s) from response text",
+                    format = if is_xml { "xml" } else { "textual" },
+                    "universal_tool_parse: parsed {} tool call(s) from response text",
                     parsed.len()
                 );
                 let synthesised: Vec<crate::providers::base::ToolCallRequest> = parsed
@@ -1503,7 +1519,11 @@ impl AgentLoopShared {
                     })
                     .collect();
                 if let Some(ref mut content) = response.content {
-                    *content = strip_textual_tool_calls(content);
+                    *content = if is_xml {
+                        strip_xml_tool_calls(content)
+                    } else {
+                        strip_textual_tool_calls(content)
+                    };
                 }
                 response.tool_calls = synthesised;
             }

@@ -814,6 +814,15 @@ impl VoicePipeline {
                 info!("Kokoro TTS ready (multilingual)");
                 (None, Some(Arc::new(Mutex::new(tts))))
             }
+            TtsEngineConfig::Magpie => {
+                let tts =
+                    tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Magpie))
+                        .await
+                        .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                        .map_err(|e| format!("Magpie TTS init failed: {e}"))?;
+                info!("Magpie TTS ready (multilingual)");
+                (None, Some(Arc::new(Mutex::new(tts))))
+            }
         };
 
         if tts_en.is_none() && tts_multi.is_none() {
