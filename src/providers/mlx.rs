@@ -195,8 +195,10 @@ mod inner {
                         prompt_concurrency: std::env::var("NANOBOT_MLX_LM_PROMPT_CONCURRENCY")
                             .ok()
                             .and_then(|v| v.parse().ok()),
-                        chat_template_args: thinking_model
-                            .then(|| r#"{"enable_thinking": true}"#.to_string()),
+                        // Always disable thinking at the template level by default.
+                        // Qwen3 templates default to enable_thinking=true which causes
+                        // <think> blocks in every response. /t toggles this at runtime.
+                        chat_template_args: Some(r#"{"enable_thinking": false}"#.to_string()),
                     };
                     // Auto-detect vllm-mlx options from model name.
                     let vllm_options = crate::agent::mlx_lm::VllmMlxOptions {
@@ -226,6 +228,11 @@ mod inner {
                         Err(e) => {
                             tracing::warn!(
                                 "{backend_name} server failed to start: {e}, falling back to in-process"
+                            );
+                            eprintln!(
+                                "\x1b[33mwarning:\x1b[0m {backend_name} server failed to start: {e}\n\
+                                 Falling back to in-process inference (slower, 4K context cap).\n\
+                                 Install {backend_name} or set mlxLmUrl to null in config to silence this."
                             );
                             (None, None)
                         }
@@ -695,6 +702,10 @@ mod inner {
             use futures_util::StreamExt;
 
             let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+            // The server starts with enable_thinking=false by default, so
+            // the template does NOT prefill <think>.  Only when the user
+            // toggles /t (thinking_budget > 0) does the template prefill.
+            let starts_in_think = self.thinking_model && want_thinking;
 
             // Only stream when delegating to mlx-lm server
             let Some(ref base_url) = self.mlx_lm_url else {
@@ -754,7 +765,10 @@ mod inner {
                 let mut finish_reason = "stop".to_string();
                 let mut usage: HashMap<String, i64> = HashMap::new();
                 let mut tool_calls_acc: HashMap<u64, (String, String, String)> = HashMap::new();
-                let mut think_split = crate::providers::openai_compat::ThinkSplitState::default();
+                let mut think_split = crate::providers::openai_compat::ThinkSplitState {
+                    in_think_block: starts_in_think,
+                    ..Default::default()
+                };
 
                 while let Some(result) = stream.next().await {
                     let bytes = match result {
@@ -794,6 +808,9 @@ mod inner {
                             .and_then(|v| v.as_str())
                         {
                             if !reasoning.is_empty() {
+                                // Server handles thinking separation — don't
+                                // also split from content via the tag splitter.
+                                think_split.in_think_block = false;
                                 let _ = tx.send(StreamChunk::ThinkingDelta(reasoning.to_string()));
                             }
                         }

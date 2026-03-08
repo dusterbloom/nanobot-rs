@@ -693,7 +693,11 @@ impl ModelConfig {
                 .unwrap_or(false);
 
         let dim = tc.get("hidden_size")?.as_u64()? as usize;
-        let hidden_dim = tc.get("intermediate_size")?.as_u64()? as usize;
+        // Dense models use intermediate_size; MoE models use moe_intermediate_size.
+        let hidden_dim = tc
+            .get("intermediate_size")
+            .or_else(|| tc.get("moe_intermediate_size"))
+            .and_then(|v| v.as_u64())? as usize;
         let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
         let n_kv_heads = tc
             .get("num_key_value_heads")
@@ -796,12 +800,17 @@ impl ModelConfig {
             "model"
         };
 
-        // Detect thinking model: name-based heuristic (Thinking/thinking in dir name)
+        // Detect thinking model: Qwen3/3.5 templates default to enable_thinking=true,
+        // so ALL Qwen3.x models are thinking-capable regardless of name.
         let dir_name = model_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let thinking_model = dir_name.contains("thinking");
+        let thinking_model = model_type.starts_with("qwen3")
+            || dir_name.contains("qwen3")
+            || dir_name.contains("thinking")
+            || dir_name.contains("reasoning")
+            || dir_name.contains("distill");
 
         tracing::info!(
             model_type,
@@ -3792,6 +3801,29 @@ mod tests {
         assert_eq!(cfg.linear_attn_indices.len(), 18, "18 of 24 layers are linear");
         assert_eq!(cfg.linear_n_heads, 16);
         assert_eq!(cfg.conv_kernel_size, 4);
+    }
+
+    #[test]
+    fn test_from_config_json_qwen3_5_moe() {
+        // MoE models (e.g. Qwen3.5-35B-A3B) use moe_intermediate_size instead of intermediate_size
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-35B-A3B not found, skipping MoE config test");
+            return;
+        }
+        let cfg = ModelConfig::from_config_json(&model_dir).expect("should parse MoE config.json");
+        assert_eq!(cfg.dim, 2048);
+        assert_eq!(cfg.hidden_dim, 512); // moe_intermediate_size, not intermediate_size
+        assert_eq!(cfg.n_layers, 40);
+        assert_eq!(cfg.n_heads, 16);
+        assert_eq!(cfg.n_kv_heads, 2);
+        assert_eq!(cfg.vocab_size, 248320);
+        assert_eq!(cfg.bits, 4);
+        assert_eq!(cfg.weight_prefix, "language_model.model");
+        assert!(cfg.attn_output_gate);
+        // 30 of 40 layers are linear attention
+        assert_eq!(cfg.linear_attn_indices.len(), 30);
     }
 
     #[test]

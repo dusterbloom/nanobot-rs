@@ -392,11 +392,18 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     let model_config = ModelConfig::from_config_json(&model_dir)
         .or_else(|| model_config_from_preset(&effective_preset))
         .ok_or_else(|| {
+            let has_config = model_dir.join("config.json").exists();
+            let detail = if has_config {
+                "config.json exists but could not be parsed (missing required fields like hidden_size or intermediate_size)"
+            } else {
+                "no config.json found in model directory"
+            };
             anyhow::anyhow!(
-                "Cannot determine model config for '{}'. \
-                 No config.json found and preset '{}' is unknown. \
+                "Cannot determine model config for '{}': {}. \
+                 Preset '{}' is also unknown. \
                  Supported presets: qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b, qwen3.5-4b, qwen3.5-9b.",
                 model_dir.display(),
+                detail,
                 effective_preset,
             )
         })?;

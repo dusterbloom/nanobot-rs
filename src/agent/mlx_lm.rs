@@ -79,15 +79,32 @@ impl MlxLmServer {
             InferenceBackend::VllmMlx => self.build_vllm_mlx_command()?,
         };
 
-        // Redirect both stdout and stderr to null. Piping stderr can cause
-        // the subprocess to block if the pipe buffer fills (64KB on macOS),
-        // which happens with larger models that produce verbose load output.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-
         let backend_name = match self.backend {
             InferenceBackend::MlxLm => "mlx_lm.server",
             InferenceBackend::VllmMlx => "vllm-mlx",
         };
+
+        // Redirect stdout to null. Stderr goes to a log file so startup
+        // failures are diagnosable (the pipe-buffer-full concern only applies
+        // to piping, not to file I/O).
+        cmd.stdout(Stdio::null());
+        let log_path = dirs::home_dir()
+            .map(|h| h.join(format!(".nanobot/{backend_name}.log")))
+            .filter(|p| {
+                p.parent()
+                    .map_or(false, |d| d.exists() || std::fs::create_dir_all(d).is_ok())
+            });
+        if let Some(ref lp) = log_path {
+            match std::fs::File::create(lp) {
+                Ok(f) => cmd.stderr(Stdio::from(f)),
+                Err(_) => cmd.stderr(Stdio::null()),
+            };
+            tracing::info!(log = %lp.display(), "server stderr → log file");
+        } else {
+            cmd.stderr(Stdio::null());
+        }
+
+        tracing::info!(backend = backend_name, cmd = ?cmd, "spawning inference server");
 
         let child = cmd
             .spawn()
@@ -108,7 +125,11 @@ impl MlxLmServer {
             // Check if process died
             if let Some(ref mut c) = self.child {
                 if let Ok(Some(status)) = c.try_wait() {
-                    return Err(format!("{backend_name} exited with {status}"));
+                    let hint = log_path
+                        .as_ref()
+                        .map(|p| format!(" (see {})", p.display()))
+                        .unwrap_or_default();
+                    return Err(format!("{backend_name} exited with {status}{hint}"));
                 }
             }
             // Try raw TCP connect + HTTP GET to check readiness
@@ -130,7 +151,11 @@ impl MlxLmServer {
             }
         }
         self.kill();
-        Err(format!("{backend_name} failed to start within 90s"))
+        let hint = log_path
+            .as_ref()
+            .map(|p| format!(" (see {})", p.display()))
+            .unwrap_or_default();
+        Err(format!("{backend_name} failed to start within 90s{hint}"))
     }
 
     /// Build the `python3 -m mlx_lm.server` command.
@@ -273,11 +298,20 @@ impl Drop for MlxLmServer {
 /// 3. `vllm-mlx` on PATH (via `which`)
 pub fn find_vllm_mlx_binary() -> Option<PathBuf> {
     // Check common venv locations.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let candidates: Vec<PathBuf> = [
         dirs::home_dir().map(|h| h.join(".nanobot/.venv/bin/vllm-mlx")),
         std::env::current_dir()
             .ok()
             .map(|d| d.join(".venv/bin/vllm-mlx")),
+        // Search upward from the executable's directory for a .venv
+        exe_dir.as_ref().and_then(|d| {
+            d.ancestors()
+                .find(|a| a.join(".venv/bin/vllm-mlx").is_file())
+                .map(|a| a.join(".venv/bin/vllm-mlx"))
+        }),
     ]
     .into_iter()
     .flatten()
