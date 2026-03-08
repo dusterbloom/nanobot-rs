@@ -416,11 +416,7 @@ pub(crate) fn build_model_profile(
             } else {
                 128 // fallback
             };
-            let kv = 2u64
-                * info.n_layers as u64
-                * info.n_kv_heads as u64
-                * head_dim as u64
-                * 2; // fp16
+            let kv = 2u64 * info.n_layers as u64 * info.n_kv_heads as u64 * head_dim as u64 * 2; // fp16
             (kv, info.context_length as usize)
         }
         None => (0, 32768),
@@ -499,12 +495,26 @@ pub(crate) fn compute_vram_budget(input: &VramBudgetInput) -> VramBudgetResult {
     // If fixed costs alone exceed limit, we can't fit even with minimum contexts
     if fixed_cost >= effective_limit {
         let main_ctx = MIN_MAIN_CTX;
-        let router_ctx = if input.router.is_some() { MIN_ROUTER_CTX } else { 0 };
-        let specialist_ctx = if input.specialist.is_some() { MIN_SPECIALIST_CTX } else { 0 };
+        let router_ctx = if input.router.is_some() {
+            MIN_ROUTER_CTX
+        } else {
+            0
+        };
+        let specialist_ctx = if input.specialist.is_some() {
+            MIN_SPECIALIST_CTX
+        } else {
+            0
+        };
 
         let main_kv = main_ctx as u64 * input.main.kv_bytes_per_token;
-        let router_kv = input.router.as_ref().map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
-        let spec_kv = input.specialist.as_ref().map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
+        let router_kv = input
+            .router
+            .as_ref()
+            .map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
+        let spec_kv = input
+            .specialist
+            .as_ref()
+            .map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
         let total = fixed_cost + main_kv + router_kv + spec_kv;
 
         let breakdown = build_breakdown(input, main_ctx, router_ctx, specialist_ctx);
@@ -573,8 +583,14 @@ pub(crate) fn compute_vram_budget(input: &VramBudgetInput) -> VramBudgetResult {
 
     // Compute actual total
     let main_kv = main_ctx as u64 * input.main.kv_bytes_per_token;
-    let router_kv = input.router.as_ref().map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
-    let spec_kv = input.specialist.as_ref().map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
+    let router_kv = input
+        .router
+        .as_ref()
+        .map_or(0, |r| router_ctx as u64 * r.kv_bytes_per_token);
+    let spec_kv = input
+        .specialist
+        .as_ref()
+        .map_or(0, |s| specialist_ctx as u64 * s.kv_bytes_per_token);
     let total = fixed_cost + main_kv + router_kv + spec_kv;
 
     let breakdown = build_breakdown(input, main_ctx, router_ctx, specialist_ctx);
@@ -1322,8 +1338,16 @@ mod tests {
             specialist: None,
         };
         let result = compute_vram_budget(&input);
-        assert_eq!(result.main_ctx % 1024, 0, "main_ctx should be multiple of 1024");
-        assert_eq!(result.router_ctx % 1024, 0, "router_ctx should be multiple of 1024");
+        assert_eq!(
+            result.main_ctx % 1024,
+            0,
+            "main_ctx should be multiple of 1024"
+        );
+        assert_eq!(
+            result.router_ctx % 1024,
+            0,
+            "router_ctx should be multiple of 1024"
+        );
     }
 
     #[test]

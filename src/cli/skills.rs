@@ -7,7 +7,10 @@
 /// - `owner/repo@skill`   -- install a specific skill by name
 ///
 /// Skills are saved to `{workspace}/skills/{name}/SKILL.md`.
-pub(crate) async fn cmd_skill_add(workspace: &std::path::Path, source: &str) -> Result<Vec<String>, String> {
+pub(crate) async fn cmd_skill_add(
+    workspace: &std::path::Path,
+    source: &str,
+) -> Result<Vec<String>, String> {
     let (repo, specific_skill) = if let Some((repo, skill)) = source.split_once('@') {
         (repo, Some(skill))
     } else {
@@ -17,7 +20,10 @@ pub(crate) async fn cmd_skill_add(workspace: &std::path::Path, source: &str) -> 
     // Validate repo format
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(format!("Invalid repo format: '{}'. Expected owner/repo", repo));
+        return Err(format!(
+            "Invalid repo format: '{}'. Expected owner/repo",
+            repo
+        ));
     }
     let (owner, repo_name) = (parts[0], parts[1]);
 
@@ -66,21 +72,32 @@ async fn fetch_skill_md(
     // Try raw.githubusercontent.com (no API rate limits, no auth needed)
     // Try multiple common paths: skills/{name}/SKILL.md, then root SKILL.md
     let paths = [
-        format!("https://raw.githubusercontent.com/{owner}/{repo}/HEAD/skills/{skill_name}/SKILL.md"),
-        format!("https://raw.githubusercontent.com/{owner}/{repo}/main/skills/{skill_name}/SKILL.md"),
-        format!("https://raw.githubusercontent.com/{owner}/{repo}/master/skills/{skill_name}/SKILL.md"),
+        format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/skills/{skill_name}/SKILL.md"
+        ),
+        format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/main/skills/{skill_name}/SKILL.md"
+        ),
+        format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/master/skills/{skill_name}/SKILL.md"
+        ),
     ];
 
     for url in &paths {
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                return resp.text().await.map_err(|e| format!("Failed to read response: {e}"));
+                return resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read response: {e}"));
             }
             _ => continue,
         }
     }
 
-    Err(format!("SKILL.md not found for '{skill_name}' in {owner}/{repo}"))
+    Err(format!(
+        "SKILL.md not found for '{skill_name}' in {owner}/{repo}"
+    ))
 }
 
 /// List skill directories in a GitHub repo's skills/ folder via the GitHub API.

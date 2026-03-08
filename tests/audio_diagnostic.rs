@@ -51,12 +51,22 @@ fn audio_diagnostic() {
     const STT_MIN_RMS: f32 = 0.0005;
     const STT_MIN_AMP: f32 = 0.002;
 
-    println!("Collected {} samples in {} chunks", all_samples.len(), chunk_count);
+    println!(
+        "Collected {} samples in {} chunks",
+        all_samples.len(),
+        chunk_count
+    );
     println!("Device sample rate: {}Hz", capture.device_sample_rate);
     println!();
     println!("=== Energy Metrics ===");
-    println!("  Peak amplitude:  {:.6}  (threshold: {:.3})", max_val, STT_MIN_AMP);
-    println!("  RMS energy:      {:.6}  (threshold: {:.3})", rms, STT_MIN_RMS);
+    println!(
+        "  Peak amplitude:  {:.6}  (threshold: {:.3})",
+        max_val, STT_MIN_AMP
+    );
+    println!(
+        "  RMS energy:      {:.6}  (threshold: {:.3})",
+        rms, STT_MIN_RMS
+    );
     println!();
 
     let would_reject = rms < STT_MIN_RMS || max_val < STT_MIN_AMP;
@@ -64,12 +74,24 @@ fn audio_diagnostic() {
         println!("⚠️  WARNING: This audio would be REJECTED by STT!");
         println!();
         if rms < STT_MIN_RMS {
-            println!("  - RMS ({:.6}) is below threshold ({:.3})", rms, STT_MIN_RMS);
-            println!("    → Need {:.1}x more volume to pass RMS check", STT_MIN_RMS / rms);
+            println!(
+                "  - RMS ({:.6}) is below threshold ({:.3})",
+                rms, STT_MIN_RMS
+            );
+            println!(
+                "    → Need {:.1}x more volume to pass RMS check",
+                STT_MIN_RMS / rms
+            );
         }
         if max_val < STT_MIN_AMP {
-            println!("  - Amplitude ({:.6}) is below threshold ({:.3})", max_val, STT_MIN_AMP);
-            println!("    → Need {:.1}x more volume to pass amplitude check", STT_MIN_AMP / max_val);
+            println!(
+                "  - Amplitude ({:.6}) is below threshold ({:.3})",
+                max_val, STT_MIN_AMP
+            );
+            println!(
+                "    → Need {:.1}x more volume to pass amplitude check",
+                STT_MIN_AMP / max_val
+            );
         }
         println!();
         println!("SOLUTIONS:");

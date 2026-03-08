@@ -45,7 +45,10 @@ impl ProviderError {
             Self::RateLimited { .. } => true,
             Self::ServerError { .. } => true,
             Self::HttpError(msg) => is_transient_http_error(msg),
-            Self::ResponseReadError(_) | Self::JsonParseError(_) | Self::AuthError { .. } | Self::Cancelled => false,
+            Self::ResponseReadError(_)
+            | Self::JsonParseError(_)
+            | Self::AuthError { .. }
+            | Self::Cancelled => false,
         }
     }
 }
@@ -179,9 +182,7 @@ pub fn classify_tool_error(error_msg: &str) -> Option<ToolErrorKind> {
         return Some(ToolErrorKind::NotFound(error_msg.to_string()));
     }
 
-    if lower.contains("invalid")
-        || lower.contains("missing required")
-        || lower.contains("expected")
+    if lower.contains("invalid") || lower.contains("missing required") || lower.contains("expected")
     {
         return Some(ToolErrorKind::InvalidArgs(error_msg.to_string()));
     }
@@ -233,15 +234,17 @@ mod tests {
 
     #[test]
     fn test_provider_error_downcast() {
-        let anyhow_err: anyhow::Error =
-            ProviderError::AuthError {
-                status: 401,
-                message: "invalid key".into(),
-            }
-            .into();
+        let anyhow_err: anyhow::Error = ProviderError::AuthError {
+            status: 401,
+            message: "invalid key".into(),
+        }
+        .into();
         let downcasted = anyhow_err.downcast_ref::<ProviderError>();
         assert!(downcasted.is_some());
-        assert!(matches!(downcasted.unwrap(), ProviderError::AuthError { status: 401, .. }));
+        assert!(matches!(
+            downcasted.unwrap(),
+            ProviderError::AuthError { status: 401, .. }
+        ));
     }
 
     // -- classify_tool_error tests --
@@ -322,13 +325,19 @@ mod tests {
 
     #[test]
     fn test_retryable_rate_limited() {
-        let e = ProviderError::RateLimited { status: 429, retry_after_ms: 1000 };
+        let e = ProviderError::RateLimited {
+            status: 429,
+            retry_after_ms: 1000,
+        };
         assert!(e.is_retryable());
     }
 
     #[test]
     fn test_retryable_server_error() {
-        let e = ProviderError::ServerError { status: 503, message: "overloaded".into() };
+        let e = ProviderError::ServerError {
+            status: 503,
+            message: "overloaded".into(),
+        };
         assert!(e.is_retryable());
     }
 
@@ -366,7 +375,10 @@ mod tests {
 
     #[test]
     fn test_not_retryable_auth() {
-        let e = ProviderError::AuthError { status: 401, message: "invalid key".into() };
+        let e = ProviderError::AuthError {
+            status: 401,
+            message: "invalid key".into(),
+        };
         assert!(!e.is_retryable());
     }
 
@@ -392,7 +404,8 @@ mod tests {
         let anyhow_err: anyhow::Error = ProviderError::RateLimited {
             status: 429,
             retry_after_ms: 5000,
-        }.into();
+        }
+        .into();
         assert!(is_retryable_provider_error(&anyhow_err));
     }
 

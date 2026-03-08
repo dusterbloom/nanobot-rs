@@ -356,7 +356,10 @@ mod tests {
         };
 
         let result = router.create_cluster_provider(&decision).await;
-        assert!(result.is_some(), "Should return a provider for Cluster decision");
+        assert!(
+            result.is_some(),
+            "Should return a provider for Cluster decision"
+        );
         let (provider, model_id) = result.unwrap();
         assert_eq!(model_id, "qwen-72b");
         // The provider should report the cluster endpoint as its base.
@@ -371,7 +374,9 @@ mod tests {
         let state = ClusterState::new();
         let router = ClusterRouter::new(state, make_config(true, true));
 
-        let result = router.create_cluster_provider(&RoutingDecision::Local).await;
+        let result = router
+            .create_cluster_provider(&RoutingDecision::Local)
+            .await;
         assert!(result.is_none());
     }
 
@@ -380,7 +385,9 @@ mod tests {
         let state = ClusterState::new();
         let router = ClusterRouter::new(state, make_config(true, true));
 
-        let result = router.create_cluster_provider(&RoutingDecision::Cloud).await;
+        let result = router
+            .create_cluster_provider(&RoutingDecision::Cloud)
+            .await;
         assert!(result.is_none());
     }
 

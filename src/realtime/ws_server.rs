@@ -236,15 +236,15 @@ mod tests {
             ..Default::default()
         };
         let server = RealtimeServer::new(config);
-        
+
         let result = server.start().await;
         assert!(result.is_ok(), "Server should start: {:?}", result.err());
-        
+
         // Give it a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        
+
         server.stop();
-        
+
         // Give it a moment to stop
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

@@ -117,16 +117,27 @@ fn long_fixtures() -> Vec<Fixture> {
     let cargo_test_failure = {
         let mut s = String::new();
         s.push_str("running 134 tests\n");
-        s.push_str("test protocol::tests::local_assistant_preserves_tool_calls_for_lm_studio ... FAILED\n");
-        s.push_str("test lcm::tests::test_second_compaction_summarizes_after_first_summary ... FAILED\n");
+        s.push_str(
+            "test protocol::tests::local_assistant_preserves_tool_calls_for_lm_studio ... FAILED\n",
+        );
+        s.push_str(
+            "test lcm::tests::test_second_compaction_summarizes_after_first_summary ... FAILED\n",
+        );
         for i in 0..120 {
-            s.push_str(&format!("retry {}: waiting for local endpoint http://127.0.0.1:1234/v1\n", i + 1));
+            s.push_str(&format!(
+                "retry {}: waiting for local endpoint http://127.0.0.1:1234/v1\n",
+                i + 1
+            ));
         }
         s.push_str("failures:\n");
         s.push_str("---- protocol::tests::local_assistant_preserves_tool_calls_for_lm_studio stdout ----\n");
         s.push_str("assertion failed: expected assistant tool_calls in session JSONL\n");
-        s.push_str("---- lcm::tests::test_second_compaction_summarizes_after_first_summary stdout ----\n");
-        s.push_str("assertion failed: Second compaction should not include messages from first summary\n");
+        s.push_str(
+            "---- lcm::tests::test_second_compaction_summarizes_after_first_summary stdout ----\n",
+        );
+        s.push_str(
+            "assertion failed: Second compaction should not include messages from first summary\n",
+        );
         s.push_str("\ntest result: FAILED. 132 passed; 2 failed; 0 ignored\n");
         s
     };
@@ -191,7 +202,10 @@ fn long_fixtures() -> Vec<Fixture> {
             ],
             safety_critical: true,
             qa_checks: vec![
-                ("How many compiler errors are reported?", "2 previous errors"),
+                (
+                    "How many compiler errors are reported?",
+                    "2 previous errors",
+                ),
                 ("Name one error code", "E0502"),
             ],
         },
@@ -239,7 +253,11 @@ fn long_fixtures() -> Vec<Fixture> {
                 "deploy] skipped",
                 "protocol_tests.rs::local_assistant_preserves_tool_calls_for_lm_studio",
             ],
-            must_exclude: vec!["final_status=success", "deploy completed", "artifact published"],
+            must_exclude: vec![
+                "final_status=success",
+                "deploy completed",
+                "artifact published",
+            ],
             safety_critical: false,
             qa_checks: vec![
                 ("Which stage failed first?", "stage:test"),
@@ -382,7 +400,9 @@ fn hallucination_proxy(summary: &str, source: &str, must_exclude: &[&str]) -> us
     let mut seen = BTreeSet::new();
     for raw in summary.split_whitespace() {
         let t = raw
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '_' && c != '.' && c != '-')
+            .trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '/' && c != '_' && c != '.' && c != '-'
+            })
             .to_ascii_lowercase();
         if t.len() < 4 {
             continue;
@@ -465,7 +485,12 @@ fn truncate_to_estimated_tokens(input: &str, max_tokens: usize) -> String {
 
 async fn list_available_models(base: &str) -> anyhow::Result<Vec<String>> {
     let url = format!("{}/models", base.trim_end_matches('/'));
-    let value: serde_json::Value = reqwest::Client::new().get(&url).send().await?.json().await?;
+    let value: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await?
+        .json()
+        .await?;
     let data = value
         .get("data")
         .and_then(|v| v.as_array())
@@ -494,7 +519,12 @@ async fn prewarm_model(base: &str, model: &str) -> anyhow::Result<()> {
 async fn list_loaded_instances(base: &str) -> anyhow::Result<Vec<(String, String)>> {
     let native = base.trim_end_matches('/').trim_end_matches("/v1");
     let url = format!("{}/api/v1/models", native);
-    let value: serde_json::Value = reqwest::Client::new().get(&url).send().await?.json().await?;
+    let value: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await?
+        .json()
+        .await?;
     let mut out = Vec::new();
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
         for model in models {
@@ -723,7 +753,11 @@ async fn bench_specialist_summaries_small_to_3b() {
                                 model, profile.name, fixture.name, repeat, e
                             );
                             eprintln!("{}", msg);
-                            (String::new(), 0usize, TokenBudget::estimate_str_tokens(&trimmed_fixture))
+                            (
+                                String::new(),
+                                0usize,
+                                TokenBudget::estimate_str_tokens(&trimmed_fixture),
+                            )
                         }
                     };
 
@@ -736,7 +770,8 @@ async fn bench_specialist_summaries_small_to_3b() {
                     };
                     let fact_recall = recall_score(&summary, &fixture.must_include);
                     let qa = qa_accuracy(&summary, &fixture.qa_checks);
-                    let hall = hallucination_proxy(&summary, &trimmed_fixture, &fixture.must_exclude);
+                    let hall =
+                        hallucination_proxy(&summary, &trimmed_fixture, &fixture.must_exclude);
                     let think = thought_ratio(&summary);
                     let overrun = output_tokens as f64 / target_tokens.max(1) as f64;
                     let fallback_like = is_fallback_like(&summary);
@@ -803,16 +838,7 @@ async fn bench_specialist_summaries_small_to_3b() {
     eprintln!("\n{:-<96}", "");
     eprintln!(
         "{:<30} {:<10} {:>6} {:>7} {:>7} {:>9} {:>9} {:>8} {:>8} {:>8}",
-        "model",
-        "profile",
-        "runs",
-        "recall",
-        "qa",
-        "hall",
-        "p95ms",
-        "compr%",
-        "overrun",
-        "fbk%"
+        "model", "profile", "runs", "recall", "qa", "hall", "p95ms", "compr%", "overrun", "fbk%"
     );
     eprintln!("{:-<96}", "");
 
@@ -874,7 +900,10 @@ async fn bench_specialist_summaries_small_to_3b() {
         eprintln!("No profile passed strict gate. Keep current specialist and inspect failures.");
     }
     if let Some((m, p, score, _)) = best_overall {
-        eprintln!("Best overall quality score: {} [{}]  score={:.3}", m, p, score);
+        eprintln!(
+            "Best overall quality score: {} [{}]  score={:.3}",
+            m, p, score
+        );
     }
 
     // Persist compact JSON report.
@@ -943,8 +972,11 @@ async fn bench_specialist_summaries_small_to_3b() {
         "aggregates": agg_json,
     });
 
-    std::fs::write(&out_path, serde_json::to_string_pretty(&payload).unwrap_or_default())
-        .expect("failed to write benchmark report json");
+    std::fs::write(
+        &out_path,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    )
+    .expect("failed to write benchmark report json");
     eprintln!("Saved benchmark JSON: {}", out_path.display());
 
     assert!(

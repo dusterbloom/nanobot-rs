@@ -17,9 +17,17 @@ pub(crate) fn parse_input_mode(s: &str) -> crate::realtime::InputMode {
 }
 
 #[cfg(feature = "voice")]
-pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local: bool, mode: String) {
+pub(crate) fn cmd_realtime(
+    engine: String,
+    voice: String,
+    session: String,
+    local: bool,
+    mode: String,
+) {
     use crate::config::schema::TtsEngineConfig;
-    use crate::realtime::{VoiceAgent, VoiceAgentConfig, VoiceAgentEvent, RealtimeConfig, InputMode};
+    use crate::realtime::{
+        InputMode, RealtimeConfig, VoiceAgent, VoiceAgentConfig, VoiceAgentEvent,
+    };
 
     println!("{} Realtime Voice Mode\n", crate::LOGO);
 
@@ -97,10 +105,26 @@ pub(crate) fn cmd_realtime(engine: String, voice: String, session: String, local
     let core_handle = if let Some(ref mlx) = mlx_handle {
         super::build_core_handle_mlx(&nanobot_config, mlx)
     } else {
-        build_core_handle(&nanobot_config, "8080", local_model, None, None, None, is_local)
+        build_core_handle(
+            &nanobot_config,
+            "8080",
+            local_model,
+            None,
+            None,
+            None,
+            is_local,
+        )
     };
     #[cfg(not(feature = "mlx"))]
-    let core_handle = build_core_handle(&nanobot_config, "8080", local_model, None, None, None, is_local);
+    let core_handle = build_core_handle(
+        &nanobot_config,
+        "8080",
+        local_model,
+        None,
+        None,
+        None,
+        is_local,
+    );
 
     #[cfg(feature = "mlx")]
     let agent_loop = if let Some(ref mlx) = mlx_handle {
@@ -229,7 +253,10 @@ pub(crate) fn cmd_realtime_server(port: u16, engine: String, voice: String, host
     println!("  TTS Engine: {:?}", config.tts_engine);
     println!("  Voice: {}", config.voice);
     println!();
-    println!("  OpenAI-compatible endpoint: ws://{}:{}/v1/realtime", config.host, config.port);
+    println!(
+        "  OpenAI-compatible endpoint: ws://{}:{}/v1/realtime",
+        config.host, config.port
+    );
     println!();
     println!("  Press Ctrl+C to stop");
     println!();

@@ -3,8 +3,8 @@
 
 use serde_json::json;
 
-use nanobot::agent::turn::{turn_from_legacy, MediaAttachment, ToolCall, Turn};
 use nanobot::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
+use nanobot::agent::turn::{turn_from_legacy, MediaAttachment, ToolCall, Turn};
 
 // ─────────────────────────────────────────────────────────────
 // Phase 1: Turn enum serialization and legacy conversion
@@ -72,7 +72,12 @@ fn turn_summary_round_trips() {
     };
     let s = serde_json::to_string(&t).unwrap();
     let t2: Turn = serde_json::from_str(&s).unwrap();
-    if let Turn::Summary { text, source_ids, level } = t2 {
+    if let Turn::Summary {
+        text,
+        source_ids,
+        level,
+    } = t2
+    {
         assert_eq!(level, 1);
         assert_eq!(source_ids.len(), 4);
         assert!(text.contains("Messages 1-20"));
@@ -83,7 +88,10 @@ fn turn_summary_round_trips() {
 
 #[test]
 fn turn_kind_tag_is_snake_case() {
-    let user = Turn::User { content: "hi".into(), media: vec![] };
+    let user = Turn::User {
+        content: "hi".into(),
+        media: vec![],
+    };
     let v = serde_json::to_value(&user).unwrap();
     assert_eq!(v["kind"], "user");
 
@@ -96,7 +104,11 @@ fn turn_kind_tag_is_snake_case() {
     let v = serde_json::to_value(&result).unwrap();
     assert_eq!(v["kind"], "tool_result");
 
-    let summary = Turn::Summary { text: "s".into(), source_ids: vec![], level: 1 };
+    let summary = Turn::Summary {
+        text: "s".into(),
+        source_ids: vec![],
+        level: 1,
+    };
     let v = serde_json::to_value(&summary).unwrap();
     assert_eq!(v["kind"], "summary");
 }
@@ -161,7 +173,13 @@ fn legacy_tool_result_converts_to_turn_tool_result() {
         "content": "file contents here"
     });
     let t = turn_from_legacy(&legacy).unwrap();
-    if let Turn::ToolResult { call_id, tool, result, ok } = t {
+    if let Turn::ToolResult {
+        call_id,
+        tool,
+        result,
+        ok,
+    } = t
+    {
         assert_eq!(call_id, "tc_1");
         assert_eq!(tool, "read_file");
         assert_eq!(result, "file contents here");
@@ -195,7 +213,10 @@ fn legacy_unknown_role_returns_none() {
 // Helper shared by multiple tests
 fn make_tool_calling_turns() -> Vec<Turn> {
     vec![
-        Turn::User { content: "read Cargo.toml".into(), media: vec![] },
+        Turn::User {
+            content: "read Cargo.toml".into(),
+            media: vec![],
+        },
         Turn::Assistant {
             text: None,
             tool_calls: vec![ToolCall {
@@ -215,17 +236,41 @@ fn make_tool_calling_turns() -> Vec<Turn> {
 
 fn make_multi_tool_turns() -> Vec<Turn> {
     vec![
-        Turn::User { content: "do two things".into(), media: vec![] },
+        Turn::User {
+            content: "do two things".into(),
+            media: vec![],
+        },
         Turn::Assistant {
             text: None,
             tool_calls: vec![
-                ToolCall { id: "tc_1".into(), tool: "read_file".into(), args: json!({"path": "a"}) },
-                ToolCall { id: "tc_2".into(), tool: "exec".into(), args: json!({"cmd": "ls"}) },
+                ToolCall {
+                    id: "tc_1".into(),
+                    tool: "read_file".into(),
+                    args: json!({"path": "a"}),
+                },
+                ToolCall {
+                    id: "tc_2".into(),
+                    tool: "exec".into(),
+                    args: json!({"cmd": "ls"}),
+                },
             ],
         },
-        Turn::ToolResult { call_id: "tc_1".into(), tool: "read_file".into(), result: "contents of a".into(), ok: true },
-        Turn::ToolResult { call_id: "tc_2".into(), tool: "exec".into(), result: "file1\nfile2".into(), ok: true },
-        Turn::Assistant { text: Some("Done".into()), tool_calls: vec![] },
+        Turn::ToolResult {
+            call_id: "tc_1".into(),
+            tool: "read_file".into(),
+            result: "contents of a".into(),
+            ok: true,
+        },
+        Turn::ToolResult {
+            call_id: "tc_2".into(),
+            tool: "exec".into(),
+            result: "file1\nfile2".into(),
+            ok: true,
+        },
+        Turn::Assistant {
+            text: Some("Done".into()),
+            tool_calls: vec![],
+        },
     ]
 }
 
@@ -238,10 +283,16 @@ fn make_multi_tool_turns() -> Vec<Turn> {
 #[test]
 fn local_renders_system_as_first_message() {
     let protocol = LocalProtocol::default();
-    let turns = vec![Turn::User { content: "hi".into(), media: vec![] }];
+    let turns = vec![Turn::User {
+        content: "hi".into(),
+        media: vec![],
+    }];
     let wire = protocol.render("You are helpful.", &turns);
     assert_eq!(wire[0]["role"], "system");
-    assert!(wire[0]["content"].as_str().unwrap().contains("You are helpful."));
+    assert!(wire[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("You are helpful."));
 }
 
 #[test]
@@ -250,13 +301,19 @@ fn local_renders_tool_result_as_user_message() {
     let wire = protocol.render("sys", &make_tool_calling_turns());
     // Last non-appended message before possible continuation
     let tool_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "tool").collect();
-    assert!(tool_msgs.is_empty(), "local protocol must never emit role:tool");
+    assert!(
+        tool_msgs.is_empty(),
+        "local protocol must never emit role:tool"
+    );
     // The tool result should appear as a user message
     let user_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "user").collect();
     let has_tool_result_as_user = user_msgs
         .iter()
         .any(|m| m["content"].as_str().unwrap_or("").contains("read_file"));
-    assert!(has_tool_result_as_user, "tool result should appear in a user message");
+    assert!(
+        has_tool_result_as_user,
+        "tool result should appear in a user message"
+    );
 }
 
 #[test]
@@ -274,8 +331,14 @@ fn local_always_ends_with_user() {
     let protocol = LocalProtocol::default();
     // Turns ending with assistant — local must append a continuation
     let turns = vec![
-        Turn::User { content: "hi".into(), media: vec![] },
-        Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "hi".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("hello".into()),
+            tool_calls: vec![],
+        },
     ];
     let wire = protocol.render("sys", &turns);
     assert_eq!(wire.last().unwrap()["role"], "user");
@@ -293,19 +356,36 @@ fn local_no_mid_thread_system_messages() {
     let protocol = LocalProtocol::default();
     // A System turn that's not the first — must become a user message
     let turns = vec![
-        Turn::User { content: "hi".into(), media: vec![] },
-        Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
-        Turn::System { content: "New system notice".into() },
-        Turn::User { content: "continue".into(), media: vec![] },
+        Turn::User {
+            content: "hi".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("hello".into()),
+            tool_calls: vec![],
+        },
+        Turn::System {
+            content: "New system notice".into(),
+        },
+        Turn::User {
+            content: "continue".into(),
+            media: vec![],
+        },
     ];
     let wire = protocol.render("sys", &turns);
     let non_first_system = wire.iter().skip(1).any(|m| m["role"] == "system");
     assert!(!non_first_system, "no system messages after index 0");
     // The injected system content must appear somewhere as a user message
-    let has_notice = wire
-        .iter()
-        .any(|m| m["content"].as_str().unwrap_or("").contains("New system notice"));
-    assert!(has_notice, "system notice content must appear in wire output");
+    let has_notice = wire.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("New system notice")
+    });
+    assert!(
+        has_notice,
+        "system notice content must appear in wire output"
+    );
 }
 
 #[test]
@@ -313,7 +393,10 @@ fn local_assistant_preserves_tool_calls_for_lm_studio() {
     let protocol = LocalProtocol::default();
     // Turn: assistant with tool_calls → tool_calls field is preserved for LM Studio
     let turns = vec![
-        Turn::User { content: "read file".into(), media: vec![] },
+        Turn::User {
+            content: "read file".into(),
+            media: vec![],
+        },
         Turn::Assistant {
             text: None,
             tool_calls: vec![ToolCall {
@@ -322,28 +405,35 @@ fn local_assistant_preserves_tool_calls_for_lm_studio() {
                 args: json!({"path": "Cargo.toml"}),
             }],
         },
-        Turn::ToolResult { call_id: "tc_1".into(), tool: "read_file".into(), result: "data".into(), ok: true },
+        Turn::ToolResult {
+            call_id: "tc_1".into(),
+            tool: "read_file".into(),
+            result: "data".into(),
+            ok: true,
+        },
     ];
     let wire = protocol.render("sys", &turns);
     let assistant_msgs: Vec<_> = wire.iter().filter(|m| m["role"] == "assistant").collect();
     // At least one assistant message must exist
     assert!(!assistant_msgs.is_empty());
     // LocalProtocol now PRESERVES tool_calls for native tool-calling support (LM Studio)
-    let has_tool_calls = assistant_msgs
-        .iter()
-        .any(|m| m.get("tool_calls").is_some());
-    assert!(has_tool_calls, "local assistant should preserve tool_calls for LM Studio compatibility");
+    let has_tool_calls = assistant_msgs.iter().any(|m| m.get("tool_calls").is_some());
+    assert!(
+        has_tool_calls,
+        "local assistant should preserve tool_calls for LM Studio compatibility"
+    );
     // Tool results are still converted to user messages
-    let tool_result_as_user = wire
-        .iter()
-        .any(|m| {
-            m["role"] == "user"
-                && m["content"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("tool execution complete")
-        });
-    assert!(tool_result_as_user, "tool results should be converted to user messages");
+    let tool_result_as_user = wire.iter().any(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("tool execution complete")
+    });
+    assert!(
+        tool_result_as_user,
+        "tool results should be converted to user messages"
+    );
 }
 
 // ---- CloudProtocol ----
@@ -352,17 +442,29 @@ fn local_assistant_preserves_tool_calls_for_lm_studio() {
 fn cloud_renders_tool_result_with_role_tool() {
     let protocol = CloudProtocol;
     let wire = protocol.render("sys", &make_tool_calling_turns());
-    let tool_msg = wire.iter().find(|m| m["role"] == "tool").expect("must have role:tool");
+    let tool_msg = wire
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("must have role:tool");
     assert_eq!(tool_msg["tool_call_id"], "tc_1");
-    assert!(tool_msg["content"].as_str().unwrap_or("").contains("nanobot"));
+    assert!(tool_msg["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("nanobot"));
 }
 
 #[test]
 fn cloud_renders_assistant_with_tool_calls_field() {
     let protocol = CloudProtocol;
     let wire = protocol.render("sys", &make_tool_calling_turns());
-    let asst = wire.iter().find(|m| m["role"] == "assistant").expect("must have assistant");
-    assert!(asst.get("tool_calls").is_some(), "cloud assistant must include tool_calls field");
+    let asst = wire
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("must have assistant");
+    assert!(
+        asst.get("tool_calls").is_some(),
+        "cloud assistant must include tool_calls field"
+    );
 }
 
 #[test]
@@ -370,8 +472,14 @@ fn cloud_does_not_end_with_assistant() {
     let protocol = CloudProtocol;
     // Turns ending with assistant — cloud must append a user continuation
     let turns = vec![
-        Turn::User { content: "hi".into(), media: vec![] },
-        Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "hi".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("hello".into()),
+            tool_calls: vec![],
+        },
     ];
     let wire = protocol.render("sys", &turns);
     assert_ne!(
@@ -384,7 +492,10 @@ fn cloud_does_not_end_with_assistant() {
 #[test]
 fn cloud_system_message_is_first() {
     let protocol = CloudProtocol;
-    let turns = vec![Turn::User { content: "hi".into(), media: vec![] }];
+    let turns = vec![Turn::User {
+        content: "hi".into(),
+        media: vec![],
+    }];
     let wire = protocol.render("You are a bot.", &turns);
     assert_eq!(wire[0]["role"], "system");
 }

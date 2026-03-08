@@ -91,7 +91,12 @@ fn log_contains_token(logs_dir: &Path, needle: &str) -> bool {
     false
 }
 
-fn run_local_agent_once(bin: &Path, home: &Path, session: &str, prompt: &str) -> std::process::Output {
+fn run_local_agent_once(
+    bin: &Path,
+    home: &Path,
+    session: &str,
+    prompt: &str,
+) -> std::process::Output {
     Command::new(bin)
         .env("HOME", home)
         .arg("agent")
@@ -173,12 +178,12 @@ fn agent_local_single_turn_smoke() {
     );
 
     let session_turns = read_session_jsonl(&session_path);
-    assert!(session_turns.iter().any(|m| m.get("role") == Some(&Value::String("user".to_string()))));
-    assert!(
-        session_turns
-            .iter()
-            .any(|m| m.get("role") == Some(&Value::String("assistant".to_string())))
-    );
+    assert!(session_turns
+        .iter()
+        .any(|m| m.get("role") == Some(&Value::String("user".to_string()))));
+    assert!(session_turns
+        .iter()
+        .any(|m| m.get("role") == Some(&Value::String("assistant".to_string()))));
 
     let logs_dir = home.join(".nanobot").join("logs");
     assert!(
@@ -231,8 +236,7 @@ fn agent_local_tool_call_smoke() {
 
     let has_assistant_tool_call = session_turns.iter().any(|m| {
         m.get("role") == Some(&Value::String("assistant".to_string()))
-            && m
-                .get("tool_calls")
+            && m.get("tool_calls")
                 .and_then(|v| v.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false)
@@ -255,7 +259,8 @@ fn agent_local_tool_call_smoke() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("SMOKE_TOOL_SENTINEL") || stdout.to_lowercase().contains("smoke_tool_sentinel"),
+        stdout.contains("SMOKE_TOOL_SENTINEL")
+            || stdout.to_lowercase().contains("smoke_tool_sentinel"),
         "expected final output to include sentinel line; stdout={} stderr={}",
         stdout,
         String::from_utf8_lossy(&output.stderr)

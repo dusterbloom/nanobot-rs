@@ -16,10 +16,7 @@ use std::path::{Path, PathBuf};
 /// 3. Glob fallback: `/mnt/c/Users/*/.cache/lm-studio/bin/lms.exe`
 pub(crate) fn find_lms_binary() -> Option<PathBuf> {
     // 1. Check PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("lms")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("lms").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -29,10 +26,7 @@ pub(crate) fn find_lms_binary() -> Option<PathBuf> {
     }
 
     // Also check for lms.exe on PATH (WSL2 can run .exe)
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("lms.exe")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("lms.exe").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -105,7 +99,15 @@ pub(crate) async fn server_start(lms_bin: &Path, port: u16) -> Result<(), String
     }
 
     let output = tokio::process::Command::new(lms_bin)
-        .args(["server", "start", "--port", &port.to_string(), "--bind", "0.0.0.0", "--cors"])
+        .args([
+            "server",
+            "start",
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "0.0.0.0",
+            "--cors",
+        ])
         .output()
         .await
         .map_err(|e| format!("failed to run lms server start: {}", e))?;
@@ -150,7 +152,11 @@ pub(crate) fn server_stop(lms_bin: &Path) -> Result<(), String> {
 /// When `host` is non-empty it is used directly; otherwise `api_host()` is
 /// called to resolve the WSL2 Windows host IP (or `"127.0.0.1"` on native Linux).
 fn rest_base(host: &str, port: u16) -> String {
-    let h = if host.is_empty() { api_host() } else { host.to_string() };
+    let h = if host.is_empty() {
+        api_host()
+    } else {
+        host.to_string()
+    };
     format!("http://{}:{}", h, port)
 }
 
@@ -180,7 +186,10 @@ pub(crate) async fn load_model_at(
     // Check if already loaded with matching context
     let models = list_models_full_at(base_url).await;
     if should_skip_load(&models, model, context_length) {
-        tracing::debug!("lms skip load: model={} already loaded with matching context", model);
+        tracing::debug!(
+            "lms skip load: model={} already loaded with matching context",
+            model
+        );
         return Ok(());
     }
 
@@ -202,7 +211,13 @@ pub(crate) async fn reload_model_with_context(
     load_timeout_secs: u64,
     unload_timeout_secs: u64,
 ) -> Result<(), String> {
-    reload_model_with_context_at(&rest_base(host, port), model, context_length, unload_timeout_secs).await
+    reload_model_with_context_at(
+        &rest_base(host, port),
+        model,
+        context_length,
+        unload_timeout_secs,
+    )
+    .await
 }
 
 /// Like `reload_model_with_context` but accepts a full base URL.
@@ -213,7 +228,8 @@ pub(crate) async fn reload_model_with_context_at(
     unload_timeout_secs: u64,
 ) -> Result<(), String> {
     let models = list_models_full_at(base_url).await;
-    let loaded_keys: Vec<String> = models.iter()
+    let loaded_keys: Vec<String> = models
+        .iter()
         .filter(|m| m.loaded && model_matches(&m.key, model))
         .map(|m| m.key.clone())
         .collect();
@@ -236,7 +252,9 @@ pub(crate) fn model_matches(loaded: &str, model: &str) -> bool {
 }
 
 fn should_skip_load(models: &[ModelInfo], model: &str, context_length: Option<usize>) -> bool {
-    let found = models.iter().find(|m| m.loaded && model_matches(&m.key, model));
+    let found = models
+        .iter()
+        .find(|m| m.loaded && model_matches(&m.key, model));
     match found {
         None => false,
         Some(info) => match context_length {
@@ -263,14 +281,17 @@ async fn post_load_model_at(
     model: &str,
     context_length: Option<usize>,
 ) -> Result<(), String> {
-
     let url = format!("{}/api/v1/models/load", base_url);
     let mut body = serde_json::json!({ "model": model });
     if let Some(ctx) = context_length {
         body["context_length"] = serde_json::json!(ctx);
     }
 
-    tracing::info!("lms load via HTTP: model={} ctx={:?}", model, context_length);
+    tracing::info!(
+        "lms load via HTTP: model={} ctx={:?}",
+        model,
+        context_length
+    );
 
     let client = reqwest::Client::new();
     let resp = client
@@ -284,14 +305,22 @@ async fn post_load_model_at(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("lms load '{}' failed (HTTP {}): {}", model, status, text));
+        return Err(format!(
+            "lms load '{}' failed (HTTP {}): {}",
+            model, status, text
+        ));
     }
 
     let json: serde_json::Value = resp.json().await.unwrap_or_default();
-    let load_time = json.get("load_time_seconds")
+    let load_time = json
+        .get("load_time_seconds")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    tracing::info!("lms load complete: model={} load_time={:.1}s", model, load_time);
+    tracing::info!(
+        "lms load complete: model={} load_time={:.1}s",
+        model,
+        load_time
+    );
 
     Ok(())
 }
@@ -300,7 +329,12 @@ async fn post_load_model_at(
 ///
 /// `host` is the hostname or IP of the LM Studio server.  Pass `""` to use the
 /// default resolved via `api_host()`.
-pub(crate) async fn unload_model(host: &str, port: u16, model: &str, timeout_secs: u64) -> Result<(), String> {
+pub(crate) async fn unload_model(
+    host: &str,
+    port: u16,
+    model: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
     unload_model_at(&rest_base(host, port), model).await
 }
 
@@ -321,7 +355,10 @@ pub(crate) async fn unload_model_at(base_url: &str, model: &str) -> Result<(), S
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("lms unload '{}' failed (HTTP {}): {}", model, status, text));
+        return Err(format!(
+            "lms unload '{}' failed (HTTP {}): {}",
+            model, status, text
+        ));
     }
 
     Ok(())
@@ -375,8 +412,7 @@ async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
         .filter_map(|m| {
             let key = m.get("key")?.as_str()?.to_string();
             let model_type = m.get("type")?.as_str()?.to_string();
-            let instances = m.get("loaded_instances")
-                .and_then(|v| v.as_array());
+            let instances = m.get("loaded_instances").and_then(|v| v.as_array());
             let loaded = instances.map(|a| !a.is_empty()).unwrap_or(false);
             let loaded_context = instances
                 .and_then(|arr| arr.first())
@@ -384,7 +420,12 @@ async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
                 .and_then(|c| c.get("context_length"))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
-            Some(ModelInfo { key, model_type, loaded, loaded_context })
+            Some(ModelInfo {
+                key,
+                model_type,
+                loaded,
+                loaded_context,
+            })
         })
         .collect()
 }
@@ -534,8 +575,7 @@ fn parse_wsl_host_ip(proc_version: &str, resolv_conf: &str) -> Option<String> {
 async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
     let host = api_host();
     let url = format!("http://{}:{}/v1/models", host, port);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(&url).await {
@@ -593,8 +633,10 @@ pub(crate) async fn probe_jinja_support(api_base: &str) -> bool {
             }
             // 4xx with error about tools → jinja not enabled
             let text = resp.text().await.unwrap_or_default();
-            let no_jinja = text.contains("tools") || text.contains("jinja")
-                || text.contains("not supported") || text.contains("unknown field");
+            let no_jinja = text.contains("tools")
+                || text.contains("jinja")
+                || text.contains("not supported")
+                || text.contains("unknown field");
             if no_jinja {
                 tracing::warn!("jinja_probe: tools rejected — --jinja likely not enabled");
             }
@@ -645,14 +687,12 @@ mod tests {
             if instances.is_empty() {
                 return None;
             }
-            return instances
-                .iter()
-                .find_map(|inst| {
-                    inst.get("config")
-                        .and_then(|c| c.get("context_length"))
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                });
+            return instances.iter().find_map(|inst| {
+                inst.get("config")
+                    .and_then(|c| c.get("context_length"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+            });
         }
         None
     }
@@ -711,7 +751,8 @@ mod tests {
     #[test]
     fn test_parse_wsl_host_ip_wsl2() {
         let proc_version = "Linux version 5.15.167.4-microsoft-standard-WSL2";
-        let resolv_conf = "# This file was automatically generated by WSL.\nnameserver 172.26.16.1\n";
+        let resolv_conf =
+            "# This file was automatically generated by WSL.\nnameserver 172.26.16.1\n";
         assert_eq!(
             parse_wsl_host_ip(proc_version, resolv_conf),
             Some("172.26.16.1".to_string())
@@ -767,27 +808,42 @@ mod tests {
     #[test]
     fn test_resolve_exact_match() {
         let available = vec!["nvidia_orchestrator-8b".to_string()];
-        assert_eq!(resolve_model_name(&available, "nvidia_orchestrator-8b"), "nvidia_orchestrator-8b");
+        assert_eq!(
+            resolve_model_name(&available, "nvidia_orchestrator-8b"),
+            "nvidia_orchestrator-8b"
+        );
     }
 
     #[test]
     fn test_resolve_with_org_prefix() {
-        let available = vec!["qwen/qwen2.5-vl-7b".to_string(), "nanbeige4.1-3b".to_string()];
+        let available = vec![
+            "qwen/qwen2.5-vl-7b".to_string(),
+            "nanbeige4.1-3b".to_string(),
+        ];
         // Stripped GGUF name contains the LMS base name (after org prefix removed)
-        assert_eq!(resolve_model_name(&available, "Qwen2.5-VL-7B-Instruct"), "qwen/qwen2.5-vl-7b");
+        assert_eq!(
+            resolve_model_name(&available, "Qwen2.5-VL-7B-Instruct"),
+            "qwen/qwen2.5-vl-7b"
+        );
     }
 
     #[test]
     fn test_resolve_instruct_suffix_stripped() {
         let available = vec!["qwen/qwen2.5-vl-7b".to_string()];
         // GGUF has -Instruct suffix, LMS doesn't — strip_match_suffixes handles this
-        assert_eq!(resolve_model_name(&available, "qwen2.5-vl-7b-instruct"), "qwen/qwen2.5-vl-7b");
+        assert_eq!(
+            resolve_model_name(&available, "qwen2.5-vl-7b-instruct"),
+            "qwen/qwen2.5-vl-7b"
+        );
     }
 
     #[test]
     fn test_resolve_no_match_returns_input() {
         let available = vec!["nanbeige4.1-3b".to_string()];
-        assert_eq!(resolve_model_name(&available, "nonexistent-model"), "nonexistent-model");
+        assert_eq!(
+            resolve_model_name(&available, "nonexistent-model"),
+            "nonexistent-model"
+        );
     }
 
     #[test]
@@ -803,7 +859,10 @@ mod tests {
 
     #[test]
     fn test_strip_match_suffixes() {
-        assert_eq!(strip_match_suffixes("qwen2.5-vl-7b-instruct"), "qwen2.5-vl-7b");
+        assert_eq!(
+            strip_match_suffixes("qwen2.5-vl-7b-instruct"),
+            "qwen2.5-vl-7b"
+        );
         assert_eq!(strip_match_suffixes("model-chat"), "model");
         assert_eq!(strip_match_suffixes("model-it"), "model");
         assert_eq!(strip_match_suffixes("plain-model"), "plain-model");
@@ -820,7 +879,11 @@ mod tests {
 
     #[test]
     fn test_should_skip_load_when_loaded_and_no_context_requested() {
-        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(4096))];
+        let models = vec![make_model_info(
+            "qwen2.5-coder-7b-instruct-mlx",
+            true,
+            Some(4096),
+        )];
         assert!(should_skip_load(
             &models,
             "qwen2.5-coder-7b-instruct-mlx",
@@ -830,7 +893,11 @@ mod tests {
 
     #[test]
     fn test_should_skip_load_when_context_matches() {
-        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(6144))];
+        let models = vec![make_model_info(
+            "qwen2.5-coder-7b-instruct-mlx",
+            true,
+            Some(6144),
+        )];
         assert!(should_skip_load(
             &models,
             "qwen2.5-coder-7b-instruct-mlx",
@@ -840,7 +907,11 @@ mod tests {
 
     #[test]
     fn test_should_not_skip_load_when_context_differs() {
-        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", true, Some(4096))];
+        let models = vec![make_model_info(
+            "qwen2.5-coder-7b-instruct-mlx",
+            true,
+            Some(4096),
+        )];
         assert!(!should_skip_load(
             &models,
             "qwen2.5-coder-7b-instruct-mlx",
@@ -850,7 +921,11 @@ mod tests {
 
     #[test]
     fn test_should_not_skip_load_when_not_loaded() {
-        let models = vec![make_model_info("qwen2.5-coder-7b-instruct-mlx", false, None)];
+        let models = vec![make_model_info(
+            "qwen2.5-coder-7b-instruct-mlx",
+            false,
+            None,
+        )];
         assert!(!should_skip_load(
             &models,
             "qwen2.5-coder-7b-instruct-mlx",

@@ -644,9 +644,11 @@ impl LLMProvider for AnthropicProvider {
                     req = req.header("x-api-key", &api_key);
                 }
 
-                let response = req.json(&body).send().await.map_err(|e| {
-                    ProviderError::HttpError(e.to_string())
-                })?;
+                let response = req
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::HttpError(e.to_string()))?;
 
                 let status = response.status();
                 if !status.is_success() {
@@ -1244,7 +1246,10 @@ mod tests {
         }
 
         let resp = done_response.expect("should produce Done even for empty stream");
-        assert!(resp.content.is_none(), "empty stream should have no content");
+        assert!(
+            resp.content.is_none(),
+            "empty stream should have no content"
+        );
         assert!(resp.tool_calls.is_empty());
     }
 }

@@ -271,7 +271,11 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
-    CliArgs { config_filter, quick, out }
+    CliArgs {
+        config_filter,
+        quick,
+        out,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,28 +287,44 @@ struct EndpointInfo {
     model: String,
 }
 
-fn extract_endpoints(config: &nanobot::config::schema::Config) -> (EndpointInfo, EndpointInfo, EndpointInfo) {
+fn extract_endpoints(
+    config: &nanobot::config::schema::Config,
+) -> (EndpointInfo, EndpointInfo, EndpointInfo) {
     // Router endpoint
     let router = if let Some(ep) = &config.trio.router_endpoint {
-        EndpointInfo { url: ep.url.clone(), model: ep.model.clone() }
+        EndpointInfo {
+            url: ep.url.clone(),
+            model: ep.model.clone(),
+        }
     } else {
         let port = config.trio.router_port;
         let model = config.trio.router_model.clone();
         EndpointInfo {
             url: format!("http://localhost:{}/v1", port),
-            model: if model.is_empty() { "router-model".to_string() } else { model },
+            model: if model.is_empty() {
+                "router-model".to_string()
+            } else {
+                model
+            },
         }
     };
 
     // Specialist endpoint
     let specialist = if let Some(ep) = &config.trio.specialist_endpoint {
-        EndpointInfo { url: ep.url.clone(), model: ep.model.clone() }
+        EndpointInfo {
+            url: ep.url.clone(),
+            model: ep.model.clone(),
+        }
     } else {
         let port = config.trio.specialist_port;
         let model = config.trio.specialist_model.clone();
         EndpointInfo {
             url: format!("http://localhost:{}/v1", port),
-            model: if model.is_empty() { "specialist-model".to_string() } else { model },
+            model: if model.is_empty() {
+                "specialist-model".to_string()
+            } else {
+                model
+            },
         }
     };
 
@@ -376,15 +396,23 @@ fn generate_markdown_report(
         let avg_router_ms = if router_ms.is_empty() {
             "N/A".to_string()
         } else {
-            format!("{:.0}ms", router_ms.iter().sum::<u64>() as f64 / router_ms.len() as f64)
+            format!(
+                "{:.0}ms",
+                router_ms.iter().sum::<u64>() as f64 / router_ms.len() as f64
+            )
         };
 
-        let avg_total_ms = results.iter().map(|r| r.total_latency_ms).sum::<u64>() as f64
-            / results.len() as f64;
+        let avg_total_ms =
+            results.iter().map(|r| r.total_latency_ms).sum::<u64>() as f64 / results.len() as f64;
 
         md.push_str(&format!(
             "| {} | {:.1}% ({}/{}) | {} | {:.0}ms |\n",
-            label, accuracy, correct, results.len(), avg_router_ms, avg_total_ms
+            label,
+            accuracy,
+            correct,
+            results.len(),
+            avg_router_ms,
+            avg_total_ms
         ));
     }
     md.push('\n');
@@ -393,7 +421,9 @@ fn generate_markdown_report(
     for (label, results) in all_results {
         // Find sweep config for label
         let sweep = SWEEPS.iter().find(|s| s.label == label.as_str());
-        let (rt, st) = sweep.map(|s| (s.router_temp, s.specialist_temp)).unwrap_or((0.0, 0.0));
+        let (rt, st) = sweep
+            .map(|s| (s.router_temp, s.specialist_temp))
+            .unwrap_or((0.0, 0.0));
 
         md.push_str(&format!(
             "## Config: {} (router_temp={:.1}, spec_temp={:.1})\n\n",
@@ -454,7 +484,11 @@ fn generate_markdown_report(
         md.push_str(&format!("### Scenario {}\n\n", idx));
         for (label, results) in all_results {
             if let Some(r) = results.iter().find(|r| r.idx == *idx) {
-                md.push_str(&format!("**{}**: {}\n\n", label, r.response_preview.replace('\n', " ")));
+                md.push_str(&format!(
+                    "**{}**: {}\n\n",
+                    label,
+                    r.response_preview.replace('\n', " ")
+                ));
             }
         }
         md.push('\n');
@@ -492,9 +526,10 @@ async fn main() {
     println!();
 
     // Build providers
-    let router_provider = OpenAICompatProvider::new("", Some(&router_ep.url), Some(&router_ep.model));
-    let spec_provider   = OpenAICompatProvider::new("", Some(&spec_ep.url),   Some(&spec_ep.model));
-    let solo_provider   = OpenAICompatProvider::new("", Some(&main_ep.url),   Some(&main_ep.model));
+    let router_provider =
+        OpenAICompatProvider::new("", Some(&router_ep.url), Some(&router_ep.model));
+    let spec_provider = OpenAICompatProvider::new("", Some(&spec_ep.url), Some(&spec_ep.model));
+    let solo_provider = OpenAICompatProvider::new("", Some(&main_ep.url), Some(&main_ep.model));
 
     let tool_names = "read_file,list_directory,run_bash,fetch_url,spawn_agent";
 
@@ -533,12 +568,7 @@ async fn main() {
 
         for (si, scenario) in scenarios.iter().enumerate() {
             let prompt_short = truncate_to(scenario.prompt, 40);
-            print!(
-                "  [{}/{}] {} ...",
-                si + 1,
-                scenarios.len(),
-                prompt_short
-            );
+            print!("  [{}/{}] {} ...", si + 1, scenarios.len(), prompt_short);
             let _ = std::io::stdout().flush();
 
             let t_start = Instant::now();
@@ -605,20 +635,23 @@ async fn main() {
                             .await;
 
                         let response_preview = match &response {
-                            Ok(r) => truncate_to(
-                                r.content.as_deref().unwrap_or("[no content]"),
-                                300,
-                            ),
+                            Ok(r) => {
+                                truncate_to(r.content.as_deref().unwrap_or("[no content]"), 300)
+                            }
                             Err(e) => format!("[error: {}]", e),
                         };
 
                         let routing_correct = decision.action == scenario.expected
                             || (scenario.expected == "respond" && decision.action == "respond")
                             || (scenario.expected == "tool" && decision.action == "tool")
-                            || (scenario.expected == "specialist" && decision.action == "specialist");
+                            || (scenario.expected == "specialist"
+                                && decision.action == "specialist");
 
                         let total_ms = t_start.elapsed().as_millis() as u64;
-                        println!(" {} ({:.2}) {}ms", decision.action, decision.confidence, total_ms);
+                        println!(
+                            " {} ({:.2}) {}ms",
+                            decision.action, decision.confidence, total_ms
+                        );
 
                         results.push(ScenarioResult {
                             idx: scenario.idx,
@@ -658,7 +691,15 @@ async fn main() {
                 // Solo mode: direct call to solo provider, no router
                 let msgs = build_solo_messages(scenario.prompt);
                 let response = solo_provider
-                    .chat(&msgs, None, Some(&main_ep.model), scenario.max_tokens, 0.7, None, None)
+                    .chat(
+                        &msgs,
+                        None,
+                        Some(&main_ep.model),
+                        scenario.max_tokens,
+                        0.7,
+                        None,
+                        None,
+                    )
                     .await;
 
                 let response_preview = match &response {

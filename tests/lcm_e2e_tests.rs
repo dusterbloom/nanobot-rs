@@ -5,14 +5,14 @@
 //! 2. LCM summarizes the correct block (after last summary, not from beginning)
 //! 3. Refusal patterns should be filtered from summaries
 
-use serde_json::json;
-use nanobot::agent::lcm::{LcmConfig, LcmEngine, CompactionAction};
-use nanobot::agent::turn::Turn;
+use async_trait::async_trait;
+use nanobot::agent::compaction::ContextCompactor;
+use nanobot::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use nanobot::agent::protocol::LocalProtocol;
 use nanobot::agent::token_budget::TokenBudget;
-use nanobot::agent::compaction::ContextCompactor;
+use nanobot::agent::turn::Turn;
 use nanobot::providers::base::{LLMProvider, LLMResponse};
-use async_trait::async_trait;
+use serde_json::json;
 use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────
@@ -58,16 +58,16 @@ fn test_clear_resets_lcm_engine() {
         tau_hard: 0.85,
         deterministic_target: 512,
     };
-    
+
     let mut engine = LcmEngine::new(config.clone());
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     engine.ingest(json!({"role": "user", "content": "First message"}));
     engine.ingest(json!({"role": "assistant", "content": "First response"}));
-    
+
     assert_eq!(engine.store_len(), 3);
     assert_eq!(engine.active_len(), 3);
-    
+
     // Simulate /clear: create a fresh engine
     let fresh_engine = LcmEngine::new(config);
     assert_eq!(fresh_engine.store_len(), 0);
@@ -79,10 +79,10 @@ fn test_clear_resets_lcm_engine() {
 fn test_rebuild_from_turns_after_clear_is_empty() {
     let config = LcmConfig::default();
     let protocol = LocalProtocol::default();
-    
+
     let turns: Vec<Turn> = vec![];
     let engine = LcmEngine::rebuild_from_turns(&turns, config, &protocol, "");
-    
+
     assert_eq!(engine.store_len(), 0);
     assert_eq!(engine.active_len(), 0);
     assert!(engine.dag_ref().is_empty());
@@ -92,36 +92,65 @@ fn test_rebuild_from_turns_after_clear_is_empty() {
 fn test_rebuild_respects_clear_marker() {
     let config = LcmConfig::default();
     let protocol = LocalProtocol::default();
-    
+
     // Turns BEFORE clear marker
     let turns_before_clear = vec![
-        Turn::User { content: "Old question 1".into(), media: vec![] },
-        Turn::Assistant { text: Some("Old answer 1".into()), tool_calls: vec![] },
-        Turn::User { content: "Old question 2".into(), media: vec![] },
-        Turn::Assistant { text: Some("Old answer 2".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "Old question 1".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("Old answer 1".into()),
+            tool_calls: vec![],
+        },
+        Turn::User {
+            content: "Old question 2".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("Old answer 2".into()),
+            tool_calls: vec![],
+        },
         Turn::Summary {
             text: "Summary of old conversation".into(),
             source_ids: vec![0, 1, 2, 3],
             level: 1,
         },
     ];
-    
+
     // Turns AFTER clear marker (what should be processed)
     let turns_after_clear = vec![
         Turn::Clear,
-        Turn::User { content: "New question".into(), media: vec![] },
-        Turn::Assistant { text: Some("New answer".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "New question".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("New answer".into()),
+            tool_calls: vec![],
+        },
     ];
-    
+
     // Combine: old turns, clear marker, new turns
     let all_turns: Vec<Turn> = [turns_before_clear, turns_after_clear].concat();
-    
+
     let engine = LcmEngine::rebuild_from_turns(&all_turns, config, &protocol, "");
-    
+
     // Should only have 2 messages (new question + new answer)
-    assert_eq!(engine.store_len(), 2, "Should only have messages after clear marker");
-    assert_eq!(engine.active_len(), 2, "Active context should only have post-clear messages");
-    assert!(engine.dag_ref().is_empty(), "Old summaries should be discarded after clear");
+    assert_eq!(
+        engine.store_len(),
+        2,
+        "Should only have messages after clear marker"
+    );
+    assert_eq!(
+        engine.active_len(),
+        2,
+        "Active context should only have post-clear messages"
+    );
+    assert!(
+        engine.dag_ref().is_empty(),
+        "Old summaries should be discarded after clear"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -131,19 +160,22 @@ fn test_rebuild_respects_clear_marker() {
 #[test]
 fn test_find_oldest_raw_block_returns_first_block() {
     let mut engine = LcmEngine::new(LcmConfig::default());
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     for i in 0..10 {
         engine.ingest(json!({"role": "user", "content": format!("User {}", i)}));
         engine.ingest(json!({"role": "assistant", "content": format!("Assistant {}", i)}));
     }
-    
+
     let block = engine.find_oldest_raw_block();
     assert!(block.is_some());
-    
+
     let (start, end) = block.unwrap();
     assert!(start >= 1, "Block should start after system message");
-    assert!(end <= engine.active_len() - 4, "Block should leave 4 recent messages");
+    assert!(
+        end <= engine.active_len() - 4,
+        "Block should leave 4 recent messages"
+    );
 }
 
 #[tokio::test]
@@ -154,26 +186,28 @@ async fn test_compaction_creates_summary_node() {
         tau_hard: 0.6,
         deterministic_target: 64,
     });
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     for i in 0..10 {
-        engine.ingest(json!({"role": "user", "content": format!("Question {} about Rust ownership", i)}));
+        engine.ingest(
+            json!({"role": "user", "content": format!("Question {} about Rust ownership", i)}),
+        );
         engine.ingest(json!({"role": "assistant", "content": format!("Answer {} explains borrowing rules", i)}));
     }
-    
+
     let budget = TokenBudget::new(4096, 2048);
     let compactor = ContextCompactor::new(
         Arc::new(MockSummarizer) as Arc<dyn LLMProvider>,
         "mock".to_string(),
         4096,
     );
-    
+
     let result = engine.compact(&compactor, &budget, 100).await;
     assert!(result.is_some());
-    
+
     let summary_turn = result.unwrap();
     assert!(matches!(summary_turn, Turn::Summary { .. }));
-    
+
     assert_eq!(engine.dag_ref().len(), 1);
 }
 
@@ -185,29 +219,29 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         tau_hard: 0.5,
         deterministic_target: 64,
     });
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     for i in 0..20 {
         engine.ingest(json!({"role": "user", "content": format!("Message {}", i)}));
         engine.ingest(json!({"role": "assistant", "content": format!("Response {}", i)}));
     }
-    
+
     let budget = TokenBudget::new(4096, 2048);
     let compactor = ContextCompactor::new(
         Arc::new(MockSummarizer) as Arc<dyn LLMProvider>,
         "mock".to_string(),
         4096,
     );
-    
+
     let r1 = engine.compact(&compactor, &budget, 100).await;
     assert!(r1.is_some(), "First compaction should succeed");
-    
+
     let first_summary = r1.unwrap();
     let first_source_ids = match &first_summary {
         Turn::Summary { source_ids, .. } => source_ids.clone(),
         _ => panic!("Expected Summary"),
     };
-    
+
     let r2 = engine.compact(&compactor, &budget, 100).await;
     if r2.is_some() {
         let second_summary = r2.unwrap();
@@ -215,7 +249,7 @@ async fn test_second_compaction_summarizes_after_first_summary() {
             Turn::Summary { source_ids, .. } => source_ids.clone(),
             _ => panic!("Expected Summary"),
         };
-        
+
         // Second compaction should NOT overlap with first
         for id in &first_source_ids {
             assert!(
@@ -239,7 +273,7 @@ fn test_contains_refusal_pattern() {
         "As an AI language model, I cannot provide that information.",
         "I'm unable to help with that specific request.",
     ];
-    
+
     for pattern in &refusal_patterns {
         assert!(
             contains_refusal_pattern(pattern),
@@ -247,14 +281,14 @@ fn test_contains_refusal_pattern() {
             pattern
         );
     }
-    
+
     let non_refusals = [
         "I can help you with that.",
         "Here's how to solve the problem.",
         "The answer to your question is...",
         "Let me explain the concept.",
     ];
-    
+
     for text in &non_refusals {
         assert!(
             !contains_refusal_pattern(text),
@@ -281,7 +315,7 @@ fn contains_refusal_pattern(text: &str) -> bool {
         "cannot fulfill",
         "can't fulfill",
     ];
-    
+
     for indicator in &refusal_indicators {
         if lower.contains(indicator) {
             return true;
@@ -292,9 +326,10 @@ fn contains_refusal_pattern(text: &str) -> bool {
 
 #[test]
 fn test_filter_refusal_from_summary() {
-    let summary_with_refusal = "User asked about Rust. I cannot assist with that request. However, here is some info.";
+    let summary_with_refusal =
+        "User asked about Rust. I cannot assist with that request. However, here is some info.";
     let clean_summary = "User asked about Rust. Here is some info about ownership.";
-    
+
     assert!(
         contains_refusal_pattern(summary_with_refusal),
         "Should detect refusal in summary"
@@ -317,36 +352,36 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
         tau_hard: 0.5,
         deterministic_target: 64,
     });
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
-    
+
     let total_messages = 30;
     for i in 0..total_messages {
         engine.ingest(json!({"role": "user", "content": format!("Original message {}", i)}));
         engine.ingest(json!({"role": "assistant", "content": format!("Original response {}", i)}));
     }
-    
+
     let store_size = engine.store_len();
-    
+
     let budget = TokenBudget::new(4096, 2048);
     let compactor = ContextCompactor::new(
         Arc::new(MockSummarizer) as Arc<dyn LLMProvider>,
         "mock".to_string(),
         4096,
     );
-    
+
     // Multiple compaction rounds
     for _ in 0..3 {
         let _ = engine.compact(&compactor, &budget, 100).await;
     }
-    
+
     // Store should be unchanged
     assert_eq!(
         engine.store_len(),
         store_size,
         "Store must never lose messages after compaction"
     );
-    
+
     // All summary nodes should have retrievable sources
     for i in 0..engine.dag_ref().len() {
         let node = engine.dag_ref().get(i).unwrap();
@@ -357,7 +392,7 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
             "All source messages for summary {} must be retrievable",
             i
         );
-        
+
         for (id, msg) in &expanded {
             let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
             assert!(
@@ -381,12 +416,15 @@ fn test_check_thresholds_below_soft() {
         tau_hard: 0.85,
         deterministic_target: 512,
     });
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     engine.ingest(json!({"role": "user", "content": "Hello"}));
-    
+
     let budget = TokenBudget::new(100_000, 8192);
-    assert_eq!(engine.check_thresholds(&budget, 500), CompactionAction::None);
+    assert_eq!(
+        engine.check_thresholds(&budget, 500),
+        CompactionAction::None
+    );
 }
 
 #[test]
@@ -397,12 +435,14 @@ fn test_check_thresholds_above_soft() {
         tau_hard: 0.8,
         deterministic_target: 512,
     });
-    
+
     engine.ingest(json!({"role": "system", "content": "System"}));
     for i in 0..20 {
-        engine.ingest(json!({"role": "user", "content": format!("A long message with content {}", i)}));
+        engine.ingest(
+            json!({"role": "user", "content": format!("A long message with content {}", i)}),
+        );
     }
-    
+
     let budget = TokenBudget::new(1024, 512);
     let action = engine.check_thresholds(&budget, 50);
     assert!(
@@ -419,29 +459,51 @@ fn test_check_thresholds_above_soft() {
 fn test_rebuild_from_turns_preserves_summaries() {
     let config = LcmConfig::default();
     let protocol = LocalProtocol::default();
-    
+
     let turns = vec![
-        Turn::User { content: "First question".into(), media: vec![] },
-        Turn::Assistant { text: Some("First answer".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "First question".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("First answer".into()),
+            tool_calls: vec![],
+        },
         Turn::Summary {
             text: "Summary of first exchange".into(),
             source_ids: vec![0, 1],
             level: 1,
         },
-        Turn::User { content: "Second question".into(), media: vec![] },
-        Turn::Assistant { text: Some("Second answer".into()), tool_calls: vec![] },
+        Turn::User {
+            content: "Second question".into(),
+            media: vec![],
+        },
+        Turn::Assistant {
+            text: Some("Second answer".into()),
+            tool_calls: vec![],
+        },
     ];
-    
+
     let engine = LcmEngine::rebuild_from_turns(&turns, config, &protocol, "");
-    
+
     // Store should have all raw messages (not summaries)
-    assert_eq!(engine.store_len(), 4, "Store should have 4 raw messages (2 user + 2 assistant)");
-    
+    assert_eq!(
+        engine.store_len(),
+        4,
+        "Store should have 4 raw messages (2 user + 2 assistant)"
+    );
+
     // DAG should have the summary
     assert_eq!(engine.dag_ref().len(), 1, "DAG should have 1 summary node");
-    
+
     // Active context should have summary + recent raw messages
     let active = engine.active_entries();
-    let summary_count = active.iter().filter(|e| matches!(e, nanobot::agent::lcm::ContextEntry::Summary { .. })).count();
-    assert_eq!(summary_count, 1, "Active context should have 1 summary entry");
+    let summary_count = active
+        .iter()
+        .filter(|e| matches!(e, nanobot::agent::lcm::ContextEntry::Summary { .. }))
+        .count();
+    assert_eq!(
+        summary_count, 1,
+        "Active context should have 1 summary entry"
+    );
 }

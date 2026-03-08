@@ -57,7 +57,11 @@ impl ClusterDiscovery {
             .build()
             .unwrap_or_default();
 
-        Self { config, state, client }
+        Self {
+            config,
+            state,
+            client,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -90,7 +94,9 @@ impl ClusterDiscovery {
                 if extract_port(&ep).is_some() {
                     vec![ep]
                 } else {
-                    self.config.scan_ports.iter()
+                    self.config
+                        .scan_ports
+                        .iter()
                         .map(|p| format!("{}:{}", ep, p))
                         .collect()
                 }
@@ -98,19 +104,27 @@ impl ClusterDiscovery {
             .collect();
 
         if !manual.is_empty() {
-            tracing::debug!(count = manual.len(), "cluster_discovery_probing_manual_endpoints");
+            tracing::debug!(
+                count = manual.len(),
+                "cluster_discovery_probing_manual_endpoints"
+            );
             self.probe_all(manual.clone()).await;
             probed.extend(manual);
         }
 
         // Probe localhost on all scan ports (local servers are excluded from subnet scan).
-        let localhost_endpoints: Vec<String> = self.config.scan_ports
+        let localhost_endpoints: Vec<String> = self
+            .config
+            .scan_ports
             .iter()
             .map(|p| format!("http://127.0.0.1:{}", p))
             .filter(|ep| !probed.contains(ep))
             .collect();
         if !localhost_endpoints.is_empty() {
-            tracing::debug!(count = localhost_endpoints.len(), "cluster_discovery_probing_localhost");
+            tracing::debug!(
+                count = localhost_endpoints.len(),
+                "cluster_discovery_probing_localhost"
+            );
             self.probe_all(localhost_endpoints.clone()).await;
             probed.extend(localhost_endpoints);
         }
@@ -514,9 +528,7 @@ fn find_lan_ip() -> Option<std::net::Ipv4Addr> {
                 // (same first two octets, same upper nibble of third octet).
                 let preferred = candidates.into_iter().find(|ip| {
                     let o = ip.octets();
-                    o[0] == gw_oct[0]
-                        && o[1] == gw_oct[1]
-                        && (o[2] >> 4) == (gw_oct[2] >> 4)
+                    o[0] == gw_oct[0] && o[1] == gw_oct[1] && (o[2] >> 4) == (gw_oct[2] >> 4)
                 });
                 if preferred.is_some() {
                     return preferred;
@@ -526,8 +538,7 @@ fn find_lan_ip() -> Option<std::net::Ipv4Addr> {
     }
 
     // Fallback: first RFC-1918 from fib_trie (original behaviour).
-    let content = fib_content
-        .or_else(|| std::fs::read_to_string("/proc/net/fib_trie").ok());
+    let content = fib_content.or_else(|| std::fs::read_to_string("/proc/net/fib_trie").ok());
 
     #[cfg(target_os = "linux")]
     {
@@ -560,7 +571,9 @@ fn find_lan_ip_bsd() -> Option<std::net::Ipv4Addr> {
     let route_str = String::from_utf8_lossy(&route_out.stdout);
 
     // Parse gateway IP.
-    let gateway_line = route_str.lines().find(|l| l.trim().starts_with("gateway:"))?;
+    let gateway_line = route_str
+        .lines()
+        .find(|l| l.trim().starts_with("gateway:"))?;
     let _gateway_ip: std::net::Ipv4Addr = gateway_line
         .trim()
         .strip_prefix("gateway:")?
@@ -569,7 +582,9 @@ fn find_lan_ip_bsd() -> Option<std::net::Ipv4Addr> {
         .ok()?;
 
     // Parse interface name.
-    let iface_line = route_str.lines().find(|l| l.trim().starts_with("interface:"))?;
+    let iface_line = route_str
+        .lines()
+        .find(|l| l.trim().starts_with("interface:"))?;
     let iface = iface_line.trim().strip_prefix("interface:")?.trim();
 
     // Get our IP on that interface.
@@ -757,26 +772,17 @@ mod tests {
 
     #[test]
     fn test_detect_peer_type_exo_port() {
-        assert_eq!(
-            detect_peer_type(Some(52415), "", &[]),
-            PeerType::Exo
-        );
+        assert_eq!(detect_peer_type(Some(52415), "", &[]), PeerType::Exo);
     }
 
     #[test]
     fn test_detect_peer_type_lmstudio_port() {
-        assert_eq!(
-            detect_peer_type(Some(1234), "", &[]),
-            PeerType::LMStudio
-        );
+        assert_eq!(detect_peer_type(Some(1234), "", &[]), PeerType::LMStudio);
     }
 
     #[test]
     fn test_detect_peer_type_llamacpp_port() {
-        assert_eq!(
-            detect_peer_type(Some(8080), "", &[]),
-            PeerType::LlamaCpp
-        );
+        assert_eq!(detect_peer_type(Some(8080), "", &[]), PeerType::LlamaCpp);
     }
 
     #[test]
@@ -802,31 +808,25 @@ mod tests {
             context_window: 0,
             requires_cluster: false,
         }];
-        assert_eq!(
-            detect_peer_type(Some(9999), "", &models),
-            PeerType::Exo
-        );
+        assert_eq!(detect_peer_type(Some(9999), "", &models), PeerType::Exo);
     }
 
     #[test]
     fn test_detect_peer_type_jan_port() {
-        assert_eq!(
-            detect_peer_type(Some(1337), "", &[]),
-            PeerType::Jan
-        );
+        assert_eq!(detect_peer_type(Some(1337), "", &[]), PeerType::Jan);
     }
 
     #[test]
     fn test_detect_peer_type_jan_header() {
-        assert_eq!(
-            detect_peer_type(None, "jan/0.5.3", &[]),
-            PeerType::Jan
-        );
+        assert_eq!(detect_peer_type(None, "jan/0.5.3", &[]), PeerType::Jan);
     }
 
     #[test]
     fn test_detect_peer_type_unknown() {
-        assert_eq!(detect_peer_type(Some(9999), "nginx", &[]), PeerType::Unknown);
+        assert_eq!(
+            detect_peer_type(Some(9999), "nginx", &[]),
+            PeerType::Unknown
+        );
     }
 
     #[test]
@@ -1049,9 +1049,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
 
         let preferred = candidates.into_iter().find(|ip| {
             let o = ip.octets();
-            o[0] == gw_oct[0]
-                && o[1] == gw_oct[1]
-                && (o[2] >> 4) == (gw_oct[2] >> 4)
+            o[0] == gw_oct[0] && o[1] == gw_oct[1] && (o[2] >> 4) == (gw_oct[2] >> 4)
         });
 
         assert_eq!(
@@ -1075,9 +1073,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
 
         let preferred = candidates.into_iter().find(|ip| {
             let o = ip.octets();
-            o[0] == gw_oct[0]
-                && o[1] == gw_oct[1]
-                && (o[2] >> 4) == (gw_oct[2] >> 4)
+            o[0] == gw_oct[0] && o[1] == gw_oct[1] && (o[2] >> 4) == (gw_oct[2] >> 4)
         });
 
         assert_eq!(
@@ -1109,11 +1105,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
             .lines()
             .find(|l| l.trim().starts_with("interface:"))
             .unwrap();
-        let iface = iface_line
-            .trim()
-            .strip_prefix("interface:")
-            .unwrap()
-            .trim();
+        let iface = iface_line.trim().strip_prefix("interface:").unwrap().trim();
         assert_eq!(iface, "en0");
     }
 
@@ -1159,17 +1151,22 @@ eth0\t00000000\tC01AA8C0\t0003\n";
                 if extract_port(&ep).is_some() {
                     vec![ep]
                 } else {
-                    config.scan_ports.iter()
+                    config
+                        .scan_ports
+                        .iter()
                         .map(|p| format!("{}:{}", ep, p))
                         .collect()
                 }
             })
             .collect();
-        assert_eq!(expanded, vec![
-            "http://192.168.1.22:1234",
-            "http://192.168.1.22:1337",
-            "http://192.168.1.22:8080",
-        ]);
+        assert_eq!(
+            expanded,
+            vec![
+                "http://192.168.1.22:1234",
+                "http://192.168.1.22:1337",
+                "http://192.168.1.22:8080",
+            ]
+        );
     }
 
     #[test]
@@ -1190,7 +1187,9 @@ eth0\t00000000\tC01AA8C0\t0003\n";
                 if extract_port(&ep).is_some() {
                     vec![ep]
                 } else {
-                    config.scan_ports.iter()
+                    config
+                        .scan_ports
+                        .iter()
                         .map(|p| format!("{}:{}", ep, p))
                         .collect()
                 }

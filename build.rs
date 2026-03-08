@@ -31,12 +31,9 @@ fn main() {
                 .expect("Failed to run make for ANE bridge");
             assert!(status.success(), "ANE bridge compilation failed");
 
-            let bridge_abs = std::fs::canonicalize(bridge_dir)
-                .expect("Failed to resolve bridge/ane path");
-            println!(
-                "cargo:rustc-link-search=native={}",
-                bridge_abs.display()
-            );
+            let bridge_abs =
+                std::fs::canonicalize(bridge_dir).expect("Failed to resolve bridge/ane path");
+            println!("cargo:rustc-link-search=native={}", bridge_abs.display());
             println!("cargo:rustc-link-lib=dylib=ane_bridge");
             println!("cargo:rustc-link-lib=framework=Accelerate");
 
@@ -51,10 +48,7 @@ fn main() {
                 ])
                 .status();
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
-            println!(
-                "cargo:rustc-link-arg=-Wl,-rpath,{}",
-                bridge_abs.display()
-            );
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bridge_abs.display());
 
             // Copy dylib next to output binaries so @rpath finds it.
             if let Ok(out_dir) = std::env::var("OUT_DIR") {
@@ -69,10 +63,7 @@ fn main() {
                 }
                 // Copy to target/debug (or release) and target/debug/deps
                 let _ = std::fs::copy(&dylib_src, target_dir.join("libane_bridge.dylib"));
-                let _ = std::fs::copy(
-                    &dylib_src,
-                    target_dir.join("deps/libane_bridge.dylib"),
-                );
+                let _ = std::fs::copy(&dylib_src, target_dir.join("deps/libane_bridge.dylib"));
             }
         }
     }
@@ -166,7 +157,7 @@ fn main() {
 /// Recursively copy a directory tree.
 #[allow(dead_code)]
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
-#[cfg(feature = "voice")]
+    #[cfg(feature = "voice")]
     let _ = std::fs::create_dir_all(dst);
     if let Ok(entries) = std::fs::read_dir(src) {
         for entry in entries.flatten() {

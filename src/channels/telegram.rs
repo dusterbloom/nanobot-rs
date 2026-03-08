@@ -274,8 +274,7 @@ impl TelegramChannel {
         msg.metadata.insert("user_id".to_string(), json!(user_id));
         msg.metadata.insert("username".to_string(), json!(username));
         msg.metadata.insert("is_group".to_string(), json!(is_group));
-        msg.metadata
-            .insert("bot_token".to_string(), json!(token));
+        msg.metadata.insert("bot_token".to_string(), json!(token));
 
         if is_voice_message {
             msg.metadata
@@ -301,7 +300,10 @@ impl TelegramChannel {
         ext: &str,
     ) -> Option<String> {
         // Step 1: getFile
-        let url = format!("{}/bot{}/getFile?file_id={}", TELEGRAM_API_BASE, token, file_id);
+        let url = format!(
+            "{}/bot{}/getFile?file_id={}",
+            TELEGRAM_API_BASE, token, file_id
+        );
         let resp = client.get(&url).send().await.ok()?;
         let data: Value = resp.json().await.ok()?;
         let file_path = data
@@ -461,17 +463,15 @@ impl Channel for TelegramChannel {
                         .unwrap_or("en");
                     if !tts_text.is_empty() {
                         match pipeline.synthesize_to_file(&tts_text, lang).await {
-                            Ok(ogg_path) => {
-                                match self._send_voice(chat_id, &ogg_path).await {
-                                    Ok(()) => {
-                                        let _ = std::fs::remove_file(&ogg_path);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to send voice, falling back to text: {}", e);
-                                        let _ = std::fs::remove_file(&ogg_path);
-                                    }
+                            Ok(ogg_path) => match self._send_voice(chat_id, &ogg_path).await {
+                                Ok(()) => {
+                                    let _ = std::fs::remove_file(&ogg_path);
                                 }
-                            }
+                                Err(e) => {
+                                    warn!("Failed to send voice, falling back to text: {}", e);
+                                    let _ = std::fs::remove_file(&ogg_path);
+                                }
+                            },
                             Err(e) => {
                                 warn!("TTS synthesis failed, sending text only: {}", e);
                             }
@@ -568,24 +568,16 @@ impl TelegramChannel {
 
 static RE_CODEBLOCK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"```[\w]*\n?([\s\S]*?)```").unwrap());
-static RE_INLINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
-static RE_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap());
-static RE_BLOCKQUOTE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^>\s*(.*)$").unwrap());
-static RE_LINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
-static RE_BOLD_STAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
-static RE_BOLD_UNDER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
+static RE_INLINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
+static RE_HEADER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap());
+static RE_BLOCKQUOTE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^>\s*(.*)$").unwrap());
+static RE_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+static RE_BOLD_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_BOLD_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__(.+?)__").unwrap());
 static RE_ITALIC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(^|[^a-zA-Z0-9])_([^_]+)_($|[^a-zA-Z0-9])").unwrap());
-static RE_STRIKE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
-static RE_BULLET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^[-*]\s+").unwrap());
+static RE_STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
+static RE_BULLET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[-*]\s+").unwrap());
 
 /// Convert markdown to Telegram-safe HTML.
 ///

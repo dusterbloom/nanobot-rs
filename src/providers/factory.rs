@@ -177,7 +177,10 @@ pub fn from_provider_config_for_model(
     }
 
     // Rule 3: default – OpenAICompat with localhost:8080 fallback.
-    create_openai_compat(ProviderSpec::from_config(cfg, Some("http://localhost:8080/v1")))
+    create_openai_compat(ProviderSpec::from_config(
+        cfg,
+        Some("http://localhost:8080/v1"),
+    ))
 }
 
 #[cfg(test)]
@@ -201,10 +204,7 @@ mod tests {
         };
         let spec = ProviderSpec::from_config(&cfg, Some("http://localhost:8080/v1"));
         assert_eq!(spec.api_key, "sk-test");
-        assert_eq!(
-            spec.api_base.as_deref(),
-            Some("http://localhost:8080/v1")
-        );
+        assert_eq!(spec.api_base.as_deref(), Some("http://localhost:8080/v1"));
         assert!(spec.model.is_none());
     }
 
@@ -216,24 +216,20 @@ mod tests {
         };
         let spec = ProviderSpec::from_config(&cfg, Some("http://localhost:8080/v1"));
         // Custom base takes precedence over default.
-        assert_eq!(
-            spec.api_base.as_deref(),
-            Some("https://custom.api.com/v1")
-        );
+        assert_eq!(spec.api_base.as_deref(), Some("https://custom.api.com/v1"));
     }
 
     #[test]
     fn test_with_jit_gate_opt_none() {
-        let spec = ProviderSpec::local("http://localhost:1234/v1", None)
-            .with_jit_gate_opt(None);
+        let spec = ProviderSpec::local("http://localhost:1234/v1", None).with_jit_gate_opt(None);
         assert!(spec.jit_gate.is_none());
     }
 
     #[test]
     fn test_with_jit_gate_opt_some() {
         let gate = Arc::new(JitGate::new());
-        let spec = ProviderSpec::local("http://localhost:1234/v1", None)
-            .with_jit_gate_opt(Some(gate));
+        let spec =
+            ProviderSpec::local("http://localhost:1234/v1", None).with_jit_gate_opt(Some(gate));
         assert!(spec.jit_gate.is_some());
     }
 
@@ -310,7 +306,10 @@ mod tests {
         // The key check: it should NOT be pointing to localhost.
         let base = provider.get_api_base();
         if let Some(b) = base {
-            assert!(!is_local_base(&b), "Anthropic key should not route to local server");
+            assert!(
+                !is_local_base(&b),
+                "Anthropic key should not route to local server"
+            );
         }
     }
 
@@ -323,7 +322,10 @@ mod tests {
         let provider = from_provider_config(&cfg);
         let base = provider.get_api_base();
         if let Some(b) = base {
-            assert!(!is_local_base(&b), "OAuth key should not route to local server");
+            assert!(
+                !is_local_base(&b),
+                "OAuth key should not route to local server"
+            );
         }
     }
 
@@ -411,7 +413,10 @@ mod tests {
         let base = provider.get_api_base();
         // Should be Anthropic (None base or anthropic URL).
         if let Some(b) = &base {
-            assert!(!is_local_base(b), "No model hint + Anthropic key should not go to localhost");
+            assert!(
+                !is_local_base(b),
+                "No model hint + Anthropic key should not go to localhost"
+            );
         }
     }
 

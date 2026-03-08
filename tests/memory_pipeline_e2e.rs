@@ -127,10 +127,7 @@ fn write_session_jsonl(dir: &Path, filename: &str, session_key: &str, turns: &[(
         session_key
     )];
     for (role, content) in turns {
-        lines.push(format!(
-            r#"{{"role":"{}","content":"{}"}}"#,
-            role, content
-        ));
+        lines.push(format!(r#"{{"role":"{}","content":"{}"}}"#, role, content));
     }
     fs::write(dir.join(filename), lines.join("\n")).expect("write session JSONL");
 }
@@ -150,7 +147,8 @@ fn knowledge_store_ingest_and_hybrid_search() {
     // Ingest two documents with real fastembed embeddings.
     let doc1 = "Rust is a systems programming language focused on safety, speed, and concurrency. \
                 It achieves memory safety without garbage collection through its ownership system.";
-    let doc2 = "Python is a high-level interpreted language known for its readability and extensive \
+    let doc2 =
+        "Python is a high-level interpreted language known for its readability and extensive \
                 standard library. It is widely used in data science and machine learning.";
 
     let r1 = store
@@ -165,12 +163,10 @@ fn knowledge_store_ingest_and_hybrid_search() {
 
     // Semantic search: "memory safety ownership" should rank Rust doc first.
     let hits = store.hybrid_search("memory safety ownership", 5).unwrap();
-    assert!(
-        !hits.is_empty(),
-        "hybrid_search should return results"
-    );
+    assert!(!hits.is_empty(), "hybrid_search should return results");
     assert_eq!(
-        hits[0].source_name, "rust_doc",
+        hits[0].source_name,
+        "rust_doc",
         "Rust doc should rank first for 'memory safety ownership'; got {:?}",
         hits.iter().map(|h| &h.source_name).collect::<Vec<_>>()
     );
@@ -178,9 +174,7 @@ fn knowledge_store_ingest_and_hybrid_search() {
     // BM25 keyword search: "garbage collection" should also find Rust doc.
     let keyword_hits = store.search("garbage collection", 5).unwrap();
     assert!(
-        keyword_hits
-            .iter()
-            .any(|h| h.source_name == "rust_doc"),
+        keyword_hits.iter().any(|h| h.source_name == "rust_doc"),
         "BM25 search should find 'garbage collection' in Rust doc"
     );
 
@@ -207,7 +201,10 @@ fn session_indexer_produces_searchable_knowledge() {
 
     let nanobot_dir = home.join(".nanobot");
     let sessions_dir = nanobot_dir.join("sessions");
-    let memory_sessions_dir = nanobot_dir.join("workspace").join("memory").join("sessions");
+    let memory_sessions_dir = nanobot_dir
+        .join("workspace")
+        .join("memory")
+        .join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
     fs::create_dir_all(&memory_sessions_dir).unwrap();
 
@@ -224,8 +221,7 @@ fn session_indexer_produces_searchable_knowledge() {
         ],
     );
 
-    let (indexed, _skipped, errors) =
-        index_sessions(&sessions_dir, &memory_sessions_dir);
+    let (indexed, _skipped, errors) = index_sessions(&sessions_dir, &memory_sessions_dir);
 
     assert_eq!(errors, 0, "no indexing errors expected");
     assert_eq!(indexed, 1, "should index exactly 1 session");
@@ -254,7 +250,9 @@ fn session_indexer_produces_searchable_knowledge() {
 
     // Verify content is searchable via KnowledgeStore (ingested by index_sessions).
     let store = KnowledgeStore::open_default().unwrap();
-    let hits = store.hybrid_search("tokio cancellation shutdown", 5).unwrap();
+    let hits = store
+        .hybrid_search("tokio cancellation shutdown", 5)
+        .unwrap();
     assert!(
         !hits.is_empty(),
         "Session content should be searchable in KnowledgeStore after indexing"
@@ -382,8 +380,8 @@ fn full_pipeline_agent_remembers_across_sessions() {
 
     let api_base = std::env::var("NANOBOT_TEST_LOCAL_API_BASE")
         .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("NANOBOT_TEST_LOCAL_MODEL")
-        .unwrap_or_else(|_| "qwen3.5-35b-a3b".to_string());
+    let model =
+        std::env::var("NANOBOT_TEST_LOCAL_MODEL").unwrap_or_else(|_| "qwen3.5-35b-a3b".to_string());
 
     write_isolated_config(home, &api_base, &model);
 
@@ -572,7 +570,10 @@ fn experience_buffer_and_d2l_generation() {
     // --- JSONL export ---
     let export_path = tmp.path().join("training").join("export.jsonl");
     let export_result = buffer.export_jsonl(&export_path, 10).unwrap();
-    assert_eq!(export_result.count, 2, "should export 2 successful experiences");
+    assert_eq!(
+        export_result.count, 2,
+        "should export 2 successful experiences"
+    );
     assert!(export_path.exists(), "JSONL file should be created");
 
     let jsonl_content = fs::read_to_string(&export_path).unwrap();
@@ -582,9 +583,15 @@ fn experience_buffer_and_d2l_generation() {
     // Verify JSONL structure.
     for line in &jsonl_lines {
         let entry: Value = serde_json::from_str(line).expect("each line should be valid JSON");
-        assert!(entry.get("messages").is_some(), "entry should have messages");
+        assert!(
+            entry.get("messages").is_some(),
+            "entry should have messages"
+        );
         assert!(entry.get("quality").is_some(), "entry should have quality");
-        assert!(entry.get("surprise").is_some(), "entry should have surprise");
+        assert!(
+            entry.get("surprise").is_some(),
+            "entry should have surprise"
+        );
     }
 
     // After export, nothing left unexported.

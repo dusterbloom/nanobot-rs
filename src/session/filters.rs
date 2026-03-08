@@ -216,10 +216,17 @@ mod tests {
             assistant("new answer"),
         ];
         let result = filter_history(&messages, 100, 0);
-        assert_eq!(result.len(), 2, "only messages after clear should be returned");
+        assert_eq!(
+            result.len(),
+            2,
+            "only messages after clear should be returned"
+        );
         assert_eq!(result[0]["content"], "new question");
         assert_eq!(result[1]["content"], "new answer");
-        assert!(result.iter().all(|m| role_of(m) != "clear"), "clear marker must not appear in output");
+        assert!(
+            result.iter().all(|m| role_of(m) != "clear"),
+            "clear marker must not appear in output"
+        );
     }
 
     #[test]
@@ -244,7 +251,10 @@ mod tests {
     fn test_clear_marker_at_end_returns_empty() {
         let messages = vec![user("q"), assistant("a"), clear()];
         let result = filter_history(&messages, 100, 0);
-        assert!(result.is_empty(), "nothing after clear marker should yield empty history");
+        assert!(
+            result.is_empty(),
+            "nothing after clear marker should yield empty history"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -283,7 +293,10 @@ mod tests {
         ];
         let result = filter_history(&messages, 100, 0);
         assert_eq!(result.len(), 4);
-        assert!(result.iter().any(|m| role_of(m) == "tool"), "complete tool group must be preserved");
+        assert!(
+            result.iter().any(|m| role_of(m) == "tool"),
+            "complete tool group must be preserved"
+        );
     }
 
     #[test]
@@ -421,7 +434,10 @@ mod tests {
         ];
         let result = filter_history(&messages, 100, 0);
         assert_eq!(result.len(), 4);
-        assert!(result[1].get("tool_calls").is_some(), "tool_calls must be preserved");
+        assert!(
+            result[1].get("tool_calls").is_some(),
+            "tool_calls must be preserved"
+        );
     }
 
     #[test]
@@ -443,10 +459,7 @@ mod tests {
             result[2].get("tool_call_id").and_then(|v| v.as_str()),
             Some("tc_42")
         );
-        assert_eq!(
-            result[2].get("name").and_then(|v| v.as_str()),
-            Some("exec")
-        );
+        assert_eq!(result[2].get("name").and_then(|v| v.as_str()), Some("exec"));
     }
 
     #[test]
@@ -481,8 +494,14 @@ mod tests {
         let result = filter_history(&messages, 100, 0);
         assert_eq!(result.len(), 1);
         // Only role, content (and optionally _turn/tool_calls etc.) should be present.
-        assert!(result[0].get("timestamp").is_none(), "timestamp must not leak to wire format");
-        assert!(result[0].get("extra_internal_field").is_none(), "internal fields must not leak");
+        assert!(
+            result[0].get("timestamp").is_none(),
+            "timestamp must not leak to wire format"
+        );
+        assert!(
+            result[0].get("extra_internal_field").is_none(),
+            "internal fields must not leak"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -494,10 +513,10 @@ mod tests {
         // clear takes priority: even if max_messages window would reach before clear,
         // clear_start wins via the max() call.
         let messages = vec![
-            user("before_clear"),   // index 0
-            clear(),               // index 1
-            user("after_clear"),   // index 2
-            assistant("answer"),   // index 3
+            user("before_clear"), // index 0
+            clear(),              // index 1
+            user("after_clear"),  // index 2
+            assistant("answer"),  // index 3
         ];
         // max_messages=4 (all), but clear at index 1 means safe_start=2
         let result = filter_history(&messages, 4, 0);

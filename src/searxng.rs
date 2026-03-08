@@ -132,7 +132,12 @@ async fn check_docker_daemon(docker: &str) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         // Force-kill all Docker Desktop processes (handles zombie/stuck state
         // where the backend is alive but the VM/daemon isn't running).
-        for proc in ["com.docker.backend", "com.docker.vmnetd", "Docker Desktop", "Docker"] {
+        for proc in [
+            "com.docker.backend",
+            "com.docker.vmnetd",
+            "Docker Desktop",
+            "Docker",
+        ] {
             let _ = Command::new("killall")
                 .args(["-9", proc])
                 .kill_on_drop(true)

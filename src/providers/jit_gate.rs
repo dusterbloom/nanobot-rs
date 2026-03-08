@@ -98,7 +98,10 @@ pub async fn warmup_jit_models(base_url: &str, api_key: &str, models: &[&str]) {
                     info!("JIT warmup: '{}' loaded OK", model);
                 } else {
                     let body = resp.text().await.unwrap_or_default();
-                    warn!("JIT warmup: '{}' returned HTTP {} — {}", model, status, body);
+                    warn!(
+                        "JIT warmup: '{}' returned HTTP {} — {}",
+                        model, status, body
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -138,7 +141,11 @@ async fn fetch_jit_loaded_models(native_base: &str) -> Vec<String> {
                 .and_then(|v| v.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            if loaded { Some(key) } else { None }
+            if loaded {
+                Some(key)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -155,7 +162,9 @@ mod tests {
     #[test]
     fn test_is_jit_loading_error_positive() {
         assert!(is_jit_loading_error("No models loaded"));
-        assert!(is_jit_loading_error("Error: no models loaded on this server"));
+        assert!(is_jit_loading_error(
+            "Error: no models loaded on this server"
+        ));
         assert!(is_jit_loading_error("Failed to load model xyz"));
         assert!(is_jit_loading_error("error loading model"));
         assert!(is_jit_loading_error("Model is loading, please wait"));

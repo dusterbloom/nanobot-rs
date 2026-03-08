@@ -15,22 +15,28 @@ impl ReplContext {
             ["peers"] => self.cmd_cluster_peers().await,
             ["use", rest @ ..] => self.cmd_cluster_use(&rest.join(" ")).await,
             _ => {
-                println!("
-  Usage: /cluster [subcommand]");
+                println!(
+                    "
+  Usage: /cluster [subcommand]"
+                );
                 println!("    /cluster              Show cluster status");
                 println!("    /cluster peers        List discovered peers");
                 println!("    /cluster models       List all models across peers");
-                println!("    /cluster use <model>  Switch to a model on a cluster peer
-");
+                println!(
+                    "    /cluster use <model>  Switch to a model on a cluster peer
+"
+                );
             }
         }
     }
 
     #[cfg(not(feature = "cluster"))]
     pub(super) async fn cmd_cluster(&mut self, _arg: &str) {
-        println!("
+        println!(
+            "
   Cluster mode not available (compile with --features cluster).
-");
+"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -38,8 +44,10 @@ impl ReplContext {
         let state = match &self.cluster_state {
             Some(s) => s,
             None => {
-                println!("
-  Cluster not enabled. Add to config:");
+                println!(
+                    "
+  Cluster not enabled. Add to config:"
+                );
                 println!("    \"cluster\": {{ \"enabled\": true }}\n");
                 return;
             }
@@ -49,8 +57,12 @@ impl ReplContext {
         let healthy = peers.iter().filter(|p| p.healthy).count();
         let total_models: usize = peers.iter().map(|p| p.models.len()).sum();
 
-        println!("
-  {}CLUSTER{}", tui::BOLD, tui::RESET);
+        println!(
+            "
+  {}CLUSTER{}",
+            tui::BOLD,
+            tui::RESET
+        );
         println!("    Peers: {} ({} healthy)", peers.len(), healthy);
         println!("    Models: {} total", total_models);
 
@@ -59,7 +71,11 @@ impl ReplContext {
             let age = peer.last_seen.elapsed().as_secs();
             println!(
                 "    {} {} ({}) — {} models, seen {}s ago",
-                status, peer.endpoint, peer.peer_type, peer.models.len(), age
+                status,
+                peer.endpoint,
+                peer.peer_type,
+                peer.models.len(),
+                age
             );
         }
         println!();
@@ -70,26 +86,38 @@ impl ReplContext {
         let state = match &self.cluster_state {
             Some(s) => s,
             None => {
-                println!("
+                println!(
+                    "
   Cluster not enabled.
-");
+"
+                );
                 return;
             }
         };
 
         let peers = state.get_all_peers().await;
         if peers.is_empty() {
-            println!("
+            println!(
+                "
   No peers discovered.
-");
+"
+            );
             return;
         }
 
-        println!("
-  Discovered peers:");
+        println!(
+            "
+  Discovered peers:"
+        );
         for (i, peer) in peers.iter().enumerate() {
             let status = if peer.healthy { "healthy" } else { "down" };
-            println!("    {}. {} [{}] ({})", i + 1, peer.endpoint, peer.peer_type, status);
+            println!(
+                "    {}. {} [{}] ({})",
+                i + 1,
+                peer.endpoint,
+                peer.peer_type,
+                status
+            );
             println!("       Models: {}", peer.models.len());
             if let Some(vram) = peer.total_vram_mb {
                 println!("       VRAM: {} MB", vram);
@@ -103,34 +131,44 @@ impl ReplContext {
         let state = match &self.cluster_state {
             Some(s) => s,
             None => {
-                println!("
+                println!(
+                    "
   Cluster not enabled.
-");
+"
+                );
                 return;
             }
         };
 
         let peers = state.get_healthy_peers().await;
         if peers.is_empty() {
-            println!("
+            println!(
+                "
   No healthy peers found.
-");
+"
+            );
             return;
         }
 
-        println!("
-  Cluster models:");
+        println!(
+            "
+  Cluster models:"
+        );
         for peer in &peers {
             // Extract short name from endpoint (e.g. "192.168.1.62" from "http://192.168.1.62:1234/v1")
-            let short = peer.endpoint
+            let short = peer
+                .endpoint
                 .trim_start_matches("http://")
                 .trim_start_matches("https://")
                 .split(':')
                 .next()
                 .unwrap_or(&peer.endpoint);
 
-            println!("
-    {} ({}):", short, peer.peer_type);
+            println!(
+                "
+    {} ({}):",
+                short, peer.peer_type
+            );
             for model in &peer.models {
                 println!("      - {}", model.id);
             }
@@ -162,7 +200,10 @@ impl ReplContext {
 
                 println!(
                     "\n  Switching to {}{}{}  on  {}",
-                    tui::BOLD, model_id, tui::RESET, peer_endpoint,
+                    tui::BOLD,
+                    model_id,
+                    tui::RESET,
+                    peer_endpoint,
                 );
 
                 // Update in-memory config.
@@ -180,10 +221,7 @@ impl ReplContext {
                 println!("  {}Done.{}\n", tui::GREEN, tui::RESET);
             }
             None => {
-                println!(
-                    "\n  No healthy peer has a model matching \"{}\".",
-                    query
-                );
+                println!("\n  No healthy peer has a model matching \"{}\".", query);
                 println!("  Use /cluster models to see available models.\n");
             }
         }
@@ -201,13 +239,30 @@ impl ReplContext {
                 let d2l = dir.join("personality.gguf");
                 let t2l = dir.join("behavior.gguf");
                 println!("\n  Adapter Status:");
-                println!("    D2L (knowledge):  {}", if d2l.exists() { "ready" } else { "not generated" });
-                println!("    T2L (behavioral): {}", if t2l.exists() { "ready" } else { "not generated" });
+                println!(
+                    "    D2L (knowledge):  {}",
+                    if d2l.exists() {
+                        "ready"
+                    } else {
+                        "not generated"
+                    }
+                );
+                println!(
+                    "    T2L (behavioral): {}",
+                    if t2l.exists() {
+                        "ready"
+                    } else {
+                        "not generated"
+                    }
+                );
                 println!("    Directory: {}", dir.display());
 
                 if let Ok(buf) = lora_bridge::ExperienceBuffer::open_default() {
                     if let Ok(stats) = buf.stats() {
-                        println!("    Experiences: {} total, {} pending", stats.total, stats.unexported);
+                        println!(
+                            "    Experiences: {} total, {} pending",
+                            stats.total, stats.unexported
+                        );
                     }
                 }
                 println!();
@@ -216,60 +271,77 @@ impl ReplContext {
                 println!("\n  Generating adapters...");
                 let server_url = &self.config.agents.defaults.local_api_base;
                 let workspace = self.core_handle.swappable().workspace.clone();
-                match lora_bridge::regenerate_adapters(&workspace, server_url, 0.5, &self.config.agents.defaults.local_model).await {
+                match lora_bridge::regenerate_adapters(
+                    &workspace,
+                    server_url,
+                    0.5,
+                    &self.config.agents.defaults.local_model,
+                )
+                .await
+                {
                     Ok(r) => {
-                        println!("  D2L: {} ({} chars input)",
-                            r.d2l_path.as_ref().map(|p| p.display().to_string()).unwrap_or("skipped".into()),
-                            r.d2l_doc_chars);
-                        println!("  T2L: {} ({} chars input)",
-                            r.t2l_path.as_ref().map(|p| p.display().to_string()).unwrap_or("skipped".into()),
-                            r.t2l_desc_chars);
+                        println!(
+                            "  D2L: {} ({} chars input)",
+                            r.d2l_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or("skipped".into()),
+                            r.d2l_doc_chars
+                        );
+                        println!(
+                            "  T2L: {} ({} chars input)",
+                            r.t2l_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or("skipped".into()),
+                            r.t2l_desc_chars
+                        );
                         println!("  {}\n", r.message);
                     }
                     Err(e) => println!("  Error: {}\n", e),
                 }
             }
-            ["scale", val] => {
-                match val.parse::<f64>() {
-                    Ok(s) if (0.0..=1.0).contains(&s) => {
-                        let dir = lora_bridge::adapters_dir();
-                        let server_url = &self.config.agents.defaults.local_api_base;
-                        let d2l = dir.join("personality.gguf");
-                        let t2l = dir.join("behavior.gguf");
-                        let mut applied = false;
-                        for path in [&d2l, &t2l] {
-                            if path.exists() {
-                                let config = lora_bridge::LoraConfig {
-                                    server_url: server_url.clone(),
-                                    adapter_path: Some(path.clone()),
-                                    scale: s,
-                                };
-                                match lora_bridge::apply_lora_adapter(&config).await {
-                                    Ok(r) if r.success => {
-                                        println!("  Applied {} at scale {}", path.display(), s);
-                                        applied = true;
-                                    }
-                                    Ok(r) => println!("  Failed: {}", r.message),
-                                    Err(e) => println!("  Error: {}", e),
+            ["scale", val] => match val.parse::<f64>() {
+                Ok(s) if (0.0..=1.0).contains(&s) => {
+                    let dir = lora_bridge::adapters_dir();
+                    let server_url = &self.config.agents.defaults.local_api_base;
+                    let d2l = dir.join("personality.gguf");
+                    let t2l = dir.join("behavior.gguf");
+                    let mut applied = false;
+                    for path in [&d2l, &t2l] {
+                        if path.exists() {
+                            let config = lora_bridge::LoraConfig {
+                                server_url: server_url.clone(),
+                                adapter_path: Some(path.clone()),
+                                scale: s,
+                            };
+                            match lora_bridge::apply_lora_adapter(&config).await {
+                                Ok(r) if r.success => {
+                                    println!("  Applied {} at scale {}", path.display(), s);
+                                    applied = true;
                                 }
+                                Ok(r) => println!("  Failed: {}", r.message),
+                                Err(e) => println!("  Error: {}", e),
                             }
                         }
-                        if !applied {
-                            println!("\n  No adapters found. Run /adapt run first.\n");
-                        } else {
-                            println!();
-                        }
                     }
-                    _ => println!("\n  Usage: /adapt scale <0.0-1.0>\n"),
+                    if !applied {
+                        println!("\n  No adapters found. Run /adapt run first.\n");
+                    } else {
+                        println!();
+                    }
                 }
-            }
+                _ => println!("\n  Usage: /adapt scale <0.0-1.0>\n"),
+            },
             _ => {
-                println!("
+                println!(
+                    "
   Usage: /adapt [subcommand]
     /adapt              Show adapter status
     /adapt run          Generate D2L + T2L adapters
     /adapt scale <f>    Set adapter scale (0.0-1.0)
-");
+"
+                );
             }
         }
     }
@@ -314,20 +386,20 @@ impl ReplContext {
                     Err(e) => println!("  Error: {}\n", e),
                 }
             }
-            ["remove", name] | ["rm", name] => {
-                match cli::cmd_skill_remove(&workspace, name) {
-                    Ok(()) => println!("\n  Removed skill: {}\n", name),
-                    Err(e) => println!("\n  Error: {}\n", e),
-                }
-            }
+            ["remove", name] | ["rm", name] => match cli::cmd_skill_remove(&workspace, name) {
+                Ok(()) => println!("\n  Removed skill: {}\n", name),
+                Err(e) => println!("\n  Error: {}\n", e),
+            },
             _ => {
-                println!("
+                println!(
+                    "
   Usage: /skill [subcommand]
     /skill              List installed skills
     /skill list         List installed skills
     /skill add <src>    Install from GitHub (owner/repo or owner/repo@skill)
     /skill remove <n>   Remove a skill by name
-");
+"
+                );
             }
         }
     }

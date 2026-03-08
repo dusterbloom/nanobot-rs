@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::config::schema::Config;
 use crate::providers::base::LLMProvider;
-use crate::providers::oauth::OAuthTokenManager;
 use crate::providers::factory;
+use crate::providers::oauth::OAuthTokenManager;
 
 /// Load a direct AnthropicProvider using OAuth tokens from Claude CLI.
 ///

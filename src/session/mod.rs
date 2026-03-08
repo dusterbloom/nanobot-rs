@@ -1,4 +1,4 @@
 pub mod db;
 pub mod filters;
 
-pub use db::{SessionDb, SessionMeta, SearchResult};
+pub use db::{SearchResult, SessionDb, SessionMeta};

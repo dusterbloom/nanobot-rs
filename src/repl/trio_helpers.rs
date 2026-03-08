@@ -4,8 +4,7 @@
 pub(crate) fn trio_enable(cfg: &mut crate::config::schema::Config) -> bool {
     use crate::config::schema::DelegationMode;
 
-    let needs_warning =
-        cfg.trio.router_model.is_empty() || cfg.trio.specialist_model.is_empty();
+    let needs_warning = cfg.trio.router_model.is_empty() || cfg.trio.specialist_model.is_empty();
     cfg.trio.enabled = true;
     cfg.tool_delegation.mode = DelegationMode::Trio;
     cfg.tool_delegation.apply_mode();
@@ -36,29 +35,29 @@ pub(crate) fn pick_trio_models(
 
     // Router detection (first match wins)
     let router_patterns: &[&str] = &["orchestrator", "router"];
-    let router = router_patterns.iter().find_map(|pat| {
-        available.iter().find(|m| {
-            let low = m.to_lowercase();
-            low.contains(pat) && !is_main(&low)
+    let router = router_patterns
+        .iter()
+        .find_map(|pat| {
+            available.iter().find(|m| {
+                let low = m.to_lowercase();
+                low.contains(pat) && !is_main(&low)
+            })
         })
-    }).cloned();
+        .cloned();
 
     // Specialist detection (first match wins, excludes main + router)
     let router_lower = router.as_ref().map(|r| r.to_lowercase());
-    let specialist_patterns: &[&str] = &[
-        "function-calling",
-        "functiongemma",
-        "instruct",
-        "ministral",
-    ];
-    let specialist = specialist_patterns.iter().find_map(|pat| {
-        available.iter().find(|m| {
-            let low = m.to_lowercase();
-            low.contains(pat)
-                && !is_main(&low)
-                && router_lower.as_deref() != Some(low.as_str())
+    let specialist_patterns: &[&str] =
+        &["function-calling", "functiongemma", "instruct", "ministral"];
+    let specialist = specialist_patterns
+        .iter()
+        .find_map(|pat| {
+            available.iter().find(|m| {
+                let low = m.to_lowercase();
+                low.contains(pat) && !is_main(&low) && router_lower.as_deref() != Some(low.as_str())
+            })
         })
-    }).cloned();
+        .cloned();
 
     (router, specialist)
 }
@@ -119,10 +118,8 @@ pub(crate) fn persist_trio_fields(
     disk.tool_delegation.mode = live.tool_delegation.mode;
     disk.tool_delegation.strict_no_tools_main = live.tool_delegation.strict_no_tools_main;
     disk.tool_delegation.strict_router_schema = live.tool_delegation.strict_router_schema;
-    disk.tool_delegation.role_scoped_context_packs =
-        live.tool_delegation.role_scoped_context_packs;
-    disk.agents.defaults.local_max_context_tokens =
-        live.agents.defaults.local_max_context_tokens;
+    disk.tool_delegation.role_scoped_context_packs = live.tool_delegation.role_scoped_context_packs;
+    disk.agents.defaults.local_max_context_tokens = live.agents.defaults.local_max_context_tokens;
 }
 
 // ============================================================================
@@ -136,7 +133,11 @@ pub(crate) fn format_vram_budget(result: &crate::server::VramBudgetResult) -> St
 
     let cap_gb = result.effective_limit_bytes as f64 / 1e9;
     let _ = writeln!(out);
-    let _ = writeln!(out, "  \x1b[1mVRAM BUDGET\x1b[0m  (limit: {:.1} GB)", cap_gb);
+    let _ = writeln!(
+        out,
+        "  \x1b[1mVRAM BUDGET\x1b[0m  (limit: {:.1} GB)",
+        cap_gb
+    );
     let _ = writeln!(out, "  {}", "\u{2500}".repeat(52));
 
     for b in &result.breakdown {
@@ -194,23 +195,35 @@ pub(crate) fn apply_trio_param(
 ) -> Result<String, String> {
     match (role, param) {
         ("router", "temperature") => {
-            let v: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            let v: f64 = value
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", value))?;
             config.trio.router_temperature = v.clamp(0.0, 2.0);
-            Ok(format!("router temperature = {:.1}", config.trio.router_temperature))
+            Ok(format!(
+                "router temperature = {:.1}",
+                config.trio.router_temperature
+            ))
         }
         ("specialist", "temperature") => {
-            let v: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            let v: f64 = value
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", value))?;
             config.trio.specialist_temperature = v.clamp(0.0, 2.0);
-            Ok(format!("specialist temperature = {:.1}", config.trio.specialist_temperature))
+            Ok(format!(
+                "specialist temperature = {:.1}",
+                config.trio.specialist_temperature
+            ))
         }
         ("router", "ctx") => {
-            let ctx = super::super::parse_ctx_arg(value).map_err(|e| e.to_string())?
+            let ctx = super::super::parse_ctx_arg(value)
+                .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Missing context size".to_string())?;
             config.trio.router_ctx_tokens = ctx;
             Ok(format!("router ctx = {}K", ctx / 1024))
         }
         ("specialist", "ctx") => {
-            let ctx = super::super::parse_ctx_arg(value).map_err(|e| e.to_string())?
+            let ctx = super::super::parse_ctx_arg(value)
+                .map_err(|e| e.to_string())?
                 .ok_or_else(|| "Missing context size".to_string())?;
             config.trio.specialist_ctx_tokens = ctx;
             Ok(format!("specialist ctx = {}K", ctx / 1024))
@@ -224,7 +237,9 @@ pub(crate) fn apply_trio_param(
             Ok(format!("main no_think = {}", config.trio.main_no_think))
         }
         ("trio", "vram_cap") => {
-            let gb: f64 = value.parse().map_err(|_| format!("Invalid number: {}", value))?;
+            let gb: f64 = value
+                .parse()
+                .map_err(|_| format!("Invalid number: {}", value))?;
             if gb < 1.0 || gb > 256.0 {
                 return Err("VRAM cap must be between 1 and 256 GB".to_string());
             }

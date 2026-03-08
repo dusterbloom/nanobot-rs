@@ -445,7 +445,9 @@ impl IncrementalRenderer {
 
     /// Erase all terminal rows occupied by the current partial line.
     fn erase_partial_rows(&self) {
-        let rows = if crate::tui::RESIZE_PENDING.load(std::sync::atomic::Ordering::Relaxed) || self.partial_rows == 0 {
+        let rows = if crate::tui::RESIZE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+            || self.partial_rows == 0
+        {
             self.compute_partial_rows()
         } else {
             self.partial_rows

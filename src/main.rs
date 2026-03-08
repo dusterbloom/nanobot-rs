@@ -6,17 +6,17 @@
 mod agent;
 mod bus;
 mod channels;
+mod cli;
 #[cfg(feature = "cluster")]
 mod cluster;
-mod cli;
 mod config;
 mod cron;
 mod errors;
 mod heartbeat;
 mod lms;
+mod providers;
 #[cfg(feature = "voice")]
 mod realtime;
-mod providers;
 mod repl;
 mod searxng;
 mod server;
@@ -210,8 +210,8 @@ enum Commands {
         /// Path to MLX model directory (containing .safetensors + tokenizer.json).
         #[arg(short, long)]
         model_dir: Option<String>,
-        /// Model config preset: "qwen3-1.7b" or "qwen3.5-2b".
-        #[arg(long, default_value = "qwen3.5-2b")]
+        /// Model config preset: auto | qwen3-0.6b | qwen3-1.7b | qwen3-4b | qwen3-8b | qwen3.5-2b.
+        #[arg(long, default_value = "auto")]
         preset: String,
         /// Host to bind to.
         #[arg(long, default_value = "127.0.0.1")]
@@ -471,16 +471,19 @@ fn main() {
     // Always suppress noisy crates regardless of RUST_LOG setting.
     // When RUST_LOG is set (e.g. "debug"), append mandatory filters so html5ever
     // and other spammy crates don't flood the log file.
-    let noisy_crate_filters = ",html5ever=error,ort=off,pocket_tts=off,hyper=warn,reqwest=warn,rustyline=warn";
+    let noisy_crate_filters =
+        ",html5ever=error,ort=off,pocket_tts=off,hyper=warn,reqwest=warn,rustyline=warn";
     let env_filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(_) => {
             // RUST_LOG is set — append our mandatory suppressions
-            let combined = format!("{}{}", std::env::var("RUST_LOG").unwrap_or_default(), noisy_crate_filters);
+            let combined = format!(
+                "{}{}",
+                std::env::var("RUST_LOG").unwrap_or_default(),
+                noisy_crate_filters
+            );
             tracing_subscriber::EnvFilter::new(combined)
         }
-        Err(_) => {
-            tracing_subscriber::EnvFilter::new(format!("warn{}", noisy_crate_filters))
-        }
+        Err(_) => tracing_subscriber::EnvFilter::new(format!("warn{}", noisy_crate_filters)),
     };
 
     // Chrome tracing: build layer + guard (feature-gated).
@@ -656,8 +659,8 @@ fn main() {
                     }
                 }
                 SkillsAction::Add { source } => {
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("Failed to create tokio runtime");
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                     match rt.block_on(cli::cmd_skill_add(&workspace, &source)) {
                         Ok(installed) => {
                             for name in &installed {
@@ -671,15 +674,13 @@ fn main() {
                         }
                     }
                 }
-                SkillsAction::Remove { name } => {
-                    match cli::cmd_skill_remove(&workspace, &name) {
-                        Ok(()) => println!("Removed skill: {}", name),
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
+                SkillsAction::Remove { name } => match cli::cmd_skill_remove(&workspace, &name) {
+                    Ok(()) => println!("Removed skill: {}", name),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
                     }
-                }
+                },
             }
         }
         Commands::Cron { action } => match action {
@@ -751,7 +752,9 @@ fn main() {
                 let key = sessions_cmd::make_session_key(name.as_deref());
                 repl::cmd_agent(None, key, local, None)
             }
-            SessionsAction::Export { key, format } => sessions_cmd::cmd_sessions_export(&key, &format),
+            SessionsAction::Export { key, format } => {
+                sessions_cmd::cmd_sessions_export(&key, &format)
+            }
             SessionsAction::Purge { older_than } => sessions_cmd::cmd_sessions_purge(&older_than),
             SessionsAction::Archive => sessions_cmd::cmd_sessions_archive(),
             SessionsAction::Nuke { force } => sessions_cmd::cmd_sessions_nuke(force),
@@ -785,36 +788,49 @@ fn main() {
         #[cfg(feature = "voice")]
         Commands::Voice { action } => match action {
             VoiceAction::List { engine } => cli::cmd_voice_list(engine),
-            VoiceAction::Clone { name, audio, transcript } => {
-                cli::cmd_voice_clone(name, audio, transcript)
-            }
+            VoiceAction::Clone {
+                name,
+                audio,
+                transcript,
+            } => cli::cmd_voice_clone(name, audio, transcript),
             VoiceAction::Config => cli::cmd_voice_config(),
         },
         #[cfg(feature = "mlx")]
-        Commands::MlxServe { model_dir, preset, host, port } => {
-            let model_dir = model_dir
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    let home = std::env::var("HOME").expect("HOME not set");
-                    std::path::PathBuf::from(home)
-                        .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
-                });
-            let model_config = match preset.as_str() {
-                "qwen3-1.7b" => crate::agent::mlx_lora::ModelConfig::qwen3_1_7b(),
-                "qwen3.5-2b" | _ => crate::agent::mlx_lora::ModelConfig::qwen3_5_2b(),
+        Commands::MlxServe {
+            model_dir,
+            preset,
+            host,
+            port,
+        } => {
+            let model_dir = model_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let home = std::env::var("HOME").expect("HOME not set");
+                std::path::PathBuf::from(home)
+                    .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
+            });
+            let effective_preset = if preset == "auto" {
+                crate::cli::preset_from_model_dir(&model_dir).to_string()
+            } else {
+                preset
+            };
+            let Some(model_config) = crate::cli::model_config_from_preset(&effective_preset) else {
+                eprintln!(
+                    "Unsupported MLX preset '{}' for model '{}'. Supported presets: auto, qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b.",
+                    effective_preset,
+                    model_dir.display()
+                );
+                return;
             };
             let server_cfg = crate::agent::mlx_server::MlxServerConfig {
                 model_dir,
                 model_config,
                 lora_config: crate::agent::mlx_lora::LoraConfig {
-                    lr: 1e-5,  // mlx_lm default; 5e-4 causes NaN on real sequences
+                    lr: 1e-5, // mlx_lm default; 5e-4 causes NaN on real sequences
                     ..crate::agent::mlx_lora::LoraConfig::default()
                 },
                 host,
                 port,
             };
-            let runtime = tokio::runtime::Runtime::new()
-                .expect("Failed to create tokio runtime");
+            let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             if let Err(e) = runtime.block_on(crate::agent::mlx_server::serve(server_cfg)) {
                 eprintln!("MLX server error: {e}");
             }
@@ -926,7 +942,8 @@ mod tests {
 
     #[test]
     fn test_cli_parses_sessions_resume() {
-        let cli = Cli::try_parse_from(["nanobot", "sessions", "resume", "20260302_143022_a7f2b1"]).unwrap();
+        let cli = Cli::try_parse_from(["nanobot", "sessions", "resume", "20260302_143022_a7f2b1"])
+            .unwrap();
         match cli.command {
             Commands::Sessions { action } => match action {
                 SessionsAction::Resume { id, local } => {
@@ -956,9 +973,10 @@ mod tests {
 
     #[test]
     fn test_cli_parses_sessions_export() {
-        let cli =
-            Cli::try_parse_from(["nanobot", "sessions", "export", "cli:x", "--format", "jsonl"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "nanobot", "sessions", "export", "cli:x", "--format", "jsonl",
+        ])
+        .unwrap();
         match cli.command {
             Commands::Sessions { action } => match action {
                 SessionsAction::Export { key, format } => {

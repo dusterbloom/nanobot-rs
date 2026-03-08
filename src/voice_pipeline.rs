@@ -11,19 +11,18 @@
 //! Uses cross-platform `AudioCapture`/`AudioPlayer` from jack-voice (cpal-based),
 //! no `parec` dependency.
 
+use parking_lot::Mutex;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 
 use crate::config::schema::TtsEngineConfig;
 use jack_voice::{
-    AudioCapture, AudioError, AudioPlayer,
     models::{self, ModelProgressCallback},
-    SpeechToText, SttMode, TextToSpeech, TtsEngine,
+    AudioCapture, AudioError, AudioPlayer, SpeechToText, SttMode, TextToSpeech, TtsEngine,
 };
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 use once_cell::sync::Lazy;
@@ -321,7 +320,10 @@ fn start_native_capture(sample_tx: std_mpsc::Sender<Vec<f32>>) -> Result<AudioCa
 /// A command sent to the synthesis thread.
 pub(crate) enum TtsCommand {
     /// Synthesize text with detected language (ISO code e.g. "en", "it", "es").
-    Synthesize { text: String, language: String },
+    Synthesize {
+        text: String,
+        language: String,
+    },
     Finish,
 }
 
@@ -433,7 +435,10 @@ impl SentenceAccumulator {
         }
         if !pending.is_empty() {
             let language = detect_language(&pending);
-            let _ = self.sentence_tx.send(TtsCommand::Synthesize { text: pending, language });
+            let _ = self.sentence_tx.send(TtsCommand::Synthesize {
+                text: pending,
+                language,
+            });
         }
         let _ = self.sentence_tx.send(TtsCommand::Finish);
     }
@@ -441,13 +446,16 @@ impl SentenceAccumulator {
     /// Send text to TTS with auto-detected language.
     fn send_to_tts(&self, text: String) {
         let language = detect_language(&text);
-        let _ = self.sentence_tx.send(TtsCommand::Synthesize { text, language });
+        let _ = self
+            .sentence_tx
+            .send(TtsCommand::Synthesize { text, language });
     }
 
     /// Same as send_to_tts but returns the Result (for use with `let _ =`).
     fn send_to_tts_raw(&self, text: String) -> Result<(), std_mpsc::SendError<TtsCommand>> {
         let language = detect_language(&text);
-        self.sentence_tx.send(TtsCommand::Synthesize { text, language })
+        self.sentence_tx
+            .send(TtsCommand::Synthesize { text, language })
     }
 
     fn enqueue_sentence(&mut self, sentence: &str) {
@@ -577,7 +585,8 @@ fn strip_inline_markdown(text: &str) -> String {
                     || cp >= 0xFE00 && cp <= 0xFE0F    // Variation selectors
                     || cp >= 0x1F000 && cp <= 0x1FAFF  // All emoji blocks
                     || cp >= 0x200D && cp <= 0x200D     // Zero-width joiner
-                    || cp >= 0xE0020 && cp <= 0xE007F   // Tag sequences (flags)
+                    || cp >= 0xE0020 && cp <= 0xE007F
+                // Tag sequences (flags)
                 {
                     continue;
                 }
@@ -672,9 +681,15 @@ impl VoicePipeline {
                 .map_err(|e| format!("spawn_blocking join error: {e}"))?
             {
                 Ok(tts) => {
-                    info!("{} TTS ready (English) [engine: {}]",
-                        if tts.engine_type() == "pocket" { "Pocket" } else { tts.engine_type() },
-                        tts.engine_type());
+                    info!(
+                        "{} TTS ready (English) [engine: {}]",
+                        if tts.engine_type() == "pocket" {
+                            "Pocket"
+                        } else {
+                            tts.engine_type()
+                        },
+                        tts.engine_type()
+                    );
                     Some(Arc::new(Mutex::new(tts)))
                 }
                 Err(e) => {
@@ -753,9 +768,11 @@ impl VoicePipeline {
                     .await
                     .map_err(|e| format!("Model download failed: {e}"))?;
 
-                let tts_en = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket))
-                    .await
-                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                let tts_en = match tokio::task::spawn_blocking(|| {
+                    TextToSpeech::with_engine(TtsEngine::Pocket)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
                 {
                     Ok(tts) => {
                         info!("Pocket TTS ready (English)");
@@ -767,9 +784,11 @@ impl VoicePipeline {
                     }
                 };
 
-                let tts_multi = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                    .await
-                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                let tts_multi = match tokio::task::spawn_blocking(|| {
+                    TextToSpeech::with_engine(TtsEngine::Kokoro)
+                })
+                .await
+                .map_err(|e| format!("spawn_blocking join error: {e}"))?
                 {
                     Ok(tts) => {
                         info!("Kokoro TTS ready (multilingual fallback)");
@@ -787,10 +806,11 @@ impl VoicePipeline {
                 models::ensure_kokoro_model(progress)
                     .await
                     .map_err(|e| format!("Model download failed: {e}"))?;
-                let tts = tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
-                    .await
-                    .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                    .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
+                let tts =
+                    tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro))
+                        .await
+                        .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                        .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
                 info!("Kokoro TTS ready (multilingual)");
                 (None, Some(Arc::new(Mutex::new(tts))))
             }
@@ -880,7 +900,9 @@ impl VoicePipeline {
         let stt = self.stt.clone();
         let result = {
             let mut guard = stt.lock();
-            guard.transcribe(&all_samples).map_err(|e| format!("Transcription failed: {e}"))?
+            guard
+                .transcribe(&all_samples)
+                .map_err(|e| format!("Transcription failed: {e}"))?
         };
 
         let text = result.text.trim().to_string();
@@ -1127,7 +1149,11 @@ impl VoicePipeline {
         }
 
         let lang = detect_language(&text);
-        debug!("Transcribed: \"{}\" (lang: {})", &text[..text.len().min(80)], lang);
+        debug!(
+            "Transcribed: \"{}\" (lang: {})",
+            &text[..text.len().min(80)],
+            lang
+        );
         Ok((text, lang))
     }
 
@@ -1155,7 +1181,9 @@ impl VoicePipeline {
                 // default voice
             } else {
                 let (voice_id, _) = language_to_kokoro_voice(&lang);
-                guard.set_speaker(voice_id).map_err(|e| format!("Voice switch failed: {e}"))?;
+                guard
+                    .set_speaker(voice_id)
+                    .map_err(|e| format!("Voice switch failed: {e}"))?;
             }
 
             let sentences = split_tts_sentences(&text);
@@ -1182,7 +1210,10 @@ impl VoicePipeline {
         .map_err(|e| format!("spawn_blocking join error: {e}"))??;
 
         let output_path = encode_samples_to_ogg(&all_samples, sample_rate)?;
-        debug!("Synthesized voice to {} (lang: {})", output_path, lang_for_log);
+        debug!(
+            "Synthesized voice to {} (lang: {})",
+            output_path, lang_for_log
+        );
         Ok(output_path)
     }
 }
@@ -1200,7 +1231,9 @@ pub type VoiceSession = VoicePipeline;
 
 fn decode_audio_file(path: &str) -> Result<Vec<f32>, String> {
     let output = Command::new("ffmpeg")
-        .args(["-i", path, "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1"])
+        .args([
+            "-i", path, "-f", "f32le", "-ar", "16000", "-ac", "1", "pipe:1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1238,8 +1271,20 @@ fn encode_samples_to_ogg(samples: &[f32], sample_rate: u32) -> Result<String, St
 
     let mut child = Command::new("ffmpeg")
         .args([
-            "-f", "f32le", "-ar", &sample_rate.to_string(), "-ac", "1",
-            "-i", "pipe:0", "-c:a", "libopus", "-b:a", "128k", "-y", &output_path_str,
+            "-f",
+            "f32le",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "128k",
+            "-y",
+            &output_path_str,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1248,10 +1293,14 @@ fn encode_samples_to_ogg(samples: &[f32], sample_rate: u32) -> Result<String, St
         .map_err(|e| format!("ffmpeg encode failed: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&raw_bytes).map_err(|e| format!("Failed to write to ffmpeg stdin: {e}"))?;
+        stdin
+            .write_all(&raw_bytes)
+            .map_err(|e| format!("Failed to write to ffmpeg stdin: {e}"))?;
     }
 
-    let output = child.wait_with_output().map_err(|e| format!("ffmpeg encode wait failed: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("ffmpeg encode wait failed: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1349,7 +1398,10 @@ pub(crate) fn start_tts_playback(
                     tracing::debug!("[tts-synth] received Finish, waiting for next turn");
                     continue;
                 }
-                TtsCommand::Synthesize { text: sentence, language } => {
+                TtsCommand::Synthesize {
+                    text: sentence,
+                    language,
+                } => {
                     if cancel_synth.load(Ordering::Relaxed) {
                         continue;
                     }
@@ -1380,7 +1432,11 @@ pub(crate) fn start_tts_playback(
                     } else {
                         let (voice_id, _) = language_to_kokoro_voice(&language);
                         if let Err(e) = guard.set_speaker(voice_id) {
-                            tracing::warn!("[tts-synth] voice switch to {} failed: {}", voice_id, e);
+                            tracing::warn!(
+                                "[tts-synth] voice switch to {} failed: {}",
+                                voice_id,
+                                e
+                            );
                         }
                     }
 
@@ -1437,7 +1493,11 @@ pub(crate) fn start_tts_playback(
                 tracing::debug!("[tts-play] empty chunk, skipping");
                 continue;
             }
-            tracing::debug!("[tts-play] received {} samples @ {}Hz", samples.len(), chunk.sample_rate);
+            tracing::debug!(
+                "[tts-play] received {} samples @ {}Hz",
+                samples.len(),
+                chunk.sample_rate
+            );
             tts_playing_play.store(true, Ordering::SeqCst);
             let p = player.get_or_insert_with(|| {
                 tracing::debug!("[tts-play] creating AudioPlayer");
@@ -1477,7 +1537,10 @@ mod tests {
 
     #[test]
     fn test_lingua_detects_spanish() {
-        assert_eq!(detect_language("Hola, cómo estás hoy? Quiero preguntarte sobre el clima."), "es");
+        assert_eq!(
+            detect_language("Hola, cómo estás hoy? Quiero preguntarte sobre el clima."),
+            "es"
+        );
     }
 
     #[test]
@@ -1593,5 +1656,4 @@ mod tests {
         assert!(total_samples > 100);
         assert!(chunk_count > 1);
     }
-
 }

@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use crate::config::loader::{load_config};
+use crate::config::loader::load_config;
 use crate::providers::base::LLMProvider;
 use crate::providers::factory;
 
-use super::provider::{create_provider, check_api_key};
+use super::provider::{check_api_key, create_provider};
 
 /// Build an LLM provider for eval: local LM Studio or cloud API.
 pub(crate) fn make_eval_provider(local: bool, port: u16) -> Arc<dyn LLMProvider> {

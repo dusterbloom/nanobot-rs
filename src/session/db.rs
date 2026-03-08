@@ -116,8 +116,9 @@ impl SessionDb {
     ///
     /// Enables WAL journal mode and creates the schema on first run.
     pub fn new(db_path: &Path) -> Self {
-        let conn = Connection::open(db_path)
-            .unwrap_or_else(|e| panic!("Failed to open session DB at {}: {}", db_path.display(), e));
+        let conn = Connection::open(db_path).unwrap_or_else(|e| {
+            panic!("Failed to open session DB at {}: {}", db_path.display(), e)
+        });
 
         // Enable WAL for concurrent read access.
         conn.execute_batch("PRAGMA journal_mode=WAL;")
@@ -202,11 +203,7 @@ impl SessionDb {
 
     /// List sessions, optionally filtered to those whose `session_key` starts
     /// with `key_filter`. Results are ordered by `updated_at` descending.
-    pub async fn list_sessions(
-        &self,
-        key_filter: Option<&str>,
-        limit: usize,
-    ) -> Vec<SessionMeta> {
+    pub async fn list_sessions(&self, key_filter: Option<&str>, limit: usize) -> Vec<SessionMeta> {
         let conn = self.conn.lock().await;
         let mut stmt = match key_filter {
             Some(_) => conn
@@ -257,10 +254,12 @@ impl SessionDb {
             Ok(SessionMeta {
                 id: row.get(0)?,
                 session_key: row.get(1)?,
-                created_at: row.get::<_, String>(2)?
+                created_at: row
+                    .get::<_, String>(2)?
                     .parse()
                     .unwrap_or_else(|_| Utc::now()),
-                updated_at: row.get::<_, String>(3)?
+                updated_at: row
+                    .get::<_, String>(3)?
                     .parse()
                     .unwrap_or_else(|_| Utc::now()),
                 message_count: row.get::<_, i64>(4)? as usize,
@@ -385,7 +384,17 @@ impl SessionDb {
 
         rows.flatten()
             .map(
-                |(role, content, tool_calls_json, tool_call_id, tool_name, turn_tag, synthetic, timestamp, metadata_json)| {
+                |(
+                    role,
+                    content,
+                    tool_calls_json,
+                    tool_call_id,
+                    tool_name,
+                    turn_tag,
+                    synthetic,
+                    timestamp,
+                    metadata_json,
+                )| {
                     reconstruct_message(
                         role,
                         content,
@@ -420,17 +429,24 @@ impl SessionDb {
             let pattern = format!("{}%", key_filter);
             let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
-                Err(e) => { warn!("FTS prepare failed: {}", e); return Vec::new(); }
+                Err(e) => {
+                    warn!("FTS prepare failed: {}", e);
+                    return Vec::new();
+                }
             };
             stmt.query_map(params![query, pattern, limit as i64], |row| {
                 Ok(SearchResult {
-                    session_id: row.get(0)?, session_key: row.get(1)?, role: row.get(2)?,
+                    session_id: row.get(0)?,
+                    session_key: row.get(1)?,
+                    role: row.get(2)?,
                     content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     timestamp: row.get(4)?,
                     snippet: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     rank: row.get(6)?,
                 })
-            }).map(|rows| rows.flatten().collect()).unwrap_or_default()
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
         } else {
             let sql = "SELECT m.session_id, s.session_key, m.role, m.content, m.timestamp,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snip, rank
@@ -441,27 +457,39 @@ impl SessionDb {
                        ORDER BY rank LIMIT ?2";
             let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
-                Err(e) => { warn!("FTS prepare failed: {}", e); return Vec::new(); }
+                Err(e) => {
+                    warn!("FTS prepare failed: {}", e);
+                    return Vec::new();
+                }
             };
             stmt.query_map(params![query, limit as i64], |row| {
                 Ok(SearchResult {
-                    session_id: row.get(0)?, session_key: row.get(1)?, role: row.get(2)?,
+                    session_id: row.get(0)?,
+                    session_key: row.get(1)?,
+                    role: row.get(2)?,
                     content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     timestamp: row.get(4)?,
                     snippet: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     rank: row.get(6)?,
                 })
-            }).map(|rows| rows.flatten().collect()).unwrap_or_default()
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
         }
     }
 
     pub async fn rebuild_fts_index(&self) {
         let conn = self.conn.lock().await;
-        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')", []).ok();
+        conn.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
+            [],
+        )
+        .ok();
         conn.execute(
             "INSERT INTO messages_fts(rowid, content, role) SELECT id, content, role FROM messages",
             [],
-        ).ok();
+        )
+        .ok();
     }
 }
 
@@ -539,7 +567,16 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
         .unwrap_or_else(|| Utc::now().to_rfc3339());
 
     // Collect any remaining fields into `metadata` so nothing is lost.
-    let reserved = ["role", "content", "tool_calls", "tool_call_id", "name", "_turn", "_synthetic", "timestamp"];
+    let reserved = [
+        "role",
+        "content",
+        "tool_calls",
+        "tool_call_id",
+        "name",
+        "_turn",
+        "_synthetic",
+        "timestamp",
+    ];
     let metadata: serde_json::Map<String, Value> = msg
         .as_object()
         .map(|obj| {
@@ -569,7 +606,10 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
             metadata_json,
         ],
     ) {
-        warn!("Failed to insert message into session {}: {}", session_id, e);
+        warn!(
+            "Failed to insert message into session {}: {}",
+            session_id, e
+        );
         return;
     }
 
@@ -579,7 +619,10 @@ fn insert_message_locked(conn: &Connection, session_id: &str, msg: &Value) {
         "UPDATE sessions SET updated_at = ?1, message_count = message_count + 1 WHERE id = ?2",
         params![now_str, session_id],
     ) {
-        warn!("Failed to update session metadata for {}: {}", session_id, e);
+        warn!(
+            "Failed to update session metadata for {}: {}",
+            session_id, e
+        );
     }
 }
 
@@ -826,7 +869,10 @@ mod tests {
 
         // get_history must filter it out.
         let history = db.get_history(&meta.id, 100, 0).await;
-        assert!(history.is_empty(), "synthetic messages must be filtered by get_history");
+        assert!(
+            history.is_empty(),
+            "synthetic messages must be filtered by get_history"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -893,7 +939,9 @@ mod tests {
 
         let telegram_only = db.list_sessions(Some("telegram"), 100).await;
         assert_eq!(telegram_only.len(), 2);
-        assert!(telegram_only.iter().all(|m| m.session_key.starts_with("telegram")));
+        assert!(telegram_only
+            .iter()
+            .all(|m| m.session_key.starts_with("telegram")));
     }
 
     #[tokio::test]
@@ -927,7 +975,10 @@ mod tests {
             .get_latest_session("cli:default")
             .await
             .expect("must find a session");
-        assert_eq!(latest.id, second.id, "get_latest_session must return the most recently updated session");
+        assert_eq!(
+            latest.id, second.id,
+            "get_latest_session must return the most recently updated session"
+        );
         // Suppress unused-variable warning; we kept `first` to verify ordering.
         let _ = first;
     }
@@ -985,10 +1036,14 @@ mod tests {
     async fn test_fts_search_basic() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:fts").await;
-        db.add_messages(&meta.id, &[
-            json!({"role": "user", "content": "What is the capital of France?"}),
-            json!({"role": "assistant", "content": "The capital of France is Paris."}),
-        ]).await;
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({"role": "user", "content": "What is the capital of France?"}),
+                json!({"role": "assistant", "content": "The capital of France is Paris."}),
+            ],
+        )
+        .await;
         let results = db.search_messages("Paris", 10, None).await;
         assert!(!results.is_empty());
         assert!(results[0].content.contains("Paris"));
@@ -998,7 +1053,8 @@ mod tests {
     async fn test_fts_search_no_match() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:fts2").await;
-        db.add_message(&meta.id, &json!({"role": "user", "content": "Hello world"})).await;
+        db.add_message(&meta.id, &json!({"role": "user", "content": "Hello world"}))
+            .await;
         let results = db.search_messages("xyznonexistent", 10, None).await;
         assert!(results.is_empty());
     }
@@ -1008,8 +1064,16 @@ mod tests {
         let (db, _dir) = make_db();
         let cli = db.create_session("cli:default").await;
         let tg = db.create_session("telegram:42").await;
-        db.add_message(&cli.id, &json!({"role": "user", "content": "CLI Rust question"})).await;
-        db.add_message(&tg.id, &json!({"role": "user", "content": "Telegram Rust question"})).await;
+        db.add_message(
+            &cli.id,
+            &json!({"role": "user", "content": "CLI Rust question"}),
+        )
+        .await;
+        db.add_message(
+            &tg.id,
+            &json!({"role": "user", "content": "Telegram Rust question"}),
+        )
+        .await;
         let results = db.search_messages("Rust", 10, Some("cli:")).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_key, "cli:default");
@@ -1019,7 +1083,11 @@ mod tests {
     async fn test_fts_rebuild() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:rebuild").await;
-        db.add_message(&meta.id, &json!({"role": "user", "content": "Rebuild test message"})).await;
+        db.add_message(
+            &meta.id,
+            &json!({"role": "user", "content": "Rebuild test message"}),
+        )
+        .await;
         db.rebuild_fts_index().await;
         let results = db.search_messages("Rebuild", 10, None).await;
         assert!(!results.is_empty());
@@ -1034,16 +1102,24 @@ mod tests {
     #[tokio::test]
     async fn test_session_key_patterns_match_legacy() {
         let (db, _dir) = make_db();
-        
-        let keys = vec!["cli:default", "telegram:12345", "disk:session", "email:user@example.com"];
+
+        let keys = vec![
+            "cli:default",
+            "telegram:12345",
+            "disk:session",
+            "email:user@example.com",
+        ];
         let mut ids = Vec::new();
-        
+
         for key in &keys {
             let meta = db.create_session(key).await;
             ids.push(meta.id);
-            assert_eq!(meta.session_key, *key, "session_key must preserve the original key format");
+            assert_eq!(
+                meta.session_key, *key,
+                "session_key must preserve the original key format"
+            );
         }
-        
+
         for (i, key) in keys.iter().enumerate() {
             let loaded = db.get_session(&ids[i]).await.expect("session must exist");
             assert_eq!(loaded.session_key, *key);
@@ -1055,18 +1131,22 @@ mod tests {
     async fn test_filters_integration_with_db() {
         let (db, _dir) = make_db();
         let meta = db.create_session("cli:filter_test").await;
-        
-        db.add_messages(&meta.id, &[
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-            json!({"role": "clear", "timestamp": "2024-01-01T00:00:00Z"}),
-            json!({"role": "user", "content": "q2"}),
-            json!({"role": "assistant", "content": "a2"}),
-        ]).await;
-        
+
+        db.add_messages(
+            &meta.id,
+            &[
+                json!({"role": "user", "content": "q1"}),
+                json!({"role": "assistant", "content": "a1"}),
+                json!({"role": "clear", "timestamp": "2024-01-01T00:00:00Z"}),
+                json!({"role": "user", "content": "q2"}),
+                json!({"role": "assistant", "content": "a2"}),
+            ],
+        )
+        .await;
+
         let all = db.get_all_messages(&meta.id).await;
         let filtered = filter_history(&all, 100, 0);
-        
+
         assert_eq!(filtered.len(), 2, "clear marker must truncate history");
         assert_eq!(filtered[0]["content"], "q2");
     }

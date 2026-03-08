@@ -195,15 +195,20 @@ impl ReplContext {
                 let sessions_dir = dirs::home_dir().unwrap().join(".nanobot/sessions");
                 let core = self.core_handle.swappable();
                 let memory_sessions_dir = core.workspace.join("memory").join("sessions");
-                let (indexed, skipped, errors) =
-                    crate::agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
+                let (indexed, skipped, errors) = crate::agent::session_indexer::index_sessions(
+                    &sessions_dir,
+                    &memory_sessions_dir,
+                );
                 println!(
                     "Indexed {} sessions ({} skipped, {} errors)",
                     indexed, skipped, errors
                 );
             }
             _ => {
-                eprintln!("Unknown subcommand '{}'. Available: list, export, purge, archive, index", sub);
+                eprintln!(
+                    "Unknown subcommand '{}'. Available: list, export, purge, archive, index",
+                    sub
+                );
             }
         }
     }

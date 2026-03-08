@@ -82,7 +82,10 @@ pub(crate) enum VoiceAgentState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum VoiceAction {
     EmitEvent(VoiceAgentEvent),
-    StartLlm { text: String, language: String },
+    StartLlm {
+        text: String,
+        language: String,
+    },
     /// Cancel in-flight LLM generation AND stop TTS playback (barge-in).
     CancelAll,
 }
@@ -96,8 +99,8 @@ pub(crate) fn next_state(
     state: &VoiceAgentState,
     event: &super::RealtimeEvent,
 ) -> (VoiceAgentState, Vec<VoiceAction>) {
-    use VoiceAgentState::*;
     use super::RealtimeEvent;
+    use VoiceAgentState::*;
 
     match (state, event) {
         // Listening: user starts speaking
@@ -186,7 +189,11 @@ impl AgentLoopProcessor {
         channel: String,
         chat_id: String,
     ) -> Self {
-        Self { agent_loop, channel, chat_id }
+        Self {
+            agent_loop,
+            channel,
+            chat_id,
+        }
     }
 }
 
@@ -260,7 +267,8 @@ pub(crate) async fn run_voice_event_loop(
                     tokio::spawn(async move {
                         let _ = event_tx.send(VoiceAgentEvent::LlmResponseStart).await;
 
-                        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                        let (delta_tx, mut delta_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<String>();
 
                         // Spawn delta forwarder
                         let event_tx_deltas = event_tx.clone();
@@ -320,7 +328,11 @@ pub(crate) async fn drive_llm_to_tts(
     let mut delta_count = 0u32;
     while let Some(delta) = delta_rx.recv().await {
         delta_count += 1;
-        let _ = event_tx.send(VoiceAgentEvent::LlmTextDelta { delta: delta.clone() }).await;
+        let _ = event_tx
+            .send(VoiceAgentEvent::LlmTextDelta {
+                delta: delta.clone(),
+            })
+            .await;
 
         // Filter out protocol metadata (NUL-prefixed messages from agent_loop)
         if delta.starts_with('\x00') {
@@ -338,7 +350,10 @@ pub(crate) async fn drive_llm_to_tts(
             accumulator.push(&cleaned);
         }
     }
-    tracing::debug!("[drive-tts] LLM stream ended after {} deltas, flushing accumulator", delta_count);
+    tracing::debug!(
+        "[drive-tts] LLM stream ended after {} deltas, flushing accumulator",
+        delta_count
+    );
     accumulator.flush();
 }
 
@@ -405,7 +420,10 @@ impl VoiceAgent {
     }
 
     /// Create a new voice agent with an AgentLoop for real LLM processing.
-    pub fn with_agent_loop(config: VoiceAgentConfig, agent_loop: Arc<crate::agent::agent_loop::AgentLoop>) -> Self {
+    pub fn with_agent_loop(
+        config: VoiceAgentConfig,
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+    ) -> Self {
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
@@ -677,7 +695,9 @@ mod tests {
 
     impl MockLlmProcessor {
         fn new(response: &str) -> Self {
-            Self { response: response.to_string() }
+            Self {
+                response: response.to_string(),
+            }
         }
     }
 
@@ -746,7 +766,9 @@ mod tests {
         let mock = MockLlmProcessor::new("Hello world from mock");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let result = mock.process_text("test input", "session1", Some("en"), tx, None).await;
+        let result = mock
+            .process_text("test input", "session1", Some("en"), tx, None)
+            .await;
 
         assert_eq!(result, "Hello world from mock");
 
@@ -771,22 +793,28 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = mock.process_text("test", "s1", None, tx, Some(cancel)).await;
+        let result = mock
+            .process_text("test", "s1", None, tx, Some(cancel))
+            .await;
 
         // Should have been cancelled before completing all 5 words
         let word_count = result.split_whitespace().count();
-        assert!(word_count < 5, "Expected cancellation before all 5 words, got {}", word_count);
+        assert!(
+            word_count < 5,
+            "Expected cancellation before all 5 words, got {}",
+            word_count
+        );
         drop(rx);
     }
 
     #[test]
     fn test_listening_on_speech_start_emits_event() {
-        let (state, actions) = next_state(
-            &VoiceAgentState::Listening,
-            &RealtimeEvent::SpeechStart,
-        );
+        let (state, actions) = next_state(&VoiceAgentState::Listening, &RealtimeEvent::SpeechStart);
         assert_eq!(state, VoiceAgentState::Listening);
-        assert_eq!(actions, vec![VoiceAction::EmitEvent(VoiceAgentEvent::UserSpeechStart)]);
+        assert_eq!(
+            actions,
+            vec![VoiceAction::EmitEvent(VoiceAgentEvent::UserSpeechStart)]
+        );
     }
 
     #[test]
@@ -799,10 +827,12 @@ mod tests {
             },
         );
         assert_eq!(state, VoiceAgentState::Processing);
-        assert!(actions.contains(&VoiceAction::EmitEvent(VoiceAgentEvent::UserText {
-            text: "hello".to_string(),
-            language: "en".to_string(),
-        })));
+        assert!(
+            actions.contains(&VoiceAction::EmitEvent(VoiceAgentEvent::UserText {
+                text: "hello".to_string(),
+                language: "en".to_string(),
+            }))
+        );
         assert!(actions.contains(&VoiceAction::StartLlm {
             text: "hello".to_string(),
             language: "en".to_string(),
@@ -811,10 +841,7 @@ mod tests {
 
     #[test]
     fn test_speaking_on_speech_start_triggers_bargein() {
-        let (state, actions) = next_state(
-            &VoiceAgentState::Speaking,
-            &RealtimeEvent::SpeechStart,
-        );
+        let (state, actions) = next_state(&VoiceAgentState::Speaking, &RealtimeEvent::SpeechStart);
         assert_eq!(state, VoiceAgentState::Listening);
         assert!(actions.contains(&VoiceAction::CancelAll));
         assert!(actions.contains(&VoiceAction::EmitEvent(VoiceAgentEvent::UserSpeechStart)));
@@ -822,33 +849,38 @@ mod tests {
 
     #[test]
     fn test_processing_on_speech_start_triggers_bargein() {
-        let (state, actions) = next_state(
-            &VoiceAgentState::Processing,
-            &RealtimeEvent::SpeechStart,
-        );
+        let (state, actions) =
+            next_state(&VoiceAgentState::Processing, &RealtimeEvent::SpeechStart);
         assert_eq!(state, VoiceAgentState::Listening);
         assert!(actions.contains(&VoiceAction::CancelAll));
     }
 
     #[test]
     fn test_listening_on_speech_end_emits_event() {
-        let (state, actions) = next_state(
-            &VoiceAgentState::Listening,
-            &RealtimeEvent::SpeechEnd,
-        );
+        let (state, actions) = next_state(&VoiceAgentState::Listening, &RealtimeEvent::SpeechEnd);
         assert_eq!(state, VoiceAgentState::Listening);
-        assert_eq!(actions, vec![VoiceAction::EmitEvent(VoiceAgentEvent::UserSpeechEnd)]);
+        assert_eq!(
+            actions,
+            vec![VoiceAction::EmitEvent(VoiceAgentEvent::UserSpeechEnd)]
+        );
     }
 
     #[test]
     fn test_any_state_on_error_emits_error() {
-        for state in [VoiceAgentState::Listening, VoiceAgentState::Processing, VoiceAgentState::Speaking] {
-            let (new_state, actions) = next_state(
-                &state,
-                &RealtimeEvent::Error("test error".to_string()),
-            );
+        for state in [
+            VoiceAgentState::Listening,
+            VoiceAgentState::Processing,
+            VoiceAgentState::Speaking,
+        ] {
+            let (new_state, actions) =
+                next_state(&state, &RealtimeEvent::Error("test error".to_string()));
             assert_eq!(new_state, VoiceAgentState::Listening);
-            assert_eq!(actions, vec![VoiceAction::EmitEvent(VoiceAgentEvent::Error("test error".to_string()))]);
+            assert_eq!(
+                actions,
+                vec![VoiceAction::EmitEvent(VoiceAgentEvent::Error(
+                    "test error".to_string()
+                ))]
+            );
         }
     }
 
@@ -859,7 +891,10 @@ mod tests {
             &RealtimeEvent::TtsPlaybackComplete,
         );
         assert_eq!(state, VoiceAgentState::Listening);
-        assert_eq!(actions, vec![VoiceAction::EmitEvent(VoiceAgentEvent::AudioComplete)]);
+        assert_eq!(
+            actions,
+            vec![VoiceAction::EmitEvent(VoiceAgentEvent::AudioComplete)]
+        );
     }
 
     #[test]
@@ -869,7 +904,10 @@ mod tests {
             &RealtimeEvent::Error("TTS synthesis failed".to_string()),
         );
         assert_eq!(state, VoiceAgentState::Listening);
-        assert!(matches!(&actions[0], VoiceAction::EmitEvent(VoiceAgentEvent::Error(_))));
+        assert!(matches!(
+            &actions[0],
+            VoiceAction::EmitEvent(VoiceAgentEvent::Error(_))
+        ));
     }
 
     #[tokio::test]
@@ -895,25 +933,34 @@ mod tests {
         ));
 
         // Send first turn - this starts the slow LLM
-        event_in_tx.send(crate::realtime::RealtimeEvent::TurnComplete {
-            text: "first question".to_string(),
-            language: "en".to_string(),
-        }).await.unwrap();
+        event_in_tx
+            .send(crate::realtime::RealtimeEvent::TurnComplete {
+                text: "first question".to_string(),
+                language: "en".to_string(),
+            })
+            .await
+            .unwrap();
 
         // Wait a bit for LLM to start producing deltas
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         // BARGE-IN: user starts speaking while LLM is still generating
-        event_in_tx.send(crate::realtime::RealtimeEvent::SpeechStart).await.unwrap();
+        event_in_tx
+            .send(crate::realtime::RealtimeEvent::SpeechStart)
+            .await
+            .unwrap();
 
         // Small delay for cancellation to propagate
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Send a new turn (the barge-in speech)
-        event_in_tx.send(crate::realtime::RealtimeEvent::TurnComplete {
-            text: "actually nevermind".to_string(),
-            language: "en".to_string(),
-        }).await.unwrap();
+        event_in_tx
+            .send(crate::realtime::RealtimeEvent::TurnComplete {
+                text: "actually nevermind".to_string(),
+                language: "en".to_string(),
+            })
+            .await
+            .unwrap();
 
         // Collect events with timeout
         let mut events = Vec::new();
@@ -941,21 +988,33 @@ mod tests {
         let _ = handle.await;
 
         // Verify: first LLM response was cut short (cancelled)
-        let first_complete = events.iter().find(|e| matches!(e, VoiceAgentEvent::LlmResponseComplete { .. }));
-        assert!(first_complete.is_some(), "Should have at least one LlmResponseComplete");
+        let first_complete = events
+            .iter()
+            .find(|e| matches!(e, VoiceAgentEvent::LlmResponseComplete { .. }));
+        assert!(
+            first_complete.is_some(),
+            "Should have at least one LlmResponseComplete"
+        );
 
         if let Some(VoiceAgentEvent::LlmResponseComplete { full_text }) = first_complete {
             let word_count = full_text.split_whitespace().count();
             // The original response has 12 words, at 100ms/word it should be cancelled
             // well before all 12 are generated (250ms wait => ~2 words emitted)
-            assert!(word_count < 12,
+            assert!(
+                word_count < 12,
                 "First response should have been cancelled early, got {} words: '{}'",
-                word_count, full_text);
+                word_count,
+                full_text
+            );
         }
 
         // Verify: barge-in event was emitted
-        assert!(events.iter().any(|e| matches!(e, VoiceAgentEvent::UserSpeechStart)),
-            "Should have received UserSpeechStart from barge-in");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, VoiceAgentEvent::UserSpeechStart)),
+            "Should have received UserSpeechStart from barge-in"
+        );
 
         // Verify: second turn was processed
         assert!(events.iter().any(|e| matches!(e, VoiceAgentEvent::UserText { text, .. } if text == "actually nevermind")),
@@ -980,10 +1039,13 @@ mod tests {
         ));
 
         // Inject turn
-        event_in_tx.send(crate::realtime::RealtimeEvent::TurnComplete {
-            text: "say something".to_string(),
-            language: "en".to_string(),
-        }).await.unwrap();
+        event_in_tx
+            .send(crate::realtime::RealtimeEvent::TurnComplete {
+                text: "say something".to_string(),
+                language: "en".to_string(),
+            })
+            .await
+            .unwrap();
 
         // Collect events
         let mut events = Vec::new();
@@ -1003,27 +1065,48 @@ mod tests {
         let _ = handle.await;
 
         // Verify multiple LlmTextDelta events were emitted
-        let delta_count = events.iter().filter(|e| matches!(e, VoiceAgentEvent::LlmTextDelta { .. })).count();
-        assert!(delta_count >= 2, "Expected multiple text deltas, got {}", delta_count);
+        let delta_count = events
+            .iter()
+            .filter(|e| matches!(e, VoiceAgentEvent::LlmTextDelta { .. }))
+            .count();
+        assert!(
+            delta_count >= 2,
+            "Expected multiple text deltas, got {}",
+            delta_count
+        );
 
         // Verify the sequence: UserText -> LlmResponseStart -> LlmTextDelta(s) -> LlmResponseComplete
-        let event_types: Vec<&str> = events.iter().map(|e| match e {
-            VoiceAgentEvent::UserText { .. } => "UserText",
-            VoiceAgentEvent::LlmResponseStart => "LlmResponseStart",
-            VoiceAgentEvent::LlmTextDelta { .. } => "LlmTextDelta",
-            VoiceAgentEvent::LlmResponseComplete { .. } => "LlmResponseComplete",
-            _ => "Other",
-        }).collect();
+        let event_types: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                VoiceAgentEvent::UserText { .. } => "UserText",
+                VoiceAgentEvent::LlmResponseStart => "LlmResponseStart",
+                VoiceAgentEvent::LlmTextDelta { .. } => "LlmTextDelta",
+                VoiceAgentEvent::LlmResponseComplete { .. } => "LlmResponseComplete",
+                _ => "Other",
+            })
+            .collect();
 
         // Find indices
         let user_text_idx = event_types.iter().position(|&t| t == "UserText");
         let response_start_idx = event_types.iter().position(|&t| t == "LlmResponseStart");
         let first_delta_idx = event_types.iter().position(|&t| t == "LlmTextDelta");
-        let response_complete_idx = event_types.iter().rposition(|&t| t == "LlmResponseComplete");
+        let response_complete_idx = event_types
+            .iter()
+            .rposition(|&t| t == "LlmResponseComplete");
 
-        assert!(user_text_idx < response_start_idx, "UserText should come before LlmResponseStart");
-        assert!(response_start_idx < first_delta_idx, "LlmResponseStart should come before first delta");
-        assert!(first_delta_idx < response_complete_idx, "First delta should come before LlmResponseComplete");
+        assert!(
+            user_text_idx < response_start_idx,
+            "UserText should come before LlmResponseStart"
+        );
+        assert!(
+            response_start_idx < first_delta_idx,
+            "LlmResponseStart should come before first delta"
+        );
+        assert!(
+            first_delta_idx < response_complete_idx,
+            "First delta should come before LlmResponseComplete"
+        );
     }
 
     #[tokio::test]
@@ -1077,16 +1160,25 @@ mod tests {
 
         // Verify event sequence
         assert!(
-            events.iter().any(|e| matches!(e, VoiceAgentEvent::UserText { text, .. } if text == "hello world")),
-            "Expected UserText with 'hello world', got: {:?}", events
+            events.iter().any(
+                |e| matches!(e, VoiceAgentEvent::UserText { text, .. } if text == "hello world")
+            ),
+            "Expected UserText with 'hello world', got: {:?}",
+            events
         );
         assert!(
-            events.iter().any(|e| matches!(e, VoiceAgentEvent::LlmResponseStart)),
-            "Expected LlmResponseStart, got: {:?}", events
+            events
+                .iter()
+                .any(|e| matches!(e, VoiceAgentEvent::LlmResponseStart)),
+            "Expected LlmResponseStart, got: {:?}",
+            events
         );
         assert!(
-            events.iter().any(|e| matches!(e, VoiceAgentEvent::LlmTextDelta { .. })),
-            "Expected LlmTextDelta, got: {:?}", events
+            events
+                .iter()
+                .any(|e| matches!(e, VoiceAgentEvent::LlmTextDelta { .. })),
+            "Expected LlmTextDelta, got: {:?}",
+            events
         );
         assert!(
             events.iter().any(|e| matches!(e, VoiceAgentEvent::LlmResponseComplete { full_text } if full_text == "I heard you clearly")),
@@ -1131,11 +1223,21 @@ mod voice_feature_tests {
     fn test_voice_agent_event_variants() {
         let _ = VoiceAgentEvent::UserSpeechStart;
         let _ = VoiceAgentEvent::UserSpeechEnd;
-        let _ = VoiceAgentEvent::UserText { text: "hello".to_string(), language: "en".to_string() };
+        let _ = VoiceAgentEvent::UserText {
+            text: "hello".to_string(),
+            language: "en".to_string(),
+        };
         let _ = VoiceAgentEvent::LlmResponseStart;
-        let _ = VoiceAgentEvent::LlmTextDelta { delta: "Hi".to_string() };
-        let _ = VoiceAgentEvent::LlmResponseComplete { full_text: "Hi there".to_string() };
-        let _ = VoiceAgentEvent::AudioChunk { samples: vec![], sample_rate: 24000 };
+        let _ = VoiceAgentEvent::LlmTextDelta {
+            delta: "Hi".to_string(),
+        };
+        let _ = VoiceAgentEvent::LlmResponseComplete {
+            full_text: "Hi there".to_string(),
+        };
+        let _ = VoiceAgentEvent::AudioChunk {
+            samples: vec![],
+            sample_rate: 24000,
+        };
         let _ = VoiceAgentEvent::AudioComplete;
         let _ = VoiceAgentEvent::Error("test".to_string());
         let _ = VoiceAgentEvent::Ready;
@@ -1158,19 +1260,18 @@ mod voice_feature_tests {
             ..Default::default()
         };
         let mut agent = VoiceAgent::new(config);
-        
+
         let mut event_rx = agent.start().await.expect("Should start agent");
         assert!(agent.is_running());
-        
+
         // Wait for Ready event
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            event_rx.recv()
-        ).await;
-        assert!(matches!(ready, Ok(Some(VoiceAgentEvent::Ready))), "Should receive Ready event");
-        
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), event_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(VoiceAgentEvent::Ready))),
+            "Should receive Ready event"
+        );
+
         agent.stop();
         assert!(!agent.is_running());
     }
-
 }

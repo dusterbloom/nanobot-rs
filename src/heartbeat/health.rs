@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use tracing::{debug, warn};
@@ -109,9 +109,10 @@ impl HealthRegistry {
 
     pub fn register(&mut self, probe: Box<dyn HealthProbe>) {
         let name = probe.name().to_string();
-        self.states
-            .write()
-            .insert(name.clone(), ProbeState::new_with_threshold(name, self.degraded_threshold));
+        self.states.write().insert(
+            name.clone(),
+            ProbeState::new_with_threshold(name, self.degraded_threshold),
+        );
         self.probes.push(probe);
     }
 
@@ -269,7 +270,10 @@ pub struct TrioEndpointProbe {
 
 impl TrioEndpointProbe {
     pub fn new(name: &str, base_url: &str, model: &str) -> Self {
-        let url = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+        let url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
         Self {
             name: name.to_string(),
             base_url: url,
@@ -370,7 +374,11 @@ mod tests {
     #[test]
     fn test_probe_state_healthy_on_success() {
         let mut state = ProbeState::new("test".to_string());
-        state.record_result(ProbeResult { healthy: true, latency_ms: 10, detail: None });
+        state.record_result(ProbeResult {
+            healthy: true,
+            latency_ms: 10,
+            detail: None,
+        });
         assert_eq!(state.status, ProbeStatus::Healthy);
         assert_eq!(state.consecutive_failures, 0);
         assert!(state.last_healthy.is_some());
@@ -380,7 +388,11 @@ mod tests {
     fn test_probe_state_degrades_after_threshold() {
         let mut state = ProbeState::new("test".to_string());
         for _ in 0..DEGRADED_THRESHOLD {
-            state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
+            state.record_result(ProbeResult {
+                healthy: false,
+                latency_ms: 0,
+                detail: None,
+            });
         }
         assert_eq!(state.status, ProbeStatus::Degraded);
         assert_eq!(state.consecutive_failures, DEGRADED_THRESHOLD);
@@ -390,7 +402,11 @@ mod tests {
     fn test_probe_state_not_degraded_before_threshold() {
         let mut state = ProbeState::new("test".to_string());
         for _ in 0..(DEGRADED_THRESHOLD - 1) {
-            state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
+            state.record_result(ProbeResult {
+                healthy: false,
+                latency_ms: 0,
+                detail: None,
+            });
         }
         assert_ne!(state.status, ProbeStatus::Degraded);
         assert_eq!(state.consecutive_failures, DEGRADED_THRESHOLD - 1);
@@ -401,11 +417,19 @@ mod tests {
         let mut state = ProbeState::new("test".to_string());
         // Degrade it
         for _ in 0..DEGRADED_THRESHOLD {
-            state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
+            state.record_result(ProbeResult {
+                healthy: false,
+                latency_ms: 0,
+                detail: None,
+            });
         }
         assert_eq!(state.status, ProbeStatus::Degraded);
         // One success recovers
-        state.record_result(ProbeResult { healthy: true, latency_ms: 5, detail: None });
+        state.record_result(ProbeResult {
+            healthy: true,
+            latency_ms: 5,
+            detail: None,
+        });
         assert_eq!(state.status, ProbeStatus::Healthy);
         assert_eq!(state.consecutive_failures, 0);
     }
@@ -413,10 +437,22 @@ mod tests {
     #[test]
     fn test_probe_state_resets_failures_on_success() {
         let mut state = ProbeState::new("test".to_string());
-        state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
-        state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
+        state.record_result(ProbeResult {
+            healthy: false,
+            latency_ms: 0,
+            detail: None,
+        });
+        state.record_result(ProbeResult {
+            healthy: false,
+            latency_ms: 0,
+            detail: None,
+        });
         assert_eq!(state.consecutive_failures, 2);
-        state.record_result(ProbeResult { healthy: true, latency_ms: 5, detail: None });
+        state.record_result(ProbeResult {
+            healthy: true,
+            latency_ms: 5,
+            detail: None,
+        });
         assert_eq!(state.consecutive_failures, 0);
     }
 
@@ -436,7 +472,11 @@ mod tests {
             let mut states = reg.states.write();
             let mut state = ProbeState::new("test_probe".to_string());
             for _ in 0..DEGRADED_THRESHOLD {
-                state.record_result(ProbeResult { healthy: false, latency_ms: 0, detail: None });
+                state.record_result(ProbeResult {
+                    healthy: false,
+                    latency_ms: 0,
+                    detail: None,
+                });
             }
             states.insert("test_probe".to_string(), state);
         }
@@ -449,7 +489,11 @@ mod tests {
         {
             let mut states = reg.states.write();
             let mut state = ProbeState::new("test_probe".to_string());
-            state.record_result(ProbeResult { healthy: true, latency_ms: 10, detail: None });
+            state.record_result(ProbeResult {
+                healthy: true,
+                latency_ms: 10,
+                detail: None,
+            });
             states.insert("test_probe".to_string(), state);
         }
         assert!(reg.is_healthy("test_probe"));
@@ -465,10 +509,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HealthProbe for MockProbe {
-        fn name(&self) -> &str { &self.name }
-        fn interval_secs(&self) -> u64 { self.interval }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn interval_secs(&self) -> u64 {
+            self.interval
+        }
         async fn check(&self) -> ProbeResult {
-            ProbeResult { healthy: self.healthy, latency_ms: 1, detail: None }
+            ProbeResult {
+                healthy: self.healthy,
+                latency_ms: 1,
+                detail: None,
+            }
         }
     }
 
@@ -597,7 +649,8 @@ mod tests {
 
     #[test]
     fn test_trio_probe_strips_v1_without_trailing_slash() {
-        let probe = TrioEndpointProbe::new("trio_specialist", "http://localhost:8095/v1", "ministral");
+        let probe =
+            TrioEndpointProbe::new("trio_specialist", "http://localhost:8095/v1", "ministral");
         assert_eq!(probe.name(), "trio_specialist");
         assert_eq!(probe.base_url, "http://localhost:8095");
         assert_eq!(probe.model, "ministral");

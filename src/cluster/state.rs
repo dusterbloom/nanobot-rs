@@ -105,7 +105,11 @@ impl ClusterState {
         peers.retain(|p| p.last_seen.elapsed() < max_age);
         let removed = before - peers.len();
         if removed > 0 {
-            tracing::info!(removed, remaining = peers.len(), "cluster_stale_peers_removed");
+            tracing::info!(
+                removed,
+                remaining = peers.len(),
+                "cluster_stale_peers_removed"
+            );
         }
     }
 
@@ -150,15 +154,23 @@ impl ClusterState {
 mod tests {
     use super::*;
 
-    fn make_peer(endpoint: &str, peer_type: PeerType, models: Vec<&str>, healthy: bool) -> ClusterPeer {
+    fn make_peer(
+        endpoint: &str,
+        peer_type: PeerType,
+        models: Vec<&str>,
+        healthy: bool,
+    ) -> ClusterPeer {
         ClusterPeer {
             endpoint: endpoint.to_string(),
             peer_type,
-            models: models.into_iter().map(|id| ClusterModel {
-                id: id.to_string(),
-                context_window: 4096,
-                requires_cluster: false,
-            }).collect(),
+            models: models
+                .into_iter()
+                .map(|id| ClusterModel {
+                    id: id.to_string(),
+                    context_window: 4096,
+                    requires_cluster: false,
+                })
+                .collect(),
             total_vram_mb: None,
             last_seen: Instant::now(),
             healthy,
@@ -168,7 +180,12 @@ mod tests {
     #[tokio::test]
     async fn test_update_peer_insert() {
         let state = ClusterState::new();
-        let peer = make_peer("http://192.168.1.10:52415/v1", PeerType::Exo, vec!["qwen-72b"], true);
+        let peer = make_peer(
+            "http://192.168.1.10:52415/v1",
+            PeerType::Exo,
+            vec!["qwen-72b"],
+            true,
+        );
         state.update_peer(peer).await;
         assert_eq!(state.peer_count().await, 1);
     }
@@ -176,10 +193,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_peer_replace() {
         let state = ClusterState::new();
-        let peer1 = make_peer("http://192.168.1.10:52415/v1", PeerType::Exo, vec!["qwen-72b"], true);
+        let peer1 = make_peer(
+            "http://192.168.1.10:52415/v1",
+            PeerType::Exo,
+            vec!["qwen-72b"],
+            true,
+        );
         state.update_peer(peer1).await;
 
-        let peer2 = make_peer("http://192.168.1.10:52415/v1", PeerType::Exo, vec!["qwen-72b", "llama-70b"], true);
+        let peer2 = make_peer(
+            "http://192.168.1.10:52415/v1",
+            PeerType::Exo,
+            vec!["qwen-72b", "llama-70b"],
+            true,
+        );
         state.update_peer(peer2).await;
 
         assert_eq!(state.peer_count().await, 1);
@@ -190,8 +217,22 @@ mod tests {
     #[tokio::test]
     async fn test_get_healthy_peers() {
         let state = ClusterState::new();
-        state.update_peer(make_peer("http://a:1234/v1", PeerType::LMStudio, vec!["m1"], true)).await;
-        state.update_peer(make_peer("http://b:1234/v1", PeerType::LMStudio, vec!["m2"], false)).await;
+        state
+            .update_peer(make_peer(
+                "http://a:1234/v1",
+                PeerType::LMStudio,
+                vec!["m1"],
+                true,
+            ))
+            .await;
+        state
+            .update_peer(make_peer(
+                "http://b:1234/v1",
+                PeerType::LMStudio,
+                vec!["m2"],
+                false,
+            ))
+            .await;
 
         let healthy = state.get_healthy_peers().await;
         assert_eq!(healthy.len(), 1);
@@ -201,7 +242,14 @@ mod tests {
     #[tokio::test]
     async fn test_find_model_exact() {
         let state = ClusterState::new();
-        state.update_peer(make_peer("http://exo:52415/v1", PeerType::Exo, vec!["qwen3.5-72b-q4"], true)).await;
+        state
+            .update_peer(make_peer(
+                "http://exo:52415/v1",
+                PeerType::Exo,
+                vec!["qwen3.5-72b-q4"],
+                true,
+            ))
+            .await;
 
         let found = state.find_model("qwen3.5-72b-q4").await;
         assert!(found.is_some());
@@ -211,7 +259,14 @@ mod tests {
     #[tokio::test]
     async fn test_find_model_case_insensitive() {
         let state = ClusterState::new();
-        state.update_peer(make_peer("http://exo:52415/v1", PeerType::Exo, vec!["Qwen3.5-72B-Q4"], true)).await;
+        state
+            .update_peer(make_peer(
+                "http://exo:52415/v1",
+                PeerType::Exo,
+                vec!["Qwen3.5-72B-Q4"],
+                true,
+            ))
+            .await;
 
         let found = state.find_model("qwen3.5-72b-q4").await;
         assert!(found.is_some());
@@ -220,7 +275,14 @@ mod tests {
     #[tokio::test]
     async fn test_find_model_substring() {
         let state = ClusterState::new();
-        state.update_peer(make_peer("http://exo:52415/v1", PeerType::Exo, vec!["qwen3.5-72b-q4-exl2"], true)).await;
+        state
+            .update_peer(make_peer(
+                "http://exo:52415/v1",
+                PeerType::Exo,
+                vec!["qwen3.5-72b-q4-exl2"],
+                true,
+            ))
+            .await;
 
         let found = state.find_model("qwen3.5-72b").await;
         assert!(found.is_some());
@@ -229,7 +291,14 @@ mod tests {
     #[tokio::test]
     async fn test_find_model_skips_unhealthy() {
         let state = ClusterState::new();
-        state.update_peer(make_peer("http://down:52415/v1", PeerType::Exo, vec!["qwen-72b"], false)).await;
+        state
+            .update_peer(make_peer(
+                "http://down:52415/v1",
+                PeerType::Exo,
+                vec!["qwen-72b"],
+                false,
+            ))
+            .await;
 
         let found = state.find_model("qwen-72b").await;
         assert!(found.is_none());
@@ -239,7 +308,14 @@ mod tests {
     async fn test_remove_stale_peers() {
         let state = ClusterState::new();
         // Fresh peer
-        state.update_peer(make_peer("http://fresh:1234/v1", PeerType::LMStudio, vec!["m1"], true)).await;
+        state
+            .update_peer(make_peer(
+                "http://fresh:1234/v1",
+                PeerType::LMStudio,
+                vec!["m1"],
+                true,
+            ))
+            .await;
 
         // Manually insert a stale peer
         {
@@ -255,7 +331,9 @@ mod tests {
         }
 
         assert_eq!(state.peer_count().await, 2);
-        state.remove_stale_peers(std::time::Duration::from_secs(60)).await;
+        state
+            .remove_stale_peers(std::time::Duration::from_secs(60))
+            .await;
         assert_eq!(state.peer_count().await, 1);
     }
 }

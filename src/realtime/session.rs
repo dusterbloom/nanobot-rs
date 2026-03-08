@@ -2,18 +2,17 @@
 //!
 //! Integrates VAD, turn detection, STT, and TTS for realtime conversations.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 #[cfg(feature = "voice")]
 use jack_voice::{
-    AudioCapture, AudioPlayer, AudioError,
-    SpeechToText, SttMode, TextToSpeech, TtsEngine,
-    TurnDetector, TurnDecision, VoiceActivityDetector,
+    AudioCapture, AudioError, AudioPlayer, SpeechToText, SttMode, TextToSpeech, TtsEngine,
+    TurnDecision, TurnDetector, VoiceActivityDetector,
 };
 
 use crate::config::schema::TtsEngineConfig;
@@ -103,30 +102,46 @@ impl RealtimeSession {
     /// Create a new realtime session with the given configuration.
     #[cfg(feature = "voice")]
     pub async fn new(config: RealtimeConfig) -> Result<Self, String> {
-        tracing::info!("Initializing realtime session with {:?}...", config.tts_engine);
+        tracing::info!(
+            "Initializing realtime session with {:?}...",
+            config.tts_engine
+        );
 
         // Ensure required models are downloaded (VAD, STT, turn detector)
         let progress = jack_voice::LogProgress;
         for bundle in jack_voice::models::MODEL_BUNDLES {
-            let target = if bundle.extract_dir.is_empty() { bundle.name } else { bundle.extract_dir };
+            let target = if bundle.extract_dir.is_empty() {
+                bundle.name
+            } else {
+                bundle.extract_dir
+            };
             if !jack_voice::models::model_exists(target) {
-                tracing::info!("Downloading model: {} ({}MB)...", bundle.name, bundle.size_mb);
+                tracing::info!(
+                    "Downloading model: {} ({}MB)...",
+                    bundle.name,
+                    bundle.size_mb
+                );
                 jack_voice::models::download_model(bundle, &progress)
                     .await
                     .map_err(|e| format!("Model download failed ({}): {}", bundle.name, e))?;
             }
         }
         // Initialize VAD
-        let vad = VoiceActivityDetector::new()
-            .map_err(|e| format!("VAD init failed: {}", e))?;
+        let vad = VoiceActivityDetector::new().map_err(|e| format!("VAD init failed: {}", e))?;
         tracing::info!("VAD ready");
 
         // Initialize turn detector
         let turn_detector = if config.smart_turn_enabled {
             match TurnDetector::new() {
                 Ok(td) => {
-                    tracing::info!("TurnDetector ready (SmartTurn {})", 
-                        if td.is_available() { "enabled" } else { "disabled" });
+                    tracing::info!(
+                        "TurnDetector ready (SmartTurn {})",
+                        if td.is_available() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
                     Some(td)
                 }
                 Err(e) => {
@@ -153,7 +168,11 @@ impl RealtimeSession {
         tracing::info!("STT ready (Parakeet TDT primary, Whisper fallback)");
 
         // Initialize TTS — always load both Pocket (English) and Kokoro (multilingual)
-        let tts_en = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Pocket)).await {
+        let tts_en = match tokio::task::spawn_blocking(|| {
+            TextToSpeech::with_engine(TtsEngine::Pocket)
+        })
+        .await
+        {
             Ok(Ok(tts)) => {
                 tracing::info!("Pocket TTS ready (English)");
                 Some(Arc::new(Mutex::new(tts)))
@@ -168,7 +187,11 @@ impl RealtimeSession {
             }
         };
 
-        let tts_multi = match tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Kokoro)).await {
+        let tts_multi = match tokio::task::spawn_blocking(|| {
+            TextToSpeech::with_engine(TtsEngine::Kokoro)
+        })
+        .await
+        {
             Ok(Ok(tts)) => {
                 tracing::info!("Kokoro TTS ready (multilingual)");
                 Some(Arc::new(Mutex::new(tts)))
@@ -182,9 +205,15 @@ impl RealtimeSession {
                 None
             }
         };
-        tracing::info!("TTS ready (en: {}, multi: {})",
+        tracing::info!(
+            "TTS ready (en: {}, multi: {})",
             if tts_en.is_some() { "Pocket" } else { "none" },
-            if tts_multi.is_some() { "Kokoro" } else { "none" });
+            if tts_multi.is_some() {
+                "Kokoro"
+            } else {
+                "none"
+            }
+        );
 
         Ok(Self {
             config,
@@ -209,7 +238,9 @@ impl RealtimeSession {
     /// Returns an audio sender for injecting audio samples (for testing)
     /// and an event receiver for session events.
     #[cfg(feature = "voice")]
-    pub fn start(&mut self) -> Result<(mpsc::Sender<Vec<f32>>, mpsc::Receiver<RealtimeEvent>), String> {
+    pub fn start(
+        &mut self,
+    ) -> Result<(mpsc::Sender<Vec<f32>>, mpsc::Receiver<RealtimeEvent>), String> {
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
         let (event_tx, event_rx) = mpsc::channel::<RealtimeEvent>(32);
 
@@ -312,7 +343,9 @@ impl RealtimeSession {
 
     /// Start the session (stub for non-voice builds).
     #[cfg(not(feature = "voice"))]
-    pub fn start(&mut self) -> Result<(mpsc::Sender<Vec<f32>>, mpsc::Receiver<RealtimeEvent>), String> {
+    pub fn start(
+        &mut self,
+    ) -> Result<(mpsc::Sender<Vec<f32>>, mpsc::Receiver<RealtimeEvent>), String> {
         Err("Realtime session requires 'voice' feature".to_string())
     }
 
@@ -320,8 +353,16 @@ impl RealtimeSession {
     ///
     /// Sends AudioChunk events to the event channel.
     #[cfg(feature = "voice")]
-    pub async fn synthesize(&self, text: &str, event_tx: mpsc::Sender<RealtimeEvent>) -> Result<(), String> {
-        let tts = self.tts_en.as_ref().or(self.tts_multi.as_ref()).ok_or("TTS not initialized")?;
+    pub async fn synthesize(
+        &self,
+        text: &str,
+        event_tx: mpsc::Sender<RealtimeEvent>,
+    ) -> Result<(), String> {
+        let tts = self
+            .tts_en
+            .as_ref()
+            .or(self.tts_multi.as_ref())
+            .ok_or("TTS not initialized")?;
         let tts = tts.clone();
         let text = text.to_string();
 
@@ -359,8 +400,8 @@ impl RealtimeSession {
         // AudioCapture::start() takes a std::sync::mpsc::Sender and writes directly to it
         let (cap_tx, cap_rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
-        let capture = AudioCapture::start(cap_tx)
-            .map_err(|e| format!("AudioCapture start failed: {}", e))?;
+        let capture =
+            AudioCapture::start(cap_tx).map_err(|e| format!("AudioCapture start failed: {}", e))?;
 
         self.capture = Some(capture);
 
@@ -400,14 +441,22 @@ impl RealtimeSession {
     /// Get clones of both TTS engine handles for external use (e.g., voice agent playback).
     /// Returns (English/Pocket, Multilingual/Kokoro).
     #[cfg(feature = "voice")]
-    pub fn tts_handles(&self) -> (Option<Arc<Mutex<TextToSpeech>>>, Option<Arc<Mutex<TextToSpeech>>>) {
+    pub fn tts_handles(
+        &self,
+    ) -> (
+        Option<Arc<Mutex<TextToSpeech>>>,
+        Option<Arc<Mutex<TextToSpeech>>>,
+    ) {
         (self.tts_en.clone(), self.tts_multi.clone())
     }
 
     /// Check if SmartTurn is available.
     #[cfg(feature = "voice")]
     pub fn has_smart_turn(&self) -> bool {
-        self.turn_detector.as_ref().map(|td| td.is_available()).unwrap_or(false)
+        self.turn_detector
+            .as_ref()
+            .map(|td| td.is_available())
+            .unwrap_or(false)
     }
 
     /// Check if SmartTurn is available (stub).
@@ -514,7 +563,9 @@ mod tests {
     #[tokio::test]
     async fn test_realtime_session_has_smart_turn() {
         let config = RealtimeConfig::default();
-        let session = RealtimeSession::new(config).await.expect("Should create session");
+        let session = RealtimeSession::new(config)
+            .await
+            .expect("Should create session");
         // SmartTurn may or may not be available depending on model download
         let _ = session.has_smart_turn();
     }
@@ -526,7 +577,9 @@ mod tests {
             input_mode: InputMode::PushToTalk,
             ..Default::default()
         };
-        let mut session = RealtimeSession::new(config).await.expect("Should create session");
+        let mut session = RealtimeSession::new(config)
+            .await
+            .expect("Should create session");
 
         let (audio_tx, event_rx) = session.start().expect("Should start session");
         assert!(session.is_running());
@@ -551,7 +604,9 @@ mod tests {
             let start_result = session.start();
             // Either succeeds (device present) or returns a descriptive error (no device)
             match start_result {
-                Ok(_) => { session.stop(); }
+                Ok(_) => {
+                    session.stop();
+                }
                 Err(e) => {
                     assert!(
                         e.contains("AudioCapture") || e.contains("device") || e.contains("audio"),
@@ -562,5 +617,4 @@ mod tests {
             }
         }
     }
-
 }

@@ -81,8 +81,14 @@ pub fn cmd_sessions_export(key: &str, format: &str) {
         "md" | _ => {
             println!("# Session: {}\n", key);
             for parsed in &messages {
-                let role = parsed.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let timestamp = parsed.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                let role = parsed
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let timestamp = parsed
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
                 // Extract just the time portion if it's an ISO timestamp.
                 let time_display = if timestamp.len() >= 19 {
@@ -103,10 +109,16 @@ pub fn cmd_sessions_export(key: &str, format: &str) {
                         }
                     }
                     "tool" => {
-                        let tool_name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let tool_name = parsed
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
                         let result = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         let abbreviated = truncate(result, 200);
-                        println!("## Tool: {} ({})\n\n{}\n", tool_name, time_display, abbreviated);
+                        println!(
+                            "## Tool: {} ({})\n\n{}\n",
+                            tool_name, time_display, abbreviated
+                        );
                     }
                     _ => {
                         let text = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -142,7 +154,11 @@ pub fn cmd_sessions_nuke(force: bool) {
         "This will delete {} session file(s), {} log file(s){}. ({} total)",
         session_count,
         log_count,
-        if has_metrics { ", and metrics.jsonl" } else { "" },
+        if has_metrics {
+            ", and metrics.jsonl"
+        } else {
+            ""
+        },
         total,
     );
 
@@ -178,7 +194,10 @@ pub fn cmd_sessions_purge(older_than: &str) {
     let seconds = match parse_duration_str(older_than) {
         Some(s) => s,
         None => {
-            eprintln!("Invalid duration: '{}'. Use format like '7d', '24h', '30d'.", older_than);
+            eprintln!(
+                "Invalid duration: '{}'. Use format like '7d', '24h', '30d'.",
+                older_than
+            );
             return;
         }
     };
@@ -236,7 +255,10 @@ pub fn cmd_sessions_archive() {
     println!("  Sessions:  {}", format_bytes(session_size));
     println!("  Logs:      {}", format_bytes(log_size));
     println!("  Metrics:   {}", format_bytes(metrics_size));
-    println!("  Total:     {}", format_bytes(session_size + log_size + metrics_size));
+    println!(
+        "  Total:     {}",
+        format_bytes(session_size + log_size + metrics_size)
+    );
     println!();
     println!("To free space: nanobot sessions purge --older-than 7d");
 }
@@ -279,7 +301,11 @@ fn parse_duration_str(s: &str) -> Option<u64> {
     }
 }
 
-fn purge_old_files(dir: &std::path::Path, cutoff: &chrono::DateTime<chrono::Utc>, ext: &str) -> u32 {
+fn purge_old_files(
+    dir: &std::path::Path,
+    cutoff: &chrono::DateTime<chrono::Utc>,
+    ext: &str,
+) -> u32 {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return 0,

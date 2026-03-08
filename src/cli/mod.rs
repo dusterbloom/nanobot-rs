@@ -10,19 +10,19 @@ mod skills;
 mod voice;
 
 // Re-export everything that other modules need.
+#[cfg(feature = "cluster")]
+pub(crate) use core_builder::setup_cluster_for_repl;
 pub(crate) use core_builder::{
     build_core_handle, create_agent_loop, effective_max_iterations, rebuild_core, strip_gguf_suffix,
 };
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
-    build_core_handle_mlx, rebuild_core_mlx, create_agent_loop_mlx, start_mlx_provider, MlxHandle,
-    preset_from_model_dir, resolve_mlx_model_dir,
+    build_core_handle_mlx, create_agent_loop_mlx, model_config_from_preset, preset_from_model_dir,
+    rebuild_core_mlx, resolve_mlx_model_dir, start_mlx_provider, MlxHandle,
 };
-#[cfg(feature = "cluster")]
-pub(crate) use core_builder::setup_cluster_for_repl;
 pub(crate) use eval::{
     cmd_eval_hanoi, cmd_eval_haystack, cmd_eval_learn, cmd_eval_report, cmd_eval_sprint,
-    make_eval_provider, eval_model_name,
+    eval_model_name, make_eval_provider,
 };
 pub(crate) use provider::{check_api_key, create_provider};
 pub(crate) use skills::{cmd_skill_add, cmd_skill_remove};
@@ -191,15 +191,20 @@ mod tests {
     #[test]
     fn test_inference_engine_mlx_model_dir_default() {
         let cfg = Config::default();
-        assert!(cfg.agents.defaults.mlx_model_dir.is_none(),
-            "mlx_model_dir should default to None (auto-detect)");
+        assert!(
+            cfg.agents.defaults.mlx_model_dir.is_none(),
+            "mlx_model_dir should default to None (auto-detect)"
+        );
     }
 
     #[test]
     fn test_inference_engine_mlx_model_dir_custom() {
         let mut cfg = Config::default();
         cfg.agents.defaults.mlx_model_dir = Some("/tmp/my-model".to_string());
-        assert_eq!(cfg.agents.defaults.mlx_model_dir.as_deref(), Some("/tmp/my-model"));
+        assert_eq!(
+            cfg.agents.defaults.mlx_model_dir.as_deref(),
+            Some("/tmp/my-model")
+        );
     }
 
     #[cfg(feature = "mlx")]
@@ -207,8 +212,11 @@ mod tests {
     fn test_resolve_mlx_model_dir_default() {
         let cfg = Config::default();
         let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        assert!(dir.to_string_lossy().contains("Qwen3.5-2B-MLX-8bit"),
-            "default dir should point to Qwen3.5-2B: {:?}", dir);
+        assert!(
+            dir.to_string_lossy().contains("Qwen3.5-2B-MLX-8bit"),
+            "default dir should point to Qwen3.5-2B: {:?}",
+            dir
+        );
     }
 
     #[cfg(feature = "mlx")]
@@ -236,21 +244,32 @@ mod tests {
     fn test_preset_from_model_dir() {
         use std::path::Path;
         assert_eq!(
-            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3-1.7B-MLX-8bit")),
+            core_builder::preset_from_model_dir(Path::new(
+                "/models/mlx-community/Qwen3-1.7B-MLX-8bit"
+            )),
             "qwen3-1.7b"
         );
         assert_eq!(
-            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3-4B-MLX-4bit")),
+            core_builder::preset_from_model_dir(Path::new(
+                "/models/mlx-community/Qwen3-4B-MLX-4bit"
+            )),
             "qwen3-4b"
         );
         assert_eq!(
-            core_builder::preset_from_model_dir(Path::new("/models/mlx-community/Qwen3.5-2B-MLX-8bit")),
+            core_builder::preset_from_model_dir(Path::new(
+                "/models/mlx-community/Qwen3.5-2B-MLX-8bit"
+            )),
             "qwen3.5-2b"
         );
-        // Unknown defaults to qwen3.5-2b
+        assert_eq!(
+            core_builder::preset_from_model_dir(Path::new(
+                "/models/mlx-community/Qwen3.5-9B-MLX-4bit"
+            )),
+            "unknown"
+        );
         assert_eq!(
             core_builder::preset_from_model_dir(Path::new("/models/some-unknown-model")),
-            "qwen3.5-2b"
+            "unknown"
         );
     }
 
@@ -272,8 +291,10 @@ mod tests {
 
         // The agent loop's shared state should have perplexity gate enabled.
         // We verify through the public accessor that exists on AgentLoop.
-        assert!(agent_loop.has_perplexity_gate(),
-            "create_agent_loop should enable perplexity gate when config says so");
+        assert!(
+            agent_loop.has_perplexity_gate(),
+            "create_agent_loop should enable perplexity gate when config says so"
+        );
     }
 
     #[test]
@@ -284,8 +305,10 @@ mod tests {
         let handle = build_core_handle(&cfg, "8080", None, None, None, None, false);
         let agent_loop = create_agent_loop(handle, &cfg, None, None, None, None);
 
-        assert!(!agent_loop.has_perplexity_gate(),
-            "perplexity gate should be off when config says disabled");
+        assert!(
+            !agent_loop.has_perplexity_gate(),
+            "perplexity gate should be off when config says disabled"
+        );
     }
 
     #[test]
@@ -300,8 +323,10 @@ mod tests {
 
         // Rebuild with same config should preserve gate.
         let second = create_agent_loop(handle, &cfg, None, None, None, None);
-        assert!(second.has_perplexity_gate(),
-            "rebuilt agent loop should still have perplexity gate enabled");
+        assert!(
+            second.has_perplexity_gate(),
+            "rebuilt agent loop should still have perplexity gate enabled"
+        );
     }
 
     // -- effective_max_iterations tests --
@@ -403,9 +428,15 @@ mod tests {
 
     #[test]
     fn test_strip_gguf_suffix() {
-        assert_eq!(strip_gguf_suffix("nanbeige4.1-3b-q8_0.gguf"), "nanbeige4.1-3b");
+        assert_eq!(
+            strip_gguf_suffix("nanbeige4.1-3b-q8_0.gguf"),
+            "nanbeige4.1-3b"
+        );
         assert_eq!(strip_gguf_suffix("Qwen3-8B-Q4_K_M.gguf"), "Qwen3-8B");
-        assert_eq!(strip_gguf_suffix("ministral-3-8b-instruct-2512.gguf"), "ministral-3-8b-instruct-2512");
+        assert_eq!(
+            strip_gguf_suffix("ministral-3-8b-instruct-2512.gguf"),
+            "ministral-3-8b-instruct-2512"
+        );
         assert_eq!(strip_gguf_suffix("nanbeige4.1-3b"), "nanbeige4.1-3b");
         assert_eq!(strip_gguf_suffix("model-f16.gguf"), "model");
         assert_eq!(strip_gguf_suffix("local-model"), "local-model");
@@ -431,7 +462,6 @@ mod tests {
         assert_eq!(parse_input_mode("p"), InputMode::PushToTalk);
         assert_eq!(parse_input_mode("unknown"), InputMode::Continuous);
     }
-
 }
 
 // ============================================================================
@@ -468,7 +498,9 @@ fn setup_voice_libs() {
                         for sub_entry in sub_entries.flatten() {
                             let onnx_dir = sub_entry.path();
                             if onnx_dir.is_dir() {
-                                if let Some(onnx_name) = onnx_dir.file_name().and_then(|n| n.to_str()) {
+                                if let Some(onnx_name) =
+                                    onnx_dir.file_name().and_then(|n| n.to_str())
+                                {
                                     if onnx_name.starts_with("sherpa-onnx-") {
                                         lib_dir = Some(onnx_dir.join("lib"));
                                         break;
@@ -779,15 +811,18 @@ pub(crate) async fn run_gateway_async(
     // Initialize voice pipeline for channels (when voice feature is enabled).
     #[cfg(feature = "voice")]
     let voice_pipeline: Option<Arc<crate::voice_pipeline::VoicePipeline>> = {
-        use tracing::warn;
         use crate::config::schema::TtsEngineConfig;
+        use tracing::warn;
 
         // Use configured TTS engine from config
         let tts_engine = config.voice.tts_engine;
 
         match crate::voice_pipeline::VoicePipeline::with_engine(tts_engine).await {
             Ok(vp) => {
-                info!("Voice pipeline initialized for channels (engine: {:?})", tts_engine);
+                info!(
+                    "Voice pipeline initialized for channels (engine: {:?})",
+                    tts_engine
+                );
                 Some(Arc::new(vp))
             }
             Err(e) => {
@@ -798,7 +833,9 @@ pub(crate) async fn run_gateway_async(
                 // Try fallback to Pocket if Qwen/Kokoro failed
                 if tts_engine != TtsEngineConfig::Pocket {
                     warn!("Falling back to Pocket TTS...");
-                    match crate::voice_pipeline::VoicePipeline::with_engine(TtsEngineConfig::Pocket).await {
+                    match crate::voice_pipeline::VoicePipeline::with_engine(TtsEngineConfig::Pocket)
+                        .await
+                    {
                         Ok(vp) => {
                             info!("Voice pipeline initialized with Pocket TTS (fallback)");
                             Some(Arc::new(vp))
