@@ -265,7 +265,7 @@ mod tests {
             core_builder::preset_from_model_dir(Path::new(
                 "/models/mlx-community/Qwen3.5-9B-MLX-4bit"
             )),
-            "unknown"
+            "qwen3.5-9b"
         );
         assert_eq!(
             core_builder::preset_from_model_dir(Path::new("/models/some-unknown-model")),

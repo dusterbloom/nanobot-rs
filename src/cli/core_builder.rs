@@ -271,7 +271,19 @@ pub(crate) fn resolve_mlx_model_dir(config: &Config) -> std::path::PathBuf {
             }
             tracing::warn!("mlxModelDir=auto but no MLX model found, using default");
         } else {
-            return std::path::PathBuf::from(dir);
+            let path = std::path::PathBuf::from(dir);
+            if path.join("tokenizer.json").exists() {
+                return path;
+            }
+            // Configured dir doesn't exist or has no tokenizer — try auto-detect.
+            tracing::warn!(
+                configured = %path.display(),
+                "mlxModelDir not found on disk, auto-detecting"
+            );
+            if let Some(found) = auto_detect_mlx_model_dir() {
+                tracing::info!(found = %found.display(), "auto-detected MLX model");
+                return found;
+            }
         }
     }
     dirs::home_dir()
@@ -331,7 +343,12 @@ use crate::agent::mlx_lm::is_mlx_model_dir;
 pub(crate) fn preset_from_model_dir(dir: &std::path::Path) -> &'static str {
     let s = dir.to_string_lossy();
     let s_lower = s.to_lowercase();
-    if s_lower.contains("qwen3.5-2b") || s_lower.contains("qwen3_5-2b") {
+    // Qwen3.5 variants (check before Qwen3 to avoid false matches)
+    if s_lower.contains("qwen3.5-9b") || s_lower.contains("qwen3_5-9b") {
+        "qwen3.5-9b"
+    } else if s_lower.contains("qwen3.5-4b") || s_lower.contains("qwen3_5-4b") {
+        "qwen3.5-4b"
+    } else if s_lower.contains("qwen3.5-2b") || s_lower.contains("qwen3_5-2b") {
         "qwen3.5-2b"
     } else if s_lower.contains("qwen3-8b") || s_lower.contains("qwen3-8_b") {
         "qwen3-8b"
@@ -356,6 +373,8 @@ pub(crate) fn model_config_from_preset(preset: &str) -> Option<ModelConfig> {
         "qwen3-4b" => Some(ModelConfig::qwen3_4b()),
         "qwen3-8b" => Some(ModelConfig::qwen3_8b()),
         "qwen3.5-2b" => Some(ModelConfig::qwen3_5_2b()),
+        "qwen3.5-4b" => Some(ModelConfig::qwen3_5_4b()),
+        "qwen3.5-9b" => Some(ModelConfig::qwen3_5_9b()),
         _ => None,
     }
 }
@@ -376,7 +395,7 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
             anyhow::anyhow!(
                 "Cannot determine model config for '{}'. \
                  No config.json found and preset '{}' is unknown. \
-                 Supported presets: qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b.",
+                 Supported presets: qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b, qwen3.5-4b, qwen3.5-9b.",
                 model_dir.display(),
                 effective_preset,
             )
@@ -819,12 +838,24 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_from_model_dir_keeps_unknown_qwen35_variants_unknown() {
+    fn test_preset_from_model_dir_resolves_qwen35_9b() {
         assert_eq!(
             preset_from_model_dir(std::path::Path::new(
                 "/tmp/mlx-community/Qwen3.5-9B-MLX-4bit"
             )),
-            "unknown"
+            "qwen3.5-9b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/WaveCut/Qwen3.5-9B-Claude-Distilled-mlx_8bit"
+            )),
+            "qwen3.5-9b"
+        );
+        assert_eq!(
+            preset_from_model_dir(std::path::Path::new(
+                "/tmp/Jackrong/MLX-Qwen3.5-4B-Claude-Distilled-4bit"
+            )),
+            "qwen3.5-4b"
         );
     }
 
@@ -836,6 +867,8 @@ mod tests {
             "qwen3-4b",
             "qwen3-8b",
             "qwen3.5-2b",
+            "qwen3.5-4b",
+            "qwen3.5-9b",
         ] {
             assert!(
                 model_config_from_preset(preset).is_some(),

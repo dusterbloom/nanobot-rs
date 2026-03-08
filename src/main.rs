@@ -807,16 +807,20 @@ fn main() {
                 std::path::PathBuf::from(home)
                     .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
             });
+            // Auto-detect from config.json first, then fall back to named preset.
             let effective_preset = if preset == "auto" {
                 crate::cli::preset_from_model_dir(&model_dir).to_string()
             } else {
                 preset
             };
-            let Some(model_config) = crate::cli::model_config_from_preset(&effective_preset) else {
+            let Some(model_config) = crate::agent::mlx_lora::ModelConfig::from_config_json(&model_dir)
+                .or_else(|| crate::cli::model_config_from_preset(&effective_preset))
+            else {
                 eprintln!(
-                    "Unsupported MLX preset '{}' for model '{}'. Supported presets: auto, qwen3-0.6b, qwen3-1.7b, qwen3-4b, qwen3-8b, qwen3.5-2b.",
+                    "Cannot determine model config for '{}'. \
+                     No config.json found and preset '{}' is unknown.",
+                    model_dir.display(),
                     effective_preset,
-                    model_dir.display()
                 );
                 return;
             };

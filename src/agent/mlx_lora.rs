@@ -608,6 +608,62 @@ impl ModelConfig {
         }
     }
 
+    pub fn qwen3_5_4b() -> Self {
+        // Hybrid GDN: 24 linear_attn + 8 full_attn (every 4th), 32 layers
+        let linear_indices: Vec<usize> = (0..32).filter(|i| i % 4 != 3).collect();
+        ModelConfig {
+            dim: 2560,
+            hidden_dim: 9216,
+            n_heads: 16,
+            n_kv_heads: 4,
+            n_layers: 32,
+            vocab_size: 248320,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 4,
+            weight_prefix: "language_model.model",
+            partial_rotary_factor: 0.25,
+            attn_output_gate: true,
+            linear_attn_indices: linear_indices,
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            linear_n_value_heads: 32,
+            linear_value_head_dim: 128,
+            conv_kernel_size: 4,
+            thinking_model: true,
+        }
+    }
+
+    pub fn qwen3_5_9b() -> Self {
+        // Hybrid GDN: 24 linear_attn + 8 full_attn (every 4th), 32 layers
+        let linear_indices: Vec<usize> = (0..32).filter(|i| i % 4 != 3).collect();
+        ModelConfig {
+            dim: 4096,
+            hidden_dim: 12288,
+            n_heads: 16,
+            n_kv_heads: 4,
+            n_layers: 32,
+            vocab_size: 248320,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            group_size: 64,
+            bits: 4,
+            weight_prefix: "language_model.model",
+            partial_rotary_factor: 0.25,
+            attn_output_gate: true,
+            linear_attn_indices: linear_indices,
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            linear_n_value_heads: 32,
+            linear_value_head_dim: 128,
+            conv_kernel_size: 4,
+            thinking_model: true,
+        }
+    }
+
     /// Build `ModelConfig` by reading the model's `config.json` from disk.
     ///
     /// Supports both Qwen3 (pure transformer) and Qwen3.5 (hybrid GDN) models.
