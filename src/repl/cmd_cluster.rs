@@ -231,6 +231,17 @@ impl ReplContext {
     pub(super) async fn cmd_adapt(&mut self, arg: &str) {
         use crate::agent::lora_bridge;
 
+        // /adapt requires LM Studio backend — it uses the LoRA adapter API
+        // which mlx/vllm-mlx backends don't expose.
+        let backend = &self.config.agents.defaults.local_backend;
+        if backend == "mlx" {
+            println!(
+                "\n  /adapt is not available in MLX mode (backend: {backend}).\n  \
+                 Switch to LM Studio with /local lmstudio to use adapter commands.\n"
+            );
+            return;
+        }
+
         let parts: Vec<&str> = arg.split_whitespace().collect();
         match parts.as_slice() {
             [] | ["status"] => {
