@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::agent::agent_profiles::{self, AgentProfile};
+use crate::agent::context::ContextBuilder;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
 use crate::bus::events::InboundMessage;
@@ -921,23 +922,14 @@ impl SubagentManager {
         };
         let tools = ToolRegistry::with_standard_tools(&tool_config);
 
-        // Build the subagent system prompt.
-        let system_prompt = if let Some(ref profile_prompt) = config.system_prompt {
-            // Profile provides the base prompt; append workspace and task context.
-            let workspace_str = workspace.to_string_lossy();
-            format!(
-                "{profile_prompt}\n\n\
-                 ## Workspace\n\
-                 Your workspace is at: {workspace_str}\n\n\
-                 ## Instructions\n\
-                 - Focus only on the assigned task.\n\
-                 - When done, provide a clear summary of what you accomplished.\n\
-                 - Do not try to communicate with users directly - your result will be announced by the main agent.\n\
-                 - Be thorough but efficient."
-            )
-        } else {
-            Self::_build_subagent_prompt(task, workspace)
-        };
+        // Build the subagent system prompt using ContextBuilder for proper
+        // context (bootstrap files, memory, skills) instead of a hardcoded stub.
+        let system_prompt = Self::_build_context_prompt(
+            workspace,
+            &config.model,
+            is_local,
+            config.system_prompt.as_deref(),
+        );
 
         let mut messages: Vec<Value> = vec![
             json!({"role": "system", "content": system_prompt}),
@@ -1260,25 +1252,68 @@ impl SubagentManager {
     }
 
     /// Build the default system prompt for a subagent (no profile).
-    fn _build_subagent_prompt(task: &str, workspace: &PathBuf) -> String {
-        let workspace_str = workspace.to_string_lossy();
+    /// Build a subagent system prompt using ContextBuilder for full context.
+    ///
+    /// Gives subagents the same foundation as the main agent: identity,
+    /// bootstrap files (AGENTS.md, SOUL.md, USER.md, TOOLS.md, IDENTITY.md),
+    /// long-term memory (MEMORY.md), and skills — with reduced budgets so
+    /// the prompt stays lean.
+    ///
+    /// If `profile_prompt` is provided, it replaces the identity section
+    /// but the context (memory, skills, bootstrap) is still appended.
+    fn _build_context_prompt(
+        workspace: &PathBuf,
+        model: &str,
+        is_local: bool,
+        profile_prompt: Option<&str>,
+    ) -> String {
+        let mut cb = if is_local {
+            let mut cb = ContextBuilder::new_lite(workspace);
+            // Subagents get half the lite budgets — they're focused workers.
+            cb.bootstrap_budget /= 2;
+            cb.long_term_memory_budget /= 2;
+            cb.skills_budget /= 2;
+            cb.profiles_budget = 0; // subagents don't spawn further subagents typically
+            cb
+        } else {
+            let mut cb = ContextBuilder::new(workspace);
+            // Subagent budgets: enough context to be useful, not bloated.
+            cb.bootstrap_budget = 800;
+            cb.long_term_memory_budget = 300;
+            cb.skills_budget = 500;
+            cb.profiles_budget = 0;
+            cb.system_prompt_cap = 3000; // keep it lean
+            cb
+        };
+        cb.model_name = model.to_string();
+        cb.local_prompt_mode = is_local;
+        cb.task_kind = "subagent".to_string();
+        // Subagents get compact skill disclosure — minimal token cost.
+        cb.skill_disclosure = "compact".to_string();
+
+        // Build the context-rich system prompt.
+        let base_prompt = if let Some(profile) = profile_prompt {
+            // Profile provides identity; append ContextBuilder's developer context
+            // (memory, skills, bootstrap) for grounding.
+            let developer = cb.build_developer_context(None, None);
+            if developer.is_empty() {
+                profile.to_string()
+            } else {
+                format!("{}\n\n---\n\n{}", profile, developer)
+            }
+        } else {
+            cb.build_system_prompt(None, None)
+        };
+
+        // Append subagent behavioral constraints.
         format!(
-            r#"You are a subagent of nanobot, a helpful AI assistant.
-
-You have been spawned to complete a specific task. Focus on this task and complete it efficiently.
-
-## Workspace
-Your workspace is at: {workspace_str}
-
-## Task
-{task}
-
-## Instructions
-- Focus only on the assigned task.
-- Use tools to accomplish the task (read files, write files, execute commands, search web).
-- When done, provide a clear summary of what you accomplished.
-- Do not try to communicate with users directly - your result will be announced by the main agent.
-- Be thorough but efficient. Do not perform unnecessary actions."#
+            "{base_prompt}\n\n\
+             ## Subagent Instructions\n\
+             - You are a subagent. Focus only on the assigned task.\n\
+             - Use tools to accomplish the task (read files, write files, execute commands, search web).\n\
+             - When done, provide a clear summary of what you accomplished.\n\
+             - Do not try to communicate with users directly — your result will be announced by the main agent.\n\
+             - Be thorough but efficient."
         )
     }
 }
@@ -1655,5 +1690,119 @@ mod tests {
         let result = format_status_block(&running, &completed);
         assert!(result.contains("RUNNING: worker-1"));
         assert!(result.contains("done-task"));
+    }
+
+    // ---------------------------------------------------------------
+    // _build_context_prompt tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_context_prompt_includes_identity_and_subagent_instructions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt = SubagentManager::_build_context_prompt(
+            &tmp.path().to_path_buf(),
+            "test-model",
+            false,
+            None,
+        );
+        // Should contain the nanobot identity from ContextBuilder
+        assert!(
+            prompt.contains("nanobot"),
+            "Prompt should include nanobot identity"
+        );
+        // Should contain subagent behavioral constraints
+        assert!(
+            prompt.contains("## Subagent Instructions"),
+            "Prompt should include subagent instructions"
+        );
+        assert!(
+            prompt.contains("your result will be announced by the main agent"),
+            "Prompt should tell subagent not to communicate with users"
+        );
+    }
+
+    #[test]
+    fn test_context_prompt_loads_bootstrap_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a bootstrap file that ContextBuilder picks up.
+        std::fs::write(tmp.path().join("SOUL.md"), "Be kind and thorough.").unwrap();
+        let prompt = SubagentManager::_build_context_prompt(
+            &tmp.path().to_path_buf(),
+            "test-model",
+            false,
+            None,
+        );
+        assert!(
+            prompt.contains("Be kind and thorough"),
+            "Prompt should include SOUL.md bootstrap content"
+        );
+    }
+
+    #[test]
+    fn test_context_prompt_loads_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("MEMORY.md"), "User prefers Rust over Python.").unwrap();
+        let prompt = SubagentManager::_build_context_prompt(
+            &tmp.path().to_path_buf(),
+            "test-model",
+            false,
+            None,
+        );
+        assert!(
+            prompt.contains("User prefers Rust over Python"),
+            "Prompt should include long-term memory"
+        );
+    }
+
+    #[test]
+    fn test_context_prompt_profile_preserves_developer_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("MEMORY.md"), "Important fact for subagent.").unwrap();
+        let prompt = SubagentManager::_build_context_prompt(
+            &tmp.path().to_path_buf(),
+            "test-model",
+            false,
+            Some("You are a specialized research agent."),
+        );
+        // Profile prompt is used as identity
+        assert!(
+            prompt.contains("You are a specialized research agent."),
+            "Prompt should include the profile prompt"
+        );
+        // But developer context (memory) is still appended
+        assert!(
+            prompt.contains("Important fact for subagent"),
+            "Prompt should still include memory even with profile prompt"
+        );
+        // Subagent instructions are still present
+        assert!(
+            prompt.contains("## Subagent Instructions"),
+            "Prompt should include subagent instructions"
+        );
+    }
+
+    #[test]
+    fn test_context_prompt_local_mode_uses_lite_budgets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt = SubagentManager::_build_context_prompt(
+            &tmp.path().to_path_buf(),
+            "local:test-model",
+            true,
+            None,
+        );
+        // Local prompts should still contain nanobot identity
+        assert!(
+            prompt.contains("nanobot"),
+            "Local prompt should include nanobot identity"
+        );
+        // And subagent instructions
+        assert!(
+            prompt.contains("## Subagent Instructions"),
+            "Local prompt should include subagent instructions"
+        );
     }
 }
