@@ -604,27 +604,18 @@ impl ReplContext {
     /// /clear — clear working memory and conversation history for the current session.
     pub(super) async fn cmd_clear(&self) {
         let core = self.core_handle.swappable();
-        if !core.memory_enabled {
-            println!("\n  Memory system is disabled.\n");
-            return;
+        if core.memory_enabled {
+            core.working_memory.clear(&self.session_id);
         }
-        let had_content = !core
-            .working_memory
-            .get_context(&self.session_id, 1)
-            .is_empty();
-        core.working_memory.clear(&self.session_id);
         let session_meta = core.sessions.get_or_resume(&self.session_id).await;
         core.sessions.clear_history(&session_meta.id).await;
         self.agent_loop.clear_lcm_engine(&self.session_id).await;
         self.agent_loop.clear_bulletin_cache();
-        if had_content {
-            println!(
-                "\n  Working memory and conversation cleared for session: {}\n",
-                self.session_id
-            );
-        } else {
-            println!("\n  Conversation history cleared.\n");
-        }
+
+        // Refresh the TUI — clear screen and reprint the logo like a fresh session.
+        print!("{}", tui::CLEAR_SCREEN);
+        tui::print_logo();
+        println!();
     }
 
     /// /agents — list running subagents.

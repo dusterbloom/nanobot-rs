@@ -202,8 +202,8 @@ const THINK_CLOSE_TAGS: [&str; 2] = ["</thinking>", "</think>"];
 
 #[derive(Default)]
 pub(crate) struct ThinkSplitState {
-    in_think_block: bool,
-    carry: String,
+    pub(crate) in_think_block: bool,
+    pub(crate) carry: String,
 }
 
 /// Try to extract a retry-after duration from an error response body.
