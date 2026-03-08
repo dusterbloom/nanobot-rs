@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "trio_bench"
 path = "src/bin/trio_bench.rs"
 
+[[bin]]
+name = "perf_ceiling"
+path = "src/bin/perf_ceiling.rs"
+required-features = ["ane"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

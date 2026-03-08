@@ -87,6 +87,57 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
         }
 
+        // libtorch: find PyTorch's lib directory and add rpath so the binary
+        // can locate libtorch_cpu.dylib etc. at runtime without DYLD_LIBRARY_PATH.
+        if let Ok(output) = std::process::Command::new("python3")
+            .args(["-c", "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"])
+            .output()
+        {
+            let torch_lib = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !torch_lib.is_empty() && std::path::Path::new(&torch_lib).exists() {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{torch_lib}");
+                // Also copy libtorch dylibs next to the binary so it works
+                // even when the venv is not present.
+                if let Ok(out_dir) = std::env::var("OUT_DIR") {
+                    let mut target_dir = std::path::PathBuf::from(&out_dir);
+                    while target_dir
+                        .file_name()
+                        .map_or(false, |f| f != "release" && f != "debug")
+                    {
+                        if !target_dir.pop() {
+                            break;
+                        }
+                    }
+                    let torch_lib_path = std::path::Path::new(&torch_lib);
+                    for name in [
+                        "libtorch.dylib",
+                        "libtorch_cpu.dylib",
+                        "libtorch_global_deps.dylib",
+                        "libc10.dylib",
+                    ] {
+                        let src = torch_lib_path.join(name);
+                        if src.exists() {
+                            safe_copy(&src, &target_dir.join(name));
+                        }
+                    }
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let local_lib = std::path::PathBuf::from(&home).join(".local/lib");
+                    let _ = std::fs::create_dir_all(&local_lib);
+                    for name in [
+                        "libtorch.dylib",
+                        "libtorch_cpu.dylib",
+                        "libtorch_global_deps.dylib",
+                        "libc10.dylib",
+                    ] {
+                        let src = torch_lib_path.join(name);
+                        if src.exists() {
+                            safe_copy(&src, &local_lib.join(name));
+                        }
+                    }
+                }
+            }
+        }
+
         // Copy sherpa-onnx shared libraries to the target directory so they're
         // next to the binary after build. Also copy to ~/.local/lib for the
         // installed binary.
