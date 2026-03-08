@@ -171,10 +171,16 @@ mod inner {
 
             let thinking_model = model_config.thinking_model;
 
-            // Start managed mlx-lm server BEFORE model worker so we can pass
+            // Start managed inference server BEFORE model worker so we can pass
             // a post-train hook that reloads adapters on the managed server.
             let (resolved_url, managed_server) = match mlx_lm_url.as_deref() {
-                Some("auto") => {
+                Some("auto") | Some("vllm-mlx") => {
+                    let is_vllm = mlx_lm_url.as_deref() == Some("vllm-mlx");
+                    let backend = if is_vllm {
+                        crate::agent::mlx_lm::InferenceBackend::VllmMlx
+                    } else {
+                        crate::agent::mlx_lm::InferenceBackend::MlxLm
+                    };
                     let port = 8090u16;
                     let adapter_path = model_dir.join("adapters");
                     let adapter = if adapter_path.join("adapters.safetensors").exists() {
@@ -190,18 +196,28 @@ mod inner {
                             .ok()
                             .and_then(|v| v.parse().ok()),
                         chat_template_args: thinking_model
-                            .then(|| r#"{"enable_thinking": false}"#.to_string()),
+                            .then(|| r#"{"enable_thinking": true}"#.to_string()),
                     };
-                    tracing::info!(port, "starting managed mlx-lm server");
+                    // Auto-detect vllm-mlx options from model name.
+                    let vllm_options = crate::agent::mlx_lm::VllmMlxOptions {
+                        tool_call_parser: Some("auto".to_string()),
+                        reasoning_parser: thinking_model.then(|| "qwen3".to_string()),
+                        continuous_batching: false,
+                        max_tokens: Some(32768),
+                    };
+                    let backend_name = if is_vllm { "vllm-mlx" } else { "mlx-lm" };
+                    tracing::info!(port, backend = backend_name, "starting managed inference server");
                     match crate::agent::mlx_lm::MlxLmServer::start(
                         model_dir.clone(),
                         adapter,
                         port,
+                        backend,
                         server_options,
+                        vllm_options,
                     ) {
                         Ok(srv) => {
                             let url = srv.base_url();
-                            tracing::info!(url = %url, "mlx-lm server ready");
+                            tracing::info!(url = %url, backend = backend_name, "inference server ready");
                             (
                                 Some(url),
                                 Some(std::sync::Arc::new(parking_lot::Mutex::new(srv))),
@@ -209,14 +225,14 @@ mod inner {
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "mlx-lm server failed to start: {e}, falling back to in-process"
+                                "{backend_name} server failed to start: {e}, falling back to in-process"
                             );
                             (None, None)
                         }
                     }
                 }
                 Some(url) => {
-                    tracing::info!(url, "MLX inference delegated to mlx-lm server");
+                    tracing::info!(url, "MLX inference delegated to external server");
                     (Some(url.to_string()), None)
                 }
                 None => (None, None),
@@ -390,9 +406,15 @@ mod inner {
             tools: Option<&[serde_json::Value]>,
             max_tokens: u32,
             temperature: f64,
+            thinking_budget: Option<u32>,
         ) -> Result<LLMResponse> {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-            let msgs = self.inject_nothink(messages);
+            let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+            let msgs = if want_thinking {
+                messages.to_vec()
+            } else {
+                self.inject_nothink(messages)
+            };
             let mut body = serde_json::json!({
                 "model": &self.model_path,
                 "messages": msgs,
@@ -429,13 +451,30 @@ mod inner {
                 .cloned()
                 .unwrap_or_default();
 
+            // Content from `content` field, plus `reasoning`/`reasoning_content`
+            // (mlx-lm puts thinking in `reasoning`; vllm-mlx non-stream is buggy
+            // and puts it in `content` instead — handle both).
             let content = message
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let reasoning = message
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .or_else(|| message.get("reasoning_content").and_then(|v| v.as_str()))
+                .unwrap_or("");
 
-            let text = strip_think_blocks(&content);
+            // If content is empty but reasoning has text, the server separated them
+            // correctly (mlx-lm). Use content as-is. If content has thinking inline
+            // (vllm-mlx non-stream bug), strip it.
+            let text = if content.is_empty() && !reasoning.is_empty() {
+                // mlx-lm path: content is empty, reasoning has the thinking.
+                // Nothing useful to return as visible text.
+                String::new()
+            } else {
+                strip_think_blocks(&content)
+            };
 
             let finish_reason = json
                 .pointer("/choices/0/finish_reason")
@@ -581,13 +620,15 @@ mod inner {
             _model: Option<&str>,
             max_tokens: u32,
             temperature: f64,
-            _thinking_budget: Option<u32>,
+            thinking_budget: Option<u32>,
             _top_p: Option<f64>,
         ) -> Result<LLMResponse> {
+            let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+
             // Delegate to mlx-lm server when configured
             if let Some(ref url) = self.mlx_lm_url {
                 return self
-                    .chat_via_mlx_lm(url, messages, tools, max_tokens, temperature)
+                    .chat_via_mlx_lm(url, messages, tools, max_tokens, temperature, thinking_budget)
                     .await;
             }
 
@@ -601,7 +642,7 @@ mod inner {
                 })
                 .collect();
 
-            let prompt = if self.thinking_model {
+            let prompt = if self.thinking_model && !want_thinking {
                 crate::agent::mlx_server::apply_chat_template_nothink(&chat_messages)
             } else {
                 crate::agent::mlx_server::apply_chat_template(&chat_messages)
@@ -647,17 +688,19 @@ mod inner {
             _model: Option<&str>,
             max_tokens: u32,
             temperature: f64,
-            _thinking_budget: Option<u32>,
+            thinking_budget: Option<u32>,
             _top_p: Option<f64>,
         ) -> Result<crate::providers::base::StreamHandle> {
             use crate::providers::base::{StreamChunk, StreamHandle};
             use futures_util::StreamExt;
 
+            let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+
             // Only stream when delegating to mlx-lm server
             let Some(ref base_url) = self.mlx_lm_url else {
                 // In-process: fall back to buffered default
                 let response = self
-                    .chat(messages, tools, None, max_tokens, temperature, None, None)
+                    .chat(messages, tools, None, max_tokens, temperature, thinking_budget, None)
                     .await?;
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 if let Some(ref content) = response.content {
@@ -668,7 +711,11 @@ mod inner {
             };
 
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-            let msgs = self.inject_nothink(messages);
+            let msgs = if want_thinking {
+                messages.to_vec()
+            } else {
+                self.inject_nothink(messages)
+            };
             let mut body = serde_json::json!({
                 "model": &self.model_path,
                 "messages": msgs,
@@ -737,6 +784,19 @@ mod inner {
                         let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
                         };
+
+                        // Extract reasoning delta (vllm-mlx --reasoning-parser)
+                        // These arrive in delta.reasoning / delta.reasoning_content
+                        // when the server separates thinking from content.
+                        let delta_obj = chunk.pointer("/choices/0/delta");
+                        if let Some(reasoning) = delta_obj
+                            .and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning")))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !reasoning.is_empty() {
+                                let _ = tx.send(StreamChunk::ThinkingDelta(reasoning.to_string()));
+                            }
+                        }
 
                         // Extract text delta
                         if let Some(delta) = chunk
