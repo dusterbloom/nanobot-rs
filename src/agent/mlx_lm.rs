@@ -1,11 +1,24 @@
-//! Managed mlx-lm server subprocess for MLX model inference.
+//! Managed MLX inference server subprocess.
 //!
-//! Spawns `python3 -m mlx_lm.server` as a child process, manages its lifecycle,
-//! and supports hot model switching by killing and respawning with a new model.
+//! Supports two backends:
+//!   - `mlx-lm` — `python3 -m mlx_lm.server` (default, supports adapter hot-reload)
+//!   - `vllm-mlx` — `vllm-mlx serve` (continuous batching, native tool calling, prefix cache)
+//!
+//! Backend is selected via `mlxLmUrl` config: `"auto"` → mlx-lm, `"vllm-mlx"` → vllm-mlx.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Which inference server backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InferenceBackend {
+    /// `python3 -m mlx_lm.server` — supports adapter hot-reload.
+    #[default]
+    MlxLm,
+    /// `vllm-mlx serve` — continuous batching, tool calling, prefix cache.
+    VllmMlx,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MlxLmServerOptions {
@@ -14,29 +27,44 @@ pub struct MlxLmServerOptions {
     pub chat_template_args: Option<String>,
 }
 
-/// Managed mlx-lm server process.
+/// Options specific to vllm-mlx backend.
+#[derive(Debug, Clone, Default)]
+pub struct VllmMlxOptions {
+    pub tool_call_parser: Option<String>,
+    pub reasoning_parser: Option<String>,
+    pub continuous_batching: bool,
+    pub max_tokens: Option<u32>,
+}
+
+/// Managed MLX inference server process.
 pub struct MlxLmServer {
     child: Option<Child>,
     pub port: u16,
     pub model_dir: PathBuf,
     pub adapter_path: Option<PathBuf>,
+    pub backend: InferenceBackend,
     pub options: MlxLmServerOptions,
+    pub vllm_options: VllmMlxOptions,
 }
 
 impl MlxLmServer {
-    /// Start mlx-lm server for the given model.
+    /// Start an MLX inference server for the given model.
     pub fn start(
         model_dir: PathBuf,
         adapter_path: Option<PathBuf>,
         port: u16,
+        backend: InferenceBackend,
         options: MlxLmServerOptions,
+        vllm_options: VllmMlxOptions,
     ) -> Result<Self, String> {
         let mut server = MlxLmServer {
             child: None,
             port,
             model_dir: model_dir.clone(),
             adapter_path: adapter_path.clone(),
+            backend,
             options,
+            vllm_options,
         };
         server.spawn_process()?;
         Ok(server)
@@ -46,6 +74,67 @@ impl MlxLmServer {
         // Kill any stale process on the port from a previous run.
         Self::kill_stale_on_port(self.port);
 
+        let mut cmd = match self.backend {
+            InferenceBackend::MlxLm => self.build_mlx_lm_command(),
+            InferenceBackend::VllmMlx => self.build_vllm_mlx_command()?,
+        };
+
+        // Redirect both stdout and stderr to null. Piping stderr can cause
+        // the subprocess to block if the pipe buffer fills (64KB on macOS),
+        // which happens with larger models that produce verbose load output.
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+        let backend_name = match self.backend {
+            InferenceBackend::MlxLm => "mlx_lm.server",
+            InferenceBackend::VllmMlx => "vllm-mlx",
+        };
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn {backend_name}: {e}"))?;
+        self.child = Some(child);
+
+        // Wait for server to be ready by polling TCP connect + simple HTTP GET.
+        // Uses raw TcpStream + manual HTTP instead of reqwest::blocking to avoid
+        // panicking inside a tokio async runtime context.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let addr = format!("127.0.0.1:{}", self.port);
+        let http_req = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            self.port,
+        );
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            // Check if process died
+            if let Some(ref mut c) = self.child {
+                if let Ok(Some(status)) = c.try_wait() {
+                    return Err(format!("{backend_name} exited with {status}"));
+                }
+            }
+            // Try raw TCP connect + HTTP GET to check readiness
+            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                Duration::from_millis(500),
+            ) {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                if stream.write_all(http_req.as_bytes()).is_ok() {
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        let resp = String::from_utf8_lossy(&buf[..n]);
+                        if resp.contains("200 OK") || resp.contains("200") {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        self.kill();
+        Err(format!("{backend_name} failed to start within 90s"))
+    }
+
+    /// Build the `python3 -m mlx_lm.server` command.
+    fn build_mlx_lm_command(&self) -> Command {
         let mut cmd = Command::new("python3");
         cmd.args(["-m", "mlx_lm.server"])
             .arg("--model")
@@ -69,54 +158,42 @@ impl MlxLmServer {
         if let Some(ref value) = self.options.chat_template_args {
             cmd.arg("--chat-template-args").arg(value);
         }
+        cmd
+    }
 
-        // Redirect both stdout and stderr to null. Piping stderr can cause
-        // the subprocess to block if the pipe buffer fills (64KB on macOS),
-        // which happens with larger models that produce verbose load output.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    /// Build the `vllm-mlx serve` command.
+    fn build_vllm_mlx_command(&self) -> Result<Command, String> {
+        let bin = find_vllm_mlx_binary()
+            .ok_or_else(|| "vllm-mlx binary not found. Install with: pip install vllm-mlx".to_string())?;
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn mlx_lm.server: {e}"))?;
-        self.child = Some(child);
+        let mut cmd = Command::new(bin);
+        cmd.arg("serve")
+            .arg(&self.model_dir)
+            .arg("--port")
+            .arg(self.port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1");
 
-        // Wait for server to be ready by polling TCP connect + simple HTTP GET.
-        // Uses raw TcpStream + manual HTTP instead of reqwest::blocking to avoid
-        // panicking inside a tokio async runtime context.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let addr = format!("127.0.0.1:{}", self.port);
-        let http_req = format!(
-            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            self.port,
-        );
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(500));
-            // Check if process died
-            if let Some(ref mut c) = self.child {
-                if let Ok(Some(status)) = c.try_wait() {
-                    return Err(format!("mlx_lm.server exited with {status}"));
-                }
-            }
-            // Try raw TCP connect + HTTP GET to check readiness
-            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                Duration::from_millis(500),
-            ) {
-                use std::io::{Read, Write};
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                if stream.write_all(http_req.as_bytes()).is_ok() {
-                    let mut buf = [0u8; 256];
-                    if let Ok(n) = stream.read(&mut buf) {
-                        let resp = String::from_utf8_lossy(&buf[..n]);
-                        if resp.contains("200 OK") || resp.contains("200") {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+        if self.vllm_options.continuous_batching {
+            cmd.arg("--continuous-batching");
         }
-        self.kill();
-        Err("mlx_lm.server failed to start within 60s".into())
+        if let Some(max) = self.vllm_options.max_tokens {
+            cmd.arg("--max-tokens").arg(max.to_string());
+        }
+        if let Some(ref parser) = self.vllm_options.tool_call_parser {
+            cmd.arg("--enable-auto-tool-choice")
+                .arg("--tool-call-parser")
+                .arg(parser);
+        }
+        if let Some(ref parser) = self.vllm_options.reasoning_parser {
+            cmd.arg("--reasoning-parser").arg(parser);
+        }
+        Ok(cmd)
+    }
+
+    /// Whether this backend supports LoRA adapter hot-reload.
+    pub fn supports_adapters(&self) -> bool {
+        self.backend == InferenceBackend::MlxLm
     }
 
     /// Switch to a different model (kills and respawns).
@@ -132,7 +209,12 @@ impl MlxLmServer {
     }
 
     /// Reload adapters by restarting with the same model but updated adapter path.
+    /// Only supported on mlx-lm backend; no-op on vllm-mlx.
     pub fn reload_adapters(&mut self, adapter_path: PathBuf) -> Result<(), String> {
+        if !self.supports_adapters() {
+            tracing::info!("vllm-mlx: adapter reload not supported, skipping");
+            return Ok(());
+        }
         let model = self.model_dir.clone();
         self.switch_model(model, Some(adapter_path))
     }
@@ -141,7 +223,7 @@ impl MlxLmServer {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Kill any stale mlx_lm.server process on the given port.
+    /// Kill any stale process on the given port.
     fn kill_stale_on_port(port: u16) {
         if let Ok(output) = Command::new("lsof")
             .args(["-ti", &format!(":{port}")])
@@ -179,6 +261,47 @@ impl Drop for MlxLmServer {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+// ---------------------------------------------------------------------------
+// vllm-mlx binary discovery
+// ---------------------------------------------------------------------------
+
+/// Find the `vllm-mlx` binary. Checks:
+/// 1. `.venv/bin/vllm-mlx` relative to `~/.nanobot/` (workspace venv)
+/// 2. `.venv/bin/vllm-mlx` in the current working directory
+/// 3. `vllm-mlx` on PATH (via `which`)
+pub fn find_vllm_mlx_binary() -> Option<PathBuf> {
+    // Check common venv locations.
+    let candidates: Vec<PathBuf> = [
+        dirs::home_dir().map(|h| h.join(".nanobot/.venv/bin/vllm-mlx")),
+        std::env::current_dir()
+            .ok()
+            .map(|d| d.join(".venv/bin/vllm-mlx")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for path in candidates {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    // Fall back to PATH lookup.
+    Command::new("which")
+        .arg("vllm-mlx")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if o.status.success() && !s.is_empty() {
+                Some(PathBuf::from(s))
+            } else {
+                None
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -301,5 +424,24 @@ mod tests {
                 "Qwen3.5-2B-MLX-8bit should be detected as MLX model"
             );
         }
+    }
+
+    #[test]
+    fn test_find_vllm_mlx_binary() {
+        // Should find the vllm-mlx binary in .venv or PATH on this machine.
+        let bin = find_vllm_mlx_binary();
+        eprintln!("vllm-mlx binary: {:?}", bin);
+        if let Some(ref path) = bin {
+            assert!(path.is_file(), "vllm-mlx path should be a file");
+            assert!(
+                path.to_string_lossy().contains("vllm-mlx"),
+                "path should contain vllm-mlx"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inference_backend_default_is_mlx_lm() {
+        assert_eq!(InferenceBackend::default(), InferenceBackend::MlxLm);
     }
 }

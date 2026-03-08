@@ -301,9 +301,11 @@ pub struct AgentDefaults {
     /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
-    /// URL of an external mlx-lm server for inference (e.g. "http://localhost:8080").
-    /// When set with `localBackend: "mlx"`, inference goes to this server via
-    /// OpenAI-compat API while training/perplexity stays in-process.
+    /// MLX inference server URL or backend selector.
+    /// - `"auto"`: spawn managed `mlx_lm.server` on port 8090 (default, supports adapter reload)
+    /// - `"vllm-mlx"`: spawn managed `vllm-mlx serve` on port 8090 (continuous batching, tool calling)
+    /// - `"http://..."`: connect to an external server
+    /// - `null`/absent: in-process inference only (no server)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mlx_lm_url: Option<String>,
     /// Path to a YAML instruction profiles file for model-specific prompt
