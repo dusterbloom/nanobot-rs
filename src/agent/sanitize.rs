@@ -12,14 +12,12 @@ pub fn strip_tool_output(text: &str) -> String {
     use regex::Regex;
 
     // CSS class tokens like css-1abc234 (at least 6 trailing alphanumeric chars).
-    static CSS_CLASS_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"\bcss-[0-9a-zA-Z]{6,}\b").expect("invalid css class regex")
-    });
+    static CSS_CLASS_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\bcss-[0-9a-zA-Z]{6,}\b").expect("invalid css class regex"));
 
     // Bare navigation URLs: http(s) URLs that are at least 40 chars and appear alone on a line.
-    static NAV_URL_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?m)^\s*https?://\S{30,}\s*$").expect("invalid nav url regex")
-    });
+    static NAV_URL_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)^\s*https?://\S{30,}\s*$").expect("invalid nav url regex"));
 
     // Pipe-separated nav bars, e.g. "Home | News | Sport | Business".
     // Require at least two pipe-separated tokens of 2-30 word chars/spaces each.
@@ -29,14 +27,12 @@ pub fn strip_tool_output(text: &str) -> String {
     });
 
     // Three or more consecutive blank lines.
-    static EXCESS_BLANK_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"\n{3,}").expect("invalid blank line regex")
-    });
+    static EXCESS_BLANK_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\n{3,}").expect("invalid blank line regex"));
 
     // HTML tags.
-    static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"<[^>]{1,200}>").expect("invalid html tag regex")
-    });
+    static HTML_TAG_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("invalid html tag regex"));
 
     if text.is_empty() {
         return text.to_string();
@@ -45,8 +41,18 @@ pub fn strip_tool_output(text: &str) -> String {
     // Detect JSON envelope with a "text" field (web_fetch results).
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(inner) = val.get("text").and_then(|v| v.as_str()) {
-            let cleaned = strip_text_content(inner, &CSS_CLASS_RE, &NAV_URL_RE, &NAV_BAR_RE, &EXCESS_BLANK_RE);
-            let result = if cleaned.is_empty() { inner.trim().to_string() } else { cleaned };
+            let cleaned = strip_text_content(
+                inner,
+                &CSS_CLASS_RE,
+                &NAV_URL_RE,
+                &NAV_BAR_RE,
+                &EXCESS_BLANK_RE,
+            );
+            let result = if cleaned.is_empty() {
+                inner.trim().to_string()
+            } else {
+                cleaned
+            };
             // Produce compact JSON with stripped text.
             let mut out = val.clone();
             if let Some(obj) = out.as_object_mut() {
@@ -62,13 +68,29 @@ pub fn strip_tool_output(text: &str) -> String {
     let trimmed = text.trim_start();
     if trimmed.starts_with("<!") || trimmed.starts_with("<html") || trimmed.starts_with("<HTML") {
         let no_tags = HTML_TAG_RE.replace_all(text, " ");
-        let cleaned = strip_text_content(&no_tags, &CSS_CLASS_RE, &NAV_URL_RE, &NAV_BAR_RE, &EXCESS_BLANK_RE);
-        let result = if cleaned.trim().is_empty() { text.trim().to_string() } else { cleaned };
+        let cleaned = strip_text_content(
+            &no_tags,
+            &CSS_CLASS_RE,
+            &NAV_URL_RE,
+            &NAV_BAR_RE,
+            &EXCESS_BLANK_RE,
+        );
+        let result = if cleaned.trim().is_empty() {
+            text.trim().to_string()
+        } else {
+            cleaned
+        };
         return result;
     }
 
     // Plain text.
-    let cleaned = strip_text_content(text, &CSS_CLASS_RE, &NAV_URL_RE, &NAV_BAR_RE, &EXCESS_BLANK_RE);
+    let cleaned = strip_text_content(
+        text,
+        &CSS_CLASS_RE,
+        &NAV_URL_RE,
+        &NAV_BAR_RE,
+        &EXCESS_BLANK_RE,
+    );
     if cleaned.trim().is_empty() {
         text.trim().to_string()
     } else {
@@ -140,8 +162,14 @@ mod tests {
     fn test_strip_css_class_tokens() {
         let input = "Welcome css-1abc234 to css-XYZ789ab the site.";
         let result = strip_tool_output(input);
-        assert!(!result.contains("css-1abc234"), "CSS class token should be removed");
-        assert!(!result.contains("css-XYZ789ab"), "CSS class token should be removed");
+        assert!(
+            !result.contains("css-1abc234"),
+            "CSS class token should be removed"
+        );
+        assert!(
+            !result.contains("css-XYZ789ab"),
+            "CSS class token should be removed"
+        );
         assert!(result.contains("Welcome"), "surrounding text should remain");
     }
 
@@ -149,15 +177,24 @@ mod tests {
     fn test_strip_nav_bar() {
         let input = "Home | News | Sport | Business\nSome article content here.";
         let result = strip_tool_output(input);
-        assert!(!result.contains("Home | News | Sport"), "nav bar should be stripped");
-        assert!(result.contains("Some article content here."), "content should remain");
+        assert!(
+            !result.contains("Home | News | Sport"),
+            "nav bar should be stripped"
+        );
+        assert!(
+            result.contains("Some article content here."),
+            "content should remain"
+        );
     }
 
     #[test]
     fn test_strip_bare_navigation_url() {
         let input = "Article title\nhttps://example.com/very/long/navigation/path/that/is/quite/long\nArticle body.";
         let result = strip_tool_output(input);
-        assert!(!result.contains("https://example.com/very/long/navigation/path"), "long nav URL should be removed");
+        assert!(
+            !result.contains("https://example.com/very/long/navigation/path"),
+            "long nav URL should be removed"
+        );
         assert!(result.contains("Article title"), "title should remain");
         assert!(result.contains("Article body."), "body should remain");
     }
@@ -166,9 +203,18 @@ mod tests {
     fn test_collapse_blank_lines() {
         let input = "Paragraph one.\n\n\n\nParagraph two.";
         let result = strip_tool_output(input);
-        assert!(!result.contains("\n\n\n"), "3+ blank lines should be collapsed to 2");
-        assert!(result.contains("Paragraph one."), "first paragraph should remain");
-        assert!(result.contains("Paragraph two."), "second paragraph should remain");
+        assert!(
+            !result.contains("\n\n\n"),
+            "3+ blank lines should be collapsed to 2"
+        );
+        assert!(
+            result.contains("Paragraph one."),
+            "first paragraph should remain"
+        );
+        assert!(
+            result.contains("Paragraph two."),
+            "second paragraph should remain"
+        );
     }
 
     #[test]
@@ -176,7 +222,10 @@ mod tests {
         let input = "{\n  \"key\": \"value\",\n  \"num\": 42\n}";
         let result = strip_tool_output(input);
         // Should be compacted (no indentation whitespace)
-        assert!(!result.contains("  "), "compact JSON should have no indentation");
+        assert!(
+            !result.contains("  "),
+            "compact JSON should have no indentation"
+        );
         assert!(result.contains("\"key\""), "key should remain");
         assert!(result.contains("\"value\""), "value should remain");
     }
@@ -189,11 +238,17 @@ mod tests {
             css_noise
         );
         let result = strip_tool_output(&input);
-        assert!(!result.contains("css-1abc234"), "CSS class token should be stripped from inner text");
-        assert!(result.contains("Actual content here."), "content should remain");
+        assert!(
+            !result.contains("css-1abc234"),
+            "CSS class token should be stripped from inner text"
+        );
+        assert!(
+            result.contains("Actual content here."),
+            "content should remain"
+        );
         // Result should still be valid JSON
-        let parsed: serde_json::Value = serde_json::from_str(&result)
-            .expect("result should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
         assert!(parsed.get("url").is_some(), "url field should remain");
         assert!(parsed.get("text").is_some(), "text field should remain");
     }
@@ -209,14 +264,21 @@ mod tests {
         // the pure-text level by checking the json/html path doesn't apply.
         // The plain text fallback: if cleaned.trim().is_empty() -> return original trimmed.
         // Since `input` is non-empty, result must be non-empty.
-        assert!(!result.trim().is_empty(), "non-empty input must produce non-empty output");
+        assert!(
+            !result.trim().is_empty(),
+            "non-empty input must produce non-empty output"
+        );
     }
 
     #[test]
     fn test_plain_text_passthrough() {
         let input = "This is a simple plain text response with no noise.";
         let result = strip_tool_output(input);
-        assert_eq!(result.trim(), input.trim(), "clean plain text should pass through unchanged");
+        assert_eq!(
+            result.trim(),
+            input.trim(),
+            "clean plain text should pass through unchanged"
+        );
     }
 
     // --- sanitize_reasoning_output tests ---
@@ -258,7 +320,10 @@ mod tests {
     fn test_empty_after_strip_returns_original() {
         let input = "<think>only thinking</think>";
         // Stripping leaves empty — fall back to original trimmed.
-        assert_eq!(sanitize_reasoning_output(input), "<think>only thinking</think>");
+        assert_eq!(
+            sanitize_reasoning_output(input),
+            "<think>only thinking</think>"
+        );
     }
 
     #[test]
@@ -305,13 +370,22 @@ let s2 = s1; // s1 is moved to s2
 // println!("{}", s1); // ERROR: s1 no longer valid
 ```"#;
         let result = sanitize_reasoning_output(input);
-        assert!(!result.contains("<think>"), "think block should be stripped");
-        assert!(!result.contains("</think>"), "think close tag should be stripped");
+        assert!(
+            !result.contains("<think>"),
+            "think block should be stripped"
+        );
+        assert!(
+            !result.contains("</think>"),
+            "think close tag should be stripped"
+        );
         assert!(
             result.contains("Rust's ownership system"),
             "response content should remain"
         );
-        assert!(result.contains("```rust"), "code blocks should be preserved");
+        assert!(
+            result.contains("```rust"),
+            "code blocks should be preserved"
+        );
     }
 
     #[test]

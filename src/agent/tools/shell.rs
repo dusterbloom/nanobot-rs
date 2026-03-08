@@ -14,7 +14,8 @@ use tokio::process::Command;
 static RE_ESCAPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\([^nrtav\\0])").unwrap());
 static RE_WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 static RE_POSIX_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/[^\s"']+"#).unwrap());
-static RE_WIN_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
+static RE_WIN_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\\"']+"#).unwrap());
 
 use super::base::{Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
@@ -375,7 +376,10 @@ impl Tool for ExecTool {
                         parts.join("\n")
                     }
                 }
-                Err(e) => format!("Error executing command: {}. Hint: verify the command exists and is in PATH.", e),
+                Err(e) => format!(
+                    "Error executing command: {}. Hint: verify the command exists and is in PATH.",
+                    e
+                ),
             }
         })
         .await;
@@ -439,7 +443,12 @@ impl Tool for ExecTool {
                 .spawn()
             {
                 Ok(c) => c,
-                Err(e) => return format!("Error executing command: {}. Hint: verify the command exists and is in PATH.", e),
+                Err(e) => {
+                    return format!(
+                    "Error executing command: {}. Hint: verify the command exists and is in PATH.",
+                    e
+                )
+                }
             };
 
             let stdout = child.stdout.take().unwrap();
@@ -1111,10 +1120,22 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        assert_eq!(events.len(), 1, "Expected 1 start-progress event, got {}", events.len());
+        assert_eq!(
+            events.len(),
+            1,
+            "Expected 1 start-progress event, got {}",
+            events.len()
+        );
         match &events[0] {
-            ToolEvent::Progress { output_preview: Some(p), .. } => {
-                assert!(p.starts_with("Running:"), "Expected 'Running:' prefix, got: {}", p);
+            ToolEvent::Progress {
+                output_preview: Some(p),
+                ..
+            } => {
+                assert!(
+                    p.starts_with("Running:"),
+                    "Expected 'Running:' prefix, got: {}",
+                    p
+                );
             }
             other => panic!("Expected Progress with output_preview, got: {:?}", other),
         }
@@ -1332,9 +1353,21 @@ mod tests {
             serde_json::Value::String("sleep 10".to_string()),
         );
         let result = tool.execute(params).await;
-        assert!(result.contains("timed out"), "Expected timeout message: {}", result);
-        assert!(result.contains("Hint:"), "Expected hint in timeout message: {}", result);
-        assert!(result.contains("simpler command"), "Expected 'simpler command' hint: {}", result);
+        assert!(
+            result.contains("timed out"),
+            "Expected timeout message: {}",
+            result
+        );
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in timeout message: {}",
+            result
+        );
+        assert!(
+            result.contains("simpler command"),
+            "Expected 'simpler command' hint: {}",
+            result
+        );
     }
 
     // ---------------------------------------------------------------

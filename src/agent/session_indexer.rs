@@ -113,10 +113,7 @@ pub fn extract_session_content(
         };
 
         // Extract content, truncate to 500 chars.
-        let content = parsed
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let content = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if content.is_empty() {
             continue;
         }
@@ -149,10 +146,7 @@ pub fn extract_session_content(
 /// Create .md summaries for orphaned files.
 ///
 /// Returns `(indexed_count, skipped_count, error_count)`.
-pub fn index_sessions(
-    sessions_dir: &Path,
-    memory_sessions_dir: &Path,
-) -> (usize, usize, usize) {
+pub fn index_sessions(sessions_dir: &Path, memory_sessions_dir: &Path) -> (usize, usize, usize) {
     let entries = match fs::read_dir(sessions_dir) {
         Ok(e) => e,
         Err(e) => {
@@ -421,10 +415,7 @@ mod tests {
 
     #[test]
     fn test_session_key_from_filename_without_date() {
-        assert_eq!(
-            session_key_from_filename("cli_mytest.jsonl"),
-            "cli:mytest"
-        );
+        assert_eq!(session_key_from_filename("cli_mytest.jsonl"), "cli:mytest");
     }
 
     // --- session_hash ---
@@ -459,8 +450,7 @@ mod tests {
 {"role":"assistant","content":"Hi there!"}"#;
         fs::write(sessions_dir.path().join("cli_test_2026-01-01.jsonl"), jsonl).unwrap();
 
-        let (indexed, skipped, errors) =
-            index_sessions(sessions_dir.path(), memory_dir.path());
+        let (indexed, skipped, errors) = index_sessions(sessions_dir.path(), memory_dir.path());
         assert_eq!(indexed, 1);
         assert_eq!(errors, 0);
 
@@ -498,8 +488,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indexed, skipped, _errors) =
-            index_sessions(sessions_dir.path(), memory_dir.path());
+        let (indexed, skipped, _errors) = index_sessions(sessions_dir.path(), memory_dir.path());
         assert_eq!(indexed, 0);
         assert_eq!(skipped, 1);
     }
@@ -515,8 +504,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indexed, skipped, _errors) =
-            index_sessions(sessions_dir.path(), memory_dir.path());
+        let (indexed, skipped, _errors) = index_sessions(sessions_dir.path(), memory_dir.path());
         assert_eq!(indexed, 0);
         assert_eq!(skipped, 1);
     }
@@ -533,8 +521,7 @@ mod tests {
         )
         .unwrap();
 
-        let (indexed, skipped, errors) =
-            index_sessions(sessions_dir.path(), memory_dir.path());
+        let (indexed, skipped, errors) = index_sessions(sessions_dir.path(), memory_dir.path());
         assert_eq!(indexed, 0);
         assert_eq!(errors, 0);
         assert_eq!(skipped, 1); // skipped because content is empty
@@ -557,10 +544,13 @@ mod tests {
         let jsonl = r#"{"_type":"metadata","session_key":"cli:ks_test","created_at":"2026-02-01T00:00:00Z","updated_at":"2026-02-01T01:00:00Z"}
 {"role":"user","content":"How does async Rust handle cancellation?"}
 {"role":"assistant","content":"Rust uses drop guards and select! for structured concurrency."}"#;
-        fs::write(sessions_dir.path().join("cli_ks_test_2026-02-01.jsonl"), jsonl).unwrap();
+        fs::write(
+            sessions_dir.path().join("cli_ks_test_2026-02-01.jsonl"),
+            jsonl,
+        )
+        .unwrap();
 
-        let (indexed, _skipped, errors) =
-            index_sessions(sessions_dir.path(), memory_dir.path());
+        let (indexed, _skipped, errors) = index_sessions(sessions_dir.path(), memory_dir.path());
         assert_eq!(indexed, 1);
         assert_eq!(errors, 0);
 

@@ -4,11 +4,11 @@
 //! Records every tool invocation with arguments, results, timing, and a
 //! SHA-256 hash chain so tampering is detectable.
 
+use parking_lot::Mutex;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;

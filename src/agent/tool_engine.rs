@@ -168,13 +168,8 @@ pub(crate) async fn execute_tools_delegated(
     }
 
     let delegation_start = std::time::Instant::now();
-    let run_result = tool_runner::run_tool_loop(
-        &runner_config,
-        routed_tool_calls,
-        &ctx.tools,
-        &task_desc,
-    )
-    .await;
+    let run_result =
+        tool_runner::run_tool_loop(&runner_config, routed_tool_calls, &ctx.tools, &task_desc).await;
     let delegation_elapsed_ms = delegation_start.elapsed().as_millis() as u64;
 
     // Only mark unhealthy on actual provider/tool-runner errors.
@@ -188,11 +183,7 @@ pub(crate) async fn execute_tools_delegated(
             .tool_results
             .first()
             .map(|(_, name, data)| {
-                format!(
-                    "[{}]: {}",
-                    name,
-                    data.chars().take(200).collect::<String>()
-                )
+                format!("[{}]: {}", name, data.chars().take(200).collect::<String>())
             })
             .unwrap_or_default();
         warn!(
@@ -204,9 +195,7 @@ pub(crate) async fn execute_tools_delegated(
             run_result.tool_results.len(),
             results_preview,
         );
-        counters
-            .delegation_healthy
-            .store(false, Ordering::Relaxed);
+        counters.delegation_healthy.store(false, Ordering::Relaxed);
     } else if delegation_elapsed_ms > 30_000 {
         debug!(
             "Delegation run was slow ({} ms) but succeeded — keeping provider healthy",
@@ -220,9 +209,7 @@ pub(crate) async fn execute_tools_delegated(
     } else if !counters.delegation_healthy.load(Ordering::Relaxed) {
         // Re-probe succeeded — server recovered!
         info!("Delegation provider recovered — re-enabling delegation");
-        counters
-            .delegation_healthy
-            .store(true, Ordering::Relaxed);
+        counters.delegation_healthy.store(true, Ordering::Relaxed);
         counters
             .delegation_retry_counter
             .store(0, Ordering::Relaxed);
@@ -256,8 +243,7 @@ pub(crate) async fn execute_tools_delegated(
             .map(|(_, _, data)| data.as_str())
             .unwrap_or("(no result)");
 
-        let full_tokens =
-            crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
+        let full_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(full_data);
 
         let injected = if let Some(ref summary) = run_result.summary {
             // Summary exists from scratch-pad analysis.
@@ -297,14 +283,11 @@ pub(crate) async fn execute_tools_delegated(
                 &injected,
             );
         } else {
-            ContextBuilder::add_tool_result(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                &injected,
-            );
+            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, &injected);
         }
-        ctx.flow.tool_guard.record_result(&tc.name, &tc.arguments, injected.clone());
+        ctx.flow
+            .tool_guard
+            .record_result(&tc.name, &tc.arguments, injected.clone());
         ctx.used_tools.insert(tc.name.clone());
     }
 
@@ -316,7 +299,7 @@ pub(crate) async fn execute_tools_delegated(
             let extra = tool_runner::format_results_for_context(
                 &run_result,
                 preview_max,
-                Some(&mut ctx.content_gate),  // Wire ContentGate for budget-aware truncation
+                Some(&mut ctx.content_gate), // Wire ContentGate for budget-aware truncation
             );
             format!(
                 "[Tool runner executed {} additional calls]\n{}",
@@ -765,8 +748,7 @@ mod tests {
             make_tc("list_dir", "3"),
             make_tc("write_file", "4"),
         ];
-        let (par, seq): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert_eq!(par.len(), 2);
         assert_eq!(seq.len(), 2);
         assert_eq!(par[0].name, "read_file");
@@ -782,8 +764,7 @@ mod tests {
             make_tc("list_dir", "2"),
             make_tc("web_search", "3"),
         ];
-        let (par, seq): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert_eq!(par.len(), 3);
         assert!(seq.is_empty());
     }
@@ -791,8 +772,7 @@ mod tests {
     #[test]
     fn test_all_sequential_no_parallel() {
         let calls = vec![make_tc("exec", "1"), make_tc("write_file", "2")];
-        let (par, seq): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert!(par.is_empty());
         assert_eq!(seq.len(), 2);
     }
@@ -801,15 +781,13 @@ mod tests {
     fn test_single_tool_partitions_correctly() {
         // Single parallel-safe tool
         let calls = vec![make_tc("read_file", "1")];
-        let (par, seq): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert_eq!(par.len(), 1);
         assert!(seq.is_empty());
 
         // Single serial tool
         let calls = vec![make_tc("exec", "1")];
-        let (par, seq): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|tc| is_parallel_safe(&tc.name));
+        let (par, seq): (Vec<_>, Vec<_>) = calls.iter().partition(|tc| is_parallel_safe(&tc.name));
         assert!(par.is_empty());
         assert_eq!(seq.len(), 1);
     }

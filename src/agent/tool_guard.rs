@@ -52,7 +52,11 @@ impl ToolGuard {
         keys.sort();
         let mut parts = Vec::with_capacity(keys.len());
         for k in keys {
-            parts.push(format!("{}={}", k, args.get(k).cloned().unwrap_or(Value::Null)));
+            parts.push(format!(
+                "{}={}",
+                k,
+                args.get(k).cloned().unwrap_or(Value::Null)
+            ));
         }
         format!("{}|{}", name, parts.join("&"))
     }
@@ -61,7 +65,11 @@ impl ToolGuard {
         let key = Self::key(name, args);
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
-        let limit = self.tool_limits.get(name).copied().unwrap_or(self.max_same_call);
+        let limit = self
+            .tool_limits
+            .get(name)
+            .copied()
+            .unwrap_or(self.max_same_call);
         if *count > limit {
             return Err(format!(
                 "duplicate tool call blocked for '{}': exceeded {} identical calls in one turn",
@@ -77,7 +85,10 @@ mod tests {
     use super::*;
 
     fn args(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+            .collect()
     }
 
     #[test]
@@ -180,4 +191,3 @@ mod tests {
         assert!(guard.allow("exec", &a).is_err());
     }
 }
-

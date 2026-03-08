@@ -10,10 +10,7 @@ use crate::bus::events::InboundMessage;
 
 /// Try to handle a gateway slash command. Returns `Some(response)` if handled,
 /// `None` if the message should be forwarded to the LLM.
-pub(crate) async fn dispatch(
-    shared: &AgentLoopShared,
-    msg: &InboundMessage,
-) -> Option<String> {
+pub(crate) async fn dispatch(shared: &AgentLoopShared, msg: &InboundMessage) -> Option<String> {
     let content = msg.content.trim();
     if !content.starts_with('/') {
         return None;
@@ -102,7 +99,9 @@ async fn cmd_clear(shared: &AgentLoopShared, session_key: &str) -> String {
     let mut engines = shared.lcm_engines.lock().await;
     engines.remove(session_key);
     drop(engines);
-    shared.bulletin_cache.store(std::sync::Arc::new(String::new()));
+    shared
+        .bulletin_cache
+        .store(std::sync::Arc::new(String::new()));
     "Working memory and history cleared.".to_string()
 }
 
@@ -176,7 +175,9 @@ fn cmd_context(shared: &AgentLoopShared) -> String {
     let msgs = counters.last_message_count.load(Ordering::Relaxed);
     let wm = counters.last_working_memory_tokens.load(Ordering::Relaxed);
     let prompt = counters.last_actual_prompt_tokens.load(Ordering::Relaxed);
-    let completion = counters.last_actual_completion_tokens.load(Ordering::Relaxed);
+    let completion = counters
+        .last_actual_completion_tokens
+        .load(Ordering::Relaxed);
 
     let pct = if max > 0 {
         (used as f64 / max as f64 * 100.0) as u64

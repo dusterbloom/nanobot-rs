@@ -172,7 +172,9 @@ impl Tool for RecallTool {
 
         // Always supplement with grep over raw memory files (catches un-indexed content).
         let grep_results = self.grep_memory(query, n).await;
-        if !grep_results.contains("No matches found") && !grep_results.contains("No memory directory") {
+        if !grep_results.contains("No matches found")
+            && !grep_results.contains("No memory directory")
+        {
             sections.push(grep_results);
         }
 

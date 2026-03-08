@@ -248,9 +248,9 @@ impl KnowledgeStore {
 
         // Now compute embeddings for all chunks and insert into chunks_vec.
         // Collect chunk ids + texts.
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content FROM chunks WHERE source_id = ?1 ORDER BY chunk_idx",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM chunks WHERE source_id = ?1 ORDER BY chunk_idx")?;
         let rows: Vec<(i64, String)> = stmt
             .query_map(params![result.source_id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -263,13 +263,12 @@ impl KnowledgeStore {
 
         // Batch embed all chunk texts.
         let texts: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
-        let embeddings = embedder::embed_batch(&texts)
-            .context("Failed to embed chunks")?;
+        let embeddings = embedder::embed_batch(&texts).context("Failed to embed chunks")?;
 
         // Insert into vec0 table.
-        let mut insert = self.conn.prepare(
-            "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?1, ?2)",
-        )?;
+        let mut insert = self
+            .conn
+            .prepare("INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?1, ?2)")?;
         for ((chunk_id, _), emb) in rows.iter().zip(embeddings.iter()) {
             let bytes = vec_to_bytes(emb);
             insert.execute(params![chunk_id, bytes])?;
@@ -322,7 +321,11 @@ impl KnowledgeStore {
                 rank: -score, // negate so lower = better (consistent with BM25)
             })
             .collect();
-        fused.sort_by(|a, b| a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal));
+        fused.sort_by(|a, b| {
+            a.rank
+                .partial_cmp(&b.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         fused.truncate(limit);
 
         Ok(fused)
@@ -350,8 +353,7 @@ impl KnowledgeStore {
             }
 
             // Embed the query.
-            let query_vec = embedder::embed_one(query)
-                .context("Failed to embed query")?;
+            let query_vec = embedder::embed_one(query).context("Failed to embed query")?;
             let query_bytes = vec_to_bytes(&query_vec);
 
             let mut stmt = self.conn.prepare(
@@ -909,7 +911,13 @@ mod tests {
             .ingest("doc1", None, "Rust programming language systems", 4096, 256)
             .unwrap();
         store
-            .ingest("doc2", None, "Python scripting language interpreted", 4096, 256)
+            .ingest(
+                "doc2",
+                None,
+                "Python scripting language interpreted",
+                4096,
+                256,
+            )
             .unwrap();
 
         let results = store.hybrid_search("Rust", 5).unwrap();
@@ -938,7 +946,10 @@ mod tests {
                 .ingest(
                     &format!("doc{}", i),
                     None,
-                    &format!("This document number {} discusses Rust systems programming", i),
+                    &format!(
+                        "This document number {} discusses Rust systems programming",
+                        i
+                    ),
                     4096,
                     256,
                 )

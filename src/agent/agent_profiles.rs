@@ -361,8 +361,14 @@ Do stuff."#;
     #[test]
     fn test_resolve_model_for_env() {
         // Cloud mode: same as resolve_model_alias
-        assert_eq!(resolve_model_for_env("haiku", false, "unused"), "claude-haiku-4-5-20251001");
-        assert_eq!(resolve_model_for_env("sonnet", false, "unused"), "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            resolve_model_for_env("haiku", false, "unused"),
+            "claude-haiku-4-5-20251001"
+        );
+        assert_eq!(
+            resolve_model_for_env("sonnet", false, "unused"),
+            "claude-sonnet-4-5-20250929"
+        );
 
         // Local mode: tier aliases resolve to local model
         let local = "qwen3.5-prism";
@@ -372,14 +378,19 @@ Do stuff."#;
         assert_eq!(resolve_model_for_env("local", true, local), local);
 
         // Local mode: non-tier names pass through
-        assert_eq!(resolve_model_for_env("groq/llama-3.3-70b", true, local), "groq/llama-3.3-70b");
+        assert_eq!(
+            resolve_model_for_env("groq/llama-3.3-70b", true, local),
+            "groq/llama-3.3-70b"
+        );
     }
 
     #[test]
     fn test_profile_with_capabilities() {
         let yaml = "---\ncapabilities: [read, http, skills]\n---\nYou are a researcher.";
         let profile = parse_profile(yaml, "researcher").unwrap();
-        let tools = profile.tools.expect("capabilities should produce a tools list");
+        let tools = profile
+            .tools
+            .expect("capabilities should produce a tools list");
         // read -> [list_dir, read_file], http -> [browser, web_search], skills -> [read_skill]
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
@@ -402,7 +413,11 @@ Do stuff."#;
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
         assert!(tools.contains(&"exec".to_string()));
-        assert_eq!(tools.iter().filter(|t| *t == "read_file").count(), 1, "read_file deduped");
+        assert_eq!(
+            tools.iter().filter(|t| *t == "read_file").count(),
+            1,
+            "read_file deduped"
+        );
         // Verify sorted
         for i in 1..tools.len() {
             assert!(tools[i] >= tools[i - 1], "tools should be sorted");
@@ -413,14 +428,18 @@ Do stuff."#;
     fn test_profile_no_capabilities_no_tools_is_none() {
         let yaml = "---\ndescription: minimal\n---\nDo stuff.";
         let profile = parse_profile(yaml, "minimal").unwrap();
-        assert!(profile.tools.is_none(), "neither capabilities nor tools => None means all tools");
+        assert!(
+            profile.tools.is_none(),
+            "neither capabilities nor tools => None means all tools"
+        );
     }
 
     // ----- inherit / deny_capabilities -----
 
     #[test]
     fn test_profile_inherit_flag_parsed() {
-        let yaml = "---\ninherit: true\ndeny_capabilities: [write, execute]\n---\nDo restricted work.";
+        let yaml =
+            "---\ninherit: true\ndeny_capabilities: [write, execute]\n---\nDo restricted work.";
         let profile = parse_profile(yaml, "restricted").unwrap();
         assert!(profile.inherit, "inherit flag should be true");
         assert!(profile.deny_capabilities.contains(&Capability::Write));
@@ -440,7 +459,8 @@ Do stuff."#;
     #[test]
     fn test_profile_explicit_capabilities_override_inherit() {
         // When `capabilities` are explicit, they define `tools` regardless of `inherit`.
-        let yaml = "---\ncapabilities: [read]\ninherit: true\ndeny_capabilities: [http]\n---\nDo stuff.";
+        let yaml =
+            "---\ncapabilities: [read]\ninherit: true\ndeny_capabilities: [http]\n---\nDo stuff.";
         let profile = parse_profile(yaml, "mixed").unwrap();
         let tools = profile.tools.expect("should have tools from capabilities");
         assert!(tools.contains(&"read_file".to_string()));

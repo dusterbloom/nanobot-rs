@@ -69,7 +69,11 @@ fn evict_by_age(msgs: &mut Vec<Value>, current_turn: u64, max_age_turns: usize) 
     let ids_to_remove: HashSet<String> = msgs
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .filter_map(|m| m.get("tool_call_id").and_then(|id| id.as_str()).map(String::from))
+        .filter_map(|m| {
+            m.get("tool_call_id")
+                .and_then(|id| id.as_str())
+                .map(String::from)
+        })
         .filter(|id| !known_call_ids.contains(id))
         .collect();
     remove_orphaned_tool_results(msgs, &ids_to_remove);

@@ -11,11 +11,13 @@ use crate::agent::audit::AuditEntry;
 
 // Static regexes for claim extraction (compiled once).
 static RE_FILE_REF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(read|wrote|created|edited|deleted|found|opened)\b[^`\n]{0,20}[`]([/~][^\s`]+)[`]").unwrap()
+    Regex::new(
+        r"(?i)\b(read|wrote|created|edited|deleted|found|opened)\b[^`\n]{0,20}[`]([/~][^\s`]+)[`]",
+    )
+    .unwrap()
 });
-static RE_CMD_REF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap()
-});
+static RE_CMD_REF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(ran|executed|running)\b[^`\n]{0,20}`([^`]+)`").unwrap());
 static RE_QUOTED_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(output|result|returns?|shows?|returned|produced)\b[:\s]*\n?```[^\n]*\n([\s\S]*?)```").unwrap()
 });
@@ -23,20 +25,24 @@ static RE_ACTION_PAST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bI (read|wrote|created|deleted|executed|searched|fetched|edited|ran|modified|updated|removed|checked|verified|built|compiled|installed|copied)\b[^.\n]{0,80}").unwrap()
 });
 static RE_ACTION_PRESENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}").unwrap()
+    Regex::new(
+        r"(?i)\b[Ll]et me (check|run|verify|look|see|test|try|build|install|copy)\b[^.\n]{0,80}",
+    )
+    .unwrap()
 });
 static RE_ACTION_WHEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}").unwrap()
+    Regex::new(r"(?i)\b(?:when|if|after)\s+I\s+(run|check|build|test|execute)\b[^.\n]{0,80}")
+        .unwrap()
 });
 static RE_NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b").unwrap()
+    Regex::new(r"\b(\d+)\s+(files?|lines?|errors?|tests?|warnings?|results?|matches?|items?)\b")
+        .unwrap()
 });
 static RE_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(build|compile|install|copy|cp|mv|mkdir|chmod|sudo|cargo|npm|pip|make|test|deploy|push|pull|merge)\b[^.\n]{0,30}\b(succeeded|failed|worked|completed|finished|passed|done|ready|updated|error|broke|broken|permission denied|not found|timed? ?out)\b").unwrap()
 });
-static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap()
-});
+static RE_TIMESTAMP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)\b").unwrap());
 
 /// Classification of how well a claim is supported by the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

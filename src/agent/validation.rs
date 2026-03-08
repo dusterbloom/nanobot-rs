@@ -13,9 +13,8 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
-static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\[(?:\w+\s+)*called[\s:]").expect("hallucination regex")
-});
+static HALLUCINATED_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\[(?:\w+\s+)*called[\s:]").expect("hallucination regex"));
 
 // ---------------------------------------------------------------------------
 // ValidationError
@@ -105,7 +104,10 @@ pub fn validate_response(
 
 /// Strip hallucinated tool-call text from response content.
 pub fn strip_hallucinated_text(content: &str) -> String {
-    HALLUCINATED_CALL_RE.replace_all(content, "").trim().to_string()
+    HALLUCINATED_CALL_RE
+        .replace_all(content, "")
+        .trim()
+        .to_string()
 }
 
 pub fn generate_retry_prompt(error: &ValidationError, attempt: u8) -> String {
@@ -269,7 +271,10 @@ mod tests {
         let content = "```\nlet me check this\n```";
         let result = validate_response(content, &[], false);
         assert!(
-            matches!(result, ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)),
+            matches!(
+                result,
+                ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
+            ),
             "Tool intent in code blocks should still be detected"
         );
     }

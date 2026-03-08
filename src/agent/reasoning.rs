@@ -423,7 +423,8 @@ fn try_strip_number_prefix(line: &str, expected: u32) -> Option<&str> {
     let num_str = expected.to_string();
     let stripped = line.strip_prefix(&num_str)?;
     // After the number, expect '.', ')', or ':'
-    let rest = stripped.strip_prefix('.')
+    let rest = stripped
+        .strip_prefix('.')
         .or_else(|| stripped.strip_prefix(')'))
         .or_else(|| stripped.strip_prefix(':'))?;
     Some(rest)
@@ -589,7 +590,7 @@ mod tests {
         // Complete A
         engine.mark_current_completed(None);
         engine.advance(); // now at B
-        // B fails
+                          // B fails
         engine.mark_current_failed("tool error");
         let alt = engine.find_alternative();
         assert!(alt.is_some()); // Should find C as alternative

@@ -141,11 +141,10 @@ impl LearnLoop for DefaultLearnLoop {
     }
 
     fn observe_async(&self, outcome: TurnOutcome) -> Option<tokio::task::JoinHandle<()>> {
-        // Only trigger perplexity gate when enabled, tools were used, and content exists.
-        if !self.perplexity_gate_config.enabled
-            || outcome.used_tools.is_empty()
-            || outcome.final_content.is_empty()
-        {
+        // Only trigger perplexity gate when enabled and content exists.
+        // Training fires for all turns (not just tool-use) so the experience
+        // buffer captures conversational patterns too.
+        if !self.perplexity_gate_config.enabled || outcome.final_content.is_empty() {
             return None;
         }
 
@@ -170,31 +169,16 @@ impl LearnLoop for DefaultLearnLoop {
             let trace_json =
                 serde_json::to_string(&tool_entries_json).unwrap_or_else(|_| "[]".into());
 
-            // Try in-process MLX perplexity first, then HTTP, then heuristic.
-            let surprise = 'surprise: {
-                #[cfg(feature = "mlx")]
-                if let Some(ref mlx) = mlx_provider {
-                    if let Ok(loss) = mlx
-                        .perplexity(&outcome.user_content, &outcome.final_content)
-                        .await
-                    {
-                        break 'surprise loss as f64;
-                    }
-                }
-                match query_perplexity(
-                    &pg_config.mlx_server_url,
-                    &outcome.user_content,
-                    &outcome.final_content,
-                )
-                .await
-                {
-                    Some(loss) => loss as f64,
-                    None => crate::agent::lora_bridge::compute_surprise(
-                        &outcome.user_content,
-                        &trace_json,
-                    ),
-                }
-            };
+            // Heuristic surprise (zero model contention).
+            //
+            // Model-based perplexity (in-process or HTTP) blocks the model
+            // worker, stalling inference for the next user turn. The heuristic
+            // is instant and contention-free — training quality comes from the
+            // LoRA step itself, not from the gate precision.
+            let surprise = crate::agent::lora_bridge::compute_surprise(
+                &outcome.user_content,
+                &trace_json,
+            );
 
             let threshold = pg_config.surprise_threshold as f64;
             if surprise <= threshold {
@@ -259,26 +243,23 @@ impl LearnLoop for DefaultLearnLoop {
             // hot-swap weights into MLX GPU model when done.
             #[cfg(all(feature = "ane", feature = "mlx"))]
             if let Some(ref mlx) = mlx_provider {
-                if let Some(ane_cfg) = build_ane_training_config() {
+                let model_dir = std::path::Path::new(mlx.model_path());
+                if let Some(ane_cfg) = build_ane_training_config(Some(model_dir)) {
                     let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
                         std::path::Path::new(&ane_cfg.model_dir),
                     ) {
                         Ok(t) => t,
                         Err(e) => {
                             debug!("perplexity_gate: ANE tokenizer load failed: {e}");
-                            // Fall through to MLX GPU training below
-                            #[cfg(feature = "mlx")]
-                            {
-                                try_mlx_or_http_train(
-                                    &mlx_provider,
-                                    &exps_data,
-                                    &ids,
-                                    &eb_mutex,
-                                    epochs,
-                                    &pg_config.mlx_server_url,
-                                )
-                                .await;
-                            }
+                            // Fall through to HTTP training (no model worker contention)
+                            try_http_train(
+                                &exps_data,
+                                &ids,
+                                &eb_mutex,
+                                epochs,
+                                &pg_config.mlx_server_url,
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -316,12 +297,11 @@ impl LearnLoop for DefaultLearnLoop {
                 }
             }
 
-            // Try in-process MLX GPU training, then HTTP fallback.
-            try_mlx_or_http_train(
-                #[cfg(feature = "mlx")]
-                &mlx_provider,
-                #[cfg(not(feature = "mlx"))]
-                &None::<()>,
+            // HTTP-only training fallback (short timeout, no model worker contention).
+            // In-process MLX training is skipped — it sends ModelRequest::Train to
+            // the same worker that handles Chat, blocking inference for the entire
+            // training duration. ANE split-silicon (above) is the preferred path.
+            try_http_train(
                 &exps_data,
                 &ids,
                 &eb_mutex,
@@ -367,86 +347,63 @@ pub(crate) async fn query_perplexity(
     json.get("loss").and_then(|v| v.as_f64()).map(|v| v as f32)
 }
 
-/// Build ANE training config from the local model directory.
+/// Build ANE training config by auto-detecting model architecture from
+/// `config.json`. Falls back to hardcoded Qwen3-1.7B if the active model
+/// directory is not provided.
 ///
 /// Returns `None` if no ANE-compatible model is available.
 #[cfg(all(feature = "ane", feature = "mlx"))]
-fn build_ane_training_config() -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
-    use crate::agent::ane_mil::MilConfig;
+fn build_ane_training_config(
+    model_dir: Option<&std::path::Path>,
+) -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
+    use crate::agent::mlx_lora::ModelConfig;
 
+    // Prefer the active inference model directory when available.
+    if let Some(dir) = model_dir {
+        if dir.join("config.json").exists() {
+            let mc = ModelConfig::from_config_json(dir)?;
+            return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
+                model_dir: dir.to_path_buf(),
+                mil_config: mc.to_mil_config(64),
+                epochs: 3,
+                lr: 1e-5,
+                linear_attn_indices: mc.linear_attn_indices.clone(),
+                kv_dim: mc.n_kv_heads * mc.head_dim,
+            });
+        }
+    }
+
+    // Fallback: look for a known model in the LM Studio cache.
     let home = dirs::home_dir()?;
     let models_dir = home.join(".cache/lm-studio/models");
-
-    // Try Qwen3-1.7B (standard transformer -- fully ANE-compatible)
     let qwen3_1_7b = models_dir.join("lmstudio-community/Qwen3-1.7B-MLX-8bit");
-    if qwen3_1_7b.join("tokenizer.json").exists() {
+    if qwen3_1_7b.join("config.json").exists() {
+        let mc = ModelConfig::from_config_json(&qwen3_1_7b)?;
         return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
             model_dir: qwen3_1_7b,
-            mil_config: MilConfig {
-                dim: 2048,
-                hidden_dim: 6144,
-                n_heads: 16,
-                seq_len: 64,
-                n_kv_heads: 8,
-                rope_theta: 1_000_000.0,
-                rms_eps: 1e-6,
-                has_lm_head: false,
-            },
+            mil_config: mc.to_mil_config(64),
             epochs: 3,
             lr: 1e-5,
-            linear_attn_indices: vec![], // standard transformer, no GDN
-            kv_dim: 8 * 128,            // n_kv_heads=8, head_dim=128
+            linear_attn_indices: mc.linear_attn_indices.clone(),
+            kv_dim: mc.n_kv_heads * mc.head_dim,
         });
     }
 
     None
 }
 
-/// Try in-process MLX GPU training, then fall back to HTTP /train endpoint.
-#[allow(unused_variables)]
-async fn try_mlx_or_http_train(
-    #[cfg(feature = "mlx")] mlx_provider: &Option<
-        Arc<crate::providers::mlx::MlxProvider>,
-    >,
-    #[cfg(not(feature = "mlx"))] mlx_provider: &Option<()>,
+/// HTTP-only training (no model worker contention).
+///
+/// Sends training data to the mlx-lm server's `/train` endpoint with a short
+/// timeout. This path is used when ANE split-silicon training is unavailable
+/// and in-process MLX training would block inference.
+async fn try_http_train(
     exps_data: &[(String, String)],
     ids: &[i64],
     eb_arc: &Arc<parking_lot::Mutex<ExperienceBuffer>>,
     epochs: usize,
     server_url: &str,
 ) {
-    #[cfg(feature = "mlx")]
-    if let Some(ref mlx) = mlx_provider {
-        let convos: Vec<Vec<crate::agent::mlx_server::ChatMessage>> = exps_data
-            .iter()
-            .map(|(p, r)| {
-                vec![
-                    crate::agent::mlx_server::ChatMessage {
-                        role: "user".into(),
-                        content: p.clone(),
-                    },
-                    crate::agent::mlx_server::ChatMessage {
-                        role: "assistant".into(),
-                        content: r.clone(),
-                    },
-                ]
-            })
-            .collect();
-        match mlx.train(convos, epochs).await {
-            Ok(()) => {
-                let eb = eb_arc.lock();
-                let _ = eb.mark_exported(ids);
-                info!(
-                    "perplexity_gate: in-process training with {} experiences",
-                    ids.len()
-                );
-                return;
-            }
-            Err(e) => debug!("perplexity_gate: in-process train failed: {e}"),
-        }
-    }
-
-    // Fall back to HTTP /train.
     let conversations: Vec<serde_json::Value> = exps_data
         .iter()
         .map(|(p, r)| {
@@ -470,12 +427,12 @@ async fn try_mlx_or_http_train(
             let eb = eb_arc.lock();
             let _ = eb.mark_exported(ids);
             info!(
-                "perplexity_gate: triggered training with {} experiences",
+                "perplexity_gate: triggered HTTP training with {} experiences",
                 ids.len()
             );
         }
         Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
-        Err(e) => debug!("perplexity_gate: training trigger failed: {e}"),
+        Err(e) => debug!("perplexity_gate: HTTP training failed: {e}"),
     }
 }
 

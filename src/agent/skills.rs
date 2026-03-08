@@ -12,8 +12,10 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-static RE_FRONTMATTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---").unwrap());
-static RE_FRONTMATTER_STRIP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^---\n.*?\n---\n").unwrap());
+static RE_FRONTMATTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---").unwrap());
+static RE_FRONTMATTER_STRIP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)^---\n.*?\n---\n").unwrap());
 use tracing::debug;
 
 /// Information about a discovered skill.
@@ -186,7 +188,8 @@ impl SkillsLoader {
             let desc = _escape_xml(&self._get_skill_description(&s.name));
             let skill_meta = self._get_skill_meta(&s.name);
             let available = _check_requirements(&skill_meta);
-            let version_attr = self._get_skill_version(&s.name)
+            let version_attr = self
+                ._get_skill_version(&s.name)
                 .map(|v| format!(" version=\"{}\"", _escape_xml(&v)))
                 .unwrap_or_default();
 
@@ -238,12 +241,46 @@ impl SkillsLoader {
             } else {
                 desc
             };
-            let version_suffix = self._get_skill_version(&skill.name)
+            let version_suffix = self
+                ._get_skill_version(&skill.name)
                 .map(|v| format!(" (v{})", v))
                 .unwrap_or_default();
             lines.push(format!("- {}{}: {}", skill.name, version_suffix, display));
         }
         lines.join("\n")
+    }
+
+    /// Build a minimal skill name index for small local prompts.
+    ///
+    /// This is intentionally terse: names only, no descriptions. The model can
+    /// call `read_skill __list__` for discovery details and `read_skill <name>`
+    /// for full content.
+    pub fn build_name_index(&self, max_names: usize) -> String {
+        let mut names: Vec<String> = self
+            .list_skills(false)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        if names.is_empty() {
+            return String::new();
+        }
+        names.sort();
+
+        let extra = names.len().saturating_sub(max_names);
+        let visible: Vec<String> = names.into_iter().take(max_names).collect();
+        let mut text = format!(
+            "Skills available on demand via `read_skill`: {}.",
+            visible.join(", ")
+        );
+        if extra > 0 {
+            text.push_str(&format!(
+                " Plus {} more. Use `read_skill __list__` for the full list.",
+                extra
+            ));
+        } else {
+            text.push_str(" Use `read_skill __list__` for descriptions.");
+        }
+        text
     }
 
     /// Get skills marked as `always=true` that also meet requirements.
@@ -857,7 +894,10 @@ mod tests {
         assert_eq!(skills.len(), 1);
         let result = loader.validate_skill(&skills[0]);
         assert!(
-            result.errors.iter().any(|e| e.contains("Missing description")),
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("Missing description")),
             "expected 'Missing description' error, got: {:?}",
             result.errors
         );
@@ -958,5 +998,15 @@ mod tests {
         assert!(index.contains("skill-b"), "should contain skill-b");
         // Should be multi-line (header + 2 skills).
         assert!(index.lines().count() >= 3);
+    }
+
+    #[test]
+    fn test_name_index_is_discovery_only() {
+        let frontmatter = "description: A versioned skill\nversion: 1.0";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_name_index(12);
+        assert!(index.contains("test-skill"));
+        assert!(index.contains("read_skill __list__"));
+        assert!(!index.contains("A versioned skill"));
     }
 }

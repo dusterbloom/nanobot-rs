@@ -36,9 +36,7 @@ static MODEL: once_cell::sync::Lazy<Mutex<TextEmbedding>> = once_cell::sync::Laz
 #[cfg(feature = "semantic")]
 pub fn embed_one(text: &str) -> Result<Embedding> {
     let mut model = MODEL.lock();
-    let mut results = model
-        .embed(vec![text], None)
-        .context("Embedding failed")?;
+    let mut results = model.embed(vec![text], None).context("Embedding failed")?;
     debug!("Embedded 1 text ({} chars)", text.len());
     results
         .pop()

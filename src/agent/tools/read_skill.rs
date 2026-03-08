@@ -164,8 +164,14 @@ mod tests {
             "list should return XML starting with <skills>: {}",
             result
         );
-        assert!(result.contains("<name>my-skill</name>"), "list should include skill name");
-        assert!(result.ends_with("</skills>"), "list should end with </skills>");
+        assert!(
+            result.contains("<name>my-skill</name>"),
+            "list should include skill name"
+        );
+        assert!(
+            result.ends_with("</skills>"),
+            "list should end with </skills>"
+        );
     }
 
     #[tokio::test]

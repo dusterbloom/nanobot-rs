@@ -6,9 +6,9 @@
 //!
 //! Cache persists to `~/.nanobot/cache/model_feature_cache.json`.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use parking_lot::Mutex;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -59,8 +59,11 @@ pub fn mark_feature_unsupported(model: &str, feature: &str) {
 // ── Disk helpers ─────────────────────────────────────────────────────────────
 
 fn cache_path() -> Option<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".nanobot").join("cache").join("model_feature_cache.json"))
+    dirs::home_dir().map(|h| {
+        h.join(".nanobot")
+            .join("cache")
+            .join("model_feature_cache.json")
+    })
 }
 
 fn load_from_disk_sync() -> HashMap<String, HashSet<String>> {
@@ -104,7 +107,9 @@ fn save_to_disk_sync() {
             .collect()
     };
 
-    let cf = CacheFile { unsupported: snapshot };
+    let cf = CacheFile {
+        unsupported: snapshot,
+    };
 
     let json = match serde_json::to_string_pretty(&cf) {
         Ok(j) => j,
@@ -220,7 +225,9 @@ mod tests {
                 (k.clone(), sorted)
             })
             .collect();
-        let cf = CacheFile { unsupported: snapshot };
+        let cf = CacheFile {
+            unsupported: snapshot,
+        };
         std::fs::write(&path, serde_json::to_string_pretty(&cf).unwrap()).unwrap();
 
         // Read back

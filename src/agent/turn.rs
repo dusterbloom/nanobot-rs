@@ -142,7 +142,12 @@ impl Turn {
     ///
     /// Returns `None` if the turn is not a summary.
     pub fn summary_to_json(&self) -> Option<Value> {
-        if let Turn::Summary { text, source_ids, level } = self {
+        if let Turn::Summary {
+            text,
+            source_ids,
+            level,
+        } = self
+        {
             Some(json!({
                 "role": "summary",
                 "text": text,
@@ -172,7 +177,10 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(Turn::User { content, media: vec![] })
+            Some(Turn::User {
+                content,
+                media: vec![],
+            })
         }
         "assistant" => {
             let text = v
@@ -205,7 +213,12 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(Turn::ToolResult { call_id, tool, result, ok: true })
+            Some(Turn::ToolResult {
+                call_id,
+                tool,
+                result,
+                ok: true,
+            })
         }
         "system" => {
             let content = v
@@ -225,14 +238,22 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
             let source_ids = v
                 .get("source_ids")
                 .and_then(|ids| ids.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
                 .unwrap_or_default();
             let level = v
                 .get("level")
                 .and_then(|l| l.as_u64())
                 .map(|n| n as u8)
                 .unwrap_or(1);
-            Some(Turn::Summary { text, source_ids, level })
+            Some(Turn::Summary {
+                text,
+                source_ids,
+                level,
+            })
         }
         "clear" => {
             // Clear marker from /clear command.
@@ -268,7 +289,10 @@ mod tests {
 
     #[test]
     fn user_round_trips() {
-        let t = Turn::User { content: "hello".into(), media: vec![] };
+        let t = Turn::User {
+            content: "hello".into(),
+            media: vec![],
+        };
         let s = serde_json::to_string(&t).unwrap();
         let t2: Turn = serde_json::from_str(&s).unwrap();
         assert_eq!(t, t2);
@@ -317,11 +341,43 @@ mod tests {
     #[test]
     fn kind_tag_is_snake_case() {
         let cases: &[(Turn, &str)] = &[
-            (Turn::User { content: "x".into(), media: vec![] }, "user"),
-            (Turn::Assistant { text: None, tool_calls: vec![] }, "assistant"),
-            (Turn::ToolResult { call_id: "x".into(), tool: "t".into(), result: "r".into(), ok: true }, "tool_result"),
-            (Turn::System { content: "s".into() }, "system"),
-            (Turn::Summary { text: "s".into(), source_ids: vec![], level: 1 }, "summary"),
+            (
+                Turn::User {
+                    content: "x".into(),
+                    media: vec![],
+                },
+                "user",
+            ),
+            (
+                Turn::Assistant {
+                    text: None,
+                    tool_calls: vec![],
+                },
+                "assistant",
+            ),
+            (
+                Turn::ToolResult {
+                    call_id: "x".into(),
+                    tool: "t".into(),
+                    result: "r".into(),
+                    ok: true,
+                },
+                "tool_result",
+            ),
+            (
+                Turn::System {
+                    content: "s".into(),
+                },
+                "system",
+            ),
+            (
+                Turn::Summary {
+                    text: "s".into(),
+                    source_ids: vec![],
+                    level: 1,
+                },
+                "summary",
+            ),
         ];
         for (turn, expected_kind) in cases {
             let v = serde_json::to_value(turn).unwrap();
@@ -331,10 +387,26 @@ mod tests {
 
     #[test]
     fn system_is_not_persistable() {
-        assert!(!Turn::System { content: "prompt".into() }.is_persistable());
-        assert!(Turn::User { content: "x".into(), media: vec![] }.is_persistable());
-        assert!(Turn::Assistant { text: None, tool_calls: vec![] }.is_persistable());
-        assert!(Turn::Summary { text: "s".into(), source_ids: vec![], level: 1 }.is_persistable());
+        assert!(!Turn::System {
+            content: "prompt".into()
+        }
+        .is_persistable());
+        assert!(Turn::User {
+            content: "x".into(),
+            media: vec![]
+        }
+        .is_persistable());
+        assert!(Turn::Assistant {
+            text: None,
+            tool_calls: vec![]
+        }
+        .is_persistable());
+        assert!(Turn::Summary {
+            text: "s".into(),
+            source_ids: vec![],
+            level: 1
+        }
+        .is_persistable());
     }
 
     #[test]
@@ -393,7 +465,13 @@ mod tests {
             "content": "file1\nfile2"
         });
         let t = turn_from_legacy(&v).unwrap();
-        if let Turn::ToolResult { call_id, tool, result, ok } = t {
+        if let Turn::ToolResult {
+            call_id,
+            tool,
+            result,
+            ok,
+        } = t
+        {
             assert_eq!(call_id, "tc_abc");
             assert_eq!(tool, "exec");
             assert_eq!(result, "file1\nfile2");
@@ -419,14 +497,23 @@ mod tests {
     #[test]
     fn empty_tool_calls_omitted_from_json() {
         // Vec::is_empty guard — no "tool_calls":[] noise in JSONL
-        let t = Turn::Assistant { text: Some("hi".into()), tool_calls: vec![] };
+        let t = Turn::Assistant {
+            text: Some("hi".into()),
+            tool_calls: vec![],
+        };
         let v = serde_json::to_value(&t).unwrap();
-        assert!(v.get("tool_calls").is_none(), "empty tool_calls should be omitted");
+        assert!(
+            v.get("tool_calls").is_none(),
+            "empty tool_calls should be omitted"
+        );
     }
 
     #[test]
     fn empty_media_omitted_from_json() {
-        let t = Turn::User { content: "hi".into(), media: vec![] };
+        let t = Turn::User {
+            content: "hi".into(),
+            media: vec![],
+        };
         let v = serde_json::to_value(&t).unwrap();
         assert!(v.get("media").is_none(), "empty media should be omitted");
     }
@@ -439,7 +526,11 @@ mod tests {
             level: 1,
         };
         assert!(summary.is_summary());
-        assert!(!Turn::User { content: "hi".into(), media: vec![] }.is_summary());
+        assert!(!Turn::User {
+            content: "hi".into(),
+            media: vec![]
+        }
+        .is_summary());
     }
 
     #[test]
@@ -458,7 +549,10 @@ mod tests {
 
     #[test]
     fn non_summary_to_json_returns_none() {
-        let user = Turn::User { content: "hi".into(), media: vec![] };
+        let user = Turn::User {
+            content: "hi".into(),
+            media: vec![],
+        };
         assert!(user.summary_to_json().is_none());
     }
 
@@ -471,7 +565,12 @@ mod tests {
             "level": 1
         });
         let t = turn_from_legacy(&v).unwrap();
-        if let Turn::Summary { text, source_ids, level } = t {
+        if let Turn::Summary {
+            text,
+            source_ids,
+            level,
+        } = t
+        {
             assert!(text.contains("Messages 1-10"));
             assert_eq!(source_ids.len(), 4);
             assert_eq!(level, 1);

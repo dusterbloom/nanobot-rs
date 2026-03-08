@@ -151,7 +151,11 @@ mod tests {
 
         // Write a file that exceeds MAX_METRICS_BYTES.
         {
-            let mut f = OpenOptions::new().create(true).write(true).open(&path).unwrap();
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
             // Write ~11MB of data to trigger rotation.
             let line = "x".repeat(1024);
             for _ in 0..(11 * 1024) {

@@ -95,11 +95,13 @@ fn resolve_local_context_limit(
 }
 
 /// Compute a conservative local response budget from the detected context size.
-fn local_response_token_limit(ctx_limit: usize, min_response_tokens: u32, max_response_tokens: u32) -> u32 {
-    let adaptive = (ctx_limit / 6).clamp(
-        min_response_tokens as usize,
-        max_response_tokens as usize,
-    );
+fn local_response_token_limit(
+    ctx_limit: usize,
+    min_response_tokens: u32,
+    max_response_tokens: u32,
+) -> u32 {
+    let adaptive =
+        (ctx_limit / 6).clamp(min_response_tokens as usize, max_response_tokens as usize);
     adaptive as u32
 }
 
@@ -943,8 +945,11 @@ impl SubagentManager {
         ];
 
         // Select conversation protocol based on whether we're talking to a local model.
-        let protocol: std::sync::Arc<dyn crate::agent::protocol::ConversationProtocol> = if is_local {
-            std::sync::Arc::new(crate::agent::protocol::LocalProtocol::auto_for_model(&config.model))
+        let protocol: std::sync::Arc<dyn crate::agent::protocol::ConversationProtocol> = if is_local
+        {
+            std::sync::Arc::new(crate::agent::protocol::LocalProtocol::auto_for_model(
+                &config.model,
+            ))
         } else {
             std::sync::Arc::new(crate::agent::protocol::CloudProtocol)
         };
@@ -960,11 +965,13 @@ impl SubagentManager {
             None
         };
         let max_response_tokens = local_ctx_limit
-            .map(|ctx| local_response_token_limit(
-                ctx,
-                tuning.local_min_response_tokens,
-                tuning.local_max_response_tokens,
-            ))
+            .map(|ctx| {
+                local_response_token_limit(
+                    ctx,
+                    tuning.local_min_response_tokens,
+                    tuning.local_max_response_tokens,
+                )
+            })
             .unwrap_or(4096);
 
         let mut used_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1077,9 +1084,9 @@ impl SubagentManager {
                 return Err(anyhow::anyhow!("[LLM Error] {}", err_msg));
             }
 
-            if crate::agent::tool_runner::process_tool_response(
-                &response, &mut messages, &tools,
-            ).await {
+            if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools)
+                .await
+            {
                 // Track invocation count and expand used_tools for local definition refresh.
                 tools_invoked += response.tool_calls.len() as u32;
                 for tc in &response.tool_calls {
@@ -1093,7 +1100,9 @@ impl SubagentManager {
                             label, tc.name, taint_state.taint_summary()
                         );
                     }
-                    let detail = tc.arguments.get("url")
+                    let detail = tc
+                        .arguments
+                        .get("url")
                         .or_else(|| tc.arguments.get("query"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
@@ -1521,7 +1530,9 @@ mod tests {
             "Result should contain the original content, got: {result}"
         );
         assert!(
-            result.starts_with("[Warning: subagent produced this response without invoking any tools]"),
+            result.starts_with(
+                "[Warning: subagent produced this response without invoking any tools]"
+            ),
             "Result should carry the zero-invocation warning, got: {result}"
         );
     }

@@ -31,8 +31,8 @@ pub(crate) struct DispatchRecord {
 /// Full record of a single router decision (preflight or post-tool).
 #[derive(Clone)]
 pub(crate) struct RouterDecisionTrace {
-    pub phase: String,          // "preflight" or "tool_routing"
-    pub action: String,         // respond | tool | specialist | subagent | ask_user
+    pub phase: String,  // "preflight" or "tool_routing"
+    pub action: String, // respond | tool | specialist | subagent | ask_user
     pub target: String,
     pub confidence: f64,
     pub args: serde_json::Value,
@@ -64,9 +64,10 @@ pub(crate) fn build_trace_entry(record: &DispatchRecord) -> Value {
 /// Build the trace JSON value from a router decision (pure, testable).
 pub(crate) fn build_router_decision_entry(record: &RouterDecisionTrace) -> Value {
     let truncated_content: String = record.user_content.chars().take(MAX_USER_CONTENT).collect();
-    let truncated_outcome: Option<String> = record.outcome.as_ref().map(|o| {
-        o.chars().take(MAX_OUTCOME).collect()
-    });
+    let truncated_outcome: Option<String> = record
+        .outcome
+        .as_ref()
+        .map(|o| o.chars().take(MAX_OUTCOME).collect());
     json!({
         "type": "router_decision",
         "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -197,7 +198,10 @@ mod tests {
             outcome: None,
         };
         let entry = build_router_decision_entry(&record);
-        assert_eq!(entry["user_content"].as_str().unwrap().len(), MAX_USER_CONTENT);
+        assert_eq!(
+            entry["user_content"].as_str().unwrap().len(),
+            MAX_USER_CONTENT
+        );
     }
 
     #[test]

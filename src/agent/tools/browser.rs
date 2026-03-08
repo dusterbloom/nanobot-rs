@@ -121,6 +121,11 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, params: HashMap<String, Value>) -> String {
+        // Fail fast if binary is missing — don't waste tokens on param validation.
+        if !*BINARY_AVAILABLE.get_or_init(check_binary) {
+            return format!("Error: {}", INSTALL_HINT);
+        }
+
         let action = match params.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
             None => return "Error: 'action' parameter is required".to_string(),

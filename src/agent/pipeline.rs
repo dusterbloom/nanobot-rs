@@ -261,11 +261,22 @@ async fn execute_step_with_tools(
         let wire_messages = if is_local {
             crate::agent::protocol::render_to_wire(&local_protocol, &messages)
         } else {
-            crate::agent::protocol::render_to_wire(&crate::agent::protocol::CloudProtocol, &messages)
+            crate::agent::protocol::render_to_wire(
+                &crate::agent::protocol::CloudProtocol,
+                &messages,
+            )
         };
 
         let response = match provider
-            .chat(&wire_messages, tool_defs_opt, Some(model), 4096, 0.7, None, None)
+            .chat(
+                &wire_messages,
+                tool_defs_opt,
+                Some(model),
+                4096,
+                0.7,
+                None,
+                None,
+            )
             .await
         {
             Ok(r) => r,
@@ -280,9 +291,8 @@ async fn execute_step_with_tools(
             return format!("Error: {}", err);
         }
 
-        if crate::agent::tool_runner::process_tool_response(
-            &response, &mut messages, &tools,
-        ).await {
+        if crate::agent::tool_runner::process_tool_response(&response, &mut messages, &tools).await
+        {
             // Tool calls processed — continue loop.
         } else {
             // No tool calls — step is done.

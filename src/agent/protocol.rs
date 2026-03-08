@@ -34,7 +34,8 @@ static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
 // The format rendered by TextualReplay is: tool_name({"arg": "val"})
 // Captures: (1) tool name, (2) JSON args string (including the braces)
 static TEXTUAL_CALL_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)").expect("textual call item regex")
+    Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)")
+        .expect("textual call item regex")
 });
 
 /// A parsed tool call extracted from textual replay format.
@@ -133,10 +134,8 @@ impl ConversationProtocol for CloudProtocol {
                     if tool_calls.is_empty() {
                         out.push(json!({"role": "assistant", "content": content_val}));
                     } else {
-                        let tc_json: Vec<Value> = tool_calls
-                            .iter()
-                            .map(tool_call_to_openai_json)
-                            .collect();
+                        let tc_json: Vec<Value> =
+                            tool_calls.iter().map(tool_call_to_openai_json).collect();
                         out.push(json!({
                             "role": "assistant",
                             "content": content_val,
@@ -144,7 +143,12 @@ impl ConversationProtocol for CloudProtocol {
                         }));
                     }
                 }
-                Turn::ToolResult { call_id, tool, result, .. } => {
+                Turn::ToolResult {
+                    call_id,
+                    tool,
+                    result,
+                    ..
+                } => {
                     out.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -163,7 +167,11 @@ impl ConversationProtocol for CloudProtocol {
         }
 
         // Anthropic compat: must not end with assistant.
-        if out.last().map(|m| m["role"] == "assistant").unwrap_or(false) {
+        if out
+            .last()
+            .map(|m| m["role"] == "assistant")
+            .unwrap_or(false)
+        {
             out.push(json!({"role": "user", "content": CONTINUE_SENTINEL}));
         }
 
@@ -241,54 +249,55 @@ impl ConversationProtocol for LocalProtocol {
                 Turn::User { content, .. } => {
                     json!({"role": "user", "content": content})
                 }
-                Turn::Assistant { text, tool_calls } => {
-                    match self.replay_mode {
-                        LocalReplayMode::NativeToolCalls => {
-                            let content_val = match text {
-                                Some(t) if !t.is_empty() => Value::String(t.clone()),
-                                _ => Value::Null,
-                            };
-                            if tool_calls.is_empty() {
-                                json!({"role": "assistant", "content": content_val})
-                            } else {
-                                let tc_json: Vec<Value> = tool_calls
-                                    .iter()
-                                    .map(tool_call_to_openai_json)
-                                    .collect();
-                                json!({
-                                    "role": "assistant",
-                                    "content": content_val,
-                                    "tool_calls": tc_json,
-                                })
-                            }
-                        }
-                        LocalReplayMode::TextualReplay => {
-                            let tool_summary = if tool_calls.is_empty() {
-                                String::new()
-                            } else {
-                                let calls: Vec<String> = tool_calls
-                                    .iter()
-                                    .map(|tc| {
-                                        let args_str = serde_json::to_string(&tc.args)
-                                            .unwrap_or_else(|_| "{}".to_string());
-                                        format!("{}({})", tc.tool, args_str)
-                                    })
-                                    .collect();
-                                format!("[I called: {}]", calls.join(", "))
-                            };
-                            let content = match text.as_deref() {
-                                Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
-                                    format!("{}\n{}", t, tool_summary)
-                                }
-                                Some(t) if !t.is_empty() => t.to_string(),
-                                _ if !tool_summary.is_empty() => tool_summary,
-                                _ => String::new(),
-                            };
-                            json!({"role": "assistant", "content": content})
+                Turn::Assistant { text, tool_calls } => match self.replay_mode {
+                    LocalReplayMode::NativeToolCalls => {
+                        let content_val = match text {
+                            Some(t) if !t.is_empty() => Value::String(t.clone()),
+                            _ => Value::Null,
+                        };
+                        if tool_calls.is_empty() {
+                            json!({"role": "assistant", "content": content_val})
+                        } else {
+                            let tc_json: Vec<Value> =
+                                tool_calls.iter().map(tool_call_to_openai_json).collect();
+                            json!({
+                                "role": "assistant",
+                                "content": content_val,
+                                "tool_calls": tc_json,
+                            })
                         }
                     }
-                }
-                Turn::ToolResult { tool, call_id, result, .. } => {
+                    LocalReplayMode::TextualReplay => {
+                        let tool_summary = if tool_calls.is_empty() {
+                            String::new()
+                        } else {
+                            let calls: Vec<String> = tool_calls
+                                .iter()
+                                .map(|tc| {
+                                    let args_str = serde_json::to_string(&tc.args)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    format!("{}({})", tc.tool, args_str)
+                                })
+                                .collect();
+                            format!("[I called: {}]", calls.join(", "))
+                        };
+                        let content = match text.as_deref() {
+                            Some(t) if !t.is_empty() && !tool_summary.is_empty() => {
+                                format!("{}\n{}", t, tool_summary)
+                            }
+                            Some(t) if !t.is_empty() => t.to_string(),
+                            _ if !tool_summary.is_empty() => tool_summary,
+                            _ => String::new(),
+                        };
+                        json!({"role": "assistant", "content": content})
+                    }
+                },
+                Turn::ToolResult {
+                    tool,
+                    call_id,
+                    result,
+                    ..
+                } => {
                     // Tool results become user messages for alternation compliance.
                     json!({
                         "role": "user",
@@ -540,7 +549,10 @@ mod tests {
 
     fn tool_turns() -> Vec<Turn> {
         vec![
-            Turn::User { content: "read file".into(), media: vec![] },
+            Turn::User {
+                content: "read file".into(),
+                media: vec![],
+            },
             Turn::Assistant {
                 text: None,
                 tool_calls: vec![ToolCall {
@@ -569,8 +581,14 @@ mod tests {
     #[test]
     fn local_ends_with_user() {
         let turns = vec![
-            Turn::User { content: "hi".into(), media: vec![] },
-            Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
+            Turn::User {
+                content: "hi".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("hello".into()),
+                tool_calls: vec![],
+            },
         ];
         let wire = LocalProtocol::default().render("sys", &turns);
         assert_eq!(wire.last().unwrap()["role"], "user");
@@ -593,16 +611,27 @@ mod tests {
     #[test]
     fn local_mid_thread_system_becomes_user() {
         let turns = vec![
-            Turn::User { content: "hi".into(), media: vec![] },
-            Turn::System { content: "Injected notice".into() },
-            Turn::User { content: "go on".into(), media: vec![] },
+            Turn::User {
+                content: "hi".into(),
+                media: vec![],
+            },
+            Turn::System {
+                content: "Injected notice".into(),
+            },
+            Turn::User {
+                content: "go on".into(),
+                media: vec![],
+            },
         ];
         let wire = LocalProtocol::default().render("sys", &turns);
         let non_first_system = wire.iter().skip(1).any(|m| m["role"] == "system");
         assert!(!non_first_system);
-        let has_notice = wire
-            .iter()
-            .any(|m| m["content"].as_str().unwrap_or("").contains("Injected notice"));
+        let has_notice = wire.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Injected notice")
+        });
         assert!(has_notice);
     }
 
@@ -625,8 +654,14 @@ mod tests {
     #[test]
     fn cloud_does_not_end_with_assistant() {
         let turns = vec![
-            Turn::User { content: "hi".into(), media: vec![] },
-            Turn::Assistant { text: Some("hello".into()), tool_calls: vec![] },
+            Turn::User {
+                content: "hi".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("hello".into()),
+                tool_calls: vec![],
+            },
         ];
         let wire = CloudProtocol.render("sys", &turns);
         assert_ne!(wire.last().unwrap()["role"], "assistant");
@@ -664,7 +699,11 @@ mod tests {
         ];
 
         let merged = merge_consecutive_role(msgs);
-        assert_eq!(merged.len(), 4, "assistant entries with metadata must not merge");
+        assert_eq!(
+            merged.len(),
+            4,
+            "assistant entries with metadata must not merge"
+        );
         assert!(merged[1].get("tool_calls").is_some());
     }
 
@@ -747,7 +786,8 @@ mod tests {
 
     #[test]
     fn parse_multiple_calls_comma_separated() {
-        let text = r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "x"})]"#;
+        let text =
+            r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "x"})]"#;
         let calls = parse_textual_tool_calls(text);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].tool, "read_file");

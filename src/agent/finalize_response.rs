@@ -80,35 +80,9 @@ impl AgentLoopShared {
             0.0
         };
 
-        // Construct TurnOutcome and dispatch through LearnLoop.
-        let outcome = TurnOutcome {
-            user_content: ctx.user_content.clone(),
-            final_content: ctx.final_content.clone(),
-            model: ctx.core.model.clone(),
-            session_key: ctx.session_key.clone(),
-            workspace: ctx.core.workspace.clone(),
-            used_tools: ctx.used_tools.clone(),
-            turn_tool_entries: std::mem::take(&mut ctx.turn_tool_entries),
-            iterations_used: ctx.iterations_used,
-            max_iterations: ctx.core.max_iterations,
-            turn_count: ctx.turn_count,
-            turn_start_elapsed_ms: ctx.turn_start.elapsed().as_millis() as u64,
-            context_tokens: final_tokens,
-            message_count: ctx.messages.len(),
-            working_memory_tokens: wm_tokens,
-            provenance_audit_enabled: ctx.core.provenance_config.enabled
-                && ctx.core.provenance_config.audit_log,
-            is_local: ctx.core.is_local,
-            cost_usd,
-            prompt_tokens,
-            completion_tokens,
-        };
-
-        // Synchronous observers: audit log, budget calibrator, structured logging.
-        self.learn_loop.observe_immediate(&outcome);
-
-        // Async observers: perplexity gate, LoRA training (fire-and-forget).
-        self.learn_loop.observe_async(outcome);
+        // Save turn_tool_entries before post-processing (moved from TurnOutcome construction
+        // so observers see final content after rescue/sanitization).
+        let turn_tool_entries = std::mem::take(&mut ctx.turn_tool_entries);
 
         if ctx.final_content.is_empty() && ctx.messages.len() > 2 {
             // Try to surface the last meaningful assistant message as a rescue
@@ -267,6 +241,37 @@ impl AgentLoopShared {
         }
 
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
+
+        // Construct TurnOutcome AFTER all post-processing (rescue, provenance,
+        // sanitization) so observers see the content the user actually receives.
+        let outcome = TurnOutcome {
+            user_content: ctx.user_content.clone(),
+            final_content: ctx.final_content.clone(),
+            model: ctx.core.model.clone(),
+            session_key: ctx.session_key.clone(),
+            workspace: ctx.core.workspace.clone(),
+            used_tools: ctx.used_tools.clone(),
+            turn_tool_entries,
+            iterations_used: ctx.iterations_used,
+            max_iterations: ctx.core.max_iterations,
+            turn_count: ctx.turn_count,
+            turn_start_elapsed_ms: ctx.turn_start.elapsed().as_millis() as u64,
+            context_tokens: final_tokens,
+            message_count: ctx.messages.len(),
+            working_memory_tokens: wm_tokens,
+            provenance_audit_enabled: ctx.core.provenance_config.enabled
+                && ctx.core.provenance_config.audit_log,
+            is_local: ctx.core.is_local,
+            cost_usd,
+            prompt_tokens,
+            completion_tokens,
+        };
+
+        // Synchronous observers: audit log, budget calibrator, structured logging.
+        self.learn_loop.observe_immediate(&outcome);
+
+        // Async observers: perplexity gate, LoRA training (fire-and-forget).
+        self.learn_loop.observe_async(outcome);
 
         if ctx.final_content.is_empty() {
             None

@@ -392,32 +392,65 @@ mod tests {
 
     #[test]
     fn test_has_size_marker_basic_match() {
-        assert!(has_size_marker("qwen3-3b", "3b"), "qwen3-3b should match 3b");
-        assert!(has_size_marker("llama-3b", "3b"), "llama-3b should match 3b");
-        assert!(has_size_marker("phi-3.5-mini-3b", "3b"), "phi-3.5-mini-3b should match 3b");
-        assert!(has_size_marker("model_3b_instruct", "3b"), "model_3b_instruct should match 3b");
-        assert!(has_size_marker("3b-model", "3b"), "3b at start should match");
+        assert!(
+            has_size_marker("qwen3-3b", "3b"),
+            "qwen3-3b should match 3b"
+        );
+        assert!(
+            has_size_marker("llama-3b", "3b"),
+            "llama-3b should match 3b"
+        );
+        assert!(
+            has_size_marker("phi-3.5-mini-3b", "3b"),
+            "phi-3.5-mini-3b should match 3b"
+        );
+        assert!(
+            has_size_marker("model_3b_instruct", "3b"),
+            "model_3b_instruct should match 3b"
+        );
+        assert!(
+            has_size_marker("3b-model", "3b"),
+            "3b at start should match"
+        );
     }
 
     #[test]
     fn test_has_size_marker_false_positive_35b() {
         // "35b" should NOT match "3b" because '5' precedes "3b"
-        assert!(!has_size_marker("qwen3.5-35b-a3b", "3b"), "35b should not match 3b");
-        assert!(!has_size_marker("mistral-35b", "3b"), "35b should not match 3b");
+        assert!(
+            !has_size_marker("qwen3.5-35b-a3b", "3b"),
+            "35b should not match 3b"
+        );
+        assert!(
+            !has_size_marker("mistral-35b", "3b"),
+            "35b should not match 3b"
+        );
     }
 
     #[test]
     fn test_has_size_marker_false_positive_a3b() {
         // "a3b" MoE active-param suffix should NOT match "3b"
-        assert!(!has_size_marker("a3b-suffix", "3b"), "a3b should not match 3b");
-        assert!(!has_size_marker("qwen3.5-35b-a3b", "3b"), "a3b in full name should not match 3b");
+        assert!(
+            !has_size_marker("a3b-suffix", "3b"),
+            "a3b should not match 3b"
+        );
+        assert!(
+            !has_size_marker("qwen3.5-35b-a3b", "3b"),
+            "a3b in full name should not match 3b"
+        );
     }
 
     #[test]
     fn test_has_size_marker_1b() {
         assert!(has_size_marker("tiny-1b", "1b"), "tiny-1b should match 1b");
-        assert!(!has_size_marker("qwen-21b", "1b"), "21b should not match 1b");
-        assert!(!has_size_marker("model-11b", "1b"), "11b should not match 1b");
+        assert!(
+            !has_size_marker("qwen-21b", "1b"),
+            "21b should not match 1b"
+        );
+        assert!(
+            !has_size_marker("model-11b", "1b"),
+            "11b should not match 1b"
+        );
     }
 
     // --- builtin_capabilities classification tests ---
@@ -436,19 +469,31 @@ mod tests {
     #[test]
     fn test_mistral_7b_is_not_small() {
         let caps = lookup("mistral-7b", &empty_overrides());
-        assert_ne!(caps.size_class, ModelSizeClass::Small, "mistral-7b should not be Small");
+        assert_ne!(
+            caps.size_class,
+            ModelSizeClass::Small,
+            "mistral-7b should not be Small"
+        );
     }
 
     #[test]
     fn test_qwen3_3b_is_small() {
         let caps = lookup("qwen3-3b", &empty_overrides());
-        assert_eq!(caps.size_class, ModelSizeClass::Small, "qwen3-3b should be Small");
+        assert_eq!(
+            caps.size_class,
+            ModelSizeClass::Small,
+            "qwen3-3b should be Small"
+        );
     }
 
     #[test]
     fn test_llama_3b_is_small() {
         let caps = lookup("llama-3b", &empty_overrides());
-        assert_eq!(caps.size_class, ModelSizeClass::Small, "llama-3b should be Small");
+        assert_eq!(
+            caps.size_class,
+            ModelSizeClass::Small,
+            "llama-3b should be Small"
+        );
     }
 
     #[test]

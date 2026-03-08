@@ -25,8 +25,10 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Static regexes (compiled once)
 // ---------------------------------------------------------------------------
-static RE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<script[\s\S]*?</script>").unwrap());
-static RE_STYLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<style[\s\S]*?</style>").unwrap());
+static RE_SCRIPT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<script[\s\S]*?</script>").unwrap());
+static RE_STYLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<style[\s\S]*?</style>").unwrap());
 static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").unwrap());
 static RE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
@@ -183,8 +185,7 @@ impl Tool for WebSearchTool {
     /// - Brave: available when an API key is present (either passed at
     ///   construction time or read from `$BRAVE_API_KEY`).
     fn is_available(&self) -> bool {
-        (self.provider == "searxng" && !self.searxng_url.is_empty())
-            || !self.api_key.is_empty()
+        (self.provider == "searxng" && !self.searxng_url.is_empty()) || !self.api_key.is_empty()
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
@@ -202,7 +203,10 @@ impl Tool for WebSearchTool {
         match self.provider.as_str() {
             "searxng" => self.execute_searxng(query, count).await,
             "brave" => self.execute_brave(query, count).await,
-            other => format!("Error: unknown search provider '{}'. Use 'searxng' or 'brave'.", other),
+            other => format!(
+                "Error: unknown search provider '{}'. Use 'searxng' or 'brave'.",
+                other
+            ),
         }
     }
 
@@ -211,10 +215,7 @@ impl Tool for WebSearchTool {
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> String {
-        let query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
         let _ = ctx.event_tx.send(ToolEvent::Progress {
             tool_name: "web_search".to_string(),
@@ -234,11 +235,7 @@ impl WebSearchTool {
         let result = self
             .client
             .get(format!("{}/search", self.searxng_url))
-            .query(&[
-                ("q", query),
-                ("format", "json"),
-                ("categories", "general"),
-            ])
+            .query(&[("q", query), ("format", "json"), ("categories", "general")])
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await;
@@ -295,10 +292,7 @@ impl WebSearchTool {
             Err(e) => {
                 // Connection error — try Brave fallback if available.
                 if !self.api_key.is_empty() {
-                    tracing::warn!(
-                        "SearXNG unavailable ({}), falling back to Brave Search",
-                        e
-                    );
+                    tracing::warn!("SearXNG unavailable ({}), falling back to Brave Search", e);
                     let mut result = self.execute_brave(query, count).await;
                     result.push_str("\n(Fell back to Brave Search)");
                     return result;
@@ -341,7 +335,10 @@ impl WebSearchTool {
                         500..=599 => ". Hint: Brave Search service error. Try again shortly.",
                         _ => ". Hint: check API key and query format.",
                     };
-                    return format!("Error: Brave Search returned HTTP {}: {}{}", status, body, hint);
+                    return format!(
+                        "Error: Brave Search returned HTTP {}: {}{}",
+                        status, body, hint
+                    );
                 }
 
                 match response.json::<serde_json::Value>().await {
@@ -400,24 +397,40 @@ impl WebFetchTool {
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Self { max_chars, client, jina_config }
+        Self {
+            max_chars,
+            client,
+            jina_config,
+        }
     }
 
     /// Fetch content via Jina Reader and return (markdown_body, jina_url).
-    async fn fetch_via_jina(&self, url: &str, config: &JinaReaderConfig) -> Result<(String, String), String> {
+    async fn fetch_via_jina(
+        &self,
+        url: &str,
+        config: &JinaReaderConfig,
+    ) -> Result<(String, String), String> {
         let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), url);
-        let mut req = self.client.get(&jina_url)
+        let mut req = self
+            .client
+            .get(&jina_url)
             .header("Accept", "text/markdown")
             .header("X-No-Cache", "true");
         if let Some(key) = &config.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        let resp = req.send().await.map_err(|e| format!("Jina request failed: {}", e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Jina request failed: {}", e))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("Jina returned {}", status));
         }
-        let body = resp.text().await.map_err(|e| format!("Jina body read failed: {}", e))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("Jina body read failed: {}", e))?;
         Ok((body, jina_url))
     }
 }
@@ -508,7 +521,11 @@ impl Tool for WebFetchTool {
                         .to_string();
                     }
                     Err(e) => {
-                        tracing::warn!("Jina Reader failed for {}: {}. Falling back to direct fetch.", url, e);
+                        tracing::warn!(
+                            "Jina Reader failed for {}: {}. Falling back to direct fetch.",
+                            url,
+                            e
+                        );
                     }
                 }
             }
@@ -614,10 +631,7 @@ impl Tool for WebFetchTool {
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> String {
-        let url = params
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
 
         let _ = ctx.event_tx.send(ToolEvent::Progress {
             tool_name: "web_fetch".to_string(),
@@ -721,7 +735,6 @@ fn fallback_extract(html: &str, mode: &str) -> String {
         format!("# {}\n\n{}", title.trim(), result)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -889,24 +902,48 @@ mod tests {
     fn test_fallback_extract_headings() {
         let html = "<html><body><h1>Title</h1><h2>Subtitle</h2></body></html>";
         let result = fallback_extract(html, "markdown");
-        assert!(result.contains("Title"), "result should contain heading text: {}", result);
-        assert!(result.contains("Subtitle"), "result should contain subheading text: {}", result);
+        assert!(
+            result.contains("Title"),
+            "result should contain heading text: {}",
+            result
+        );
+        assert!(
+            result.contains("Subtitle"),
+            "result should contain subheading text: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fallback_extract_links() {
         let html = r#"<html><body><a href="https://example.com">Example</a></body></html>"#;
         let result = fallback_extract(html, "markdown");
-        assert!(result.contains("Example"), "result should contain link text: {}", result);
-        assert!(result.contains("https://example.com"), "result should contain URL: {}", result);
+        assert!(
+            result.contains("Example"),
+            "result should contain link text: {}",
+            result
+        );
+        assert!(
+            result.contains("https://example.com"),
+            "result should contain URL: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fallback_extract_list_items() {
         let html = "<html><body><ul><li>First</li><li>Second</li></ul></body></html>";
         let result = fallback_extract(html, "markdown");
-        assert!(result.contains("First"), "result should contain first item: {}", result);
-        assert!(result.contains("Second"), "result should contain second item: {}", result);
+        assert!(
+            result.contains("First"),
+            "result should contain first item: {}",
+            result
+        );
+        assert!(
+            result.contains("Second"),
+            "result should contain second item: {}",
+            result
+        );
     }
 
     #[test]
@@ -921,17 +958,37 @@ mod tests {
     fn test_fallback_extract_no_raw_tags() {
         let html = "<html><body><div><span>text content</span></div></body></html>";
         let result = fallback_extract(html, "markdown");
-        assert!(result.contains("text content"), "result should contain text: {}", result);
-        assert!(!result.contains("<span>"), "result should not contain raw span tags: {}", result);
-        assert!(!result.contains("<div>"), "result should not contain raw div tags: {}", result);
+        assert!(
+            result.contains("text content"),
+            "result should contain text: {}",
+            result
+        );
+        assert!(
+            !result.contains("<span>"),
+            "result should not contain raw span tags: {}",
+            result
+        );
+        assert!(
+            !result.contains("<div>"),
+            "result should not contain raw div tags: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fallback_extract_text_mode_no_markdown() {
         let html = "<html><body><h1>Heading</h1><p>Paragraph text</p></body></html>";
         let result = fallback_extract(html, "text");
-        assert!(result.contains("Heading"), "result should contain heading text: {}", result);
-        assert!(result.contains("Paragraph text"), "result should contain paragraph: {}", result);
+        assert!(
+            result.contains("Heading"),
+            "result should contain heading text: {}",
+            result
+        );
+        assert!(
+            result.contains("Paragraph text"),
+            "result should contain paragraph: {}",
+            result
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -969,13 +1026,23 @@ mod tests {
 
     #[test]
     fn test_web_search_tool_name() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://localhost:8888".to_string(),
+        );
         assert_eq!(tool.name(), "web_search");
     }
 
     #[test]
     fn test_web_search_tool_parameters() {
-        let tool = WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://localhost:8888".to_string(),
+        );
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
@@ -998,7 +1065,12 @@ mod tests {
     #[tokio::test]
     async fn test_web_search_no_api_key() {
         // With provider="brave" and no API key, expect the Brave key error.
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(
+            Some(String::new()),
+            5,
+            "brave".to_string(),
+            "http://localhost:8888".to_string(),
+        );
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
@@ -1010,15 +1082,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_no_api_key_has_hint() {
-        let tool = WebSearchTool::new(Some(String::new()), 5, "brave".to_string(), "http://localhost:8888".to_string());
+        let tool = WebSearchTool::new(
+            Some(String::new()),
+            5,
+            "brave".to_string(),
+            "http://localhost:8888".to_string(),
+        );
         let mut params = HashMap::new();
         params.insert(
             "query".to_string(),
             serde_json::Value::String("test".to_string()),
         );
         let result = tool.execute(params).await;
-        assert!(result.contains("config.json"), "Expected config.json hint: {}", result);
-        assert!(result.contains("braveApiKey"), "Expected braveApiKey hint: {}", result);
+        assert!(
+            result.contains("config.json"),
+            "Expected config.json hint: {}",
+            result
+        );
+        assert!(
+            result.contains("braveApiKey"),
+            "Expected braveApiKey hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1087,7 +1172,11 @@ mod tests {
             url: "https://r.jina.ai".to_string(),
             api_key: None,
         };
-        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), "https://www.bbc.com/news");
+        let jina_url = format!(
+            "{}/{}",
+            config.url.trim_end_matches('/'),
+            "https://www.bbc.com/news"
+        );
         assert_eq!(jina_url, "https://r.jina.ai/https://www.bbc.com/news");
     }
 
@@ -1098,7 +1187,11 @@ mod tests {
             url: "https://r.jina.ai/".to_string(),
             api_key: None,
         };
-        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), "https://example.com");
+        let jina_url = format!(
+            "{}/{}",
+            config.url.trim_end_matches('/'),
+            "https://example.com"
+        );
         assert_eq!(jina_url, "https://r.jina.ai/https://example.com");
     }
 
@@ -1271,7 +1364,10 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
                 assert_eq!(elapsed_ms, 0);
                 assert!(preview.contains("rust programming"));
             }
-            other => panic!("Expected Progress event with output_preview, got: {:?}", other),
+            other => panic!(
+                "Expected Progress event with output_preview, got: {:?}",
+                other
+            ),
         }
     }
 
@@ -1347,11 +1443,19 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             events.push(ev);
         }
 
-        assert_eq!(events.len(), 2, "Expected 2 progress events, got {}", events.len());
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected 2 progress events, got {}",
+            events.len()
+        );
 
         let has_extracting = events.iter().any(|ev| {
             matches!(ev, ToolEvent::Progress { output_preview: Some(p), .. } if p.contains("Extracting content"))
         });
-        assert!(has_extracting, "Expected 'Extracting content...' progress event");
+        assert!(
+            has_extracting,
+            "Expected 'Extracting content...' progress event"
+        );
     }
 }

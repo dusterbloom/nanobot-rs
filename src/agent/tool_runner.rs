@@ -338,10 +338,7 @@ async fn analyze_via_scratch_pad(
                         "DUPLICATE: This exact {} call was already executed. Use the existing result from memory.",
                         tc.name
                     );
-                    context_store.mem_store(
-                        &format!("dedup_{}", tc.name),
-                        dedup_msg,
-                    );
+                    context_store.mem_store(&format!("dedup_{}", tc.name), dedup_msg);
                     continue;
                 }
                 seen_calls.insert(call_key);
@@ -380,20 +377,31 @@ async fn analyze_via_scratch_pad(
                     // model re-requests identical calls until dedup blocks them.
                     match tc.name.as_str() {
                         "ctx_slice" | "ctx_grep" | "ctx_length" => {
-                            let var = tc.arguments.get("variable")
+                            let var = tc
+                                .arguments
+                                .get("variable")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?");
                             let key = match tc.name.as_str() {
                                 "ctx_slice" => {
-                                    let s = tc.arguments.get("start")
-                                        .and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let e = tc.arguments.get("end")
-                                        .and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let s = tc
+                                        .arguments
+                                        .get("start")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let e = tc
+                                        .arguments
+                                        .get("end")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     format!("slice_{}_{}-{}", var, s, e)
                                 }
                                 "ctx_grep" => {
-                                    let pat = tc.arguments.get("pattern")
-                                        .and_then(|v| v.as_str()).unwrap_or("?");
+                                    let pat = tc
+                                        .arguments
+                                        .get("pattern")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
                                     format!("grep_{}_{}", var, pat)
                                 }
                                 _ => format!("len_{}", var),
@@ -468,7 +476,8 @@ async fn analyze_via_scratch_pad(
 /// Small local models should spend fewer rounds "thinking about tool outputs"
 /// and move on faster to actionable tool execution/results.
 fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
-    let caps = crate::agent::model_capabilities::lookup(&config.model, &std::collections::HashMap::new());
+    let caps =
+        crate::agent::model_capabilities::lookup(&config.model, &std::collections::HashMap::new());
     let rounds = config.max_iterations.clamp(1, 10) as usize;
     rounds.min(caps.scratch_pad_rounds).max(1)
 }
@@ -670,10 +679,7 @@ pub async fn run_tool_loop(
         }
 
         // Build assistant message with tool_calls (using normalized IDs).
-        let tc_json: Vec<Value> = pending_calls
-            .iter()
-            .map(|tc| tc.to_openai_json())
-            .collect();
+        let tc_json: Vec<Value> = pending_calls.iter().map(|tc| tc.to_openai_json()).collect();
         ContextBuilder::add_assistant_message(&mut messages, None, Some(&tc_json));
 
         // Execute each tool call with ContextStore-aware dispatch.
@@ -1193,7 +1199,6 @@ async fn execute_with_retry(
 
 /// Default maximum retries for transient tool errors.
 const TOOL_MAX_RETRIES: u32 = 3;
-
 
 #[cfg(test)]
 #[path = "tool_runner_tests.rs"]

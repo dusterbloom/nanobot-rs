@@ -440,7 +440,6 @@ pub fn repair_for_strict_alternation(messages: &mut Vec<Value>) {
     merge_consecutive_role(messages, "assistant");
 }
 
-
 /// Full repair pipeline for local models.
 ///
 /// Combines all three repair steps that local models need before each LLM call:
@@ -1291,7 +1290,9 @@ mod tests {
 
         // After repair: no tool-role messages remain (converted to user).
         assert!(
-            !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            !messages
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
             "tool messages should be converted"
         );
         // No [Called patterns remain.

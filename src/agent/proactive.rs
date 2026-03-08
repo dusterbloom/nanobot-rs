@@ -64,14 +64,12 @@ pub fn extract_intent(user_text: &str) -> IntentSignal {
 
     // 2. File operations — path-like token + action verb
     if has_path_like(&lower) {
-        let tools = if lower.contains("read ") || lower.contains("show ") || lower.contains("cat ") {
+        let tools = if lower.contains("read ") || lower.contains("show ") || lower.contains("cat ")
+        {
             vec!["read_file".to_string()]
         } else if lower.contains("write ") || lower.contains("create ") {
             vec!["write_file".to_string()]
-        } else if lower.contains("edit ")
-            || lower.contains("fix ")
-            || lower.contains("modify ")
-        {
+        } else if lower.contains("edit ") || lower.contains("fix ") || lower.contains("modify ") {
             vec!["edit_file".to_string(), "read_file".to_string()]
         } else if lower.contains("list ") {
             vec!["list_dir".to_string()]
@@ -121,9 +119,8 @@ pub fn extract_intent(user_text: &str) -> IntentSignal {
 
     // 4. Web research
     let has_url = lower.contains("http://") || lower.contains("https://");
-    let has_web_kw = lower.contains("search for")
-        || lower.contains("look up")
-        || lower.contains("research");
+    let has_web_kw =
+        lower.contains("search for") || lower.contains("look up") || lower.contains("research");
     if has_url || has_web_kw {
         debug!("intent: WebResearch");
         return IntentSignal {
@@ -176,15 +173,14 @@ pub fn extract_intent(user_text: &str) -> IntentSignal {
 /// and common tool-verb noise, then returns up to 8 terms.
 pub fn extract_search_terms(text: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "it", "this", "that", "what",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "it", "this", "that", "what",
         "how", "when", "where", "who", "which", "me", "about",
     ];
     const TOOL_VERBS: &[&str] = &[
-        "read", "write", "edit", "fix", "show", "list", "run", "execute",
-        "search", "send", "message", "explain", "tell", "look", "up",
+        "read", "write", "edit", "fix", "show", "list", "run", "execute", "search", "send",
+        "message", "explain", "tell", "look", "up",
     ];
 
     text.to_lowercase()
@@ -270,9 +266,8 @@ pub fn retrieve_grounding(
             .join("\n")
     };
 
-    let estimated_tokens = (knowledge_snippets.iter().map(|s| s.len()).sum::<usize>()
-        + tool_hints.len())
-        / 4;
+    let estimated_tokens =
+        (knowledge_snippets.iter().map(|s| s.len()).sum::<usize>() + tool_hints.len()) / 4;
 
     GroundingPayload {
         knowledge_snippets,
@@ -403,9 +398,8 @@ mod tests {
 
     #[test]
     fn test_search_terms_max_eight() {
-        let terms = extract_search_terms(
-            "one two three four five six seven eight nine ten eleven twelve",
-        );
+        let terms =
+            extract_search_terms("one two three four five six seven eight nine ten eleven twelve");
         assert!(terms.len() <= 8);
     }
 
@@ -466,7 +460,8 @@ mod tests {
         let db_path = dir.path().join("test_knowledge.db");
         let ks = KnowledgeStore::open(&db_path).unwrap();
         let large_content = "Rust borrow checker ".repeat(200);
-        ks.ingest("large_doc", None, &large_content, 4096, 256).unwrap();
+        ks.ingest("large_doc", None, &large_content, 4096, 256)
+            .unwrap();
         let intent = IntentSignal {
             category: IntentCategory::KnowledgeQuery,
             likely_tools: vec![],

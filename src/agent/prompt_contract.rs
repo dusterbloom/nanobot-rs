@@ -213,7 +213,10 @@ fn enforce_budget(sections: &mut Vec<SectionEntry>, cap: usize) {
     // Pass 1b: If still over budget, drop shrinkable sections from tail too,
     // but leave at least one shrinkable section for Pass 2 to truncate.
     if total > cap {
-        let shrinkable_count = sections.iter().filter(|s| s.included && s.shrinkable).count();
+        let shrinkable_count = sections
+            .iter()
+            .filter(|s| s.included && s.shrinkable)
+            .count();
         let mut remaining_shrinkable = shrinkable_count;
         for i in (0..sections.len()).rev() {
             if total <= cap {
@@ -255,14 +258,10 @@ fn enforce_budget(sections: &mut Vec<SectionEntry>, cap: usize) {
         // Estimate chars from target tokens (inverse: ~4 chars per token).
         let target_chars = target_tokens.saturating_mul(4);
         let content = sections[idx].block.content();
-        let truncated_end =
-            crate::utils::helpers::floor_char_boundary(content, target_chars);
+        let truncated_end = crate::utils::helpers::floor_char_boundary(content, target_chars);
         let truncated_content = &content[..truncated_end];
         let old_tokens = sections[idx].actual_tokens;
-        let new_block = PromptBlock::new(
-            sections[idx].block.report_title(),
-            truncated_content,
-        );
+        let new_block = PromptBlock::new(sections[idx].block.report_title(), truncated_content);
         let new_tokens = TokenBudget::estimate_str_tokens(&new_block.render());
         tracing::warn!(
             "Prompt overflow: shrinking section {:?} from {} to {} tokens",
@@ -465,10 +464,7 @@ mod tests {
             PromptSection::WorkingMemory.kind(),
             PromptBlockKind::Runtime
         );
-        assert_eq!(
-            PromptSection::ToolPatterns.kind(),
-            PromptBlockKind::Runtime
-        );
+        assert_eq!(PromptSection::ToolPatterns.kind(), PromptBlockKind::Runtime);
         assert_eq!(PromptSection::RecentNotes.kind(), PromptBlockKind::Runtime);
         assert_eq!(
             PromptSection::BackgroundTasks.kind(),
@@ -530,7 +526,11 @@ mod tests {
         }
     }
 
-    fn make_ctx(context_window: usize, cap_pct: f64, sections: Vec<SectionEntry>) -> AssemblyContext {
+    fn make_ctx(
+        context_window: usize,
+        cap_pct: f64,
+        sections: Vec<SectionEntry>,
+    ) -> AssemblyContext {
         AssemblyContext {
             context_window,
             system_prompt_cap_pct: cap_pct,
@@ -557,7 +557,11 @@ mod tests {
         let sections = vec![
             make_entry(PromptSection::Identity, "Identity", "I am nanobot"),
             make_entry(PromptSection::Verification, "Verification", "Check stuff"),
-            make_entry(PromptSection::WorkingMemory, "Working Memory", "Remember this"),
+            make_entry(
+                PromptSection::WorkingMemory,
+                "Working Memory",
+                "Remember this",
+            ),
         ];
         let ctx = make_ctx(128_000, 0.4, sections);
         let result = CloudAssembler.assemble(&ctx);
@@ -591,7 +595,12 @@ mod tests {
         // SM should be included (lower discriminant = higher priority)
         assert!(result.system_content.contains("session info"));
         // BG should be dropped (highest discriminant among non-shrinkable)
-        let bg_block = result.report.blocks.iter().find(|b| b.title == "BG").unwrap();
+        let bg_block = result
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.title == "BG")
+            .unwrap();
         assert!(!bg_block.included, "BackgroundTasks should be dropped");
     }
 
@@ -608,10 +617,22 @@ mod tests {
         let ctx = make_ctx(1000, 0.2, sections);
         let result = LocalAssembler.assemble(&ctx);
         // Working memory should still be included (shrunk, not dropped)
-        let wm_block = result.report.blocks.iter().find(|b| b.title == "WM").unwrap();
-        assert!(wm_block.included, "WorkingMemory should be shrunk, not dropped");
+        let wm_block = result
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.title == "WM")
+            .unwrap();
+        assert!(
+            wm_block.included,
+            "WorkingMemory should be shrunk, not dropped"
+        );
         // Its token count should be less than original
-        assert!(wm_block.tokens < 2000, "should have been shrunk, got {} tokens", wm_block.tokens);
+        assert!(
+            wm_block.tokens < 2000,
+            "should have been shrunk, got {} tokens",
+            wm_block.tokens
+        );
     }
 
     #[test]
@@ -622,15 +643,25 @@ mod tests {
         ];
         let sections_large = sections_small.clone();
 
-        let ctx_small = make_ctx(4_000, 0.3, sections_small);  // 1200 token cap
+        let ctx_small = make_ctx(4_000, 0.3, sections_small); // 1200 token cap
         let ctx_large = make_ctx(128_000, 0.4, sections_large); // 51200 token cap
 
         let result_small = LocalAssembler.assemble(&ctx_small);
         let result_large = LocalAssembler.assemble(&ctx_large);
 
         // Both should report allocated_tokens, and large should have bigger allocations
-        let wm_small = result_small.report.blocks.iter().find(|b| b.title == "WM").unwrap();
-        let wm_large = result_large.report.blocks.iter().find(|b| b.title == "WM").unwrap();
+        let wm_small = result_small
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.title == "WM")
+            .unwrap();
+        let wm_large = result_large
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.title == "WM")
+            .unwrap();
         assert!(
             wm_large.allocated_tokens > wm_small.allocated_tokens,
             "larger context window should produce larger allocated budget: small={} large={}",
@@ -652,7 +683,12 @@ mod tests {
         assert!(!result.developer_content.contains("Verification"));
         assert!(!result.developer_content.contains("WM"));
         // Report should mark them as not included
-        let ver = result.report.blocks.iter().find(|b| b.title == "Verification").unwrap();
+        let ver = result
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.title == "Verification")
+            .unwrap();
         assert!(!ver.included, "empty section should be excluded");
     }
 
@@ -696,7 +732,10 @@ mod tests {
             .find(|b| b.title == "Memory")
             .unwrap();
         // MemoryBriefing should have been shrunk (still included but fewer tokens)
-        assert!(memory_block.included, "shrinkable section should be shrunk, not dropped");
+        assert!(
+            memory_block.included,
+            "shrinkable section should be shrunk, not dropped"
+        );
         assert!(
             memory_block.tokens < 1250,
             "should be shrunk below original ~1250 tokens, got {}",

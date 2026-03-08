@@ -62,10 +62,7 @@ impl Tool for SessionSearchTool {
             _ => return "Error: 'query' parameter is required and must be non-empty.".to_string(),
         };
 
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
         let channel = params
             .get("channel")
@@ -73,9 +70,7 @@ impl Tool for SessionSearchTool {
             .map(|s| s.to_string());
 
         let db = SessionDb::new(&self.db_path);
-        let results = db
-            .search_messages(&query, limit, channel.as_deref())
-            .await;
+        let results = db.search_messages(&query, limit, channel.as_deref()).await;
 
         if results.is_empty() {
             return format!("No results found for '{}'.", query);
@@ -151,7 +146,11 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("query".to_string(), json!(""));
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"), "Empty query must return Error: {}", result);
+        assert!(
+            result.contains("Error"),
+            "Empty query must return Error: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -159,7 +158,11 @@ mod tests {
         let (_tmp, tool) = make_tool();
         let params = HashMap::new();
         let result = tool.execute(params).await;
-        assert!(result.contains("Error"), "Missing query must return Error: {}", result);
+        assert!(
+            result.contains("Error"),
+            "Missing query must return Error: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -220,7 +223,11 @@ mod tests {
         params.insert("query".to_string(), json!("benchmark"));
         params.insert("channel".to_string(), json!("cli:"));
         let result = tool.execute(params).await;
-        assert!(result.contains("cli:default"), "Should contain cli session: {}", result);
+        assert!(
+            result.contains("cli:default"),
+            "Should contain cli session: {}",
+            result
+        );
         assert!(
             !result.contains("telegram:"),
             "Should NOT contain telegram session when filtered: {}",
@@ -248,7 +255,11 @@ mod tests {
         params.insert("limit".to_string(), json!(2));
         let result = tool.execute(params).await;
         // Should contain "Found 2 result(s)" (limit applied).
-        assert!(result.contains("Found 2 result"), "Expected 2 results with limit=2, got: {}", result);
+        assert!(
+            result.contains("Found 2 result"),
+            "Expected 2 results with limit=2, got: {}",
+            result
+        );
     }
 
     #[tokio::test]

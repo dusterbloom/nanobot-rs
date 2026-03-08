@@ -17,9 +17,16 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
     // 1. research/summarize + URL → spawn researcher
     //    Must precede plain URL to avoid web_fetch stealing research requests.
     if has_url
-        && ["research", "report", "summarize", "summarise", "analyze", "analyse"]
-            .iter()
-            .any(|kw| lower.contains(kw))
+        && [
+            "research",
+            "report",
+            "summarize",
+            "summarise",
+            "analyze",
+            "analyse",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw))
         && has_tool("spawn")
     {
         return ToolPlan {
@@ -131,9 +138,15 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
 
     // 8. run/execute/cargo/npm/git → exec
     if (["run ", "execute "].iter().any(|kw| lower.starts_with(kw))
-        || ["run the ", "execute the ", "build the ", "compile the ", "run my "]
-            .iter()
-            .any(|v| lower.contains(v))
+        || [
+            "run the ",
+            "execute the ",
+            "build the ",
+            "compile the ",
+            "run my ",
+        ]
+        .iter()
+        .any(|v| lower.contains(v))
         || ["cargo ", "npm ", "git ", "make ", "python "]
             .iter()
             .any(|cmd| lower.starts_with(cmd)))
@@ -149,9 +162,15 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
     }
 
     // 9. search/look up (no path) → web_search
-    if ["search for ", "search about ", "look up ", "find out about ", "google "]
-        .iter()
-        .any(|kw| lower.contains(kw))
+    if [
+        "search for ",
+        "search about ",
+        "look up ",
+        "find out about ",
+        "google ",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
         && has_tool("web_search")
     {
         return ToolPlan {
@@ -193,10 +212,19 @@ mod tests {
     use super::*;
 
     fn all_tools() -> Vec<String> {
-        ["read_file", "write_file", "edit_file", "list_dir", "exec", "web_search", "web_fetch", "spawn"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "web_search",
+            "web_fetch",
+            "spawn",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     fn policy() -> SessionPolicy {
@@ -275,7 +303,11 @@ mod tests {
 
     #[test]
     fn test_write_new_file_routes_to_write_file() {
-        let plan = route("write a new file called output.txt with results", &all_tools(), &policy());
+        let plan = route(
+            "write a new file called output.txt with results",
+            &all_tools(),
+            &policy(),
+        );
         assert_eq!(plan.action, ToolPlanAction::Tool);
         assert_eq!(plan.target, "write_file");
     }

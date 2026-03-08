@@ -17,9 +17,8 @@ pub struct HermesParser;
 // Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` bracket.
 // Captures the inner content (everything between `[` ... `]`).
 // Mirrors TEXTUAL_CALL_OUTER_RE in protocol.rs.
-static HERMES_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\[(?:I\s+)?called[:\s]\s*(.*?)\]").expect("hermes outer regex")
-});
+static HERMES_OUTER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\[(?:I\s+)?called[:\s]\s*(.*?)\]").expect("hermes outer regex"));
 
 // Matches a single `tool_name({...})` pair within the inner content.
 // Mirrors TEXTUAL_CALL_ITEM_RE in protocol.rs.
@@ -95,7 +94,8 @@ mod tests {
 
     #[test]
     fn test_hermes_parse_multiple_calls() {
-        let text = r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "x"})]"#;
+        let text =
+            r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "x"})]"#;
         let calls = HermesParser.parse(text);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "read_file");

@@ -18,12 +18,12 @@
 //! `execute_code` is never included in the available-tools list exposed to the
 //! Python stub, so scripts cannot nest `execute_code` calls.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -308,7 +308,13 @@ impl Tool for CodeExecutionTool {
 
         // Spawn RPC server in a dedicated blocking thread.
         let _server_handle = task::spawn_blocking(move || {
-            run_rpc_server(listener, registry, max_tool_calls, call_count_clone, stop_clone);
+            run_rpc_server(
+                listener,
+                registry,
+                max_tool_calls,
+                call_count_clone,
+                stop_clone,
+            );
         });
 
         // Spawn child python3 process.
@@ -513,7 +519,10 @@ mod tests {
         let params = disabled_tool().parameters();
         assert_eq!(params["type"], "object");
         let required = params["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "code"), "code must be required");
+        assert!(
+            required.iter().any(|v| v == "code"),
+            "code must be required"
+        );
     }
 
     #[test]

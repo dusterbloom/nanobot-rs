@@ -908,8 +908,16 @@ mod tests {
         let tool = ReadFileTool;
         let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_xyz.txt")]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("list_dir"),
+            "Expected list_dir hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -918,8 +926,16 @@ mod tests {
         let tool = ReadFileTool;
         let params = make_params(&[("path", dir.path().to_str().unwrap())]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("list_dir"),
+            "Expected list_dir hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -931,8 +947,16 @@ mod tests {
             ("new_text", "b"),
         ]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("list_dir"),
+            "Expected list_dir hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -948,8 +972,16 @@ mod tests {
             ("new_text", "replacement"),
         ]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("read_file"), "Expected read_file hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("read_file"),
+            "Expected read_file hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -957,8 +989,16 @@ mod tests {
         let tool = ListDirTool;
         let params = make_params(&[("path", "/tmp/nanobot_hint_test_nonexistent_dir_xyz")]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("list_dir"), "Expected list_dir hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("list_dir"),
+            "Expected list_dir hint: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -970,7 +1010,15 @@ mod tests {
         let tool = ListDirTool;
         let params = make_params(&[("path", file_path.to_str().unwrap())]);
         let result = tool.execute(params).await;
-        assert!(result.contains("Hint:"), "Expected hint in error: {}", result);
-        assert!(result.contains("read_file"), "Expected read_file hint: {}", result);
+        assert!(
+            result.contains("Hint:"),
+            "Expected hint in error: {}",
+            result
+        );
+        assert!(
+            result.contains("read_file"),
+            "Expected read_file hint: {}",
+            result
+        );
     }
 }

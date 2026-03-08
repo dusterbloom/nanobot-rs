@@ -88,7 +88,10 @@ pub fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionSc
 
     // Signal 3: babble without action
     let word_count = content.split_whitespace().count();
-    let has_tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty());
+    let has_tool_calls = msg
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty());
     let has_code_block = content.contains("```");
     if word_count > 150 && !has_tool_calls && !has_code_block {
         score += 0.2;
@@ -96,7 +99,9 @@ pub fn score_message(msg: &Value, prev_assistant_msgs: &[&Value]) -> PollutionSc
     }
 
     // Signal 4: hallucination markers
-    let has_fake_tool_xml = content.contains("[Called") || content.contains("<tool_call>") || content.contains("<function_call>");
+    let has_fake_tool_xml = content.contains("[Called")
+        || content.contains("<tool_call>")
+        || content.contains("<function_call>");
     let has_claim_without_evidence = content.contains("I ran") || content.contains("I executed");
     // Only flag claims if there's no preceding tool result in the message itself
     if has_fake_tool_xml || (has_claim_without_evidence && !has_tool_calls) {
@@ -229,8 +234,7 @@ fn evict_polluted_turns(messages: &mut Vec<Value>, threshold: f32) -> usize {
 
         let score = score_message(&messages[i], &recent_refs);
         if score.score >= threshold {
-            messages[i]["content"] =
-                Value::String("[low-quality response removed]".to_string());
+            messages[i]["content"] = Value::String("[low-quality response removed]".to_string());
             evicted += 1;
         }
     }
@@ -360,11 +364,7 @@ fn collapse_babble(content: &mut String, max_tokens: usize) {
 
     let sentences: Vec<&str> = split_sentences(content);
     let condensed = if sentences.len() >= 3 {
-        format!(
-            "{} {} [response condensed]",
-            sentences[0],
-            sentences[1]
-        )
+        format!("{} {} [response condensed]", sentences[0], sentences[1])
     } else if sentences.len() == 2 {
         format!("{} [response condensed]", sentences[0])
     } else {
@@ -479,15 +479,25 @@ mod tests {
     fn test_score_message_filler_heavy() {
         let msg = json!({"role": "assistant", "content": "Certainly! Absolutely! Of course! I'd be happy to help! Well, basically, essentially, honestly, thank you for asking!"});
         let score = score_message(&msg, &[]);
-        assert!(score.signals.contains(&"filler_heavy"), "Expected filler_heavy signal");
+        assert!(
+            score.signals.contains(&"filler_heavy"),
+            "Expected filler_heavy signal"
+        );
     }
 
     #[test]
     fn test_score_message_condensed_marker() {
         let msg = json!({"role": "assistant", "content": "First sentence. [response condensed]"});
         let score = score_message(&msg, &[]);
-        assert!(score.score >= 0.4, "Condensed marker message scored {}", score.score);
-        assert!(score.signals.contains(&"condensed_marker"), "Expected condensed_marker signal");
+        assert!(
+            score.score >= 0.4,
+            "Condensed marker message scored {}",
+            score.score
+        );
+        assert!(
+            score.signals.contains(&"condensed_marker"),
+            "Expected condensed_marker signal"
+        );
     }
 
     #[test]
@@ -505,7 +515,11 @@ mod tests {
             json!({"role": "user", "content": "Thanks"}),
         ];
         let evicted = evict_polluted_turns(&mut messages, 0.6);
-        assert!(evicted >= 1, "Expected at least 1 eviction, got {}", evicted);
+        assert!(
+            evicted >= 1,
+            "Expected at least 1 eviction, got {}",
+            evicted
+        );
         // The polluted message at index 2 should be replaced
         assert_eq!(
             messages[2]["content"].as_str().unwrap(),
@@ -530,7 +544,10 @@ mod tests {
         let collapsed = collapse_repetitive_attempts(&mut messages, 3);
         assert_eq!(collapsed, 2, "Expected 2 collapsed, got {}", collapsed);
         // Last in the run (index 3) should be preserved
-        assert_eq!(messages[3]["content"].as_str().unwrap(), "Let me try reading the file now");
+        assert_eq!(
+            messages[3]["content"].as_str().unwrap(),
+            "Let me try reading the file now"
+        );
     }
 
     #[test]
@@ -553,8 +570,15 @@ mod tests {
     fn test_collapse_babble() {
         let mut content = "First sentence here. Second sentence here. Third long sentence that goes on and on with many many words to push the count over the limit and trigger condensation of the overall response text. Fourth sentence adds even more words to make it clear. Fifth for good measure with padding words.".to_string();
         collapse_babble(&mut content, 20);
-        assert!(content.contains("[response condensed]"), "Expected condensed marker in: {}", content);
-        assert!(content.starts_with("First sentence here."), "Expected to keep first sentence");
+        assert!(
+            content.contains("[response condensed]"),
+            "Expected condensed marker in: {}",
+            content
+        );
+        assert!(
+            content.starts_with("First sentence here."),
+            "Expected to keep first sentence"
+        );
     }
 
     #[test]
@@ -607,19 +631,28 @@ mod tests {
         pre_completion_pipeline(&mut messages, 3, &config);
 
         // At least one polluted turn should be evicted
-        let evicted_count = messages.iter().filter(|m| {
-            msg_content(m) == "[low-quality response removed]"
-        }).count();
-        assert!(evicted_count >= 1,
-            "Expected at least 1 evicted turn in drifting conversation, got {}", evicted_count);
+        let evicted_count = messages
+            .iter()
+            .filter(|m| msg_content(m) == "[low-quality response removed]")
+            .count();
+        assert!(
+            evicted_count >= 1,
+            "Expected at least 1 evicted turn in drifting conversation, got {}",
+            evicted_count
+        );
 
         // Format anchor should be injected at iteration 3
-        let has_anchor = messages.iter().any(|m| msg_content(m).contains("[format-anchor]"));
+        let has_anchor = messages
+            .iter()
+            .any(|m| msg_content(m).contains("[format-anchor]"));
         assert!(has_anchor, "Expected format anchor at iteration 3");
 
         // Message count should grow by 1 (anchor) but no messages are deleted
-        assert_eq!(messages.len(), original_len + 1,
-            "Pipeline should add anchor but not delete messages");
+        assert_eq!(
+            messages.len(),
+            original_len + 1,
+            "Pipeline should add anchor but not delete messages"
+        );
     }
 
     #[test]
@@ -637,13 +670,16 @@ mod tests {
         // that a default config DOES modify and a custom threshold of 1.1
         // (impossible to reach) effectively disables eviction.
         let no_evict_config = AntiDriftConfig {
-            pollution_threshold: 1.1, // impossible score
-            anchor_interval: 0,       // no anchors
+            pollution_threshold: 1.1,  // impossible score
+            anchor_interval: 0,        // no anchors
             repetition_min_count: 999, // no collapse
             ..Default::default()
         };
         pre_completion_pipeline(&mut messages, 3, &no_evict_config);
-        assert_eq!(messages, original, "Impossible thresholds should produce no changes");
+        assert_eq!(
+            messages, original,
+            "Impossible thresholds should produce no changes"
+        );
     }
 
     #[test]
@@ -666,11 +702,15 @@ mod tests {
         pre_completion_pipeline(&mut messages, 1, &config);
 
         // The 3 identical assistant attempts should be collapsed (all but last replaced)
-        let collapsed_count = messages.iter().filter(|m| {
-            msg_content(m).contains("previous similar attempts removed")
-        }).count();
-        assert!(collapsed_count >= 2,
-            "Expected 2 collapsed attempts in interleaved conversation, got {}", collapsed_count);
+        let collapsed_count = messages
+            .iter()
+            .filter(|m| msg_content(m).contains("previous similar attempts removed"))
+            .count();
+        assert!(
+            collapsed_count >= 2,
+            "Expected 2 collapsed attempts in interleaved conversation, got {}",
+            collapsed_count
+        );
     }
 
     #[test]
@@ -678,26 +718,42 @@ mod tests {
         // Overlapping multi-word filler phrases that could produce ratio > 1.0
         let text = "I'd be happy to help you. Happy to help! Certainly, of course, absolutely, I'd be happy to help again. Thank you for asking, thanks for that. I understand, let me help.";
         let ratio = filler_ratio(text);
-        assert!(ratio <= 1.0,
-            "filler_ratio must be capped at 1.0, got {}", ratio);
+        assert!(
+            ratio <= 1.0,
+            "filler_ratio must be capped at 1.0, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn test_e2e_babble_collapse_two_long_sentences() {
         // Two extremely long sentences that exceed babble_max_tokens.
         // The function should still condense when only 2 sentences exist but they're huge.
-        let long_sentence_a = format!("This is the first sentence with {} padding words.", "very ".repeat(300));
-        let long_sentence_b = format!("And this is the second sentence with {} more padding.", "extra ".repeat(300));
+        let long_sentence_a = format!(
+            "This is the first sentence with {} padding words.",
+            "very ".repeat(300)
+        );
+        let long_sentence_b = format!(
+            "And this is the second sentence with {} more padding.",
+            "extra ".repeat(300)
+        );
         let mut content = format!("{} {}", long_sentence_a, long_sentence_b);
         let word_count = content.split_whitespace().count();
-        assert!(word_count > 500, "Test setup: need >500 words, got {}", word_count);
+        assert!(
+            word_count > 500,
+            "Test setup: need >500 words, got {}",
+            word_count
+        );
 
         collapse_babble(&mut content, 500);
 
         // Should be condensed even with just 2 sentences, since total exceeds max
-        assert!(content.len() < long_sentence_a.len() + long_sentence_b.len(),
+        assert!(
+            content.len() < long_sentence_a.len() + long_sentence_b.len(),
             "Two-sentence babble should be condensed, but content length {} >= original {}",
-            content.len(), long_sentence_a.len() + long_sentence_b.len());
+            content.len(),
+            long_sentence_a.len() + long_sentence_b.len()
+        );
     }
 
     #[test]
@@ -717,8 +773,10 @@ mod tests {
         post_completion_pipeline(&mut content, &[], &config);
 
         // After stripping thinking, "Short answer." is < 500 words → no babble collapse
-        assert_eq!(content, "Short answer.",
-            "After stripping thinking, short content should pass through unchanged");
+        assert_eq!(
+            content, "Short answer.",
+            "After stripping thinking, short content should pass through unchanged"
+        );
     }
 
     #[test]
@@ -728,23 +786,24 @@ mod tests {
             "First sentence here. Second sentence here. {}",
             "And then more and more words follow in the third fourth fifth sentences. ".repeat(40)
         );
-        let mut content = format!(
-            "<thinking>Some thought</thinking>{}",
-            long_text
-        );
+        let mut content = format!("<thinking>Some thought</thinking>{}", long_text);
 
         // Step 1: strip thinking tags
         content = crate::agent::compaction::strip_thinking_tags(&content);
-        assert!(content.split_whitespace().count() > 500,
+        assert!(
+            content.split_whitespace().count() > 500,
             "Setup: content after strip should exceed 500 words, got {}",
-            content.split_whitespace().count());
+            content.split_whitespace().count()
+        );
 
         // Step 2: post-completion pipeline
         let config = AntiDriftConfig::default();
         post_completion_pipeline(&mut content, &[], &config);
 
-        assert!(content.contains("[response condensed]"),
-            "Long content after thinking strip should be condensed");
+        assert!(
+            content.contains("[response condensed]"),
+            "Long content after thinking strip should be condensed"
+        );
     }
 
     #[test]
@@ -778,14 +837,23 @@ mod tests {
         pre_completion_pipeline(&mut messages, 3, &config);
 
         // Filler-heavy message should be evicted (if not in safe window)
-        let evicted = messages.iter().filter(|m| {
-            msg_content(m) == "[low-quality response removed]"
-        }).count();
-        assert!(evicted >= 1, "Anti-drift should evict filler-heavy messages");
+        let evicted = messages
+            .iter()
+            .filter(|m| msg_content(m) == "[low-quality response removed]")
+            .count();
+        assert!(
+            evicted >= 1,
+            "Anti-drift should evict filler-heavy messages"
+        );
 
         // Anchor should be injected at iteration 3
-        let has_anchor = messages.iter().any(|m| msg_content(m).contains("[format-anchor]"));
-        assert!(has_anchor, "Anti-drift should inject format anchor at iteration 3");
+        let has_anchor = messages
+            .iter()
+            .any(|m| msg_content(m).contains("[format-anchor]"));
+        assert!(
+            has_anchor,
+            "Anti-drift should inject format anchor at iteration 3"
+        );
     }
 
     #[test]
@@ -802,29 +870,52 @@ mod tests {
             json!({"role": "assistant", "content": "Certainly again! Absolutely! Basically!"}),
         ];
 
-        let config = AntiDriftConfig { pollution_threshold: 0.0, ..Default::default() }; // evict everything
+        let config = AntiDriftConfig {
+            pollution_threshold: 0.0,
+            ..Default::default()
+        }; // evict everything
         pre_completion_pipeline(&mut messages, 1, &config);
 
         // Messages in safe window (last 4, indices 3-6) should NOT be replaced
-        assert_ne!(messages[4]["content"].as_str().unwrap(), "[low-quality response removed]",
-            "Safe window message should not be evicted");
-        assert_ne!(messages[6]["content"].as_str().unwrap(), "[low-quality response removed]",
-            "Safe window message should not be evicted");
+        assert_ne!(
+            messages[4]["content"].as_str().unwrap(),
+            "[low-quality response removed]",
+            "Safe window message should not be evicted"
+        );
+        assert_ne!(
+            messages[6]["content"].as_str().unwrap(),
+            "[low-quality response removed]",
+            "Safe window message should not be evicted"
+        );
     }
 
     #[test]
     fn test_e2e_score_multi_signal_accumulation() {
         // Message that triggers filler + hallucination + babble = 0.7
         // Need >150 words for babble_no_action signal
-        let filler_and_hallucination = "Certainly! Absolutely! Of course! Well, basically, honestly, I understand! ".repeat(20);
-        let content = format!("{} [Called read_file] I ran the command and I executed it successfully.", filler_and_hallucination);
-        assert!(content.split_whitespace().count() > 150, "Setup: need >150 words for babble signal");
+        let filler_and_hallucination =
+            "Certainly! Absolutely! Of course! Well, basically, honestly, I understand! "
+                .repeat(20);
+        let content = format!(
+            "{} [Called read_file] I ran the command and I executed it successfully.",
+            filler_and_hallucination
+        );
+        assert!(
+            content.split_whitespace().count() > 150,
+            "Setup: need >150 words for babble signal"
+        );
         let msg = json!({"role": "assistant", "content": content});
         let score = score_message(&msg, &[]);
-        assert!(score.score >= 0.6,
-            "Message with multiple signals should score >= 0.6, got {}", score.score);
-        assert!(score.signals.len() >= 2,
-            "Should have 2+ signals, got {:?}", score.signals);
+        assert!(
+            score.score >= 0.6,
+            "Message with multiple signals should score >= 0.6, got {}",
+            score.score
+        );
+        assert!(
+            score.signals.len() >= 2,
+            "Should have 2+ signals, got {:?}",
+            score.signals
+        );
     }
 
     #[test]

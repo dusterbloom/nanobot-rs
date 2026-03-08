@@ -61,8 +61,8 @@ impl KnowledgeGraph {
         #[cfg(feature = "knowledge-graph")]
         {
             let (graph, name_index) = if path.exists() {
-                let data = std::fs::read_to_string(path)
-                    .context("Failed to read knowledge graph")?;
+                let data =
+                    std::fs::read_to_string(path).context("Failed to read knowledge graph")?;
                 let gd: GraphData =
                     serde_json::from_str(&data).context("Failed to parse knowledge graph")?;
                 Self::from_graph_data(gd)
@@ -100,8 +100,8 @@ impl KnowledgeGraph {
                     .context("Failed to create knowledge graph directory")?;
             }
             let gd = self.to_graph_data();
-            let json = serde_json::to_string_pretty(&gd)
-                .context("Failed to serialize knowledge graph")?;
+            let json =
+                serde_json::to_string_pretty(&gd).context("Failed to serialize knowledge graph")?;
             std::fs::write(&self.path, json).context("Failed to write knowledge graph")?;
         }
 
@@ -228,8 +228,7 @@ impl KnowledgeGraph {
         self.graph
             .node_weights()
             .filter(|e| {
-                e.name.to_lowercase().contains(&lower)
-                    || e.summary.to_lowercase().contains(&lower)
+                e.name.to_lowercase().contains(&lower) || e.summary.to_lowercase().contains(&lower)
             })
             .collect()
     }
@@ -328,8 +327,7 @@ impl KnowledgeGraph {
         let mut relations = Vec::new();
         for edge in self.graph.edge_indices() {
             let (source, target) = self.graph.edge_endpoints(edge).unwrap();
-            if let (Some(&from), Some(&to)) = (node_to_idx.get(&source), node_to_idx.get(&target))
-            {
+            if let (Some(&from), Some(&to)) = (node_to_idx.get(&source), node_to_idx.get(&target)) {
                 relations.push((from, to, self.graph[edge].clone()));
             }
         }

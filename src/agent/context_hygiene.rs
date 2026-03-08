@@ -592,13 +592,23 @@ mod tests {
         ];
         merge_consecutive_same_role(&mut messages);
 
-        assert_eq!(messages.len(), 1, "two consecutive user messages should be merged into one");
+        assert_eq!(
+            messages.len(),
+            1,
+            "two consecutive user messages should be merged into one"
+        );
         assert!(
-            messages[0]["content"].as_str().unwrap().contains("first message"),
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("first message"),
             "merged content must include first message"
         );
         assert!(
-            messages[0]["content"].as_str().unwrap().contains("second message"),
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("second message"),
             "merged content must include second message"
         );
         assert_eq!(

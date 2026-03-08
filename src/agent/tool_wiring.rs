@@ -53,7 +53,10 @@ impl AgentLoopShared {
         core: &SwappableCore,
         channel: &str,
         chat_id: &str,
-    ) -> (ToolRegistry, crate::agent::tools::reasoning_tools::SharedEngine) {
+    ) -> (
+        ToolRegistry,
+        crate::agent::tools::reasoning_tools::SharedEngine,
+    ) {
         // Standard stateless tools via unified ToolConfig.
         let db_path = dirs::home_dir()
             .unwrap_or_default()

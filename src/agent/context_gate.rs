@@ -18,9 +18,7 @@ pub enum GateResult {
     /// Content fits — pass through unchanged.
     Raw(String),
     /// Content was too large — summarized.
-    Briefing {
-        summary: String,
-    },
+    Briefing { summary: String },
 }
 
 impl GateResult {
@@ -116,7 +114,8 @@ impl ContentGate {
         // JSON tool output is handled deterministically to avoid model drift.
         // This path preserves exact values and avoids hallucinated fields.
         if let Some(summary) = build_json_briefing(content, target_tokens) {
-            let summary_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
+            let summary_tokens =
+                crate::agent::token_budget::TokenBudget::estimate_str_tokens(&summary);
             self.budget.consume(summary_tokens);
             return GateResult::Briefing { summary };
         }
@@ -125,7 +124,10 @@ impl ContentGate {
         let summary = match specialist_summarize(provider, model, content, target_tokens).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!("Specialist summarization failed, using simple briefing: {}", e);
+                tracing::debug!(
+                    "Specialist summarization failed, using simple briefing: {}",
+                    e
+                );
                 build_simple_briefing(content, target_tokens)
             }
         };
@@ -269,7 +271,10 @@ fn anomaly_line_for_object(path: &str, map: &serde_json::Map<String, Value>) -> 
     }
     if let Some(e) = error {
         if !e.trim().is_empty() {
-            notes.push(format!("error=\"{}\"", e.chars().take(120).collect::<String>()));
+            notes.push(format!(
+                "error=\"{}\"",
+                e.chars().take(120).collect::<String>()
+            ));
         }
     }
     if let Some(ms) = latency {
@@ -798,5 +803,4 @@ mod tests {
             }
         }
     }
-
 }

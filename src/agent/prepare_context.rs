@@ -151,19 +151,21 @@ impl AgentLoopShared {
                 }
             }
 
-            // Tool patterns remain as a separate section (not a memory layer).
-            let learning_ctx = core.learning.get_learning_context();
-            if !learning_ctx.is_empty() {
-                sections.push(SectionEntry {
-                    section: PromptSection::ToolPatterns,
-                    block: PromptBlock::new("Tool Patterns", &learning_ctx),
-                    allocated_tokens: 0,
-                    actual_tokens: 0,
-                    source: SectionSource::Runtime("learning patterns".to_string()),
-                    included: true,
-                    shrinkable: PromptSection::ToolPatterns.shrinkable(),
-                });
-            }
+        }
+
+        // Tool patterns are independent of memory — include regardless of
+        // memory_enabled to match the local prompt path.
+        let learning_ctx = core.learning.get_learning_context();
+        if !learning_ctx.is_empty() {
+            sections.push(SectionEntry {
+                section: PromptSection::ToolPatterns,
+                block: PromptBlock::new("Tool Patterns", &learning_ctx),
+                allocated_tokens: 0,
+                actual_tokens: 0,
+                source: SectionSource::Runtime("learning patterns".to_string()),
+                included: true,
+                shrinkable: PromptSection::ToolPatterns.shrinkable(),
+            });
         }
 
         // 2. Recent daily notes (cloud mode, local-backend only).

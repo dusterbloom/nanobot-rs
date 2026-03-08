@@ -8,21 +8,21 @@ use std::sync::atomic::Ordering;
 use serde_json::{json, Value};
 use tracing::{debug, info, instrument, warn};
 
+use super::trace_store::{append_router_decision_trace, RouterDecisionTrace};
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::TurnContext;
 use crate::agent::context::ContextBuilder;
+use crate::agent::markers::{
+    TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
+};
 use crate::agent::policy;
 use crate::agent::role_policy;
 use crate::agent::role_policy::{build_specialist_system_prompt, parse_specialist_response};
 use crate::agent::router_fallback;
 use crate::agent::tool_guard::ToolGuard;
 use crate::agent::toolplan::{self, ToolPlanAction};
-use crate::agent::markers::{
-    TOOL_ANALYSIS_FULL_OUTPUT_MARKER, TOOL_ANALYSIS_SUMMARY_PREFIX, TOOL_RUNNER_SUMMARY_PREFIX,
-};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest};
-use super::trace_store::{RouterDecisionTrace, append_router_decision_trace};
 
 const ROUTER_SUSPICIOUS_TARGET_MAX_LEN: usize = 96;
 const ROUTER_PARSE_ERROR_RAW_PREVIEW_CHARS: usize = 220;
@@ -55,7 +55,10 @@ impl SpecialistMemory {
         } else {
             summary
         };
-        let buf = self.entries.entry(domain.to_string()).or_insert_with(|| VecDeque::with_capacity(self.max_entries));
+        let buf = self
+            .entries
+            .entry(domain.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(self.max_entries));
         if buf.len() >= self.max_entries {
             buf.pop_front();
         }
@@ -129,7 +132,12 @@ pub fn find_scratch_pad_summary_in_messages(messages: &[Value]) -> Option<String
     None
 }
 
-pub fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_chars: usize, max_chars: usize) -> String {
+pub fn build_conversation_tail(
+    messages: &[Value],
+    max_pairs: usize,
+    max_msg_chars: usize,
+    max_chars: usize,
+) -> String {
     let mut pairs: Vec<(Option<&str>, Option<&str>)> = Vec::new();
     let mut current_user: Option<&str> = None;
 
@@ -195,7 +203,11 @@ pub fn build_conversation_tail(messages: &[Value], max_pairs: usize, max_msg_cha
 pub(crate) fn truncate_tool_result(data: &str, max_chars: usize) -> String {
     if data.len() > max_chars {
         let truncated: String = data.chars().take(max_chars).collect();
-        format!("{}... [truncated, {} total chars]", truncated, data.chars().count())
+        format!(
+            "{}... [truncated, {} total chars]",
+            truncated,
+            data.chars().count()
+        )
     } else {
         data.to_string()
     }
@@ -277,9 +289,9 @@ pub(crate) fn parse_lenient_router_decision(raw: &str) -> Option<role_policy::Ro
         raw.to_string()
     }
     .replace("<start_function_call>", "")
-        .replace("<end_function_call>", "")
-        .replace("<escape>", "")
-        .replace('\n', " ");
+    .replace("<end_function_call>", "")
+    .replace("<escape>", "")
+    .replace('\n', " ");
 
     let end = tail.find("<end_function_call>").unwrap_or(tail.len());
     tail = tail[..end].trim().to_string();
@@ -747,7 +759,10 @@ pub(crate) async fn dispatch_subagent(
 
 /// Determine the PreflightResult for a successful specialist dispatch.
 /// Pure function — extracted for testability.
-pub(crate) fn specialist_preflight_result(specialist_response: &str, synthesis: bool) -> PreflightResult {
+pub(crate) fn specialist_preflight_result(
+    specialist_response: &str,
+    synthesis: bool,
+) -> PreflightResult {
     if synthesis {
         PreflightResult::Continue
     } else {
@@ -826,23 +841,29 @@ pub(crate) async fn router_preflight(
     }
 
     info!("router_preflight_firing");
-    ctx.counters.trio_metrics.router_preflight_fired.store(true, Ordering::Relaxed);
+    ctx.counters
+        .trio_metrics
+        .router_preflight_fired
+        .store(true, Ordering::Relaxed);
     ctx.flow.router_preflight_done = true;
-    let (router_provider, router_model) =
-        match (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref()) {
-            (Some(p), Some(m)) => (p.clone(), m.to_string()),
-            _ => {
-                tracing::Span::current().record("routing_decision", "break_no_router");
-                return PreflightResult::Break(
+    let (router_provider, router_model) = match (
+        ctx.core.router_provider.as_ref(),
+        ctx.core.router_model.as_deref(),
+    ) {
+        (Some(p), Some(m)) => (p.clone(), m.to_string()),
+        _ => {
+            tracing::Span::current().record("routing_decision", "break_no_router");
+            return PreflightResult::Break(
                     "Router lane is required by policy but not configured. Start trio router server and retry.".to_string(),
                 );
-            }
-        };
+        }
+    };
 
     // Health gate: skip preflight if router endpoint is degraded.
     if let Some(hr) = health_registry {
         if !hr.is_healthy("trio_router") {
-            ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
+            ctx.counters
+                .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
             warn!("[router] trio_router probe degraded — falling through to main model");
             tracing::Span::current().record("routing_decision", "passthrough_degraded");
             return PreflightResult::Passthrough;
@@ -851,8 +872,14 @@ pub(crate) async fn router_preflight(
 
     // Circuit breaker gate: skip if router has too many recent failures.
     let cb_key = format!("router:{}", router_model);
-    if !ctx.counters.trio_circuit_breaker.lock().is_available(&cb_key) {
-        ctx.counters.set_trio_state(crate::agent::agent_core::TrioState::Degraded);
+    if !ctx
+        .counters
+        .trio_circuit_breaker
+        .lock()
+        .is_available(&cb_key)
+    {
+        ctx.counters
+            .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
         warn!("[router] circuit breaker open for {cb_key} — falling through to main model");
         tracing::Span::current().record("routing_decision", "passthrough_circuit_open");
         return PreflightResult::Passthrough;
@@ -873,7 +900,10 @@ pub(crate) async fn router_preflight(
     let conv_tail = build_conversation_tail(
         &ctx.messages,
         ROUTER_TAIL_MAX_PAIRS,
-        ctx.core.tool_delegation_config.router_tuning.tail_max_msg_chars,
+        ctx.core
+            .tool_delegation_config
+            .router_tuning
+            .tail_max_msg_chars,
         ctx.core.tool_delegation_config.router_tuning.tail_max_chars,
     );
     let task_state = if conv_tail.is_empty() {
@@ -911,12 +941,18 @@ pub(crate) async fn router_preflight(
     .await
     {
         Ok(d) => {
-            ctx.counters.trio_circuit_breaker.lock().record_success(&cb_key);
+            ctx.counters
+                .trio_circuit_breaker
+                .lock()
+                .record_success(&cb_key);
             d
         }
         Err(e) => {
             warn!("[router] router call failed: {} — recording failure and falling through to main model", e);
-            ctx.counters.trio_circuit_breaker.lock().record_failure(&cb_key);
+            ctx.counters
+                .trio_circuit_breaker
+                .lock()
+                .record_failure(&cb_key);
             tracing::Span::current().record("routing_decision", "passthrough_router_error");
             return PreflightResult::Passthrough;
         }
@@ -978,16 +1014,28 @@ pub(crate) async fn router_preflight(
             .await
             {
                 Ok(record) => {
-                    ctx.counters.trio_metrics.specialist_dispatched.store(true, Ordering::Relaxed);
+                    ctx.counters
+                        .trio_metrics
+                        .specialist_dispatched
+                        .store(true, Ordering::Relaxed);
                     if ctx.core.trace_log {
                         super::trace_store::append_specialist_trace(&record);
                     }
                     // Record specialist output for domain memory.
-                    ctx.counters.specialist_memory.lock().push(&decision.target, &record.specialist_response);
-                    let injected = format!("[specialist:{}] {}", decision.target, record.specialist_response);
+                    ctx.counters
+                        .specialist_memory
+                        .lock()
+                        .push(&decision.target, &record.specialist_response);
+                    let injected = format!(
+                        "[specialist:{}] {}",
+                        decision.target, record.specialist_response
+                    );
                     ctx.messages
                         .push(json!({"role":"user","content": injected, "_synthetic": true}));
-                    specialist_preflight_result(&record.specialist_response, ctx.core.tool_delegation_config.specialist_synthesis)
+                    specialist_preflight_result(
+                        &record.specialist_response,
+                        ctx.core.tool_delegation_config.specialist_synthesis,
+                    )
                 }
                 Err(e) => PreflightResult::Break(e),
             }
@@ -1010,8 +1058,7 @@ pub(crate) async fn router_preflight(
                         trace.outcome = Some(text.clone());
                         append_router_decision_trace(&trace);
                     }
-                    ctx.messages
-                        .push(json!({"role":"user","content": text}));
+                    ctx.messages.push(json!({"role":"user","content": text}));
                     subagent_preflight_result(&text)
                 }
                 Err(e) => {
@@ -1060,7 +1107,13 @@ pub(crate) async fn router_preflight(
                 append_router_decision_trace(&trace);
             }
             let content = extract_tool_content(&tr.data);
-            let truncated = truncate_tool_result(&content, ctx.core.tool_delegation_config.router_tuning.max_tool_result_chars);
+            let truncated = truncate_tool_result(
+                &content,
+                ctx.core
+                    .tool_delegation_config
+                    .router_tuning
+                    .max_tool_result_chars,
+            );
             ctx.messages.push(json!({
                 "role":"user",
                 "content": format!(
@@ -1159,7 +1212,10 @@ pub(crate) async fn route_tool_calls(
         let conv_tail = build_conversation_tail(
             &ctx.messages,
             ROUTER_TAIL_MAX_PAIRS,
-            ctx.core.tool_delegation_config.router_tuning.tail_max_msg_chars,
+            ctx.core
+                .tool_delegation_config
+                .router_tuning
+                .tail_max_msg_chars,
             ctx.core.tool_delegation_config.router_tuning.tail_max_chars,
         );
         let router_pack = if ctx.core.tool_delegation_config.role_scoped_context_packs {
@@ -1175,9 +1231,10 @@ pub(crate) async fn route_tool_calls(
             task_state
         };
 
-        if let (Some(router_provider), Some(router_model)) =
-            (ctx.core.router_provider.as_ref(), ctx.core.router_model.as_deref())
-        {
+        if let (Some(router_provider), Some(router_model)) = (
+            ctx.core.router_provider.as_ref(),
+            ctx.core.router_model.as_deref(),
+        ) {
             let router_start = std::time::Instant::now();
             match request_strict_router_decision(
                 router_provider.as_ref(),
@@ -1195,7 +1252,12 @@ pub(crate) async fn route_tool_calls(
                     let router_elapsed_ms = router_start.elapsed().as_millis() as u64;
                     router_decision_valid = true;
                     if ctx.core.trace_log {
-                        let model = ctx.core.router_model.as_deref().unwrap_or("unknown").to_string();
+                        let model = ctx
+                            .core
+                            .router_model
+                            .as_deref()
+                            .unwrap_or("unknown")
+                            .to_string();
                         append_router_decision_trace(&RouterDecisionTrace {
                             phase: "tool_routing".to_string(),
                             action: decision.action.clone(),
@@ -1227,7 +1289,10 @@ pub(crate) async fn route_tool_calls(
             Err(e) => {
                 warn!("router decision normalization failed: {}", e);
                 if ctx.core.tool_delegation_config.strict_toolplan_validation
-                    && ctx.core.tool_delegation_config.deterministic_router_fallback
+                    && ctx
+                        .core
+                        .tool_delegation_config
+                        .deterministic_router_fallback
                 {
                     selected_plan = Some(router_fallback::route(
                         &ctx.user_content,
@@ -1246,7 +1311,11 @@ pub(crate) async fn route_tool_calls(
         )
         && !router_decision_valid
     {
-        if ctx.core.tool_delegation_config.deterministic_router_fallback {
+        if ctx
+            .core
+            .tool_delegation_config
+            .deterministic_router_fallback
+        {
             warn!(
                 "strict router invalid; using deterministic fallback plan (model={})",
                 ctx.core.model
@@ -1270,16 +1339,17 @@ pub(crate) async fn route_tool_calls(
     if let Some(plan) = selected_plan {
         if ctx.core.tool_delegation_config.strict_toolplan_validation {
             if let Err(e) = plan.validate() {
-                if ctx.core.tool_delegation_config.deterministic_router_fallback {
+                if ctx
+                    .core
+                    .tool_delegation_config
+                    .deterministic_router_fallback
+                {
                     warn!(
                         "tool plan validation failed ({}), using deterministic fallback",
                         e
                     );
                 } else {
-                    return RouteResult::Break(format!(
-                        "Router produced invalid tool plan: {}",
-                        e
-                    ));
+                    return RouteResult::Break(format!("Router produced invalid tool plan: {}", e));
                 }
             }
         }
@@ -1321,7 +1391,10 @@ pub(crate) async fn route_tool_calls(
                         if ctx.core.trace_log {
                             super::trace_store::append_specialist_trace(&record);
                         }
-                        let injected = format!("[specialist:{}] {}", plan.target, record.specialist_response);
+                        let injected = format!(
+                            "[specialist:{}] {}",
+                            plan.target, record.specialist_response
+                        );
                         ctx.messages
                             .push(json!({"role":"user","content": injected, "_synthetic": true}));
                         return specialist_route_result(&record.specialist_response);
@@ -1341,8 +1414,7 @@ pub(crate) async fn route_tool_calls(
                 .await
                 {
                     Ok(text) => {
-                        ctx.messages
-                            .push(json!({"role":"user","content": text}));
+                        ctx.messages.push(json!({"role":"user","content": text}));
                         return subagent_route_result(&text);
                     }
                     Err(e) => return RouteResult::Break(e),
@@ -1407,18 +1479,9 @@ pub(crate) async fn route_tool_calls(
             .iter()
             .map(|(tc, _)| tc.to_openai_json())
             .collect();
-        ContextBuilder::add_assistant_message(
-            &mut ctx.messages,
-            response_content,
-            Some(&tc_json),
-        );
+        ContextBuilder::add_assistant_message(&mut ctx.messages, response_content, Some(&tc_json));
         for (tc, cached_result) in &blocked_with_result {
-            ContextBuilder::add_tool_result(
-                &mut ctx.messages,
-                &tc.id,
-                &tc.name,
-                cached_result,
-            );
+            ContextBuilder::add_tool_result(&mut ctx.messages, &tc.id, &tc.name, cached_result);
         }
     }
 
@@ -1498,7 +1561,10 @@ mod tests {
     fn test_extract_json_object_markdown_wrapped() {
         let raw = "```json\n{\"action\":\"respond\"}\n```";
         let result = extract_json_object(raw);
-        assert!(result.is_some(), "markdown-wrapped JSON should be extracted");
+        assert!(
+            result.is_some(),
+            "markdown-wrapped JSON should be extracted"
+        );
         assert_eq!(result.unwrap(), r#"{"action":"respond"}"#);
     }
 
@@ -1592,7 +1658,10 @@ mod tests {
         // Falls through to main model via Passthrough.
         let raw = "[specialist:coding] Here is the answer";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_none(), "embedded marker with no extractable fields returns None");
+        assert!(
+            result.is_none(),
+            "embedded marker with no extractable fields returns None"
+        );
     }
 
     #[test]
@@ -1637,9 +1706,7 @@ mod tests {
 
     #[test]
     fn test_find_summary_tool_runner_marker() {
-        let msgs = vec![
-            json!({"role": "user", "content": "[tool runner summary] found 5 files"}),
-        ];
+        let msgs = vec![json!({"role": "user", "content": "[tool runner summary] found 5 files"})];
         let result = find_scratch_pad_summary_in_messages(&msgs);
         assert_eq!(result, Some("found 5 files".to_string()));
     }
@@ -1674,7 +1741,10 @@ mod tests {
             msgs.push(json!({"role": "assistant", "content": format!("message {}", i)}));
         }
         let result = find_scratch_pad_summary_in_messages(&msgs);
-        assert!(result.is_none(), "summary outside 10-message window should return None");
+        assert!(
+            result.is_none(),
+            "summary outside 10-message window should return None"
+        );
     }
 
     #[test]
@@ -1717,9 +1787,18 @@ mod tests {
         ];
         let result = build_conversation_tail(&msgs, 5, 1000, 10_000);
         assert!(result.contains("User:"), "should contain User: prefix");
-        assert!(result.contains("Hello there"), "should contain first user message");
-        assert!(result.contains("How are you"), "should contain second user message");
-        assert!(result.contains("Hi back"), "should contain assistant response");
+        assert!(
+            result.contains("Hello there"),
+            "should contain first user message"
+        );
+        assert!(
+            result.contains("How are you"),
+            "should contain second user message"
+        );
+        assert!(
+            result.contains("Hi back"),
+            "should contain assistant response"
+        );
     }
 
     #[test]
@@ -1732,10 +1811,16 @@ mod tests {
         // max_msg_chars = 100
         let result = build_conversation_tail(&msgs, 5, 100, 10_000);
         assert!(result.contains("User:"), "should contain User: prefix");
-        assert!(result.contains('…'), "truncated message should end with ellipsis");
+        assert!(
+            result.contains('…'),
+            "truncated message should end with ellipsis"
+        );
         // The user message should be truncated to ~100 chars + ellipsis
         let user_line = result.lines().find(|l| l.starts_with("User:")).unwrap();
-        assert!(user_line.len() <= 120, "truncated line should not be too long");
+        assert!(
+            user_line.len() <= 120,
+            "truncated line should not be too long"
+        );
     }
 
     #[test]
@@ -1746,7 +1831,10 @@ mod tests {
             json!({"role": "tool_call", "content": "function call"}),
         ];
         let result = build_conversation_tail(&msgs, 5, 1000, 10_000);
-        assert!(result.is_empty(), "system and tool messages should be skipped");
+        assert!(
+            result.is_empty(),
+            "system and tool messages should be skipped"
+        );
     }
 
     #[test]
@@ -1761,16 +1849,31 @@ mod tests {
         ];
         // max_pairs = 1 — only the last pair should appear
         let result = build_conversation_tail(&msgs, 1, 1000, 10_000);
-        assert!(result.contains("Third question"), "last pair user message should be present");
-        assert!(result.contains("Third answer"), "last pair assistant message should be present");
-        assert!(!result.contains("First question"), "earlier pairs should be excluded");
-        assert!(!result.contains("Second question"), "earlier pairs should be excluded");
+        assert!(
+            result.contains("Third question"),
+            "last pair user message should be present"
+        );
+        assert!(
+            result.contains("Third answer"),
+            "last pair assistant message should be present"
+        );
+        assert!(
+            !result.contains("First question"),
+            "earlier pairs should be excluded"
+        );
+        assert!(
+            !result.contains("Second question"),
+            "earlier pairs should be excluded"
+        );
     }
 
     #[test]
     fn test_build_tail_empty_messages() {
         let result = build_conversation_tail(&[], 5, 1000, 10_000);
-        assert!(result.is_empty(), "empty messages should produce empty tail");
+        assert!(
+            result.is_empty(),
+            "empty messages should produce empty tail"
+        );
     }
 
     #[test]
@@ -1840,13 +1943,17 @@ mod tests {
         // Defaults to action="tool", target="" → fails strict → None.
         let raw = "[specialist:coding] Here is the answer";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_none(), "embedded marker with no extractable fields returns None");
+        assert!(
+            result.is_none(),
+            "embedded marker with no extractable fields returns None"
+        );
     }
 
     #[test]
     fn test_tool_file_read() {
         // "tool" is in normalize_action known set, "read_file" is non-empty target.
-        let raw = r#"{"action":"tool","target":"read_file","args":{"path":"README"},"confidence":0.85}"#;
+        let raw =
+            r#"{"action":"tool","target":"read_file","args":{"path":"README"},"confidence":0.85}"#;
         let result = parse_lenient_router_decision(raw);
         assert!(result.is_some());
         let d = result.unwrap();
@@ -1900,7 +2007,10 @@ mod tests {
         // Non-empty target passes strict validation.
         let raw = "{action: specialist, target: math}";
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_some(), "comma-separated path extracts non-empty target");
+        assert!(
+            result.is_some(),
+            "comma-separated path extracts non-empty target"
+        );
         assert_eq!(result.unwrap().action, "tool");
     }
 
@@ -1932,7 +2042,10 @@ mod tests {
         // The lenient parser does not filter by confidence threshold.
         let raw = r#"{"action":"specialist","target":"math","args":{},"confidence":0.1}"#;
         let result = parse_lenient_router_decision(raw);
-        assert!(result.is_some(), "low confidence specialist should still parse");
+        assert!(
+            result.is_some(),
+            "low confidence specialist should still parse"
+        );
         assert_eq!(result.unwrap().action, "specialist");
     }
 
@@ -1986,7 +2099,10 @@ mod tests {
     fn test_tool_result_no_truncation_when_short() {
         let short_input = "short result";
         let result = truncate_tool_result(short_input, 12000);
-        assert_eq!(result, short_input, "short input must be returned unchanged");
+        assert_eq!(
+            result, short_input,
+            "short input must be returned unchanged"
+        );
     }
 
     #[test]
@@ -1999,7 +2115,10 @@ mod tests {
             result.len()
         );
         assert!(result.contains("truncated"), "must contain 'truncated'");
-        assert!(result.contains("500 total chars"), "must report original size");
+        assert!(
+            result.contains("500 total chars"),
+            "must report original size"
+        );
     }
 
     // ── Turn isolation: preflight arms must return Break, not Continue ─────────
@@ -2007,8 +2126,10 @@ mod tests {
     #[test]
     fn test_specialist_synthesis_enabled_returns_continue() {
         let result = specialist_preflight_result("Here is the specialist analysis...", true);
-        assert!(matches!(result, PreflightResult::Continue),
-            "with synthesis enabled, specialist should return Continue so main model presents");
+        assert!(
+            matches!(result, PreflightResult::Continue),
+            "with synthesis enabled, specialist should return Continue so main model presents"
+        );
     }
 
     #[test]
@@ -2047,7 +2168,8 @@ mod tests {
     #[test]
     fn test_tool_arm_with_specialist_returns_synthesized() {
         let specialist_response = Some("Here are the top 5 HN stories...".to_string());
-        let result = tool_preflight_result("web_fetch", "<html>raw content</html>", specialist_response);
+        let result =
+            tool_preflight_result("web_fetch", "<html>raw content</html>", specialist_response);
         match result {
             PreflightResult::Break(msg) => {
                 assert_eq!(msg, "Here are the top 5 HN stories...");
@@ -2106,10 +2228,22 @@ mod tests {
             router_temp: f64,
         }
         let configs = vec![
-            SweepConfig { label: "conservative", router_temp: 0.1 },
-            SweepConfig { label: "default", router_temp: 0.2 },
-            SweepConfig { label: "warm", router_temp: 0.3 },
-            SweepConfig { label: "exploratory", router_temp: 0.4 },
+            SweepConfig {
+                label: "conservative",
+                router_temp: 0.1,
+            },
+            SweepConfig {
+                label: "default",
+                router_temp: 0.2,
+            },
+            SweepConfig {
+                label: "warm",
+                router_temp: 0.3,
+            },
+            SweepConfig {
+                label: "exploratory",
+                router_temp: 0.4,
+            },
         ];
         for cfg in &configs {
             eprintln!("## Config: {} (temp={})", cfg.label, cfg.router_temp);
@@ -2219,7 +2353,10 @@ mod tests {
     #[test]
     fn test_specialist_memory_char_cap() {
         let mut mem = SpecialistMemory::new(3, 10);
-        mem.push("coding", "this is a very long specialist response that should be truncated");
+        mem.push(
+            "coding",
+            "this is a very long specialist response that should be truncated",
+        );
         let ctx = mem.format_context("coding");
         assert!(ctx.contains("this is a "));
         assert!(!ctx.contains("truncated"));

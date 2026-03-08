@@ -124,10 +124,7 @@ impl SummaryDag {
 #[derive(Debug, Clone)]
 pub enum ContextEntry {
     /// A raw message from the immutable store.
-    Raw {
-        msg_id: MessageId,
-        message: Value,
-    },
+    Raw { msg_id: MessageId, message: Value },
     /// A summary node replacing a block of older messages.
     Summary {
         node_id: usize,
@@ -233,15 +230,16 @@ impl LcmEngine {
         _system_prompt: &str,
     ) -> Self {
         let mut engine = Self::new(config.clone());
-        
+
         // Find the last clear marker - everything before it is ignored.
         let clear_idx = turns.iter().rposition(|t| matches!(t, Turn::Clear));
         let start_idx = clear_idx.map(|i| i + 1).unwrap_or(0);
         let turns_to_process = &turns[start_idx..];
-        
+
         // Track which raw message IDs have been summarized
-        let mut summarized_ids: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
-        
+        let mut summarized_ids: std::collections::HashSet<MessageId> =
+            std::collections::HashSet::new();
+
         // First pass: ingest all raw messages into store, track summaries
         for turn in turns_to_process {
             match turn {
@@ -268,7 +266,12 @@ impl LcmEngine {
                     };
                     engine.store.push(msg);
                 }
-                Turn::ToolResult { call_id, tool, result, ok: _ } => {
+                Turn::ToolResult {
+                    call_id,
+                    tool,
+                    result,
+                    ok: _,
+                } => {
                     let msg = serde_json::json!({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -281,10 +284,16 @@ impl LcmEngine {
                     let msg = serde_json::json!({"role": "system", "content": content});
                     engine.store.push(msg);
                 }
-                Turn::Summary { text, source_ids, level } => {
+                Turn::Summary {
+                    text,
+                    source_ids,
+                    level,
+                } => {
                     // Create summary node in DAG
-                    let _node = engine.dag.create_node(source_ids.clone(), text.clone(), *level);
-                    
+                    let _node = engine
+                        .dag
+                        .create_node(source_ids.clone(), text.clone(), *level);
+
                     // Track which raw messages are covered by summaries
                     for &id in source_ids {
                         summarized_ids.insert(id);
@@ -300,14 +309,15 @@ impl LcmEngine {
                 }
             }
         }
-        
+
         // Second pass: build active context
         // Start with system prompt (as ContextEntry, not from store)
         // Then add summary nodes, then raw messages not covered by summaries
-        
+
         // Add summary entries to active context
         for node in &engine.dag.nodes {
-            let id_list: String = node.source_ids
+            let id_list: String = node
+                .source_ids
                 .iter()
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>()
@@ -327,7 +337,7 @@ impl LcmEngine {
                 message: summary_message,
             });
         }
-        
+
         // Add raw messages that aren't covered by any summary.
         // Iterate over the full store so that messages with IDs lower than
         // last_summary_end but not included in any summary (e.g. user messages
@@ -338,7 +348,7 @@ impl LcmEngine {
                 engine.active.push(ContextEntry::Raw { msg_id, message });
             }
         }
-        
+
         debug!(
             "LCM rebuild: {} store entries, {} summary nodes, {} active entries (cleared at idx {:?})",
             engine.store.len(),
@@ -346,7 +356,7 @@ impl LcmEngine {
             engine.active.len(),
             clear_idx
         );
-        
+
         engine
     }
 
@@ -361,7 +371,7 @@ impl LcmEngine {
     ) -> Vec<Value> {
         // Convert active entries to Turns, then render via protocol
         let mut turns: Vec<Turn> = Vec::new();
-        
+
         for entry in &self.active {
             match entry {
                 ContextEntry::Raw { message, .. } => {
@@ -380,7 +390,7 @@ impl LcmEngine {
                 }
             }
         }
-        
+
         protocol.render(system_prompt, &turns)
     }
 
@@ -406,7 +416,11 @@ impl LcmEngine {
     }
 
     /// Check thresholds and return what action is needed.
-    pub fn check_thresholds(&self, budget: &TokenBudget, tool_def_tokens: usize) -> CompactionAction {
+    pub fn check_thresholds(
+        &self,
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+    ) -> CompactionAction {
         let available = budget.available_budget(tool_def_tokens);
         let current = self.active_tokens();
 
@@ -476,9 +490,13 @@ impl LcmEngine {
         );
 
         // Three-level escalation (Algorithm 3).
-        let (summary_text, level) =
-            escalated_summary(&block_messages, target, compactor, self.config.deterministic_target)
-                .await;
+        let (summary_text, level) = escalated_summary(
+            &block_messages,
+            target,
+            compactor,
+            self.config.deterministic_target,
+        )
+        .await;
 
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
 
@@ -501,7 +519,9 @@ impl LcmEngine {
         );
 
         // Create summary node in DAG.
-        let node = self.dag.create_node(source_ids.clone(), summary_text.clone(), level);
+        let node = self
+            .dag
+            .create_node(source_ids.clone(), summary_text.clone(), level);
         let node_id = node.id;
 
         // Build the summary message with lossless pointers.
@@ -548,17 +568,17 @@ impl LcmEngine {
     /// This ensures we don't re-compact messages that have already been summarized.
     fn find_oldest_raw_block_impl(&self) -> Option<(usize, usize)> {
         let mut last_summary_idx: Option<usize> = None;
-        
+
         // Find the position of the last summary in active context
         for (i, entry) in self.active.iter().enumerate() {
             if matches!(entry, ContextEntry::Summary { .. }) {
                 last_summary_idx = Some(i);
             }
         }
-        
+
         // Start searching for raw messages after the last summary
         let search_start = last_summary_idx.map(|idx| idx + 1).unwrap_or(0);
-        
+
         let mut start = None;
         let mut end = 0;
 
@@ -706,16 +726,25 @@ async fn escalated_summary(
     let original_tokens = TokenBudget::estimate_tokens(messages);
 
     // Level 1: Preserve details.
-    if let Ok(summary) = compactor.summarize_for_lcm(messages, "preserve_details").await {
+    if let Ok(summary) = compactor
+        .summarize_for_lcm(messages, "preserve_details")
+        .await
+    {
         let tokens = TokenBudget::estimate_str_tokens(&summary);
         if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-            debug!("LCM escalation: Level 1 succeeded ({} -> {} tokens)", original_tokens, tokens);
+            debug!(
+                "LCM escalation: Level 1 succeeded ({} -> {} tokens)",
+                original_tokens, tokens
+            );
             return (summary, 1);
         }
         if contains_refusal_pattern(&summary) {
             debug!("LCM escalation: Level 1 contained refusal pattern, escalating");
         } else {
-            debug!("LCM escalation: Level 1 failed (output {} >= input {})", tokens, original_tokens);
+            debug!(
+                "LCM escalation: Level 1 failed (output {} >= input {})",
+                tokens, original_tokens
+            );
         }
     }
 
@@ -723,13 +752,19 @@ async fn escalated_summary(
     if let Ok(summary) = compactor.summarize_for_lcm(messages, "bullet_points").await {
         let tokens = TokenBudget::estimate_str_tokens(&summary);
         if tokens < original_tokens && !contains_refusal_pattern(&summary) {
-            debug!("LCM escalation: Level 2 succeeded ({} -> {} tokens)", original_tokens, tokens);
+            debug!(
+                "LCM escalation: Level 2 succeeded ({} -> {} tokens)",
+                original_tokens, tokens
+            );
             return (summary, 2);
         }
         if contains_refusal_pattern(&summary) {
             debug!("LCM escalation: Level 2 contained refusal pattern, escalating");
         } else {
-            debug!("LCM escalation: Level 2 failed (output {} >= input {})", tokens, original_tokens);
+            debug!(
+                "LCM escalation: Level 2 failed (output {} >= input {})",
+                tokens, original_tokens
+            );
         }
     }
 
@@ -850,7 +885,7 @@ pub fn contains_refusal_pattern(text: &str) -> bool {
         "unethical",
         "harmful",
     ];
-    
+
     for indicator in &refusal_indicators {
         if lower.contains(indicator) {
             return true;
@@ -1050,7 +1085,10 @@ mod tests {
         engine.ingest(json!({"role": "user", "content": "Hi"}));
 
         let budget = TokenBudget::new(100_000, 8192);
-        assert_eq!(engine.check_thresholds(&budget, 500), CompactionAction::None);
+        assert_eq!(
+            engine.check_thresholds(&budget, 500),
+            CompactionAction::None
+        );
     }
 
     #[test]
@@ -1091,7 +1129,7 @@ mod tests {
         assert!(block.is_some());
         let (start, end) = block.unwrap();
         assert_eq!(start, 1); // After system message.
-        // End should leave at least 4 raw messages protected.
+                              // End should leave at least 4 raw messages protected.
         assert!(end <= engine.active.len() - 4);
     }
 
@@ -1189,7 +1227,10 @@ mod tests {
         assert!(!node.source_ids.is_empty());
 
         // Active context should contain a Summary entry.
-        let has_summary = engine.active.iter().any(|e| matches!(e, ContextEntry::Summary { .. }));
+        let has_summary = engine
+            .active
+            .iter()
+            .any(|e| matches!(e, ContextEntry::Summary { .. }));
         assert!(has_summary, "Active context must contain a Summary entry");
 
         // Expand: retrieve originals via the IDs stored in the summary node.
@@ -1283,7 +1324,9 @@ mod tests {
         {
             let mut e = engine.lock().await;
             e.ingest(json!({"role": "user", "content": "What is Rust?"}));
-            e.ingest(json!({"role": "assistant", "content": "Rust is a systems programming language."}));
+            e.ingest(
+                json!({"role": "assistant", "content": "Rust is a systems programming language."}),
+            );
             e.ingest(json!({"role": "user", "content": "Tell me about ownership."}));
         }
 
@@ -1406,7 +1449,9 @@ mod tests {
 
         // Build a realistic 10-turn conversation (fixed, deterministic input).
         let mut conversation: Vec<Value> = Vec::new();
-        conversation.push(json!({"role": "system", "content": "You are a helpful Rust programming assistant."}));
+        conversation.push(
+            json!({"role": "system", "content": "You are a helpful Rust programming assistant."}),
+        );
 
         let turns = [
             ("user", "Explain Rust ownership rules in detail. Each value in Rust has exactly one owner at a time. When the owner goes out of scope, the value is dropped. Ownership can be transferred via moves. For example, let s1 = String::from(\"hello\"); let s2 = s1; after this, s1 is invalid."),
@@ -1638,14 +1683,38 @@ mod tests {
 
         // Build 8 turns: user0, asst1, user2, asst3, user4, asst5, user6, asst7
         let turns = vec![
-            Turn::User { content: "user0".into(), media: vec![] },
-            Turn::Assistant { text: Some("asst1".into()), tool_calls: vec![] },
-            Turn::User { content: "user2".into(), media: vec![] },
-            Turn::Assistant { text: Some("asst3".into()), tool_calls: vec![] },
-            Turn::User { content: "user4".into(), media: vec![] },
-            Turn::Assistant { text: Some("asst5".into()), tool_calls: vec![] },
-            Turn::User { content: "user6".into(), media: vec![] },
-            Turn::Assistant { text: Some("asst7".into()), tool_calls: vec![] },
+            Turn::User {
+                content: "user0".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("asst1".into()),
+                tool_calls: vec![],
+            },
+            Turn::User {
+                content: "user2".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("asst3".into()),
+                tool_calls: vec![],
+            },
+            Turn::User {
+                content: "user4".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("asst5".into()),
+                tool_calls: vec![],
+            },
+            Turn::User {
+                content: "user6".into(),
+                media: vec![],
+            },
+            Turn::Assistant {
+                text: Some("asst7".into()),
+                tool_calls: vec![],
+            },
             // Summary covers only the assistant messages (non-contiguous IDs 1, 3, 5)
             Turn::Summary {
                 text: "Summary of assistant messages.".into(),
@@ -1655,12 +1724,8 @@ mod tests {
         ];
 
         let protocol = CloudProtocol;
-        let engine = LcmEngine::rebuild_from_turns(
-            &turns,
-            LcmConfig::default(),
-            &protocol,
-            "system prompt",
-        );
+        let engine =
+            LcmEngine::rebuild_from_turns(&turns, LcmConfig::default(), &protocol, "system prompt");
 
         // Collect the msg_ids of all Raw entries in the active context.
         let raw_ids: Vec<usize> = engine
@@ -1728,6 +1793,9 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ContextEntry::Summary { .. }))
             .count();
-        assert_eq!(summary_count, 1, "Expected exactly 1 Summary entry in active");
+        assert_eq!(
+            summary_count, 1,
+            "Expected exactly 1 Summary entry in active"
+        );
     }
 }

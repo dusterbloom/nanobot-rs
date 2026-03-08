@@ -160,7 +160,10 @@ mod tests {
         let result = append_fact(current, "Second fact", "2026-03-02");
         let first_pos = result.find("First fact").unwrap();
         let second_pos = result.find("Second fact").unwrap();
-        assert!(first_pos < second_pos, "first fact must appear before second");
+        assert!(
+            first_pos < second_pos,
+            "first fact must appear before second"
+        );
     }
 
     #[test]
@@ -176,7 +179,10 @@ mod tests {
     #[test]
     fn test_append_fact_trims_whitespace() {
         let result = append_fact("", "  padded fact  ", "2026-03-02");
-        assert!(result.contains("- padded fact"), "leading/trailing space trimmed");
+        assert!(
+            result.contains("- padded fact"),
+            "leading/trailing space trimmed"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -241,8 +247,7 @@ mod tests {
             result
         );
 
-        let content =
-            std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
         assert!(content.contains("- Testing round trip"));
     }
 
@@ -259,8 +264,7 @@ mod tests {
         args2.insert("fact".to_string(), json!("Second fact"));
         tool.execute(args2).await;
 
-        let content =
-            std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("memory").join("MEMORY.md")).unwrap();
         assert!(content.contains("- First fact"), "first fact missing");
         assert!(content.contains("- Second fact"), "second fact missing");
     }

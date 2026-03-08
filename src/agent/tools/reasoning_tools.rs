@@ -4,9 +4,9 @@
 //! conversation snapshots, restore them on failure, and decompose tasks
 //! into a dependency DAG.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use daggy::Dag;

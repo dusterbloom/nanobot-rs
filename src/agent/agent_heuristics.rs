@@ -14,7 +14,9 @@ use crate::config::schema::AdaptiveTokenConfig;
 // ---------------------------------------------------------------------------
 
 pub(super) fn last_user_message(messages: &[serde_json::Value]) -> Option<String> {
-    messages.iter().rev()
+    messages
+        .iter()
+        .rev()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .map(|s| s.to_string())
@@ -27,7 +29,10 @@ pub(super) fn last_user_message(messages: &[serde_json::Value]) -> Option<String
 ///   the `system` argument to `protocol.render()`.
 /// - Any `_turn` / `_synthetic` metadata tags on raw messages are not forwarded
 ///   to the wire output (they are internal-only fields used for trimming).
-pub(super) fn render_via_protocol(protocol: &dyn ConversationProtocol, messages: &[Value]) -> Vec<Value> {
+pub(super) fn render_via_protocol(
+    protocol: &dyn ConversationProtocol,
+    messages: &[Value],
+) -> Vec<Value> {
     // Extract system prompt from the leading system message (if present).
     let system = messages
         .first()
@@ -56,19 +61,23 @@ pub(super) fn render_via_protocol(protocol: &dyn ConversationProtocol, messages:
 
 /// Decide whether trio routing is healthy enough to strip tools from the main model.
 /// Pure function: takes health status as booleans, returns true if tools should be stripped.
-#[instrument(name = "should_strip_tools_for_trio", fields(
-    is_local,
-    strict_no_tools_main,
-    router_probe_healthy,
-    circuit_breaker_available,
-))]
+#[instrument(
+    name = "should_strip_tools_for_trio",
+    fields(
+        is_local,
+        strict_no_tools_main,
+        router_probe_healthy,
+        circuit_breaker_available,
+    )
+)]
 pub(super) fn should_strip_tools_for_trio(
     is_local: bool,
     strict_no_tools_main: bool,
     router_probe_healthy: bool,
     circuit_breaker_available: bool,
 ) -> bool {
-    let result = is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
+    let result =
+        is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
     tracing::debug!(strip_tools = result, "trio_strip_decision");
     result
 }
@@ -141,7 +150,10 @@ pub(super) fn proactive_recall(user_message: &str) -> Option<String> {
         } else {
             hit.snippet.clone()
         };
-        output.push_str(&format!("**{}** (chunk {}): {}\n", hit.source_name, hit.chunk_idx, snippet));
+        output.push_str(&format!(
+            "**{}** (chunk {}): {}\n",
+            hit.source_name, hit.chunk_idx, snippet
+        ));
     }
 
     Some(output.trim_end().to_string())
@@ -165,11 +177,19 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
     // Strip trailing emoji (non-ASCII symbols like rust crab, smiley, etc.) and any surrounding
     // whitespace before checking the "real" last character — an emoji after a
     // period must not trigger continuation.
-    let stripped = trimmed.trim_end_matches(|c: char| !c.is_alphanumeric() && !c.is_ascii()).trim_end();
-    let text_for_check = if stripped.is_empty() { trimmed } else { stripped };
+    let stripped = trimmed
+        .trim_end_matches(|c: char| !c.is_alphanumeric() && !c.is_ascii())
+        .trim_end();
+    let text_for_check = if stripped.is_empty() {
+        trimmed
+    } else {
+        stripped
+    };
     let last_char = text_for_check.chars().last().unwrap();
-    let ends_mid_sentence = !matches!(last_char, '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']' | '}' | '`')
-        && !trimmed.ends_with("```");
+    let ends_mid_sentence = !matches!(
+        last_char,
+        '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']' | '}' | '`'
+    ) && !trimmed.ends_with("```");
 
     // Has unclosed backtick (odd number of backticks on the last line).
     // Exclude code fences (lines that are purely backticks, e.g. "```") —
