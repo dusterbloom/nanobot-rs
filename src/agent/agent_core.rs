@@ -203,6 +203,13 @@ pub struct RuntimeCounters {
     pub trio_state: AtomicU8,
     /// Per-domain ring buffer memory for specialist multi-turn context.
     pub specialist_memory: parking_lot::Mutex<crate::agent::router::SpecialistMemory>,
+    // --- Training observability ---
+    /// True while an ANE or HTTP training step is in progress.
+    pub training_active: AtomicBool,
+    /// Total training steps completed (ANE + HTTP combined).
+    pub training_steps_total: AtomicU64,
+    /// Timestamp (epoch ms) when the current training step started. 0 = idle.
+    pub training_started_ms: AtomicU64,
 }
 
 impl RuntimeCounters {
@@ -233,6 +240,9 @@ impl RuntimeCounters {
             specialist_memory: parking_lot::Mutex::new(
                 crate::agent::router::SpecialistMemory::default(),
             ),
+            training_active: AtomicBool::new(false),
+            training_steps_total: AtomicU64::new(0),
+            training_started_ms: AtomicU64::new(0),
         }
     }
 }

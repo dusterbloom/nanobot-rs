@@ -514,6 +514,39 @@ pub(crate) fn print_status_bar(
         parts.push(format!("{GREY}\u{1f9e0}{RESET}"));
     }
 
+    // Training status indicator
+    let train_total = core_handle
+        .counters
+        .training_steps_total
+        .load(Ordering::Relaxed);
+    if core_handle
+        .counters
+        .training_active
+        .load(Ordering::Relaxed)
+    {
+        let started = core_handle
+            .counters
+            .training_started_ms
+            .load(Ordering::Relaxed);
+        let elapsed_s = if started > 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            (now_ms.saturating_sub(started)) / 1000
+        } else {
+            0
+        };
+        parts.push(format!(
+            "{YELLOW}train:{BOLD}active{RESET}{DIM} ({}s, #{}){}",
+            elapsed_s,
+            train_total + 1,
+            RESET
+        ));
+    } else if train_total > 0 {
+        parts.push(format!("{DIM}train:#{train_total}{RESET}"));
+    }
+
     parts.push(format!("t:{}", turn));
 
     println!("  {}{}{}", DIM, parts.join(" | "), RESET);

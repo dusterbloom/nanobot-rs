@@ -742,4 +742,56 @@ impl ReplContext {
             }
         }
     }
+
+    /// /train — show ANE/HTTP training status.
+    pub(super) fn cmd_train_status(&self) {
+        let counters = &self.core_handle.counters;
+        let active = counters.training_active.load(Ordering::Relaxed);
+        let total = counters.training_steps_total.load(Ordering::Relaxed);
+        let started_ms = counters.training_started_ms.load(Ordering::Relaxed);
+
+        println!("\n  Training Status:");
+        if active {
+            let elapsed_s = if started_ms > 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                (now_ms.saturating_sub(started_ms)) / 1000
+            } else {
+                0
+            };
+            println!(
+                "    State:  \x1b[33mactive\x1b[0m (running for {}s)",
+                elapsed_s
+            );
+        } else {
+            println!("    State:  \x1b[32midle\x1b[0m");
+        }
+        println!("    Steps completed: {}", total);
+
+        // Show experience buffer stats if available.
+        if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
+            if let Ok(stats) = eb.stats() {
+                println!(
+                    "    Experiences: {} total, {} pending export",
+                    stats.total, stats.unexported
+                );
+            }
+        }
+
+        // Show perplexity gate config.
+        let pg = &self.config.perplexity_gate;
+        println!(
+            "    Perplexity gate: {}",
+            if pg.enabled { "enabled" } else { "disabled" }
+        );
+        if pg.enabled {
+            println!(
+                "    Surprise threshold: {}, min experiences: {}",
+                pg.surprise_threshold, pg.min_experiences
+            );
+        }
+        println!();
+    }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -66,6 +67,8 @@ pub(crate) struct DefaultLearnLoop {
     pub perplexity_gate_config: PerplexityGateConfig,
     #[cfg(feature = "mlx")]
     pub mlx_provider: Option<Arc<crate::providers::mlx::MlxProvider>>,
+    /// Runtime counters for training status visibility in TUI.
+    pub training_counters: Option<Arc<crate::agent::agent_core::RuntimeCounters>>,
 }
 
 impl DefaultLearnLoop {
@@ -150,6 +153,7 @@ impl LearnLoop for DefaultLearnLoop {
 
         let eb_mutex = self.experience_buffer.as_ref()?.clone();
         let pg_config = self.perplexity_gate_config.clone();
+        let train_counters = self.training_counters.clone();
 
         #[cfg(feature = "mlx")]
         let mlx_provider = self.mlx_provider.clone();
@@ -258,6 +262,7 @@ impl LearnLoop for DefaultLearnLoop {
                                 &eb_mutex,
                                 epochs,
                                 &pg_config.mlx_server_url,
+                                &train_counters,
                             )
                             .await;
                             return;
@@ -283,9 +288,29 @@ impl LearnLoop for DefaultLearnLoop {
                     }
                     if !samples.is_empty() {
                         let mlx_tx = mlx.model_tx();
-                        let _handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
+                        // Signal training start.
+                        if let Some(ref tc) = train_counters {
+                            tc.training_active.store(true, Ordering::Relaxed);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            tc.training_started_ms.store(now_ms, Ordering::Relaxed);
+                        }
+                        let tc_for_done = train_counters.clone();
+                        let handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
                             ane_cfg, samples, mlx_tx,
                         );
+                        // Spawn a watcher that clears training_active when the
+                        // ANE thread completes (runs on a blocking thread to avoid
+                        // tying up the async runtime).
+                        tokio::task::spawn_blocking(move || {
+                            let _ = handle.join();
+                            if let Some(ref tc) = tc_for_done {
+                                tc.training_active.store(false, Ordering::Relaxed);
+                                tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
                         let eb = eb_mutex.lock();
                         let _ = eb.mark_exported(&ids);
                         info!(
@@ -307,6 +332,7 @@ impl LearnLoop for DefaultLearnLoop {
                 &eb_mutex,
                 epochs,
                 &pg_config.mlx_server_url,
+                &train_counters,
             )
             .await;
         });
@@ -403,7 +429,18 @@ async fn try_http_train(
     eb_arc: &Arc<parking_lot::Mutex<ExperienceBuffer>>,
     epochs: usize,
     server_url: &str,
+    train_counters: &Option<Arc<crate::agent::agent_core::RuntimeCounters>>,
 ) {
+    // Signal training start.
+    if let Some(ref tc) = train_counters {
+        tc.training_active.store(true, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        tc.training_started_ms.store(now_ms, Ordering::Relaxed);
+    }
+
     let conversations: Vec<serde_json::Value> = exps_data
         .iter()
         .map(|(p, r)| {
@@ -420,12 +457,21 @@ async fn try_http_train(
         .build()
     {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            // Signal training done (failed to build client).
+            if let Some(ref tc) = train_counters {
+                tc.training_active.store(false, Ordering::Relaxed);
+            }
+            return;
+        }
     };
     match client.post(&url).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             let eb = eb_arc.lock();
             let _ = eb.mark_exported(ids);
+            if let Some(ref tc) = train_counters {
+                tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+            }
             info!(
                 "perplexity_gate: triggered HTTP training with {} experiences",
                 ids.len()
@@ -433,6 +479,10 @@ async fn try_http_train(
         }
         Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
         Err(e) => debug!("perplexity_gate: HTTP training failed: {e}"),
+    }
+    // Signal training done.
+    if let Some(ref tc) = train_counters {
+        tc.training_active.store(false, Ordering::Relaxed);
     }
 }
 
@@ -536,6 +586,7 @@ mod tests {
             perplexity_gate_config: PerplexityGateConfig::default(),
             #[cfg(feature = "mlx")]
             mlx_provider: None,
+            training_counters: None,
         };
         let outcome = make_test_outcome();
         // Should not panic even with no calibrator and audit disabled.

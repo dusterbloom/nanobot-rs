@@ -679,6 +679,9 @@ impl ReplContext {
             "/adapt" => {
                 self.cmd_adapt(arg).await;
             }
+            "/train" => {
+                self.cmd_train_status();
+            }
             "/skill" | "/skills" => {
                 self.cmd_skill(arg).await;
             }

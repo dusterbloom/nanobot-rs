@@ -416,6 +416,7 @@ pub(crate) fn print_help() {
     println!("  /provenance     - Toggle provenance display on/off");
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
     println!("  /adapt          - LoRA adapter management (status, run, scale)");
+    println!("  /train          - Show ANE/HTTP training status and experience stats");
     println!("  /skill, /sk     - Manage skills (list, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");

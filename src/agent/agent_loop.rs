@@ -218,6 +218,7 @@ impl AgentLoop {
                     perplexity_gate_config: Default::default(),
                     #[cfg(feature = "mlx")]
                     mlx_provider: None,
+                    training_counters: None,
                 })
             },
             #[cfg(feature = "cluster")]
@@ -242,6 +243,7 @@ impl AgentLoop {
                 perplexity_gate_config: s.perplexity_gate_config.clone(),
                 #[cfg(feature = "mlx")]
                 mlx_provider: s.mlx_provider.clone(),
+                training_counters: Some(s.core_handle.counters.clone()),
             });
         }
 
@@ -268,6 +270,7 @@ impl AgentLoop {
             perplexity_gate_config: shared.perplexity_gate_config.clone(),
             #[cfg(feature = "mlx")]
             mlx_provider: shared.mlx_provider.clone(),
+            training_counters: Some(shared.core_handle.counters.clone()),
         });
     }
 
@@ -283,6 +286,7 @@ impl AgentLoop {
             experience_buffer: shared.experience_buffer.clone(),
             perplexity_gate_config: shared.perplexity_gate_config.clone(),
             mlx_provider: Some(provider),
+            training_counters: Some(shared.core_handle.counters.clone()),
         });
     }
 
