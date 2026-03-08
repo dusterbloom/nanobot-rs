@@ -463,9 +463,13 @@ pub struct ModelConfig {
     /// Layer indices that use linear (Mamba) attention instead of full attention.
     /// Empty for pure-transformer models like Qwen3.
     pub linear_attn_indices: Vec<usize>,
-    /// Linear attention head config (only used when linear_attn_indices is non-empty)
+    /// Linear attention key head config (only used when linear_attn_indices is non-empty)
     pub linear_n_heads: usize,
     pub linear_head_dim: usize,
+    /// Linear attention value head config.  Defaults to key config when equal
+    /// (Qwen3.5-2B), but can differ (Qwen3.5-9B: 32 value heads vs 16 key heads).
+    pub linear_n_value_heads: usize,
+    pub linear_value_head_dim: usize,
     pub conv_kernel_size: usize,
     /// Thinking model: use /nothink system instruction instead of empty think prefill
     pub thinking_model: bool,
@@ -491,6 +495,8 @@ impl ModelConfig {
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
         }
@@ -515,6 +521,8 @@ impl ModelConfig {
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: false,
         }
@@ -539,6 +547,8 @@ impl ModelConfig {
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
         }
@@ -563,6 +573,8 @@ impl ModelConfig {
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
         }
@@ -589,6 +601,8 @@ impl ModelConfig {
             linear_attn_indices: linear_indices,
             linear_n_heads: 16,
             linear_head_dim: 128,
+            linear_n_value_heads: 16,
+            linear_value_head_dim: 128,
             conv_kernel_size: 4,
             thinking_model: false,
         }
@@ -700,14 +714,21 @@ impl ModelConfig {
 
         let linear_n_heads = tc
             .get("linear_num_key_heads")
-            .or_else(|| tc.get("linear_num_value_heads"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
         let linear_head_dim = tc
             .get("linear_key_head_dim")
-            .or_else(|| tc.get("linear_value_head_dim"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        // Value heads can differ from key heads (e.g. Qwen3.5-9B: 32 vs 16).
+        let linear_n_value_heads = tc
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_head_dim as u64) as usize;
         let conv_kernel_size = tc
             .get("linear_conv_kernel_dim")
             .and_then(|v| v.as_u64())
@@ -755,9 +776,32 @@ impl ModelConfig {
             linear_attn_indices,
             linear_n_heads,
             linear_head_dim,
+            linear_n_value_heads,
+            linear_value_head_dim,
             conv_kernel_size,
             thinking_model,
         })
+    }
+
+    /// Convert to the ANE-compatible MilConfig used by the training pipeline.
+    #[cfg(feature = "ane")]
+    pub fn to_mil_config(&self, seq_len: usize) -> super::ane_mil::MilConfig {
+        super::ane_mil::MilConfig {
+            dim: self.dim,
+            hidden_dim: self.hidden_dim,
+            n_heads: self.n_heads,
+            seq_len,
+            n_kv_heads: self.n_kv_heads,
+            rope_theta: self.rope_theta as f64,
+            rms_eps: self.rms_eps,
+            has_lm_head: false,
+            linear_attn_indices: self.linear_attn_indices.clone(),
+            linear_n_heads: self.linear_n_heads,
+            linear_head_dim: self.linear_head_dim,
+            linear_n_value_heads: self.linear_n_value_heads,
+            linear_value_head_dim: self.linear_value_head_dim,
+            conv_kernel_size: self.conv_kernel_size,
+        }
     }
 
     pub fn rope_dims(&self) -> i32 {
@@ -1536,8 +1580,13 @@ pub struct MlxLinearAttention {
     pub a_log: Param<Array>,
     pub dt_bias: Param<Array>,
     pub norm: RmsNorm,
+    /// Number of key/query heads (may differ from value heads in GQA-style GDN).
     pub n_heads: i32,
     pub head_dim: i32,
+    /// Number of value heads — the recurrence runs with this many heads.
+    /// K/Q are repeated n_value_heads/n_heads times to match.
+    pub n_value_heads: i32,
+    pub value_head_dim: i32,
     pub conv_kernel: i32,
 }
 
@@ -1567,6 +1616,8 @@ impl MlxLinearAttention {
             norm: load_rms_norm(weights, &format!("{prefix}.norm"), cfg.rms_eps)?,
             n_heads: cfg.linear_n_heads as i32,
             head_dim: cfg.linear_head_dim as i32,
+            n_value_heads: cfg.linear_n_value_heads as i32,
+            value_head_dim: cfg.linear_value_head_dim as i32,
             conv_kernel: cfg.conv_kernel_size as i32,
         };
         attn.freeze_parameters(true);
@@ -1583,23 +1634,24 @@ impl MlxLinearAttention {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
-        let h = self.n_heads;
-        let d = self.head_dim;
-        let key_dim = h * d; // 2048 for Qwen3.5-2B
+        let h_k = self.n_heads; // key/query heads
+        let d_k = self.head_dim; // key/query head dim
+        let h_v = self.n_value_heads; // value heads (recurrence runs at this count)
+        let d_v = self.value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let kv_repeat = h_v / h_k; // GQA repeat factor (1 when symmetric)
 
         // 1. Project QKV, alpha, beta, z
-        let qkv = self.in_proj_qkv.forward(x)?; // [B, L, key_dim*2 + value_dim]
-        let a = self.in_proj_a.forward(x)?; // [B, L, H]
-        let b = self.in_proj_b.forward(x)?; // [B, L, H]
+        let qkv = self.in_proj_qkv.forward(x)?; // [B, L, 2*key_dim + value_dim]
+        let a = self.in_proj_a.forward(x)?; // [B, L, H_v]
+        let b = self.in_proj_b.forward(x)?; // [B, L, H_v]
 
         // 2. Causal depthwise conv1d on QKV
-        //    Weight shape from safetensors: [conv_dim, kernel, 1] (depthwise: groups=conv_dim)
-        let conv_dim = qkv.shape()[2]; // key_dim*2 + value_dim
+        let conv_dim = qkv.shape()[2];
         let kernel = self.conv_kernel;
-        // Left-pad for causal convolution (kernel-1 on left, 0 on right)
         let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
         let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
-        // Depthwise conv1d: groups = conv_dim, weight [conv_dim, kernel, 1]
         let qkv_conv = mlx_rs::ops::conv1d(
             &qkv_padded,
             &*self.conv1d_weight,
@@ -1610,83 +1662,86 @@ impl MlxLinearAttention {
         )?;
         let qkv_conv = nn::silu(&qkv_conv)?;
 
-        // 3. Split into Q, K, V (NOT equal thirds)
+        // 3. Split into Q, K, V — Q and K share key_dim, V uses value_dim
         let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
-        let q = parts[0].reshape(&[batch, seq_len, h, d])?;
-        let k = parts[1].reshape(&[batch, seq_len, h, d])?;
-        let v = parts[2].reshape(&[batch, seq_len, h, d])?;
+        let q = parts[0].reshape(&[batch, seq_len, h_k, d_k])?;
+        let k = parts[1].reshape(&[batch, seq_len, h_k, d_k])?;
+        let v = parts[2].reshape(&[batch, seq_len, h_v, d_v])?;
 
-        // 4. QK RMS normalization (weight-free, just normalize)
-        let inv_scale = (d as f32).powf(-0.5);
-        let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
-        let q_flat = q.reshape(&[-1, d])?;
-        let k_flat = k.reshape(&[-1, d])?;
+        // 4. QK RMS normalization (weight-free)
+        let inv_scale = (d_k as f32).powf(-0.5);
+        let ones_d = mlx_rs::ops::ones::<f32>(&[d_k])?;
+        let q_flat = q.reshape(&[-1, d_k])?;
+        let k_flat = k.reshape(&[-1, d_k])?;
         let q_norm =
-            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
+            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
         let k_norm =
-            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
-        let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
-        let k = k_norm.multiply(array!(inv_scale))?;
+            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
+
+        // GQA-style repeat K/Q to match value head count
+        let (q, k) = if kv_repeat > 1 {
+            // [B, L, H_k, D_k] → [B, L, H_k, 1, D_k] → [B, L, H_k, R, D_k] → [B, L, H_v, D_k]
+            let q_exp = mlx_rs::ops::broadcast_to(
+                &q_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            let k_exp = mlx_rs::ops::broadcast_to(
+                &k_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            (q_exp, k_exp)
+        } else {
+            (q_norm, k_norm)
+        };
+        let q = q.multiply(Array::from_f32(inv_scale * inv_scale))?;
+        let k = k.multiply(Array::from_f32(inv_scale))?;
 
         // 5. Compute decay g and write gate beta
-        //    g = exp(-exp(A_log) * softplus(a + dt_bias))
-        let a_plus_bias = a.add(&*self.dt_bias)?; // [B, L, H]
+        let a_plus_bias = a.add(&*self.dt_bias)?; // [B, L, H_v]
         let sp = nn::softplus(&a_plus_bias)?;
         let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
-        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?; // [B, L, H]
-        let beta = nn::sigmoid(&b)?; // [B, L, H]
+        let g = mlx_rs::ops::exp(&decay_rate.negative()?)?; // [B, L, H_v]
+        let beta = nn::sigmoid(&b)?; // [B, L, H_v]
 
-        // 6. Gated delta recurrence
-        //    State: [B, H, D_v, D_k] — we accumulate outer products
-        let mut state = mlx_rs::ops::zeros::<f32>(&[batch, h, d, d])?;
+        // 6. Gated delta recurrence — state: [B, H_v, D_v, D_k]
+        let mut state = mlx_rs::ops::zeros::<f32>(&[batch, h_v, d_v, d_k])?;
         let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            // Slice [B, H] for this timestep
-            let g_t = g.index((.., t, ..)); // [B, H]
-            let beta_t = beta.index((.., t, ..)); // [B, H]
-            let q_t = q.index((.., t, .., ..)); // [B, H, D]
-            let k_t = k.index((.., t, .., ..)); // [B, H, D]
-            let v_t = v.index((.., t, .., ..)); // [B, H, D]
+            let g_t = g.index((.., t, ..)).reshape(&[batch, h_v, 1, 1])?;
+            let beta_t = beta.index((.., t, ..)).reshape(&[batch, h_v, 1])?;
+            let q_t = q.index((.., t, .., ..)); // [B, H_v, D_k]
+            let k_t = k.index((.., t, .., ..)); // [B, H_v, D_k]
+            let v_t = v.index((.., t, .., ..)); // [B, H_v, D_v]
 
-            // state *= g (broadcast [B, H, 1, 1])
-            let g_t = g_t.reshape(&[batch, h, 1, 1])?;
             state = state.multiply(&g_t)?;
-
-            // kv_mem = (state * k[..., None, :]).sum(-1) → [B, H, D_v]
-            let k_expanded = k_t.expand_dims(-2)?; // [B, H, 1, D_k]
-            let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
-
-            // delta = (v - kv_mem) * beta[..., None]
-            let beta_t = beta_t.reshape(&[batch, h, 1])?;
-            let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?; // [B, H, D_v]
-
-            // state += k[..., None, :] * delta[..., :, None]  (outer product update)
-            let delta_expanded = delta.expand_dims(-1)?; // [B, H, D_v, 1]
+            let k_expanded = k_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
+            let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
+            let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?;
+            let delta_expanded = delta.expand_dims(-1)?; // [B, H_v, D_v, 1]
             state = state.add(&k_expanded.multiply(&delta_expanded)?)?;
-
-            // y_t = (state * q[..., None, :]).sum(-1) → [B, H, D_v]
-            let q_expanded = q_t.expand_dims(-2)?; // [B, H, 1, D_k]
-            let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H, D_v]
+            let q_expanded = q_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
+            let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
             outputs.push(y_t);
         }
 
-        // Stack: [B, H, D_v] * L → [B, L, H, D_v]
-        let y = mlx_rs::ops::stack_axis(&outputs, 1)?; // [B, L, H, D]
+        // Stack: [B, H_v, D_v] * L → [B, L, H_v, D_v]
+        let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
 
-        // 7. RMSNormGated: rms_norm(out) on last dim (D), then silu(z) * normed
-        //    z is [B, L, H, D], norm weight is [D=128]
+        // 7. RMSNormGated: norm on last dim (D_v), then silu(z) * normed
         let z = self
             .in_proj_z
             .forward(x)?
-            .reshape(&[batch, seq_len, h, d])?;
-        let y_flat = y.reshape(&[-1, d])?;
+            .reshape(&[batch, seq_len, h_v, d_v])?;
+        let y_flat = y.reshape(&[-1, d_v])?;
         let y_normed = self
             .norm
             .forward(&y_flat)?
-            .reshape(&[batch, seq_len, h, d])?;
+            .reshape(&[batch, seq_len, h_v, d_v])?;
         let y = nn::silu(&z)?.multiply(&y_normed)?;
-        let y = y.reshape(&[batch, seq_len, h * d])?;
+        let y = y.reshape(&[batch, seq_len, value_dim])?;
 
         self.out_proj.forward(&y)
     }
@@ -1702,9 +1757,12 @@ impl MlxLinearAttention {
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
-        let h = self.n_heads;
-        let d = self.head_dim;
-        let key_dim = h * d;
+        let h_k = self.n_heads;
+        let d_k = self.head_dim;
+        let h_v = self.n_value_heads;
+        let d_v = self.value_head_dim;
+        let key_dim = h_k * d_k;
+        let kv_repeat = h_v / h_k;
 
         // 1. Project QKV, alpha, beta, z
         let qkv = self.in_proj_qkv.forward(x)?;
@@ -1715,18 +1773,13 @@ impl MlxLinearAttention {
 
         // 2. Conv1d — different path for prefill vs decode
         let qkv_conv = if seq_len == 1 {
-            // Decode: use conv buffer (circular)
-            // conv_buf: [B, kernel-1, conv_dim], qkv: [B, 1, conv_dim]
             let buf = if let Some(ref cb) = cache.conv_buf {
-                // Append new input, drop oldest
-                let combined = mlx_rs::ops::concatenate_axis(&[cb, &qkv], 1)?; // [B, kernel, conv_dim]
-                                                                               // Keep last kernel-1 for next step
+                let combined = mlx_rs::ops::concatenate_axis(&[cb, &qkv], 1)?;
                 let new_buf = combined.index((.., 1.., ..));
                 new_buf.eval()?;
                 cache.conv_buf = Some(new_buf);
                 combined
             } else {
-                // First step without prefill — zero-pad
                 let zeros = mlx_rs::ops::zeros::<f32>(&[batch, kernel - 1, conv_dim])?;
                 let combined = mlx_rs::ops::concatenate_axis(&[&zeros, &qkv], 1)?;
                 let new_buf = combined.index((.., 1.., ..));
@@ -1734,7 +1787,6 @@ impl MlxLinearAttention {
                 cache.conv_buf = Some(new_buf);
                 combined
             };
-            // buf is [B, kernel, conv_dim] — apply depthwise conv1d (no padding needed)
             let conv_out = mlx_rs::ops::conv1d(
                 &buf,
                 &*self.conv1d_weight,
@@ -1743,10 +1795,8 @@ impl MlxLinearAttention {
                 None,
                 conv_dim as i32,
             )?;
-            // conv1d output: [B, 1, conv_dim] (kernel input → 1 output)
             nn::silu(&conv_out)?
         } else {
-            // Prefill: standard causal conv1d with left-padding
             let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
             let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
             let qkv_conv = mlx_rs::ops::conv1d(
@@ -1757,7 +1807,6 @@ impl MlxLinearAttention {
                 None,
                 conv_dim as i32,
             )?;
-            // Save last kernel-1 inputs as conv buffer for future decode
             let start = seq_len - (kernel - 1);
             let conv_tail = qkv.index((.., start.., ..));
             conv_tail.eval()?;
@@ -1765,22 +1814,38 @@ impl MlxLinearAttention {
             nn::silu(&qkv_conv)?
         };
 
-        // 3. Split Q, K, V + normalize
+        // 3. Split Q, K, V + normalize + GQA repeat
         let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
-        let q = parts[0].reshape(&[batch, seq_len, h, d])?;
-        let k = parts[1].reshape(&[batch, seq_len, h, d])?;
-        let v = parts[2].reshape(&[batch, seq_len, h, d])?;
+        let q = parts[0].reshape(&[batch, seq_len, h_k, d_k])?;
+        let k = parts[1].reshape(&[batch, seq_len, h_k, d_k])?;
+        let v = parts[2].reshape(&[batch, seq_len, h_v, d_v])?;
 
-        let inv_scale = (d as f32).powf(-0.5);
-        let ones_d = mlx_rs::ops::ones::<f32>(&[d])?;
-        let q_flat = q.reshape(&[-1, d])?;
-        let k_flat = k.reshape(&[-1, d])?;
+        let inv_scale = (d_k as f32).powf(-0.5);
+        let ones_d = mlx_rs::ops::ones::<f32>(&[d_k])?;
+        let q_flat = q.reshape(&[-1, d_k])?;
+        let k_flat = k.reshape(&[-1, d_k])?;
         let q_norm =
-            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
+            mlx_rs::fast::rms_norm(&q_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
         let k_norm =
-            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h, d])?;
-        let q = q_norm.multiply(array!(inv_scale * inv_scale))?;
-        let k = k_norm.multiply(array!(inv_scale))?;
+            mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
+
+        let (q, k) = if kv_repeat > 1 {
+            let q_exp = mlx_rs::ops::broadcast_to(
+                &q_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            let k_exp = mlx_rs::ops::broadcast_to(
+                &k_norm.expand_dims(3)?,
+                &[batch, seq_len, h_k, kv_repeat, d_k],
+            )?
+            .reshape(&[batch, seq_len, h_v, d_k])?;
+            (q_exp, k_exp)
+        } else {
+            (q_norm, k_norm)
+        };
+        let q = q.multiply(Array::from_f32(inv_scale * inv_scale))?;
+        let k = k.multiply(Array::from_f32(inv_scale))?;
 
         // 4. Decay and beta gates
         let a_plus_bias = a.add(&*self.dt_bias)?;
@@ -1789,16 +1854,16 @@ impl MlxLinearAttention {
         let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;
         let beta = nn::sigmoid(&b)?;
 
-        // 5. Recurrence with state caching
+        // 5. Recurrence with state caching — state: [B, H_v, D_v, D_k]
         let mut state = cache
             .state
             .take()
-            .unwrap_or_else(|| mlx_rs::ops::zeros::<f32>(&[batch, h, d, d]).unwrap());
+            .unwrap_or_else(|| mlx_rs::ops::zeros::<f32>(&[batch, h_v, d_v, d_k]).unwrap());
         let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            let g_t = g.index((.., t, ..)).reshape(&[batch, h, 1, 1])?;
-            let beta_t = beta.index((.., t, ..)).reshape(&[batch, h, 1])?;
+            let g_t = g.index((.., t, ..)).reshape(&[batch, h_v, 1, 1])?;
+            let beta_t = beta.index((.., t, ..)).reshape(&[batch, h_v, 1])?;
             let q_t = q.index((.., t, .., ..));
             let k_t = k.index((.., t, .., ..));
             let v_t = v.index((.., t, .., ..));
@@ -1820,17 +1885,18 @@ impl MlxLinearAttention {
 
         // 6. Stack + RMSNormGated + out_proj
         let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
+        let value_dim = h_v * d_v;
         let z = self
             .in_proj_z
             .forward(x)?
-            .reshape(&[batch, seq_len, h, d])?;
-        let y_flat = y.reshape(&[-1, d])?;
+            .reshape(&[batch, seq_len, h_v, d_v])?;
+        let y_flat = y.reshape(&[-1, d_v])?;
         let y_normed = self
             .norm
             .forward(&y_flat)?
-            .reshape(&[batch, seq_len, h, d])?;
+            .reshape(&[batch, seq_len, h_v, d_v])?;
         let y = nn::silu(&z)?.multiply(&y_normed)?;
-        let y = y.reshape(&[batch, seq_len, h * d])?;
+        let y = y.reshape(&[batch, seq_len, value_dim])?;
 
         self.out_proj.forward(&y)
     }

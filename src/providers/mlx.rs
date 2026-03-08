@@ -128,6 +128,11 @@ mod inner {
     }
 
     impl MlxProvider {
+        /// Full model directory path (e.g. `~/.cache/lm-studio/models/...`).
+        pub fn model_path(&self) -> &str {
+            &self.model_path
+        }
+
         /// Start the model worker thread and return the provider.
         ///
         /// The model is loaded once (~2GB for 8-bit Qwen3.5-2B) and serves
