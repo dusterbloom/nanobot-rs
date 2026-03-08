@@ -771,23 +771,31 @@ impl ReplContext {
             }
         }
 
-        // Show perplexity gate config.
+        // Show perplexity gate config (use runtime state, not persisted config,
+        // because core_builder auto-enables the gate for MLX).
         let pg = &self.config.perplexity_gate;
+        let runtime_enabled = self.agent_loop.has_perplexity_gate();
         println!(
             "    Perplexity gate: {}",
-            if pg.enabled { "enabled" } else { "disabled" }
+            if runtime_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
-        if pg.enabled {
-            let effective = (pg.surprise_threshold).min(1.0);
-            if pg.surprise_threshold > 1.0 {
+        if runtime_enabled {
+            let raw = pg.surprise_threshold as f64;
+            let effective = if raw > 1.0 { 0.3 } else { raw.clamp(0.0, 1.0) };
+            if raw > 1.0 || raw < 0.0 {
                 println!(
-                    "    Surprise threshold: {} \x1b[33m→ clamped to {}\x1b[0m (heuristic range 0.0–1.0), min experiences: {}",
-                    pg.surprise_threshold, effective, pg.min_experiences
+                    "    Surprise threshold: {} \x1b[33m→ effective {}\x1b[0m (heuristic range 0.0–1.0), min experiences: {}",
+                    pg.surprise_threshold, effective, pg.min_experiences.max(1)
                 );
             } else {
                 println!(
                     "    Surprise threshold: {}, min experiences: {}",
-                    pg.surprise_threshold, pg.min_experiences
+                    pg.surprise_threshold,
+                    pg.min_experiences.max(1)
                 );
             }
         }

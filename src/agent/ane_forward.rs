@@ -95,8 +95,16 @@ pub fn cpu_gemm(
             for ni in 0..n {
                 let mut acc = 0.0f32;
                 for ki in 0..k {
-                    let av = if trans_a { a[ki * m + mi] } else { a[mi * k + ki] };
-                    let bv = if trans_b { b[ni * k + ki] } else { b[ki * n + ni] };
+                    let av = if trans_a {
+                        a[ki * m + mi]
+                    } else {
+                        a[mi * k + ki]
+                    };
+                    let bv = if trans_b {
+                        b[ni * k + ki]
+                    } else {
+                        b[ki * n + ni]
+                    };
                     acc += av * bv;
                 }
                 c[mi * n + ni] += alpha * acc;
@@ -703,6 +711,22 @@ pub fn forward_with_lora<T: TokenId>(
 // exceeds IOSurface limits, and for correctness testing)
 // ---------------------------------------------------------------------------
 
+const QUANTIZED_MATMUL_ROW_BLOCK: usize = 128;
+
+#[derive(Default)]
+pub(crate) struct QuantizedMatmulWorkspace {
+    dense_block: Vec<f32>,
+}
+
+impl QuantizedMatmulWorkspace {
+    fn ensure_dense_block(&mut self, needed: usize) -> &mut [f32] {
+        if self.dense_block.len() < needed {
+            self.dense_block.resize(needed, 0.0);
+        }
+        &mut self.dense_block[..needed]
+    }
+}
+
 /// CPU matmul: out[M,S] = W[M,N] @ x[N,S] (row-major W, channels-first x).
 ///
 /// Uses Apple Accelerate SGEMM on macOS (25-300x faster than naive).
@@ -711,6 +735,176 @@ pub fn cpu_matmul(w: &[f32], x: &[f32], m: usize, n: usize, s: usize) -> Vec<f32
     debug_assert_eq!(x.len(), n * s);
     let mut out = vec![0.0f32; m * s];
     cpu_gemm(&mut out, w, false, x, false, m, s, n, 1.0, 0.0);
+    out
+}
+
+fn dequantize_row_block(
+    w: &ane_weights::QuantizedTensor,
+    row_start: usize,
+    row_count: usize,
+    out: &mut [f32],
+) {
+    debug_assert!(row_start + row_count <= w.rows);
+    debug_assert_eq!(out.len(), row_count * w.cols);
+
+    let n_groups = w.cols / w.group_size;
+    for local_row in 0..row_count {
+        let row = row_start + local_row;
+        let data_row = &w.data[row * w.cols..(row + 1) * w.cols];
+        let out_row = &mut out[local_row * w.cols..(local_row + 1) * w.cols];
+        for col in 0..w.cols {
+            let group = col / w.group_size;
+            let scale = w.scales[row * n_groups + group];
+            let bias = w.biases[row * n_groups + group];
+            out_row[col] = scale * data_row[col] as f32 + bias;
+        }
+    }
+}
+
+pub(crate) fn cpu_quantized_matmul_into(
+    w: &ane_weights::QuantizedTensor,
+    x: &[f32],
+    s: usize,
+    out: &mut [f32],
+    workspace: &mut QuantizedMatmulWorkspace,
+) {
+    debug_assert_eq!(x.len(), w.cols * s);
+    debug_assert_eq!(out.len(), w.rows * s);
+
+    let block_rows = QUANTIZED_MATMUL_ROW_BLOCK.min(w.rows.max(1));
+    for row_start in (0..w.rows).step_by(block_rows) {
+        let row_count = (w.rows - row_start).min(block_rows);
+        let dense_block = workspace.ensure_dense_block(row_count * w.cols);
+        dequantize_row_block(w, row_start, row_count, dense_block);
+        cpu_gemm(
+            &mut out[row_start * s..(row_start + row_count) * s],
+            dense_block,
+            false,
+            x,
+            false,
+            row_count,
+            s,
+            w.cols,
+            1.0,
+            0.0,
+        );
+    }
+}
+
+/// Quantized CPU matmul: out[rows, s] = dequantize(W[rows, cols]) @ x[cols, s].
+///
+/// The weight matrix is dequantized in row blocks so we avoid materializing the
+/// full dense matrix for each projection.
+pub fn cpu_quantized_matmul(w: &ane_weights::QuantizedTensor, x: &[f32], s: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), w.cols * s);
+
+    let mut out = vec![0.0f32; w.rows * s];
+    let mut workspace = QuantizedMatmulWorkspace::default();
+    cpu_quantized_matmul_into(w, x, s, &mut out, &mut workspace);
+
+    out
+}
+
+pub(crate) fn cpu_quantized_matmul_lhs_transposed_into(
+    w: &ane_weights::QuantizedTensor,
+    x: &[f32],
+    s: usize,
+    out: &mut [f32],
+    workspace: &mut QuantizedMatmulWorkspace,
+    accumulate: bool,
+) {
+    debug_assert_eq!(x.len(), w.rows * s);
+    debug_assert_eq!(out.len(), w.cols * s);
+
+    let block_rows = QUANTIZED_MATMUL_ROW_BLOCK.min(w.rows.max(1));
+    let mut first_block = !accumulate;
+
+    for row_start in (0..w.rows).step_by(block_rows) {
+        let row_count = (w.rows - row_start).min(block_rows);
+        let dense_block = workspace.ensure_dense_block(row_count * w.cols);
+        dequantize_row_block(w, row_start, row_count, dense_block);
+        cpu_gemm(
+            out,
+            dense_block,
+            true,
+            &x[row_start * s..(row_start + row_count) * s],
+            false,
+            w.cols,
+            s,
+            row_count,
+            1.0,
+            if first_block { 0.0 } else { 1.0 },
+        );
+        first_block = false;
+    }
+}
+
+/// Quantized CPU matmul with a transposed left-hand matrix:
+/// out[cols, s] = dequantize(W[rows, cols])^T @ x[rows, s].
+///
+/// This mirrors `cpu_matmul_lhs_transposed` while avoiding full dense weight
+/// materialization for quantized weights.
+pub fn cpu_quantized_matmul_lhs_transposed(
+    w: &ane_weights::QuantizedTensor,
+    x: &[f32],
+    s: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), w.rows * s);
+
+    let mut out = vec![0.0f32; w.cols * s];
+    let mut workspace = QuantizedMatmulWorkspace::default();
+    cpu_quantized_matmul_lhs_transposed_into(w, x, s, &mut out, &mut workspace, false);
+
+    out
+}
+
+/// Collapse expanded GQA activations or gradients back to KV-head layout by
+/// summing repeated head blocks.
+pub fn collapse_grouped_kv_rows(
+    expanded: &[f32],
+    kv_rows: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    seq: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(expanded.len(), kv_rows * heads_per_group * seq);
+    if heads_per_group <= 1 {
+        return expanded.to_vec();
+    }
+
+    let n_kv_heads = kv_rows / head_dim;
+    let mut collapsed = vec![0.0f32; kv_rows * seq];
+    for kv_head in 0..n_kv_heads {
+        for rep in 0..heads_per_group {
+            let src_head = kv_head * heads_per_group + rep;
+            for d in 0..head_dim {
+                let src_row = src_head * head_dim + d;
+                let dst_row = kv_head * head_dim + d;
+                for t in 0..seq {
+                    collapsed[dst_row * seq + t] += expanded[src_row * seq + t];
+                }
+            }
+        }
+    }
+    collapsed
+}
+
+/// CPU matmul with a transposed left-hand matrix:
+/// out[cols, s] = w[rows, cols]^T @ x[rows, s].
+///
+/// This avoids materializing an explicit transposed copy of frozen weights in
+/// backward passes.
+pub fn cpu_matmul_lhs_transposed(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    s: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), rows * s);
+    let mut out = vec![0.0f32; cols * s];
+    cpu_gemm(&mut out, w, true, x, false, cols, s, rows, 1.0, 0.0);
     out
 }
 
@@ -982,20 +1176,42 @@ fn gdn_recurrence(
                 let v_t = v_raw[(h * d_v + dv) * seq + t];
                 let delta = (v_t - kv_mem) * beta_t;
                 for dk in 0..d_k {
-                    state[h * d_v * d_k + dv * d_k + dk] +=
-                        k_exp[(h * d_k + dk) * seq + t] * delta;
+                    state[h * d_v * d_k + dv * d_k + dk] += k_exp[(h * d_k + dk) * seq + t] * delta;
                 }
             }
             for dv in 0..d_v {
                 let mut y_val = 0.0f32;
                 for dk in 0..d_k {
-                    y_val +=
-                        state[h * d_v * d_k + dv * d_k + dk] * q_exp[(h * d_k + dk) * seq + t];
+                    y_val += state[h * d_v * d_k + dv * d_k + dk] * q_exp[(h * d_k + dk) * seq + t];
                 }
                 y[(h * d_v + dv) * seq + t] = y_val;
             }
         }
     }
+}
+
+/// Benchmark/helper entrypoint that runs the production GDN recurrence kernel.
+///
+/// Intended for microbenchmarks that want to time the exact recurrence used by
+/// the CPU GDN path without reimplementing the kernel in another crate.
+#[doc(hidden)]
+pub fn cpu_gdn_recurrence_bench(
+    q_exp: &[f32],
+    k_exp: &[f32],
+    v_raw: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    h_v: usize,
+    d_k: usize,
+    d_v: usize,
+    seq: usize,
+) -> Vec<f32> {
+    let mut state = vec![0.0f32; h_v * d_v * d_k];
+    let mut y = vec![0.0f32; h_v * d_v * seq];
+    gdn_recurrence(
+        &mut state, &mut y, q_exp, k_exp, v_raw, g, beta, h_v, d_k, d_v, seq,
+    );
+    y
 }
 
 /// CPU GDN (Gated Delta Net) forward for a single layer.
@@ -1004,13 +1220,19 @@ fn gdn_recurrence(
 /// Layout: channels-first `[C, S]` (no batch dimension).
 ///
 /// Returns the attention output `[dim, seq]` (before Wo residual add).
-fn cpu_gdn_forward(
-    gdn: &ane_weights::GdnLayerWeights,
-    xnorm: &[f32],     // [dim, seq] pre-attention-norm input
+fn cpu_gdn_forward_post_proj(
+    qkv_raw: &[f32], // [qkv_dim, seq]
+    a_raw: &[f32],   // [h_v, seq]
+    b_raw: &[f32],   // [h_v, seq]
+    z: &[f32],       // [value_dim, seq]
+    a_log: &[f32],   // [h_v]
+    dt_bias: &[f32], // [h_v]
+    norm_weight: &[f32],
+    conv_weight: &[f32], // [qkv_dim, kernel_size]
+    conv_bias: &[f32],   // [qkv_dim]
     cfg: &MilConfig,
+    apply_o_proj: impl FnOnce(&[f32]) -> Vec<f32>,
 ) -> Vec<f32> {
-    let dim = cfg.dim;
-    let seq = cfg.seq_len;
     let h_k = cfg.linear_n_heads;
     let d_k = cfg.linear_head_dim;
     let h_v = cfg.linear_n_value_heads;
@@ -1020,13 +1242,22 @@ fn cpu_gdn_forward(
     let qkv_dim = 2 * key_dim + value_dim;
     let kernel = cfg.conv_kernel_size;
     let kv_repeat = h_v / h_k.max(1);
+    let seq = cfg.seq_len;
 
-    // 1. Project QKV, a, b  —  all [out, seq] channels-first
-    let qkv_raw = cpu_matmul(&gdn.qkv_proj, xnorm, qkv_dim, dim, seq); // [qkv_dim, seq]
-    let a_raw = cpu_matmul(&gdn.a_proj, xnorm, h_v, dim, seq);         // [Hv, seq]
-    let b_raw = cpu_matmul(&gdn.b_proj, xnorm, h_v, dim, seq);         // [Hv, seq]
+    debug_assert_eq!(qkv_raw.len(), qkv_dim * seq);
+    debug_assert_eq!(a_raw.len(), h_v * seq);
+    debug_assert_eq!(b_raw.len(), h_v * seq);
+    debug_assert_eq!(z.len(), value_dim * seq);
+    debug_assert_eq!(a_log.len(), h_v);
+    debug_assert_eq!(dt_bias.len(), h_v);
+    assert!(
+        norm_weight.len() == d_v || norm_weight.len() == value_dim,
+        "GDN norm weight must have length d_v ({d_v}) or value_dim ({value_dim}), got {}",
+        norm_weight.len()
+    );
+    debug_assert_eq!(conv_weight.len(), qkv_dim * kernel);
 
-    // 2. Causal depthwise conv1d + SiLU on QKV
+    // 1. Causal depthwise conv1d + SiLU on QKV
     //    Input: [qkv_dim, seq], kernel: [qkv_dim, kernel_size] (depthwise)
     //    Left-pad by kernel-1 zeros, then for each channel: sum over kernel window
     let mut qkv_conv = vec![0.0f32; qkv_dim * seq];
@@ -1040,11 +1271,11 @@ fn cpu_gdn_forward(
                 } else {
                     0.0 // left-pad with zeros
                 };
-                acc += val * gdn.conv_weight[c * kernel + ki];
+                acc += val * conv_weight[c * kernel + ki];
             }
             // Add bias if present
-            if c < gdn.conv_bias.len() {
-                acc += gdn.conv_bias[c];
+            if c < conv_bias.len() {
+                acc += conv_bias[c];
             }
             // SiLU activation
             qkv_conv[c * seq + t] = acc / (1.0 + (-acc).exp());
@@ -1077,8 +1308,7 @@ fn cpu_gdn_forward(
             for d in 0..d_k {
                 q[(h * d_k + d) * seq + t] =
                     q_raw[(h * d_k + d) * seq + t] / q_rms * inv_scale * inv_scale;
-                k[(h * d_k + d) * seq + t] =
-                    k_raw[(h * d_k + d) * seq + t] / k_rms * inv_scale;
+                k[(h * d_k + d) * seq + t] = k_raw[(h * d_k + d) * seq + t] / k_rms * inv_scale;
             }
         }
     }
@@ -1110,10 +1340,14 @@ fn cpu_gdn_forward(
     let mut g = vec![0.0f32; h_v * seq];
     let mut beta = vec![0.0f32; h_v * seq];
     for h in 0..h_v {
-        let exp_a_log = gdn.a_log[h].exp();
+        let exp_a_log = a_log[h].exp();
         for t in 0..seq {
-            let a_val = a_raw[h * seq + t] + gdn.dt_bias[h];
-            let sp = if a_val > 20.0 { a_val } else { a_val.exp().ln_1p() }; // softplus
+            let a_val = a_raw[h * seq + t] + dt_bias[h];
+            let sp = if a_val > 20.0 {
+                a_val
+            } else {
+                a_val.exp().ln_1p()
+            }; // softplus
             g[h * seq + t] = (-exp_a_log * sp).exp();
 
             let bv = b_raw[h * seq + t];
@@ -1127,15 +1361,13 @@ fn cpu_gdn_forward(
     let mut y = vec![0.0f32; value_dim * seq]; // [Hv*Dv, seq]
 
     gdn_recurrence(
-        &mut state, &mut y, &q_exp, &k_exp, v_raw, &g, &beta,
-        h_v, d_k, d_v, seq,
+        &mut state, &mut y, &q_exp, &k_exp, v_raw, &g, &beta, h_v, d_k, d_v, seq,
     );
 
     // 8. Output gating: silu(z) * rmsnorm(y), then out_proj
-    let z = cpu_matmul(&gdn.z_proj, xnorm, value_dim, dim, seq); // [value_dim, seq]
-
     // RMSNorm on y (per-head across d_v dimension) using norm_weight
     let mut y_normed = vec![0.0f32; value_dim * seq];
+    let shared_norm_weight = norm_weight.len() == d_v;
     for h in 0..h_v {
         for t in 0..seq {
             let mut ss = 0.0f32;
@@ -1145,8 +1377,12 @@ fn cpu_gdn_forward(
             }
             let rms = (ss / d_v as f32 + 1e-6).sqrt();
             for d in 0..d_v {
-                y_normed[(h * d_v + d) * seq + t] =
-                    y[(h * d_v + d) * seq + t] / rms * gdn.norm_weight[h * d_v + d];
+                let norm = if shared_norm_weight {
+                    norm_weight[d]
+                } else {
+                    norm_weight[h * d_v + d]
+                };
+                y_normed[(h * d_v + d) * seq + t] = y[(h * d_v + d) * seq + t] / rms * norm;
             }
         }
     }
@@ -1159,8 +1395,103 @@ fn cpu_gdn_forward(
         gated[i] = silu_z * y_normed[i];
     }
 
-    // out_proj: [dim, value_dim] @ gated[value_dim, seq] → [dim, seq]
-    cpu_matmul(&gdn.o_proj, &gated, dim, value_dim, seq)
+    apply_o_proj(&gated)
+}
+
+fn cpu_gdn_forward(
+    gdn: &ane_weights::GdnLayerWeights,
+    xnorm: &[f32], // [dim, seq] pre-attention-norm input
+    cfg: &MilConfig,
+) -> Vec<f32> {
+    let dim = cfg.dim;
+    let seq = cfg.seq_len;
+    let value_dim = cfg.linear_n_value_heads * cfg.linear_value_head_dim;
+    let qkv_dim = 2 * cfg.linear_n_heads * cfg.linear_head_dim + value_dim;
+    let h_v = cfg.linear_n_value_heads;
+
+    // Project QKV, a, b, z  —  all [out, seq] channels-first
+    let qkv_raw = cpu_matmul(&gdn.qkv_proj, xnorm, qkv_dim, dim, seq);
+    let a_raw = cpu_matmul(&gdn.a_proj, xnorm, h_v, dim, seq);
+    let b_raw = cpu_matmul(&gdn.b_proj, xnorm, h_v, dim, seq);
+    let z = cpu_matmul(&gdn.z_proj, xnorm, value_dim, dim, seq);
+
+    cpu_gdn_forward_post_proj(
+        &qkv_raw,
+        &a_raw,
+        &b_raw,
+        &z,
+        &gdn.a_log,
+        &gdn.dt_bias,
+        &gdn.norm_weight,
+        &gdn.conv_weight,
+        &gdn.conv_bias,
+        cfg,
+        |gated| cpu_matmul(&gdn.o_proj, gated, dim, value_dim, seq),
+    )
+}
+
+fn cpu_quantized_gdn_forward_with_workspace(
+    gdn: &ane_weights::QuantizedGdnLayerWeights,
+    xnorm: &[f32], // [dim, seq] pre-attention-norm input
+    cfg: &MilConfig,
+    workspace: &mut QuantizedMatmulWorkspace,
+) -> Vec<f32> {
+    let seq = cfg.seq_len;
+    let value_dim = cfg.linear_n_value_heads * cfg.linear_value_head_dim;
+    let qkv_dim = 2 * cfg.linear_n_heads * cfg.linear_head_dim + value_dim;
+    let h_v = cfg.linear_n_value_heads;
+
+    // Project QKV, a, b, z directly from quantized weights without
+    // materializing the full dense layer first.
+    let mut qkv_raw = vec![0.0f32; qkv_dim * seq];
+    cpu_quantized_matmul_into(&gdn.qkv_proj, xnorm, seq, &mut qkv_raw, workspace);
+    let mut a_raw = vec![0.0f32; h_v * seq];
+    cpu_quantized_matmul_into(&gdn.a_proj, xnorm, seq, &mut a_raw, workspace);
+    let mut b_raw = vec![0.0f32; h_v * seq];
+    cpu_quantized_matmul_into(&gdn.b_proj, xnorm, seq, &mut b_raw, workspace);
+    let mut z = vec![0.0f32; value_dim * seq];
+    cpu_quantized_matmul_into(&gdn.z_proj, xnorm, seq, &mut z, workspace);
+
+    debug_assert_eq!(qkv_raw.len(), qkv_dim * seq);
+    debug_assert_eq!(a_raw.len(), h_v * seq);
+    debug_assert_eq!(b_raw.len(), h_v * seq);
+    debug_assert_eq!(z.len(), value_dim * seq);
+
+    cpu_gdn_forward_post_proj(
+        &qkv_raw,
+        &a_raw,
+        &b_raw,
+        &z,
+        &gdn.a_log,
+        &gdn.dt_bias,
+        &gdn.norm_weight,
+        &gdn.conv_weight,
+        &gdn.conv_bias,
+        cfg,
+        |gated| {
+            let mut out = vec![0.0f32; gdn.o_proj.rows * seq];
+            cpu_quantized_matmul_into(&gdn.o_proj, gated, seq, &mut out, workspace);
+            out
+        },
+    )
+}
+
+pub fn cpu_quantized_gdn_forward(
+    gdn: &ane_weights::QuantizedGdnLayerWeights,
+    xnorm: &[f32], // [dim, seq] pre-attention-norm input
+    cfg: &MilConfig,
+) -> Vec<f32> {
+    let mut workspace = QuantizedMatmulWorkspace::default();
+    cpu_quantized_gdn_forward_with_workspace(gdn, xnorm, cfg, &mut workspace)
+}
+
+#[doc(hidden)]
+pub fn cpu_gdn_forward_bench(
+    gdn: &ane_weights::GdnLayerWeights,
+    xnorm: &[f32],
+    cfg: &MilConfig,
+) -> Vec<f32> {
+    cpu_gdn_forward(gdn, xnorm, cfg)
 }
 
 /// CPU-only forward pass for large-dim models.
@@ -1203,24 +1534,23 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
 
     // 2. Transformer layers
     for l in 0..n_layers {
-        let lw_cow = model.layer(l);
-        let lw = &*lw_cow;
         let lora_layer = lora.map(|lm| &lm.layers[l]);
-
         let layer_in = x_cur.clone();
-
-        // RMSNorm before attention
-        let mut xnorm = vec![0.0f32; dim * seq];
-        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
-
         let mut lora_layer_acts = LoraLayerActivations::empty();
 
-        // Attention: GDN (linear) or MHA path
-        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm) =
-            if let Some(gdn_w) = &lw.gdn {
-                // GDN path: combined QKV → conv1d → recurrence → output gate
-                let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
-                // GDN layers produce the final output directly (no separate Wo)
+        if let Some(ql) = model.quantized_layer(l) {
+            let mut quantized_workspace = QuantizedMatmulWorkspace::default();
+            // RMSNorm before attention
+            let mut xnorm = vec![0.0f32; dim * seq];
+            rmsnorm(&mut xnorm, &x_cur, &ql.rms_att, dim, seq, cfg.rms_eps);
+
+            let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm) = if let Some(gdn_q) = &ql.gdn {
+                let gdn_out = cpu_quantized_gdn_forward_with_workspace(
+                    gdn_q,
+                    &xnorm,
+                    cfg,
+                    &mut quantized_workspace,
+                );
                 let empty = vec![0.0f32; 0];
                 (
                     empty.clone(),
@@ -1232,12 +1562,35 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                     None,
                 )
             } else {
-                // MHA path: Q/K/V → QK-norm → RoPE → SDPA → Wo
-                let mut q = cpu_matmul(&lw.wq, &xnorm, dim, dim, seq);
-                let mut k = cpu_matmul(&lw.wk, &xnorm, dim, dim, seq);
-                let v = cpu_matmul(&lw.wv, &xnorm, dim, dim, seq);
+                // Quantized MHA path: apply projections directly from quantized
+                // weights, then expand KV activations for GQA instead of
+                // expanding KV weights.
+                let mut q = vec![0.0f32; ql.wq.rows * seq];
+                cpu_quantized_matmul_into(&ql.wq, &xnorm, seq, &mut q, &mut quantized_workspace);
+                let mut k = vec![0.0f32; ql.wk.rows * seq];
+                cpu_quantized_matmul_into(&ql.wk, &xnorm, seq, &mut k, &mut quantized_workspace);
+                let mut v = vec![0.0f32; ql.wv.rows * seq];
+                cpu_quantized_matmul_into(&ql.wv, &xnorm, seq, &mut v, &mut quantized_workspace);
 
-                let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
+                let heads_per_group = cfg.heads_per_group();
+                if heads_per_group > 1 {
+                    k = ane_weights::expand_kv_static(
+                        &k,
+                        ql.wk.rows,
+                        head_dim,
+                        heads_per_group,
+                        dim,
+                    );
+                    v = ane_weights::expand_kv_static(
+                        &v,
+                        ql.wv.rows,
+                        head_dim,
+                        heads_per_group,
+                        dim,
+                    );
+                }
+
+                let q_pre_norm = if let Some(q_norm_w) = &ql.q_norm {
                     Some(qk_rmsnorm_fwd(
                         &mut q,
                         q_norm_w,
@@ -1249,7 +1602,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 } else {
                     None
                 };
-                let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
+                let k_pre_norm = if let Some(k_norm_w) = &ql.k_norm {
                     Some(qk_rmsnorm_fwd(
                         &mut k,
                         k_norm_w,
@@ -1264,9 +1617,15 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
 
                 cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
                 let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
-                let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, dim, seq);
+                let mut o_out = vec![0.0f32; ql.wo.rows * seq];
+                cpu_quantized_matmul_into(
+                    &ql.wo,
+                    &attn_out,
+                    seq,
+                    &mut o_out,
+                    &mut quantized_workspace,
+                );
 
-                // LoRA on Wo (MHA only — GDN layers use stop_gradient on attention)
                 if let Some(ll) = lora_layer {
                     if let Some(wo_adapter) = ll.wo.as_ref() {
                         let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
@@ -1278,6 +1637,128 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
 
                 (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm)
             };
+
+            let mut x2 = x_cur.clone();
+            vec_add_inplace(&mut x2, &o_out);
+
+            let mut x2norm = vec![0.0f32; dim * seq];
+            rmsnorm(&mut x2norm, &x2, &ql.rms_ffn, dim, seq, cfg.rms_eps);
+
+            let mut h1 = vec![0.0f32; ql.w1.rows * seq];
+            cpu_quantized_matmul_into(&ql.w1, &x2norm, seq, &mut h1, &mut quantized_workspace);
+            let mut h3 = vec![0.0f32; ql.w3.rows * seq];
+            cpu_quantized_matmul_into(&ql.w3, &x2norm, seq, &mut h3, &mut quantized_workspace);
+            cpu_silu_inplace(&mut h1);
+            let mut gate = vec![0.0f32; hidden * seq];
+            for i in 0..hidden * seq {
+                gate[i] = h1[i] * h3[i];
+            }
+
+            let mut ffn_out = vec![0.0f32; ql.w2.rows * seq];
+            cpu_quantized_matmul_into(&ql.w2, &gate, seq, &mut ffn_out, &mut quantized_workspace);
+
+            if let Some(ll) = lora_layer {
+                if let Some(w2_adapter) = ll.w2.as_ref() {
+                    let (w2_delta, w2_h) = w2_adapter.forward_cpu(&gate, seq);
+                    super::ane_lora::vec_add_scaled(&mut ffn_out, &w2_delta, lora_scale);
+                    lora_layer_acts.w2_x = Some(gate.clone());
+                    lora_layer_acts.w2_h = Some(w2_h);
+                }
+            }
+
+            x_cur = x2.clone();
+            vec_add_inplace(&mut x_cur, &ffn_out);
+
+            layer_acts.push(LayerActivations {
+                layer_in,
+                xnorm,
+                q,
+                k,
+                v,
+                attn_out,
+                o_out,
+                x2,
+                x2norm,
+                h1,
+                h3,
+                gate,
+                ffn_out,
+                q_pre_norm,
+                k_pre_norm,
+            });
+            lora_acts_vec.push(lora_layer_acts);
+            continue;
+        }
+
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
+
+        // RMSNorm before attention
+        let mut xnorm = vec![0.0f32; dim * seq];
+        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+
+        // Attention: GDN (linear) or MHA path
+        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm) = if let Some(gdn_w) = &lw.gdn {
+            // GDN path: combined QKV → conv1d → recurrence → output gate
+            let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
+            // GDN layers produce the final output directly (no separate Wo)
+            let empty = vec![0.0f32; 0];
+            (
+                empty.clone(),
+                empty.clone(),
+                empty,
+                gdn_out.clone(),
+                gdn_out,
+                None,
+                None,
+            )
+        } else {
+            // MHA path: Q/K/V → QK-norm → RoPE → SDPA → Wo
+            let mut q = cpu_matmul(&lw.wq, &xnorm, dim, dim, seq);
+            let mut k = cpu_matmul(&lw.wk, &xnorm, dim, dim, seq);
+            let v = cpu_matmul(&lw.wv, &xnorm, dim, dim, seq);
+
+            let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
+                Some(qk_rmsnorm_fwd(
+                    &mut q,
+                    q_norm_w,
+                    n_heads,
+                    head_dim,
+                    seq,
+                    cfg.rms_eps,
+                ))
+            } else {
+                None
+            };
+            let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
+                Some(qk_rmsnorm_fwd(
+                    &mut k,
+                    k_norm_w,
+                    n_heads,
+                    head_dim,
+                    seq,
+                    cfg.rms_eps,
+                ))
+            } else {
+                None
+            };
+
+            cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
+            let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+            let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, dim, seq);
+
+            // LoRA on Wo (MHA only — GDN layers use stop_gradient on attention)
+            if let Some(ll) = lora_layer {
+                if let Some(wo_adapter) = ll.wo.as_ref() {
+                    let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
+                    super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                    lora_layer_acts.wo_x = Some(attn_out.clone());
+                    lora_layer_acts.wo_h = Some(wo_h);
+                }
+            }
+
+            (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm)
+        };
 
         // Residual
         let mut x2 = x_cur.clone();
@@ -1371,6 +1852,69 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn quantize_tensor_affine(
+        dense: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> ane_weights::QuantizedTensor {
+        assert_eq!(dense.len(), rows * cols);
+        assert_eq!(cols % group_size, 0);
+
+        let n_groups = cols / group_size;
+        let mut data = vec![0u8; dense.len()];
+        let mut scales = vec![0.0f32; rows * n_groups];
+        let mut biases = vec![0.0f32; rows * n_groups];
+
+        for row in 0..rows {
+            for group in 0..n_groups {
+                let start = row * cols + group * group_size;
+                let values = &dense[start..start + group_size];
+                let mut min_v = f32::INFINITY;
+                let mut max_v = f32::NEG_INFINITY;
+                for &value in values {
+                    min_v = min_v.min(value);
+                    max_v = max_v.max(value);
+                }
+
+                let scale = if max_v > min_v {
+                    (max_v - min_v) / 255.0
+                } else {
+                    0.0
+                };
+                let idx = row * n_groups + group;
+                scales[idx] = scale;
+                biases[idx] = min_v;
+
+                for (offset, &value) in values.iter().enumerate() {
+                    let q = if scale > 0.0 {
+                        ((value - min_v) / scale).round().clamp(0.0, 255.0)
+                    } else {
+                        0.0
+                    };
+                    data[start + offset] = q as u8;
+                }
+            }
+        }
+
+        ane_weights::QuantizedTensor {
+            data,
+            scales,
+            biases,
+            rows,
+            cols,
+            group_size,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Round 1: rmsnorm + embed_lookup
@@ -1559,6 +2103,276 @@ mod tests {
         // logits[0] = 1*7 + 2*8 + 3*9 = 7+16+27 = 50
         // logits[1] = 4*7 + 5*8 + 6*9 = 28+40+54 = 122
         assert_eq!(logits, vec![50.0, 122.0]);
+    }
+
+    #[test]
+    fn test_cpu_matmul_lhs_transposed_matches_explicit_transpose() {
+        let rows = 3;
+        let cols = 2;
+        let seq = 2;
+
+        let w = vec![
+            1.0, 2.0, //
+            3.0, 4.0, //
+            5.0, 6.0,
+        ];
+        let x = vec![
+            7.0, 8.0, //
+            9.0, 10.0, //
+            11.0, 12.0,
+        ];
+
+        let wt = ane_weights::transpose_weight(&w, rows, cols);
+        let explicit = cpu_matmul(&wt, &x, cols, rows, seq);
+        let direct = cpu_matmul_lhs_transposed(&w, rows, cols, &x, seq);
+
+        assert_eq!(direct, explicit);
+    }
+
+    #[test]
+    fn test_cpu_quantized_matmul_matches_materialized_matmul() {
+        let rows = 5;
+        let cols = 8;
+        let seq = 3;
+
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32 * 0.37 + 0.11).sin()) * 2.0)
+            .collect();
+        let x: Vec<f32> = (0..cols * seq)
+            .map(|i| ((i as f32 * 0.19 + 0.23).cos()) * 1.5)
+            .collect();
+
+        let quantized = quantize_tensor_affine(&w, rows, cols, 2);
+        let materialized = cpu_matmul(&quantized.dequantize(), &x, rows, cols, seq);
+        let blocked = cpu_quantized_matmul(&quantized, &x, seq);
+
+        assert!(max_abs_diff(&materialized, &blocked) < 1e-5);
+    }
+
+    #[test]
+    fn test_forward_cpu_generic_quantized_matches_dequantized_reference_for_gqa() {
+        use super::super::ane_weights::{
+            ModelWeights, QuantizedLayerWeights, QuantizedModelWeights,
+        };
+
+        let cfg = MilConfig {
+            dim: 8,
+            hidden_dim: 16,
+            n_heads: 4,
+            seq_len: 3,
+            n_kv_heads: 2,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+        };
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let kv_dim = cfg.kv_dim();
+        let vocab = 11;
+        let group_size = 2;
+
+        let make_vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.173).sin() * 0.2)
+                .collect()
+        };
+
+        let quantized = QuantizedModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![QuantizedLayerWeights {
+                wq: quantize_tensor_affine(&make_vals(dim * dim, 0), dim, dim, group_size),
+                wk: quantize_tensor_affine(&make_vals(kv_dim * dim, 100), kv_dim, dim, group_size),
+                wv: quantize_tensor_affine(&make_vals(kv_dim * dim, 200), kv_dim, dim, group_size),
+                wo: quantize_tensor_affine(&make_vals(dim * dim, 300), dim, dim, group_size),
+                w1: quantize_tensor_affine(&make_vals(hidden * dim, 400), hidden, dim, group_size),
+                w2: quantize_tensor_affine(&make_vals(dim * hidden, 500), dim, hidden, group_size),
+                w3: quantize_tensor_affine(&make_vals(hidden * dim, 600), hidden, dim, group_size),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: Some(vec![1.0, 0.9]),
+                k_norm: Some(vec![1.1, 0.8]),
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_vals(vocab * dim, 700),
+            vocab_size: vocab,
+            lm_head: None,
+            heads_per_group: cfg.heads_per_group(),
+        };
+
+        let dense = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![quantized.dequantize_layer(0)],
+            rms_final: quantized.rms_final.clone(),
+            embed: quantized.embed.clone(),
+            vocab_size: quantized.vocab_size,
+            lm_head: quantized.lm_head.clone(),
+        };
+
+        let tokens = vec![1u16, 2, 3];
+        let targets = vec![2u16, 3, 4];
+
+        let quantized_fwd = forward_cpu_generic(&quantized, None, &tokens, &targets);
+        let dense_fwd = forward_cpu_generic(&dense, None, &tokens, &targets);
+
+        assert!((quantized_fwd.base.loss - dense_fwd.base.loss).abs() < 1e-4);
+        assert!(max_abs_diff(&quantized_fwd.base.logits, &dense_fwd.base.logits) < 1e-4);
+        assert!(max_abs_diff(&quantized_fwd.base.dlogits, &dense_fwd.base.dlogits) < 1e-4);
+
+        let q_act = &quantized_fwd.base.layer_acts[0];
+        let d_act = &dense_fwd.base.layer_acts[0];
+        assert!(max_abs_diff(&q_act.q, &d_act.q) < 1e-4);
+        assert!(max_abs_diff(&q_act.k, &d_act.k) < 1e-4);
+        assert!(max_abs_diff(&q_act.v, &d_act.v) < 1e-4);
+        assert!(max_abs_diff(&q_act.attn_out, &d_act.attn_out) < 1e-4);
+        assert!(max_abs_diff(&q_act.ffn_out, &d_act.ffn_out) < 1e-4);
+    }
+
+    #[test]
+    fn test_forward_cpu_generic_quantized_matches_dequantized_reference_for_gdn() {
+        use super::super::ane_weights::{
+            ModelWeights, QuantizedGdnLayerWeights, QuantizedLayerWeights, QuantizedModelWeights,
+            QuantizedTensor,
+        };
+
+        let cfg = MilConfig {
+            dim: 8,
+            hidden_dim: 16,
+            n_heads: 2,
+            seq_len: 3,
+            n_kv_heads: 2,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            linear_attn_indices: vec![0],
+            linear_n_heads: 2,
+            linear_head_dim: 4,
+            linear_n_value_heads: 2,
+            linear_value_head_dim: 4,
+            conv_kernel_size: 2,
+        };
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = cfg.conv_kernel_size;
+        let vocab = 13;
+        let group_size = 2;
+
+        let make_vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.173).sin() * 0.2)
+                .collect()
+        };
+        let empty = QuantizedTensor {
+            data: vec![],
+            scales: vec![],
+            biases: vec![],
+            rows: 0,
+            cols: 0,
+            group_size: 1,
+        };
+
+        let quantized = QuantizedModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![QuantizedLayerWeights {
+                wq: empty.clone(),
+                wk: empty.clone(),
+                wv: empty.clone(),
+                wo: empty,
+                w1: quantize_tensor_affine(&make_vals(hidden * dim, 400), hidden, dim, group_size),
+                w2: quantize_tensor_affine(&make_vals(dim * hidden, 500), dim, hidden, group_size),
+                w3: quantize_tensor_affine(&make_vals(hidden * dim, 600), hidden, dim, group_size),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: Some(QuantizedGdnLayerWeights {
+                    qkv_proj: quantize_tensor_affine(
+                        &make_vals(qkv_dim * dim, 0),
+                        qkv_dim,
+                        dim,
+                        group_size,
+                    ),
+                    a_proj: quantize_tensor_affine(
+                        &make_vals(h_v * dim, 100),
+                        h_v,
+                        dim,
+                        group_size,
+                    ),
+                    b_proj: quantize_tensor_affine(
+                        &make_vals(h_v * dim, 200),
+                        h_v,
+                        dim,
+                        group_size,
+                    ),
+                    z_proj: quantize_tensor_affine(
+                        &make_vals(value_dim * dim, 300),
+                        value_dim,
+                        dim,
+                        group_size,
+                    ),
+                    o_proj: quantize_tensor_affine(
+                        &make_vals(dim * value_dim, 350),
+                        dim,
+                        value_dim,
+                        group_size,
+                    ),
+                    a_log: make_vals(h_v, 700),
+                    dt_bias: make_vals(h_v, 800),
+                    norm_weight: vec![1.0; value_dim],
+                    conv_weight: make_vals(qkv_dim * kernel, 900),
+                    conv_bias: make_vals(qkv_dim, 1000),
+                }),
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_vals(vocab * dim, 1100),
+            vocab_size: vocab,
+            lm_head: None,
+            heads_per_group: cfg.heads_per_group(),
+        };
+
+        let dense = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![quantized.dequantize_layer(0)],
+            rms_final: quantized.rms_final.clone(),
+            embed: quantized.embed.clone(),
+            vocab_size: quantized.vocab_size,
+            lm_head: quantized.lm_head.clone(),
+        };
+
+        let tokens = vec![1u16, 2, 3];
+        let targets = vec![2u16, 3, 4];
+
+        let quantized_fwd = forward_cpu_generic(&quantized, None, &tokens, &targets);
+        let dense_fwd = forward_cpu_generic(&dense, None, &tokens, &targets);
+
+        assert!((quantized_fwd.base.loss - dense_fwd.base.loss).abs() < 1e-4);
+        assert!(max_abs_diff(&quantized_fwd.base.logits, &dense_fwd.base.logits) < 1e-4);
+        assert!(max_abs_diff(&quantized_fwd.base.dlogits, &dense_fwd.base.dlogits) < 1e-4);
+
+        let q_act = &quantized_fwd.base.layer_acts[0];
+        let d_act = &dense_fwd.base.layer_acts[0];
+        assert_eq!(q_act.q.len(), 0);
+        assert_eq!(q_act.k.len(), 0);
+        assert_eq!(q_act.v.len(), 0);
+        assert_eq!(d_act.q.len(), 0);
+        assert_eq!(d_act.k.len(), 0);
+        assert_eq!(d_act.v.len(), 0);
+        assert!(max_abs_diff(&q_act.attn_out, &d_act.attn_out) < 1e-4);
+        assert!(max_abs_diff(&q_act.o_out, &d_act.o_out) < 1e-4);
+        assert!(max_abs_diff(&q_act.ffn_out, &d_act.ffn_out) < 1e-4);
     }
 
     // -----------------------------------------------------------------------
@@ -2084,9 +2898,9 @@ mod tests {
 
         // Load reference data (Python row-major, batch=1 stripped)
         let a_raw_py = load_f32_bin(&dir.join("a_raw.bin")); // [seq, h_v]
-        let a_log = load_f32_bin(&dir.join("A_log.bin"));    // [h_v]
+        let a_log = load_f32_bin(&dir.join("A_log.bin")); // [h_v]
         let dt_bias = load_f32_bin(&dir.join("dt_bias.bin")); // [h_v]
-        let g_ref_py = load_f32_bin(&dir.join("g.bin"));     // [seq, h_v]
+        let g_ref_py = load_f32_bin(&dir.join("g.bin")); // [seq, h_v]
 
         assert_eq!(a_raw_py.len(), seq * h_v);
         assert_eq!(a_log.len(), h_v);
@@ -2148,10 +2962,10 @@ mod tests {
         let d_v: usize = 128;
 
         // Load reference data
-        let q_normed_py = load_f32_bin(&dir.join("q_normed.bin"));     // [seq, h, d]
+        let q_normed_py = load_f32_bin(&dir.join("q_normed.bin")); // [seq, h, d]
         let k_normed_py = load_f32_bin(&dir.join("k_normed.bin"));
         let v_py = load_f32_bin(&dir.join("v.bin"));
-        let g_py = load_f32_bin(&dir.join("g.bin"));                   // [seq, h]
+        let g_py = load_f32_bin(&dir.join("g.bin")); // [seq, h]
         let beta_py = load_f32_bin(&dir.join("beta.bin"));
         let rec_out_py = load_f32_bin(&dir.join("recurrence_out.bin")); // [seq, h, d]
         let final_state_py = load_f32_bin(&dir.join("final_state.bin")); // [h, d_v, d_k]
@@ -2161,10 +2975,10 @@ mod tests {
         assert_eq!(final_state_py.len(), h_v * d_v * d_k);
 
         // Transpose to channels-first layout
-        let q = transpose_3d_to_cf(&q_normed_py, seq, h_v, d_k);   // [h*d_k, seq]
+        let q = transpose_3d_to_cf(&q_normed_py, seq, h_v, d_k); // [h*d_k, seq]
         let k = transpose_3d_to_cf(&k_normed_py, seq, h_v, d_k);
         let v = transpose_3d_to_cf(&v_py, seq, h_v, d_v);
-        let g_cf = transpose_2d(&g_py, seq, h_v);                   // [h_v, seq]
+        let g_cf = transpose_2d(&g_py, seq, h_v); // [h_v, seq]
         let beta_cf = transpose_2d(&beta_py, seq, h_v);
 
         // Run recurrence (same code as cpu_gdn_forward step 7)
@@ -2193,16 +3007,14 @@ mod tests {
                     let v_t = v[(h * d_v + dv) * seq + t];
                     let delta = (v_t - kv_mem) * beta_t;
                     for dk in 0..d_k {
-                        state[h * d_v * d_k + dv * d_k + dk] +=
-                            k[(h * d_k + dk) * seq + t] * delta;
+                        state[h * d_v * d_k + dv * d_k + dk] += k[(h * d_k + dk) * seq + t] * delta;
                     }
                 }
 
                 for dv in 0..d_v {
                     let mut y_val = 0.0f32;
                     for dk in 0..d_k {
-                        y_val +=
-                            state[h * d_v * d_k + dv * d_k + dk] * q[(h * d_k + dk) * seq + t];
+                        y_val += state[h * d_v * d_k + dv * d_k + dk] * q[(h * d_k + dk) * seq + t];
                     }
                     y[(h * d_v + dv) * seq + t] = y_val;
                 }
@@ -2316,14 +3128,97 @@ mod tests {
             dim * seq
         );
         for (i, &v) in output.iter().enumerate() {
-            assert!(
-                v.is_finite(),
-                "output[{i}] is not finite: {v}"
-            );
+            assert!(v.is_finite(), "output[{i}] is not finite: {v}");
         }
         eprintln!(
             "synthetic GDN forward: output[0..4]={:?}",
             &output[..4.min(output.len())]
         );
+    }
+
+    #[test]
+    fn test_gdn_forward_shared_norm_weight_matches_expanded_form() {
+        let dim = 8;
+        let seq = 3;
+        let h_k = 2;
+        let d_k = 4;
+        let h_v = 2;
+        let d_v = 4;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = 2;
+
+        let mut rng_state = 7u64;
+        let mut next_f32 = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let rand_vec = |n: usize, rng: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..n).map(|_| rng()).collect()
+        };
+
+        let qkv_proj = rand_vec(qkv_dim * dim, &mut next_f32);
+        let a_proj = rand_vec(h_v * dim, &mut next_f32);
+        let b_proj = rand_vec(h_v * dim, &mut next_f32);
+        let z_proj = rand_vec(value_dim * dim, &mut next_f32);
+        let o_proj = rand_vec(dim * value_dim, &mut next_f32);
+        let a_log = rand_vec(h_v, &mut next_f32);
+        let dt_bias = rand_vec(h_v, &mut next_f32);
+        let conv_weight = rand_vec(qkv_dim * kernel, &mut next_f32);
+        let conv_bias = rand_vec(qkv_dim, &mut next_f32);
+        let shared_norm = rand_vec(d_v, &mut next_f32);
+        let expanded_norm: Vec<f32> = (0..h_v).flat_map(|_| shared_norm.iter().copied()).collect();
+
+        let gdn_shared = super::ane_weights::GdnLayerWeights {
+            qkv_proj: qkv_proj.clone(),
+            a_proj: a_proj.clone(),
+            b_proj: b_proj.clone(),
+            z_proj: z_proj.clone(),
+            o_proj: o_proj.clone(),
+            a_log: a_log.clone(),
+            dt_bias: dt_bias.clone(),
+            norm_weight: shared_norm,
+            conv_weight: conv_weight.clone(),
+            conv_bias: conv_bias.clone(),
+        };
+        let gdn_expanded = super::ane_weights::GdnLayerWeights {
+            qkv_proj,
+            a_proj,
+            b_proj,
+            z_proj,
+            o_proj,
+            a_log,
+            dt_bias,
+            norm_weight: expanded_norm,
+            conv_weight,
+            conv_bias,
+        };
+
+        let cfg = super::ane_mil::MilConfig {
+            dim,
+            hidden_dim: 32,
+            n_heads: h_k,
+            seq_len: seq,
+            n_kv_heads: h_k,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            linear_attn_indices: vec![0],
+            linear_n_heads: h_k,
+            linear_head_dim: d_k,
+            linear_n_value_heads: h_v,
+            linear_value_head_dim: d_v,
+            conv_kernel_size: kernel,
+        };
+
+        let xnorm: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i as f32) * 0.17 - 0.2).sin())
+            .collect();
+
+        let shared_out = cpu_gdn_forward(&gdn_shared, &xnorm, &cfg);
+        let expanded_out = cpu_gdn_forward(&gdn_expanded, &xnorm, &cfg);
+
+        assert!(max_abs_diff(&shared_out, &expanded_out) < 1e-5);
     }
 }

@@ -604,7 +604,10 @@ fn trailing_partial_tag_len(buffer: &str, tags: &[&str]) -> usize {
 
 /// Split one streamed content delta into visible text and reasoning text by
 /// extracting `<think>...</think>` / `<thinking>...</thinking>` blocks.
-pub(crate) fn split_thinking_from_content_delta(state: &mut ThinkSplitState, delta: &str) -> (String, String) {
+pub(crate) fn split_thinking_from_content_delta(
+    state: &mut ThinkSplitState,
+    delta: &str,
+) -> (String, String) {
     state.carry.push_str(delta);
     let mut visible = String::new();
     let mut reasoning = String::new();
@@ -1892,6 +1895,63 @@ mod tests {
         let (v3, r3) = split_thinking_from_content_delta(&mut state, "ink> world");
         assert_eq!(v3, " world");
         assert!(r3.is_empty());
+    }
+
+    /// When in_think_block starts true but content has NO close tag,
+    /// ALL content is classified as reasoning and NOTHING is visible.
+    /// This was the root cause of the streaming display bug: mlx.rs
+    /// set starts_in_think=true while the server had enable_thinking=false,
+    /// so the entire response vanished into ThinkingDelta.
+    #[test]
+    fn test_split_thinking_pre_assumed_think_eats_all_content() {
+        let mut state = ThinkSplitState {
+            in_think_block: true,
+            ..Default::default()
+        };
+
+        // Feed normal content — no <think> tags at all.
+        let (v1, r1) = split_thinking_from_content_delta(&mut state, "Hello world");
+        assert!(v1.is_empty(), "visible should be empty but got: {v1:?}");
+        assert_eq!(r1, "Hello world", "all content goes to reasoning");
+
+        let (v2, r2) = split_thinking_from_content_delta(&mut state, ", this is a test.");
+        assert!(v2.is_empty());
+        assert_eq!(r2, ", this is a test.");
+
+        // Flush also goes to reasoning.
+        let (v3, r3) = flush_thinking_split_state(&mut state);
+        assert!(v3.is_empty());
+        // Carry may have trailing partial-tag buffer; reasoning gets the rest.
+        // The key point: nothing ever becomes visible.
+    }
+
+    /// With in_think_block=false (the fix), normal content without tags
+    /// is correctly classified as visible.
+    #[test]
+    fn test_split_thinking_default_state_passes_content_through() {
+        let mut state = ThinkSplitState::default(); // in_think_block: false
+
+        let (v1, r1) = split_thinking_from_content_delta(&mut state, "Hello world");
+        assert_eq!(v1, "Hello world");
+        assert!(r1.is_empty());
+
+        let (v2, r2) = split_thinking_from_content_delta(&mut state, ", more text.");
+        assert_eq!(v2, ", more text.");
+        assert!(r2.is_empty());
+    }
+
+    /// With in_think_block=false, self-generated <think> tags in content
+    /// are still correctly detected and split.
+    #[test]
+    fn test_split_thinking_detects_inline_tags_from_default_state() {
+        let mut state = ThinkSplitState::default();
+
+        let (v1, r1) = split_thinking_from_content_delta(
+            &mut state,
+            "Before <think>reasoning here</think> after",
+        );
+        assert_eq!(v1, "Before  after");
+        assert_eq!(r1, "reasoning here");
     }
 
     // ── Provider creation / detection tests ───────────────────────

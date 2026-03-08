@@ -94,12 +94,10 @@ impl PromptProfile {
     pub fn includes(&self, section: PromptSection) -> bool {
         match self {
             PromptProfile::Action => true,
-            PromptProfile::Answer => {
-                !matches!(
-                    section,
-                    PromptSection::ToolPatterns | PromptSection::BackgroundTasks
-                )
-            }
+            PromptProfile::Answer => !matches!(
+                section,
+                PromptSection::ToolPatterns | PromptSection::BackgroundTasks
+            ),
         }
     }
 }
@@ -264,6 +262,9 @@ mod tests {
         let action = Lane::Action.policy();
         assert_ne!(answer.prompt, action.prompt);
         assert_ne!(answer.tools, action.tools);
-        assert!((answer.memory.budget_multiplier - action.memory.budget_multiplier).abs() > f64::EPSILON);
+        assert!(
+            (answer.memory.budget_multiplier - action.memory.budget_multiplier).abs()
+                > f64::EPSILON
+        );
     }
 }

@@ -519,11 +519,7 @@ pub(crate) fn print_status_bar(
         .counters
         .training_steps_total
         .load(Ordering::Relaxed);
-    if core_handle
-        .counters
-        .training_active
-        .load(Ordering::Relaxed)
-    {
+    if core_handle.counters.training_active.load(Ordering::Relaxed) {
         let started = core_handle
             .counters
             .training_started_ms

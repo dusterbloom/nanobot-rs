@@ -31,20 +31,16 @@ impl AgentLoopShared {
         let mut blocks = Vec::new();
 
         if core.memory_enabled {
-            let ladder = MemoryLadder::new(
-                &core.workspace,
-                &core.working_memory,
-                None,
-                &core.sessions,
-            );
+            let ladder =
+                MemoryLadder::new(&core.workspace, &core.working_memory, None, &core.sessions);
             let memory_multiplier = core.lane.policy().memory.budget_multiplier;
-            let adjusted_budget = ((core.working_memory_budget as f64 * memory_multiplier) as usize).min(200);
-            let results = ladder
-                .query(&MemoryQuery {
-                    session_key,
-                    query: "",
-                    total_budget: adjusted_budget,
-                });
+            let adjusted_budget =
+                ((core.working_memory_budget as f64 * memory_multiplier) as usize).min(200);
+            let results = ladder.query(&MemoryQuery {
+                session_key,
+                query: "",
+                total_budget: adjusted_budget,
+            });
             for result in results {
                 if !result.content.is_empty() {
                     let title = match result.layer {
@@ -121,18 +117,18 @@ impl AgentLoopShared {
             );
             let memory_multiplier = core.lane.policy().memory.budget_multiplier;
             let adjusted_budget = (core.working_memory_budget as f64 * memory_multiplier) as usize;
-            let results = ladder
-                .query(&MemoryQuery {
-                    session_key,
-                    query: "",
-                    total_budget: adjusted_budget,
-                });
+            let results = ladder.query(&MemoryQuery {
+                session_key,
+                query: "",
+                total_budget: adjusted_budget,
+            });
 
             for result in results {
                 let (section, title) = match result.layer {
-                    MemoryLayer::WorkingSession => {
-                        (PromptSection::WorkingMemory, "Working Memory (Current Session)")
-                    }
+                    MemoryLayer::WorkingSession => (
+                        PromptSection::WorkingMemory,
+                        "Working Memory (Current Session)",
+                    ),
                     _ => (PromptSection::MemoryBriefing, "Memory Briefing"),
                 };
                 if !result.content.is_empty() {
@@ -141,16 +137,12 @@ impl AgentLoopShared {
                         block: PromptBlock::new(title, &result.content),
                         allocated_tokens: 0,
                         actual_tokens: 0,
-                        source: SectionSource::Runtime(format!(
-                            "memory-ladder:{:?}",
-                            result.layer
-                        )),
+                        source: SectionSource::Runtime(format!("memory-ladder:{:?}", result.layer)),
                         included: true,
                         shrinkable: section.shrinkable(),
                     });
                 }
             }
-
         }
 
         // Tool patterns are independent of memory — include regardless of

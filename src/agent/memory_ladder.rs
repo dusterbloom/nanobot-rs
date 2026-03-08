@@ -143,9 +143,7 @@ impl<'a> MemoryLadder<'a> {
                 let raw = MemoryStore::new(&self.workspace).read_long_term();
                 truncate_to_token_budget(&raw, budget)
             }
-            MemoryLayer::WorkingSession => {
-                self.working_memory.get_context(session_key, budget)
-            }
+            MemoryLayer::WorkingSession => self.working_memory.get_context(session_key, budget),
             MemoryLayer::DurablePersonal => {
                 #[cfg(feature = "knowledge-graph")]
                 {
@@ -180,7 +178,9 @@ impl<'a> MemoryLadder<'a> {
                             }
                             let formatted: Vec<String> = hits
                                 .iter()
-                                .map(|h| format!("[{}#{}] {}", h.source_name, h.chunk_idx, h.snippet))
+                                .map(|h| {
+                                    format!("[{}#{}] {}", h.source_name, h.chunk_idx, h.snippet)
+                                })
                                 .collect();
                             truncate_to_token_budget(&formatted.join("\n"), budget)
                         } else {
@@ -193,7 +193,9 @@ impl<'a> MemoryLadder<'a> {
                 #[cfg(not(feature = "semantic"))]
                 {
                     let _ = (query, budget);
-                    unreachable!("SearchIndex layer should not be available without semantic feature")
+                    unreachable!(
+                        "SearchIndex layer should not be available without semantic feature"
+                    )
                 }
             }
             MemoryLayer::Scratch => {
@@ -203,9 +205,8 @@ impl<'a> MemoryLadder<'a> {
                 // session_db.search_messages is async; use block_in_place to
                 // call it from synchronous context without Send issues.
                 let results = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        self.session_db.search_messages(query, 10, None),
-                    )
+                    tokio::runtime::Handle::current()
+                        .block_on(self.session_db.search_messages(query, 10, None))
                 });
                 if results.is_empty() {
                     return String::new();

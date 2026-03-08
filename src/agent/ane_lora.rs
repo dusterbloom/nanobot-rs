@@ -137,23 +137,36 @@ impl LoraAdapter {
 
         // dh[R,S] = B^T[R,Dout] @ d_out_grad[Dout,S]
         let mut dh = vec![0.0f32; self.rank * seq];
-        cpu_gemm(&mut dh, &self.b, true, d_out_grad, false,
-                 self.rank, seq, self.d_out, 1.0, 0.0);
+        cpu_gemm(
+            &mut dh, &self.b, true, d_out_grad, false, self.rank, seq, self.d_out, 1.0, 0.0,
+        );
 
         // dx_lora[Din,S] = A^T[Din,R] @ dh[R,S]
         let mut dx_lora = vec![0.0f32; self.d_in * seq];
-        cpu_gemm(&mut dx_lora, &self.a, true, &dh, false,
-                 self.d_in, seq, self.rank, 1.0, 0.0);
+        cpu_gemm(
+            &mut dx_lora,
+            &self.a,
+            true,
+            &dh,
+            false,
+            self.d_in,
+            seq,
+            self.rank,
+            1.0,
+            0.0,
+        );
 
         // dB[Dout,R] = d_out_grad[Dout,S] @ h^T[S,R]
         let mut db = vec![0.0f32; self.d_out * self.rank];
-        cpu_gemm(&mut db, d_out_grad, false, h, true,
-                 self.d_out, self.rank, seq, 1.0, 0.0);
+        cpu_gemm(
+            &mut db, d_out_grad, false, h, true, self.d_out, self.rank, seq, 1.0, 0.0,
+        );
 
         // dA[R,Din] = dh[R,S] @ x^T[S,Din]
         let mut da = vec![0.0f32; self.rank * self.d_in];
-        cpu_gemm(&mut da, &dh, false, x, true,
-                 self.rank, self.d_in, seq, 1.0, 0.0);
+        cpu_gemm(
+            &mut da, &dh, false, x, true, self.rank, self.d_in, seq, 1.0, 0.0,
+        );
 
         (dx_lora, da, db)
     }

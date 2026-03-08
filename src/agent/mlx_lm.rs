@@ -188,8 +188,9 @@ impl MlxLmServer {
 
     /// Build the `vllm-mlx serve` command.
     fn build_vllm_mlx_command(&self) -> Result<Command, String> {
-        let bin = find_vllm_mlx_binary()
-            .ok_or_else(|| "vllm-mlx binary not found. Install with: pip install vllm-mlx".to_string())?;
+        let bin = find_vllm_mlx_binary().ok_or_else(|| {
+            "vllm-mlx binary not found. Install with: pip install vllm-mlx".to_string()
+        })?;
 
         let mut cmd = Command::new(bin);
         cmd.arg("serve")

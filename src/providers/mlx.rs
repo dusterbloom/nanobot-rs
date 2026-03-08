@@ -208,7 +208,11 @@ mod inner {
                         max_tokens: Some(32768),
                     };
                     let backend_name = if is_vllm { "vllm-mlx" } else { "mlx-lm" };
-                    tracing::info!(port, backend = backend_name, "starting managed inference server");
+                    tracing::info!(
+                        port,
+                        backend = backend_name,
+                        "starting managed inference server"
+                    );
                     match crate::agent::mlx_lm::MlxLmServer::start(
                         model_dir.clone(),
                         adapter,
@@ -635,7 +639,14 @@ mod inner {
             // Delegate to mlx-lm server when configured
             if let Some(ref url) = self.mlx_lm_url {
                 return self
-                    .chat_via_mlx_lm(url, messages, tools, max_tokens, temperature, thinking_budget)
+                    .chat_via_mlx_lm(
+                        url,
+                        messages,
+                        tools,
+                        max_tokens,
+                        temperature,
+                        thinking_budget,
+                    )
                     .await;
             }
 
@@ -702,16 +713,27 @@ mod inner {
             use futures_util::StreamExt;
 
             let want_thinking = thinking_budget.map_or(false, |b| b > 0);
-            // The server starts with enable_thinking=false by default, so
-            // the template does NOT prefill <think>.  Only when the user
-            // toggles /t (thinking_budget > 0) does the template prefill.
-            let starts_in_think = self.thinking_model && want_thinking;
+            // The server is started with enable_thinking=false (chat_template_args)
+            // and there is no per-request mechanism to change it, so the template
+            // never prefills <think>.  Don't pre-assume thinking mode — the
+            // splitter will detect <think> open tags if the model self-generates
+            // them, and vllm-mlx reasoning arrives via separate delta fields
+            // (reasoning_content/reasoning) handled independently.
+            let starts_in_think = false;
 
             // Only stream when delegating to mlx-lm server
             let Some(ref base_url) = self.mlx_lm_url else {
                 // In-process: fall back to buffered default
                 let response = self
-                    .chat(messages, tools, None, max_tokens, temperature, thinking_budget, None)
+                    .chat(
+                        messages,
+                        tools,
+                        None,
+                        max_tokens,
+                        temperature,
+                        thinking_budget,
+                        None,
+                    )
                     .await?;
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 if let Some(ref content) = response.content {

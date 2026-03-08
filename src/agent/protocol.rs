@@ -435,8 +435,7 @@ static XML_FUNCTION_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 // Extracts `<parameter=KEY>VALUE</parameter>` pairs.
 static XML_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?si)<parameter=(\w+)>\s*(.*?)\s*</parameter>"#)
-        .expect("xml parameter regex")
+    Regex::new(r#"(?si)<parameter=(\w+)>\s*(.*?)\s*</parameter>"#).expect("xml parameter regex")
 });
 
 /// Parse XML-style tool calls from response content.
@@ -471,8 +470,8 @@ pub fn parse_xml_tool_calls(text: &str) -> Vec<ParsedToolCall> {
             let key = param_cap[1].to_string();
             let value = param_cap[2].trim().to_string();
             // Try parsing as number/bool/null, fall back to string.
-            let json_val = serde_json::from_str::<Value>(&value)
-                .unwrap_or_else(|_| Value::String(value));
+            let json_val =
+                serde_json::from_str::<Value>(&value).unwrap_or_else(|_| Value::String(value));
             args.insert(key, json_val);
         }
 
@@ -528,9 +527,7 @@ impl XmlToolCallFilter {
         // In Buffering state, just accumulate until closing tag.
         if self.state == XmlFilterState::Buffering {
             self.buf.push_str(delta);
-            if self.buf.ends_with("</tool_call>")
-                || self.buf.contains("</tool_call>")
-            {
+            if self.buf.ends_with("</tool_call>") || self.buf.contains("</tool_call>") {
                 // Find text after the closing tag (if any).
                 let after = self
                     .buf
@@ -1093,7 +1090,8 @@ And also:
     #[test]
     fn filter_suppresses_tool_call_single_chunk() {
         let mut f = XmlToolCallFilter::new();
-        let out = f.filter("<tool_call><function=test><parameter=a>b</parameter></function></tool_call>");
+        let out =
+            f.filter("<tool_call><function=test><parameter=a>b</parameter></function></tool_call>");
         assert!(out.is_empty());
     }
 
@@ -1118,7 +1116,9 @@ And also:
     fn filter_mixed_content_and_tool_call() {
         let mut f = XmlToolCallFilter::new();
         assert_eq!(f.filter("Before "), "Before ");
-        assert!(f.filter("<tool_call><function=x></function></tool_call>").is_empty());
+        assert!(f
+            .filter("<tool_call><function=x></function></tool_call>")
+            .is_empty());
         assert_eq!(f.filter(" After"), " After");
     }
 }

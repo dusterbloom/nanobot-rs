@@ -1535,12 +1535,9 @@ mod tests {
     #[tokio::test]
     async fn test_query_perplexity_unreachable() {
         // query_perplexity should return None when server is unreachable.
-        let result = super::super::learn_loop::query_perplexity(
-            "http://127.0.0.1:19999",
-            "hello",
-            "world",
-        )
-        .await;
+        let result =
+            super::super::learn_loop::query_perplexity("http://127.0.0.1:19999", "hello", "world")
+                .await;
         assert!(
             result.is_none(),
             "should return None for unreachable server"

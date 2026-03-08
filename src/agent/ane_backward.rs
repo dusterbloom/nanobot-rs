@@ -131,7 +131,9 @@ pub fn classifier_bwd(
     ane_forward::cpu_gemm(dy, embed, true, dlogits, false, dim, seq, vocab, 1.0, 0.0);
 
     // dembed[V,D] += dlogits[V,S] @ x_final^T[S,D]  (beta=1.0 to accumulate)
-    ane_forward::cpu_gemm(dembed, dlogits, false, x_final, true, vocab, dim, seq, 1.0, 1.0);
+    ane_forward::cpu_gemm(
+        dembed, dlogits, false, x_final, true, vocab, dim, seq, 1.0, 1.0,
+    );
 }
 
 /// Embedding backward: scatter gradient to embedding rows.
@@ -840,8 +842,6 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
 
     // Per-layer backward (reverse)
     for l in (0..n_layers).rev() {
-        let lw_cow = model.layer(l);
-        let lw = &*lw_cow;
         let ac = &fwd.base.layer_acts[l];
         let la = &fwd.lora_acts[l];
 
@@ -864,20 +864,209 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             }
         }
 
-        // CPU: dsilu = dffn @ W2^T
-        let w2t = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let dsilu = ane_forward::cpu_matmul(&w2t, &dffn, hidden, dim, seq);
+        if let Some(ql) = model.quantized_layer(l).filter(|ql| ql.gdn.is_none()) {
+            let mut quantized_workspace = ane_forward::QuantizedMatmulWorkspace::default();
+            // CPU: dsilu = dffn @ W2^T without materializing dense quantized weights.
+            let mut dsilu = vec![0.0f32; ql.w2.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w2,
+                &dffn,
+                seq,
+                &mut dsilu,
+                &mut quantized_workspace,
+                false,
+            );
+
+            let mut dh1 = vec![0.0f32; hidden * seq];
+            let mut dh3 = vec![0.0f32; hidden * seq];
+            silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
+
+            let mut dx_ffn = vec![0.0f32; ql.w1.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w1,
+                &dh1,
+                seq,
+                &mut dx_ffn,
+                &mut quantized_workspace,
+                false,
+            );
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w3,
+                &dh3,
+                seq,
+                &mut dx_ffn,
+                &mut quantized_workspace,
+                true,
+            );
+
+            let mut dx2 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx2,
+                &mut vec![0.0f32; dim],
+                &dx_ffn,
+                &ac.x2,
+                &ql.rms_ffn,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
+            ane_forward::vec_add_inplace(&mut dx2, &dy);
+
+            if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
+                lora.layers[l].wo.as_ref(),
+                la.wo_x.as_ref(),
+                la.wo_h.as_ref(),
+                lora_grads.layers[l].wo.as_mut(),
+            ) {
+                let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
+                let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
+                for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                    *g += v;
+                }
+                for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                    *g += v;
+                }
+            }
+
+            let mut da = vec![0.0f32; ql.wo.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.wo,
+                &dx2,
+                seq,
+                &mut da,
+                &mut quantized_workspace,
+                false,
+            );
+            let (mut dq, mut dk, _dv) =
+                cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
+
+            ane_forward::rope_backward(
+                &mut dq,
+                &mut dk,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rope_theta,
+            );
+
+            if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &ql.q_norm) {
+                ane_forward::qk_rmsnorm_bwd(
+                    &mut dq,
+                    &mut vec![0.0f32; cfg.head_dim()],
+                    q_pre,
+                    q_nw,
+                    cfg.n_heads,
+                    cfg.head_dim(),
+                    seq,
+                    cfg.rms_eps,
+                );
+            }
+            if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &ql.k_norm) {
+                ane_forward::qk_rmsnorm_bwd(
+                    &mut dk,
+                    &mut vec![0.0f32; cfg.head_dim()],
+                    k_pre,
+                    k_nw,
+                    cfg.n_heads,
+                    cfg.head_dim(),
+                    seq,
+                    cfg.rms_eps,
+                );
+            }
+
+            let mut dx_attn = vec![0.0f32; ql.wq.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.wq,
+                &dq,
+                seq,
+                &mut dx_attn,
+                &mut quantized_workspace,
+                false,
+            );
+            let heads_per_group = cfg.heads_per_group();
+            if heads_per_group > 1 {
+                let dk_collapsed = ane_forward::collapse_grouped_kv_rows(
+                    &dk,
+                    ql.wk.rows,
+                    cfg.head_dim(),
+                    heads_per_group,
+                    seq,
+                );
+                ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                    &ql.wk,
+                    &dk_collapsed,
+                    seq,
+                    &mut dx_attn,
+                    &mut quantized_workspace,
+                    true,
+                );
+            } else {
+                ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                    &ql.wk,
+                    &dk,
+                    seq,
+                    &mut dx_attn,
+                    &mut quantized_workspace,
+                    true,
+                );
+            }
+            if heads_per_group > 1 {
+                let dv_collapsed = ane_forward::collapse_grouped_kv_rows(
+                    &_dv,
+                    ql.wv.rows,
+                    cfg.head_dim(),
+                    heads_per_group,
+                    seq,
+                );
+                ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                    &ql.wv,
+                    &dv_collapsed,
+                    seq,
+                    &mut dx_attn,
+                    &mut quantized_workspace,
+                    true,
+                );
+            } else {
+                ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                    &ql.wv,
+                    &_dv,
+                    seq,
+                    &mut dx_attn,
+                    &mut quantized_workspace,
+                    true,
+                );
+            }
+
+            let mut dx_rms1 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx_rms1,
+                &mut vec![0.0f32; dim],
+                &dx_attn,
+                &ac.layer_in,
+                &ql.rms_att,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
+            dy = dx_rms1;
+            ane_forward::vec_add_inplace(&mut dy, &dx2);
+            continue;
+        }
+
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
+
+        // CPU: dsilu = dffn @ W2^T (without materializing W2^T)
+        let dsilu = ane_forward::cpu_matmul_lhs_transposed(&lw.w2, dim, hidden, &dffn, seq);
 
         // silu backward
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
-        // CPU: dx_ffn = dh1 @ W1^T + dh3 @ W3^T
-        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
-        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let dx_w1 = ane_forward::cpu_matmul(&w1t, &dh1, dim, hidden, seq);
-        let dx_w3 = ane_forward::cpu_matmul(&w3t, &dh3, dim, hidden, seq);
+        // CPU: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (no explicit transposes)
+        let dx_w1 = ane_forward::cpu_matmul_lhs_transposed(&lw.w1, hidden, dim, &dh1, seq);
+        let dx_w3 = ane_forward::cpu_matmul_lhs_transposed(&lw.w3, hidden, dim, &dh3, seq);
         let mut dx_ffn = dx_w1;
         ane_forward::vec_add_inplace(&mut dx_ffn, &dx_w3);
 
@@ -912,9 +1101,8 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             }
         }
 
-        // CPU: da = dx2 @ Wo^T
-        let wot = ane_weights::transpose_weight(&lw.wo, dim, dim);
-        let da = ane_forward::cpu_matmul(&wot, &dx2, dim, dim, seq);
+        // CPU: da = dx2 @ Wo^T (no explicit transpose)
+        let da = ane_forward::cpu_matmul_lhs_transposed(&lw.wo, dim, dim, &dx2, seq);
 
         // CPU SDPA backward
         let (mut dq, mut dk, _dv) =
@@ -956,13 +1144,10 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             );
         }
 
-        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
-        let wqt = ane_weights::transpose_weight(&lw.wq, dim, dim);
-        let wkt = ane_weights::transpose_weight(&lw.wk, dim, dim);
-        let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
-        let mut dx_attn = ane_forward::cpu_matmul(&wqt, &dq, dim, dim, seq);
-        let dx_k = ane_forward::cpu_matmul(&wkt, &dk, dim, dim, seq);
-        let dx_v = ane_forward::cpu_matmul(&wvt, &_dv, dim, dim, seq);
+        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (no explicit transposes)
+        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, dim, dim, &dq, seq);
+        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, dim, dim, &dk, seq);
+        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, dim, dim, &_dv, seq);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
 
@@ -1288,8 +1473,74 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 mod tests {
     use super::*;
     use crate::agent::ane_forward;
+    use crate::agent::ane_lora::{LoraConfig, LoraModel};
     use crate::agent::ane_mil::MilConfig;
-    use crate::agent::ane_weights::{LayerWeights, ModelWeights};
+    use crate::agent::ane_weights::{
+        LayerWeights, ModelWeights, QuantizedLayerWeights, QuantizedModelWeights, QuantizedTensor,
+    };
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn quantize_tensor_affine(
+        dense: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> QuantizedTensor {
+        assert_eq!(dense.len(), rows * cols);
+        assert_eq!(cols % group_size, 0);
+
+        let n_groups = cols / group_size;
+        let mut data = vec![0u8; dense.len()];
+        let mut scales = vec![0.0f32; rows * n_groups];
+        let mut biases = vec![0.0f32; rows * n_groups];
+
+        for row in 0..rows {
+            for group in 0..n_groups {
+                let start = row * cols + group * group_size;
+                let values = &dense[start..start + group_size];
+                let mut min_v = f32::INFINITY;
+                let mut max_v = f32::NEG_INFINITY;
+                for &value in values {
+                    min_v = min_v.min(value);
+                    max_v = max_v.max(value);
+                }
+
+                let scale = if max_v > min_v {
+                    (max_v - min_v) / 255.0
+                } else {
+                    0.0
+                };
+                let idx = row * n_groups + group;
+                scales[idx] = scale;
+                biases[idx] = min_v;
+
+                for (offset, &value) in values.iter().enumerate() {
+                    let q = if scale > 0.0 {
+                        ((value - min_v) / scale).round().clamp(0.0, 255.0)
+                    } else {
+                        0.0
+                    };
+                    data[start + offset] = q as u8;
+                }
+            }
+        }
+
+        QuantizedTensor {
+            data,
+            scales,
+            biases,
+            rows,
+            cols,
+            group_size,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Round 1: rmsnorm_bwd
@@ -1526,6 +1777,100 @@ mod tests {
                 "embed_bwd tok=1 d={d} should be 0"
             );
         }
+    }
+
+    #[test]
+    fn test_backward_lora_cpu_generic_quantized_matches_dequantized_reference_for_gqa() {
+        let cfg = MilConfig {
+            dim: 8,
+            hidden_dim: 16,
+            n_heads: 4,
+            seq_len: 3,
+            n_kv_heads: 2,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+        };
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let kv_dim = cfg.kv_dim();
+        let vocab = 13;
+        let group_size = 2;
+
+        let make_vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.173).sin() * 0.2)
+                .collect()
+        };
+
+        let quantized = QuantizedModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![QuantizedLayerWeights {
+                wq: quantize_tensor_affine(&make_vals(dim * dim, 0), dim, dim, group_size),
+                wk: quantize_tensor_affine(&make_vals(kv_dim * dim, 100), kv_dim, dim, group_size),
+                wv: quantize_tensor_affine(&make_vals(kv_dim * dim, 200), kv_dim, dim, group_size),
+                wo: quantize_tensor_affine(&make_vals(dim * dim, 300), dim, dim, group_size),
+                w1: quantize_tensor_affine(&make_vals(hidden * dim, 400), hidden, dim, group_size),
+                w2: quantize_tensor_affine(&make_vals(dim * hidden, 500), dim, hidden, group_size),
+                w3: quantize_tensor_affine(&make_vals(hidden * dim, 600), hidden, dim, group_size),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: Some(vec![1.0, 0.9]),
+                k_norm: Some(vec![1.1, 0.8]),
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_vals(vocab * dim, 700),
+            vocab_size: vocab,
+            lm_head: None,
+            heads_per_group: cfg.heads_per_group(),
+        };
+
+        let dense = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![quantized.dequantize_layer(0)],
+            rms_final: quantized.rms_final.clone(),
+            embed: quantized.embed.clone(),
+            vocab_size: quantized.vocab_size,
+            lm_head: quantized.lm_head.clone(),
+        };
+
+        let lora = LoraModel::with_kv_dim(
+            LoraConfig {
+                rank: 4,
+                alpha: 4.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            dim,
+            kv_dim,
+            hidden,
+        );
+
+        let tokens = vec![1u16, 2, 3];
+        let targets = vec![2u16, 3, 4];
+
+        let quantized_fwd =
+            ane_forward::forward_cpu_generic(&quantized, Some(&lora), &tokens, &targets);
+        let dense_fwd = ane_forward::forward_cpu_generic(&dense, Some(&lora), &tokens, &targets);
+        let quantized_bwd = backward_lora_cpu_generic(&quantized, &quantized_fwd, &lora, &tokens);
+        let dense_bwd = backward_lora_cpu_generic(&dense, &dense_fwd, &lora, &tokens);
+
+        let q_w2 = quantized_bwd.lora_grads.layers[0].w2.as_ref().unwrap();
+        let d_w2 = dense_bwd.lora_grads.layers[0].w2.as_ref().unwrap();
+        let q_wo = quantized_bwd.lora_grads.layers[0].wo.as_ref().unwrap();
+        let d_wo = dense_bwd.lora_grads.layers[0].wo.as_ref().unwrap();
+
+        assert!(max_abs_diff(&q_w2.da, &d_w2.da) < 1e-4);
+        assert!(max_abs_diff(&q_w2.db, &d_w2.db) < 1e-4);
+        assert!(max_abs_diff(&q_wo.da, &d_wo.da) < 1e-4);
+        assert!(max_abs_diff(&q_wo.db, &d_wo.db) < 1e-4);
     }
 
     // -----------------------------------------------------------------------

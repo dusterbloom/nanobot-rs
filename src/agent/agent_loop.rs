@@ -235,8 +235,7 @@ impl AgentLoop {
         });
         // Rebuild learn_loop now that shared fields are accessible.
         {
-            let s = Arc::get_mut(&mut shared)
-                .expect("learn_loop init: shared Arc not yet cloned");
+            let s = Arc::get_mut(&mut shared).expect("learn_loop init: shared Arc not yet cloned");
             s.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
                 calibrator: s.calibrator.clone(),
                 experience_buffer: s.experience_buffer.clone(),
@@ -306,7 +305,6 @@ impl AgentLoop {
     }
 
     /// Check whether the perplexity gate is enabled on this agent loop.
-    #[cfg(test)]
     pub fn has_perplexity_gate(&self) -> bool {
         self.shared.perplexity_gate_config.enabled
     }

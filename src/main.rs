@@ -747,7 +747,14 @@ fn main() {
         },
         Commands::Sessions { action } => match action {
             SessionsAction::List => sessions_cmd::cmd_sessions_list(),
-            SessionsAction::Resume { id, local } => repl::cmd_agent(None, "cli:default".to_string(), local, None, Some(id), false),
+            SessionsAction::Resume { id, local } => repl::cmd_agent(
+                None,
+                "cli:default".to_string(),
+                local,
+                None,
+                Some(id),
+                false,
+            ),
             SessionsAction::New { name, local } => {
                 let key = sessions_cmd::make_session_key(name.as_deref());
                 repl::cmd_agent(None, key, local, None, None, false)
@@ -813,8 +820,9 @@ fn main() {
             } else {
                 preset
             };
-            let Some(model_config) = crate::agent::mlx_lora::ModelConfig::from_config_json(&model_dir)
-                .or_else(|| crate::cli::model_config_from_preset(&effective_preset))
+            let Some(model_config) =
+                crate::agent::mlx_lora::ModelConfig::from_config_json(&model_dir)
+                    .or_else(|| crate::cli::model_config_from_preset(&effective_preset))
             else {
                 let has_config = model_dir.join("config.json").exists();
                 let detail = if has_config {

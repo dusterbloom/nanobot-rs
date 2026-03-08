@@ -37,12 +37,12 @@ pub struct MilConfig {
     pub rms_eps: f32,      // RMSNorm epsilon (1e-5 for llama, 1e-6 for Qwen)
     pub has_lm_head: bool, // true = untied lm_head, false = share embed
     // Qwen3.5 GDN (Gated Delta Network) linear attention config
-    pub linear_attn_indices: Vec<usize>,  // layer indices using linear attention
-    pub linear_n_heads: usize,            // key/query heads for GDN
-    pub linear_head_dim: usize,           // key/query head dimension
-    pub linear_n_value_heads: usize,      // value heads (recurrence count)
-    pub linear_value_head_dim: usize,     // value head dimension
-    pub conv_kernel_size: usize,          // causal conv kernel size (usually 4)
+    pub linear_attn_indices: Vec<usize>, // layer indices using linear attention
+    pub linear_n_heads: usize,           // key/query heads for GDN
+    pub linear_head_dim: usize,          // key/query head dimension
+    pub linear_n_value_heads: usize,     // value heads (recurrence count)
+    pub linear_value_head_dim: usize,    // value head dimension
+    pub conv_kernel_size: usize,         // causal conv kernel size (usually 4)
 }
 
 impl MilConfig {

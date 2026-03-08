@@ -90,7 +90,10 @@ fn main() {
         // libtorch: find PyTorch's lib directory and add rpath so the binary
         // can locate libtorch_cpu.dylib etc. at runtime without DYLD_LIBRARY_PATH.
         if let Ok(output) = std::process::Command::new("python3")
-            .args(["-c", "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"])
+            .args([
+                "-c",
+                "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))",
+            ])
             .output()
         {
             let torch_lib = String::from_utf8_lossy(&output.stdout).trim().to_string();

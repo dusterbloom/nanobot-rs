@@ -159,6 +159,8 @@ pub struct LoraLinear {
     pub lora_a: Linear,
     pub lora_b: Linear,
     pub scale: f32,
+    adapter_active: bool,
+    training: bool,
 }
 
 impl LoraLinear {
@@ -187,7 +189,17 @@ impl LoraLinear {
             lora_a,
             lora_b,
             scale,
+            adapter_active: false,
+            training: false,
         })
+    }
+
+    fn uses_adapter_path(&self) -> bool {
+        self.training || self.adapter_active
+    }
+
+    pub fn set_adapter_active(&mut self, active: bool) {
+        self.adapter_active = active;
     }
 }
 
@@ -245,6 +257,9 @@ impl Module<&Array> for LoraLinear {
 
     fn forward(&mut self, x: &Array) -> Result<Array, Self::Error> {
         let base_out = self.base.forward(x)?;
+        if !self.uses_adapter_path() {
+            return Ok(base_out);
+        }
         let h = self.lora_a.forward(x)?;
         let delta = self.lora_b.forward(&h)?;
         let scaled = delta.multiply(&array!(self.scale))?;
@@ -252,6 +267,7 @@ impl Module<&Array> for LoraLinear {
     }
 
     fn training_mode(&mut self, mode: bool) {
+        self.training = mode;
         self.base.training_mode(mode);
         self.lora_a.training_mode(mode);
         self.lora_b.training_mode(mode);
@@ -1476,6 +1492,12 @@ impl MlxLoraAttention {
 
         self.o_proj.forward(&attn)
     }
+
+    fn set_lora_training_mode(&mut self, mode: bool) {
+        self.q_proj.training_mode(mode);
+        self.v_proj.training_mode(mode);
+        self.o_proj.training_mode(mode);
+    }
 }
 
 impl ModuleParameters for MlxLoraAttention {
@@ -1578,11 +1600,44 @@ impl MlxLoraMLP {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        self.forward_profiled(x, None)
+    }
+
+    fn forward_profiled(
+        &mut self,
+        x: &Array,
+        mut profile: Option<&mut LinearDecodeSubProfile>,
+    ) -> Result<Array, Exception> {
+        let gate_proj_t0 = std::time::Instant::now();
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(&gate)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            gate.eval()?;
+            profile.mlp_gate_proj_ms = gate_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let up_proj_t0 = std::time::Instant::now();
         let up = self.up_proj.forward(x)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            up.eval()?;
+            profile.mlp_up_proj_ms = up_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let act_mul_t0 = std::time::Instant::now();
+        let gate = nn::silu(&gate)?;
         let h = gate.multiply(&up)?;
-        self.down_proj.forward(&h)
+        if let Some(profile) = profile.as_deref_mut() {
+            h.eval()?;
+            profile.mlp_act_mul_ms = act_mul_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let down_proj_t0 = std::time::Instant::now();
+        let out = self.down_proj.forward(&h)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            out.eval()?;
+            profile.mlp_down_proj_ms = down_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        Ok(out)
+    }
+
+    fn set_lora_training_mode(&mut self, mode: bool) {
+        self.down_proj.training_mode(mode);
     }
 }
 
@@ -1689,6 +1744,28 @@ impl MlxLinearAttention {
         Ok(attn)
     }
 
+    pub fn apply_decode_conv1d_step(
+        &self,
+        qkv: &Array,
+        cache: &mut GdnCache,
+    ) -> Result<Array, Exception> {
+        apply_decode_conv1d_step_with_weight(&*self.conv1d_weight, self.conv_kernel, qkv, cache)
+    }
+
+    #[doc(hidden)]
+    pub fn apply_decode_conv1d_step_reference(
+        &self,
+        qkv: &Array,
+        cache: &mut GdnCache,
+    ) -> Result<Array, Exception> {
+        apply_decode_conv1d_step_reference_with_weight(
+            &*self.conv1d_weight,
+            self.conv_kernel,
+            qkv,
+            cache,
+        )
+    }
+
     /// Gated Delta Net forward (linear attention with delta rule).
     ///
     /// Implements the recurrence from `mlx_lm.models.gated_delta`:
@@ -1743,25 +1820,9 @@ impl MlxLinearAttention {
         let k_norm =
             mlx_rs::fast::rms_norm(&k_flat, &ones_d, 1e-6)?.reshape(&[batch, seq_len, h_k, d_k])?;
 
-        // GQA-style repeat K/Q to match value head count
-        let (q, k) = if kv_repeat > 1 {
-            // [B, L, H_k, D_k] → [B, L, H_k, 1, D_k] → [B, L, H_k, R, D_k] → [B, L, H_v, D_k]
-            let q_exp = mlx_rs::ops::broadcast_to(
-                &q_norm.expand_dims(3)?,
-                &[batch, seq_len, h_k, kv_repeat, d_k],
-            )?
-            .reshape(&[batch, seq_len, h_v, d_k])?;
-            let k_exp = mlx_rs::ops::broadcast_to(
-                &k_norm.expand_dims(3)?,
-                &[batch, seq_len, h_k, kv_repeat, d_k],
-            )?
-            .reshape(&[batch, seq_len, h_v, d_k])?;
-            (q_exp, k_exp)
-        } else {
-            (q_norm, k_norm)
-        };
-        let q = q.multiply(Array::from_f32(inv_scale * inv_scale))?;
-        let k = k.multiply(Array::from_f32(inv_scale))?;
+        let q = q_norm.multiply(Array::from_f32(inv_scale * inv_scale))?;
+        let k = k_norm.multiply(Array::from_f32(inv_scale))?;
+        let v = v.reshape(&[batch, seq_len, h_k, kv_repeat, d_v])?;
 
         // 5. Compute decay g and write gate beta
         let a_plus_bias = a.add(&*self.dt_bias)?; // [B, L, H_v]
@@ -1769,26 +1830,28 @@ impl MlxLinearAttention {
         let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
         let g = mlx_rs::ops::exp(&decay_rate.negative()?)?; // [B, L, H_v]
         let beta = nn::sigmoid(&b)?; // [B, L, H_v]
+        let g = g.reshape(&[batch, seq_len, h_k, kv_repeat])?;
+        let beta = beta.reshape(&[batch, seq_len, h_k, kv_repeat])?;
 
-        // 6. Gated delta recurrence — state: [B, H_v, D_v, D_k]
-        let mut state = mlx_rs::ops::zeros::<f32>(&[batch, h_v, d_v, d_k])?;
+        // 6. Gated delta recurrence — grouped state avoids materializing repeated Q/K heads.
+        let mut state = mlx_rs::ops::zeros::<f32>(&[batch, h_k, kv_repeat, d_v, d_k])?;
         let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            let g_t = g.index((.., t, ..)).reshape(&[batch, h_v, 1, 1])?;
-            let beta_t = beta.index((.., t, ..)).reshape(&[batch, h_v, 1])?;
-            let q_t = q.index((.., t, .., ..)); // [B, H_v, D_k]
-            let k_t = k.index((.., t, .., ..)); // [B, H_v, D_k]
-            let v_t = v.index((.., t, .., ..)); // [B, H_v, D_v]
+            let g_t = g.index((.., t, .., ..)).reshape(&[batch, h_k, kv_repeat, 1, 1])?;
+            let beta_t = beta.index((.., t, .., ..)).reshape(&[batch, h_k, kv_repeat, 1])?;
+            let q_t = q.index((.., t, .., ..)).reshape(&[batch, h_k, 1, 1, d_k])?;
+            let k_t = k.index((.., t, .., ..)).reshape(&[batch, h_k, 1, 1, d_k])?;
+            let v_t = v.index((.., t, .., .., ..)); // [B, H_k, R, D_v]
 
             state = state.multiply(&g_t)?;
-            let k_expanded = k_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
-            let kv_mem = state.multiply(&k_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
+            let kv_mem = state.multiply(&k_t)?.sum_axes(&[-1], false)?; // [B, H_k, R, D_v]
             let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?;
-            let delta_expanded = delta.expand_dims(-1)?; // [B, H_v, D_v, 1]
-            state = state.add(&k_expanded.multiply(&delta_expanded)?)?;
-            let q_expanded = q_t.expand_dims(-2)?; // [B, H_v, 1, D_k]
-            let y_t = state.multiply(&q_expanded)?.sum_axes(&[-1], false)?; // [B, H_v, D_v]
+            state = state.add(&k_t.multiply(&delta.expand_dims(-1)?)?)?;
+            let y_t = state
+                .multiply(&q_t)?
+                .sum_axes(&[-1], false)?
+                .reshape(&[batch, h_v, d_v])?;
             outputs.push(y_t);
         }
 
@@ -1796,10 +1859,7 @@ impl MlxLinearAttention {
         let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
 
         // 7. RMSNormGated: norm on last dim (D_v), then silu(z) * normed
-        let z = self
-            .in_proj_z
-            .forward(x)?
-            .reshape(&[batch, seq_len, h_v, d_v])?;
+        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h_v, d_v])?;
         let y_flat = y.reshape(&[-1, d_v])?;
         let y_normed = self
             .norm
@@ -1820,6 +1880,15 @@ impl MlxLinearAttention {
         x: &Array,
         cache: &mut GdnCache,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache_internal(x, cache, None)
+    }
+
+    fn forward_with_cache_internal(
+        &mut self,
+        x: &Array,
+        cache: &mut GdnCache,
+        mut profile: Option<&mut LinearDecodeSubProfile>,
+    ) -> Result<Array, Exception> {
         let shape = x.shape();
         let (batch, seq_len) = (shape[0], shape[1]);
         let h_k = self.n_heads;
@@ -1830,37 +1899,26 @@ impl MlxLinearAttention {
         let kv_repeat = h_v / h_k;
 
         // 1. Project QKV, alpha, beta, z
+        let qkv_proj_t0 = std::time::Instant::now();
         let qkv = self.in_proj_qkv.forward(x)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            qkv.eval()?;
+            profile.qkv_proj_ms = qkv_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let ab_proj_t0 = std::time::Instant::now();
         let a = self.in_proj_a.forward(x)?;
         let b = self.in_proj_b.forward(x)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            eval([&a, &b])?;
+            profile.ab_proj_ms = ab_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
         let conv_dim = qkv.shape()[2];
         let kernel = self.conv_kernel;
 
         // 2. Conv1d — different path for prefill vs decode
+        let conv_t0 = std::time::Instant::now();
         let qkv_conv = if seq_len == 1 {
-            let buf = if let Some(ref cb) = cache.conv_buf {
-                let combined = mlx_rs::ops::concatenate_axis(&[cb, &qkv], 1)?;
-                let new_buf = combined.index((.., 1.., ..));
-                new_buf.eval()?;
-                cache.conv_buf = Some(new_buf);
-                combined
-            } else {
-                let zeros = mlx_rs::ops::zeros::<f32>(&[batch, kernel - 1, conv_dim])?;
-                let combined = mlx_rs::ops::concatenate_axis(&[&zeros, &qkv], 1)?;
-                let new_buf = combined.index((.., 1.., ..));
-                new_buf.eval()?;
-                cache.conv_buf = Some(new_buf);
-                combined
-            };
-            let conv_out = mlx_rs::ops::conv1d(
-                &buf,
-                &*self.conv1d_weight,
-                None,
-                None,
-                None,
-                conv_dim as i32,
-            )?;
-            nn::silu(&conv_out)?
+            self.apply_decode_conv1d_step(&qkv, cache)?
         } else {
             let pad_widths: &[(i32, i32)] = &[(0, 0), (kernel - 1, 0), (0, 0)];
             let qkv_padded = mlx_rs::ops::pad(&qkv, pad_widths, None, None)?;
@@ -1872,14 +1930,31 @@ impl MlxLinearAttention {
                 None,
                 conv_dim as i32,
             )?;
-            let start = seq_len - (kernel - 1);
-            let conv_tail = qkv.index((.., start.., ..));
-            conv_tail.eval()?;
-            cache.conv_buf = Some(conv_tail);
+            let history_len = kernel.saturating_sub(1);
+            if history_len > 0 {
+                let mut history =
+                    mlx_rs::ops::zeros_dtype(&[batch, history_len, conv_dim], qkv.dtype())?;
+                let tail_len = seq_len.min(history_len);
+                if tail_len > 0 {
+                    let tail = qkv.index((.., seq_len - tail_len.., ..));
+                    history.try_index_mut((.., 0..tail_len, ..), &tail)?;
+                }
+                history.eval()?;
+                cache.conv_buf = Some(history);
+                cache.conv_pos = tail_len - 1;
+            } else {
+                cache.conv_buf = None;
+                cache.conv_pos = -1;
+            }
             nn::silu(&qkv_conv)?
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            qkv_conv.eval()?;
+            profile.conv_ms = conv_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 3. Split Q, K, V + normalize + GQA repeat
+        let qk_norm_t0 = std::time::Instant::now();
         let parts = qkv_conv.split_axis(&[key_dim, 2 * key_dim], -1)?;
         let q = parts[0].reshape(&[batch, seq_len, h_k, d_k])?;
         let k = parts[1].reshape(&[batch, seq_len, h_k, d_k])?;
@@ -1911,15 +1986,25 @@ impl MlxLinearAttention {
         };
         let q = q.multiply(Array::from_f32(inv_scale * inv_scale))?;
         let k = k.multiply(Array::from_f32(inv_scale))?;
+        if let Some(profile) = profile.as_deref_mut() {
+            eval([&q, &k, &v])?;
+            profile.qk_norm_ms = qk_norm_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 4. Decay and beta gates
+        let gate_t0 = std::time::Instant::now();
         let a_plus_bias = a.add(&*self.dt_bias)?;
         let sp = nn::softplus(&a_plus_bias)?;
         let decay_rate = mlx_rs::ops::exp(&*self.a_log)?.multiply(&sp)?;
         let g = mlx_rs::ops::exp(&decay_rate.negative()?)?;
         let beta = nn::sigmoid(&b)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            eval([&g, &beta])?;
+            profile.gate_ms = gate_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 5. Recurrence with state caching — state: [B, H_v, D_v, D_k]
+        let recurrence_t0 = std::time::Instant::now();
         let mut state = cache
             .state
             .take()
@@ -1947,14 +2032,23 @@ impl MlxLinearAttention {
         // Save final recurrent state
         state.eval()?;
         cache.state = Some(state);
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.recurrence_ms = recurrence_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // 6. Stack + RMSNormGated + out_proj
         let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
         let value_dim = h_v * d_v;
+        let z_proj_t0 = std::time::Instant::now();
         let z = self
             .in_proj_z
             .forward(x)?
             .reshape(&[batch, seq_len, h_v, d_v])?;
+        if let Some(profile) = profile.as_deref_mut() {
+            z.eval()?;
+            profile.z_proj_ms = z_proj_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let output_t0 = std::time::Instant::now();
         let y_flat = y.reshape(&[-1, d_v])?;
         let y_normed = self
             .norm
@@ -1962,9 +2056,98 @@ impl MlxLinearAttention {
             .reshape(&[batch, seq_len, h_v, d_v])?;
         let y = nn::silu(&z)?.multiply(&y_normed)?;
         let y = y.reshape(&[batch, seq_len, value_dim])?;
-
-        self.out_proj.forward(&y)
+        let out = self.out_proj.forward(&y)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            out.eval()?;
+            profile.output_ms = output_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        Ok(out)
     }
+}
+
+fn apply_decode_conv1d_step_with_weight(
+    conv1d_weight: &Array,
+    conv_kernel: i32,
+    qkv: &Array,
+    cache: &mut GdnCache,
+) -> Result<Array, Exception> {
+    let shape = qkv.shape();
+    let (batch, seq_len, conv_dim) = (shape[0], shape[1], shape[2]);
+    debug_assert_eq!(seq_len, 1, "decode conv expects a single token");
+
+    let history_len = conv_kernel.saturating_sub(1);
+    let qkv_flat = qkv.reshape(&[batch, conv_dim])?;
+    let current_weight = conv1d_weight.index((.., conv_kernel - 1, 0));
+    let mut conv_flat = qkv_flat.multiply(&current_weight)?;
+
+    if history_len > 0 {
+        if let Some(history) = cache.conv_buf.as_ref() {
+            debug_assert_eq!(history.shape(), &[batch, history_len, conv_dim]);
+            for lag in 0..history_len {
+                if cache.conv_pos < 0 {
+                    break;
+                }
+                let idx = (cache.conv_pos - lag).rem_euclid(history_len);
+                let prev = history
+                    .index((.., idx..idx + 1, ..))
+                    .reshape(&[batch, conv_dim])?;
+                let weight = conv1d_weight.index((.., history_len - 1 - lag, 0));
+                conv_flat = conv_flat.add(&prev.multiply(&weight)?)?;
+            }
+        }
+
+        let history = if let Some(history) = cache.conv_buf.as_mut() {
+            history
+        } else {
+            cache.conv_buf = Some(mlx_rs::ops::zeros_dtype(
+                &[batch, history_len, conv_dim],
+                qkv.dtype(),
+            )?);
+            cache
+                .conv_buf
+                .as_mut()
+                .ok_or_else(|| Exception::custom("decode conv history buffer missing"))?
+        };
+        let next_pos = if cache.conv_pos < 0 {
+            0
+        } else {
+            (cache.conv_pos + 1).rem_euclid(history_len)
+        };
+        history.try_index_mut((.., next_pos..next_pos + 1, ..), qkv)?;
+        history.eval()?;
+        cache.conv_pos = next_pos;
+    }
+
+    nn::silu(&conv_flat.reshape(&[batch, 1, conv_dim])?)
+}
+
+fn apply_decode_conv1d_step_reference_with_weight(
+    conv1d_weight: &Array,
+    conv_kernel: i32,
+    qkv: &Array,
+    cache: &mut GdnCache,
+) -> Result<Array, Exception> {
+    let shape = qkv.shape();
+    let (batch, seq_len, conv_dim) = (shape[0], shape[1], shape[2]);
+    debug_assert_eq!(seq_len, 1, "decode conv expects a single token");
+    let history_len = conv_kernel.saturating_sub(1);
+
+    let buf = if let Some(ref cb) = cache.conv_buf {
+        let combined = mlx_rs::ops::concatenate_axis(&[cb, qkv], 1)?;
+        let new_buf = combined.index((.., 1.., ..));
+        new_buf.eval()?;
+        cache.conv_buf = Some(new_buf);
+        combined
+    } else {
+        let zeros = mlx_rs::ops::zeros_dtype(&[batch, history_len, conv_dim], qkv.dtype())?;
+        let combined = mlx_rs::ops::concatenate_axis(&[&zeros, qkv], 1)?;
+        let new_buf = combined.index((.., 1.., ..));
+        new_buf.eval()?;
+        cache.conv_buf = Some(new_buf);
+        combined
+    };
+    let conv_out = mlx_rs::ops::conv1d(&buf, conv1d_weight, None, None, None, conv_dim as i32)?;
+    nn::silu(&conv_out)
 }
 
 impl ModuleParameters for MlxLinearAttention {
@@ -2087,6 +2270,20 @@ impl MlxLoraDecoderLayer {
         }
     }
 
+    pub fn linear_attention(&self) -> Option<&MlxLinearAttention> {
+        match &self.attn {
+            AttentionKind::Linear(attn) => Some(attn),
+            AttentionKind::Full(_) => None,
+        }
+    }
+
+    pub fn linear_attention_mut(&mut self) -> Option<&mut MlxLinearAttention> {
+        match &mut self.attn {
+            AttentionKind::Linear(attn) => Some(attn),
+            AttentionKind::Full(_) => None,
+        }
+    }
+
     /// Apply LoRA weight arrays to a specific target in this layer.
     /// Returns true if applied, false if the target doesn't exist (e.g. attention on GDN layer).
     pub fn apply_lora_weights(&mut self, target: &str, new_a: Array, new_b: Array) -> bool {
@@ -2104,11 +2301,13 @@ impl MlxLoraDecoderLayer {
                 };
                 *ll.lora_a.weight = new_a;
                 *ll.lora_b.weight = new_b;
+                ll.set_adapter_active(true);
                 true
             }
             "down_proj" => {
                 *self.mlp.down_proj.lora_a.weight = new_a;
                 *self.mlp.down_proj.lora_b.weight = new_b;
+                self.mlp.down_proj.set_adapter_active(true);
                 true
             }
             _ => false,
@@ -2117,6 +2316,13 @@ impl MlxLoraDecoderLayer {
 
     pub fn is_full_attention(&self) -> bool {
         matches!(&self.attn, AttentionKind::Full(_))
+    }
+
+    fn set_lora_training_mode(&mut self, mode: bool) {
+        if let AttentionKind::Full(attn) = &mut self.attn {
+            attn.set_lora_training_mode(mode);
+        }
+        self.mlp.set_lora_training_mode(mode);
     }
 
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
@@ -2141,25 +2347,53 @@ impl MlxLoraDecoderLayer {
         mask: Option<&Array>,
         cache: Option<&mut LayerCache>,
         compiled_plain_kv_decode: Option<&mut CompiledPlainKvDecodeFn>,
+        mut linear_profile: Option<&mut LinearDecodeSubProfile>,
     ) -> Result<Array, Exception> {
         let residual = x;
+        let input_norm_t0 = std::time::Instant::now();
         let h = self.input_layernorm.forward(x)?;
+        if let Some(profile) = linear_profile.as_deref_mut() {
+            h.eval()?;
+            profile.input_norm_ms = input_norm_t0.elapsed().as_secs_f64() * 1000.0;
+        }
         let h = match (&mut self.attn, cache) {
             (AttentionKind::Full(attn), Some(LayerCache::FullAttn(c))) => {
                 attn.forward_with_cache(&h, mask, c, compiled_plain_kv_decode)?
             }
             (AttentionKind::Linear(attn), Some(LayerCache::LinearAttn(c))) => {
-                mlx_rs::stop_gradient(&attn.forward_with_cache(&h, c)?)?
+                mlx_rs::stop_gradient(&attn.forward_with_cache_internal(
+                    &h,
+                    c,
+                    linear_profile.as_deref_mut(),
+                )?)?
             }
             (AttentionKind::Full(attn), _) => attn.forward(&h, mask)?,
             (AttentionKind::Linear(attn), _) => mlx_rs::stop_gradient(&attn.forward(&h)?)?,
         };
+        let attn_residual_t0 = std::time::Instant::now();
         let x = h.add(residual)?;
+        if let Some(profile) = linear_profile.as_deref_mut() {
+            x.eval()?;
+            profile.attn_residual_ms = attn_residual_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         let residual = &x;
+        let post_attn_norm_t0 = std::time::Instant::now();
         let h = self.post_attention_layernorm.forward(&x)?;
-        let h = self.mlp.forward(&h)?;
-        h.add(residual)
+        if let Some(profile) = linear_profile.as_deref_mut() {
+            h.eval()?;
+            profile.post_attn_norm_ms = post_attn_norm_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let h = self
+            .mlp
+            .forward_profiled(&h, linear_profile.as_deref_mut())?;
+        let final_residual_t0 = std::time::Instant::now();
+        let out = h.add(residual)?;
+        if let Some(profile) = linear_profile.as_deref_mut() {
+            out.eval()?;
+            profile.final_residual_ms = final_residual_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        Ok(out)
     }
 }
 
@@ -2247,6 +2481,133 @@ impl ModuleParameters for MlxLoraDecoderLayer {
 
 // --- Full model ---
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedDecodeLayerKind {
+    FullAttention,
+    LinearAttention,
+}
+
+impl CachedDecodeLayerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CachedDecodeLayerKind::FullAttention => "full-attn",
+            CachedDecodeLayerKind::LinearAttention => "linear-attn",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedDecodeLayerProfile {
+    pub layer_idx: usize,
+    pub kind: CachedDecodeLayerKind,
+    pub cache_len_before: i32,
+    pub quantized_kv: bool,
+    pub compiled_decode: bool,
+    pub total_ms: f64,
+    pub linear_decode: Option<LinearDecodeSubProfile>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LinearDecodeSubProfile {
+    pub input_norm_ms: f64,
+    pub qkv_proj_ms: f64,
+    pub ab_proj_ms: f64,
+    pub conv_ms: f64,
+    pub qk_norm_ms: f64,
+    pub gate_ms: f64,
+    pub recurrence_ms: f64,
+    pub z_proj_ms: f64,
+    pub output_ms: f64,
+    pub attn_residual_ms: f64,
+    pub post_attn_norm_ms: f64,
+    pub mlp_gate_proj_ms: f64,
+    pub mlp_up_proj_ms: f64,
+    pub mlp_act_mul_ms: f64,
+    pub mlp_down_proj_ms: f64,
+    pub final_residual_ms: f64,
+}
+
+impl LinearDecodeSubProfile {
+    pub fn total_ms(&self) -> f64 {
+        self.input_norm_ms
+            + self.qkv_proj_ms
+            + self.ab_proj_ms
+            + self.conv_ms
+            + self.qk_norm_ms
+            + self.gate_ms
+            + self.recurrence_ms
+            + self.z_proj_ms
+            + self.output_ms
+            + self.attn_residual_ms
+            + self.post_attn_norm_ms
+            + self.mlp_gate_proj_ms
+            + self.mlp_up_proj_ms
+            + self.mlp_act_mul_ms
+            + self.mlp_down_proj_ms
+            + self.final_residual_ms
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CachedDecodeProfile {
+    pub total_ms: f64,
+    pub embed_ms: f64,
+    pub mask_ms: f64,
+    pub layer_profiles: Vec<CachedDecodeLayerProfile>,
+    pub final_norm_ms: f64,
+    pub logits_ms: f64,
+}
+
+impl CachedDecodeProfile {
+    pub fn layer_total_ms(&self) -> f64 {
+        self.layer_profiles.iter().map(|layer| layer.total_ms).sum()
+    }
+
+    pub fn kind_total_ms(&self, kind: CachedDecodeLayerKind) -> f64 {
+        self.layer_profiles
+            .iter()
+            .filter(|layer| layer.kind == kind)
+            .map(|layer| layer.total_ms)
+            .sum()
+    }
+
+    pub fn unattributed_ms(&self) -> f64 {
+        (self.total_ms
+            - self.embed_ms
+            - self.mask_ms
+            - self.layer_total_ms()
+            - self.final_norm_ms
+            - self.logits_ms)
+            .max(0.0)
+    }
+
+    pub fn linear_decode_stage_totals(&self) -> LinearDecodeSubProfile {
+        let mut totals = LinearDecodeSubProfile::default();
+        for layer in &self.layer_profiles {
+            let Some(linear) = layer.linear_decode.as_ref() else {
+                continue;
+            };
+            totals.input_norm_ms += linear.input_norm_ms;
+            totals.qkv_proj_ms += linear.qkv_proj_ms;
+            totals.ab_proj_ms += linear.ab_proj_ms;
+            totals.conv_ms += linear.conv_ms;
+            totals.qk_norm_ms += linear.qk_norm_ms;
+            totals.gate_ms += linear.gate_ms;
+            totals.recurrence_ms += linear.recurrence_ms;
+            totals.z_proj_ms += linear.z_proj_ms;
+            totals.output_ms += linear.output_ms;
+            totals.attn_residual_ms += linear.attn_residual_ms;
+            totals.post_attn_norm_ms += linear.post_attn_norm_ms;
+            totals.mlp_gate_proj_ms += linear.mlp_gate_proj_ms;
+            totals.mlp_up_proj_ms += linear.mlp_up_proj_ms;
+            totals.mlp_act_mul_ms += linear.mlp_act_mul_ms;
+            totals.mlp_down_proj_ms += linear.mlp_down_proj_ms;
+            totals.final_residual_ms += linear.final_residual_ms;
+        }
+        totals
+    }
+}
+
 #[derive(Debug)]
 pub struct MlxLoraModel {
     pub embed_tokens: MlxEmbedding,
@@ -2320,6 +2681,23 @@ impl MlxLoraModel {
             lm_head,
             kv_cache_config: KvCacheConfig::default(),
         })
+    }
+
+    fn set_lora_training_mode(&mut self, mode: bool) {
+        for layer in &mut self.layers {
+            layer.set_lora_training_mode(mode);
+        }
+    }
+
+    fn mark_adapters_active(&mut self) {
+        for layer in &mut self.layers {
+            if let AttentionKind::Full(attn) = &mut layer.attn {
+                attn.q_proj.set_adapter_active(true);
+                attn.v_proj.set_adapter_active(true);
+                attn.o_proj.set_adapter_active(true);
+            }
+            layer.mlp.down_proj.set_adapter_active(true);
+        }
     }
 
     fn build_layer_caches(&self, capacity: i32) -> Vec<LayerCache> {
@@ -2510,7 +2888,43 @@ impl MlxLoraModel {
         tokens: &Array,
         caches: &mut [LayerCache],
     ) -> Result<Array, Exception> {
-        self.forward_logits_cached_with_compiled(tokens, caches, &mut None)
+        self.forward_logits_cached_internal(tokens, caches, &mut None, None)
+    }
+
+    pub fn profile_forward_logits_cached_step(
+        &mut self,
+        tokens: &Array,
+        caches: &mut [LayerCache],
+    ) -> Result<(Array, CachedDecodeProfile), Exception> {
+        let compiled_decode = compiled_decode_enabled();
+        if compiled_decode {
+            for cache in caches.iter_mut() {
+                if let LayerCache::FullAttn(KvCache::Plain(kv)) = cache {
+                    kv.prepare_compiled_decode_state()?;
+                }
+            }
+        }
+
+        let first_full_attn_scale = self.layers.iter().find_map(|layer| match &layer.attn {
+            AttentionKind::Full(attn) => Some(attn.attn_scale),
+            AttentionKind::Linear(_) => None,
+        });
+        let mut compiled_plain_kv_decode = if compiled_decode && first_full_attn_scale.is_some() {
+            Some(make_compiled_plain_kv_decode(
+                first_full_attn_scale.unwrap(),
+            ))
+        } else {
+            None
+        };
+
+        let mut profile = CachedDecodeProfile::default();
+        let logits = self.forward_logits_cached_internal(
+            tokens,
+            caches,
+            &mut compiled_plain_kv_decode,
+            Some(&mut profile),
+        )?;
+        Ok((logits, profile))
     }
 
     fn forward_logits_cached_with_compiled(
@@ -2519,8 +2933,25 @@ impl MlxLoraModel {
         caches: &mut [LayerCache],
         compiled_plain_kv_decode: &mut Option<Box<CompiledPlainKvDecodeFn>>,
     ) -> Result<Array, Exception> {
+        self.forward_logits_cached_internal(tokens, caches, compiled_plain_kv_decode, None)
+    }
+
+    fn forward_logits_cached_internal(
+        &mut self,
+        tokens: &Array,
+        caches: &mut [LayerCache],
+        compiled_plain_kv_decode: &mut Option<Box<CompiledPlainKvDecodeFn>>,
+        mut profile: Option<&mut CachedDecodeProfile>,
+    ) -> Result<Array, Exception> {
+        let total_t0 = std::time::Instant::now();
+        let profiling_enabled = profile.is_some();
         let q_len = tokens.shape()[1] as i32;
+        let embed_t0 = std::time::Instant::now();
         let mut h = self.embed_tokens.forward(tokens)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            h.eval()?;
+            profile.embed_ms = embed_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
         // Determine total KV length from first full-attention cache that has data
         let kv_len = caches
@@ -2534,23 +2965,71 @@ impl MlxLoraModel {
             })
             .unwrap_or(q_len);
 
+        let mask_t0 = std::time::Instant::now();
         let mask = if needs_explicit_cached_mask(q_len, kv_len) {
             Some(create_causal_mask_cached(q_len, kv_len)?)
         } else {
             None
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            if let Some(mask) = mask.as_ref() {
+                mask.eval()?;
+            }
+            profile.mask_ms = mask_t0.elapsed().as_secs_f64() * 1000.0;
+        }
 
-        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+        for (layer_idx, (layer, cache)) in self.layers.iter_mut().zip(caches.iter_mut()).enumerate()
+        {
+            let kind = if layer.is_full_attention() {
+                CachedDecodeLayerKind::FullAttention
+            } else {
+                CachedDecodeLayerKind::LinearAttention
+            };
+            let (cache_len_before, quantized_kv) = match cache {
+                LayerCache::FullAttn(KvCache::Plain(kv)) => (kv.len(), false),
+                LayerCache::FullAttn(KvCache::Quantized(kv)) => (kv.len(), true),
+                LayerCache::LinearAttn(_) => (0, false),
+            };
+            let compiled_decode = q_len == 1
+                && mask.is_none()
+                && compiled_plain_kv_decode.is_some()
+                && matches!(cache, LayerCache::FullAttn(KvCache::Plain(kv)) if kv.compiled_decode_ready());
+            let layer_t0 = std::time::Instant::now();
+            let mut linear_decode =
+                if profiling_enabled && kind == CachedDecodeLayerKind::LinearAttention {
+                    Some(LinearDecodeSubProfile::default())
+                } else {
+                    None
+                };
             h = layer.forward_with_cache(
                 &h,
                 mask.as_ref(),
                 Some(cache),
                 compiled_plain_kv_decode.as_deref_mut(),
+                linear_decode.as_mut(),
             )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                h.eval()?;
+                profile.layer_profiles.push(CachedDecodeLayerProfile {
+                    layer_idx,
+                    kind,
+                    cache_len_before,
+                    quantized_kv,
+                    compiled_decode,
+                    total_ms: layer_t0.elapsed().as_secs_f64() * 1000.0,
+                    linear_decode,
+                });
+            }
         }
 
+        let norm_t0 = std::time::Instant::now();
         h = self.norm.forward(&h)?;
-        if let Some(lm) = &mut self.lm_head {
+        if let Some(profile) = profile.as_deref_mut() {
+            h.eval()?;
+            profile.final_norm_ms = norm_t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        let logits_t0 = std::time::Instant::now();
+        let logits = if let Some(lm) = &mut self.lm_head {
             lm.forward(&h)
         } else {
             match &self.embed_tokens {
@@ -2559,7 +3038,13 @@ impl MlxLoraModel {
                     mlx_rs::ops::matmul(&h, &e.weight.transpose_axes(&[1, 0])?)
                 }
             }
+        }?;
+        if let Some(profile) = profile.as_deref_mut() {
+            logits.eval()?;
+            profile.logits_ms = logits_t0.elapsed().as_secs_f64() * 1000.0;
+            profile.total_ms = total_t0.elapsed().as_secs_f64() * 1000.0;
         }
+        Ok(logits)
     }
 
     pub fn generate_text(
@@ -2809,6 +3294,8 @@ pub struct GdnCache {
     pub state: Option<Array>,
     /// Conv1d circular buffer: last `kernel_size - 1` inputs, `[B, kernel-1, conv_dim]`
     pub conv_buf: Option<Array>,
+    /// Index of the most recent token in `conv_buf` when present.
+    pub conv_pos: i32,
 }
 
 fn quantized_layout_dims(
@@ -3492,6 +3979,7 @@ impl GdnCache {
         GdnCache {
             state: None,
             conv_buf: None,
+            conv_pos: -1,
         }
     }
 }
@@ -3547,42 +4035,50 @@ pub fn train_step(
     targets: &Array,
     grad_clip: f32,
 ) -> Result<(f32, f32), anyhow::Error> {
-    let loss_fn =
-        |model: &mut MlxLoraModel, (toks, tgts): (&Array, &Array)| -> Result<Array, Exception> {
+    model.set_lora_training_mode(true);
+    let result = (|| -> Result<(f32, f32), anyhow::Error> {
+        let loss_fn = |model: &mut MlxLoraModel,
+                       (toks, tgts): (&Array, &Array)|
+         -> Result<Array, Exception> {
             let logits = model.forward_logits(toks)?;
             cross_entropy_loss(&logits, tgts)
         };
 
-    let mut vg = nn::value_and_grad(loss_fn);
+        let mut vg = nn::value_and_grad(loss_fn);
 
-    let (loss, grads) =
-        vg(model, (tokens, targets)).map_err(|e| anyhow::anyhow!("value_and_grad: {e}"))?;
+        let (loss, grads) =
+            vg(model, (tokens, targets)).map_err(|e| anyhow::anyhow!("value_and_grad: {e}"))?;
 
-    let (clipped, total_norm) = mlx_rs::optimizers::clip_grad_norm(&grads, grad_clip)
-        .map_err(|e| anyhow::anyhow!("clip_grad_norm: {e}"))?;
+        let (clipped, total_norm) = mlx_rs::optimizers::clip_grad_norm(&grads, grad_clip)
+            .map_err(|e| anyhow::anyhow!("clip_grad_norm: {e}"))?;
 
-    // Skip optimizer update if gradient is NaN (prevents permanent weight corruption).
-    if total_norm.is_finite() {
-        let owned_grads: HashMap<Rc<str>, Array> = clipped
-            .into_iter()
-            .map(|(k, v)| (k, v.into_owned()))
-            .collect();
+        // Skip optimizer update if gradient is NaN (prevents permanent weight corruption).
+        if total_norm.is_finite() {
+            let owned_grads: HashMap<Rc<str>, Array> = clipped
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
 
-        optimizer
-            .update(model, &owned_grads)
-            .map_err(|e| anyhow::anyhow!("optimizer update: {e}"))?;
-    } else {
-        tracing::warn!("skipped NaN gradient update");
-    }
+            optimizer
+                .update(model, &owned_grads)
+                .map_err(|e| anyhow::anyhow!("optimizer update: {e}"))?;
+            model.mark_adapters_active();
+        } else {
+            tracing::warn!("skipped NaN gradient update");
+        }
 
-    // Evaluate loss, model parameters, AND optimizer state — matching Python mlx_lm.
-    let params = model.parameters().flatten();
-    let mut eval_targets: Vec<&Array> = vec![&loss];
-    eval_targets.extend(params.values());
-    mlx_rs::transforms::eval(eval_targets.into_iter()).map_err(|e| anyhow::anyhow!("eval: {e}"))?;
+        // Evaluate loss and model parameters to materialize the updated graph.
+        let params = model.parameters().flatten();
+        let mut eval_targets: Vec<&Array> = vec![&loss];
+        eval_targets.extend(params.values());
+        mlx_rs::transforms::eval(eval_targets.into_iter())
+            .map_err(|e| anyhow::anyhow!("eval: {e}"))?;
 
-    let loss_val: f32 = loss.as_slice::<f32>()[0];
-    Ok((loss_val, total_norm))
+        let loss_val: f32 = loss.as_slice::<f32>()[0];
+        Ok((loss_val, total_norm))
+    })();
+    model.set_lora_training_mode(false);
+    result
 }
 
 /// Optional callback invoked after each training step with (step, loss, grad_norm).
@@ -3779,7 +4275,10 @@ mod tests {
         assert_eq!(cfg.n_layers, 36);
         assert_eq!(cfg.vocab_size, 151936);
         assert_eq!(cfg.bits, 4);
-        assert!(cfg.linear_attn_indices.is_empty(), "Qwen3 has no linear attention");
+        assert!(
+            cfg.linear_attn_indices.is_empty(),
+            "Qwen3 has no linear attention"
+        );
         assert_eq!(cfg.weight_prefix, "model");
         assert!(cfg.thinking_model, "name contains 'Thinking'");
     }
@@ -3798,7 +4297,11 @@ mod tests {
         assert_eq!(cfg.bits, 8);
         assert_eq!(cfg.weight_prefix, "language_model.model");
         assert!(cfg.attn_output_gate);
-        assert_eq!(cfg.linear_attn_indices.len(), 18, "18 of 24 layers are linear");
+        assert_eq!(
+            cfg.linear_attn_indices.len(),
+            18,
+            "18 of 24 layers are linear"
+        );
         assert_eq!(cfg.linear_n_heads, 16);
         assert_eq!(cfg.conv_kernel_size, 4);
     }
@@ -4319,6 +4822,7 @@ mod tests {
     fn test_lora_linear_grad() {
         let ql = QuantizedLinear::new(128, 64).unwrap();
         let mut lora = LoraLinear::new(ql, 4, 1.0).unwrap();
+        lora.training_mode(true);
         let x = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[1, 128], None).unwrap();
 
         let loss_fn = |model: &mut LoraLinear, x: &Array| -> Result<Array, Exception> {
@@ -4844,6 +5348,259 @@ mod tests {
             generated[0], 11751,
             "first generated token should be 11751 (Paris), got {}",
             generated[0]
+        );
+    }
+
+    #[test]
+    fn test_profiled_cached_decode_matches_regular_step() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
+        let prompt = &[760i32, 6511, 314, 9338, 369];
+        let state = model.prefill(prompt, 2).expect("prefill");
+        let token = sample_next_token(&state.last_logits, 0.0)
+            .expect("sample")
+            .reshape(&[1, 1])
+            .expect("reshape");
+
+        let mut regular_caches = state.caches.clone();
+        let regular = model
+            .forward_logits_cached(&token, &mut regular_caches)
+            .expect("regular cached decode");
+
+        let mut profiled_caches = state.caches.clone();
+        let (profiled, profile) = model
+            .profile_forward_logits_cached_step(&token, &mut profiled_caches)
+            .expect("profiled cached decode");
+
+        let max_diff = profiled
+            .subtract(&regular)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            max_diff < 1e-4,
+            "profiled cached decode drift too large: {max_diff}"
+        );
+        assert_eq!(profile.layer_profiles.len(), model.layers.len());
+        assert!(
+            profile.total_ms > 0.0,
+            "profile should record non-zero total time"
+        );
+        assert!(
+            profile.embed_ms > 0.0,
+            "profile should record embedding time"
+        );
+        assert!(profile.logits_ms > 0.0, "profile should record logits time");
+        assert!(
+            profile
+                .layer_profiles
+                .iter()
+                .any(|layer| layer.kind == CachedDecodeLayerKind::FullAttention),
+            "expected at least one full-attention layer in cached decode profile"
+        );
+        assert!(
+            profile
+                .layer_profiles
+                .iter()
+                .any(|layer| layer.kind == CachedDecodeLayerKind::LinearAttention),
+            "expected at least one linear-attention layer in cached decode profile"
+        );
+        assert!(
+            profile
+                .layer_profiles
+                .iter()
+                .filter(|layer| layer.kind == CachedDecodeLayerKind::LinearAttention)
+                .all(|layer| layer.linear_decode.is_some()),
+            "expected linear-attention layers to carry a decode subprofile"
+        );
+    }
+
+    #[test]
+    fn test_decode_conv1d_helper_matches_reference_path() {
+        let conv_dim = 2;
+        let kernel = 4;
+        let conv_weight = Array::from_slice(
+            &[
+                0.5f32, -0.25, 1.5, 2.0, // channel 0
+                -1.0, 0.75, 0.25, 1.25, // channel 1
+            ],
+            &[conv_dim, kernel, 1],
+        );
+
+        let prefill_tail = Array::from_slice(
+            &[
+                1.0f32, 10.0, //
+                2.0, 20.0, //
+                3.0, 30.0,
+            ],
+            &[1, kernel - 1, conv_dim],
+        );
+        let decode_steps = [
+            Array::from_slice(&[4.0f32, 40.0], &[1, 1, conv_dim]),
+            Array::from_slice(&[5.0f32, 50.0], &[1, 1, conv_dim]),
+            Array::from_slice(&[6.0f32, 60.0], &[1, 1, conv_dim]),
+        ];
+
+        let mut optimized_cache = GdnCache {
+            state: None,
+            conv_buf: Some(prefill_tail.clone()),
+            conv_pos: kernel - 2,
+        };
+        let mut reference_cache = GdnCache {
+            state: None,
+            conv_buf: Some(prefill_tail),
+            conv_pos: -1,
+        };
+
+        for (step_idx, qkv) in decode_steps.iter().enumerate() {
+            let optimized = apply_decode_conv1d_step_with_weight(
+                &conv_weight,
+                kernel,
+                qkv,
+                &mut optimized_cache,
+            )
+            .expect("optimized decode conv");
+            let reference = apply_decode_conv1d_step_reference_with_weight(
+                &conv_weight,
+                kernel,
+                qkv,
+                &mut reference_cache,
+            )
+            .expect("reference decode conv");
+            let (max_diff, mean_diff) = compare_arrays(&optimized, &reference);
+            assert!(
+                max_diff < 1e-6 && mean_diff < 1e-6,
+                "decode conv drift at step {step_idx}: max={max_diff:.3e} mean={mean_diff:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_attn_cached_step_matches_full_forward_last_token() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
+        let hidden: Vec<f32> = (0..(5 * cfg.dim))
+            .map(|i| ((i as f32) * 0.013 - 0.7).sin() * 0.5)
+            .collect();
+        let input = Array::from_slice(&hidden, &[1, 5, cfg.dim as i32]);
+
+        let linear_idx = model
+            .layers
+            .iter()
+            .position(|layer| matches!(layer.attn, AttentionKind::Linear(_)))
+            .expect("expected at least one linear-attention layer");
+        let layer = &mut model.layers[linear_idx];
+        let full = layer.forward_linear_attn(&input).expect("full forward");
+        let expected_last = full.index((.., 4..5, ..));
+
+        let prefill = input.index((.., ..4, ..));
+        let decode = input.index((.., 4..5, ..));
+        let mut cache = GdnCache::new();
+        let prefill_out = match &mut layer.attn {
+            AttentionKind::Linear(attn) => attn
+                .forward_with_cache(&prefill, &mut cache)
+                .expect("prefill cache forward"),
+            AttentionKind::Full(_) => panic!("expected linear-attention layer"),
+        };
+        assert_eq!(prefill_out.shape(), &[1, 4, cfg.dim as i32]);
+        let actual_last = match &mut layer.attn {
+            AttentionKind::Linear(attn) => attn
+                .forward_with_cache(&decode, &mut cache)
+                .expect("decode cache forward"),
+            AttentionKind::Full(_) => panic!("expected linear-attention layer"),
+        };
+
+        let (max_diff, mean_diff) = compare_arrays(&actual_last, &expected_last);
+        assert!(
+            max_diff < 1e-4 && mean_diff < 1e-5,
+            "linear-attn cached-step drift too large: max={max_diff:.3e} mean={mean_diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn test_full_model_cached_first_step_parity_long_prompt() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-2B-MLX-8bit not found, skipping");
+            return;
+        }
+
+        const BASE_SENTENCE: &str = concat!(
+            "Rust favors explicit data movement over hidden allocations. ",
+            "Quantized checkpoints reduce bandwidth pressure during inference. ",
+            "Hybrid attention models mix full attention with gated delta recurrence. "
+        );
+
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora_cfg = LoraConfig::default();
+        let mut model = MlxLoraModel::load(&model_dir, &cfg, &lora_cfg).expect("model load failed");
+        let tokenizer = MlxTokenizer::load(&model_dir).expect("tokenizer load failed");
+        let mut text = String::new();
+        let mut prompt = Vec::new();
+        while prompt.len() < 128 {
+            text.push_str(BASE_SENTENCE);
+            prompt = tokenizer.encode(&text).expect("encode");
+        }
+        prompt.truncate(128);
+
+        let prefill = model.prefill(&prompt, 2).expect("prefill");
+        let token = sample_next_token(&prefill.last_logits, 0.0)
+            .expect("sample")
+            .reshape(&[1, 1])
+            .expect("reshape");
+        let token_id = token.as_slice::<i32>()[0];
+
+        let mut cached_caches = prefill.caches.clone();
+        let cached_logits = model
+            .forward_logits_cached(&token, &mut cached_caches)
+            .expect("cached decode");
+        let cached_last = cached_logits.index((.., -1, ..));
+
+        let mut profiled_caches = prefill.caches.clone();
+        let (profiled_logits, _) = model
+            .profile_forward_logits_cached_step(&token, &mut profiled_caches)
+            .expect("profiled cached decode");
+        let profiled_last = profiled_logits.index((.., -1, ..));
+
+        let mut prompt_plus_first = prompt;
+        prompt_plus_first.push(token_id);
+        let no_cache_input =
+            Array::from_slice(&prompt_plus_first, &[1, prompt_plus_first.len() as i32]);
+        let no_cache_logits = model
+            .forward_logits(&no_cache_input)
+            .expect("no-cache forward");
+        let no_cache_last = no_cache_logits.index((.., -1, ..));
+
+        let (cached_max_diff, cached_mean_diff) = compare_arrays(&cached_last, &no_cache_last);
+        let (profiled_max_diff, profiled_mean_diff) =
+            compare_arrays(&profiled_last, &no_cache_last);
+        let (profile_delta_max, profile_delta_mean) = compare_arrays(&profiled_last, &cached_last);
+        eprintln!(
+            "long-prompt full-model parity: cached/no-cache max={cached_max_diff:.3e} mean={cached_mean_diff:.3e}; profiled/no-cache max={profiled_max_diff:.3e} mean={profiled_mean_diff:.3e}; profiled/cached max={profile_delta_max:.3e} mean={profile_delta_mean:.3e}"
+        );
+        assert!(
+            profile_delta_max < 1e-4 && profile_delta_mean < 1e-5,
+            "profiled cached-step drift too large on long prompt: max={profile_delta_max:.3e} mean={profile_delta_mean:.3e}"
         );
     }
 

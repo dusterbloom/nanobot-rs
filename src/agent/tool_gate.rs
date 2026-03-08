@@ -70,7 +70,10 @@ mod tests {
     fn test_small_contains_expected_tools() {
         let tools = ToolGate::filter(ModelSizeClass::Small, None).unwrap();
         // Verify specific tools from each capability group
-        assert!(tools.contains(&"read_file".to_string()), "Read -> read_file");
+        assert!(
+            tools.contains(&"read_file".to_string()),
+            "Read -> read_file"
+        );
         assert!(tools.contains(&"list_dir".to_string()), "Read -> list_dir");
         assert!(
             tools.contains(&"web_search".to_string()),

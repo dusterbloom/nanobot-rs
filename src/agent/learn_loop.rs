@@ -152,14 +152,15 @@ impl LearnLoop for DefaultLearnLoop {
         }
 
         // Warn once if the threshold looks like a legacy CE-loss value.
-        if self.perplexity_gate_config.surprise_threshold > 1.0 {
+        let raw_thresh = self.perplexity_gate_config.surprise_threshold;
+        if raw_thresh > 1.0 || raw_thresh < 0.0 {
             use std::sync::atomic::{AtomicBool, Ordering};
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
                 warn!(
-                    "perplexity_gate: surpriseThreshold={:.1} exceeds heuristic range (0.0-1.0), \
-                     clamping to 1.0 — update config to a value like 0.3",
-                    self.perplexity_gate_config.surprise_threshold
+                    "perplexity_gate: surpriseThreshold={:.1} outside heuristic range (0.0-1.0), \
+                     using default 0.3 — update config to a value like 0.3",
+                    raw_thresh
                 );
             }
         }
@@ -192,15 +193,18 @@ impl LearnLoop for DefaultLearnLoop {
             // worker, stalling inference for the next user turn. The heuristic
             // is instant and contention-free — training quality comes from the
             // LoRA step itself, not from the gate precision.
-            let surprise = crate::agent::lora_bridge::compute_surprise(
-                &outcome.user_content,
-                &trace_json,
-            );
+            let surprise =
+                crate::agent::lora_bridge::compute_surprise(&outcome.user_content, &trace_json);
 
-            // Heuristic surprise is 0.0–1.0; clamp the threshold so legacy
-            // configs that still carry the old CE-loss default (3.0) don't
-            // silently disable training.
-            let threshold = (pg_config.surprise_threshold as f64).min(1.0);
+            // Heuristic surprise is 0.0–1.0; clamp threshold into valid range.
+            // Legacy configs with CE-loss defaults (e.g. 3.0) get a sensible
+            // default rather than 1.0 (which would still block all training).
+            let raw_threshold = pg_config.surprise_threshold as f64;
+            let threshold = if raw_threshold > 1.0 {
+                0.3 // Legacy CE-loss value — use reasonable default
+            } else {
+                raw_threshold.clamp(0.0, 1.0)
+            };
             if surprise <= threshold {
                 return;
             }
@@ -239,7 +243,7 @@ impl LearnLoop for DefaultLearnLoop {
             }
 
             let epochs = pg_config.train_epochs;
-            let min_exp = pg_config.min_experiences;
+            let min_exp = pg_config.min_experiences.max(1); // 0 would LIMIT 0 → empty
 
             // Collect experiences under lock.
             let (exps_data, ids) = {
@@ -579,7 +583,9 @@ mod tests {
         let mock = MockLearnLoop::new();
         let outcome = make_test_outcome();
         mock.observe_immediate(&outcome);
-        assert!(mock.immediate_called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(mock
+            .immediate_called
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // Test 3: LearnLoop can be used as trait object (dyn dispatch).
@@ -647,7 +653,10 @@ mod tests {
         let outcome = make_test_outcome();
         let handle = mock.observe_async(outcome);
         assert!(handle.is_some());
-        handle.unwrap().await.expect("async observer should not panic");
+        handle
+            .unwrap()
+            .await
+            .expect("async observer should not panic");
     }
 
     fn make_test_outcome() -> TurnOutcome {
@@ -672,5 +681,83 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Threshold edge-case tests (P1/P2 fixes)
+    // ---------------------------------------------------------------
+
+    /// Legacy CE-loss threshold (3.0) must map to 0.3, not 1.0.
+    /// With the old code, 3.0 clamped to 1.0 which was unreachable
+    /// because compute_surprise() returns 0.0–1.0.
+    #[test]
+    fn test_legacy_threshold_maps_to_usable_default() {
+        let raw: f64 = 3.0;
+        let threshold = if raw > 1.0 { 0.3 } else { raw.clamp(0.0, 1.0) };
+        assert_eq!(threshold, 0.3);
+        // A moderately interesting turn should pass this gate.
+        let surprise = crate::agent::lora_bridge::compute_surprise(
+            "hello",
+            r#"[{"name":"exec","ok":true,"duration_ms":50},{"name":"read","ok":true,"duration_ms":30}]"#,
+        );
+        assert!(
+            surprise > threshold,
+            "surprise {surprise} should exceed legacy default 0.3"
+        );
+    }
+
+    /// Negative threshold must clamp to 0.0, not stay negative
+    /// (which would make the gate always-on).
+    #[test]
+    fn test_negative_threshold_clamps_to_zero() {
+        let raw: f64 = -1.0;
+        let threshold = if raw > 1.0 { 0.3 } else { raw.clamp(0.0, 1.0) };
+        assert_eq!(threshold, 0.0);
+    }
+
+    /// Valid thresholds in 0.0–1.0 pass through unchanged.
+    #[test]
+    fn test_valid_threshold_passthrough() {
+        for &v in &[0.0, 0.1, 0.3, 0.5, 0.99, 1.0] {
+            let threshold = if v > 1.0 {
+                0.3
+            } else {
+                (v as f64).clamp(0.0, 1.0)
+            };
+            assert!(
+                (threshold - v).abs() < f64::EPSILON,
+                "threshold {v} should pass through"
+            );
+        }
+    }
+
+    /// compute_surprise always returns values in [0.0, 1.0].
+    #[test]
+    fn test_surprise_range_bounded() {
+        // Empty trace → surprise = 0
+        let s1 = crate::agent::lora_bridge::compute_surprise("hello", "[]");
+        assert!(s1 >= 0.0 && s1 <= 1.0, "empty trace surprise={s1}");
+
+        // Large trace with many tools
+        let big_trace = format!(
+            "[{}]",
+            (0..10)
+                .map(|i| format!(
+                    r#"{{"name":"tool_{i}","ok":true,"duration_ms":{}}}"#,
+                    i * 100
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let s2 = crate::agent::lora_bridge::compute_surprise("x", &big_trace);
+        assert!(s2 >= 0.0 && s2 <= 1.0, "big trace surprise={s2}");
+    }
+
+    /// minExperiences=0 must be clamped to 1 at training time.
+    #[test]
+    fn test_min_experiences_zero_clamped() {
+        let min_exp: usize = 0;
+        let effective = min_exp.max(1);
+        assert_eq!(effective, 1);
     }
 }

@@ -20,8 +20,8 @@ use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
 use crate::agent::protocol::{
-    parse_textual_tool_calls, parse_xml_tool_calls, strip_textual_tool_calls,
-    strip_xml_tool_calls, ConversationProtocol, XmlToolCallFilter,
+    parse_textual_tool_calls, parse_xml_tool_calls, strip_textual_tool_calls, strip_xml_tool_calls,
+    ConversationProtocol, XmlToolCallFilter,
 };
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::subagent::SubagentManager;
@@ -833,7 +833,11 @@ impl AgentLoopShared {
         // subagents handle their own tools_filter in SubagentManager).
         // Lane policy can override the effective size class (e.g. Answer
         // lane forces Small/tiny tier regardless of actual model size).
-        let effective_size = ctx.core.lane.policy().tools
+        let effective_size = ctx
+            .core
+            .lane
+            .policy()
+            .tools
             .effective_size_class(ctx.core.model_capabilities.size_class);
         if let Some(allowed) = ToolGate::filter(effective_size, None) {
             let allowed_set: std::collections::HashSet<&str> =
@@ -1847,8 +1851,8 @@ impl AgentLoopShared {
                     finish_reason = %response.finish_reason,
                     "empty_llm_response: SLM returned no content and no tool calls, injecting fallback"
                 );
-                content = "I couldn't produce a response in this turn. Please try again."
-                    .to_string();
+                content =
+                    "I couldn't produce a response in this turn. Please try again.".to_string();
             }
             // Send finish_reason metadata to the REPL renderer before closing the channel.
             if let Some(ref tx) = ctx.text_delta_tx {

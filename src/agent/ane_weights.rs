@@ -25,7 +25,7 @@ pub struct GdnLayerWeights {
     pub o_proj: Vec<f32>,      // [dim, value_dim] output projection
     pub a_log: Vec<f32>,       // [Hv] learnable log decay
     pub dt_bias: Vec<f32>,     // [Hv] learnable time bias
-    pub norm_weight: Vec<f32>, // [value_dim] output RMSNorm weight
+    pub norm_weight: Vec<f32>, // [value_head_dim] shared per head or expanded [value_dim]
     pub conv_weight: Vec<f32>, // [qkv_dim, kernel_size] causal depthwise conv
     pub conv_bias: Vec<f32>,   // [qkv_dim] causal conv bias
 }
@@ -57,6 +57,69 @@ pub struct ModelWeights {
     pub embed: Vec<f32>,     // [vocab * dim]
     pub vocab_size: usize,
     pub lm_head: Option<Vec<f32>>, // [vocab * dim] untied classifier (Qwen)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MlxCheckpointMeta {
+    group_size: usize,
+    n_layers: usize,
+    vocab_size: usize,
+}
+
+fn parse_mlx_checkpoint_meta(root: &serde_json::Value) -> io::Result<MlxCheckpointMeta> {
+    let text_config = root.get("text_config").unwrap_or(root);
+    let quant = root
+        .get("quantization")
+        .or_else(|| root.get("quantization_config"));
+
+    let read_usize = |field: &str| -> io::Result<usize> {
+        text_config
+            .get(field)
+            .or_else(|| root.get(field))
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("config.json missing integer field {field}"),
+                )
+            })
+    };
+
+    Ok(MlxCheckpointMeta {
+        group_size: quant
+            .and_then(|q| q.get("group_size"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(64) as usize,
+        n_layers: read_usize("num_hidden_layers")?,
+        vocab_size: read_usize("vocab_size")?,
+    })
+}
+
+fn resolve_tensor_name<V>(tensors: &std::collections::HashMap<String, V>, name: &str) -> String {
+    let prefixed = format!("language_model.{name}");
+    if tensors.contains_key(name) {
+        name.to_string()
+    } else if tensors.contains_key(&prefixed) {
+        prefixed
+    } else {
+        name.to_string()
+    }
+}
+
+fn resolve_weight_base<V>(tensors: &std::collections::HashMap<String, V>, base: &str) -> String {
+    let direct_weight = format!("{base}.weight");
+    if tensors.contains_key(&direct_weight) {
+        return base.to_string();
+    }
+
+    let prefixed = format!("language_model.{base}");
+    let prefixed_weight = format!("{prefixed}.weight");
+    if tensors.contains_key(&prefixed_weight) {
+        prefixed
+    } else {
+        base.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +673,7 @@ impl ModelWeights {
                           base: &str,
                           group_size: usize|
          -> io::Result<Vec<f32>> {
+            let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
@@ -651,7 +715,8 @@ impl ModelWeights {
 
         /// Get a BF16 tensor directly (for layernorm weights, QK-norm)
         let get_bf16 = |tensors: &HashMap<String, Vec<u8>>, name: &str| -> io::Result<Vec<f32>> {
-            let data = tensors.get(name).ok_or_else(|| {
+            let name = resolve_tensor_name(tensors, name);
+            let data = tensors.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
             Ok(bf16_to_f32(data))
@@ -663,12 +728,13 @@ impl ModelWeights {
         let config: serde_json::Value = serde_json::from_str(&config_str).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}"))
         })?;
-        let group_size = config["quantization"]["group_size"].as_u64().unwrap_or(64) as usize;
+        let meta = parse_mlx_checkpoint_meta(&config)?;
 
         let dim = cfg.dim;
         let kv_dim = cfg.kv_dim();
-        let n_layers = config["num_hidden_layers"].as_u64().unwrap() as usize;
-        let vocab_size = config["vocab_size"].as_u64().unwrap() as usize;
+        let n_layers = meta.n_layers;
+        let vocab_size = meta.vocab_size;
+        let group_size = meta.group_size;
         let hpg = cfg.heads_per_group();
 
         // Embedding (quantized)
@@ -716,17 +782,41 @@ impl ModelWeights {
                 // GDN layers: load from linear_attn.* prefix, MHA projections are empty
                 let la = format!("{prefix}.linear_attn");
                 let gdn_w = GdnLayerWeights {
-                    qkv_proj: get_weight(&tensors, &tensor_meta, &format!("{la}.in_proj_qkv"), group_size)?,
-                    a_proj: get_weight(&tensors, &tensor_meta, &format!("{la}.in_proj_a"), group_size)?,
-                    b_proj: get_weight(&tensors, &tensor_meta, &format!("{la}.in_proj_b"), group_size)?,
-                    z_proj: get_weight(&tensors, &tensor_meta, &format!("{la}.in_proj_z"), group_size)?,
-                    o_proj: get_weight(&tensors, &tensor_meta, &format!("{la}.out_proj"), group_size)?,
+                    qkv_proj: get_weight(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{la}.in_proj_qkv"),
+                        group_size,
+                    )?,
+                    a_proj: get_weight(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{la}.in_proj_a"),
+                        group_size,
+                    )?,
+                    b_proj: get_weight(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{la}.in_proj_b"),
+                        group_size,
+                    )?,
+                    z_proj: get_weight(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{la}.in_proj_z"),
+                        group_size,
+                    )?,
+                    o_proj: get_weight(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{la}.out_proj"),
+                        group_size,
+                    )?,
                     a_log: get_bf16(&tensors, &format!("{la}.A_log"))?,
                     dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
                     norm_weight: get_bf16(&tensors, &format!("{la}.norm.weight"))?,
                     conv_weight: get_bf16(&tensors, &format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias"))
-                        .unwrap_or_default(),
+                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // GDN layers have no separate q/k/v/o projections
                 (vec![], vec![], vec![], vec![], None, None, Some(gdn_w))
@@ -758,10 +848,8 @@ impl ModelWeights {
                 )?;
                 let wk = expand_kv(&wk_raw, kv_dim, dim, hpg);
                 let wv = expand_kv(&wv_raw, kv_dim, dim, hpg);
-                let q_norm =
-                    get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm =
-                    get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -917,6 +1005,7 @@ impl QuantizedModelWeights {
                              base: &str,
                              group_size: usize|
          -> io::Result<QuantizedTensor> {
+            let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
@@ -948,43 +1037,44 @@ impl QuantizedModelWeights {
         };
 
         let get_bf16 = |tensors: &HashMap<String, Vec<u8>>, name: &str| -> io::Result<Vec<f32>> {
-            let data = tensors.get(name).ok_or_else(|| {
+            let name = resolve_tensor_name(tensors, name);
+            let data = tensors.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
             Ok(bf16_to_f32(data))
         };
 
         // Also need a dequantized loader for embeddings (quantized but needed as f32)
-        let dequant_8bit =
-            |weight: &[u8],
-             scales: &[u8],
-             biases: &[u8],
-             rows: usize,
-             cols: usize,
-             group_size: usize|
-             -> Vec<f32> {
-                let n_groups = cols / group_size;
-                let sc = bf16_to_f32(scales);
-                let bi = bf16_to_f32(biases);
-                let mut out = vec![0.0f32; rows * cols];
-                for r in 0..rows {
-                    let row_start = r * cols;
-                    for c in 0..cols {
-                        let qval = weight[row_start + c] as f32;
-                        let g = c / group_size;
-                        let s = sc[r * n_groups + g];
-                        let b = bi[r * n_groups + g];
-                        out[r * cols + c] = s * qval + b;
-                    }
+        let dequant_8bit = |weight: &[u8],
+                            scales: &[u8],
+                            biases: &[u8],
+                            rows: usize,
+                            cols: usize,
+                            group_size: usize|
+         -> Vec<f32> {
+            let n_groups = cols / group_size;
+            let sc = bf16_to_f32(scales);
+            let bi = bf16_to_f32(biases);
+            let mut out = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                let row_start = r * cols;
+                for c in 0..cols {
+                    let qval = weight[row_start + c] as f32;
+                    let g = c / group_size;
+                    let s = sc[r * n_groups + g];
+                    let b = bi[r * n_groups + g];
+                    out[r * cols + c] = s * qval + b;
                 }
-                out
-            };
+            }
+            out
+        };
 
         let get_weight_f32 = |tensors: &HashMap<String, Vec<u8>>,
                               tensor_meta: &HashMap<String, (String, Vec<usize>)>,
                               base: &str,
                               group_size: usize|
          -> io::Result<Vec<f32>> {
+            let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
@@ -1012,9 +1102,10 @@ impl QuantizedModelWeights {
         let config: serde_json::Value = serde_json::from_str(&config_str).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}"))
         })?;
-        let group_size = config["quantization"]["group_size"].as_u64().unwrap_or(64) as usize;
-        let n_layers = config["num_hidden_layers"].as_u64().unwrap() as usize;
-        let vocab_size = config["vocab_size"].as_u64().unwrap() as usize;
+        let meta = parse_mlx_checkpoint_meta(&config)?;
+        let group_size = meta.group_size;
+        let n_layers = meta.n_layers;
+        let vocab_size = meta.vocab_size;
         let hpg = cfg.heads_per_group();
 
         // Embedding — must be f32 (accessed every step, random access pattern)
@@ -1064,8 +1155,7 @@ impl QuantizedModelWeights {
                     dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
                     norm_weight: get_bf16(&tensors, &format!("{la}.norm.weight"))?,
                     conv_weight: get_bf16(&tensors, &format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias"))
-                        .unwrap_or_default(),
+                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // Dummy empty tensors for MHA fields (not used for GDN layers)
                 let empty = QuantizedTensor {
@@ -1111,10 +1201,8 @@ impl QuantizedModelWeights {
                     &format!("{prefix}.self_attn.o_proj"),
                     group_size,
                 )?;
-                let q_norm =
-                    get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm =
-                    get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -1242,7 +1330,7 @@ pub struct QuantizedGdnLayerWeights {
     pub o_proj: QuantizedTensor,   // [dim, value_dim]
     pub a_log: Vec<f32>,           // [Hv]
     pub dt_bias: Vec<f32>,         // [Hv]
-    pub norm_weight: Vec<f32>,     // [value_dim]
+    pub norm_weight: Vec<f32>,     // [value_head_dim] shared per head or expanded [value_dim]
     pub conv_weight: Vec<f32>,     // [qkv_dim, kernel_size]
     pub conv_bias: Vec<f32>,       // [qkv_dim]
 }
@@ -1390,7 +1478,7 @@ impl QuantizedModelWeights {
 
 /// Expand KV weights from [kv_dim, in_dim] to [dim, in_dim] by repeating
 /// each head_dim-sized block `hpg` times (GQA expansion).
-fn expand_kv_static(
+pub(crate) fn expand_kv_static(
     kv: &[f32],
     kv_dim: usize,
     head_dim: usize,
@@ -1425,6 +1513,9 @@ pub trait WeightSource {
     fn cfg(&self) -> &MilConfig;
     fn n_layers(&self) -> usize;
     fn layer(&self, l: usize) -> std::borrow::Cow<'_, LayerWeights>;
+    fn quantized_layer(&self, _l: usize) -> Option<&QuantizedLayerWeights> {
+        None
+    }
     fn embed(&self) -> &[f32];
     fn rms_final(&self) -> &[f32];
     fn vocab_size(&self) -> usize;
@@ -1464,6 +1555,9 @@ impl WeightSource for QuantizedModelWeights {
     }
     fn layer(&self, l: usize) -> std::borrow::Cow<'_, LayerWeights> {
         std::borrow::Cow::Owned(self.dequantize_layer(l))
+    }
+    fn quantized_layer(&self, l: usize) -> Option<&QuantizedLayerWeights> {
+        Some(&self.layers[l])
     }
     fn embed(&self) -> &[f32] {
         &self.embed
@@ -2080,6 +2174,67 @@ mod tests {
         assert_eq!(model.rms_final.len(), 768);
         assert!(model.vocab_size > 0);
         assert_eq!(model.embed.len(), model.vocab_size * 768);
+    }
+
+    #[test]
+    fn test_parse_mlx_checkpoint_meta_qwen3_root_layout() {
+        let config = serde_json::json!({
+            "num_hidden_layers": 28,
+            "vocab_size": 151936,
+            "quantization": {
+                "group_size": 64
+            }
+        });
+
+        let meta = parse_mlx_checkpoint_meta(&config).expect("should parse root-layout config");
+        assert_eq!(meta.group_size, 64);
+        assert_eq!(meta.n_layers, 28);
+        assert_eq!(meta.vocab_size, 151936);
+    }
+
+    #[test]
+    fn test_parse_mlx_checkpoint_meta_qwen3_5_text_config_layout() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "num_hidden_layers": 24,
+                "vocab_size": 248320
+            },
+            "quantization_config": {
+                "group_size": 128
+            }
+        });
+
+        let meta = parse_mlx_checkpoint_meta(&config).expect("should parse text_config layout");
+        assert_eq!(meta.group_size, 128);
+        assert_eq!(meta.n_layers, 24);
+        assert_eq!(meta.vocab_size, 248320);
+    }
+
+    #[test]
+    fn test_resolve_weight_base_prefers_language_model_prefix_when_needed() {
+        let tensors = std::collections::HashMap::from([(
+            "language_model.model.embed_tokens.weight".to_string(),
+            vec![1u8],
+        )]);
+
+        assert_eq!(
+            resolve_weight_base(&tensors, "model.embed_tokens"),
+            "language_model.model.embed_tokens"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tensor_name_prefers_language_model_prefix_when_needed() {
+        let tensors = std::collections::HashMap::from([(
+            "language_model.model.norm.weight".to_string(),
+            vec![1u8],
+        )]);
+
+        assert_eq!(
+            resolve_tensor_name(&tensors, "model.norm.weight"),
+            "language_model.model.norm.weight"
+        );
     }
 
     #[test]

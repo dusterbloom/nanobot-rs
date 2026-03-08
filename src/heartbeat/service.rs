@@ -315,7 +315,10 @@ impl HeartbeatService {
                 .await
                 .map_or(false, |s| s.success());
             if !found {
-                debug!("Maintenance: skipping `{}` — binary `{}` not in PATH", cmd, binary);
+                debug!(
+                    "Maintenance: skipping `{}` — binary `{}` not in PATH",
+                    cmd, binary
+                );
                 return;
             }
         }

@@ -186,21 +186,23 @@ pub fn spawn_ane_training(
             // 1. Load base model weights in quantized form (QLoRA: ~4x less memory).
             // Layer weights stay in 8-bit and are dequantized per-layer during
             // forward/backward, keeping only one layer's f32 weights in memory.
-            let mut model =
-                match QuantizedModelWeights::from_mlx_safetensors(&cfg.model_dir, &cfg.mil_config) {
-                    Ok(m) => {
-                        tracing::info!(
-                            "ANE train: loaded quantized model in {}ms ({:.1} MB)",
-                            t0.elapsed().as_millis(),
-                            m.quantized_memory_bytes() as f64 / 1_048_576.0,
-                        );
-                        m
-                    }
-                    Err(e) => {
-                        tracing::error!("ANE train: failed to load weights: {e}");
-                        return;
-                    }
-                };
+            let mut model = match QuantizedModelWeights::from_mlx_safetensors(
+                &cfg.model_dir,
+                &cfg.mil_config,
+            ) {
+                Ok(m) => {
+                    tracing::info!(
+                        "ANE train: loaded quantized model in {}ms ({:.1} MB)",
+                        t0.elapsed().as_millis(),
+                        m.quantized_memory_bytes() as f64 / 1_048_576.0,
+                    );
+                    m
+                }
+                Err(e) => {
+                    tracing::error!("ANE train: failed to load weights: {e}");
+                    return;
+                }
+            };
 
             // 2. Initialize or restore LoRA
             let lora_dir = dirs::home_dir()
@@ -267,9 +269,8 @@ pub fn spawn_ane_training(
                         break 'outer;
                     }
 
-                    let bwd = ane_backward::backward_lora_cpu_generic(
-                        &model, &fwd, &lora, &tokens_u32,
-                    );
+                    let bwd =
+                        ane_backward::backward_lora_cpu_generic(&model, &fwd, &lora, &tokens_u32);
 
                     step += 1;
                     lora_adam_update(
@@ -479,6 +480,7 @@ mod tests {
         let ones_b = vec![0.1f32; 32 * 4]; // [d_out=32, rank=4]
         *ll.lora_a.weight = Array::from_slice(&ones_a, &[4, 64]);
         *ll.lora_b.weight = Array::from_slice(&ones_b, &[32, 4]);
+        ll.set_adapter_active(true);
 
         let after = ll.forward(&x).unwrap();
         let diff_after: f32 = after
@@ -538,6 +540,12 @@ mod tests {
             rope_theta: 1_000_000.0,
             rms_eps: 1e-6,
             has_lm_head: false,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
         };
 
         // 1. Load ANE base weights and train LoRA (3 steps)
@@ -651,6 +659,12 @@ mod tests {
                 rope_theta: 1_000_000.0,
                 rms_eps: 1e-6,
                 has_lm_head: false,
+                linear_attn_indices: vec![],
+                linear_n_heads: 0,
+                linear_head_dim: 0,
+                linear_n_value_heads: 0,
+                linear_value_head_dim: 0,
+                conv_kernel_size: 0,
             },
             epochs: 1,
             lr: 1e-5,
@@ -764,6 +778,12 @@ mod tests {
                 rope_theta: 1_000_000.0,
                 rms_eps: 1e-6,
                 has_lm_head: false,
+                linear_attn_indices: vec![],
+                linear_n_heads: 0,
+                linear_head_dim: 0,
+                linear_n_value_heads: 0,
+                linear_value_head_dim: 0,
+                conv_kernel_size: 0,
             },
             epochs: 2,
             lr: 1e-5,
