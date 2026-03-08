@@ -127,28 +127,11 @@ pub fn classifier_bwd(
     debug_assert_eq!(embed.len(), vocab * dim);
     debug_assert_eq!(x_final.len(), dim * seq);
 
-    // dy[d,t] = sum_v embed[v,d] * dlogits[v,t]
-    // embed[v,d] = embed[v*dim + d], dlogits[v,t] = dlogits[v*seq + t]
-    for d in 0..dim {
-        for t in 0..seq {
-            let mut acc = 0.0f32;
-            for v in 0..vocab {
-                acc += embed[v * dim + d] * dlogits[v * seq + t];
-            }
-            dy[d * seq + t] = acc;
-        }
-    }
+    // dy[D,S] = embed^T[D,V] @ dlogits[V,S]
+    ane_forward::cpu_gemm(dy, embed, true, dlogits, false, dim, seq, vocab, 1.0, 0.0);
 
-    // dembed[v,d] += sum_t dlogits[v,t] * x_final[d,t]
-    for v in 0..vocab {
-        for d in 0..dim {
-            let mut acc = 0.0f32;
-            for t in 0..seq {
-                acc += dlogits[v * seq + t] * x_final[d * seq + t];
-            }
-            dembed[v * dim + d] += acc;
-        }
-    }
+    // dembed[V,D] += dlogits[V,S] @ x_final^T[S,D]  (beta=1.0 to accumulate)
+    ane_forward::cpu_gemm(dembed, dlogits, false, x_final, true, vocab, dim, seq, 1.0, 1.0);
 }
 
 /// Embedding backward: scatter gradient to embedding rows.

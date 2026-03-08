@@ -107,31 +107,9 @@ impl LoraAdapter {
     /// Also returns intermediate h = A @ x ([rank, seq]) for backward.
     pub fn forward_cpu(&self, x: &[f32], seq: usize) -> (Vec<f32>, Vec<f32>) {
         debug_assert_eq!(x.len(), self.d_in * seq);
-
-        // h[r, t] = sum_i A[r, i] * x[i, t]
-        let mut h = vec![0.0f32; self.rank * seq];
-        for r in 0..self.rank {
-            for t in 0..seq {
-                let mut acc = 0.0f32;
-                for i in 0..self.d_in {
-                    acc += self.a[r * self.d_in + i] * x[i * seq + t];
-                }
-                h[r * seq + t] = acc;
-            }
-        }
-
-        // dy[o, t] = sum_r B[o, r] * h[r, t]
-        let mut dy = vec![0.0f32; self.d_out * seq];
-        for o in 0..self.d_out {
-            for t in 0..seq {
-                let mut acc = 0.0f32;
-                for r in 0..self.rank {
-                    acc += self.b[o * self.rank + r] * h[r * seq + t];
-                }
-                dy[o * seq + t] = acc;
-            }
-        }
-
+        use super::ane_forward::cpu_matmul;
+        let h = cpu_matmul(&self.a, x, self.rank, self.d_in, seq);
+        let dy = cpu_matmul(&self.b, &h, self.d_out, self.rank, seq);
         (dy, h)
     }
 
@@ -155,54 +133,27 @@ impl LoraAdapter {
         debug_assert_eq!(d_out_grad.len(), self.d_out * seq);
         debug_assert_eq!(x.len(), self.d_in * seq);
         debug_assert_eq!(h.len(), self.rank * seq);
+        use super::ane_forward::cpu_gemm;
 
-        // dh[r, t] = sum_o B[o, r] * d_out_grad[o, t]  (B^T @ d_out_grad)
+        // dh[R,S] = B^T[R,Dout] @ d_out_grad[Dout,S]
         let mut dh = vec![0.0f32; self.rank * seq];
-        for r in 0..self.rank {
-            for t in 0..seq {
-                let mut acc = 0.0f32;
-                for o in 0..self.d_out {
-                    acc += self.b[o * self.rank + r] * d_out_grad[o * seq + t];
-                }
-                dh[r * seq + t] = acc;
-            }
-        }
+        cpu_gemm(&mut dh, &self.b, true, d_out_grad, false,
+                 self.rank, seq, self.d_out, 1.0, 0.0);
 
-        // dx_lora[i, t] = sum_r A[r, i] * dh[r, t]  (A^T @ dh)
+        // dx_lora[Din,S] = A^T[Din,R] @ dh[R,S]
         let mut dx_lora = vec![0.0f32; self.d_in * seq];
-        for i in 0..self.d_in {
-            for t in 0..seq {
-                let mut acc = 0.0f32;
-                for r in 0..self.rank {
-                    acc += self.a[r * self.d_in + i] * dh[r * seq + t];
-                }
-                dx_lora[i * seq + t] = acc;
-            }
-        }
+        cpu_gemm(&mut dx_lora, &self.a, true, &dh, false,
+                 self.d_in, seq, self.rank, 1.0, 0.0);
 
-        // dB[o, r] = sum_t d_out_grad[o, t] * h[r, t]
+        // dB[Dout,R] = d_out_grad[Dout,S] @ h^T[S,R]
         let mut db = vec![0.0f32; self.d_out * self.rank];
-        for o in 0..self.d_out {
-            for r in 0..self.rank {
-                let mut acc = 0.0f32;
-                for t in 0..seq {
-                    acc += d_out_grad[o * seq + t] * h[r * seq + t];
-                }
-                db[o * self.rank + r] = acc;
-            }
-        }
+        cpu_gemm(&mut db, d_out_grad, false, h, true,
+                 self.d_out, self.rank, seq, 1.0, 0.0);
 
-        // dA[r, i] = sum_t dh[r, t] * x[i, t]
+        // dA[R,Din] = dh[R,S] @ x^T[S,Din]
         let mut da = vec![0.0f32; self.rank * self.d_in];
-        for r in 0..self.rank {
-            for i in 0..self.d_in {
-                let mut acc = 0.0f32;
-                for t in 0..seq {
-                    acc += dh[r * seq + t] * x[i * seq + t];
-                }
-                da[r * self.d_in + i] = acc;
-            }
-        }
+        cpu_gemm(&mut da, &dh, false, x, true,
+                 self.rank, self.d_in, seq, 1.0, 0.0);
 
         (dx_lora, da, db)
     }

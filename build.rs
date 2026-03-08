@@ -12,6 +12,10 @@ fn safe_copy(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 fn main() {
+    // Accelerate framework is needed unconditionally on macOS for cpu_gemm (SGEMM).
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-lib=framework=Accelerate");
+
     // ANE (Apple Neural Engine) bridge — compile Obj-C dylib when `ane` feature is active.
     #[cfg(feature = "ane")]
     {
@@ -35,7 +39,6 @@ fn main() {
                 std::fs::canonicalize(bridge_dir).expect("Failed to resolve bridge/ane path");
             println!("cargo:rustc-link-search=native={}", bridge_abs.display());
             println!("cargo:rustc-link-lib=dylib=ane_bridge");
-            println!("cargo:rustc-link-lib=framework=Accelerate");
 
             // Set install name on the dylib so it can be found at runtime
             // relative to the executable, and also add rpath for the bridge dir.
