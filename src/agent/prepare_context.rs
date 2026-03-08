@@ -478,6 +478,7 @@ impl AgentLoopShared {
                 agent_retry_attempted: false,
                 continuations_used: 0,
                 validation_retries: 0,
+                empty_response_retry_attempted: false,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),

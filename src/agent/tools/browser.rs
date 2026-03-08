@@ -352,7 +352,10 @@ mod tests {
         let tool = BrowserTool::new(MAX_OUTPUT_CHARS);
         let result = tool.execute(HashMap::new()).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("action"));
+        // If binary available, error mentions "action"; otherwise install hint.
+        if tool.is_available() {
+            assert!(result.contains("action"));
+        }
     }
 
     #[tokio::test]
@@ -362,7 +365,9 @@ mod tests {
         params.insert("action".to_string(), Value::String("fly".to_string()));
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("fly"));
+        if tool.is_available() {
+            assert!(result.contains("fly"));
+        }
     }
 
     #[tokio::test]
@@ -372,7 +377,9 @@ mod tests {
         params.insert("action".to_string(), Value::String("open".to_string()));
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("url"));
+        if tool.is_available() {
+            assert!(result.contains("url"));
+        }
     }
 
     #[tokio::test]
@@ -382,7 +389,9 @@ mod tests {
         params.insert("action".to_string(), Value::String("click".to_string()));
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("ref"));
+        if tool.is_available() {
+            assert!(result.contains("ref"));
+        }
     }
 
     #[tokio::test]
@@ -394,7 +403,9 @@ mod tests {
         // Missing 'text'
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("text"));
+        if tool.is_available() {
+            assert!(result.contains("text"));
+        }
     }
 
     #[tokio::test]
@@ -404,7 +415,9 @@ mod tests {
         params.insert("action".to_string(), Value::String("search".to_string()));
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("query"));
+        if tool.is_available() {
+            assert!(result.contains("query"));
+        }
     }
 
     #[tokio::test]
@@ -418,7 +431,9 @@ mod tests {
         );
         let result = tool.execute(params).await;
         assert!(result.starts_with("Error:"));
-        assert!(result.contains("up") || result.contains("down"));
+        if tool.is_available() {
+            assert!(result.contains("up") || result.contains("down"));
+        }
     }
 
     #[test]

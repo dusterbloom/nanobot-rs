@@ -1966,7 +1966,7 @@ pub(crate) fn cmd_agent(
                 }
             }
 
-            // Re-index qmd sessions collection so the latest conversation is
+            // Re-index sessions in-process so the latest conversation is
             // immediately searchable via recall in the next session.
             index_sessions_background();
 
@@ -1990,49 +1990,31 @@ pub(crate) fn cmd_agent(
 // Post-session indexing
 // ============================================================================
 
-/// Re-index the `qmd sessions` collection so the latest conversation is
-/// searchable via the recall tool in the next session. Fire-and-forget:
-/// errors are logged but never block shutdown.
+/// Re-index sessions so the latest conversation is searchable via the recall
+/// tool in the next session. Runs the in-process session indexer (JSONL →
+/// SESSION_*.md + knowledge store ingestion). Fire-and-forget: errors are
+/// logged but never block shutdown.
 fn index_sessions_background() {
-    use std::process::Command;
+    let sessions_dir = match dirs::home_dir() {
+        Some(h) => h.join(".nanobot/sessions"),
+        None => {
+            warn!("Cannot determine home directory for session indexing");
+            return;
+        }
+    };
+    let memory_sessions_dir = match dirs::home_dir() {
+        Some(h) => h.join(".nanobot/workspace/memory/sessions"),
+        None => return,
+    };
 
-    // Sanitize new/changed JSONL sessions before qmd re-indexes.
-    let script = dirs::home_dir().map(|h| h.join("Dev/nanobot/scripts/sanitize-sessions.sh"));
-    if let Some(ref path) = script {
-        if path.exists() {
-            match Command::new("bash").arg(path).output() {
-                Ok(out) if out.status.success() => {
-                    debug!("session sanitizer completed");
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(
-                        "session sanitizer exited with {}: {}",
-                        out.status,
-                        stderr.trim()
-                    );
-                }
-                Err(e) => {
-                    warn!("session sanitizer failed: {}", e);
-                }
-            }
-        }
-    }
+    let (indexed, skipped, errors) =
+        crate::agent::session_indexer::index_sessions(&sessions_dir, &memory_sessions_dir);
 
-    match Command::new("qmd").args(["update"]).output() {
-        Ok(out) if out.status.success() => {
-            debug!("qmd update completed (sessions re-indexed)");
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            warn!("qmd update exited with {}: {}", out.status, stderr.trim());
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // qmd not installed — silently skip.
-        }
-        Err(e) => {
-            warn!("qmd update failed: {}", e);
-        }
+    if indexed > 0 || errors > 0 {
+        debug!(
+            "Session indexing complete: {} indexed, {} skipped, {} errors",
+            indexed, skipped, errors
+        );
     }
 }
 

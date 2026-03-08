@@ -208,6 +208,10 @@ pub(crate) struct FlowControl {
     /// `MAX_VALIDATION_RETRIES` before the retry is treated as a normal
     /// continuation (i.e. consumes an iteration slot).
     pub(crate) validation_retries: u32,
+    /// Whether we already retried an empty response with thinking disabled.
+    /// One-shot: prevents infinite retry loops when the model genuinely
+    /// produces nothing.
+    pub(crate) empty_response_retry_attempted: bool,
 }
 
 /// Shared handles for background compaction coordination.
@@ -961,7 +965,7 @@ impl AgentLoopShared {
 
                         tokio::spawn(async move {
                             let timeout_result =
-                                tokio::time::timeout(Duration::from_secs(30), async {
+                                tokio::time::timeout(Duration::from_secs(90), async {
                                     // Use dedicated LCM compactor if configured,
                                     // otherwise fall back to the core memory compactor.
                                     let compactor: &ContextCompactor =
@@ -1026,7 +1030,7 @@ impl AgentLoopShared {
                                 })
                                 .await;
                             if timeout_result.is_err() {
-                                warn!("LCM compaction timed out after 30s, resetting in_flight");
+                                warn!("LCM compaction timed out after 90s, resetting in_flight");
                             }
                             in_flight.store(false, Ordering::SeqCst);
                         });
@@ -1057,7 +1061,7 @@ impl AgentLoopShared {
 
             let bg_proprio = self.proprioception_config.clone();
             tokio::spawn(async move {
-                let timeout_result = tokio::time::timeout(Duration::from_secs(30), async {
+                let timeout_result = tokio::time::timeout(Duration::from_secs(90), async {
                     let result = if bg_proprio.enabled && bg_proprio.gradient_memory {
                         bg_core
                             .compactor
@@ -1097,7 +1101,7 @@ impl AgentLoopShared {
                 })
                 .await;
                 if timeout_result.is_err() {
-                    warn!("Core compaction timed out after 30s, resetting in_flight");
+                    warn!("Core compaction timed out after 90s, resetting in_flight");
                 }
                 in_flight.store(false, Ordering::SeqCst);
             });
@@ -1808,11 +1812,22 @@ impl AgentLoopShared {
         } else {
             let mut content = response.content.unwrap_or_default();
             if content.trim().is_empty() {
+                let thinking_was_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
+                if thinking_was_on && !ctx.flow.empty_response_retry_attempted {
+                    ctx.flow.empty_response_retry_attempted = true;
+                    warn!(
+                        finish_reason = %response.finish_reason,
+                        "empty_llm_response: thinking consumed entire output, retrying with thinking off"
+                    );
+                    // Temporarily disable thinking and re-enter the Calling phase.
+                    counters.thinking_budget.store(0, Ordering::Relaxed);
+                    return StepResult::Done(IterationOutcome::Continue);
+                }
                 warn!(
                     finish_reason = %response.finish_reason,
                     "empty_llm_response: SLM returned no content and no tool calls, injecting fallback"
                 );
-                content = "I couldn't produce a final answer in this turn. Please retry with /thinking off."
+                content = "I couldn't produce a response in this turn. Please try again."
                     .to_string();
             }
             // Send finish_reason metadata to the REPL renderer before closing the channel.
