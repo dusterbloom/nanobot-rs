@@ -321,21 +321,33 @@ impl LearnLoop for DefaultLearnLoop {
                         let handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
                             ane_cfg, samples, mlx_tx,
                         );
+                        let eb_for_done = eb_mutex.clone();
+                        let n_exps = ids.len();
                         // Spawn a watcher that clears training_active when the
-                        // ANE thread completes (runs on a blocking thread to avoid
-                        // tying up the async runtime).
+                        // ANE thread completes. mark_exported only runs after
+                        // training succeeds (returns true).
                         tokio::task::spawn_blocking(move || {
-                            let _ = handle.join();
+                            let ok = handle.join().unwrap_or(false);
                             if let Some(ref tc) = tc_for_done {
                                 tc.training_active.store(false, Ordering::Relaxed);
-                                tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+                                if ok {
+                                    tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            if ok {
+                                let eb = eb_for_done.lock();
+                                let _ = eb.mark_exported(&ids);
+                                info!(
+                                    "perplexity_gate: ANE training completed ({n_exps} experiences)"
+                                );
+                            } else {
+                                warn!(
+                                    "perplexity_gate: ANE training failed, experiences NOT marked exported"
+                                );
                             }
                         });
-                        let eb = eb_mutex.lock();
-                        let _ = eb.mark_exported(&ids);
                         info!(
-                            "perplexity_gate: ANE split-silicon training spawned ({} experiences)",
-                            ids.len()
+                            "perplexity_gate: ANE split-silicon training spawned ({n_exps} experiences)"
                         );
                         return;
                     }

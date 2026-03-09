@@ -36,6 +36,9 @@ pub struct MilConfig {
     pub rope_theta: f64,   // RoPE frequency base (10000.0 for llama, 1e6 for Qwen)
     pub rms_eps: f32,      // RMSNorm epsilon (1e-5 for llama, 1e-6 for Qwen)
     pub has_lm_head: bool, // true = untied lm_head, false = share embed
+    /// Explicit per-head dimension. May differ from `dim / n_heads` in models
+    /// like Qwen3.5 where n_heads * head_dim > dim (over-parameterised attention).
+    pub head_dim_explicit: usize,
     // Qwen3.5 GDN (Gated Delta Network) linear attention config
     pub linear_attn_indices: Vec<usize>, // layer indices using linear attention
     pub linear_n_heads: usize,           // key/query heads for GDN
@@ -58,6 +61,7 @@ impl MilConfig {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: dim / n_heads,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -72,8 +76,16 @@ impl MilConfig {
         self.linear_attn_indices.contains(&idx)
     }
 
+    /// Per-head dimension. Uses the explicit value from model config, which may
+    /// differ from `dim / n_heads` for over-parameterised attention (Qwen3.5).
     pub fn head_dim(&self) -> usize {
-        self.dim / self.n_heads
+        self.head_dim_explicit
+    }
+
+    /// Total attention dimension: `n_heads * head_dim`. Equals `dim` for
+    /// standard transformers but can be larger for Qwen3.5-style models.
+    pub fn attn_dim(&self) -> usize {
+        self.n_heads * self.head_dim_explicit
     }
     pub fn score_ch(&self) -> usize {
         self.n_heads * self.seq_len
@@ -1581,6 +1593,7 @@ mod tests {
             rope_theta: 1e6,
             rms_eps: 1e-6,
             has_lm_head: true,
+            head_dim_explicit: 1024 / 16,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,

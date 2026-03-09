@@ -1652,20 +1652,21 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 cpu_quantized_matmul_into(&ql.wv, &xnorm, seq, &mut v, &mut quantized_workspace);
 
                 let heads_per_group = cfg.heads_per_group();
+                let attn_dim = cfg.attn_dim();
                 if heads_per_group > 1 {
                     k = ane_weights::expand_kv_static(
                         &k,
                         ql.wk.rows,
                         head_dim,
                         heads_per_group,
-                        dim,
+                        attn_dim,
                     );
                     v = ane_weights::expand_kv_static(
                         &v,
                         ql.wv.rows,
                         head_dim,
                         heads_per_group,
-                        dim,
+                        attn_dim,
                     );
                 }
 
@@ -1793,9 +1794,10 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
             )
         } else {
             // MHA path: Q/K/V → QK-norm → RoPE → SDPA → Wo
-            let mut q = cpu_matmul(&lw.wq, &xnorm, dim, dim, seq);
-            let mut k = cpu_matmul(&lw.wk, &xnorm, dim, dim, seq);
-            let v = cpu_matmul(&lw.wv, &xnorm, dim, dim, seq);
+            let ad = cfg.attn_dim();
+            let mut q = cpu_matmul(&lw.wq, &xnorm, ad, dim, seq);
+            let mut k = cpu_matmul(&lw.wk, &xnorm, ad, dim, seq);
+            let v = cpu_matmul(&lw.wv, &xnorm, ad, dim, seq);
 
             let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
                 Some(qk_rmsnorm_fwd(
@@ -1824,7 +1826,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
 
             cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
             let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
-            let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, dim, seq);
+            let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, ad, seq);
 
             // LoRA on Wo (MHA only — GDN layers use stop_gradient on attention)
             if let Some(ll) = lora_layer {
@@ -2244,6 +2246,7 @@ mod tests {
             rope_theta: 10_000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: 8 / 4,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -2330,6 +2333,7 @@ mod tests {
             rope_theta: 10_000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: 8 / 2,
             linear_attn_indices: vec![0],
             linear_n_heads: 2,
             linear_head_dim: 4,
@@ -2795,6 +2799,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             rms_eps: 1e-6,
             has_lm_head: false,
+            head_dim_explicit: 2048 / 16,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -2857,6 +2862,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             rms_eps: 1e-6,
             has_lm_head: false,
+            head_dim_explicit: 2048 / 16,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -3186,6 +3192,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: dim / h_k,
             linear_attn_indices: vec![0],
             linear_n_heads: h_k,
             linear_head_dim: d_k,
@@ -3285,6 +3292,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: dim / h_k,
             linear_attn_indices: vec![0],
             linear_n_heads: h_k,
             linear_head_dim: d_k,

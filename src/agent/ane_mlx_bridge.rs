@@ -157,19 +157,19 @@ pub struct AneTrainingConfig {
 /// the resulting deltas to the MLX model worker via `ApplyLoraDeltas`.
 ///
 /// The thread:
-/// 1. Loads base model weights from safetensors (CPU, f32)
-/// 2. Initializes or restores LoRA from `~/.nanobot/workspace/lora/latest.bin`
+/// 1. Loads base model weights from safetensors (CPU, quantized)
+/// 2. Initializes or restores LoRA from `~/.nanobot/workspace/lora/{model_key}.bin`
 /// 3. Trains for `epochs` steps with AdamW
 /// 4. Saves updated LoRA to disk (warm start for next run)
 /// 5. Sends `ApplyLoraDeltas` to MLX model worker
 ///
-/// Returns the JoinHandle. Training is fire-and-forget from the caller's perspective.
+/// Returns `JoinHandle<bool>` — `true` if training completed and LoRA was saved.
 #[cfg(feature = "mlx")]
 pub fn spawn_ane_training(
     cfg: AneTrainingConfig,
     samples: Vec<(Vec<i32>, Vec<i32>)>,
     mlx_tx: std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<bool> {
     std::thread::Builder::new()
         .name("ane-lora-train".into())
         .spawn(move || {
@@ -200,7 +200,7 @@ pub fn spawn_ane_training(
                 }
                 Err(e) => {
                     tracing::error!("ANE train: failed to load weights: {e}");
-                    return;
+                    return false;
                 }
             };
 
@@ -312,13 +312,16 @@ pub fn spawn_ane_training(
             tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
 
             // 4. Save LoRA to disk
-            if let Err(e) = std::fs::create_dir_all(&lora_dir) {
+            let saved = if let Err(e) = std::fs::create_dir_all(&lora_dir) {
                 tracing::warn!("ANE train: failed to create lora dir: {e}");
+                false
             } else if let Err(e) = save_lora_bin(&lora, &lora_path) {
                 tracing::warn!("ANE train: failed to save LoRA: {e}");
+                false
             } else {
                 tracing::info!("ANE train: saved LoRA to {}", lora_path.display());
-            }
+                true
+            };
 
             // 5. Extract deltas and send to MLX
             let deltas = extract_lora_deltas(
@@ -335,6 +338,8 @@ pub fn spawn_ane_training(
                 reply: None, // fire-and-forget
             });
             tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+
+            saved
         })
         .expect("failed to spawn ANE training thread")
 }
@@ -545,6 +550,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             rms_eps: 1e-6,
             has_lm_head: false,
+            head_dim_explicit: 2048 / 16,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -664,6 +670,7 @@ mod tests {
                 rope_theta: 1_000_000.0,
                 rms_eps: 1e-6,
                 has_lm_head: false,
+                head_dim_explicit: 2048 / 16,
                 linear_attn_indices: vec![],
                 linear_n_heads: 0,
                 linear_head_dim: 0,
@@ -783,6 +790,7 @@ mod tests {
                 rope_theta: 1_000_000.0,
                 rms_eps: 1e-6,
                 has_lm_head: false,
+                head_dim_explicit: 2048 / 16,
                 linear_attn_indices: vec![],
                 linear_n_heads: 0,
                 linear_head_dim: 0,

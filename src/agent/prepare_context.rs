@@ -30,6 +30,24 @@ impl AgentLoopShared {
     ) -> Vec<crate::agent::context::PromptBlock> {
         let mut blocks = Vec::new();
 
+        // LCM context awareness for local models.
+        if self.lcm_config.enabled {
+            let has_summaries = {
+                let engines = self.lcm_engines.lock().await;
+                engines
+                    .get(session_key)
+                    .map(|e| e.try_lock().map_or(true, |eng| !eng.dag().is_empty()))
+                    .unwrap_or(false)
+            };
+            if has_summaries {
+                blocks.push(crate::agent::context::PromptBlock::new(
+                    "Context Management",
+                    "Blocks marked [Summary of messages X-Y] are compressed earlier messages. \
+                     Call lcm_expand with message IDs to retrieve originals.",
+                ));
+            }
+        }
+
         if core.memory_enabled {
             let ladder =
                 MemoryLadder::new(&core.workspace, &core.working_memory, None, &core.sessions);
@@ -99,6 +117,37 @@ impl AgentLoopShared {
         session_key: &str,
     ) -> Vec<SectionEntry> {
         let mut sections = Vec::new();
+
+        // LCM context awareness: tell the model about summarized context.
+        if self.lcm_config.enabled {
+            let has_summaries = {
+                let engines = self.lcm_engines.lock().await;
+                engines
+                    .get(session_key)
+                    .map(|e| {
+                        // Try lock to avoid blocking; if locked, assume summaries exist.
+                        e.try_lock().map_or(true, |eng| !eng.dag().is_empty())
+                    })
+                    .unwrap_or(false)
+            };
+            if has_summaries {
+                sections.push(SectionEntry {
+                    section: PromptSection::ToolUse,
+                    block: PromptBlock::new(
+                        "Context Management",
+                        "Your conversation history is managed by LCM. Blocks marked \
+                         [Summary of messages X-Y] are compressed versions of earlier messages. \
+                         If you need the full original text, call lcm_expand with the message \
+                         IDs shown. The system may auto-expand relevant summaries for you.",
+                    ),
+                    allocated_tokens: 0,
+                    actual_tokens: 0,
+                    source: SectionSource::Runtime("lcm-context".to_string()),
+                    included: true,
+                    shrinkable: false,
+                });
+            }
+        }
 
         // 1. Memory layers via MemoryLadder (replaces direct working memory + bulletin cache).
         if core.memory_enabled {
@@ -273,21 +322,71 @@ impl AgentLoopShared {
             self.build_tools(&core, &msg.channel, &msg.chat_id).await;
 
         // Register lcm_expand tool when LCM is enabled.
-        // Bug 4 fix: do NOT insert a fresh engine here. Only look up an
-        // existing engine so that step_pre_call's rebuild_from_turns path
-        // is not bypassed on session restart. If no engine exists yet, skip
-        // registration — step_pre_call will create/rebuild the engine on the
-        // first iteration and the tool will be available from the next turn.
+        // Eagerly create the engine here (with DB-persisted DAG if available)
+        // so the tool is available from the very first turn.
         if self.lcm_config.enabled {
             let lcm_engine = {
-                let engines = self.lcm_engines.lock().await;
-                engines.get(&session_key).cloned()
+                let mut engines = self.lcm_engines.lock().await;
+                if !engines.contains_key(&session_key) {
+                    use crate::agent::lcm::{LcmConfig, LcmEngine};
+                    let config = LcmConfig::from(&self.lcm_config);
+
+                    // Try to restore DAG from SQLite summary_nodes table.
+                    let session_meta_tmp = core.sessions.get_or_resume(&session_key).await;
+                    let db_nodes = core
+                        .sessions
+                        .load_summary_nodes(&session_meta_tmp.id)
+                        .await;
+
+                    let engine = if !db_nodes.is_empty() {
+                        // Restore from DB-persisted DAG + raw messages.
+                        let all_msgs = core
+                            .sessions
+                            .get_all_messages(&session_meta_tmp.id)
+                            .await;
+                        tracing::debug!(
+                            session = %session_key,
+                            node_count = db_nodes.len(),
+                            "LCM: rebuilding engine from DB summary nodes"
+                        );
+                        LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
+                    } else {
+                        // Check for legacy Turn::Summary entries in messages.
+                        let all_msgs = core
+                            .sessions
+                            .get_all_messages(&session_meta_tmp.id)
+                            .await;
+                        let turns: Vec<crate::agent::turn::Turn> = all_msgs
+                            .iter()
+                            .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
+                            .collect();
+                        let has_summaries = turns.iter().any(|t| t.is_summary());
+
+                        if has_summaries {
+                            tracing::debug!(
+                                session = %session_key,
+                                "LCM: rebuilding engine from legacy Turn::Summary entries"
+                            );
+                            LcmEngine::rebuild_from_turns(
+                                &turns,
+                                config,
+                                &crate::agent::protocol::CloudProtocol as &dyn crate::agent::protocol::ConversationProtocol,
+                                "",
+                            )
+                        } else {
+                            LcmEngine::new(config)
+                        }
+                    };
+
+                    engines.insert(
+                        session_key.clone(),
+                        std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+                    );
+                }
+                engines.get(&session_key).cloned().unwrap()
             };
-            if let Some(engine) = lcm_engine {
-                use crate::agent::lcm::LcmExpandTool;
-                tools.register(Box::new(LcmExpandTool::new(engine)));
-            }
-            // Engine will be created/rebuilt in step_pre_call if needed.
+            use crate::agent::lcm::LcmExpandTool;
+            tools.register(Box::new(LcmExpandTool::new(lcm_engine)));
         }
 
         // Resolve or create session for this key.

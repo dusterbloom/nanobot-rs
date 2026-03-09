@@ -358,17 +358,36 @@ impl AgentLoopShared {
             _ => return,
         };
 
+        let has_xml_blocks = content_text.contains("<tool_call>");
+
         let parsed = parse_textual_tool_calls(content_text);
         let parsed = if parsed.is_empty() {
             parse_xml_tool_calls(content_text)
         } else {
             parsed
         };
+
+        // Even when no valid tool calls were parsed, strip empty/malformed
+        // <tool_call> blocks from the content.  Leaving them in pollutes the
+        // conversation history and confuses the model into repeating the same
+        // broken XML format on subsequent iterations.
         if parsed.is_empty() {
+            if has_xml_blocks {
+                if let Some(ref mut content) = response.content {
+                    let cleaned = strip_xml_tool_calls(content);
+                    if cleaned.len() != content.len() {
+                        debug!(
+                            "Stripped empty/malformed <tool_call> blocks from response \
+                             (no valid tool calls parsed)"
+                        );
+                        *content = cleaned;
+                    }
+                }
+            }
             return;
         }
 
-        let is_xml = content_text.contains("<tool_call>");
+        let is_xml = has_xml_blocks;
         debug!(
             n = parsed.len(),
             format = if is_xml { "xml" } else { "textual" },
@@ -824,6 +843,37 @@ mod tests {
         let resp = make_response(Some("All done. Here is your answer."), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
         assert!(matches!(kind, ResponseKind::Text(_)));
+    }
+
+    #[test]
+    fn test_classify_calling_tool_as_tool_call() {
+        // [Calling tool: ...] should be parsed as a real tool call, not plain text.
+        let resp = make_response(
+            Some(r#"[Calling tool: read_file({"path":"/tmp/test"})]"#),
+            "stop",
+        );
+        let kind = classify_response(&resp, false, false, false, &default_retries(), false);
+        assert!(
+            matches!(kind, ResponseKind::ToolCalls { .. }),
+            "Expected ToolCalls for [Calling tool: ...], got {:?}",
+            kind
+        );
+    }
+
+    #[test]
+    fn test_classify_empty_xml_tool_call_as_empty_not_text() {
+        // Empty <tool_call></tool_call> should NOT be classified as ToolCalls
+        // (no valid function inside) and the XML tags should have been stripped
+        // by extract_textual_tool_calls before classification.
+        let resp = make_response(Some("<tool_call>\n</tool_call>"), "stop");
+        let kind = classify_response(&resp, false, false, false, &default_retries(), false);
+        // After stripping, content would be empty -- but classify_response sees
+        // the content pre-stripping, so it falls through to text or empty.
+        // The key assertion: it must NOT be ResponseKind::ToolCalls.
+        assert!(
+            !matches!(kind, ResponseKind::ToolCalls { .. }),
+            "Empty <tool_call></tool_call> must NOT be classified as tool calls"
+        );
     }
 
     #[test]

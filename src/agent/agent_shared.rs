@@ -855,36 +855,60 @@ impl AgentLoopShared {
         // When LCM is enabled, use the LCM engine's control loop instead.
         if self.lcm_config.enabled {
             // LCM path: get or create per-session engine, check thresholds.
-            // On first creation, check for existing summaries and rebuild DAG if present.
+            // On first creation, restore DAG from DB summary_nodes table,
+            // falling back to legacy Turn::Summary entries in messages.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
                 if !engines.contains_key(&ctx.session_key) {
                     let config = LcmConfig::from(&self.lcm_config);
 
-                    // Check if session has existing summary turns.
-                    let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_key).await;
-                    let turns: Vec<crate::agent::turn::Turn> = all_msgs
-                        .iter()
-                        .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
-                        .collect();
-                    let has_summaries = turns.iter().any(|t| t.is_summary());
+                    // Try DB-persisted DAG first (preferred).
+                    let db_nodes = ctx
+                        .core
+                        .sessions
+                        .load_summary_nodes(&ctx.session_id)
+                        .await;
 
-                    let engine = if has_summaries {
-                        // Rebuild from persisted summaries.
+                    let engine = if !db_nodes.is_empty() {
+                        let all_msgs = ctx
+                            .core
+                            .sessions
+                            .get_all_messages(&ctx.session_id)
+                            .await;
                         debug!(
                             session = %ctx.session_key,
-                            summary_count = turns.iter().filter(|t| t.is_summary()).count(),
-                            "LCM: rebuilding engine from persisted summaries"
+                            node_count = db_nodes.len(),
+                            "LCM: rebuilding engine from DB summary nodes"
                         );
-                        LcmEngine::rebuild_from_turns(
-                            &turns,
-                            config,
-                            ctx.protocol.as_ref(),
-                            "", // system prompt not needed for rebuild
-                        )
+                        LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
                     } else {
-                        // Fresh engine - will ingest messages below.
-                        LcmEngine::new(config)
+                        // Fallback: check for legacy Turn::Summary entries.
+                        let all_msgs = ctx
+                            .core
+                            .sessions
+                            .get_all_messages(&ctx.session_id)
+                            .await;
+                        let turns: Vec<crate::agent::turn::Turn> = all_msgs
+                            .iter()
+                            .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
+                            .collect();
+                        let has_summaries = turns.iter().any(|t| t.is_summary());
+
+                        if has_summaries {
+                            debug!(
+                                session = %ctx.session_key,
+                                summary_count = turns.iter().filter(|t| t.is_summary()).count(),
+                                "LCM: rebuilding engine from legacy Turn::Summary entries"
+                            );
+                            LcmEngine::rebuild_from_turns(
+                                &turns,
+                                config,
+                                ctx.protocol.as_ref(),
+                                "",
+                            )
+                        } else {
+                            LcmEngine::new(config)
+                        }
                     };
 
                     engines.insert(
@@ -993,6 +1017,32 @@ impl AgentLoopShared {
                                                 .add_message(&bg_session_id, &summary_json)
                                                 .await;
                                         }
+
+                                        // Persist summary node to SQLite for DAG restoration.
+                                        if let crate::agent::turn::Turn::Summary {
+                                            text: ref s_text,
+                                            ref source_ids,
+                                            level: s_level,
+                                        } = turn
+                                        {
+                                            let engine = bg_lcm.lock().await;
+                                            // The node ID is dag.len() - 1 (just created).
+                                            let node_id =
+                                                engine.dag().len().saturating_sub(1);
+                                            let tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(s_text);
+                                            bg_core
+                                                .sessions
+                                                .save_summary_node(
+                                                    &bg_session_id,
+                                                    node_id,
+                                                    source_ids,
+                                                    &[],
+                                                    s_text,
+                                                    tokens,
+                                                    *s_level,
+                                                )
+                                                .await;
+                                        }
                                     }
 
                                     // Update working memory with compaction observation.
@@ -1029,6 +1079,21 @@ impl AgentLoopShared {
                         });
                     }
                     CompactionAction::None => {}
+                }
+            }
+
+            // Auto-expand relevant summaries before the LLM call.
+            // This is the key innovation: the system decides when to expand,
+            // not the model. Uses keyword overlap (no LLM needed).
+            {
+                let mut engine = lcm_engine.lock().await;
+                if !engine.dag().is_empty() {
+                    let expanded = engine.auto_expand(&ctx.core.token_budget, tool_def_tokens);
+                    if expanded {
+                        // Replace ctx.messages with the auto-expanded context.
+                        ctx.messages = engine.active_context();
+                        debug!("LCM auto_expand: replaced context with expanded messages");
+                    }
                 }
             }
         } else if !ctx.compaction.in_flight.load(Ordering::Relaxed)

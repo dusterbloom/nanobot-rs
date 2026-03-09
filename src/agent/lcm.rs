@@ -693,6 +693,201 @@ impl LcmEngine {
     pub fn find_oldest_raw_block(&self) -> Option<(usize, usize)> {
         self.find_oldest_raw_block_impl()
     }
+
+    /// Auto-expand summaries that are relevant to the latest user message.
+    ///
+    /// Uses keyword overlap (cheap, no LLM needed) between the latest user
+    /// message and summary source messages. If overlap exceeds threshold,
+    /// temporarily replaces the summary entry with original messages for
+    /// this turn only.
+    ///
+    /// Returns true if any summaries were expanded.
+    pub fn auto_expand(
+        &mut self,
+        budget: &TokenBudget,
+        tool_def_tokens: usize,
+    ) -> bool {
+        // Find the latest user message content.
+        let user_text = self
+            .active
+            .iter()
+            .rev()
+            .find_map(|entry| {
+                let msg = entry.message();
+                if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+
+        let user_text = match user_text {
+            Some(t) if !t.is_empty() => t,
+            _ => return false,
+        };
+
+        let user_keywords = extract_keywords(&user_text);
+        if user_keywords.is_empty() {
+            return false;
+        }
+
+        // Check budget: only expand if we're below τ_hard.
+        let available = budget.available_budget(tool_def_tokens);
+        let hard_limit = (available as f64 * self.config.tau_hard) as usize;
+        let current_tokens = self.active_tokens();
+        let headroom = hard_limit.saturating_sub(current_tokens);
+        if headroom < 100 {
+            debug!("LCM auto_expand: no headroom ({} tokens available), skipping", headroom);
+            return false;
+        }
+
+        // Find summary entries with high keyword overlap.
+        let mut expansions: Vec<(usize, Vec<ContextEntry>)> = Vec::new();
+
+        for (idx, entry) in self.active.iter().enumerate() {
+            if let ContextEntry::Summary { node_id, .. } = entry {
+                let source_ids = self.dag.all_source_ids(*node_id);
+                // Compute keyword overlap with source messages.
+                let mut source_keywords = std::collections::HashSet::new();
+                for &sid in &source_ids {
+                    if let Some(msg) = self.store.get(sid) {
+                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                            for kw in extract_keywords(content) {
+                                source_keywords.insert(kw);
+                            }
+                        }
+                    }
+                }
+
+                if source_keywords.is_empty() {
+                    continue;
+                }
+
+                let overlap: usize = user_keywords
+                    .iter()
+                    .filter(|kw| source_keywords.contains(*kw))
+                    .count();
+                let relevance = overlap as f64 / user_keywords.len() as f64;
+
+                if relevance >= 0.3 {
+                    // Check if expansion fits in headroom.
+                    let source_messages: Vec<Value> = source_ids
+                        .iter()
+                        .filter_map(|&id| self.store.get(id).cloned())
+                        .collect();
+                    let expansion_tokens = TokenBudget::estimate_tokens(&source_messages);
+                    let summary_tokens = entry.message().get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| TokenBudget::estimate_str_tokens(s))
+                        .unwrap_or(0);
+                    let net_cost = expansion_tokens.saturating_sub(summary_tokens);
+
+                    if net_cost <= headroom {
+                        debug!(
+                            "LCM auto_expand: expanding summary node {} (relevance={:.2}, +{} tokens)",
+                            node_id, relevance, net_cost
+                        );
+                        let entries: Vec<ContextEntry> = source_ids
+                            .iter()
+                            .filter_map(|&id| {
+                                self.store.get(id).map(|msg| ContextEntry::Raw {
+                                    msg_id: id,
+                                    message: msg.clone(),
+                                })
+                            })
+                            .collect();
+                        expansions.push((idx, entries));
+                    } else {
+                        debug!(
+                            "LCM auto_expand: skipping node {} (needs {} tokens, {} available)",
+                            node_id, net_cost, headroom
+                        );
+                    }
+                }
+            }
+        }
+
+        if expansions.is_empty() {
+            return false;
+        }
+
+        // Apply expansions in reverse order to preserve indices.
+        for (idx, entries) in expansions.into_iter().rev() {
+            self.active.splice(idx..=idx, entries);
+        }
+
+        true
+    }
+
+    /// Rebuild the LCM engine from persisted summary nodes (from SQLite DB).
+    ///
+    /// This is the preferred way to restore the DAG after a restart — it uses
+    /// the summary_nodes table instead of scanning Turn::Summary entries from
+    /// the message stream.
+    pub fn rebuild_from_db_nodes(
+        raw_messages: &[Value],
+        nodes: &[(usize, Vec<usize>, Vec<usize>, String, usize, u8)],
+        config: LcmConfig,
+    ) -> Self {
+        let mut engine = Self::new(config);
+
+        // Ingest all raw messages into the store.
+        for msg in raw_messages {
+            engine.store.push(msg.clone());
+        }
+
+        // Track which message IDs are covered by summaries.
+        let mut summarized_ids: std::collections::HashSet<MessageId> =
+            std::collections::HashSet::new();
+
+        // Reconstruct DAG nodes.
+        for &(ref _id, ref source_ids, ref _child_ids, ref text, _tokens, level) in nodes {
+            engine.dag.create_node(source_ids.clone(), text.clone(), level);
+            for &sid in source_ids {
+                summarized_ids.insert(sid);
+            }
+        }
+
+        // Build active context: summaries first, then unsummarized raw messages.
+        for node in &engine.dag.nodes {
+            let id_list: String = node
+                .source_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let summary_message = json!({
+                "role": "user",
+                "content": format!(
+                    "[Summary of messages {}-{} (IDs: {}). Use lcm_expand to retrieve originals.]\n\n{}",
+                    node.source_ids.first().unwrap_or(&0),
+                    node.source_ids.last().unwrap_or(&0),
+                    id_list,
+                    node.text
+                )
+            });
+            engine.active.push(ContextEntry::Summary {
+                node_id: node.id,
+                message: summary_message,
+            });
+        }
+
+        for msg_id in 0..engine.store.len() {
+            if !summarized_ids.contains(&msg_id) {
+                let message = engine.store[msg_id].clone();
+                engine.active.push(ContextEntry::Raw { msg_id, message });
+            }
+        }
+
+        debug!(
+            "LCM rebuild_from_db: {} store entries, {} DAG nodes, {} active entries",
+            engine.store.len(),
+            engine.dag.len(),
+            engine.active.len(),
+        );
+
+        engine
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1087,39 @@ pub fn contains_refusal_pattern(text: &str) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Keyword extraction for auto-expand relevance scoring
+// ---------------------------------------------------------------------------
+
+/// Extract significant keywords from text for relevance matching.
+///
+/// Lowercases, splits on non-alphanumeric boundaries, and filters out
+/// stopwords and short words. Returns a set of unique keywords.
+fn extract_keywords(text: &str) -> std::collections::HashSet<String> {
+    static STOPWORDS: &[&str] = &[
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "must", "ought",
+        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+        "they", "them", "their", "this", "that", "these", "those", "what",
+        "which", "who", "whom", "how", "when", "where", "why",
+        "and", "but", "or", "nor", "not", "no", "so", "if", "then",
+        "for", "with", "about", "from", "into", "of", "to", "in", "on",
+        "at", "by", "as", "up", "out", "off", "over", "under",
+        "just", "also", "very", "really", "quite", "much", "more",
+        "some", "any", "all", "each", "every", "both", "few", "many",
+        "use", "tell", "let", "see", "get", "got", "make", "made",
+        "know", "think", "want", "like", "said", "say", "help",
+    ];
+
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,5 +2025,263 @@ mod tests {
             summary_count, 1,
             "Expected exactly 1 Summary entry in active"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-expand: relevant summary gets expanded
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_expand_relevant_summary() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.3,
+            tau_hard: 0.85,
+            deterministic_target: 64,
+        });
+
+        // Ingest messages about Rust ownership.
+        engine.ingest(json!({"role": "system", "content": "You are helpful."}));
+        engine.ingest(json!({"role": "user", "content": "Explain Rust ownership and borrowing rules."}));
+        engine.ingest(json!({"role": "assistant", "content": "Rust ownership means each value has one owner. Borrowing allows references."}));
+        engine.ingest(json!({"role": "user", "content": "How do lifetimes work in Rust?"}));
+        engine.ingest(json!({"role": "assistant", "content": "Lifetimes track how long references are valid."}));
+
+        // Manually create a summary covering messages 1-4.
+        let node = engine.dag.create_node(
+            vec![1, 2, 3, 4],
+            "Discussion about Rust ownership, borrowing, and lifetimes.".to_string(),
+            1,
+        );
+        let node_id = node.id;
+        let summary_msg = json!({
+            "role": "user",
+            "content": "[Summary of messages 1-4 (IDs: 1,2,3,4). Use lcm_expand to retrieve originals.]\n\nDiscussion about Rust ownership, borrowing, and lifetimes."
+        });
+
+        // Replace raw entries 1-4 with the summary in active context.
+        engine.active = vec![
+            engine.active[0].clone(), // system
+            ContextEntry::Summary {
+                node_id,
+                message: summary_msg,
+            },
+        ];
+
+        // Now add a new user message about ownership (should trigger expansion).
+        engine.ingest(json!({"role": "user", "content": "Tell me more about Rust ownership rules and borrow checker."}));
+
+        let budget = TokenBudget::new(100_000, 8192);
+        let expanded = engine.auto_expand(&budget, 100);
+        assert!(expanded, "Auto-expand should trigger for relevant query");
+
+        // After expansion, the summary should be replaced with raw messages.
+        let has_summary = engine
+            .active
+            .iter()
+            .any(|e| matches!(e, ContextEntry::Summary { .. }));
+        assert!(
+            !has_summary,
+            "Summary should be replaced by raw messages after auto-expand"
+        );
+
+        // Should have system + 4 expanded raw + 1 new user = 6 entries.
+        let raw_count = engine
+            .active
+            .iter()
+            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
+            .count();
+        assert!(
+            raw_count >= 5,
+            "Should have at least 5 raw entries after expansion, got {}",
+            raw_count
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-expand: budget-aware — doesn't expand when near τ_hard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_expand_budget_aware() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.3,
+            tau_hard: 0.85,
+            deterministic_target: 64,
+        });
+
+        // Fill with enough messages to be near the hard limit.
+        engine.ingest(json!({"role": "system", "content": "S"}));
+        for i in 0..20 {
+            engine.ingest(json!({
+                "role": "user",
+                "content": format!("Long question {} about Rust ownership and memory management details with many words.", i)
+            }));
+            engine.ingest(json!({
+                "role": "assistant",
+                "content": format!("Long answer {} about ownership, borrowing, lifetimes, and the borrow checker.", i)
+            }));
+        }
+
+        // Create a summary covering messages 1-10.
+        let source_ids: Vec<usize> = (1..=10).collect();
+        let node = engine.dag.create_node(
+            source_ids.clone(),
+            "Summary of first 10 messages.".to_string(),
+            1,
+        );
+        let node_id = node.id;
+        let summary_msg = json!({
+            "role": "user",
+            "content": "[Summary of messages 1-10 (IDs: 1..10).]\n\nSummary of first 10 messages."
+        });
+
+        // Replace messages 1-10 in active with summary.
+        let mut new_active = vec![engine.active[0].clone()];
+        new_active.push(ContextEntry::Summary {
+            node_id,
+            message: summary_msg,
+        });
+        for entry in engine.active.iter().skip(11) {
+            new_active.push(entry.clone());
+        }
+        engine.active = new_active;
+
+        // Use a tiny budget where there's no headroom.
+        let budget = TokenBudget::new(256, 128); // Very small
+        let expanded = engine.auto_expand(&budget, 50);
+        assert!(
+            !expanded,
+            "Should NOT expand when budget headroom is insufficient"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-expand: irrelevant query doesn't trigger expansion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_expand_irrelevant_query() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.3,
+            tau_hard: 0.85,
+            deterministic_target: 64,
+        });
+
+        engine.ingest(json!({"role": "system", "content": "S"}));
+        engine.ingest(json!({"role": "user", "content": "Explain Rust ownership and borrowing."}));
+        engine.ingest(json!({"role": "assistant", "content": "Ownership means each value has one owner."}));
+
+        let node = engine.dag.create_node(
+            vec![1, 2],
+            "Discussion about Rust ownership.".to_string(),
+            1,
+        );
+        let node_id = node.id;
+        let summary_msg = json!({
+            "role": "user",
+            "content": "[Summary of messages 1-2.]\n\nDiscussion about Rust ownership."
+        });
+
+        engine.active = vec![
+            engine.active[0].clone(),
+            ContextEntry::Summary {
+                node_id,
+                message: summary_msg,
+            },
+        ];
+
+        // Ask about something completely unrelated.
+        engine.ingest(json!({"role": "user", "content": "What is the weather forecast for Tokyo tomorrow?"}));
+
+        let budget = TokenBudget::new(100_000, 8192);
+        let expanded = engine.auto_expand(&budget, 100);
+        assert!(
+            !expanded,
+            "Should NOT expand for an irrelevant query"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rebuild_from_db_nodes: round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rebuild_from_db_nodes() {
+        // Simulate raw messages.
+        let raw_messages = vec![
+            json!({"role": "system", "content": "System prompt."}),
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "assistant", "content": "Hi there!"}),
+            json!({"role": "user", "content": "How are you?"}),
+            json!({"role": "assistant", "content": "I'm good, thanks!"}),
+            json!({"role": "user", "content": "Tell me a joke."}),
+        ];
+
+        // Simulate a DB node covering messages 1-4.
+        let db_nodes = vec![(
+            0usize,                   // node_id
+            vec![1usize, 2, 3, 4],   // source_ids
+            vec![],                   // child_ids
+            "Greeting exchange.".to_string(), // text
+            10usize,                  // tokens
+            1u8,                      // level
+        )];
+
+        let config = LcmConfig {
+            enabled: true,
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+        };
+
+        let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, config);
+
+        // Should have all 6 messages in store.
+        assert_eq!(engine.store_len(), 6);
+
+        // DAG should have 1 node.
+        assert_eq!(engine.dag().len(), 1);
+        let node = engine.dag().get(0).unwrap();
+        assert_eq!(node.source_ids, vec![1, 2, 3, 4]);
+        assert_eq!(node.level, 1);
+
+        // Active context: 1 summary + 2 raw (system + msg 5).
+        let summary_count = engine
+            .active_entries()
+            .iter()
+            .filter(|e| matches!(e, ContextEntry::Summary { .. }))
+            .count();
+        assert_eq!(summary_count, 1);
+
+        let raw_count = engine
+            .active_entries()
+            .iter()
+            .filter(|e| matches!(e, ContextEntry::Raw { .. }))
+            .count();
+        assert_eq!(raw_count, 2, "system + msg 5 should be raw");
+
+        // Expand still works.
+        let expanded = engine.expand(&[1, 2, 3, 4]);
+        assert_eq!(expanded.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyword extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_keywords() {
+        let keywords = extract_keywords("Explain Rust ownership and borrowing rules in detail.");
+        assert!(keywords.contains("rust"));
+        assert!(keywords.contains("ownership"));
+        assert!(keywords.contains("borrowing"));
+        assert!(keywords.contains("rules"));
+        assert!(keywords.contains("detail"));
+        // Stopwords should be excluded.
+        assert!(!keywords.contains("and"));
+        assert!(!keywords.contains("in"));
     }
 }

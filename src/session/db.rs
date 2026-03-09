@@ -70,6 +70,18 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content, role) VALUES('delete', old.id, old.content, old.role);
 END;
+
+CREATE TABLE IF NOT EXISTS summary_nodes (
+    id            INTEGER PRIMARY KEY,
+    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    source_ids    TEXT NOT NULL,
+    child_ids     TEXT DEFAULT '[]',
+    text          TEXT NOT NULL,
+    tokens        INTEGER NOT NULL,
+    level         INTEGER NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summary_nodes_session ON summary_nodes(session_id);
 "#;
 
 // ---------------------------------------------------------------------------
@@ -475,6 +487,101 @@ impl SessionDb {
             })
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Summary DAG persistence (LCM)
+    // -----------------------------------------------------------------------
+
+    /// Persist a summary node for LCM's summary DAG.
+    pub async fn save_summary_node(
+        &self,
+        session_id: &str,
+        node_id: usize,
+        source_ids: &[usize],
+        child_ids: &[usize],
+        text: &str,
+        tokens: usize,
+        level: u8,
+    ) {
+        let conn = self.conn.lock().await;
+        let source_json = serde_json::to_string(source_ids).unwrap_or_else(|_| "[]".to_string());
+        let child_json = serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".to_string());
+        let now = Utc::now().to_rfc3339();
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO summary_nodes \
+             (id, session_id, source_ids, child_ids, text, tokens, level, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                node_id as i64,
+                session_id,
+                source_json,
+                child_json,
+                text,
+                tokens as i64,
+                level as i64,
+                now,
+            ],
+        ) {
+            warn!(
+                "Failed to save summary node {} for session {}: {}",
+                node_id, session_id, e
+            );
+        }
+    }
+
+    /// Load all summary nodes for a session, ordered by ID.
+    ///
+    /// Returns a vec of (node_id, source_ids, child_ids, text, tokens, level).
+    pub async fn load_summary_nodes(
+        &self,
+        session_id: &str,
+    ) -> Vec<(usize, Vec<usize>, Vec<usize>, String, usize, u8)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT id, source_ids, child_ids, text, tokens, level \
+             FROM summary_nodes WHERE session_id = ?1 ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to prepare load_summary_nodes query: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            let id: i64 = row.get(0)?;
+            let source_str: String = row.get(1)?;
+            let child_str: String = row.get(2)?;
+            let text: String = row.get(3)?;
+            let tokens: i64 = row.get(4)?;
+            let level: i64 = row.get(5)?;
+            Ok((id, source_str, child_str, text, tokens, level))
+        });
+
+        match rows {
+            Ok(r) => r
+                .flatten()
+                .map(|(id, source_str, child_str, text, tokens, level)| {
+                    let source_ids: Vec<usize> =
+                        serde_json::from_str(&source_str).unwrap_or_default();
+                    let child_ids: Vec<usize> =
+                        serde_json::from_str(&child_str).unwrap_or_default();
+                    (
+                        id as usize,
+                        source_ids,
+                        child_ids,
+                        text,
+                        tokens as usize,
+                        level as u8,
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                warn!("Failed to load summary nodes for session {}: {}", session_id, e);
+                Vec::new()
+            }
         }
     }
 
@@ -1149,5 +1256,83 @@ mod tests {
 
         assert_eq!(filtered.len(), 2, "clear marker must truncate history");
         assert_eq!(filtered[0]["content"], "q2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Summary DAG persistence
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dag_persistence_roundtrip() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:dag_test").await;
+
+        // Save two summary nodes.
+        db.save_summary_node(
+            &meta.id,
+            0,
+            &[1, 2, 3, 4],
+            &[],
+            "Summary of greeting exchange.",
+            15,
+            1,
+        )
+        .await;
+
+        db.save_summary_node(
+            &meta.id,
+            1,
+            &[5, 6, 7],
+            &[],
+            "Summary of technical discussion.",
+            12,
+            2,
+        )
+        .await;
+
+        // Load them back.
+        let nodes = db.load_summary_nodes(&meta.id).await;
+        assert_eq!(nodes.len(), 2);
+
+        let (id0, src0, child0, text0, tokens0, level0) = &nodes[0];
+        assert_eq!(*id0, 0);
+        assert_eq!(*src0, vec![1, 2, 3, 4]);
+        assert!(child0.is_empty());
+        assert_eq!(text0, "Summary of greeting exchange.");
+        assert_eq!(*tokens0, 15);
+        assert_eq!(*level0, 1);
+
+        let (id1, src1, _child1, text1, tokens1, level1) = &nodes[1];
+        assert_eq!(*id1, 1);
+        assert_eq!(*src1, vec![5, 6, 7]);
+        assert_eq!(text1, "Summary of technical discussion.");
+        assert_eq!(*tokens1, 12);
+        assert_eq!(*level1, 2);
+    }
+
+    #[tokio::test]
+    async fn test_dag_persistence_empty_session() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:empty").await;
+
+        let nodes = db.load_summary_nodes(&meta.id).await;
+        assert!(nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dag_persistence_upsert() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:upsert").await;
+
+        // Save, then overwrite with updated text.
+        db.save_summary_node(&meta.id, 0, &[1, 2], &[], "Original.", 5, 1)
+            .await;
+        db.save_summary_node(&meta.id, 0, &[1, 2], &[], "Updated.", 6, 1)
+            .await;
+
+        let nodes = db.load_summary_nodes(&meta.id).await;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].3, "Updated.");
+        assert_eq!(nodes[0].4, 6);
     }
 }

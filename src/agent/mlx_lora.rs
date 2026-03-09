@@ -348,6 +348,44 @@ fn load_quantized_linear(
     Ok(ql)
 }
 
+/// Load a fused `gate_up_proj` QuantizedLinear and split into (gate, up).
+///
+/// Some models (distilled) store `gate_proj` and `up_proj` as a single
+/// `gate_up_proj` with shape `[2*hidden_dim, dim]`. This splits the packed
+/// weight, scales, and biases at the row midpoint.
+fn split_fused_gate_up(
+    weights: &mut HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<(QuantizedLinear, QuantizedLinear), anyhow::Error> {
+    let fused = load_quantized_linear(weights, &format!("{prefix}.gate_up_proj"), group_size, bits)?;
+
+    // Split weight [2*H, packed_cols], scales [2*H, n_groups], biases [2*H, n_groups] at row midpoint
+    let w_parts = fused.inner.weight.split(2, 0)?;
+    let s_parts = fused.scales.split(2, 0)?;
+    let b_parts = fused.biases.split(2, 0)?;
+
+    let make_ql = |w: &Array, s: &Array, b: &Array| -> QuantizedLinear {
+        let mut ql = QuantizedLinear {
+            group_size,
+            bits,
+            scales: Param::new(s.clone()),
+            biases: Param::new(b.clone()),
+            inner: Linear {
+                weight: Param::new(w.clone()),
+                bias: Param::new(None),
+            },
+        };
+        ql.freeze_parameters(true);
+        ql
+    };
+
+    let gate = make_ql(&w_parts[0], &s_parts[0], &b_parts[0]);
+    let up = make_ql(&w_parts[1], &s_parts[1], &b_parts[1]);
+    Ok((gate, up))
+}
+
 fn load_rms_norm(
     weights: &mut HashMap<String, Array>,
     prefix: &str,
@@ -504,6 +542,8 @@ pub struct ModelConfig {
     pub conv_kernel_size: usize,
     /// Thinking model: use /nothink system instruction instead of empty think prefill
     pub thinking_model: bool,
+    /// Mixture-of-Experts model: in-process training not supported (use vllm-mlx for inference)
+    pub is_moe: bool,
 }
 
 impl ModelConfig {
@@ -530,6 +570,7 @@ impl ModelConfig {
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
+            is_moe: false,
         }
     }
 
@@ -556,6 +597,7 @@ impl ModelConfig {
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: false,
+            is_moe: false,
         }
     }
 
@@ -582,6 +624,7 @@ impl ModelConfig {
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
+            is_moe: false,
         }
     }
 
@@ -608,6 +651,7 @@ impl ModelConfig {
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
             thinking_model: true,
+            is_moe: false,
         }
     }
 
@@ -636,6 +680,7 @@ impl ModelConfig {
             linear_value_head_dim: 128,
             conv_kernel_size: 4,
             thinking_model: false,
+            is_moe: false,
         }
     }
 
@@ -664,6 +709,7 @@ impl ModelConfig {
             linear_value_head_dim: 128,
             conv_kernel_size: 4,
             thinking_model: true,
+            is_moe: false,
         }
     }
 
@@ -692,6 +738,7 @@ impl ModelConfig {
             linear_value_head_dim: 128,
             conv_kernel_size: 4,
             thinking_model: true,
+            is_moe: false,
         }
     }
 
@@ -843,6 +890,12 @@ impl ModelConfig {
             || dir_name.contains("reasoning")
             || dir_name.contains("distill");
 
+        let is_moe = tc
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 1;
+
         tracing::info!(
             model_type,
             dim,
@@ -876,6 +929,7 @@ impl ModelConfig {
             linear_value_head_dim,
             conv_kernel_size,
             thinking_model,
+            is_moe,
         })
     }
 
@@ -891,6 +945,7 @@ impl ModelConfig {
             rope_theta: self.rope_theta as f64,
             rms_eps: self.rms_eps,
             has_lm_head: false,
+            head_dim_explicit: self.head_dim,
             linear_attn_indices: self.linear_attn_indices.clone(),
             linear_n_heads: self.linear_n_heads,
             linear_head_dim: self.linear_head_dim,
@@ -1602,15 +1657,32 @@ impl MlxLoraMLP {
         let gs = cfg.group_size;
         let bits = cfg.bits;
 
+        // Fallback chain: dense → shared_expert (MoE) → fused gate_up_proj
+        let mut try_load_mlp = |pfx: &str| -> Option<(QuantizedLinear, QuantizedLinear, QuantizedLinear)> {
+            let g = load_quantized_linear(weights, &format!("{pfx}.gate_proj"), gs, bits).ok()?;
+            let u = load_quantized_linear(weights, &format!("{pfx}.up_proj"), gs, bits).ok()?;
+            let d = load_quantized_linear(weights, &format!("{pfx}.down_proj"), gs, bits).ok()?;
+            Some((g, u, d))
+        };
+        let (gate_proj, up_proj, down_proj_base) = if let Some(mlp) = try_load_mlp(prefix) {
+            mlp
+        } else {
+            // prefix is like "model.layers.0.mlp" — try "model.layers.0.mlp.shared_expert"
+            let se_prefix = format!("{prefix}.shared_expert");
+            if let Some(mlp) = try_load_mlp(&se_prefix) {
+                mlp
+            } else {
+                let (g, u) = split_fused_gate_up(weights, prefix, gs, bits)?;
+                let d = load_quantized_linear(weights, &format!("{prefix}.down_proj"), gs, bits)?;
+                (g, u, d)
+            }
+        };
+
         Ok(MlxLoraMLP {
-            gate_proj: load_quantized_linear(weights, &format!("{prefix}.gate_proj"), gs, bits)?,
-            up_proj: load_quantized_linear(weights, &format!("{prefix}.up_proj"), gs, bits)?,
-            down_proj: LoraLinear::new(
-                load_quantized_linear(weights, &format!("{prefix}.down_proj"), gs, bits)?,
-                lora_cfg.rank,
-                lora_cfg.scale(),
-            )
-            .map_err(|e| anyhow::anyhow!("LoRA down_proj: {e}"))?,
+            gate_proj,
+            up_proj,
+            down_proj: LoraLinear::new(down_proj_base, lora_cfg.rank, lora_cfg.scale())
+                .map_err(|e| anyhow::anyhow!("LoRA down_proj: {e}"))?,
         })
     }
 

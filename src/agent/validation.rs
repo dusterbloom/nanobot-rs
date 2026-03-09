@@ -13,8 +13,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
-static HALLUCINATED_CALL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\[(?:\w+\s+)*called[\s:]").expect("hallucination regex"));
+static HALLUCINATED_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    // Matches `[Called ...]`, `[I called: ...]`, `[Calling tool: ...]`, etc.
+    // Both past tense (called) and present (calling) with optional "tool" word.
+    Regex::new(r"(?i)\[(?:\w+\s+)*call(?:ed|ing)(?:\s+tool)?[\s:]").expect("hallucination regex")
+});
 
 // ---------------------------------------------------------------------------
 // ValidationError
@@ -319,6 +322,26 @@ mod tests {
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
         );
+    }
+
+    #[test]
+    fn test_calling_tool_detected_as_hallucination() {
+        // Local models sometimes write [Calling tool: ...] instead of actual tool calls.
+        let content = "[Calling tool: write_file({\"path\": \"/tmp/game.py\"})]";
+        let result = validate_response(content, &[], false, false);
+        assert_eq!(
+            result,
+            ValidationOutcome::Error(ValidationError::HallucinatedToolCall),
+            "[Calling tool: ...] should be detected as hallucinated tool call"
+        );
+    }
+
+    #[test]
+    fn test_calling_tool_stripped_when_real_tools_present() {
+        let content = "Processing... [Calling tool: read_file({\"path\": \"x\"})] Done.";
+        let tool_calls = vec![make_tool_call("read_file")];
+        let result = validate_response(content, &tool_calls, false, false);
+        assert_eq!(result, ValidationOutcome::StripHallucination);
     }
 
     #[test]

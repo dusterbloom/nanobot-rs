@@ -1139,7 +1139,8 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         }
 
         // CPU: da = dx2 @ Wo^T (no explicit transpose)
-        let da = ane_forward::cpu_matmul_lhs_transposed(&lw.wo, dim, dim, &dx2, seq);
+        let ad = cfg.attn_dim();
+        let da = ane_forward::cpu_matmul_lhs_transposed(&lw.wo, dim, ad, &dx2, seq);
 
         // CPU SDPA backward
         let (mut dq, mut dk, _dv) =
@@ -1182,9 +1183,9 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         }
 
         // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (no explicit transposes)
-        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, dim, dim, &dq, seq);
-        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, dim, dim, &dk, seq);
-        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, dim, dim, &_dv, seq);
+        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq, seq);
+        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
+        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
 
@@ -1828,6 +1829,7 @@ mod tests {
             rope_theta: 10_000.0,
             rms_eps: 1e-5,
             has_lm_head: false,
+            head_dim_explicit: 8 / 4,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,

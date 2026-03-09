@@ -25,10 +25,13 @@ use std::sync::LazyLock;
 use super::turn::{ToolCall, Turn};
 use crate::agent::model_capabilities::{lookup, ModelSizeClass};
 
-// Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` bracket.
-// Captures the inner content (everything between `[` ... `]`).
+// Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
+// `[Calling tool: ...]` bracket. Captures the inner content.
+// The alternation handles both past tense (called/calling) and the extra "tool"
+// word that local models sometimes insert.
 static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\[(?:I\s+)?called[:\s]\s*(.*?)\]").expect("textual call outer regex")
+    Regex::new(r"(?i)\[(?:I\s+)?call(?:ed|ing)(?:\s+tool)?[:\s]\s*(.*?)\]")
+        .expect("textual call outer regex")
 });
 
 // Matches a single `tool_name({...})` pair within the inner content.
@@ -1003,6 +1006,52 @@ mod tests {
         let calls = parse_textual_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "read_file");
+    }
+
+    // ---- "Calling tool" variant (local model format confusion) ----
+
+    #[test]
+    fn parse_calling_tool_format() {
+        let text = r#"[Calling tool: write_file({"path": "/tmp/game.py", "content": "print('hi')"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1, "Should parse [Calling tool: ...] format");
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(calls[0].args["path"], "/tmp/game.py");
+    }
+
+    #[test]
+    fn parse_calling_tool_without_colon() {
+        let text = r#"[Calling tool read_file({"path": "/tmp/x"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "read_file");
+    }
+
+    #[test]
+    fn strip_calling_tool_format() {
+        let text = r#"Some text. [Calling tool: write_file({"path": "x", "content": "y"})] Done."#;
+        let stripped = strip_textual_tool_calls(text);
+        assert!(!stripped.contains("[Calling tool:"));
+        assert!(stripped.contains("Some text."));
+        assert!(stripped.contains("Done."));
+    }
+
+    // ---- empty XML tool_call blocks ----
+
+    #[test]
+    fn parse_xml_empty_block_returns_empty() {
+        let text = "<tool_call>\n</tool_call>";
+        let calls = parse_xml_tool_calls(text);
+        assert!(calls.is_empty(), "Empty <tool_call> block should yield no parsed calls");
+    }
+
+    #[test]
+    fn strip_xml_removes_empty_blocks() {
+        let text = "Some text. <tool_call>\n</tool_call> More text.";
+        let stripped = strip_xml_tool_calls(text);
+        assert!(!stripped.contains("<tool_call>"), "Empty XML blocks should be stripped");
+        assert!(stripped.contains("Some text."));
+        assert!(stripped.contains("More text."));
     }
 
     // ---- strip_textual_tool_calls() ----

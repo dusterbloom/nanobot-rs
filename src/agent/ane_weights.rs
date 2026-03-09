@@ -719,6 +719,7 @@ impl ModelWeights {
         let meta = parse_mlx_checkpoint_meta(&config)?;
 
         let dim = cfg.dim;
+        let attn_dim = cfg.attn_dim();
         let kv_dim = cfg.kv_dim();
         let n_layers = meta.n_layers;
         let vocab_size = meta.vocab_size;
@@ -850,35 +851,35 @@ impl ModelWeights {
                     group_size,
                     bits,
                 )?;
-                let wk = expand_kv(&wk_raw, kv_dim, dim, hpg);
-                let wv = expand_kv(&wv_raw, kv_dim, dim, hpg);
+                let wk = expand_kv(&wk_raw, kv_dim, attn_dim, hpg);
+                let wv = expand_kv(&wv_raw, kv_dim, attn_dim, hpg);
                 let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
                 let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
             // FFN weights (shared by both MHA and GDN layers)
-            let w1 = get_weight(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.gate_proj"),
-                group_size,
-                bits,
-            )?;
-            let w2 = get_weight(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.down_proj"),
-                group_size,
-                bits,
-            )?;
-            let w3 = get_weight(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.up_proj"),
-                group_size,
-                bits,
-            )?;
+            // Fallback chain for MLP prefix:
+            //   1. mlp.gate_proj (dense models)
+            //   2. mlp.shared_expert.gate_proj (MoE — train shared expert only)
+            //   3. mlp.gate_up_proj (fused gate+up, split in half)
+            let try_load_ffn = |pfx: &str| -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+                let g = get_weight(&tensors, &tensor_meta, &format!("{pfx}.gate_proj"), group_size, bits).ok()?;
+                let u = get_weight(&tensors, &tensor_meta, &format!("{pfx}.up_proj"), group_size, bits).ok()?;
+                let d = get_weight(&tensors, &tensor_meta, &format!("{pfx}.down_proj"), group_size, bits).ok()?;
+                Some((g, u, d))
+            };
+            let (w1, w3, w2) = if let Some(ffn) = try_load_ffn(&format!("{prefix}.mlp")) {
+                ffn
+            } else if let Some(ffn) = try_load_ffn(&format!("{prefix}.mlp.shared_expert")) {
+                ffn
+            } else {
+                // Fused gate_up_proj: [2*hidden_dim, dim] → split in half by rows
+                let fused = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let mid = fused.len() / 2;
+                let d = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.down_proj"), group_size, bits)?;
+                (fused[..mid].to_vec(), fused[mid..].to_vec(), d)
+            };
 
             // RMSNorm weights (BF16, not quantized)
             let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
@@ -1214,27 +1215,24 @@ impl QuantizedModelWeights {
             };
 
             // FFN weights (shared by both MHA and GDN layers)
-            let w1 = get_quantized(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.gate_proj"),
-                group_size,
-                bits,
-            )?;
-            let w2 = get_quantized(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.down_proj"),
-                group_size,
-                bits,
-            )?;
-            let w3 = get_quantized(
-                &tensors,
-                &tensor_meta,
-                &format!("{prefix}.mlp.up_proj"),
-                group_size,
-                bits,
-            )?;
+            // Some models (distilled) use fused gate_up_proj instead of separate gate_proj/up_proj.
+            // Same fallback chain as f32 path: dense → shared_expert (MoE) → fused
+            let try_load_ffn_q = |pfx: &str| -> Option<(QuantizedTensor, QuantizedTensor, QuantizedTensor)> {
+                let g = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.gate_proj"), group_size, bits).ok()?;
+                let u = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.up_proj"), group_size, bits).ok()?;
+                let d = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.down_proj"), group_size, bits).ok()?;
+                Some((g, u, d))
+            };
+            let (w1, w3, w2) = if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp")) {
+                ffn
+            } else if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp.shared_expert")) {
+                ffn
+            } else {
+                let fused = get_quantized(&tensors, &tensor_meta, &format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let (g, u) = fused.split_rows_half();
+                let d = get_quantized(&tensors, &tensor_meta, &format!("{prefix}.mlp.down_proj"), group_size, bits)?;
+                (g, u, d)
+            };
 
             let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
             let rms_ffn = get_bf16(
@@ -1364,6 +1362,41 @@ impl QuantizedTensor {
     pub fn quantized_bytes(&self) -> usize {
         self.data.len() + (self.scales.len() + self.biases.len()) * 4
     }
+
+    /// Split a fused tensor in half along the row dimension.
+    ///
+    /// Used for fused `gate_up_proj` [2*hidden_dim, dim] → gate [hidden_dim, dim] + up [hidden_dim, dim].
+    pub fn split_rows_half(&self) -> (QuantizedTensor, QuantizedTensor) {
+        let half_rows = self.rows / 2;
+        let elems_per_u32 = 32 / self.bits;
+        let packed_cols = self.cols / elems_per_u32;
+        let bytes_per_row = packed_cols * 4; // 4 bytes per u32
+        let data_mid = half_rows * bytes_per_row;
+
+        let n_groups_per_row = self.cols / self.group_size;
+        let scales_mid = half_rows * n_groups_per_row;
+
+        (
+            QuantizedTensor {
+                data: self.data[..data_mid].to_vec(),
+                scales: self.scales[..scales_mid].to_vec(),
+                biases: self.biases[..scales_mid].to_vec(),
+                rows: half_rows,
+                cols: self.cols,
+                group_size: self.group_size,
+                bits: self.bits,
+            },
+            QuantizedTensor {
+                data: self.data[data_mid..].to_vec(),
+                scales: self.scales[scales_mid..].to_vec(),
+                biases: self.biases[scales_mid..].to_vec(),
+                rows: half_rows,
+                cols: self.cols,
+                group_size: self.group_size,
+                bits: self.bits,
+            },
+        )
+    }
 }
 
 /// GDN (linear attention) weights stored in quantized form.
@@ -1476,16 +1509,16 @@ impl QuantizedModelWeights {
         // MHA layer: dequantize attention projections + expand KV for GQA
         let hpg = self.heads_per_group;
         let hd = self.cfg.head_dim();
-        let dim = self.cfg.dim;
+        let attn_dim = self.cfg.attn_dim();
 
         let wq = ql.wq.dequantize();
         let wk_raw = ql.wk.dequantize();
         let wv_raw = ql.wv.dequantize();
         let wo = ql.wo.dequantize();
 
-        // Expand KV for GQA
-        let wk = expand_kv_static(&wk_raw, ql.wk.rows, hd, hpg, dim);
-        let wv = expand_kv_static(&wv_raw, ql.wv.rows, hd, hpg, dim);
+        // Expand KV for GQA (target is attn_dim = n_heads * head_dim, not dim)
+        let wk = expand_kv_static(&wk_raw, ql.wk.rows, hd, hpg, attn_dim);
+        let wv = expand_kv_static(&wv_raw, ql.wv.rows, hd, hpg, attn_dim);
 
         LayerWeights {
             wq,
@@ -1539,21 +1572,25 @@ impl QuantizedModelWeights {
     }
 }
 
-/// Expand KV weights from [kv_dim, in_dim] to [dim, in_dim] by repeating
-/// each head_dim-sized block `hpg` times (GQA expansion).
+/// Expand KV weights/activations from [kv_dim, in_dim] to [target_dim, in_dim]
+/// by repeating each head_dim-sized block `hpg` times (GQA expansion).
+///
+/// `target_dim` should be `n_heads * head_dim` (= `MilConfig::attn_dim()`), which
+/// equals `dim` for standard transformers but can be larger for models like
+/// Qwen3.5 where n_heads * head_dim > dim (over-parameterised attention).
 pub(crate) fn expand_kv_static(
     kv: &[f32],
     kv_dim: usize,
     head_dim: usize,
     hpg: usize,
-    dim: usize,
+    target_dim: usize,
 ) -> Vec<f32> {
     if hpg <= 1 {
         return kv.to_vec();
     }
     let n_kv = kv_dim / head_dim;
     let dim_in = kv.len() / kv_dim;
-    let mut expanded = vec![0.0f32; dim * dim_in];
+    let mut expanded = vec![0.0f32; target_dim * dim_in];
     for kv_h in 0..n_kv {
         for rep in 0..hpg {
             let dst_h = kv_h * hpg + rep;
@@ -2395,6 +2432,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             rms_eps: 1e-6,
             has_lm_head: false,
+            head_dim_explicit: 2048 / 16,
             linear_attn_indices: vec![],
             linear_n_heads: 0,
             linear_head_dim: 0,
@@ -2531,5 +2569,77 @@ mod tests {
         for (a, b) in current.embed.iter().zip(loaded.embed.iter()) {
             assert!((a - b).abs() < 1e-5, "embed mismatch");
         }
+    }
+
+    /// Verify expand_kv_static works for Qwen3.5-4B geometry where
+    /// n_heads * head_dim (4096) > dim (2560).
+    #[test]
+    fn test_expand_kv_static_over_parameterised_attn() {
+        // Qwen3.5-4B: dim=2560, n_heads=16, head_dim=256, n_kv_heads=4, hpg=4
+        let head_dim = 256;
+        let n_kv_heads = 4;
+        let hpg = 4;
+        let n_heads = n_kv_heads * hpg; // 16
+        let kv_dim = n_kv_heads * head_dim; // 1024
+        let attn_dim = n_heads * head_dim; // 4096 (> dim=2560)
+        let seq = 3;
+
+        // Create KV activation [kv_dim, seq] with identifiable values
+        let kv: Vec<f32> = (0..kv_dim * seq).map(|i| i as f32).collect();
+
+        let expanded = expand_kv_static(&kv, kv_dim, head_dim, hpg, attn_dim);
+        assert_eq!(expanded.len(), attn_dim * seq);
+
+        // Verify each KV head is replicated hpg times
+        for kv_h in 0..n_kv_heads {
+            for rep in 0..hpg {
+                let dst_h = kv_h * hpg + rep;
+                for d in 0..head_dim {
+                    let src_row = kv_h * head_dim + d;
+                    let dst_row = dst_h * head_dim + d;
+                    for s in 0..seq {
+                        assert_eq!(
+                            expanded[dst_row * seq + s],
+                            kv[src_row * seq + s],
+                            "mismatch at kv_h={kv_h} rep={rep} d={d} s={s}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// MilConfig::attn_dim() vs dim for standard vs over-parameterised.
+    #[test]
+    fn test_milconfig_attn_dim() {
+        // Standard: attn_dim == dim
+        let cfg = MilConfig::mha(512, 1024, 8, 64);
+        assert_eq!(cfg.head_dim(), 64);
+        assert_eq!(cfg.attn_dim(), 512);
+        assert_eq!(cfg.attn_dim(), cfg.dim);
+
+        // Over-parameterised (Qwen3.5-4B): attn_dim > dim
+        let cfg2 = MilConfig {
+            dim: 2560,
+            hidden_dim: 9216,
+            n_heads: 16,
+            seq_len: 64,
+            n_kv_heads: 4,
+            rope_theta: 1e7,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 256,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+        };
+        assert_eq!(cfg2.head_dim(), 256);
+        assert_eq!(cfg2.attn_dim(), 4096);
+        assert!(cfg2.attn_dim() > cfg2.dim);
+        assert_eq!(cfg2.kv_dim(), 4 * 256);
+        assert_eq!(cfg2.heads_per_group(), 4);
     }
 }

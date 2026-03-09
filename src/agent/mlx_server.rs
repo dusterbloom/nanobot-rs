@@ -277,6 +277,8 @@ pub fn run_model_worker(
     // Try to load the model; may fail for unsupported architectures.
     // When mlx-lm server handles inference, the in-process model is only
     // needed for training/perplexity — so we can still serve requests.
+    // MoE models have a different MLP structure (expert routing) that the
+    // dense LoRA model doesn't support — skip loading entirely.
     let mut model: Option<MlxLoraModel> = match MlxLoraModel::load(&model_dir, &cfg, &lora_cfg) {
         Ok(m) => Some(m),
         Err(e) => {
