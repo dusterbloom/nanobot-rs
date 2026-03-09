@@ -19,10 +19,7 @@ use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_hygiene;
 use crate::agent::lcm::{CompactionAction, LcmConfig, LcmEngine};
 use crate::agent::policy;
-use crate::agent::protocol::{
-    parse_textual_tool_calls, parse_xml_tool_calls, strip_textual_tool_calls, strip_xml_tool_calls,
-    ConversationProtocol, XmlToolCallFilter,
-};
+use crate::agent::protocol::{ConversationProtocol, XmlToolCallFilter};
 use crate::agent::reasoning::{BranchAttempt, ReasoningEngine, ReasoningMode, StepStatus};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::system_state::{self, AhaPriority, AhaSignal, SystemState};
@@ -47,6 +44,10 @@ use super::{
     adaptive_max_tokens, appears_incomplete, last_user_message, render_via_protocol,
     should_strip_tools_for_trio,
 };
+
+#[path = "agent_response.rs"]
+pub(crate) mod agent_response;
+pub(crate) use agent_response::RetryState;
 
 // ---------------------------------------------------------------------------
 // Per-instance state (different per agent)
@@ -183,36 +184,23 @@ pub(crate) struct TurnContext {
 /// These are orthogonal booleans (not a linear state machine):
 /// - `force_response`: set by exec/write_file tools, cleared after boundary injection
 /// - `router_preflight_done`: one-shot, set after router runs
-/// - `forced_finalize_attempted`: one-shot, set after rescue pass for empty responses
 /// - `content_was_streamed`: one-shot, set when TextDelta chunks are sent
 /// - `iterations_since_compaction`: counter, reset when compaction swaps in
 /// - `tool_guard`: per-turn tool call policy enforcement
+/// - `retries`: typed per-failure counters (validation, continuation, rescue, etc.)
 pub(crate) struct FlowControl {
     pub(crate) force_response: bool,
     pub(crate) router_preflight_done: bool,
     pub(crate) tool_guard: ToolGuard,
     pub(crate) iterations_since_compaction: u32,
-    pub(crate) forced_finalize_attempted: bool,
     pub(crate) content_was_streamed: bool,
     /// Consecutive rounds where ALL tool calls were blocked by the guard.
     /// When this reaches the threshold, the loop forces a text response.
     pub(crate) consecutive_all_blocked: u32,
     /// When the LLM call started — set in step_call_llm, read in step_process_response.
     pub(crate) llm_call_start: Option<std::time::Instant>,
-    /// Whether the agent-level retry for transient LLM errors has already been used
-    /// in this turn. Limits retries to one per iteration to avoid infinite loops.
-    pub(crate) agent_retry_attempted: bool,
-    /// Number of auto-continuations used this turn for truncated responses.
-    pub(crate) continuations_used: u32,
-    /// Consecutive validation retries for the current main-loop iteration.
-    /// Reset to 0 on each successful (non-validation) iteration. Capped at
-    /// `MAX_VALIDATION_RETRIES` before the retry is treated as a normal
-    /// continuation (i.e. consumes an iteration slot).
-    pub(crate) validation_retries: u32,
-    /// Whether we already retried an empty response with thinking disabled.
-    /// One-shot: prevents infinite retry loops when the model genuinely
-    /// produces nothing.
-    pub(crate) empty_response_retry_attempted: bool,
+    /// Typed retry counters — each failure mode has a named field with its own cap.
+    pub(crate) retries: RetryState,
 }
 
 /// Shared handles for background compaction coordination.
@@ -419,7 +407,7 @@ impl AgentLoopShared {
                 if ctx.streaming { " (streaming)" } else { "" },
                 iteration + 1,
                 ctx.core.max_iterations,
-                ctx.flow.validation_retries
+                ctx.flow.retries.validation
             );
 
             // Sync messages to reasoning engine so CheckpointTool can capture them.
@@ -438,7 +426,7 @@ impl AgentLoopShared {
                     if let Some(restored) = engine.take_pending_restore() {
                         ctx.messages = restored;
                         iteration += 1;
-                        ctx.flow.validation_retries = 0;
+                        ctx.flow.retries.validation = 0;
                         continue;
                     }
                 }
@@ -449,21 +437,21 @@ impl AgentLoopShared {
                     // A validation error injected a corrective hint. Only count
                     // this against the validation budget, not the main iteration
                     // budget, so format corrections don't exhaust real work slots.
-                    ctx.flow.validation_retries += 1;
-                    if ctx.flow.validation_retries >= validation::MAX_VALIDATION_RETRIES as u32 {
+                    ctx.flow.retries.validation += 1;
+                    if ctx.flow.retries.validation >= validation::MAX_VALIDATION_RETRIES as u32 {
                         // Exhausted validation retries — treat as a normal
                         // iteration so the loop can make forward progress.
                         warn!(
                             "validation retries exhausted ({}/{}), counting as real iteration",
-                            ctx.flow.validation_retries,
+                            ctx.flow.retries.validation,
                             validation::MAX_VALIDATION_RETRIES,
                         );
-                        ctx.flow.validation_retries = 0;
+                        ctx.flow.retries.validation = 0;
                         iteration += 1;
                     } else {
                         debug!(
                             "validation retry {}/{} — not counting against main budget",
-                            ctx.flow.validation_retries,
+                            ctx.flow.retries.validation,
                             validation::MAX_VALIDATION_RETRIES,
                         );
                         // Do NOT increment `iteration` — re-run the same slot.
@@ -473,7 +461,7 @@ impl AgentLoopShared {
                 IterationOutcome::Continue => {
                     // Successful (non-validation) iteration — reset retry counter
                     // and advance to the next main-budget slot.
-                    ctx.flow.validation_retries = 0;
+                    ctx.flow.retries.validation = 0;
                     iteration += 1;
                     // Consume step budget if plan-guided.
                     {
@@ -493,7 +481,7 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Finished(content) => {
-                    ctx.flow.validation_retries = 0;
+                    ctx.flow.retries.validation = 0;
                     iteration += 1;
                     // In plan-guided mode, advance to next step.
                     let should_continue = {
@@ -514,7 +502,7 @@ impl AgentLoopShared {
                     break;
                 }
                 IterationOutcome::Error(msg) => {
-                    ctx.flow.validation_retries = 0;
+                    ctx.flow.retries.validation = 0;
                     iteration += 1;
                     // Try backtracking before giving up.
                     let should_backtrack = {
@@ -1327,8 +1315,8 @@ impl AgentLoopShared {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if !ctx.flow.agent_retry_attempted && is_retryable_provider_error(&e) {
-                        ctx.flow.agent_retry_attempted = true;
+                    if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
+                        ctx.flow.retries.api_retried = true;
                         warn!(model = %ctx.core.model, error = %e, "llm_stream_call_failed_retrying");
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         return StepResult::Done(IterationOutcome::Continue);
@@ -1439,8 +1427,8 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if !ctx.flow.agent_retry_attempted && is_retryable_provider_error(&e) {
-                        ctx.flow.agent_retry_attempted = true;
+                    if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
+                        ctx.flow.retries.api_retried = true;
                         warn!(model = %ctx.core.model, error = %e, "llm_call_failed_retrying");
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         return StepResult::Done(IterationOutcome::Continue);
@@ -1462,406 +1450,13 @@ impl AgentLoopShared {
     }
 
     // -----------------------------------------------------------------------
-    // Step 4: Processing — validate response, rescue pass, error check, telemetry
+    // Step 4: Processing — delegated to agent_response.rs
     // -----------------------------------------------------------------------
-
-    /// Response validation (hallucinated tool calls), rescue pass for empty
-    /// local model responses, provider error check, token telemetry.
-    #[instrument(name = "step_process_response", skip(self, ctx, response), fields(
-        has_tool_calls = response.has_tool_calls(),
-        finish_reason = %response.finish_reason,
-        n_tool_calls = response.tool_calls.len(),
-    ))]
-    async fn step_process_response(
-        &self,
-        ctx: &mut TurnContext,
-        mut response: LLMResponse,
-    ) -> StepResult {
-        let counters = &self.core_handle.counters;
-
-        // --- Universal textual tool-call extraction ---
-        // If the response has no native tool_calls but contains [I called: ...]
-        // patterns, parse them regardless of protocol mode. This prevents
-        // the validation step from flagging them as hallucinated tool calls.
-        if !response.has_tool_calls()
-            && response
-                .content
-                .as_ref()
-                .map(|c| !c.trim().is_empty())
-                .unwrap_or(false)
-        {
-            let content_text = response.content.as_deref().unwrap_or("");
-            // Try bracket format first: [I called: tool(args)]
-            let parsed = parse_textual_tool_calls(content_text);
-            // Then try XML format: <tool_call><function=name>...</tool_call>
-            let parsed = if parsed.is_empty() {
-                parse_xml_tool_calls(content_text)
-            } else {
-                parsed
-            };
-            if !parsed.is_empty() {
-                let is_xml = content_text.contains("<tool_call>");
-                debug!(
-                    n = parsed.len(),
-                    format = if is_xml { "xml" } else { "textual" },
-                    "universal_tool_parse: parsed {} tool call(s) from response text",
-                    parsed.len()
-                );
-                let synthesised: Vec<crate::providers::base::ToolCallRequest> = parsed
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, ptc)| {
-                        let args: HashMap<String, Value> = match ptc.args {
-                            Value::Object(map) => map.into_iter().collect(),
-                            _ => HashMap::new(),
-                        };
-                        crate::providers::base::ToolCallRequest {
-                            id: format!("tc_textual_{}", i + 1),
-                            name: ptc.tool,
-                            arguments: args,
-                        }
-                    })
-                    .collect();
-                if let Some(ref mut content) = response.content {
-                    *content = if is_xml {
-                        strip_xml_tool_calls(content)
-                    } else {
-                        strip_textual_tool_calls(content)
-                    };
-                }
-                response.tool_calls = synthesised;
-            }
-        }
-
-        // --- Response Validation: detect hallucinated tool calls ---
-        let content_str = response.content.as_deref().unwrap_or("");
-        let tool_calls_as_maps: Vec<HashMap<String, Value>> = response
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                let mut map = HashMap::new();
-                map.insert("id".to_string(), Value::String(tc.id.clone()));
-                map.insert("name".to_string(), Value::String(tc.name.clone()));
-                map.insert(
-                    "arguments".to_string(),
-                    Value::Object(
-                        tc.arguments
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                );
-                map
-            })
-            .collect();
-
-        match validation::validate_response(
-            content_str,
-            &tool_calls_as_maps,
-            ctx.protocol.is_textual_replay(),
-            ctx.flow.tool_guard.had_blocked_calls,
-        ) {
-            validation::ValidationOutcome::Error(validation_err) => {
-                let retry_num = ctx.flow.validation_retries + 1;
-                warn!(
-                    model = %ctx.core.model,
-                    validation = %format!("{:?}", validation_err),
-                    retry = retry_num,
-                    max_retries = validation::MAX_VALIDATION_RETRIES,
-                    "response_validation_failed"
-                );
-                let hint = validation::generate_retry_prompt(&validation_err, retry_num as u8);
-                ctx.messages.push(json!({
-                    "role": "assistant",
-                    "content": content_str
-                }));
-                ctx.messages.push(json!({
-                    "role": "user",
-                    "content": hint
-                }));
-                debug!(
-                    "Injected validation retry hint (retry {}/{})",
-                    retry_num,
-                    validation::MAX_VALIDATION_RETRIES
-                );
-                return StepResult::Done(IterationOutcome::ValidationRetry);
-            }
-            validation::ValidationOutcome::StripHallucination => {
-                debug!("Stripping hallucinated tool-call text from response");
-                if let Some(ref mut content) = response.content {
-                    *content = validation::strip_hallucinated_text(content);
-                }
-            }
-            validation::ValidationOutcome::Ok => {}
-        }
-
-        // --- Strip thinking tags leaked by models (Qwen3, MiniCPM, etc.) ---
-        if let Some(ref mut content) = response.content {
-            let cleaned = crate::agent::compaction::strip_thinking_tags(content);
-            if cleaned.len() != content.len() {
-                *content = cleaned;
-            }
-        }
-
-        // Rescue pass: if local model consumed completion on reasoning and produced no
-        // visible answer, force one concise no-thinking completion once.
-        let empty_visible = response
-            .content
-            .as_ref()
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(true);
-        if ctx.core.is_local
-            && !response.has_tool_calls()
-            && empty_visible
-            && response.finish_reason == "length"
-            && !ctx.flow.forced_finalize_attempted
-        {
-            ctx.flow.forced_finalize_attempted = true;
-            // Use the same max_tokens cap the original code used (from effective_max_tokens
-            // passed through the response, but we only need rescue_tokens here).
-            let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
-            let mut rescue_messages = ctx.messages.clone();
-            rescue_messages.push(json!({
-                "role": "user",
-                "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
-            }));
-            counters.inference_active.store(true, Ordering::Relaxed);
-            match ctx
-                .core
-                .provider
-                .chat(
-                    &rescue_messages,
-                    None,
-                    Some(&ctx.core.model),
-                    rescue_tokens,
-                    0.2,
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(r) => {
-                    response = r;
-                }
-                Err(e) => {
-                    warn!("Finalize rescue call failed: {}", e);
-                }
-            }
-            counters.inference_active.store(false, Ordering::Relaxed);
-        }
-
-        // --- Auto-continue: stitch truncated non-empty responses ---
-        let max_cont = ctx.core.max_continuations;
-        while !response.has_tool_calls()
-            && response
-                .content
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            && (response.finish_reason == "length"
-                || (response.finish_reason == "stop"
-                    && response
-                        .content
-                        .as_ref()
-                        .map(|s| appears_incomplete(s))
-                        .unwrap_or(false)))
-            && ctx.flow.continuations_used < max_cont
-        {
-            ctx.flow.continuations_used += 1;
-            if response.finish_reason == "stop" {
-                info!("auto_continue: heuristic detected incomplete response despite finish_reason='stop'");
-            }
-            info!(
-                "auto_continue: continuation {}/{} — finish_reason was '{}'",
-                ctx.flow.continuations_used, max_cont, response.finish_reason
-            );
-
-            // Streaming indicator
-            if let Some(ref tx) = ctx.text_delta_tx {
-                let _ = tx.send("\x1b[2m [continuing...]\x1b[0m".to_string());
-            }
-
-            // Build continuation messages: original context + partial as assistant + "Continue."
-            let mut cont_messages = ctx.messages.clone();
-            cont_messages.push(json!({
-                "role": "assistant",
-                "content": response.content.as_deref().unwrap_or("")
-            }));
-            cont_messages.push(json!({
-                "role": "user",
-                "content": "Continue."
-            }));
-
-            // Check cancellation before LLM call
-            if ctx
-                .cancellation_token
-                .as_ref()
-                .map_or(false, |t| t.is_cancelled())
-            {
-                break;
-            }
-
-            counters.inference_active.store(true, Ordering::Relaxed);
-            let cont_result = ctx
-                .core
-                .provider
-                .chat(
-                    &cont_messages,
-                    None, // no tools during continuation
-                    Some(&ctx.core.model),
-                    ctx.core.max_tokens,
-                    ctx.core.temperature,
-                    None, // no thinking budget
-                    None,
-                )
-                .await;
-            counters.inference_active.store(false, Ordering::Relaxed);
-
-            match cont_result {
-                Ok(cont_response) => {
-                    // Stream continuation content
-                    if let Some(ref new_text) = cont_response.content {
-                        if let Some(ref tx) = ctx.text_delta_tx {
-                            let _ = tx.send(new_text.clone());
-                        }
-                    }
-
-                    // Stitch content
-                    let original = response.content.take().unwrap_or_default();
-                    let continuation = cont_response.content.unwrap_or_default();
-                    response.content = Some(format!("{}{}", original, continuation));
-
-                    // Update finish_reason (enables next iteration if still "length")
-                    response.finish_reason = cont_response.finish_reason;
-
-                    // Merge usage
-                    for (key, val) in cont_response.usage {
-                        *response.usage.entry(key).or_insert(0) += val;
-                    }
-                }
-                Err(e) => {
-                    warn!("auto_continue: continuation call failed: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // --- Anti-Drift post-completion: collapse babble ---
-        if ctx.core.is_local && ctx.core.anti_drift.enabled && !response.has_tool_calls() {
-            if let Some(ref mut content) = response.content {
-                anti_drift::post_completion_pipeline(content, &ctx.messages, &ctx.core.anti_drift);
-            }
-        }
-
-        // Check for LLM provider errors before processing the response.
-        if let Some(err_msg) = response.error_detail() {
-            error!(model = %ctx.core.model, error = %err_msg, "llm_provider_error");
-
-            // In local mode, check if the server is still alive.
-            if ctx.core.is_local {
-                if let Some(base) = ctx.core.provider.get_api_base() {
-                    if !crate::server::check_health(base, ctx.core.health_check_timeout_secs).await
-                    {
-                        error!("Local LLM server is down!");
-                        return StepResult::Done(IterationOutcome::Error(
-                            "[LLM Error] Local server crashed. Use /restart or /local to recover."
-                                .into(),
-                        ));
-                    }
-                }
-            }
-
-            return StepResult::Done(IterationOutcome::Error(format!("[LLM Error] {}", err_msg)));
-        }
-
-        // Token telemetry: log actual vs estimated usage.
-        {
-            let estimated_prompt = TokenBudget::estimate_tokens(&ctx.messages);
-            let actual_prompt = response.usage.get("prompt_tokens").copied().unwrap_or(-1);
-            let actual_completion = response
-                .usage
-                .get("completion_tokens")
-                .copied()
-                .unwrap_or(-1);
-            // Note: max_tokens is not available here (it was consumed by the Calling phase).
-            // We log what we can — the actual usage is the important part.
-            info!(
-                "tokens: estimated_prompt={}, actual_prompt={}, actual_completion={}",
-                estimated_prompt, actual_prompt, actual_completion
-            );
-            // Store actual tokens for /status display.
-            if actual_prompt > 0 {
-                counters
-                    .last_actual_prompt_tokens
-                    .store(actual_prompt as u64, Ordering::Relaxed);
-            }
-            if actual_completion > 0 {
-                counters
-                    .last_actual_completion_tokens
-                    .store(actual_completion as u64, Ordering::Relaxed);
-            }
-            counters
-                .last_estimated_prompt_tokens
-                .store(estimated_prompt as u64, Ordering::Relaxed);
-
-            // Emit per-call metrics to ~/.nanobot/metrics.jsonl.
-            crate::agent::metrics::emit(&crate::agent::metrics::RequestMetrics {
-                timestamp: chrono::Local::now().to_rfc3339(),
-                request_id: ctx.request_id.clone(),
-                role: "main".into(),
-                model: ctx.core.model.clone(),
-                provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),
-                elapsed_ms: ctx
-                    .flow
-                    .llm_call_start
-                    .map_or(0, |t| t.elapsed().as_millis() as u64),
-                prompt_tokens: actual_prompt.max(0) as u64,
-                completion_tokens: actual_completion.max(0) as u64,
-                status: "ok".into(),
-                error_detail: None,
-                anti_drift_score: None,
-                anti_drift_signals: None,
-                tool_calls_requested: response.tool_calls.len() as u32,
-                tool_calls_executed: 0, // updated after execution
-                validation_result: None,
-            });
-        }
-
-        // Branch: tool calls → Executing, no tool calls → finished.
-        if response.has_tool_calls() {
-            let tool_calls = response.tool_calls.clone();
-            StepResult::Next(IterationPhase::Executing {
-                response,
-                tool_calls,
-            })
-        } else {
-            let mut content = response.content.unwrap_or_default();
-            if content.trim().is_empty() {
-                let thinking_was_on = counters.thinking_budget.load(Ordering::Relaxed) > 0;
-                if thinking_was_on && !ctx.flow.empty_response_retry_attempted {
-                    ctx.flow.empty_response_retry_attempted = true;
-                    warn!(
-                        finish_reason = %response.finish_reason,
-                        "empty_llm_response: thinking consumed entire output, retrying with thinking off"
-                    );
-                    // Temporarily disable thinking and re-enter the Calling phase.
-                    counters.thinking_budget.store(0, Ordering::Relaxed);
-                    return StepResult::Done(IterationOutcome::Continue);
-                }
-                warn!(
-                    finish_reason = %response.finish_reason,
-                    "empty_llm_response: SLM returned no content and no tool calls, injecting fallback"
-                );
-                content =
-                    "I couldn't produce a response in this turn. Please try again.".to_string();
-            }
-            // Send finish_reason metadata to the REPL renderer before closing the channel.
-            if let Some(ref tx) = ctx.text_delta_tx {
-                let _ = tx.send(format!("\x00finish_reason:{}", response.finish_reason));
-            }
-            StepResult::Done(IterationOutcome::Finished(content))
-        }
-    }
+    // `step_process_response` is now implemented in `agent_response.rs` via
+    // the `#[path]` submodule. It classifies the response into a
+    // `ResponseKind` and dispatches to typed handler methods.
+    //
+    // See: agent_response::AgentLoopShared::step_process_response()
 
     // -----------------------------------------------------------------------
     // Step 5: Executing — route and execute tool calls
