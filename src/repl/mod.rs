@@ -1862,6 +1862,9 @@ pub(crate) fn cmd_agent(
 
                 // Dispatch slash commands.
                 if input.starts_with('/') && ctx.dispatch(input).await {
+                    // Push content up on next bar render so short command
+                    // output (e.g. /cluster, /status) isn't overwritten.
+                    bar_needs_push = true;
                     continue;
                 }
 
@@ -1958,6 +1961,10 @@ pub(crate) fn cmd_agent(
             }
 
             ctx.srv.shutdown();
+
+            // Safety net: kill any managed child processes whose Drop may not
+            // have fired (e.g. Arc still held elsewhere).
+            crate::agent::pid_file::cleanup_stale_pids();
 
             // On exit, force a reflection pass if any working memory has
             // accumulated — threshold=0 means "reflect if there is anything".

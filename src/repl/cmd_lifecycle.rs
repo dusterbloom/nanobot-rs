@@ -1070,6 +1070,11 @@ impl ReplContext {
         let currently_local = self.core_handle.swappable().is_local;
 
         if !currently_local {
+            // Kill any stale managed inference servers from previous runs
+            // before attempting to start a new one (prevents OOM from
+            // overlapping servers).
+            crate::agent::pid_file::cleanup_stale_pids();
+
             // Try to start LM Studio if no engine is active.
             if self.config.agents.defaults.local_api_base.is_empty()
                 && !self.srv.lms_managed
@@ -1210,7 +1215,7 @@ impl ReplContext {
             self.apply_and_rebuild_with(true);
             tui::print_mode_banner(&self.srv.local_port, true);
         } else {
-            // Toggle OFF
+            // Toggle OFF — switch to cloud mode.
             if self.srv.lms_managed {
                 let lms_port = self.config.agents.defaults.lms_port;
                 crate::lms::unload_all("", lms_port, self.config.timeouts.lms_unload_secs)
@@ -1218,11 +1223,11 @@ impl ReplContext {
                     .ok();
                 self.srv.lms_managed = false;
                 self.srv.lms_binary = None;
-                self.config.agents.defaults.local_api_base.clear();
-                self.config.agents.defaults.skip_jit_gate = false;
             }
-            self.srv.engine = super::super::InferenceEngine::None;
+            // Clear local endpoint so next restart doesn't force local mode.
+            self.config.agents.defaults.local_api_base.clear();
             self.config.agents.defaults.skip_jit_gate = false;
+            self.srv.engine = super::super::InferenceEngine::None;
             self.stop_watchdog();
             self.persist_local_config();
             self.apply_and_rebuild_with(false);

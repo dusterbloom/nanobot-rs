@@ -66,6 +66,7 @@ pub mod model_feature_cache;
 pub mod model_prices;
 pub mod observer;
 pub mod parsers;
+pub(crate) mod pid_file;
 pub mod pipeline;
 pub mod policy;
 pub mod prepare_context;

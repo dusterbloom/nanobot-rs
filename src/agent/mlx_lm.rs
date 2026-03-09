@@ -48,6 +48,16 @@ pub struct MlxLmServer {
 }
 
 impl MlxLmServer {
+    /// PID-file service name for this backend.
+    fn pid_name(&self) -> &str {
+        match self.backend {
+            InferenceBackend::MlxLm => "mlx-lm",
+            InferenceBackend::VllmMlx => "vllm-mlx",
+        }
+    }
+}
+
+impl MlxLmServer {
     /// Start an MLX inference server for the given model.
     pub fn start(
         model_dir: PathBuf,
@@ -71,6 +81,8 @@ impl MlxLmServer {
     }
 
     fn spawn_process(&mut self) -> Result<(), String> {
+        // Kill any stale child processes tracked by PID files from previous runs.
+        super::pid_file::cleanup_stale_pids();
         // Kill any stale process on the port from a previous run.
         Self::kill_stale_on_port(self.port);
 
@@ -109,6 +121,7 @@ impl MlxLmServer {
         let child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn {backend_name}: {e}"))?;
+        super::pid_file::write_pid(self.pid_name(), self.port, child.id());
         self.child = Some(child);
 
         // Wait for server to be ready by polling TCP connect + simple HTTP GET.
@@ -269,8 +282,23 @@ impl MlxLmServer {
 
     pub fn kill(&mut self) {
         if let Some(ref mut child) = self.child.take() {
+            // Graceful shutdown: SIGTERM first, then escalate to SIGKILL.
+            let pid = child.id();
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(Some(_)) = child.try_wait() {
+                    super::pid_file::remove_pid(self.pid_name(), self.port);
+                    return;
+                }
+            }
+            // Still alive after grace period — force kill
             let _ = child.kill();
             let _ = child.wait();
+            super::pid_file::remove_pid(self.pid_name(), self.port);
         }
     }
 

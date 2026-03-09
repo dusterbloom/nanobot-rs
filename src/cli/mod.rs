@@ -929,6 +929,10 @@ pub(crate) async fn run_gateway_async(
     agent_loop.stop();
     heartbeat.stop().await;
     channel_manager.stop_all().await;
+
+    // Safety net: kill any managed child processes whose Drop may not
+    // have fired (e.g. Arc still held elsewhere).
+    crate::agent::pid_file::cleanup_stale_pids();
 }
 
 // ============================================================================

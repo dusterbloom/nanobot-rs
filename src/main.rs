@@ -452,9 +452,13 @@ enum CronAction {
 }
 
 fn main() {
-    // Safety net: restore terminal state on panic
+    // Clean up any stale child processes from previous crashed runs.
+    agent::pid_file::cleanup_stale_pids();
+
+    // Safety net: restore terminal state on panic and kill child processes
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        agent::pid_file::cleanup_stale_pids();
         tui::force_exit_raw_mode();
         print!("\x1b[r"); // reset scroll region
         print!("\x1b[?25h"); // show cursor

@@ -312,12 +312,16 @@ impl ReplContext {
     /// Like `apply_and_rebuild` but with an explicit `is_local` override.
     /// Use when toggling between local and cloud mode.
     pub fn apply_and_rebuild_with(&mut self, is_local: bool) {
-        // MLX mode: rebuild core via rebuild_core_mlx, not make_local_providers
+        // MLX mode: rebuild core via rebuild_core_mlx, not make_local_providers.
+        // Only use the MLX path when staying in local mode; when switching to
+        // cloud we must fall through to the normal provider path.
         #[cfg(feature = "mlx")]
-        if let Some(ref mlx) = self.mlx_handle {
-            cli::rebuild_core_mlx(&self.core_handle, &self.config, mlx);
-            self.rebuild_agent_loop();
-            return;
+        if is_local {
+            if let Some(ref mlx) = self.mlx_handle {
+                cli::rebuild_core_mlx(&self.core_handle, &self.config, mlx);
+                self.rebuild_agent_loop();
+                return;
+            }
         }
 
         super::apply_server_change(

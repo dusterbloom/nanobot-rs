@@ -96,6 +96,21 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
         });
     }
 
+    // Model has a known provider prefix but that provider's key is empty.
+    // Strip the prefix so the fallback provider (whichever has a key) gets
+    // a clean model name instead of "anthropic/claude-opus-4-5".
+    let model = if let Some(stripped) =
+        crate::config::schema::ProvidersConfig::strip_known_prefix(model)
+    {
+        info!(
+            "create_provider: prefix provider has no key, stripped '{}' -> '{}'",
+            model, stripped
+        );
+        stripped.to_string()
+    } else {
+        model.clone()
+    };
+
     let api_key = config.get_api_key().unwrap_or_default();
 
     // No API key configured at all -> try OAuth as last resort.
@@ -104,7 +119,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
             "create_provider: no API key configured, falling back to OAuth for model={}",
             model
         );
-        match load_oauth_provider(model) {
+        match load_oauth_provider(&model) {
             Ok(provider) => return provider,
             Err(e) => {
                 info!("OAuth fallback failed ({}), continuing with empty key", e);
@@ -120,7 +135,7 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
     factory::create_openai_compat(factory::ProviderSpec {
         api_key,
         api_base,
-        model: Some(model.to_string()),
+        model: Some(model),
         jit_gate: None,
         retry: config.retry.clone(),
         timeout_secs: config.timeouts.provider_http_secs,
@@ -152,10 +167,18 @@ pub(super) fn has_oauth_credentials() -> bool {
 /// Check that an LLM API key is configured, exit with error if not.
 ///
 /// Allows through if OAuth credentials exist at `~/.claude/.credentials.json`
-/// (Claude Max auto-detection).
+/// (Claude Max auto-detection), if a provider-prefix model is configured,
+/// or if local mode is active (localApiBase set).
 pub(crate) fn check_api_key(config: &Config) {
     let model = &config.agents.defaults.model;
+    let has_prefix = config.resolve_provider_for_model(model).is_some();
+    let local_env = std::env::var("NANOBOT_LOCAL")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let has_local = local_env || !config.agents.defaults.local_api_base.is_empty();
     if config.get_api_key().is_none()
+        && !has_prefix
+        && !has_local
         && !model.starts_with("bedrock/")
         && !model.starts_with("claude-max")
         && !has_oauth_credentials()

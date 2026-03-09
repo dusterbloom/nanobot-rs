@@ -620,6 +620,17 @@ impl ProvidersConfig {
         }
         None
     }
+
+    /// Strip a known provider prefix from a model name, regardless of whether
+    /// that provider has a key configured.  Returns `None` if no prefix matches.
+    pub fn strip_known_prefix(model: &str) -> Option<&str> {
+        for (prefix, _, _) in PROVIDER_PREFIXES {
+            if let Some(rest) = model.strip_prefix(prefix) {
+                return Some(rest);
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
