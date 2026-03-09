@@ -45,6 +45,7 @@ static LANG_DETECTOR: Lazy<LanguageDetector> = Lazy::new(|| {
         Language::Japanese,
         Language::Portuguese,
         Language::Chinese,
+        Language::Vietnamese,
     ])
     .build()
 });
@@ -62,6 +63,7 @@ pub(crate) fn detect_language(text: &str) -> String {
             Language::Japanese => "ja",
             Language::Portuguese => "pt",
             Language::Chinese => "zh",
+            Language::Vietnamese => "vi",
             _ => "en",
         })
         .unwrap_or("en")
@@ -163,6 +165,12 @@ fn f32le_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Languages where Magpie TTS produces better output than Kokoro.
+fn is_magpie_language(_lang: &str) -> bool {
+    // Disabled: Magpie has issues (slow TTFT, ticking, ordering). Use Kokoro instead.
+    false
 }
 
 /// Map ISO 639-1 language code to a default Kokoro voice ID and language code.
@@ -611,6 +619,7 @@ pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
+    tts_magpie: Option<Arc<Mutex<TextToSpeech>>>,
     engine_config: TtsEngineConfig,
     cancel: Arc<AtomicBool>,
 }
@@ -719,7 +728,25 @@ impl VoicePipeline {
             None
         };
 
-        if tts_en.is_none() && tts_multi.is_none() {
+        // Disabled: Magpie has issues (slow TTFT, ticking, ordering). Use Kokoro instead.
+        let tts_magpie = None;
+        // let tts_magpie = match tokio::task::spawn_blocking(|| {
+        //     TextToSpeech::with_engine(TtsEngine::Magpie)
+        // })
+        // .await
+        // .map_err(|e| format!("spawn_blocking join error: {e}"))?
+        // {
+        //     Ok(tts) => {
+        //         info!("Magpie TTS ready (fr/it/vi)");
+        //         Some(Arc::new(Mutex::new(tts)))
+        //     }
+        //     Err(e) => {
+        //         tracing::warn!("Magpie TTS not available: {e}");
+        //         None
+        //     }
+        // };
+
+        if tts_en.is_none() && tts_multi.is_none() && tts_magpie.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
 
@@ -727,6 +754,7 @@ impl VoicePipeline {
             stt: Arc::new(Mutex::new(stt)),
             tts_en,
             tts_multi,
+            tts_magpie,
             engine_config: TtsEngineConfig::Pocket,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -762,7 +790,7 @@ impl VoicePipeline {
 
         let stt = SpeechToText::new(SttMode::Batch).map_err(|e| format!("STT init failed: {e}"))?;
 
-        let (tts_en, tts_multi) = match engine {
+        let (tts_en, tts_multi, tts_magpie) = match engine {
             TtsEngineConfig::Pocket => {
                 models::ensure_kokoro_model(progress)
                     .await
@@ -800,7 +828,25 @@ impl VoicePipeline {
                     }
                 };
 
-                (tts_en, tts_multi)
+                // Disabled: Magpie has issues (slow TTFT, ticking, ordering). Use Kokoro instead.
+                let tts_magpie = None;
+                // let tts_magpie = match tokio::task::spawn_blocking(|| {
+                //     TextToSpeech::with_engine(TtsEngine::Magpie)
+                // })
+                // .await
+                // .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                // {
+                //     Ok(tts) => {
+                //         info!("Magpie TTS ready (fr/it/vi)");
+                //         Some(Arc::new(Mutex::new(tts)))
+                //     }
+                //     Err(e) => {
+                //         info!("Magpie TTS not available: {e}");
+                //         None
+                //     }
+                // };
+
+                (tts_en, tts_multi, tts_magpie)
             }
             TtsEngineConfig::Kokoro => {
                 models::ensure_kokoro_model(progress)
@@ -812,20 +858,22 @@ impl VoicePipeline {
                         .map_err(|e| format!("spawn_blocking join error: {e}"))?
                         .map_err(|e| format!("Kokoro TTS init failed: {e}"))?;
                 info!("Kokoro TTS ready (multilingual)");
-                (None, Some(Arc::new(Mutex::new(tts))))
+                (None, Some(Arc::new(Mutex::new(tts))), None)
             }
+            // Disabled: Magpie has issues. Redirect to Kokoro instead.
             TtsEngineConfig::Magpie => {
-                let tts =
-                    tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Magpie))
-                        .await
-                        .map_err(|e| format!("spawn_blocking join error: {e}"))?
-                        .map_err(|e| format!("Magpie TTS init failed: {e}"))?;
-                info!("Magpie TTS ready (multilingual)");
-                (None, Some(Arc::new(Mutex::new(tts))))
+                return Err("Magpie TTS is disabled (use Kokoro instead)".to_string());
+                // let tts =
+                //     tokio::task::spawn_blocking(|| TextToSpeech::with_engine(TtsEngine::Magpie))
+                //         .await
+                //         .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                //         .map_err(|e| format!("Magpie TTS init failed: {e}"))?;
+                // info!("Magpie TTS ready (multilingual)");
+                // (None, None, Some(Arc::new(Mutex::new(tts))))
             }
         };
 
-        if tts_en.is_none() && tts_multi.is_none() {
+        if tts_en.is_none() && tts_multi.is_none() && tts_magpie.is_none() {
             return Err("No TTS engine could be initialized".to_string());
         }
 
@@ -835,6 +883,7 @@ impl VoicePipeline {
             stt: Arc::new(Mutex::new(stt)),
             tts_en,
             tts_multi,
+            tts_magpie,
             engine_config: engine,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -932,6 +981,14 @@ impl VoicePipeline {
     /// Select the appropriate TTS engine based on language and config.
     fn select_tts(&self, lang: &str) -> Result<(Arc<Mutex<TextToSpeech>>, String), String> {
         let is_english = matches!(lang, "en" | "en-us" | "en-gb");
+
+        // Prefer Magpie for languages it handles best
+        if !is_english && is_magpie_language(lang) {
+            if let Some(ref tts) = self.tts_magpie {
+                return Ok((tts.clone(), "0".to_string()));
+            }
+        }
+
         let tts = if is_english {
             self.tts_en.as_ref().or(self.tts_multi.as_ref())
         } else {
@@ -1171,22 +1228,36 @@ impl VoicePipeline {
         let text = text.to_string();
         let lang = lang.to_string();
         let lang_for_log = lang.clone();
-        let tts = {
-            let is_english = matches!(lang.as_str(), "en" | "en-us" | "en-gb");
-            if is_english {
-                self.tts_en.as_ref().or(self.tts_multi.as_ref())
-            } else {
-                self.tts_multi.as_ref().or(self.tts_en.as_ref())
-            }
-            .ok_or("No TTS engine available")?
-            .clone()
+        let is_english = matches!(lang.as_str(), "en" | "en-us" | "en-gb");
+        let use_magpie = !is_english && is_magpie_language(&lang) && self.tts_magpie.is_some();
+        let tts = if use_magpie {
+            self.tts_magpie.as_ref().unwrap().clone()
+        } else if is_english {
+            self.tts_en
+                .as_ref()
+                .or(self.tts_multi.as_ref())
+                .ok_or("No TTS engine available")?
+                .clone()
+        } else {
+            self.tts_multi
+                .as_ref()
+                .or(self.tts_en.as_ref())
+                .ok_or("No TTS engine available")?
+                .clone()
         };
 
         let (all_samples, sample_rate) = tokio::task::spawn_blocking(move || {
             let mut guard = tts.lock();
             let engine_type = guard.engine_type().to_string();
 
-            if engine_type == "pocket" {
+            if use_magpie {
+                guard
+                    .set_language(&lang)
+                    .map_err(|e| format!("Language switch failed: {e}"))?;
+                guard
+                    .set_speaker("0")
+                    .map_err(|e| format!("Voice switch failed: {e}"))?;
+            } else if engine_type == "pocket" {
                 // default voice
             } else {
                 let (voice_id, _) = language_to_kokoro_voice(&lang);
@@ -1375,6 +1446,7 @@ impl ModelProgressCallback for TerminalProgress {
 pub(crate) fn start_tts_playback(
     tts_en: Option<Arc<Mutex<TextToSpeech>>>,
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
+    tts_magpie: Option<Arc<Mutex<TextToSpeech>>>,
     tts_playing: Arc<AtomicBool>,
 ) -> (std_mpsc::Sender<TtsCommand>, Arc<AtomicBool>) {
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1400,6 +1472,11 @@ pub(crate) fn start_tts_playback(
             let _ = g.set_speaker("35"); // Italian (if_sara)
             tracing::debug!("[tts-synth] Kokoro pre-warmed (multilingual)");
         }
+        if let Some(ref tts) = tts_magpie {
+            let mut g = tts.lock();
+            let _ = g.set_speaker("0");
+            tracing::debug!("[tts-synth] Magpie pre-warmed (fr/it/vi)");
+        }
 
         for cmd in sentence_rx {
             match cmd {
@@ -1417,6 +1494,41 @@ pub(crate) fn start_tts_playback(
 
                     // Route to the right engine based on language
                     let is_english = matches!(language.as_str(), "en" | "en-us" | "en-gb" | "");
+                    let use_magpie =
+                        !is_english && is_magpie_language(&language) && tts_magpie.is_some();
+
+                    if use_magpie {
+                        let engine = tts_magpie.as_ref().unwrap();
+                        let mut guard = engine.lock();
+                        let _ = guard.set_language(&language);
+                        let _ = guard.set_speaker("0");
+
+                        let cancel_ref = &cancel_synth;
+                        let mut all_samples: Vec<f32> = Vec::new();
+                        let mut sr = 0u32;
+                        let mut cancelled = false;
+                        if let Err(e) =
+                            guard.synthesize_streaming(&sentence, |samples, sample_rate| {
+                                if cancel_ref.load(Ordering::Relaxed) {
+                                    cancelled = true;
+                                    return false;
+                                }
+                                sr = sample_rate;
+                                all_samples.extend_from_slice(samples);
+                                true
+                            })
+                        {
+                            tracing::error!("[tts-synth] Magpie synthesis failed: {}", e);
+                        }
+                        if !cancelled && !all_samples.is_empty() {
+                            let chunk = AudioChunk {
+                                data: samples_to_f32le_bytes(&all_samples),
+                                sample_rate: sr,
+                            };
+                            let _ = audio_tx.send(chunk);
+                        }
+                        continue;
+                    }
 
                     // Pick the right Arc, lock it per-sentence, synthesize, then release
                     let engine: Option<&Arc<Mutex<TextToSpeech>>> = if is_english {
