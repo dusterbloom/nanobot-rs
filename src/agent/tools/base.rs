@@ -32,6 +32,22 @@ impl ToolExecutionResult {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
     }
 
+    /// Map a raw tool output string to a structured result.
+    /// Outputs starting with `Error:` are treated as failures.
+    pub fn from_output(out: String) -> Self {
+        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
+            let error_kind = crate::errors::classify_tool_error(&err);
+            Self {
+                ok: false,
+                data: out,
+                error: Some(err),
+                error_kind,
+            }
+        } else {
+            Self::success(out)
+        }
+    }
+
     pub fn failure(message: String) -> Self {
         let error_kind = crate::errors::classify_tool_error(&message);
         Self {
@@ -83,18 +99,7 @@ pub trait Tool: Send + Sync {
         &self,
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
-        let out = self.execute(params).await;
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            let error_kind = crate::errors::classify_tool_error(&err);
-            ToolExecutionResult {
-                ok: false,
-                data: out,
-                error: Some(err),
-                error_kind,
-            }
-        } else {
-            ToolExecutionResult::success(out)
-        }
+        ToolExecutionResult::from_output(self.execute(params).await)
     }
 
     /// Execute the tool with an execution context for progress reporting
@@ -121,18 +126,7 @@ pub trait Tool: Send + Sync {
         params: HashMap<String, serde_json::Value>,
         ctx: &ToolExecutionContext,
     ) -> ToolExecutionResult {
-        let out = self.execute_with_context(params, ctx).await;
-        if let Some(err) = out.strip_prefix("Error:").map(|s| s.trim().to_string()) {
-            let error_kind = crate::errors::classify_tool_error(&err);
-            ToolExecutionResult {
-                ok: false,
-                data: out,
-                error: Some(err),
-                error_kind,
-            }
-        } else {
-            ToolExecutionResult::success(out)
-        }
+        ToolExecutionResult::from_output(self.execute_with_context(params, ctx).await)
     }
 
     /// Whether this tool is currently available for use.

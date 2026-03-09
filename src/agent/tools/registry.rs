@@ -9,7 +9,8 @@ use serde_json::Value;
 use super::base::{Tool, ToolExecutionContext, ToolExecutionResult};
 use super::{
     BrowserTool, CodeExecutionTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool,
-    ReadSkillTool, RecallTool, RememberTool, SessionSearchTool, WebSearchTool, WriteFileTool,
+    ReadSkillTool, RecallTool, RememberTool, SessionSearchTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
 use crate::config::schema::{CodeExecutionConfig, JinaReaderConfig};
@@ -162,62 +163,38 @@ impl ToolRegistry {
             Self::require_non_empty_string(&params, "action", "browser")?;
         }
 
-        if canonical_name == "read_file" {
-            if !params.contains_key("path") {
-                if let Some(v) = params
-                    .get("file_path")
-                    .cloned()
-                    .or_else(|| params.get("filepath").cloned())
-                    .or_else(|| params.get("file").cloned())
-                {
-                    params.insert("path".to_string(), v);
-                }
-            }
-            Self::require_non_empty_string(&params, "path", "read_file")?;
-        }
+        // Normalize path aliases for file tools.
+        let file_aliases: &[&str] = &["file_path", "filepath", "file"];
+        let dir_aliases: &[&str] = &["dir_path", "directory", "dir"];
 
-        if canonical_name == "write_file" {
-            if !params.contains_key("path") {
-                if let Some(v) = params
-                    .get("file_path")
-                    .cloned()
-                    .or_else(|| params.get("filepath").cloned())
-                    .or_else(|| params.get("file").cloned())
-                {
-                    params.insert("path".to_string(), v);
-                }
+        match canonical_name {
+            "read_file" | "write_file" | "edit_file" => {
+                Self::normalize_param_aliases(&mut params, "path", file_aliases);
+                Self::require_non_empty_string(&params, "path", canonical_name)?;
             }
-            Self::require_non_empty_string(&params, "path", "write_file")?;
-        }
-
-        if canonical_name == "edit_file" {
-            if !params.contains_key("path") {
-                if let Some(v) = params
-                    .get("file_path")
-                    .cloned()
-                    .or_else(|| params.get("filepath").cloned())
-                    .or_else(|| params.get("file").cloned())
-                {
-                    params.insert("path".to_string(), v);
-                }
+            "list_dir" => {
+                Self::normalize_param_aliases(&mut params, "path", dir_aliases);
             }
-            Self::require_non_empty_string(&params, "path", "edit_file")?;
-        }
-
-        if canonical_name == "list_dir" {
-            if !params.contains_key("path") {
-                if let Some(v) = params
-                    .get("dir_path")
-                    .cloned()
-                    .or_else(|| params.get("directory").cloned())
-                    .or_else(|| params.get("dir").cloned())
-                {
-                    params.insert("path".to_string(), v);
-                }
-            }
+            _ => {}
         }
 
         Ok((canonical_name.to_string(), params))
+    }
+
+    fn normalize_param_aliases(
+        params: &mut HashMap<String, Value>,
+        canonical: &str,
+        aliases: &[&str],
+    ) {
+        if params.contains_key(canonical) {
+            return;
+        }
+        for alias in aliases {
+            if let Some(v) = params.get(*alias).cloned() {
+                params.insert(canonical.to_string(), v);
+                return;
+            }
+        }
     }
 
     fn require_non_empty_string(
@@ -302,6 +279,12 @@ impl ToolRegistry {
                 config.search_max_results,
                 config.search_provider.clone(),
                 config.searxng_url.clone(),
+            )));
+        }
+        if should_include("web_fetch") {
+            self.register(Box::new(WebFetchTool::new(
+                config.max_tool_result_chars,
+                None,
             )));
         }
         if should_include("browser") {
@@ -494,8 +477,17 @@ impl ToolRegistry {
     /// Keyword-to-tool mapping for context-triggered tool selection.
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
         (
-            &["search", "find online", "look up", "google"],
+            &[
+                "search", "find online", "look up", "google", "news", "latest", "current events",
+                "what's happening", "headlines", "update on", "weather", "stock", "price of",
+            ],
             "web_search",
+        ),
+        (
+            &[
+                "fetch", "download", "read url", "get page", "web_fetch", "scrape",
+            ],
+            "web_fetch",
         ),
         (
             &[
@@ -530,34 +522,32 @@ impl ToolRegistry {
         ),
     ];
 
-    /// Get tool definitions filtered by relevance to the current context.
+    /// Shared logic for building filtered tool definitions.
     ///
-    /// Core tools (filesystem, exec) are always included. Other tools are
-    /// included if they were previously used in the conversation or if
-    /// relevant keywords appear in recent messages.
-    pub fn get_relevant_definitions(
+    /// `core_tools` — always-included tool names.
+    /// `scan_depth` — how many recent messages to scan for keyword triggers.
+    fn collect_filtered_definitions(
         &self,
+        core_tools: &[&str],
         messages: &[serde_json::Value],
         used_tools: &HashSet<String>,
+        scan_depth: usize,
     ) -> Vec<serde_json::Value> {
         let mut relevant: HashSet<String> = HashSet::new();
 
-        // Always include core tools.
-        for name in Self::CORE_TOOLS {
+        for name in core_tools {
             if self.tools.contains_key(*name) {
                 relevant.insert(name.to_string());
             }
         }
 
-        // Include any tools already used in this conversation.
         for name in used_tools {
             if self.tools.contains_key(name) {
                 relevant.insert(name.clone());
             }
         }
 
-        // Scan recent messages for keyword triggers.
-        let recent_text = Self::extract_recent_text(messages, 5);
+        let recent_text = Self::extract_recent_text(messages, scan_depth);
         let lower_text = recent_text.to_lowercase();
 
         for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
@@ -571,7 +561,6 @@ impl ToolRegistry {
             }
         }
 
-        // If we end up with all tools anyway, just return everything.
         if relevant.len() >= self.tools.len() {
             return self.get_definitions();
         }
@@ -588,6 +577,15 @@ impl ToolRegistry {
         defs
     }
 
+    /// Get tool definitions filtered by relevance to the current context.
+    pub fn get_relevant_definitions(
+        &self,
+        messages: &[serde_json::Value],
+        used_tools: &HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        self.collect_filtered_definitions(Self::CORE_TOOLS, messages, used_tools, 5)
+    }
+
     /// Get tool definitions for local models — smaller core set with keyword
     /// expansion to conserve context tokens.
     pub fn get_local_definitions(
@@ -595,47 +593,7 @@ impl ToolRegistry {
         messages: &[serde_json::Value],
         used_tools: &HashSet<String>,
     ) -> Vec<serde_json::Value> {
-        let mut relevant: HashSet<String> = HashSet::new();
-
-        // Minimal core for local models.
-        for name in Self::LOCAL_CORE_TOOLS {
-            if self.tools.contains_key(*name) {
-                relevant.insert(name.to_string());
-            }
-        }
-
-        // Include tools the model has already used (it expects them).
-        for name in used_tools {
-            if self.tools.contains_key(name) {
-                relevant.insert(name.clone());
-            }
-        }
-
-        // Keyword triggers still apply, but only last 3 messages (tighter).
-        let recent_text = Self::extract_recent_text(messages, 3);
-        let lower_text = recent_text.to_lowercase();
-
-        for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
-            if self.tools.contains_key(*tool_name) {
-                for kw in *keywords {
-                    if lower_text.contains(kw) {
-                        relevant.insert(tool_name.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut defs: Vec<serde_json::Value> = self
-            .tools
-            .iter()
-            .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
-            .map(|(_, tool)| tool.to_schema())
-            .collect();
-        if self.condensed {
-            Self::condense_definitions(&mut defs);
-        }
-        defs
+        self.collect_filtered_definitions(Self::LOCAL_CORE_TOOLS, messages, used_tools, 3)
     }
 
     /// Extract text content from the last N messages for keyword scanning.
@@ -659,7 +617,7 @@ impl ToolRegistry {
                 Some(&["read_file", "write_file", "edit_file", "list_dir", "exec"])
             }
             TaskPhase::CodeExecution => Some(&["exec", "read_file", "list_dir"]),
-            TaskPhase::WebResearch => Some(&["web_search", "browser", "read_file"]),
+            TaskPhase::WebResearch => Some(&["web_search", "web_fetch", "browser", "read_file"]),
             TaskPhase::Communication => Some(&["message", "send_email", "check_inbox"]),
             _ => None, // Idle/Understanding/Planning/Reflection -> all tools
         }
@@ -675,56 +633,16 @@ impl ToolRegistry {
         messages: &[serde_json::Value],
         used_tools: &HashSet<String>,
     ) -> Vec<serde_json::Value> {
-        let mut relevant: HashSet<String> = HashSet::new();
-
-        // Phase-specific tools (if any).
-        if let Some(phase_tools) = Self::tools_for_phase(phase) {
-            for name in phase_tools {
-                if self.tools.contains_key(*name) {
-                    relevant.insert(name.to_string());
-                }
-            }
-        }
-
-        // Always include core tools.
+        let phase_tools = Self::tools_for_phase(phase)
+            .map(|pt| pt.to_vec())
+            .unwrap_or_default();
+        let mut core: Vec<&str> = phase_tools.iter().copied().collect();
         for name in Self::CORE_TOOLS {
-            if self.tools.contains_key(*name) {
-                relevant.insert(name.to_string());
+            if !core.contains(name) {
+                core.push(name);
             }
         }
-
-        // Include any tools already used in this conversation.
-        for name in used_tools {
-            if self.tools.contains_key(name) {
-                relevant.insert(name.clone());
-            }
-        }
-
-        // Scan recent messages for keyword triggers.
-        let recent_text = Self::extract_recent_text(messages, 5);
-        let lower_text = recent_text.to_lowercase();
-
-        for (keywords, tool_name) in Self::KEYWORD_TRIGGERS {
-            if self.tools.contains_key(*tool_name) {
-                for kw in *keywords {
-                    if lower_text.contains(kw) {
-                        relevant.insert(tool_name.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        // If we end up with all tools anyway, just return everything.
-        if relevant.len() >= self.tools.len() {
-            return self.get_definitions();
-        }
-
-        self.tools
-            .iter()
-            .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
-            .map(|(_, tool)| tool.to_schema())
-            .collect()
+        self.collect_filtered_definitions(&core, messages, used_tools, 5)
     }
 
     /// Get tool definitions scoped for the delegation model (strict).
@@ -777,7 +695,7 @@ fn builtin_toolsets() -> HashMap<&'static str, Vec<&'static str>> {
         "core",
         vec!["read_file", "write_file", "edit_file", "list_dir", "exec"],
     );
-    m.insert("web", vec!["web_search", "browser"]);
+    m.insert("web", vec!["web_search", "web_fetch", "browser"]);
     m.insert(
         "memory",
         vec!["recall", "remember", "read_skill", "session_search"],
@@ -1565,8 +1483,9 @@ mod tests {
     fn test_tools_for_phase_web_research() {
         let tools = ToolRegistry::tools_for_phase(&TaskPhase::WebResearch).unwrap();
         assert!(tools.contains(&"web_search"));
+        assert!(tools.contains(&"web_fetch"));
         assert!(tools.contains(&"browser"));
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -1712,6 +1631,31 @@ mod tests {
 
         assert!(names.contains("web_search")); // keyword-triggered
         assert!(names.contains("read_file")); // local core
+    }
+
+    #[test]
+    fn test_local_defs_news_triggers_web_search() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "list_dir", "exec", "web_search"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        // "news" should trigger web_search — previously missed keyword
+        let messages =
+            vec![serde_json::json!({"role": "user", "content": "tell me the latest news on Iran"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(
+            names.contains("web_search"),
+            "\"news\" should trigger web_search, got: {:?}",
+            names
+        );
     }
 
     #[test]

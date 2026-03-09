@@ -7,6 +7,14 @@ use async_trait::async_trait;
 
 use super::base::Tool;
 
+/// Extract a required string parameter, returning an error string on missing.
+fn require_param<'a>(params: &'a HashMap<String, serde_json::Value>, key: &str) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("Error: '{}' parameter is required", key))
+}
+
 // ---------------------------------------------------------------------------
 // ReadFileTool
 // ---------------------------------------------------------------------------
@@ -42,9 +50,9 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: 'path' parameter is required".to_string(),
+        let path = match require_param(&params, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
         };
 
         let file_path = resolve_read_path(path);
@@ -69,8 +77,7 @@ impl Tool for ReadFileTool {
         };
 
         // Binary detection: null bytes in first 512 bytes.
-        let check_len = bytes.len().min(512);
-        if bytes[..check_len].contains(&0u8) {
+        if crate::utils::helpers::is_binary(&bytes) {
             return format!("[Binary file: {}, {} bytes]", path, bytes.len());
         }
 
@@ -120,9 +127,9 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: 'path' parameter is required".to_string(),
+        let path = match require_param(&params, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
         };
         let content = match params.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
@@ -190,9 +197,9 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: 'path' parameter is required".to_string(),
+        let path = match require_param(&params, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
         };
         let old_text = match params.get("old_text").and_then(|v| v.as_str()) {
             Some(t) => t,
@@ -273,9 +280,9 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, params: HashMap<String, serde_json::Value>) -> String {
-        let path = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: 'path' parameter is required".to_string(),
+        let path = match require_param(&params, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
         };
 
         let dir_path = expand_path(path);
@@ -286,6 +293,14 @@ impl Tool for ListDirTool {
         if !dir_path.is_dir() {
             return format!("Error: Not a directory: {}. Hint: this path is a file, not a directory. Use read_file instead.", path);
         }
+
+        // Detect when the model is listing the workspace instead of the project.
+        let workspace = crate::utils::helpers::get_workspace_path(None);
+        let is_workspace = dir_path
+            .canonicalize()
+            .ok()
+            .and_then(|canon| workspace.canonicalize().ok().map(|ws| canon.starts_with(ws)))
+            .unwrap_or(false);
 
         match tokio::fs::read_dir(&dir_path).await {
             Ok(mut entries) => {
@@ -325,7 +340,19 @@ impl Tool for ListDirTool {
                     })
                     .collect();
 
-                lines.join("\n")
+                let mut output = lines.join("\n");
+
+                if is_workspace {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| ".".to_string());
+                    output.push_str(&format!(
+                        "\n\n⚠ This is your internal workspace (memory, skills, config). \
+                         The user's project is at: {cwd} — use list_dir on that path instead."
+                    ));
+                }
+
+                output
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -413,23 +440,19 @@ fn extract_line_range(content: &str, range: &str, path: &str) -> String {
 /// pass bare filenames like `MEMORY.md`. Resolving against the workspace
 /// makes these succeed instead of failing with "File not found".
 fn expand_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    if path.starts_with('~') {
+        return crate::utils::helpers::expand_tilde(path);
+    }
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
     } else {
-        let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            // Resolve relative paths against the shell working directory first
-            // (matches exec/pwd behavior), then fall back to workspace for
-            // memory/bootstrap convenience.
-            let cwd = std::env::current_dir().ok();
-            let workspace = crate::utils::helpers::get_workspace_path(None);
-            resolve_relative_path(&p, cwd.as_deref(), &workspace)
-        }
+        // Resolve relative paths against the shell working directory first
+        // (matches exec/pwd behavior), then fall back to workspace for
+        // memory/bootstrap convenience.
+        let cwd = std::env::current_dir().ok();
+        let workspace = crate::utils::helpers::get_workspace_path(None);
+        resolve_relative_path(&p, cwd.as_deref(), &workspace)
     }
 }
 

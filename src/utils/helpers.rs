@@ -153,8 +153,14 @@ pub fn parse_session_key(key: &str) -> Result<(String, String)> {
     }
 }
 
+/// Check if bytes look like binary content (null byte in first 512 bytes).
+pub fn is_binary(bytes: &[u8]) -> bool {
+    let check_len = bytes.len().min(512);
+    bytes[..check_len].contains(&0u8)
+}
+
 /// Expand a leading `~` to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
+pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         home.join(rest)
