@@ -62,8 +62,16 @@ pub struct ModelWeights {
 #[derive(Debug, Clone, Copy)]
 struct MlxCheckpointMeta {
     group_size: usize,
+    bits: usize,
     n_layers: usize,
     vocab_size: usize,
+}
+
+impl MlxCheckpointMeta {
+    /// Number of quantized values packed per u32 word (8 for 4-bit, 4 for 8-bit).
+    fn elems_per_u32(&self) -> usize {
+        32 / self.bits
+    }
 }
 
 fn parse_mlx_checkpoint_meta(root: &serde_json::Value) -> io::Result<MlxCheckpointMeta> {
@@ -91,6 +99,10 @@ fn parse_mlx_checkpoint_meta(root: &serde_json::Value) -> io::Result<MlxCheckpoi
             .and_then(|q| q.get("group_size"))
             .and_then(|value| value.as_u64())
             .unwrap_or(64) as usize,
+        bits: quant
+            .and_then(|q| q.get("bits"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(8) as usize,
         n_layers: read_usize("num_hidden_layers")?,
         vocab_size: read_usize("vocab_size")?,
     })
@@ -637,41 +649,14 @@ impl ModelWeights {
                 .collect()
         }
 
-        /// Dequantize MLX 8-bit: U32-packed weights + BF16 scales/biases, group_size
-        fn dequant_8bit(
-            weight: &[u8],
-            scales: &[u8],
-            biases: &[u8],
-            rows: usize,
-            cols: usize,
-            group_size: usize,
-        ) -> Vec<f32> {
-            let n_groups = cols / group_size;
-            let sc = bf16_to_f32(scales);
-            let bi = bf16_to_f32(biases);
-            let mut out = vec![0.0f32; rows * cols];
-
-            for r in 0..rows {
-                // Unpack U32 → uint8 for this row
-                let row_u32s = cols / 4;
-                let row_start = r * row_u32s * 4;
-                for c in 0..cols {
-                    let byte_idx = row_start + c; // each byte is one quantized value
-                    let qval = weight[byte_idx] as f32;
-                    let g = c / group_size;
-                    let s = sc[r * n_groups + g];
-                    let b = bi[r * n_groups + g];
-                    out[r * cols + c] = s * qval + b;
-                }
-            }
-            out
-        }
-
         /// Get a dequantized weight tensor by base name (e.g. "model.layers.0.self_attn.q_proj")
+        ///
+        /// `bits` — quantization width (4 or 8). Determines packing: 8 or 4 values per u32.
         let get_weight = |tensors: &HashMap<String, Vec<u8>>,
                           tensor_meta: &HashMap<String, (String, Vec<usize>)>,
                           base: &str,
-                          group_size: usize|
+                          group_size: usize,
+                          bits: usize|
          -> io::Result<Vec<f32>> {
             let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
@@ -686,8 +671,11 @@ impl ModelWeights {
                 let (_, shape) = tensor_meta.get(&w_key).unwrap();
                 let rows = shape[0];
                 let packed_cols = shape[1];
-                let cols = packed_cols * 4; // U32 → 4 bytes
-                Ok(dequant_8bit(w, s, b, rows, cols, group_size))
+                let elems_per_u32 = 32 / bits;
+                let cols = packed_cols * elems_per_u32;
+                let sc = bf16_to_f32(s);
+                let bi = bf16_to_f32(b);
+                Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
             } else {
                 // Try non-quantized (BF16)
                 let key = base.to_string();
@@ -735,10 +723,17 @@ impl ModelWeights {
         let n_layers = meta.n_layers;
         let vocab_size = meta.vocab_size;
         let group_size = meta.group_size;
+        let bits = meta.bits;
         let hpg = cfg.heads_per_group();
 
-        // Embedding (quantized)
-        let embed_raw = get_weight(&tensors, &tensor_meta, "model.embed_tokens", group_size)?;
+        // Embedding (quantized or bf16)
+        let embed_raw = get_weight(
+            &tensors,
+            &tensor_meta,
+            "model.embed_tokens",
+            group_size,
+            bits,
+        )?;
         // embed_raw is [vocab, dim] row-major → we need [dim, vocab] col-major (our format: embed[d * vocab + v])
         // Actually our format: embed[v * dim + d] for embed_lookup which does: out[d * seq + t] = embed[token * dim + d]
         // So we need [vocab, dim] row-major — that's what we already have.
@@ -787,30 +782,35 @@ impl ModelWeights {
                         &tensor_meta,
                         &format!("{la}.in_proj_qkv"),
                         group_size,
+                        bits,
                     )?,
                     a_proj: get_weight(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_a"),
                         group_size,
+                        bits,
                     )?,
                     b_proj: get_weight(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_b"),
                         group_size,
+                        bits,
                     )?,
                     z_proj: get_weight(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_z"),
                         group_size,
+                        bits,
                     )?,
                     o_proj: get_weight(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.out_proj"),
                         group_size,
+                        bits,
                     )?,
                     a_log: get_bf16(&tensors, &format!("{la}.A_log"))?,
                     dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
@@ -827,24 +827,28 @@ impl ModelWeights {
                     &tensor_meta,
                     &format!("{prefix}.self_attn.q_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wk_raw = get_weight(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.k_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wv_raw = get_weight(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.v_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wo = get_weight(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.o_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wk = expand_kv(&wk_raw, kv_dim, dim, hpg);
                 let wv = expand_kv(&wv_raw, kv_dim, dim, hpg);
@@ -859,18 +863,21 @@ impl ModelWeights {
                 &tensor_meta,
                 &format!("{prefix}.mlp.gate_proj"),
                 group_size,
+                bits,
             )?;
             let w2 = get_weight(
                 &tensors,
                 &tensor_meta,
                 &format!("{prefix}.mlp.down_proj"),
                 group_size,
+                bits,
             )?;
             let w3 = get_weight(
                 &tensors,
                 &tensor_meta,
                 &format!("{prefix}.mlp.up_proj"),
                 group_size,
+                bits,
             )?;
 
             // RMSNorm weights (BF16, not quantized)
@@ -1003,7 +1010,8 @@ impl QuantizedModelWeights {
         let get_quantized = |tensors: &HashMap<String, Vec<u8>>,
                              tensor_meta: &HashMap<String, (String, Vec<usize>)>,
                              base: &str,
-                             group_size: usize|
+                             group_size: usize,
+                             bits: usize|
          -> io::Result<QuantizedTensor> {
             let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
@@ -1018,7 +1026,8 @@ impl QuantizedModelWeights {
                 let (_, shape) = tensor_meta.get(&w_key).unwrap();
                 let rows = shape[0];
                 let packed_cols = shape[1];
-                let cols = packed_cols * 4; // U32 → 4 bytes
+                let elems_per_u32 = 32 / bits;
+                let cols = packed_cols * elems_per_u32;
 
                 Ok(QuantizedTensor {
                     data: w.clone(),
@@ -1027,6 +1036,7 @@ impl QuantizedModelWeights {
                     rows,
                     cols,
                     group_size,
+                    bits,
                 })
             } else {
                 Err(io::Error::new(
@@ -1044,35 +1054,12 @@ impl QuantizedModelWeights {
             Ok(bf16_to_f32(data))
         };
 
-        // Also need a dequantized loader for embeddings (quantized but needed as f32)
-        let dequant_8bit = |weight: &[u8],
-                            scales: &[u8],
-                            biases: &[u8],
-                            rows: usize,
-                            cols: usize,
-                            group_size: usize|
-         -> Vec<f32> {
-            let n_groups = cols / group_size;
-            let sc = bf16_to_f32(scales);
-            let bi = bf16_to_f32(biases);
-            let mut out = vec![0.0f32; rows * cols];
-            for r in 0..rows {
-                let row_start = r * cols;
-                for c in 0..cols {
-                    let qval = weight[row_start + c] as f32;
-                    let g = c / group_size;
-                    let s = sc[r * n_groups + g];
-                    let b = bi[r * n_groups + g];
-                    out[r * cols + c] = s * qval + b;
-                }
-            }
-            out
-        };
-
+        /// Dequantize a tensor to f32 (for embeddings that need random access as f32).
         let get_weight_f32 = |tensors: &HashMap<String, Vec<u8>>,
                               tensor_meta: &HashMap<String, (String, Vec<usize>)>,
                               base: &str,
-                              group_size: usize|
+                              group_size: usize,
+                              bits: usize|
          -> io::Result<Vec<f32>> {
             let base = resolve_weight_base(tensors, base);
             let w_key = format!("{base}.weight");
@@ -1085,8 +1072,11 @@ impl QuantizedModelWeights {
             ) {
                 let (_, shape) = tensor_meta.get(&w_key).unwrap();
                 let rows = shape[0];
-                let cols = shape[1] * 4;
-                Ok(dequant_8bit(w, s, b, rows, cols, group_size))
+                let elems_per_u32 = 32 / bits;
+                let cols = shape[1] * elems_per_u32;
+                let sc = bf16_to_f32(s);
+                let bi = bf16_to_f32(b);
+                Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
             } else if let Some(data) = tensors.get(&format!("{base}.weight")) {
                 Ok(bf16_to_f32(data))
             } else {
@@ -1104,12 +1094,19 @@ impl QuantizedModelWeights {
         })?;
         let meta = parse_mlx_checkpoint_meta(&config)?;
         let group_size = meta.group_size;
+        let bits = meta.bits;
         let n_layers = meta.n_layers;
         let vocab_size = meta.vocab_size;
         let hpg = cfg.heads_per_group();
 
         // Embedding — must be f32 (accessed every step, random access pattern)
-        let embed_raw = get_weight_f32(&tensors, &tensor_meta, "model.embed_tokens", group_size)?;
+        let embed_raw = get_weight_f32(
+            &tensors,
+            &tensor_meta,
+            "model.embed_tokens",
+            group_size,
+            bits,
+        )?;
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -1126,30 +1123,35 @@ impl QuantizedModelWeights {
                         &tensor_meta,
                         &format!("{la}.in_proj_qkv"),
                         group_size,
+                        bits,
                     )?,
                     a_proj: get_quantized(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_a"),
                         group_size,
+                        bits,
                     )?,
                     b_proj: get_quantized(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_b"),
                         group_size,
+                        bits,
                     )?,
                     z_proj: get_quantized(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.in_proj_z"),
                         group_size,
+                        bits,
                     )?,
                     o_proj: get_quantized(
                         &tensors,
                         &tensor_meta,
                         &format!("{la}.out_proj"),
                         group_size,
+                        bits,
                     )?,
                     a_log: get_bf16(&tensors, &format!("{la}.A_log"))?,
                     dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
@@ -1165,6 +1167,7 @@ impl QuantizedModelWeights {
                     rows: 0,
                     cols: 0,
                     group_size: 1,
+                    bits,
                 };
                 (
                     empty.clone(),
@@ -1182,24 +1185,28 @@ impl QuantizedModelWeights {
                     &tensor_meta,
                     &format!("{prefix}.self_attn.q_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wk = get_quantized(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.k_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wv = get_quantized(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.v_proj"),
                     group_size,
+                    bits,
                 )?;
                 let wo = get_quantized(
                     &tensors,
                     &tensor_meta,
                     &format!("{prefix}.self_attn.o_proj"),
                     group_size,
+                    bits,
                 )?;
                 let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
                 let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
@@ -1212,18 +1219,21 @@ impl QuantizedModelWeights {
                 &tensor_meta,
                 &format!("{prefix}.mlp.gate_proj"),
                 group_size,
+                bits,
             )?;
             let w2 = get_quantized(
                 &tensors,
                 &tensor_meta,
                 &format!("{prefix}.mlp.down_proj"),
                 group_size,
+                bits,
             )?;
             let w3 = get_quantized(
                 &tensors,
                 &tensor_meta,
                 &format!("{prefix}.mlp.up_proj"),
                 group_size,
+                bits,
             )?;
 
             let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
@@ -1282,33 +1292,72 @@ impl QuantizedModelWeights {
 // QLoRA: quantized weight storage for low-memory training
 // ---------------------------------------------------------------------------
 
+/// Dequantize a weight matrix from N-bit packed u32 format to f32.
+///
+/// Handles both 4-bit (8 values per u32) and 8-bit (4 values per u32).
+/// MLX stores quantized values as u32 words in little-endian byte order,
+/// with values packed LSB-first within each word.
+fn dequant_nbit(
+    weight: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+) -> Vec<f32> {
+    let n_groups = cols / group_size;
+    let elems_per_u32 = 32 / bits;
+    let mask = (1u32 << bits) - 1;
+    let packed_cols = cols / elems_per_u32; // u32 words per row
+    let mut out = vec![0.0f32; rows * cols];
+
+    for r in 0..rows {
+        let row_byte_offset = r * packed_cols * 4; // 4 bytes per u32
+        for c in 0..cols {
+            let word_idx = c / elems_per_u32;
+            let elem_idx = c % elems_per_u32;
+            let byte_off = row_byte_offset + word_idx * 4;
+            let u32_val = u32::from_le_bytes([
+                weight[byte_off],
+                weight[byte_off + 1],
+                weight[byte_off + 2],
+                weight[byte_off + 3],
+            ]);
+            let qval = ((u32_val >> (elem_idx * bits)) & mask) as f32;
+            let g = c / group_size;
+            let s = scales[r * n_groups + g];
+            let b = biases[r * n_groups + g];
+            out[r * cols + c] = s * qval + b;
+        }
+    }
+    out
+}
+
 /// A single quantized weight matrix (8-bit or 4-bit with group scales/biases).
 #[derive(Debug, Clone)]
 pub struct QuantizedTensor {
-    pub data: Vec<u8>,    // Raw quantized bytes (1 byte per value for 8-bit)
+    pub data: Vec<u8>,    // Raw quantized bytes (u32 words, little-endian)
     pub scales: Vec<f32>, // Per-group scales [rows * n_groups]
     pub biases: Vec<f32>, // Per-group biases [rows * n_groups]
     pub rows: usize,
     pub cols: usize, // Logical (unpacked) columns
     pub group_size: usize,
+    pub bits: usize, // Quantization bits (4 or 8)
 }
 
 impl QuantizedTensor {
-    /// Dequantize to full f32 (same logic as dequant_8bit in from_mlx_safetensors).
+    /// Dequantize to full f32. Handles both 4-bit and 8-bit quantization.
     pub fn dequantize(&self) -> Vec<f32> {
-        let n_groups = self.cols / self.group_size;
-        let mut out = vec![0.0f32; self.rows * self.cols];
-        for r in 0..self.rows {
-            let row_start = r * self.cols;
-            for c in 0..self.cols {
-                let qval = self.data[row_start + c] as f32;
-                let g = c / self.group_size;
-                let s = self.scales[r * n_groups + g];
-                let b = self.biases[r * n_groups + g];
-                out[r * self.cols + c] = s * qval + b;
-            }
-        }
-        out
+        dequant_nbit(
+            &self.data,
+            &self.scales,
+            &self.biases,
+            self.rows,
+            self.cols,
+            self.group_size,
+            self.bits,
+        )
     }
 
     /// Memory footprint in bytes (quantized storage only).
@@ -1351,6 +1400,20 @@ pub struct QuantizedLayerWeights {
     pub k_norm: Option<Vec<f32>>, // [head_dim]
     /// GDN weights — `Some` for linear attention layers, `None` for MHA layers.
     pub gdn: Option<QuantizedGdnLayerWeights>,
+}
+
+impl QuantizedLayerWeights {
+    /// Returns the model hidden dimension (dim) derived from actual weight tensors.
+    /// Uses w2.rows since w2 is the FFN down projection: [dim, hidden_dim].
+    pub fn dim(&self) -> usize {
+        self.w2.rows
+    }
+
+    /// Returns the FFN intermediate dimension (hidden_dim) derived from actual weight tensors.
+    /// Uses w2.cols since w2 is the FFN down projection: [dim, hidden_dim].
+    pub fn hidden_dim(&self) -> usize {
+        self.w2.cols
+    }
 }
 
 /// Full model with quantized layer weights.
@@ -1520,6 +1583,16 @@ pub trait WeightSource {
     fn rms_final(&self) -> &[f32];
     fn vocab_size(&self) -> usize;
     fn lm_head(&self) -> Option<&[f32]>;
+
+    /// Returns the actual model hidden dimension from loaded weights.
+    /// For QuantizedModelWeights, this is derived from w2.rows.
+    /// For ModelWeights, this should match cfg.dim.
+    fn actual_dim(&self) -> usize;
+
+    /// Returns the actual FFN hidden dimension from loaded weights.
+    /// For QuantizedModelWeights, this is derived from w2.cols.
+    /// For ModelWeights, this should match cfg.hidden_dim.
+    fn actual_hidden_dim(&self) -> usize;
 }
 
 impl WeightSource for ModelWeights {
@@ -1543,6 +1616,35 @@ impl WeightSource for ModelWeights {
     }
     fn lm_head(&self) -> Option<&[f32]> {
         self.lm_head.as_deref()
+    }
+    fn actual_dim(&self) -> usize {
+        // Derive from w2: [dim, hidden_dim], so len = dim * hidden_dim
+        // We need to find dim. Since w2 = [dim, hidden], and wo = [dim, dim],
+        // we can use wo.len().sqrt() or derive from w2.
+        // For safety, use the first layer's dimensions.
+        if self.layers.is_empty() {
+            return self.cfg.dim;
+        }
+        // w2 is [dim, hidden], wo is [dim, dim]
+        // Use wo to get dim directly
+        let wo_len = self.layers[0].wo.len();
+        let dim = (wo_len as f64).sqrt() as usize;
+        if dim * dim == wo_len {
+            dim
+        } else {
+            // Fallback: derive from w2 and hidden relationship
+            // This shouldn't happen for valid models
+            self.cfg.dim
+        }
+    }
+    fn actual_hidden_dim(&self) -> usize {
+        // Derive from w2: [dim, hidden_dim]
+        if self.layers.is_empty() {
+            return self.cfg.hidden_dim;
+        }
+        let dim = self.actual_dim();
+        let w2 = &self.layers[0].w2;
+        w2.len() / dim
     }
 }
 
@@ -1570,6 +1672,20 @@ impl WeightSource for QuantizedModelWeights {
     }
     fn lm_head(&self) -> Option<&[f32]> {
         self.lm_head.as_deref()
+    }
+    fn actual_dim(&self) -> usize {
+        // Derive from the first layer's quantized weights
+        if self.layers.is_empty() {
+            return self.cfg.dim;
+        }
+        self.layers[0].dim()
+    }
+    fn actual_hidden_dim(&self) -> usize {
+        // Derive from the first layer's quantized weights
+        if self.layers.is_empty() {
+            return self.cfg.hidden_dim;
+        }
+        self.layers[0].hidden_dim()
     }
 }
 

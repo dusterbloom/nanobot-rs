@@ -787,8 +787,9 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     use super::ane_lora;
 
     let cfg = model.cfg();
-    let dim = cfg.dim;
-    let hidden = cfg.hidden_dim;
+    // Use actual dimensions from loaded weights, not from config
+    let dim = model.actual_dim();
+    let hidden = model.actual_hidden_dim();
     let seq = cfg.seq_len;
     let n_layers = model.n_layers();
     let scale = lora.scale();
@@ -1539,6 +1540,7 @@ mod tests {
             rows,
             cols,
             group_size,
+            bits: 8,
         }
     }
 
