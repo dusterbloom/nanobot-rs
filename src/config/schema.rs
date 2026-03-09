@@ -13,6 +13,7 @@ use crate::providers::constants::{
     ANTHROPIC_API_BASE, DEEPSEEK_API_BASE, GEMINI_API_BASE, GROQ_API_BASE, HUGGINGFACE_API_BASE,
     OPENAI_API_BASE, OPENROUTER_API_BASE, ZHIPU_API_BASE, ZHIPU_CODING_API_BASE,
 };
+use crate::utils::helpers::expand_tilde;
 
 // ---------------------------------------------------------------------------
 // Channel configs
@@ -362,7 +363,7 @@ fn default_local_max_context_tokens() -> usize {
 }
 
 fn default_max_tokens() -> u32 {
-    2048
+    4096
 }
 
 fn default_temperature() -> f64 {
@@ -388,7 +389,7 @@ fn default_max_tool_result_chars() -> usize {
 }
 
 fn default_max_continuations() -> u32 {
-    4
+    6
 }
 
 fn default_lms_port() -> u16 {
@@ -436,11 +437,11 @@ fn default_adaptive_long_form_trigger_chars() -> u32 {
 }
 
 fn default_adaptive_tool_heavy_max_tokens() -> u32 {
-    1024
+    2048
 }
 
 fn default_adaptive_tool_heavy_min_tokens() -> u32 {
-    512
+    1024
 }
 
 impl Default for AgentDefaults {
@@ -515,8 +516,8 @@ impl Default for AdaptiveTokenConfig {
             adaptive_long_mode_min_tokens: 8192,
             adaptive_long_form_min_tokens: 4096,
             adaptive_long_form_trigger_chars: 500,
-            adaptive_tool_heavy_max_tokens: 1024,
-            adaptive_tool_heavy_min_tokens: 512,
+            adaptive_tool_heavy_max_tokens: 2048,
+            adaptive_tool_heavy_min_tokens: 1024,
         }
     }
 }
@@ -2297,17 +2298,6 @@ impl Config {
     }
 }
 
-/// Expand a leading `~` to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        PathBuf::from(path)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2986,9 +2976,38 @@ mod tests {
 
     #[test]
     fn test_default_max_continuations() {
-        assert_eq!(default_max_continuations(), 4);
+        assert_eq!(default_max_continuations(), 6);
         let cfg = Config::default();
-        assert_eq!(cfg.agents.defaults.max_continuations, 4);
+        assert_eq!(cfg.agents.defaults.max_continuations, 6);
+    }
+
+    #[test]
+    fn test_default_max_tokens_raised_for_local_models() {
+        // max_tokens raised from 2048 → 4096 to prevent premature EOS on
+        // quantized local models that hit the cap before completing tool calls.
+        assert_eq!(default_max_tokens(), 4096);
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.defaults.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_adaptive_tool_heavy_defaults_raised() {
+        // Raised from 1024/512 → 2048/1024 to give tool-heavy sessions
+        // enough output budget for complete tool-call JSON on small models.
+        assert_eq!(default_adaptive_tool_heavy_max_tokens(), 2048);
+        assert_eq!(default_adaptive_tool_heavy_min_tokens(), 1024);
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.defaults.adaptive_tool_heavy_max_tokens, 2048);
+        assert_eq!(cfg.agents.defaults.adaptive_tool_heavy_min_tokens, 1024);
+    }
+
+    #[test]
+    fn test_adaptive_token_config_from_defaults_consistency() {
+        // AdaptiveTokenConfig should faithfully reflect AgentDefaults values.
+        let cfg = Config::default();
+        let atc = AdaptiveTokenConfig::from_defaults(&cfg.agents.defaults);
+        assert_eq!(atc.adaptive_tool_heavy_max_tokens, cfg.agents.defaults.adaptive_tool_heavy_max_tokens);
+        assert_eq!(atc.adaptive_tool_heavy_min_tokens, cfg.agents.defaults.adaptive_tool_heavy_min_tokens);
     }
 
     #[test]

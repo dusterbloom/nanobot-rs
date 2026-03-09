@@ -85,6 +85,11 @@ pub fn lookup(
     caps
 }
 
+/// Convenience: look up capabilities without user overrides.
+pub fn lookup_default(model: &str) -> ModelCapabilities {
+    lookup(model, &HashMap::new())
+}
+
 /// Returns true if `name` contains `marker` as a standalone size token.
 ///
 /// A standalone match requires the character immediately before the match to be

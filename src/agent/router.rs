@@ -425,8 +425,7 @@ pub async fn request_strict_router_decision(
     // Build user content with optional /no_think prefix, but only for
     // models that actually require template-level no_think handling.
     let model_needs_no_think_prefix =
-        crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new())
-            .needs_native_lms_api;
+        crate::agent::model_capabilities::lookup_default(model).needs_native_lms_api;
     let user_content = if no_think && model_needs_no_think_prefix {
         format!(" /no_think\n{}", router_pack)
     } else {

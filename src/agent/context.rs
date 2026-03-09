@@ -27,8 +27,7 @@ pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
     }
 
     // Binary detection: null bytes in first 512 bytes.
-    let check_len = result.len().min(512);
-    if result.as_bytes()[..check_len].contains(&0u8) {
+    if crate::utils::helpers::is_binary(result.as_bytes()) {
         return format!("[Binary content, {} bytes]", result.len());
     }
 
@@ -1204,14 +1203,17 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach �
 You are nanobot, a local tool-using assistant.
 Time: {now}
 {model_line}
-Project: {cwd}
-Workspace: {workspace_path}
+
+## IMPORTANT: Directories
+**Project directory: {cwd}** ← The user's code lives HERE. Always start here.
+Internal workspace: {workspace_path} ← Your memory/skills/config only. NOT the user's project.
+
+When running `exec`, `list_dir`, `read_file`, or `write_file`, use paths under the **project directory** ({cwd}).
+Only access the workspace for `recall`, `remember`, or `read_skill` — never for the user's files.
 
 Rules:
 - Use tools to inspect files, commands, and memory. Never invent outputs, paths, or results.
-- Keep replies short unless the user asks for detail.
-- User files live under Project. Internal memory and skills live under Workspace.
-- Use `recall` for memory and `read_skill` for skills only when needed.{local_mode_hint}"#
+- Keep replies short unless the user asks for detail.{local_mode_hint}"#
         )
     }
 

@@ -476,8 +476,7 @@ async fn analyze_via_scratch_pad(
 /// Small local models should spend fewer rounds "thinking about tool outputs"
 /// and move on faster to actionable tool execution/results.
 fn scratch_pad_round_budget(config: &ToolRunnerConfig) -> usize {
-    let caps =
-        crate::agent::model_capabilities::lookup(&config.model, &std::collections::HashMap::new());
+    let caps = crate::agent::model_capabilities::lookup_default(&config.model);
     let rounds = config.max_iterations.clamp(1, 10) as usize;
     rounds.min(caps.scratch_pad_rounds).max(1)
 }

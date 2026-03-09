@@ -535,7 +535,7 @@ async fn specialist_summarize(
     target_tokens: usize,
 ) -> Result<String, String> {
     use serde_json::json;
-    let caps = crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new());
+    let caps = crate::agent::model_capabilities::lookup_default(model);
     let thinking_budget = if caps.thinking {
         // Enable hidden reasoning only for thinking-capable models.
         // Budget scales with requested summary size but stays bounded.

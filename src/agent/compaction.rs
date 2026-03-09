@@ -64,8 +64,7 @@ impl ReaderProfile {
     /// Delegates to the model capabilities registry for consistency.
     /// Use `from_capabilities()` when ModelCapabilities is already available.
     pub fn from_model(model: &str) -> Self {
-        let caps =
-            crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new());
+        let caps = crate::agent::model_capabilities::lookup_default(model);
         Self::from_capabilities(&caps)
     }
 }
