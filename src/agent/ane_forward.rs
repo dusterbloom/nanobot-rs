@@ -748,15 +748,30 @@ fn dequantize_row_block(
     debug_assert_eq!(out.len(), row_count * w.cols);
 
     let n_groups = w.cols / w.group_size;
+    let elems_per_u32 = 32 / w.bits;
+    let mask = (1u32 << w.bits) - 1;
+    let packed_cols = w.cols / elems_per_u32; // u32 words per row
+    let row_bytes = packed_cols * 4; // bytes per row
+
     for local_row in 0..row_count {
         let row = row_start + local_row;
-        let data_row = &w.data[row * w.cols..(row + 1) * w.cols];
+        let row_byte_offset = row * row_bytes;
         let out_row = &mut out[local_row * w.cols..(local_row + 1) * w.cols];
         for col in 0..w.cols {
+            let word_idx = col / elems_per_u32;
+            let elem_idx = col % elems_per_u32;
+            let byte_off = row_byte_offset + word_idx * 4;
+            let u32_val = u32::from_le_bytes([
+                w.data[byte_off],
+                w.data[byte_off + 1],
+                w.data[byte_off + 2],
+                w.data[byte_off + 3],
+            ]);
+            let qval = ((u32_val >> (elem_idx * w.bits)) & mask) as f32;
             let group = col / w.group_size;
             let scale = w.scales[row * n_groups + group];
             let bias = w.biases[row * n_groups + group];
-            out_row[col] = scale * data_row[col] as f32 + bias;
+            out_row[col] = scale * qval + bias;
         }
     }
 }
@@ -768,8 +783,24 @@ pub(crate) fn cpu_quantized_matmul_into(
     out: &mut [f32],
     workspace: &mut QuantizedMatmulWorkspace,
 ) {
-    debug_assert_eq!(x.len(), w.cols * s);
-    debug_assert_eq!(out.len(), w.rows * s);
+    assert_eq!(
+        x.len(),
+        w.cols * s,
+        "Dimension mismatch in quantized matmul: x.len()={} but expected w.cols({}) * s({}) = {}",
+        x.len(),
+        w.cols,
+        s,
+        w.cols * s
+    );
+    assert_eq!(
+        out.len(),
+        w.rows * s,
+        "Dimension mismatch in quantized matmul: out.len()={} but expected w.rows({}) * s({}) = {}",
+        out.len(),
+        w.rows,
+        s,
+        w.rows * s
+    );
 
     let block_rows = QUANTIZED_MATMUL_ROW_BLOCK.min(w.rows.max(1));
     for row_start in (0..w.rows).step_by(block_rows) {
@@ -796,7 +827,15 @@ pub(crate) fn cpu_quantized_matmul_into(
 /// The weight matrix is dequantized in row blocks so we avoid materializing the
 /// full dense matrix for each projection.
 pub fn cpu_quantized_matmul(w: &ane_weights::QuantizedTensor, x: &[f32], s: usize) -> Vec<f32> {
-    debug_assert_eq!(x.len(), w.cols * s);
+    assert_eq!(
+        x.len(),
+        w.cols * s,
+        "Dimension mismatch in quantized matmul: x.len()={} but expected w.cols({}) * s({}) = {}",
+        x.len(),
+        w.cols,
+        s,
+        w.cols * s
+    );
 
     let mut out = vec![0.0f32; w.rows * s];
     let mut workspace = QuantizedMatmulWorkspace::default();
@@ -813,8 +852,24 @@ pub(crate) fn cpu_quantized_matmul_lhs_transposed_into(
     workspace: &mut QuantizedMatmulWorkspace,
     accumulate: bool,
 ) {
-    debug_assert_eq!(x.len(), w.rows * s);
-    debug_assert_eq!(out.len(), w.cols * s);
+    assert_eq!(
+        x.len(),
+        w.rows * s,
+        "Dimension mismatch in quantized matmul: x.len()={} but expected w.rows({}) * s({}) = {}",
+        x.len(),
+        w.rows,
+        s,
+        w.rows * s
+    );
+    assert_eq!(
+        out.len(),
+        w.cols * s,
+        "Dimension mismatch in quantized matmul: out.len()={} but expected w.cols({}) * s({}) = {}",
+        out.len(),
+        w.cols,
+        s,
+        w.cols * s
+    );
 
     let block_rows = QUANTIZED_MATMUL_ROW_BLOCK.min(w.rows.max(1));
     let mut first_block = !accumulate;
@@ -849,7 +904,15 @@ pub fn cpu_quantized_matmul_lhs_transposed(
     x: &[f32],
     s: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(x.len(), w.rows * s);
+    assert_eq!(
+        x.len(),
+        w.rows * s,
+        "Dimension mismatch in quantized matmul: x.len()={} but expected w.rows({}) * s({}) = {}",
+        x.len(),
+        w.rows,
+        s,
+        w.rows * s
+    );
 
     let mut out = vec![0.0f32; w.cols * s];
     let mut workspace = QuantizedMatmulWorkspace::default();
@@ -901,8 +964,24 @@ pub fn cpu_matmul_lhs_transposed(
     x: &[f32],
     s: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(w.len(), rows * cols);
-    debug_assert_eq!(x.len(), rows * s);
+    assert_eq!(
+        w.len(),
+        rows * cols,
+        "Dimension mismatch in matmul: w.len()={} but expected rows({}) * cols({}) = {}",
+        w.len(),
+        rows,
+        cols,
+        rows * cols
+    );
+    assert_eq!(
+        x.len(),
+        rows * s,
+        "Dimension mismatch in matmul: x.len()={} but expected rows({}) * s({}) = {}",
+        x.len(),
+        rows,
+        s,
+        rows * s
+    );
     let mut out = vec![0.0f32; cols * s];
     cpu_gemm(&mut out, w, true, x, false, cols, s, rows, 1.0, 0.0);
     out
@@ -1913,6 +1992,7 @@ mod tests {
             rows,
             cols,
             group_size,
+            bits: 8,
         }
     }
 
@@ -2282,6 +2362,7 @@ mod tests {
             rows: 0,
             cols: 0,
             group_size: 1,
+            bits: 8,
         };
 
         let quantized = QuantizedModelWeights {
