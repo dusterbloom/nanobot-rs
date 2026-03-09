@@ -6,20 +6,22 @@ use serde_json::Value;
 
 /// Read-only tools that benefit from higher repeat limits.
 const READ_TOOL_LIMIT: u32 = 2;
-const READ_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "recall",
-    "read_skill",
-    "web_search",
-    "web_fetch",
-];
+const READ_TOOLS: &[&str] = &["read_file", "list_dir", "recall", "read_skill"];
+
+/// Web tools need even higher limits — agents frequently search/fetch many
+/// different URLs or refine queries within one turn.
+const WEB_TOOL_LIMIT: u32 = 6;
+const WEB_TOOLS: &[&str] = &["web_search", "web_fetch"];
 
 pub struct ToolGuard {
     seen: HashMap<String, u32>,
     max_same_call: u32,
     tool_limits: HashMap<String, u32>,
     results: HashMap<String, String>,
+    /// True if any tool call was blocked this turn. Used to suppress
+    /// ClaimedButNotExecuted validation — the model wanted to use tools
+    /// but was prevented, so "let me search" text is expected, not a hallucination.
+    pub had_blocked_calls: bool,
 }
 
 impl ToolGuard {
@@ -28,11 +30,15 @@ impl ToolGuard {
         for &tool in READ_TOOLS {
             tool_limits.insert(tool.to_string(), READ_TOOL_LIMIT);
         }
+        for &tool in WEB_TOOLS {
+            tool_limits.insert(tool.to_string(), WEB_TOOL_LIMIT);
+        }
         Self {
             seen: HashMap::new(),
             max_same_call: max_same_call.max(1),
             tool_limits,
             results: HashMap::new(),
+            had_blocked_calls: false,
         }
     }
 
@@ -71,6 +77,7 @@ impl ToolGuard {
             .copied()
             .unwrap_or(self.max_same_call);
         if *count > limit {
+            self.had_blocked_calls = true;
             return Err(format!(
                 "duplicate tool call blocked for '{}': exceeded {} identical calls in one turn",
                 name, limit

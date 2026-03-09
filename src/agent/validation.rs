@@ -72,12 +72,24 @@ pub fn validate_response(
     content: &str,
     actual_tool_calls: &[HashMap<String, Value>],
     is_textual_replay: bool,
+    had_blocked_calls: bool,
 ) -> ValidationOutcome {
     // In TextualReplay mode the model legitimately writes `[I called: ...]` to
     // express history and intent. The parser upstream extracts real tool calls
     // from those patterns — triggering validation errors here would create a
     // death spiral that exhausts the iteration budget.
     if is_textual_replay {
+        return ValidationOutcome::Ok;
+    }
+
+    // When the tool guard recently blocked calls, the model may express intent
+    // ("let me search/check") because it genuinely wanted to use tools but was
+    // prevented. Punishing it with ClaimedButNotExecuted retries creates a
+    // death spiral. Only check for hallucinated `[Called ...]` syntax.
+    if had_blocked_calls && actual_tool_calls.is_empty() {
+        if HALLUCINATED_CALL_RE.is_match(content) {
+            return ValidationOutcome::Error(ValidationError::HallucinatedToolCall);
+        }
         return ValidationOutcome::Ok;
     }
 
@@ -146,7 +158,7 @@ mod tests {
     #[test]
     fn test_reject_hallucinated_called_pattern() {
         let content = "I'll read the file.\n\n[Called read_file({\"path\":\"/tmp/test\"})]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(matches!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -156,7 +168,7 @@ mod tests {
     #[test]
     fn test_reject_claimed_but_not_executed() {
         let content = "Let me check that file for you.";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(matches!(
             result,
             ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
@@ -167,21 +179,21 @@ mod tests {
     fn test_accept_response_with_actual_tools() {
         let content = "Let me check that file for you.";
         let tool_calls = vec![make_tool_call("read_file")];
-        let result = validate_response(content, &tool_calls, false);
+        let result = validate_response(content, &tool_calls, false, false);
         assert_eq!(result, ValidationOutcome::Ok);
     }
 
     #[test]
     fn test_accept_plain_response() {
         let content = "The answer is 42.";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
     }
 
     #[test]
     fn test_detect_multiple_hallucinations() {
         let content = "[Called spawn(...)] and [Called exec(...)]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(matches!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -191,7 +203,7 @@ mod tests {
     #[test]
     fn test_case_insensitive_patterns() {
         let content = "LET ME CHECK that for you.";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(matches!(
             result,
             ValidationOutcome::Error(ValidationError::ClaimedButNotExecuted)
@@ -211,7 +223,7 @@ mod tests {
         ];
 
         for content in test_cases {
-            let result = validate_response(content, &[], false);
+            let result = validate_response(content, &[], false, false);
             assert!(
                 matches!(
                     result,
@@ -226,7 +238,7 @@ mod tests {
     #[test]
     fn test_lower_case_called_pattern() {
         let content = "i will do it\n[called spawn({})]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(matches!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -249,27 +261,27 @@ mod tests {
 
     #[test]
     fn test_empty_content_passes() {
-        let result = validate_response("", &[], false);
+        let result = validate_response("", &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
     }
 
     #[test]
     fn test_whitespace_only_passes() {
-        let result = validate_response("   \n\t  ", &[], false);
+        let result = validate_response("   \n\t  ", &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
     }
 
     #[test]
     fn test_response_with_code_block_passes() {
         let content = "Here's the code:\n```rust\nfn main() {}\n```";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert_eq!(result, ValidationOutcome::Ok);
     }
 
     #[test]
     fn test_tool_intent_in_code_block_still_detected() {
         let content = "```\nlet me check this\n```";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert!(
             matches!(
                 result,
@@ -282,7 +294,7 @@ mod tests {
     #[test]
     fn test_i_called_colon_detected() {
         let content = "[I called: recall({\"query\": \"test\"})]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert_eq!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -292,7 +304,7 @@ mod tests {
     #[test]
     fn test_i_called_space_detected() {
         let content = "[I called recall({\"query\": \"test\"})]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert_eq!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -302,7 +314,7 @@ mod tests {
     #[test]
     fn test_hallucination_case_insensitive() {
         let content = "[I CALLED: tool()]";
-        let result = validate_response(content, &[], false);
+        let result = validate_response(content, &[], false, false);
         assert_eq!(
             result,
             ValidationOutcome::Error(ValidationError::HallucinatedToolCall)
@@ -313,7 +325,7 @@ mod tests {
     fn test_strip_when_real_tools_present() {
         let content = "Processing... [I called: recall({\"query\": \"test\"})] Done.";
         let tool_calls = vec![make_tool_call("recall")];
-        let result = validate_response(content, &tool_calls, false);
+        let result = validate_response(content, &tool_calls, false, false);
         assert_eq!(result, ValidationOutcome::StripHallucination);
     }
 
@@ -340,7 +352,7 @@ mod tests {
         // In textual replay mode the `[I called: ...]` pattern is legitimate history.
         // Validation must return Ok, not an error.
         let content = "[I called: read_file({\"path\":\"/tmp/test\"})]";
-        let result = validate_response(content, &[], true);
+        let result = validate_response(content, &[], true, false);
         assert_eq!(
             result,
             ValidationOutcome::Ok,
@@ -353,7 +365,7 @@ mod tests {
         // Models in textual replay mode may write intent phrases while describing
         // what they are about to do — those should not trigger validation errors.
         let content = "Let me check that file for you.";
-        let result = validate_response(content, &[], true);
+        let result = validate_response(content, &[], true, false);
         assert_eq!(
             result,
             ValidationOutcome::Ok,
@@ -372,7 +384,7 @@ mod tests {
             "i found that the answer is 42",
         ];
         for content in cases {
-            let result = validate_response(content, &[], true);
+            let result = validate_response(content, &[], true, false);
             assert_eq!(
                 result,
                 ValidationOutcome::Ok,

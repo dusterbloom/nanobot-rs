@@ -295,7 +295,14 @@ impl ReplContext {
 
     /// /model [filter] — unified model picker across all sources.
     pub(super) async fn cmd_model(&mut self, filter: &str) {
-        if !self.core_handle.swappable().is_local {
+        let has_cluster = {
+            #[cfg(feature = "cluster")]
+            { self.cluster_state.is_some() }
+            #[cfg(not(feature = "cluster"))]
+            { false }
+        };
+
+        if !self.core_handle.swappable().is_local && !has_cluster {
             println!("\n  /model is only available in local mode. Use /local to switch.\n");
             return;
         }

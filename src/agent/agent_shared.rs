@@ -1559,6 +1559,7 @@ impl AgentLoopShared {
             content_str,
             &tool_calls_as_maps,
             ctx.protocol.is_textual_replay(),
+            ctx.flow.tool_guard.had_blocked_calls,
         ) {
             validation::ValidationOutcome::Error(validation_err) => {
                 let retry_num = ctx.flow.validation_retries + 1;

@@ -301,9 +301,24 @@ pub fn load_weights(model_dir: &Path) -> Result<HashMap<String, Array>, anyhow::
 }
 
 fn take(weights: &mut HashMap<String, Array>, key: &str) -> Result<Array, anyhow::Error> {
-    weights
-        .remove(key)
-        .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", key))
+    // Try exact key first, then try adding/removing "language_model." prefix.
+    if let Some(v) = weights.remove(key) {
+        return Ok(v);
+    }
+    // If key starts with "language_model.", try without prefix
+    if let Some(stripped) = key.strip_prefix("language_model.") {
+        if let Some(v) = weights.remove(stripped) {
+            return Ok(v);
+        }
+    }
+    // If key starts with "model.", try with "language_model." prefix
+    if key.starts_with("model.") {
+        let prefixed = format!("language_model.{key}");
+        if let Some(v) = weights.remove(&prefixed) {
+            return Ok(v);
+        }
+    }
+    Err(anyhow::anyhow!("Weight not found: {}", key))
 }
 
 fn load_quantized_linear(
