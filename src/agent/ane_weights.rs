@@ -1618,33 +1618,33 @@ impl WeightSource for ModelWeights {
         self.lm_head.as_deref()
     }
     fn actual_dim(&self) -> usize {
-        // Derive from w2: [dim, hidden_dim], so len = dim * hidden_dim
-        // We need to find dim. Since w2 = [dim, hidden], and wo = [dim, dim],
-        // we can use wo.len().sqrt() or derive from w2.
-        // For safety, use the first layer's dimensions.
         if self.layers.is_empty() {
             return self.cfg.dim;
         }
-        // w2 is [dim, hidden], wo is [dim, dim]
-        // Use wo to get dim directly
-        let wo_len = self.layers[0].wo.len();
-        let dim = (wo_len as f64).sqrt() as usize;
-        if dim * dim == wo_len {
-            dim
-        } else {
-            // Fallback: derive from w2 and hidden relationship
-            // This shouldn't happen for valid models
-            self.cfg.dim
+        // Find first non-GDN layer (GDN layers have empty wo dummy tensors).
+        for layer in &self.layers {
+            if layer.gdn.is_none() {
+                let wo_len = layer.wo.len();
+                let dim = (wo_len as f64).sqrt() as usize;
+                if dim * dim == wo_len {
+                    return dim;
+                }
+            }
         }
+        self.cfg.dim
     }
     fn actual_hidden_dim(&self) -> usize {
-        // Derive from w2: [dim, hidden_dim]
         if self.layers.is_empty() {
             return self.cfg.hidden_dim;
         }
         let dim = self.actual_dim();
-        let w2 = &self.layers[0].w2;
-        w2.len() / dim
+        // Find first non-GDN layer for w2 dimensions.
+        for layer in &self.layers {
+            if layer.gdn.is_none() && !layer.w2.is_empty() {
+                return layer.w2.len() / dim;
+            }
+        }
+        self.cfg.hidden_dim
     }
 }
 
@@ -1674,18 +1674,27 @@ impl WeightSource for QuantizedModelWeights {
         self.lm_head.as_deref()
     }
     fn actual_dim(&self) -> usize {
-        // Derive from the first layer's quantized weights
         if self.layers.is_empty() {
             return self.cfg.dim;
         }
-        self.layers[0].dim()
+        // Skip GDN layers (have empty dummy wq/wo tensors).
+        for layer in &self.layers {
+            if layer.gdn.is_none() {
+                return layer.dim();
+            }
+        }
+        self.cfg.dim
     }
     fn actual_hidden_dim(&self) -> usize {
-        // Derive from the first layer's quantized weights
         if self.layers.is_empty() {
             return self.cfg.hidden_dim;
         }
-        self.layers[0].hidden_dim()
+        for layer in &self.layers {
+            if layer.gdn.is_none() {
+                return layer.hidden_dim();
+            }
+        }
+        self.cfg.hidden_dim
     }
 }
 

@@ -204,11 +204,15 @@ pub fn spawn_ane_training(
                 }
             };
 
-            // 2. Initialize or restore LoRA
+            // 2. Initialize or restore LoRA (per-model file keyed by dir name)
             let lora_dir = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".nanobot/workspace/lora");
-            let lora_path = lora_dir.join("latest.bin");
+            let model_key = cfg.model_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "default".into());
+            let lora_path = lora_dir.join(format!("{model_key}.bin"));
             let n_layers = model.n_layers();
             let dim = cfg.mil_config.dim;
             let hidden_dim = cfg.mil_config.hidden_dim;
@@ -231,6 +235,7 @@ pub fn spawn_ane_training(
                     }
                 }
             } else {
+                tracing::info!("ANE train: new LoRA for model {model_key}");
                 LoraModel::with_kv_dim(LoraConfig::default(), n_layers, dim, cfg.kv_dim, hidden_dim)
             };
             let mut adam = LoraModelAdam::zeros(&lora);

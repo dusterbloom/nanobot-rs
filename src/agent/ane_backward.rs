@@ -865,6 +865,42 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             }
         }
 
+        // GDN layers: quantized FFN backward only (no attention backward —
+        // LoRA targets wq/wv/wo don't apply to GDN's linear_attn projections).
+        if let Some(ql) = model.quantized_layer(l).filter(|ql| ql.gdn.is_some()) {
+            let mut quantized_workspace = ane_forward::QuantizedMatmulWorkspace::default();
+            // FFN backward through quantized weights
+            let mut dsilu = vec![0.0f32; ql.w2.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w2, &dffn, seq, &mut dsilu, &mut quantized_workspace, false,
+            );
+            let mut dh1 = vec![0.0f32; hidden * seq];
+            let mut dh3 = vec![0.0f32; hidden * seq];
+            silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
+            let mut dx_ffn = vec![0.0f32; ql.w1.cols * seq];
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w1, &dh1, seq, &mut dx_ffn, &mut quantized_workspace, false,
+            );
+            ane_forward::cpu_quantized_matmul_lhs_transposed_into(
+                &ql.w3, &dh3, seq, &mut dx_ffn, &mut quantized_workspace, true,
+            );
+            let mut dx2 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx2, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2,
+                &ql.rms_ffn, dim, seq, cfg.rms_eps,
+            );
+            ane_forward::vec_add_inplace(&mut dx2, &dy);
+            // Skip attention backward entirely for GDN — gradient flows
+            // through the residual connection only (dx2 already includes dy).
+            let mut dx_rms1 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx_rms1, &mut vec![0.0f32; dim], &dx2, &ac.layer_in,
+                &ql.rms_att, dim, seq, cfg.rms_eps,
+            );
+            dy = dx_rms1;
+            continue;
+        }
+
         if let Some(ql) = model.quantized_layer(l).filter(|ql| ql.gdn.is_none()) {
             let mut quantized_workspace = ane_forward::QuantizedMatmulWorkspace::default();
             // CPU: dsilu = dffn @ W2^T without materializing dense quantized weights.

@@ -375,6 +375,14 @@ impl<'a> nanobot::agent::ane_weights::WeightSource for BorrowedSingleLayerModel<
     fn lm_head(&self) -> Option<&[f32]> {
         self.lm_head
     }
+
+    fn actual_dim(&self) -> usize {
+        self.cfg.dim
+    }
+
+    fn actual_hidden_dim(&self) -> usize {
+        self.cfg.hidden_dim
+    }
 }
 
 #[cfg(feature = "mlx")]
@@ -827,6 +835,7 @@ fn quantize_affine_u8(
         rows,
         cols,
         group_size,
+        bits: 8,
     }
 }
 
