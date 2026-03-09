@@ -105,6 +105,28 @@ pub fn silu_bwd(dh1: &mut [f32], dh3: &mut [f32], dsilu: &[f32], h1: &[f32], h3:
     }
 }
 
+/// Sigmoid gate backward for Qwen3.5 attn_output_gate.
+///
+/// Forward: gated_out = attn_out * sigmoid(gate_raw)
+/// Backward: d_attn = da * sig, d_gate = da * attn_out * sig * (1 - sig)
+fn sigmoid_gate_backward(
+    da: &[f32],
+    gate_raw: &[f32],
+    pre_gate: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let n = da.len();
+    debug_assert_eq!(gate_raw.len(), n);
+    debug_assert_eq!(pre_gate.len(), n);
+    let mut d_attn = vec![0.0f32; n];
+    let mut d_gate = vec![0.0f32; n];
+    for i in 0..n {
+        let sig = 1.0 / (1.0 + (-gate_raw[i]).exp());
+        d_attn[i] = da[i] * sig;
+        d_gate[i] = da[i] * pre_gate[i] * sig * (1.0 - sig);
+    }
+    (d_attn, d_gate)
+}
+
 /// Classifier backward: dy = embed^T @ dlogits, dembed += dlogits @ x_final^T.
 ///
 /// dy[D,S] = embed^T[D,V] @ dlogits[V,S]
@@ -974,6 +996,17 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
                 &mut quantized_workspace,
                 false,
             );
+
+            // Attn output gate backward (Qwen3.5)
+            let (da, d_gate) = if cfg.attn_output_gate {
+                let gate_raw = ac.attn_gate.as_ref().unwrap();
+                let pre_gate = ac.attn_pre_gate.as_ref().unwrap();
+                let (d_attn, dg) = sigmoid_gate_backward(&da, gate_raw, pre_gate);
+                (d_attn, Some(dg))
+            } else {
+                (da, None)
+            };
+
             let (mut dq, mut dk, _dv) =
                 cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
 
@@ -1011,10 +1044,17 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
                 );
             }
 
+            // Merge d_gate back with dq for wq backward (Qwen3.5 attn_output_gate)
+            let dq_for_wq = if let Some(dg) = &d_gate {
+                ane_forward::merge_q_gate(&dq, dg, cfg.n_heads, cfg.head_dim(), seq)
+            } else {
+                dq
+            };
+
             let mut dx_attn = vec![0.0f32; ql.wq.cols * seq];
             ane_forward::cpu_quantized_matmul_lhs_transposed_into(
                 &ql.wq,
-                &dq,
+                &dq_for_wq,
                 seq,
                 &mut dx_attn,
                 &mut quantized_workspace,
@@ -1142,6 +1182,16 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         let ad = cfg.attn_dim();
         let da = ane_forward::cpu_matmul_lhs_transposed(&lw.wo, dim, ad, &dx2, seq);
 
+        // Attn output gate backward (Qwen3.5)
+        let (da, d_gate) = if cfg.attn_output_gate {
+            let gate_raw = ac.attn_gate.as_ref().unwrap();
+            let pre_gate = ac.attn_pre_gate.as_ref().unwrap();
+            let (d_attn, dg) = sigmoid_gate_backward(&da, gate_raw, pre_gate);
+            (d_attn, Some(dg))
+        } else {
+            (da, None)
+        };
+
         // CPU SDPA backward
         let (mut dq, mut dk, _dv) =
             cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
@@ -1182,8 +1232,15 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             );
         }
 
+        // Merge d_gate back with dq for wq backward (Qwen3.5 attn_output_gate)
+        let dq_for_wq = if let Some(dg) = &d_gate {
+            ane_forward::merge_q_gate(&dq, dg, cfg.n_heads, cfg.head_dim(), seq)
+        } else {
+            dq
+        };
+
         // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (no explicit transposes)
-        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq, seq);
+        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq_for_wq, seq);
         let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
         let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
@@ -1836,6 +1893,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
         let dim = cfg.dim;
         let hidden = cfg.hidden_dim;

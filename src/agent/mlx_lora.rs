@@ -952,6 +952,7 @@ impl ModelConfig {
             linear_n_value_heads: self.linear_n_value_heads,
             linear_value_head_dim: self.linear_value_head_dim,
             conv_kernel_size: self.conv_kernel_size,
+            attn_output_gate: self.attn_output_gate,
         }
     }
 

@@ -904,14 +904,14 @@ impl ModelWeights {
             });
 
             if l == 0 {
-                eprintln!(
-                    "loaded layer 0: wq={} wk={} wv={} wo={} w1={} w2={}",
-                    layers[0].wq.len(),
-                    layers[0].wk.len(),
-                    layers[0].wv.len(),
-                    layers[0].wo.len(),
-                    layers[0].w1.len(),
-                    layers[0].w2.len()
+                tracing::debug!(
+                    wq = layers[0].wq.len(),
+                    wk = layers[0].wk.len(),
+                    wv = layers[0].wv.len(),
+                    wo = layers[0].wo.len(),
+                    w1 = layers[0].w1.len(),
+                    w2 = layers[0].w2.len(),
+                    "loaded f32 layer 0"
                 );
             }
         }
@@ -1258,15 +1258,15 @@ impl QuantizedModelWeights {
             if l == 0 {
                 let ql = &layers[0];
                 if ql.gdn.is_some() {
-                    eprintln!(
-                        "loaded quantized GDN layer 0: qkv_proj={}B (quantized, 4x smaller)",
-                        ql.gdn.as_ref().unwrap().qkv_proj.quantized_bytes(),
+                    tracing::debug!(
+                        qkv_bytes = ql.gdn.as_ref().unwrap().qkv_proj.quantized_bytes(),
+                        "loaded quantized GDN layer 0",
                     );
                 } else {
-                    eprintln!(
-                        "loaded quantized MHA layer 0: wq={}B wk={}B (quantized, 4x smaller)",
-                        ql.wq.quantized_bytes(),
-                        ql.wk.quantized_bytes(),
+                    tracing::debug!(
+                        wq_bytes = ql.wq.quantized_bytes(),
+                        wk_bytes = ql.wk.quantized_bytes(),
+                        "loaded quantized MHA layer 0",
                     );
                 }
             }
@@ -2439,6 +2439,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
 
         let t0 = std::time::Instant::now();
@@ -2635,6 +2636,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
         assert_eq!(cfg2.head_dim(), 256);
         assert_eq!(cfg2.attn_dim(), 4096);

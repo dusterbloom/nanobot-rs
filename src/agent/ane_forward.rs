@@ -403,6 +403,64 @@ pub fn qk_rmsnorm_bwd(
     }
 }
 
+/// Split interleaved q_proj output [2*attn_dim, seq] into separate q [attn_dim, seq]
+/// and gate [attn_dim, seq]. Memory layout: for head h, dim d,
+/// q src = (h*2*head_dim + d)*seq, gate src = (h*2*head_dim + head_dim + d)*seq.
+pub(crate) fn split_q_gate(
+    q_full: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let attn_dim = n_heads * head_dim;
+    debug_assert_eq!(q_full.len(), 2 * attn_dim * seq);
+    let mut q = vec![0.0f32; attn_dim * seq];
+    let mut gate = vec![0.0f32; attn_dim * seq];
+    for h in 0..n_heads {
+        for d in 0..head_dim {
+            let dst_off = (h * head_dim + d) * seq;
+            let q_src = (h * 2 * head_dim + d) * seq;
+            let g_src = (h * 2 * head_dim + head_dim + d) * seq;
+            q[dst_off..dst_off + seq].copy_from_slice(&q_full[q_src..q_src + seq]);
+            gate[dst_off..dst_off + seq].copy_from_slice(&q_full[g_src..g_src + seq]);
+        }
+    }
+    (q, gate)
+}
+
+/// Inverse of split_q_gate: merge q [attn_dim, seq] and gate [attn_dim, seq]
+/// back into interleaved [2*attn_dim, seq].
+pub(crate) fn merge_q_gate(
+    dq: &[f32],
+    dgate: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+) -> Vec<f32> {
+    let attn_dim = n_heads * head_dim;
+    debug_assert_eq!(dq.len(), attn_dim * seq);
+    debug_assert_eq!(dgate.len(), attn_dim * seq);
+    let mut merged = vec![0.0f32; 2 * attn_dim * seq];
+    for h in 0..n_heads {
+        for d in 0..head_dim {
+            let src_off = (h * head_dim + d) * seq;
+            let q_dst = (h * 2 * head_dim + d) * seq;
+            let g_dst = (h * 2 * head_dim + head_dim + d) * seq;
+            merged[q_dst..q_dst + seq].copy_from_slice(&dq[src_off..src_off + seq]);
+            merged[g_dst..g_dst + seq].copy_from_slice(&dgate[src_off..src_off + seq]);
+        }
+    }
+    merged
+}
+
+/// Apply sigmoid gate element-wise in-place: attn_out[i] *= sigmoid(gate[i]).
+fn apply_sigmoid_gate(attn_out: &mut [f32], gate: &[f32]) {
+    debug_assert_eq!(attn_out.len(), gate.len());
+    for i in 0..attn_out.len() {
+        attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+    }
+}
+
 /// Vector add in-place: dst[i] += src[i] (residual connections).
 pub fn vec_add_inplace(dst: &mut [f32], src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -497,6 +555,10 @@ pub struct LayerActivations {
     pub ffn_out: Vec<f32>,            // [dim, seq]
     pub q_pre_norm: Option<Vec<f32>>, // [dim, seq] pre-QK-norm Q (for backward)
     pub k_pre_norm: Option<Vec<f32>>, // [dim, seq] pre-QK-norm K (for backward)
+    /// Raw gate values from q_proj split (Qwen3.5 attn_output_gate). [attn_dim, seq]
+    pub attn_gate: Option<Vec<f32>>,
+    /// SDPA output before sigmoid gate was applied (for backward). [attn_dim, seq]
+    pub attn_pre_gate: Option<Vec<f32>>,
 }
 
 /// Forward pass result.
@@ -671,6 +733,8 @@ pub fn forward_with_lora<T: TokenId>(
             ffn_out,
             q_pre_norm: None,
             k_pre_norm: None,
+            attn_gate: None,
+            attn_pre_gate: None,
         });
         lora_acts_vec.push(lora_layer_acts);
     }
@@ -1623,7 +1687,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
             let mut xnorm = vec![0.0f32; dim * seq];
             rmsnorm(&mut xnorm, &x_cur, &ql.rms_att, dim, seq, cfg.rms_eps);
 
-            let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm) = if let Some(gdn_q) = &ql.gdn {
+            let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) = if let Some(gdn_q) = &ql.gdn {
                 let gdn_out = cpu_quantized_gdn_forward_with_workspace(
                     gdn_q,
                     &xnorm,
@@ -1639,13 +1703,21 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                     gdn_out,
                     None,
                     None,
+                    None,
+                    None,
                 )
             } else {
                 // Quantized MHA path: apply projections directly from quantized
                 // weights, then expand KV activations for GQA instead of
                 // expanding KV weights.
-                let mut q = vec![0.0f32; ql.wq.rows * seq];
-                cpu_quantized_matmul_into(&ql.wq, &xnorm, seq, &mut q, &mut quantized_workspace);
+                let mut q_full = vec![0.0f32; ql.wq.rows * seq];
+                cpu_quantized_matmul_into(&ql.wq, &xnorm, seq, &mut q_full, &mut quantized_workspace);
+                let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
+                    split_q_gate(&q_full, n_heads, head_dim, seq)
+                } else {
+                    (q_full, vec![])
+                };
+
                 let mut k = vec![0.0f32; ql.wk.rows * seq];
                 cpu_quantized_matmul_into(&ql.wk, &xnorm, seq, &mut k, &mut quantized_workspace);
                 let mut v = vec![0.0f32; ql.wv.rows * seq];
@@ -1696,7 +1768,16 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 };
 
                 cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
-                let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+                let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+                let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
+                    let pre_gate = attn_out.clone();
+                    apply_sigmoid_gate(&mut attn_out, &attn_gate_raw);
+                    (Some(pre_gate), Some(attn_gate_raw))
+                } else {
+                    (None, None)
+                };
+
                 let mut o_out = vec![0.0f32; ql.wo.rows * seq];
                 cpu_quantized_matmul_into(
                     &ql.wo,
@@ -1715,7 +1796,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                     }
                 }
 
-                (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm)
+                (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved)
             };
 
             let mut x2 = x_cur.clone();
@@ -1765,6 +1846,8 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 ffn_out,
                 q_pre_norm,
                 k_pre_norm,
+                attn_gate: attn_gate_saved,
+                attn_pre_gate: attn_pre_gate_saved,
             });
             lora_acts_vec.push(lora_layer_acts);
             continue;
@@ -1778,7 +1861,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
         rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
 
         // Attention: GDN (linear) or MHA path
-        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm) = if let Some(gdn_w) = &lw.gdn {
+        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) = if let Some(gdn_w) = &lw.gdn {
             // GDN path: combined QKV → conv1d → recurrence → output gate
             let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
             // GDN layers produce the final output directly (no separate Wo)
@@ -1791,11 +1874,19 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 gdn_out,
                 None,
                 None,
+                None,
+                None,
             )
         } else {
             // MHA path: Q/K/V → QK-norm → RoPE → SDPA → Wo
             let ad = cfg.attn_dim();
-            let mut q = cpu_matmul(&lw.wq, &xnorm, ad, dim, seq);
+            let qpd = cfg.q_proj_dim();
+            let q_full = cpu_matmul(&lw.wq, &xnorm, qpd, dim, seq);
+            let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
+                split_q_gate(&q_full, n_heads, head_dim, seq)
+            } else {
+                (q_full, vec![])
+            };
             let mut k = cpu_matmul(&lw.wk, &xnorm, ad, dim, seq);
             let v = cpu_matmul(&lw.wv, &xnorm, ad, dim, seq);
 
@@ -1825,7 +1916,16 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
             };
 
             cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
-            let attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+            let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+            let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
+                let pre_gate = attn_out.clone();
+                apply_sigmoid_gate(&mut attn_out, &attn_gate_raw);
+                (Some(pre_gate), Some(attn_gate_raw))
+            } else {
+                (None, None)
+            };
+
             let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, ad, seq);
 
             // LoRA on Wo (MHA only — GDN layers use stop_gradient on attention)
@@ -1838,7 +1938,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 }
             }
 
-            (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm)
+            (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved)
         };
 
         // Residual
@@ -1891,6 +1991,8 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
             ffn_out,
             q_pre_norm,
             k_pre_norm,
+            attn_gate: attn_gate_saved,
+            attn_pre_gate: attn_pre_gate_saved,
         });
         lora_acts_vec.push(lora_layer_acts);
     }
@@ -2253,6 +2355,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
         let dim = cfg.dim;
         let hidden = cfg.hidden_dim;
@@ -2340,6 +2443,7 @@ mod tests {
             linear_n_value_heads: 2,
             linear_value_head_dim: 4,
             conv_kernel_size: 2,
+            attn_output_gate: false,
         };
         let dim = cfg.dim;
         let hidden = cfg.hidden_dim;
@@ -2806,6 +2910,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
 
         eprintln!("loading Qwen3-1.7B weights...");
@@ -2869,6 +2974,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
 
         eprintln!("loading Qwen3-1.7B...");
@@ -3199,6 +3305,7 @@ mod tests {
             linear_n_value_heads: h_v,
             linear_value_head_dim: d_v,
             conv_kernel_size: kernel,
+            attn_output_gate: false,
         };
 
         // Input: [dim, seq] channels-first, small values
@@ -3299,6 +3406,7 @@ mod tests {
             linear_n_value_heads: h_v,
             linear_value_head_dim: d_v,
             conv_kernel_size: kernel,
+            attn_output_gate: false,
         };
 
         let xnorm: Vec<f32> = (0..dim * seq)

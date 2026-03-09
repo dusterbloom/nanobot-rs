@@ -1062,6 +1062,7 @@ fn bench_quantized_gdn_path() -> QuantizedGdnBenchResult {
         linear_n_value_heads: 16,
         linear_value_head_dim: 128,
         conv_kernel_size: 4,
+        attn_output_gate: false,
     };
     let dim = cfg.dim;
     let seq = cfg.seq_len;
@@ -1209,6 +1210,7 @@ fn bench_quantized_layer_forward_path() -> QuantizedLayerForwardBenchResult {
         linear_n_value_heads: 0,
         linear_value_head_dim: 0,
         conv_kernel_size: 0,
+        attn_output_gate: false,
     };
     let dim = cfg.dim;
     let hidden = cfg.hidden_dim;

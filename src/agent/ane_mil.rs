@@ -46,6 +46,9 @@ pub struct MilConfig {
     pub linear_n_value_heads: usize,     // value heads (recurrence count)
     pub linear_value_head_dim: usize,    // value head dimension
     pub conv_kernel_size: usize,         // causal conv kernel size (usually 4)
+    /// Qwen3.5: q_proj outputs [Q, gate] interleaved per-head (2× attn_dim).
+    /// The gate is sigmoid-ed and multiplied with SDPA output before o_proj.
+    pub attn_output_gate: bool,
 }
 
 impl MilConfig {
@@ -68,6 +71,7 @@ impl MilConfig {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         }
     }
 
@@ -86,6 +90,10 @@ impl MilConfig {
     /// standard transformers but can be larger for Qwen3.5-style models.
     pub fn attn_dim(&self) -> usize {
         self.n_heads * self.head_dim_explicit
+    }
+    /// Q projection output dimension: `attn_dim * 2` when `attn_output_gate`, else `attn_dim`.
+    pub fn q_proj_dim(&self) -> usize {
+        if self.attn_output_gate { 2 * self.attn_dim() } else { self.attn_dim() }
     }
     pub fn score_ch(&self) -> usize {
         self.n_heads * self.seq_len
@@ -1600,6 +1608,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
         assert_eq!(cfg.head_dim(), 64);
         assert_eq!(cfg.kv_dim(), 512); // 8 * 64

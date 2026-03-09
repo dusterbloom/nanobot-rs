@@ -225,18 +225,20 @@ pub fn spawn_ane_training(
                     }
                     _ => {
                         tracing::warn!("ANE train: stale LoRA file, reinitializing");
-                        LoraModel::with_kv_dim(
+                        LoraModel::with_full_dims(
                             LoraConfig::default(),
                             n_layers,
                             dim,
-                            cfg.kv_dim,
+                            cfg.mil_config.kv_dim(),
+                            cfg.mil_config.attn_dim(),
+                            cfg.mil_config.q_proj_dim(),
                             hidden_dim,
                         )
                     }
                 }
             } else {
                 tracing::info!("ANE train: new LoRA for model {model_key}");
-                LoraModel::with_kv_dim(LoraConfig::default(), n_layers, dim, cfg.kv_dim, hidden_dim)
+                LoraModel::with_full_dims(LoraConfig::default(), n_layers, dim, cfg.mil_config.kv_dim(), cfg.mil_config.attn_dim(), cfg.mil_config.q_proj_dim(), hidden_dim)
             };
             let mut adam = LoraModelAdam::zeros(&lora);
 
@@ -557,6 +559,7 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
+            attn_output_gate: false,
         };
 
         // 1. Load ANE base weights and train LoRA (3 steps)

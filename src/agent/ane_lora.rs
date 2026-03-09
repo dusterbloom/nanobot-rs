@@ -208,13 +208,30 @@ impl LoraModel {
         kv_dim: usize,
         hidden_dim: usize,
     ) -> Self {
+        Self::with_full_dims(cfg, n_layers, dim, kv_dim, dim, dim, hidden_dim)
+    }
+
+    /// Create LoRA model with explicit attention dimensions.
+    ///
+    /// `attn_dim`: n_heads * head_dim (may differ from `dim` for Qwen3.5).
+    /// `q_proj_dim`: attn_dim * 2 when attn_output_gate, else attn_dim.
+    pub fn with_full_dims(
+        cfg: LoraConfig,
+        n_layers: usize,
+        dim: usize,
+        kv_dim: usize,
+        attn_dim: usize,
+        q_proj_dim: usize,
+        hidden_dim: usize,
+    ) -> Self {
         let rank = cfg.rank;
         let targets = &cfg.target_modules;
 
         let layers = (0..n_layers)
             .map(|_| LoraLayerAdapters {
                 wq: if targets.iter().any(|t| t == "wq") {
-                    Some(LoraAdapter::new(rank, dim, dim))
+                    // wq: [q_proj_dim, dim] → d_in=dim, d_out=q_proj_dim
+                    Some(LoraAdapter::new(rank, dim, q_proj_dim))
                 } else {
                     None
                 },
@@ -224,7 +241,8 @@ impl LoraModel {
                     None
                 },
                 wo: if targets.iter().any(|t| t == "wo") {
-                    Some(LoraAdapter::new(rank, dim, dim))
+                    // wo: [dim, attn_dim] → d_in=attn_dim, d_out=dim
+                    Some(LoraAdapter::new(rank, attn_dim, dim))
                 } else {
                     None
                 },

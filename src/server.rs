@@ -693,39 +693,12 @@ pub(crate) async fn check_health(api_base: &str, timeout_secs: u64) -> bool {
     }
 }
 
-/// Deep health check: verify server can handle a chat completion.
-pub(crate) async fn check_chat_health(port: &str) -> bool {
-    let url = format!("http://localhost:{}/v1/chat/completions", port);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-
-    let body = serde_json::json!({
-        "model": "default",
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1
-    });
-
-    match client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                return false;
-            }
-            if let Ok(text) = resp.text().await {
-                text.contains("\"choices\"") || text.contains("\"content\"")
-            } else {
-                false
-            }
-        }
-        Err(_) => false,
-    }
+/// Lightweight health check for a local server by port number.
+///
+/// Delegates to `check_health` with a localhost URL.
+pub(crate) async fn check_local_health(port: &str) -> bool {
+    let base = format!("http://localhost:{}", port);
+    check_health(&base, 5).await
 }
 
 // ============================================================================
@@ -834,27 +807,49 @@ pub(crate) fn start_health_watchdog_with_autorepair(
         let mut consecutive_failures: HashMap<String, u32> =
             ports.iter().map(|(role, _)| (role.clone(), 0)).collect();
 
+        // Track whether each server has ever responded successfully.
+        // Until a server passes its first health check, we assume it's still
+        // starting up (loading model weights) and don't count failures.
+        let mut seen_healthy: HashMap<String, bool> =
+            ports.iter().map(|(role, _)| (role.clone(), false)).collect();
+
+        let mut cooldown_remaining: u32 = 0;
+
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
 
             if inference_active.load(std::sync::atomic::Ordering::Relaxed) {
+                // Reset stale failure counts during inference so they don't
+                // trigger a restart the moment inference ends.
+                for v in consecutive_failures.values_mut() {
+                    *v = 0;
+                }
+                cooldown_remaining = 2; // grace period after inference ends
+                continue;
+            }
+
+            if cooldown_remaining > 0 {
+                cooldown_remaining -= 1;
                 continue;
             }
 
             for (role, port) in &ports {
-                let healthy = if role == "main" {
-                    check_chat_health(port).await
-                } else {
-                    let url = format!("http://localhost:{}/health", port);
-                    match client.get(&url).send().await {
-                        Ok(resp) => resp.status().is_success(),
-                        Err(_) => false,
-                    }
+                let url = format!("http://localhost:{}/health", port);
+                let healthy = match client.get(&url).send().await {
+                    Ok(resp) => resp.status().is_success(),
+                    Err(_) => false,
                 };
 
                 let prev = was_healthy.get(role).copied().unwrap_or(true);
 
                 if !healthy {
+                    // Server hasn't passed a health check yet — still in
+                    // initial startup (loading model weights). Don't count
+                    // these as failures.
+                    if !seen_healthy.get(role).copied().unwrap_or(false) {
+                        continue;
+                    }
+
                     *consecutive_failures.get_mut(role).unwrap() += 1;
                     let failures = consecutive_failures[role];
 
@@ -874,6 +869,9 @@ pub(crate) fn start_health_watchdog_with_autorepair(
                         consecutive_failures.insert(role.clone(), 0);
                     }
                 } else {
+                    if !seen_healthy.get(role).copied().unwrap_or(false) {
+                        seen_healthy.insert(role.clone(), true);
+                    }
                     let was_failed = consecutive_failures[role] > 0;
                     consecutive_failures.insert(role.clone(), 0);
 

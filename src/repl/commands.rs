@@ -207,7 +207,7 @@ impl ReplContext {
                 // Wait for server to be ready
                 for i in 0..10 {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    if server::check_chat_health(&self.srv.local_port).await {
+                    if server::check_local_health(&self.srv.local_port).await {
                         let _ = self.display_tx.send(format!(
                             "\x1b[RAW]\n  \x1b[32m\u{25cf}\x1b[0m Main server \x1b[32mready\x1b[0m\n"
                         ));
