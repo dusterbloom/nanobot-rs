@@ -3288,6 +3288,7 @@ dependencies = [
  "lingua-japanese-language-model",
  "lingua-portuguese-language-model",
  "lingua-spanish-language-model",
+ "lingua-vietnamese-language-model",
  "maplit",
  "rayon",
  "regex",
@@ -3367,6 +3368,15 @@ name = "lingua-spanish-language-model"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05df7766652773b2292e7ad12221c0090954baed18ca2ff631a5f134ce08d91d"
+dependencies = [
+ "include_dir",
+]
+
+[[package]]
+name = "lingua-vietnamese-language-model"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "489ba31146a87c04a783bcca606b961320a9cace365378bd329933a8b3ae2f50"
 dependencies = [
  "include_dir",
 ]

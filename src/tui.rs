@@ -611,6 +611,7 @@ pub(crate) fn print_mlx_splash(model_name: &str, mlx_lm_mode: Option<&str>) {
     print_logo();
     let mode_hint = match mlx_lm_mode {
         Some("auto") => "mlx-lm (managed)",
+        Some("vllm-mlx") => "vllm-mlx (managed)",
         Some(_) => "mlx-lm (external)",
         None => "in-process GPU",
     };

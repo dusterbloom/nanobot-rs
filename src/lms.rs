@@ -339,9 +339,26 @@ pub(crate) async fn unload_model(
 }
 
 /// Like `unload_model` but accepts a full base URL.
+///
+/// Looks up the `instance_id` from `/api/v1/models` (required by newer LM Studio
+/// versions) and falls back to identifier-only for older versions.
 pub(crate) async fn unload_model_at(base_url: &str, model: &str) -> Result<(), String> {
     let url = format!("{}/api/v1/models/unload", base_url);
-    let body = serde_json::json!({ "identifier": model });
+
+    // Look up the instance_id for this model.
+    let instance_id = {
+        let models = list_models_full_at(base_url).await;
+        models
+            .iter()
+            .find(|m| m.loaded && model_matches(&m.key, model))
+            .and_then(|m| m.instance_id.clone())
+    };
+
+    let body = if let Some(ref iid) = instance_id {
+        serde_json::json!({ "identifier": model, "instance_id": iid })
+    } else {
+        serde_json::json!({ "identifier": model })
+    };
 
     let client = reqwest::Client::new();
     let resp = client
@@ -383,6 +400,8 @@ pub(crate) struct ModelInfo {
     pub loaded: bool,
     /// Context length of the first loaded instance, if any.
     pub loaded_context: Option<usize>,
+    /// Instance ID of the first loaded instance (required for unload API).
+    pub instance_id: Option<String>,
 }
 
 /// List all models via `GET /api/v1/models`, returning full info.
@@ -414,17 +433,22 @@ async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
             let model_type = m.get("type")?.as_str()?.to_string();
             let instances = m.get("loaded_instances").and_then(|v| v.as_array());
             let loaded = instances.map(|a| !a.is_empty()).unwrap_or(false);
-            let loaded_context = instances
-                .and_then(|arr| arr.first())
+            let first_instance = instances.and_then(|arr| arr.first());
+            let loaded_context = first_instance
                 .and_then(|inst| inst.get("config"))
                 .and_then(|c| c.get("context_length"))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
+            let instance_id = first_instance
+                .and_then(|inst| inst.get("instance_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(ModelInfo {
                 key,
                 model_type,
                 loaded,
                 loaded_context,
+                instance_id,
             })
         })
         .collect()
@@ -874,6 +898,7 @@ mod tests {
             model_type: "llm".to_string(),
             loaded,
             loaded_context,
+            instance_id: None,
         }
     }
 

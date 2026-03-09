@@ -479,14 +479,14 @@ impl VoiceAgent {
                 let (_audio_tx, mut realtime_rx) = start_result.unwrap();
 
                 // Set up TTS playback pipeline with echo suppression
-                let (tts_en, tts_multi) = session.tts_handles();
+                let (tts_en, tts_multi, tts_magpie) = session.tts_handles();
                 let tts_playing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let tts_state: Option<(
                     std::sync::mpsc::Sender<crate::voice_pipeline::TtsCommand>,
                     std::sync::Arc<std::sync::atomic::AtomicBool>,
-                )> = if tts_en.is_some() || tts_multi.is_some() {
+                )> = if tts_en.is_some() || tts_multi.is_some() || tts_magpie.is_some() {
                     Some(crate::voice_pipeline::start_tts_playback(
-                        tts_en, tts_multi, tts_playing.clone(),
+                        tts_en, tts_multi, tts_magpie, tts_playing.clone(),
                     ))
                 } else {
                     None

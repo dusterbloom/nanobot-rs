@@ -113,6 +113,7 @@ url = "2"
 lingua = { version = "1.7", default-features = false, features = [
     "english", "spanish", "french", "hindi",
     "italian", "japanese", "portuguese", "chinese",
+    "vietnamese",
 ], optional = true }
 
 # Mime type guessing

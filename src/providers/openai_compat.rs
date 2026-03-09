@@ -263,7 +263,7 @@ fn is_private_ip(url: &str) -> bool {
 /// Delegates to the centralized `model_capabilities` registry so the logic
 /// stays in one place.
 fn model_supports_thinking(model: &str) -> bool {
-    crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new()).thinking
+    crate::agent::model_capabilities::lookup_default(model).thinking
 }
 
 /// Apply local reasoning controls when talking to localhost.
@@ -306,8 +306,7 @@ fn apply_local_reasoning_controls(
 /// Only these models benefit from `try_native_lms_chat`; for everything else
 /// the extra HTTP roundtrip is pure overhead.
 fn needs_native_lms_api(model: &str) -> bool {
-    crate::agent::model_capabilities::lookup(model, &std::collections::HashMap::new())
-        .needs_native_lms_api
+    crate::agent::model_capabilities::lookup_default(model).needs_native_lms_api
 }
 
 /// Extract the unsupported feature name from an LMS error message.
