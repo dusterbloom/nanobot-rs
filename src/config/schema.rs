@@ -497,7 +497,9 @@ pub struct AgentsConfig {
 /// as a single field without requiring callers to populate 8 separate fields.
 #[derive(Debug, Clone)]
 pub struct AdaptiveTokenConfig {
+    #[allow(dead_code)] // kept for config.json backwards compat
     pub local_thinking_reserve_tokens: u32,
+    #[allow(dead_code)] // kept for config.json backwards compat
     pub local_thinking_min_completion_tokens: u32,
     pub local_thinking_small_model_cap: u32,
     pub adaptive_long_mode_min_tokens: u32,
@@ -2309,7 +2311,6 @@ impl Config {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3017,8 +3018,14 @@ mod tests {
         // AdaptiveTokenConfig should faithfully reflect AgentDefaults values.
         let cfg = Config::default();
         let atc = AdaptiveTokenConfig::from_defaults(&cfg.agents.defaults);
-        assert_eq!(atc.adaptive_tool_heavy_max_tokens, cfg.agents.defaults.adaptive_tool_heavy_max_tokens);
-        assert_eq!(atc.adaptive_tool_heavy_min_tokens, cfg.agents.defaults.adaptive_tool_heavy_min_tokens);
+        assert_eq!(
+            atc.adaptive_tool_heavy_max_tokens,
+            cfg.agents.defaults.adaptive_tool_heavy_max_tokens
+        );
+        assert_eq!(
+            atc.adaptive_tool_heavy_min_tokens,
+            cfg.agents.defaults.adaptive_tool_heavy_min_tokens
+        );
     }
 
     #[test]

@@ -116,10 +116,14 @@ pub(super) fn adaptive_max_tokens(
         }
     };
 
-    if is_local && thinking_budget.is_some() {
-        effective = effective
-            .saturating_sub(cfg.local_thinking_reserve_tokens)
-            .max(cfg.local_thinking_min_completion_tokens);
+    if is_local {
+        if let Some(budget) = thinking_budget {
+            // Reasoning models burn thinking tokens INSIDE the max_tokens budget.
+            // Add the thinking budget on top so the model has room for both
+            // thinking AND completion output, capped at 32K to stay within
+            // typical local model context limits.
+            effective = (effective + budget).min(32768);
+        }
     }
 
     effective

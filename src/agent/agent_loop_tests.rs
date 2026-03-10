@@ -1757,7 +1757,9 @@ fn test_should_strip_tools_both_degraded() {
 }
 
 #[test]
-fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
+fn test_adaptive_max_tokens_adds_thinking_headroom_for_local() {
+    // Thinking budget is added on top of base so the model has room for
+    // both reasoning tokens AND completion output.
     let out = adaptive_max_tokens(
         4096,
         false,
@@ -1767,7 +1769,7 @@ fn test_adaptive_max_tokens_reserves_budget_for_local_thinking() {
         Some(512),
         &AdaptiveTokenConfig::default(),
     );
-    assert_eq!(out, 3584);
+    assert_eq!(out, 4608); // 4096 + 512
 }
 
 #[test]
@@ -1799,7 +1801,8 @@ fn test_adaptive_max_tokens_no_reserve_for_cloud() {
 }
 
 #[test]
-fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
+fn test_adaptive_max_tokens_adds_thinking_even_on_small_base() {
+    // Even with a small base, thinking budget is added on top.
     let out = adaptive_max_tokens(
         512,
         false,
@@ -1809,7 +1812,7 @@ fn test_adaptive_max_tokens_keeps_floor_when_base_is_small() {
         Some(128),
         &AdaptiveTokenConfig::default(),
     );
-    assert_eq!(out, 256);
+    assert_eq!(out, 640); // 512 + 128
 }
 
 // -----------------------------------------------------------------------
@@ -2097,8 +2100,8 @@ async fn test_local_thinking_reserves_max_tokens_end_to_end() {
 
     assert_eq!(
         main.last_max_tokens(),
-        256,
-        "local thinking should reserve tool-call budget from base max_tokens=512"
+        640,
+        "local thinking should add budget on top of base max_tokens=512 (512+128=640)"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
