@@ -333,17 +333,11 @@ impl AgentLoopShared {
 
                     // Try to restore DAG from SQLite summary_nodes table.
                     let session_meta_tmp = core.sessions.get_or_resume(&session_key).await;
-                    let db_nodes = core
-                        .sessions
-                        .load_summary_nodes(&session_meta_tmp.id)
-                        .await;
+                    let db_nodes = core.sessions.load_summary_nodes(&session_meta_tmp.id).await;
 
                     let engine = if !db_nodes.is_empty() {
                         // Restore from DB-persisted DAG + raw messages.
-                        let all_msgs = core
-                            .sessions
-                            .get_all_messages(&session_meta_tmp.id)
-                            .await;
+                        let all_msgs = core.sessions.get_all_messages(&session_meta_tmp.id).await;
                         tracing::debug!(
                             session = %session_key,
                             node_count = db_nodes.len(),
@@ -352,10 +346,7 @@ impl AgentLoopShared {
                         LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
                     } else {
                         // Check for legacy Turn::Summary entries in messages.
-                        let all_msgs = core
-                            .sessions
-                            .get_all_messages(&session_meta_tmp.id)
-                            .await;
+                        let all_msgs = core.sessions.get_all_messages(&session_meta_tmp.id).await;
                         let turns: Vec<crate::agent::turn::Turn> = all_msgs
                             .iter()
                             .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
@@ -370,7 +361,8 @@ impl AgentLoopShared {
                             LcmEngine::rebuild_from_turns(
                                 &turns,
                                 config,
-                                &crate::agent::protocol::CloudProtocol as &dyn crate::agent::protocol::ConversationProtocol,
+                                &crate::agent::protocol::CloudProtocol
+                                    as &dyn crate::agent::protocol::ConversationProtocol,
                                 "",
                             )
                         } else {

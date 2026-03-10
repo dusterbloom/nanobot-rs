@@ -579,7 +579,10 @@ impl SessionDb {
                 })
                 .collect(),
             Err(e) => {
-                warn!("Failed to load summary nodes for session {}: {}", session_id, e);
+                warn!(
+                    "Failed to load summary nodes for session {}: {}",
+                    session_id, e
+                );
                 Vec::new()
             }
         }

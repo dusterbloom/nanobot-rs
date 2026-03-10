@@ -810,8 +810,10 @@ pub(crate) fn start_health_watchdog_with_autorepair(
         // Track whether each server has ever responded successfully.
         // Until a server passes its first health check, we assume it's still
         // starting up (loading model weights) and don't count failures.
-        let mut seen_healthy: HashMap<String, bool> =
-            ports.iter().map(|(role, _)| (role.clone(), false)).collect();
+        let mut seen_healthy: HashMap<String, bool> = ports
+            .iter()
+            .map(|(role, _)| (role.clone(), false))
+            .collect();
 
         let mut cooldown_remaining: u32 = 0;
 

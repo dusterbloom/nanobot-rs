@@ -1012,7 +1012,8 @@ mod tests {
 
     #[test]
     fn parse_calling_tool_format() {
-        let text = r#"[Calling tool: write_file({"path": "/tmp/game.py", "content": "print('hi')"})]"#;
+        let text =
+            r#"[Calling tool: write_file({"path": "/tmp/game.py", "content": "print('hi')"})]"#;
         let calls = parse_textual_tool_calls(text);
         assert_eq!(calls.len(), 1, "Should parse [Calling tool: ...] format");
         assert_eq!(calls[0].tool, "write_file");
@@ -1042,14 +1043,20 @@ mod tests {
     fn parse_xml_empty_block_returns_empty() {
         let text = "<tool_call>\n</tool_call>";
         let calls = parse_xml_tool_calls(text);
-        assert!(calls.is_empty(), "Empty <tool_call> block should yield no parsed calls");
+        assert!(
+            calls.is_empty(),
+            "Empty <tool_call> block should yield no parsed calls"
+        );
     }
 
     #[test]
     fn strip_xml_removes_empty_blocks() {
         let text = "Some text. <tool_call>\n</tool_call> More text.";
         let stripped = strip_xml_tool_calls(text);
-        assert!(!stripped.contains("<tool_call>"), "Empty XML blocks should be stripped");
+        assert!(
+            !stripped.contains("<tool_call>"),
+            "Empty XML blocks should be stripped"
+        );
         assert!(stripped.contains("Some text."));
         assert!(stripped.contains("More text."));
     }

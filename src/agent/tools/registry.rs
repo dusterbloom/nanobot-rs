@@ -478,14 +478,30 @@ impl ToolRegistry {
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
         (
             &[
-                "search", "find online", "look up", "google", "news", "latest", "current events",
-                "what's happening", "headlines", "update on", "weather", "stock", "price of",
+                "search",
+                "find online",
+                "look up",
+                "google",
+                "news",
+                "latest",
+                "current events",
+                "what's happening",
+                "headlines",
+                "update on",
+                "weather",
+                "stock",
+                "price of",
             ],
             "web_search",
         ),
         (
             &[
-                "fetch", "download", "read url", "get page", "web_fetch", "scrape",
+                "fetch",
+                "download",
+                "read url",
+                "get page",
+                "web_fetch",
+                "scrape",
             ],
             "web_fetch",
         ),

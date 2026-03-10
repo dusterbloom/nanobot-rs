@@ -297,9 +297,13 @@ impl ReplContext {
     pub(super) async fn cmd_model(&mut self, filter: &str) {
         let has_cluster = {
             #[cfg(feature = "cluster")]
-            { self.cluster_state.is_some() }
+            {
+                self.cluster_state.is_some()
+            }
             #[cfg(not(feature = "cluster"))]
-            { false }
+            {
+                false
+            }
         };
 
         if !self.core_handle.swappable().is_local && !has_cluster {

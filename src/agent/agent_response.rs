@@ -33,9 +33,7 @@ use super::{AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnC
 #[derive(Debug)]
 pub(crate) enum ResponseKind {
     /// Response has native or text-parsed tool calls to execute.
-    ToolCalls {
-        tool_calls: Vec<ToolCallRequest>,
-    },
+    ToolCalls { tool_calls: Vec<ToolCallRequest> },
     /// Response contains visible text, no tool calls — final answer.
     Text(String),
     /// Validation failed (hallucinated tool call or claimed-but-not-executed).
@@ -174,8 +172,7 @@ pub(crate) fn classify_response(
 
     // Non-empty text, no tool calls — check for truncation.
     let is_truncated = response.finish_reason == "length"
-        || (response.finish_reason == "stop"
-            && super::appears_incomplete(content));
+        || (response.finish_reason == "stop" && super::appears_incomplete(content));
     if is_truncated && retries.continuations < 10 {
         // Only classify as Truncated if there's room to continue.
         // (Actual cap is checked in the handler via core.max_continuations.)
@@ -189,10 +186,7 @@ pub(crate) fn classify_response(
 // Channel helpers (avoids type-inference issues in #[path] submodules)
 // ---------------------------------------------------------------------------
 
-fn send_finish_reason(
-    tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    reason: &str,
-) {
+fn send_finish_reason(tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>, reason: &str) {
     if let Some(ref tx) = tx {
         let _ = tx.send(format!("\x00finish_reason:{}", reason));
     }
@@ -317,9 +311,7 @@ impl AgentLoopShared {
                 self.handle_validation_error(ctx, &error, &raw_content)
             }
 
-            ResponseKind::ProviderError(err_msg) => {
-                self.handle_provider_error(ctx, &err_msg).await
-            }
+            ResponseKind::ProviderError(err_msg) => self.handle_provider_error(ctx, &err_msg).await,
 
             ResponseKind::Truncated(partial) => {
                 let full = self.handle_truncated(ctx, &response, partial).await;
@@ -495,8 +487,7 @@ impl AgentLoopShared {
         while ctx.flow.retries.continuations < max_cont {
             // Check if still truncated.
             let is_truncated = finish_reason == "length"
-                || (finish_reason == "stop"
-                    && super::appears_incomplete(&accumulated));
+                || (finish_reason == "stop" && super::appears_incomplete(&accumulated));
             if !is_truncated {
                 break;
             }
@@ -789,10 +780,7 @@ mod tests {
         // triggers validation error when no native tool calls exist.
         // Use a pattern that the validation regex catches but the textual parser
         // cannot parse (malformed args).
-        let resp = make_response(
-            Some("I did the work. [Called spawn(NOT_JSON)]"),
-            "stop",
-        );
+        let resp = make_response(Some("I did the work. [Called spawn(NOT_JSON)]"), "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
         assert!(matches!(
             kind,
@@ -827,8 +815,7 @@ mod tests {
     #[test]
     fn test_classify_provider_error() {
         let mut resp = make_response(Some(""), "stop");
-        resp.usage
-            .insert("error".to_string(), -1);
+        resp.usage.insert("error".to_string(), -1);
         // Provider errors are detected by error_detail() on LLMResponse.
         // We test the path by checking that our kind logic handles it.
         // Since error_detail() checks specific fields, let's test via the

@@ -99,17 +99,16 @@ pub(crate) fn create_provider(config: &Config) -> Arc<dyn LLMProvider> {
     // Model has a known provider prefix but that provider's key is empty.
     // Strip the prefix so the fallback provider (whichever has a key) gets
     // a clean model name instead of "anthropic/claude-opus-4-5".
-    let model = if let Some(stripped) =
-        crate::config::schema::ProvidersConfig::strip_known_prefix(model)
-    {
-        info!(
-            "create_provider: prefix provider has no key, stripped '{}' -> '{}'",
-            model, stripped
-        );
-        stripped.to_string()
-    } else {
-        model.clone()
-    };
+    let model =
+        if let Some(stripped) = crate::config::schema::ProvidersConfig::strip_known_prefix(model) {
+            info!(
+                "create_provider: prefix provider has no key, stripped '{}' -> '{}'",
+                model, stripped
+            );
+            stripped.to_string()
+        } else {
+            model.clone()
+        };
 
     let api_key = config.get_api_key().unwrap_or_default();
 

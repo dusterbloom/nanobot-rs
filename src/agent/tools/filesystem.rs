@@ -8,7 +8,10 @@ use async_trait::async_trait;
 use super::base::Tool;
 
 /// Extract a required string parameter, returning an error string on missing.
-fn require_param<'a>(params: &'a HashMap<String, serde_json::Value>, key: &str) -> Result<&'a str, String> {
+fn require_param<'a>(
+    params: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a str, String> {
     params
         .get(key)
         .and_then(|v| v.as_str())
@@ -299,7 +302,12 @@ impl Tool for ListDirTool {
         let is_workspace = dir_path
             .canonicalize()
             .ok()
-            .and_then(|canon| workspace.canonicalize().ok().map(|ws| canon.starts_with(ws)))
+            .and_then(|canon| {
+                workspace
+                    .canonicalize()
+                    .ok()
+                    .map(|ws| canon.starts_with(ws))
+            })
             .unwrap_or(false);
 
         match tokio::fs::read_dir(&dir_path).await {

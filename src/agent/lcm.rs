@@ -702,24 +702,18 @@ impl LcmEngine {
     /// this turn only.
     ///
     /// Returns true if any summaries were expanded.
-    pub fn auto_expand(
-        &mut self,
-        budget: &TokenBudget,
-        tool_def_tokens: usize,
-    ) -> bool {
+    pub fn auto_expand(&mut self, budget: &TokenBudget, tool_def_tokens: usize) -> bool {
         // Find the latest user message content.
-        let user_text = self
-            .active
-            .iter()
-            .rev()
-            .find_map(|entry| {
-                let msg = entry.message();
-                if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
+        let user_text = self.active.iter().rev().find_map(|entry| {
+            let msg = entry.message();
+            if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                msg.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
 
         let user_text = match user_text {
             Some(t) if !t.is_empty() => t,
@@ -737,7 +731,10 @@ impl LcmEngine {
         let current_tokens = self.active_tokens();
         let headroom = hard_limit.saturating_sub(current_tokens);
         if headroom < 100 {
-            debug!("LCM auto_expand: no headroom ({} tokens available), skipping", headroom);
+            debug!(
+                "LCM auto_expand: no headroom ({} tokens available), skipping",
+                headroom
+            );
             return false;
         }
 
@@ -776,7 +773,9 @@ impl LcmEngine {
                         .filter_map(|&id| self.store.get(id).cloned())
                         .collect();
                     let expansion_tokens = TokenBudget::estimate_tokens(&source_messages);
-                    let summary_tokens = entry.message().get("content")
+                    let summary_tokens = entry
+                        .message()
+                        .get("content")
                         .and_then(|c| c.as_str())
                         .map(|s| TokenBudget::estimate_str_tokens(s))
                         .unwrap_or(0);
@@ -842,7 +841,9 @@ impl LcmEngine {
 
         // Reconstruct DAG nodes.
         for &(ref _id, ref source_ids, ref _child_ids, ref text, _tokens, level) in nodes {
-            engine.dag.create_node(source_ids.clone(), text.clone(), level);
+            engine
+                .dag
+                .create_node(source_ids.clone(), text.clone(), level);
             for &sid in source_ids {
                 summarized_ids.insert(sid);
             }
@@ -1099,19 +1100,15 @@ pub fn contains_refusal_pattern(text: &str) -> bool {
 /// stopwords and short words. Returns a set of unique keywords.
 fn extract_keywords(text: &str) -> std::collections::HashSet<String> {
     static STOPWORDS: &[&str] = &[
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "must", "ought",
-        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
-        "they", "them", "their", "this", "that", "these", "those", "what",
-        "which", "who", "whom", "how", "when", "where", "why",
-        "and", "but", "or", "nor", "not", "no", "so", "if", "then",
-        "for", "with", "about", "from", "into", "of", "to", "in", "on",
-        "at", "by", "as", "up", "out", "off", "over", "under",
-        "just", "also", "very", "really", "quite", "much", "more",
-        "some", "any", "all", "each", "every", "both", "few", "many",
-        "use", "tell", "let", "see", "get", "got", "make", "made",
-        "know", "think", "want", "like", "said", "say", "help",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "need", "must", "ought", "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+        "they", "them", "their", "this", "that", "these", "those", "what", "which", "who", "whom",
+        "how", "when", "where", "why", "and", "but", "or", "nor", "not", "no", "so", "if", "then",
+        "for", "with", "about", "from", "into", "of", "to", "in", "on", "at", "by", "as", "up",
+        "out", "off", "over", "under", "just", "also", "very", "really", "quite", "much", "more",
+        "some", "any", "all", "each", "every", "both", "few", "many", "use", "tell", "let", "see",
+        "get", "got", "make", "made", "know", "think", "want", "like", "said", "say", "help",
     ];
 
     let lower = text.to_lowercase();
@@ -2042,7 +2039,9 @@ mod tests {
 
         // Ingest messages about Rust ownership.
         engine.ingest(json!({"role": "system", "content": "You are helpful."}));
-        engine.ingest(json!({"role": "user", "content": "Explain Rust ownership and borrowing rules."}));
+        engine.ingest(
+            json!({"role": "user", "content": "Explain Rust ownership and borrowing rules."}),
+        );
         engine.ingest(json!({"role": "assistant", "content": "Rust ownership means each value has one owner. Borrowing allows references."}));
         engine.ingest(json!({"role": "user", "content": "How do lifetimes work in Rust?"}));
         engine.ingest(json!({"role": "assistant", "content": "Lifetimes track how long references are valid."}));
@@ -2172,7 +2171,9 @@ mod tests {
 
         engine.ingest(json!({"role": "system", "content": "S"}));
         engine.ingest(json!({"role": "user", "content": "Explain Rust ownership and borrowing."}));
-        engine.ingest(json!({"role": "assistant", "content": "Ownership means each value has one owner."}));
+        engine.ingest(
+            json!({"role": "assistant", "content": "Ownership means each value has one owner."}),
+        );
 
         let node = engine.dag.create_node(
             vec![1, 2],
@@ -2194,14 +2195,13 @@ mod tests {
         ];
 
         // Ask about something completely unrelated.
-        engine.ingest(json!({"role": "user", "content": "What is the weather forecast for Tokyo tomorrow?"}));
+        engine.ingest(
+            json!({"role": "user", "content": "What is the weather forecast for Tokyo tomorrow?"}),
+        );
 
         let budget = TokenBudget::new(100_000, 8192);
         let expanded = engine.auto_expand(&budget, 100);
-        assert!(
-            !expanded,
-            "Should NOT expand for an irrelevant query"
-        );
+        assert!(!expanded, "Should NOT expand for an irrelevant query");
     }
 
     // -----------------------------------------------------------------------
@@ -2222,12 +2222,12 @@ mod tests {
 
         // Simulate a DB node covering messages 1-4.
         let db_nodes = vec![(
-            0usize,                   // node_id
-            vec![1usize, 2, 3, 4],   // source_ids
-            vec![],                   // child_ids
+            0usize,                           // node_id
+            vec![1usize, 2, 3, 4],            // source_ids
+            vec![],                           // child_ids
             "Greeting exchange.".to_string(), // text
-            10usize,                  // tokens
-            1u8,                      // level
+            10usize,                          // tokens
+            1u8,                              // level
         )];
 
         let config = LcmConfig {

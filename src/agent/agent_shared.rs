@@ -863,18 +863,10 @@ impl AgentLoopShared {
                     let config = LcmConfig::from(&self.lcm_config);
 
                     // Try DB-persisted DAG first (preferred).
-                    let db_nodes = ctx
-                        .core
-                        .sessions
-                        .load_summary_nodes(&ctx.session_id)
-                        .await;
+                    let db_nodes = ctx.core.sessions.load_summary_nodes(&ctx.session_id).await;
 
                     let engine = if !db_nodes.is_empty() {
-                        let all_msgs = ctx
-                            .core
-                            .sessions
-                            .get_all_messages(&ctx.session_id)
-                            .await;
+                        let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
                         debug!(
                             session = %ctx.session_key,
                             node_count = db_nodes.len(),
@@ -883,11 +875,7 @@ impl AgentLoopShared {
                         LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
                     } else {
                         // Fallback: check for legacy Turn::Summary entries.
-                        let all_msgs = ctx
-                            .core
-                            .sessions
-                            .get_all_messages(&ctx.session_id)
-                            .await;
+                        let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
                         let turns: Vec<crate::agent::turn::Turn> = all_msgs
                             .iter()
                             .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
@@ -900,12 +888,7 @@ impl AgentLoopShared {
                                 summary_count = turns.iter().filter(|t| t.is_summary()).count(),
                                 "LCM: rebuilding engine from legacy Turn::Summary entries"
                             );
-                            LcmEngine::rebuild_from_turns(
-                                &turns,
-                                config,
-                                ctx.protocol.as_ref(),
-                                "",
-                            )
+                            LcmEngine::rebuild_from_turns(&turns, config, ctx.protocol.as_ref(), "")
                         } else {
                             LcmEngine::new(config)
                         }
