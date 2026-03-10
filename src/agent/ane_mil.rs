@@ -93,7 +93,11 @@ impl MilConfig {
     }
     /// Q projection output dimension: `attn_dim * 2` when `attn_output_gate`, else `attn_dim`.
     pub fn q_proj_dim(&self) -> usize {
-        if self.attn_output_gate { 2 * self.attn_dim() } else { self.attn_dim() }
+        if self.attn_output_gate {
+            2 * self.attn_dim()
+        } else {
+            self.attn_dim()
+        }
     }
     pub fn score_ch(&self) -> usize {
         self.n_heads * self.seq_len
@@ -189,12 +193,13 @@ impl KernelSpec {
                 )
             }
             KernelType::Wot => {
-                let sp_in = cfg.seq_len + cfg.dim;
+                let ad = cfg.attn_dim();
+                let sp_in = cfg.seq_len + ad;
                 (
                     gen_wot(cfg),
                     cfg.dim,
                     sp_in,
-                    cfg.dim,
+                    ad,
                     cfg.seq_len,
                     false,
                     false,
@@ -724,9 +729,9 @@ pub fn gen_ffn_w2(cfg: &MilConfig) -> String {
     m
 }
 
-/// Wo^T backward matmul: dx2 @ Wo^T → da (dim → dim).
+/// Wo^T backward matmul: dx2 @ Wo^T → da (dim → attn_dim).
 pub fn gen_wot(cfg: &MilConfig) -> String {
-    gen_dyn_matmul_mil(cfg.dim, cfg.dim, cfg.seq_len)
+    gen_dyn_matmul_mil(cfg.dim, cfg.attn_dim(), cfg.seq_len)
 }
 
 /// FFN backward part 1: dffn @ W2^T (dim → hidden).

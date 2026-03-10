@@ -1687,7 +1687,17 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
             let mut xnorm = vec![0.0f32; dim * seq];
             rmsnorm(&mut xnorm, &x_cur, &ql.rms_att, dim, seq, cfg.rms_eps);
 
-            let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) = if let Some(gdn_q) = &ql.gdn {
+            let (
+                q,
+                k,
+                v,
+                attn_out,
+                o_out,
+                q_pre_norm,
+                k_pre_norm,
+                attn_gate_saved,
+                attn_pre_gate_saved,
+            ) = if let Some(gdn_q) = &ql.gdn {
                 let gdn_out = cpu_quantized_gdn_forward_with_workspace(
                     gdn_q,
                     &xnorm,
@@ -1711,7 +1721,13 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 // weights, then expand KV activations for GQA instead of
                 // expanding KV weights.
                 let mut q_full = vec![0.0f32; ql.wq.rows * seq];
-                cpu_quantized_matmul_into(&ql.wq, &xnorm, seq, &mut q_full, &mut quantized_workspace);
+                cpu_quantized_matmul_into(
+                    &ql.wq,
+                    &xnorm,
+                    seq,
+                    &mut q_full,
+                    &mut quantized_workspace,
+                );
                 let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
                     split_q_gate(&q_full, n_heads, head_dim, seq)
                 } else {
@@ -1796,7 +1812,17 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                     }
                 }
 
-                (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved)
+                (
+                    q,
+                    k,
+                    v,
+                    attn_out,
+                    o_out,
+                    q_pre_norm,
+                    k_pre_norm,
+                    attn_gate_saved,
+                    attn_pre_gate_saved,
+                )
             };
 
             let mut x2 = x_cur.clone();
@@ -1861,7 +1887,17 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
         rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
 
         // Attention: GDN (linear) or MHA path
-        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) = if let Some(gdn_w) = &lw.gdn {
+        let (
+            q,
+            k,
+            v,
+            attn_out,
+            o_out,
+            q_pre_norm,
+            k_pre_norm,
+            attn_gate_saved,
+            attn_pre_gate_saved,
+        ) = if let Some(gdn_w) = &lw.gdn {
             // GDN path: combined QKV → conv1d → recurrence → output gate
             let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
             // GDN layers produce the final output directly (no separate Wo)
@@ -1938,7 +1974,17 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
                 }
             }
 
-            (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved)
+            (
+                q,
+                k,
+                v,
+                attn_out,
+                o_out,
+                q_pre_norm,
+                k_pre_norm,
+                attn_gate_saved,
+                attn_pre_gate_saved,
+            )
         };
 
         // Residual
@@ -2026,6 +2072,261 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
         },
         lora_acts: lora_acts_vec,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ANE-accelerated forward (CPU attention + ANE FFN + stability fixes)
+// ---------------------------------------------------------------------------
+
+/// Logit softcapping: cap * tanh(logits / cap). Prevents extreme logits
+/// that cause NaN in softmax during early training.
+pub fn logit_softcap(logits: &mut [f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    for v in logits.iter_mut() {
+        *v = cap * (*v * inv_cap).tanh();
+    }
+}
+
+/// ANE-accelerated forward pass generic over weight source.
+///
+/// Runs attention on CPU (handles GQA, GDN, QK-norm, attn_output_gate) and
+/// FFN on ANE hardware (W1+W3 and W2 matmuls via compiled kernels). Includes
+/// training stability fixes: logit softcapping and scaled residuals.
+///
+/// `softcap`: logit capping value (15.0 recommended, 0.0 disables)
+/// `residual_scale`: multiplied after each residual add
+///   (1.0/sqrt(2*n_layers) recommended for stability, 1.0 disables)
+pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
+    kernels: &CompiledKernels,
+    model: &W,
+    lora: Option<&super::ane_lora::LoraModel>,
+    tokens: &[T],
+    targets: &[T],
+    softcap: f32,
+    residual_scale: f32,
+) -> Result<ForwardResultWithLora, String> {
+    use super::ane_lora::LoraLayerActivations;
+
+    let cfg = model.cfg();
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let n_heads = cfg.n_heads;
+    let head_dim = cfg.head_dim();
+    let n_layers = model.n_layers();
+    let lora_scale = lora.map_or(0.0, |l| l.scale());
+    let apply_res_scale = (residual_scale - 1.0).abs() > f32::EPSILON;
+
+    // 1. Embedding (CPU)
+    let mut x_cur = vec![0.0f32; dim * seq];
+    embed_lookup(&mut x_cur, model.embed(), tokens, dim, seq);
+
+    let mut layer_acts = Vec::with_capacity(n_layers);
+    let mut lora_acts_vec = Vec::with_capacity(n_layers);
+
+    // 2. Transformer layers
+    for l in 0..n_layers {
+        let lora_layer = lora.map(|lm| &lm.layers[l]);
+        let layer_in = x_cur.clone();
+        let mut lora_layer_acts = LoraLayerActivations::empty();
+
+        // Dequantize layer (borrows for ModelWeights, allocates for QuantizedModelWeights)
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
+
+        // RMSNorm before attention (CPU)
+        let mut xnorm = vec![0.0f32; dim * seq];
+        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+
+        // --- Attention (CPU — handles GDN, GQA, QK-norm, attn_output_gate) ---
+        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) =
+            if let Some(gdn_w) = &lw.gdn {
+                let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
+                let empty = vec![0.0f32; 0];
+                (
+                    empty.clone(),
+                    empty.clone(),
+                    empty,
+                    gdn_out.clone(),
+                    gdn_out,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                let ad = cfg.attn_dim();
+                let qpd = cfg.q_proj_dim();
+                let q_full = cpu_matmul(&lw.wq, &xnorm, qpd, dim, seq);
+                let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
+                    split_q_gate(&q_full, n_heads, head_dim, seq)
+                } else {
+                    (q_full, vec![])
+                };
+                let mut k = cpu_matmul(&lw.wk, &xnorm, ad, dim, seq);
+                let v = cpu_matmul(&lw.wv, &xnorm, ad, dim, seq);
+
+                let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
+                    Some(qk_rmsnorm_fwd(
+                        &mut q, q_norm_w, n_heads, head_dim, seq, cfg.rms_eps,
+                    ))
+                } else {
+                    None
+                };
+                let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
+                    Some(qk_rmsnorm_fwd(
+                        &mut k, k_norm_w, n_heads, head_dim, seq, cfg.rms_eps,
+                    ))
+                } else {
+                    None
+                };
+
+                cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
+                let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+                let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
+                    let pre_gate = attn_out.clone();
+                    apply_sigmoid_gate(&mut attn_out, &attn_gate_raw);
+                    (Some(pre_gate), Some(attn_gate_raw))
+                } else {
+                    (None, None)
+                };
+
+                let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, ad, seq);
+
+                // LoRA on Wo
+                if let Some(ll) = lora_layer {
+                    if let Some(wo_adapter) = ll.wo.as_ref() {
+                        let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
+                        super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                        lora_layer_acts.wo_x = Some(attn_out.clone());
+                        lora_layer_acts.wo_h = Some(wo_h);
+                    }
+                }
+
+                (
+                    q,
+                    k,
+                    v,
+                    attn_out,
+                    o_out,
+                    q_pre_norm,
+                    k_pre_norm,
+                    attn_gate_saved,
+                    attn_pre_gate_saved,
+                )
+            };
+
+        // Residual (attention) + optional scaling
+        let mut x2 = x_cur.clone();
+        vec_add_inplace(&mut x2, &o_out);
+        if apply_res_scale {
+            for v in x2.iter_mut() {
+                *v *= residual_scale;
+            }
+        }
+
+        // RMSNorm before FFN (CPU)
+        let mut x2norm = vec![0.0f32; dim * seq];
+        rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+
+        // --- FFN on ANE: W1+W3 ---
+        let w13_input = ane_weights::pack_ffn_w13(&x2norm, &lw.w1, &lw.w3, cfg);
+        let w13_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW13);
+        kernels.ffn_w13.write_input(0, &w13_input);
+        kernels.ffn_w13.eval()?;
+        let mut w13_out = vec![0u8; w13_spec.output_bytes];
+        kernels.ffn_w13.read_output(0, &mut w13_out);
+        let (h1, h3, gate) = ane_weights::unpack_ffn_w13(&w13_out, cfg);
+
+        // --- FFN on ANE: W2 ---
+        let w2_input = ane_weights::pack_ffn_w2(&gate, &lw.w2, cfg);
+        let w2_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW2);
+        kernels.ffn_w2.write_input(0, &w2_input);
+        kernels.ffn_w2.eval()?;
+        let mut w2_out = vec![0u8; w2_spec.output_bytes];
+        kernels.ffn_w2.read_output(0, &mut w2_out);
+        let mut ffn_out: Vec<f32> = w2_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // LoRA on W2
+        if let Some(ll) = lora_layer {
+            if let Some(w2_adapter) = ll.w2.as_ref() {
+                let (w2_delta, w2_h) = w2_adapter.forward_cpu(&gate, seq);
+                super::ane_lora::vec_add_scaled(&mut ffn_out, &w2_delta, lora_scale);
+                lora_layer_acts.w2_x = Some(gate.clone());
+                lora_layer_acts.w2_h = Some(w2_h);
+            }
+        }
+
+        // Residual (FFN) + optional scaling
+        x_cur = x2.clone();
+        vec_add_inplace(&mut x_cur, &ffn_out);
+        if apply_res_scale {
+            for v in x_cur.iter_mut() {
+                *v *= residual_scale;
+            }
+        }
+
+        layer_acts.push(LayerActivations {
+            layer_in,
+            xnorm,
+            q,
+            k,
+            v,
+            attn_out,
+            o_out,
+            x2,
+            x2norm,
+            h1,
+            h3,
+            gate,
+            ffn_out,
+            q_pre_norm,
+            k_pre_norm,
+            attn_gate: attn_gate_saved,
+            attn_pre_gate: attn_pre_gate_saved,
+        });
+        lora_acts_vec.push(lora_layer_acts);
+    }
+
+    // 3. Final RMSNorm (CPU)
+    let mut x_final = vec![0.0f32; dim * seq];
+    rmsnorm(
+        &mut x_final,
+        &x_cur,
+        model.rms_final(),
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
+
+    // 4. Classifier (CPU)
+    let vocab = model.vocab_size();
+    let mut logits = vec![0.0f32; vocab * seq];
+    let cls_w = model.lm_head().unwrap_or(model.embed());
+    classifier_forward(&mut logits, cls_w, &x_final, vocab, dim, seq);
+
+    // 5. Logit softcapping (training stability)
+    logit_softcap(&mut logits, softcap);
+
+    // 6. Cross-entropy loss
+    let (loss, dlogits) = cross_entropy_loss(&logits, targets, vocab, seq);
+
+    Ok(ForwardResultWithLora {
+        base: ForwardResult {
+            logits,
+            loss,
+            dlogits,
+            layer_acts,
+        },
+        lora_acts: lora_acts_vec,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3417,5 +3718,387 @@ mod tests {
         let expanded_out = cpu_gdn_forward(&gdn_expanded, &xnorm, &cfg);
 
         assert!(max_abs_diff(&shared_out, &expanded_out) < 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Logit softcap: roundtrip and numerical gradient
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_logit_softcap_bounds_and_identity_at_small_values() {
+        let cap = 15.0f32;
+
+        // Large values should be bounded to [-cap, cap]
+        let mut logits = vec![-100.0, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0];
+        logit_softcap(&mut logits, cap);
+
+        for &v in &logits {
+            assert!(
+                v.abs() <= cap + 1e-5,
+                "softcap should bound to [-{cap},{cap}], got {v}"
+            );
+        }
+        // At x=0, tanh(0)=0 → output should be 0
+        assert!(logits[3].abs() < 1e-6, "softcap(0) should be 0");
+
+        // cap <= 0 should be a no-op
+        let mut logits2 = vec![5.0, -3.0, 100.0];
+        let orig = logits2.clone();
+        logit_softcap(&mut logits2, 0.0);
+        assert_eq!(logits2, orig);
+        logit_softcap(&mut logits2, -1.0);
+        assert_eq!(logits2, orig);
+    }
+
+    #[test]
+    fn test_logit_softcap_bwd_numerical_gradient() {
+        use crate::agent::ane_backward::logit_softcap_bwd;
+
+        let cap = 15.0f32;
+        let eps = 5e-4f32;
+
+        // Test at several operating points including saturated region
+        let raw_inputs = vec![-20.0, -5.0, -1.0, 0.0, 0.5, 3.0, 12.0, 30.0];
+
+        for &raw in &raw_inputs {
+            // Forward: capped = cap * tanh(raw / cap)
+            let mut capped = vec![raw];
+            logit_softcap(&mut capped, cap);
+            let capped_val = capped[0];
+
+            // Analytical backward: d(capped)/d(raw) = 1 - (capped/cap)^2
+            let mut dl = vec![1.0f32]; // upstream gradient = 1
+            logit_softcap_bwd(&mut dl, &[capped_val], cap);
+            let analytical = dl[0];
+
+            // Numerical: (softcap(raw+eps) - softcap(raw-eps)) / (2*eps)
+            let mut plus = vec![raw + eps];
+            let mut minus = vec![raw - eps];
+            logit_softcap(&mut plus, cap);
+            logit_softcap(&mut minus, cap);
+            let numerical = (plus[0] - minus[0]) / (2.0 * eps);
+
+            let err = (analytical - numerical).abs();
+            assert!(
+                err < 0.01,
+                "softcap bwd at raw={raw}: analytical={analytical:.6}, numerical={numerical:.6}, err={err:.6}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ANE vs CPU forward: compare forward_ane_generic against forward_cpu_generic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ane_forward_matches_cpu_forward_small_model() {
+        use super::super::ane_lora::{LoraConfig, LoraModel};
+        use super::super::ane_weights::LayerWeights;
+
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 16;
+        let vocab = 32;
+
+        let cfg = MilConfig::mha(dim, hidden, n_heads, seq);
+
+        // Compile ANE kernels — skip if hardware unavailable
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE vs CPU forward test (ANE unavailable): {e}");
+                return;
+            }
+        };
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make_small(dim * dim, 0),
+                wk: make_small(dim * dim, 1000),
+                wv: make_small(dim * dim, 2000),
+                wo: make_small(dim * dim, 3000),
+                w1: make_small(hidden * dim, 4000),
+                w2: make_small(dim * hidden, 5000),
+                w3: make_small(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_small(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        // CPU forward (no softcap, no residual scaling)
+        let cpu_result = forward_cpu_generic(&model, None, &tokens, &targets);
+
+        // ANE forward (softcap=0 disables, residual_scale=1.0 disables)
+        let ane_result =
+            forward_ane_generic(&kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+                .expect("ANE forward failed");
+
+        // Compare loss — ANE uses fp16 intermediates for FFN matmuls, so allow tolerance
+        let loss_err = (cpu_result.base.loss - ane_result.base.loss).abs();
+        eprintln!(
+            "ANE vs CPU: cpu_loss={:.6}, ane_loss={:.6}, err={:.6}",
+            cpu_result.base.loss, ane_result.base.loss, loss_err
+        );
+        assert!(
+            loss_err < 0.5,
+            "loss mismatch: cpu={:.6}, ane={:.6}, err={:.6}",
+            cpu_result.base.loss,
+            ane_result.base.loss,
+            loss_err
+        );
+
+        // Compare logits (fp16 ANE intermediates cause drift, generous tolerance)
+        let logit_err = max_abs_diff(&cpu_result.base.logits, &ane_result.base.logits);
+        eprintln!("logits max_abs_diff={logit_err:.6}");
+        assert!(
+            logit_err < 1.0,
+            "logits max abs diff too large: {logit_err}"
+        );
+
+        // Both should produce finite, positive loss near ln(vocab)
+        let ln_vocab = (vocab as f32).ln();
+        for (name, loss) in [("cpu", cpu_result.base.loss), ("ane", ane_result.base.loss)] {
+            assert!(loss.is_finite(), "{name} loss not finite: {loss}");
+            assert!(loss > 0.0, "{name} loss should be positive: {loss}");
+            assert!(
+                (loss - ln_vocab).abs() < 2.0,
+                "{name} loss={loss} should be near ln({vocab})={ln_vocab:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ane_forward_with_lora_matches_cpu() {
+        use super::super::ane_lora::{LoraConfig, LoraModel};
+        use super::super::ane_weights::LayerWeights;
+
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 16;
+        let vocab = 32;
+
+        let cfg = MilConfig::mha(dim, hidden, n_heads, seq);
+
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE vs CPU LoRA forward test (ANE unavailable): {e}");
+                return;
+            }
+        };
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make_small(dim * dim, 0),
+                wk: make_small(dim * dim, 1000),
+                wv: make_small(dim * dim, 2000),
+                wo: make_small(dim * dim, 3000),
+                w1: make_small(hidden * dim, 4000),
+                w2: make_small(dim * hidden, 5000),
+                w3: make_small(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_small(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        // LoRA with rank=16 (ANE requires multiple of 16)
+        let lora = LoraModel::new(
+            LoraConfig {
+                rank: 16,
+                alpha: 16.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            dim,
+            hidden,
+        );
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        // With B=0 (default init), LoRA contributes nothing — both paths should match baseline
+        let cpu_result = forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+        let ane_result =
+            forward_ane_generic(&kernels, &model, Some(&lora), &tokens, &targets, 0.0, 1.0)
+                .expect("ANE forward with LoRA failed");
+
+        let loss_err = (cpu_result.base.loss - ane_result.base.loss).abs();
+        eprintln!(
+            "ANE vs CPU (LoRA, B=0): cpu_loss={:.6}, ane_loss={:.6}, err={:.6}",
+            cpu_result.base.loss, ane_result.base.loss, loss_err
+        );
+        assert!(
+            loss_err < 0.5,
+            "LoRA loss mismatch: cpu={:.6}, ane={:.6}",
+            cpu_result.base.loss,
+            ane_result.base.loss
+        );
+
+        // Activations should have same shape
+        assert_eq!(cpu_result.base.layer_acts.len(), ane_result.base.layer_acts.len());
+        assert_eq!(cpu_result.lora_acts.len(), ane_result.lora_acts.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: ANE training loop — loss should decrease over 10 steps
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ane_training_loop_loss_decreases() {
+        use super::super::ane_backward::{self, BackwardKernels};
+        use super::super::ane_lora::{
+            self, LoraConfig, LoraModel, LoraModelAdam,
+        };
+        use super::super::ane_weights::LayerWeights;
+
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 64;
+        let vocab = 32;
+
+        let cfg = MilConfig::mha(dim, hidden, n_heads, seq);
+
+        // Compile ANE kernels
+        let fwd_kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE training loop test (ANE unavailable): {e}");
+                return;
+            }
+        };
+        let bwd_kernels = BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
+            .expect("backward compile failed");
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make_small(dim * dim, 0),
+                wk: make_small(dim * dim, 1000),
+                wv: make_small(dim * dim, 2000),
+                wo: make_small(dim * dim, 3000),
+                w1: make_small(hidden * dim, 4000),
+                w2: make_small(dim * hidden, 5000),
+                w3: make_small(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_small(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        // LoRA rank=16 (ANE alignment), targets: wo + w2
+        let mut lora = LoraModel::new(
+            LoraConfig {
+                rank: 16,
+                alpha: 16.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            dim,
+            hidden,
+        );
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        // Training data: simple next-token prediction
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        let n_steps = 10;
+        let base_lr = 5e-4;
+        let mut losses = Vec::with_capacity(n_steps);
+
+        eprintln!("ANE training loop: {n_steps} steps, dim={dim}, rank=16, seq={seq}");
+        for step in 0..n_steps {
+            let t0 = std::time::Instant::now();
+
+            // ANE forward (no softcap/residual_scale for clean comparison)
+            let fwd = forward_ane_generic(
+                &fwd_kernels, &model, Some(&lora), &tokens, &targets, 0.0, 1.0,
+            )
+            .expect("ANE forward failed");
+
+            let loss = fwd.base.loss;
+            losses.push(loss);
+            assert!(loss.is_finite(), "step {step}: loss not finite: {loss}");
+
+            // ANE backward for LoRA gradients
+            let bwd = ane_backward::backward_lora_ane_generic(
+                &bwd_kernels, &model, &fwd, &lora, &tokens, 0.0, 1.0, 1.0,
+            );
+
+            // Adam update with split LR (attn 0.05x, FFN 1.0x)
+            ane_lora::lora_adam_update_split_lr(
+                &mut lora,
+                &bwd.lora_grads,
+                &mut adam,
+                step + 1,
+                base_lr,
+                0.05,
+                1.0,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
+
+            let step_ms = t0.elapsed().as_millis();
+            eprintln!("  step {step}: loss={loss:.4}, time={step_ms}ms");
+        }
+
+        let first = losses[0];
+        let last = losses[n_steps - 1];
+        eprintln!(
+            "loss trajectory: {first:.4} -> {last:.4} (delta={:.4})",
+            last - first
+        );
+        assert!(
+            last < first,
+            "loss should decrease over training: first={first:.4}, last={last:.4}"
+        );
     }
 }

@@ -864,9 +864,30 @@ impl ModelWeights {
             //   2. mlp.shared_expert.gate_proj (MoE — train shared expert only)
             //   3. mlp.gate_up_proj (fused gate+up, split in half)
             let try_load_ffn = |pfx: &str| -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                let g = get_weight(&tensors, &tensor_meta, &format!("{pfx}.gate_proj"), group_size, bits).ok()?;
-                let u = get_weight(&tensors, &tensor_meta, &format!("{pfx}.up_proj"), group_size, bits).ok()?;
-                let d = get_weight(&tensors, &tensor_meta, &format!("{pfx}.down_proj"), group_size, bits).ok()?;
+                let g = get_weight(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{pfx}.gate_proj"),
+                    group_size,
+                    bits,
+                )
+                .ok()?;
+                let u = get_weight(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{pfx}.up_proj"),
+                    group_size,
+                    bits,
+                )
+                .ok()?;
+                let d = get_weight(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{pfx}.down_proj"),
+                    group_size,
+                    bits,
+                )
+                .ok()?;
                 Some((g, u, d))
             };
             let (w1, w3, w2) = if let Some(ffn) = try_load_ffn(&format!("{prefix}.mlp")) {
@@ -875,9 +896,21 @@ impl ModelWeights {
                 ffn
             } else {
                 // Fused gate_up_proj: [2*hidden_dim, dim] → split in half by rows
-                let fused = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let fused = get_weight(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{prefix}.mlp.gate_up_proj"),
+                    group_size,
+                    bits,
+                )?;
                 let mid = fused.len() / 2;
-                let d = get_weight(&tensors, &tensor_meta, &format!("{prefix}.mlp.down_proj"), group_size, bits)?;
+                let d = get_weight(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{prefix}.mlp.down_proj"),
+                    group_size,
+                    bits,
+                )?;
                 (fused[..mid].to_vec(), fused[mid..].to_vec(), d)
             };
 
@@ -1217,20 +1250,54 @@ impl QuantizedModelWeights {
             // FFN weights (shared by both MHA and GDN layers)
             // Some models (distilled) use fused gate_up_proj instead of separate gate_proj/up_proj.
             // Same fallback chain as f32 path: dense → shared_expert (MoE) → fused
-            let try_load_ffn_q = |pfx: &str| -> Option<(QuantizedTensor, QuantizedTensor, QuantizedTensor)> {
-                let g = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.gate_proj"), group_size, bits).ok()?;
-                let u = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.up_proj"), group_size, bits).ok()?;
-                let d = get_quantized(&tensors, &tensor_meta, &format!("{pfx}.down_proj"), group_size, bits).ok()?;
-                Some((g, u, d))
-            };
+            let try_load_ffn_q =
+                |pfx: &str| -> Option<(QuantizedTensor, QuantizedTensor, QuantizedTensor)> {
+                    let g = get_quantized(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{pfx}.gate_proj"),
+                        group_size,
+                        bits,
+                    )
+                    .ok()?;
+                    let u = get_quantized(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{pfx}.up_proj"),
+                        group_size,
+                        bits,
+                    )
+                    .ok()?;
+                    let d = get_quantized(
+                        &tensors,
+                        &tensor_meta,
+                        &format!("{pfx}.down_proj"),
+                        group_size,
+                        bits,
+                    )
+                    .ok()?;
+                    Some((g, u, d))
+                };
             let (w1, w3, w2) = if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp")) {
                 ffn
             } else if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp.shared_expert")) {
                 ffn
             } else {
-                let fused = get_quantized(&tensors, &tensor_meta, &format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let fused = get_quantized(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{prefix}.mlp.gate_up_proj"),
+                    group_size,
+                    bits,
+                )?;
                 let (g, u) = fused.split_rows_half();
-                let d = get_quantized(&tensors, &tensor_meta, &format!("{prefix}.mlp.down_proj"), group_size, bits)?;
+                let d = get_quantized(
+                    &tensors,
+                    &tensor_meta,
+                    &format!("{prefix}.mlp.down_proj"),
+                    group_size,
+                    bits,
+                )?;
                 (g, u, d)
             };
 
@@ -1611,6 +1678,7 @@ pub(crate) fn expand_kv_static(
 /// `QuantizedModelWeights` dequantizes on demand (one layer at a time in memory).
 pub trait WeightSource {
     fn cfg(&self) -> &MilConfig;
+    fn cfg_mut(&mut self) -> &mut MilConfig;
     fn n_layers(&self) -> usize;
     fn layer(&self, l: usize) -> std::borrow::Cow<'_, LayerWeights>;
     fn quantized_layer(&self, _l: usize) -> Option<&QuantizedLayerWeights> {
@@ -1635,6 +1703,9 @@ pub trait WeightSource {
 impl WeightSource for ModelWeights {
     fn cfg(&self) -> &MilConfig {
         &self.cfg
+    }
+    fn cfg_mut(&mut self) -> &mut MilConfig {
+        &mut self.cfg
     }
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1688,6 +1759,9 @@ impl WeightSource for ModelWeights {
 impl WeightSource for QuantizedModelWeights {
     fn cfg(&self) -> &MilConfig {
         &self.cfg
+    }
+    fn cfg_mut(&mut self) -> &mut MilConfig {
+        &mut self.cfg
     }
     fn n_layers(&self) -> usize {
         self.layers.len()
@@ -1899,9 +1973,33 @@ fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
 }
 
 fn fp16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect()
+    fp16_bytes_to_f32_neon(data)
+}
+
+/// Batch convert f32 slice to fp16 bytes.
+///
+/// Uses `half::slice::to_le_bytes` for efficient batch conversion.
+/// Returns `Vec<u8>` of length `src.len() * 2`.
+pub fn f32_to_fp16_bytes_neon(src: &[f32]) -> Vec<u8> {
+    let fp16s: Vec<half::f16> = src.iter().map(|&v| half::f16::from_f32(v)).collect();
+    let mut dst = vec![0u8; src.len() * 2];
+    for (i, h) in fp16s.iter().enumerate() {
+        dst[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+    }
+    dst
+}
+
+/// Batch convert fp16 bytes to f32 vec.
+///
+/// Uses `half::f16` for conversion. On aarch64, the `half` crate
+/// leverages hardware fp16 support for each conversion.
+pub fn fp16_bytes_to_f32_neon(data: &[u8]) -> Vec<f32> {
+    let n = data.len() / 2;
+    let mut dst = vec![0.0f32; n];
+    for j in 0..n {
+        dst[j] = half::f16::from_le_bytes([data[j * 2], data[j * 2 + 1]]).to_f32();
+    }
+    dst
 }
 
 fn vec_sub(a: &[f32], b: &[f32]) -> Vec<f32> {

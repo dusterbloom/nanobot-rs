@@ -109,11 +109,7 @@ pub fn silu_bwd(dh1: &mut [f32], dh3: &mut [f32], dsilu: &[f32], h1: &[f32], h3:
 ///
 /// Forward: gated_out = attn_out * sigmoid(gate_raw)
 /// Backward: d_attn = da * sig, d_gate = da * attn_out * sig * (1 - sig)
-fn sigmoid_gate_backward(
-    da: &[f32],
-    gate_raw: &[f32],
-    pre_gate: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
+fn sigmoid_gate_backward(da: &[f32], gate_raw: &[f32], pre_gate: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let n = da.len();
     debug_assert_eq!(gate_raw.len(), n);
     debug_assert_eq!(pre_gate.len(), n);
@@ -206,7 +202,7 @@ fn matmul_accum_at(dw: &mut [f32], a: &[f32], b: &[f32], r: usize, c: usize, s: 
 pub struct BackwardKernels {
     pub ffn_bwd_w2t: AneKernel,  // DynMatmul(dim, hidden) — dffn @ W2^T
     pub ffn_bwd_w13t: AneKernel, // Fused dh1@W1^T + dh3@W3^T
-    pub wot_bwd: AneKernel,      // DynMatmul(dim, dim) — dx2 @ Wo^T
+    pub wot_bwd: AneKernel,      // DynMatmul(dim, attn_dim) — dx2 @ Wo^T
     pub sdpa_bwd1: AneKernel,    // fp16: recompute softmax + dV + dp
     pub sdpa_bwd2: AneKernel,    // fp16: softmax bwd → dQ, dK
     pub qkv_bwd: AneKernel,      // Fused dq@Wq^T + dk@Wk^T + dv@Wv^T
@@ -235,7 +231,7 @@ impl BackwardKernels {
             &[w13t_spec.output_bytes],
         )?;
 
-        // wot_bwd: DynMatmul(dim, dim)
+        // wot_bwd: DynMatmul(dim, attn_dim)
         let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
         let wot_bwd = AneKernel::compile(
             &wot_spec.mil_text,
@@ -507,8 +503,9 @@ pub fn backward<T: ane_forward::TokenId>(
         // --- Attention backward ---
 
         // h. ANE wot_bwd: da = dx2 @ Wo^T
-        let wot = ane_weights::transpose_weight(&lw.wo, dim, dim);
-        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, dim, seq);
+        let ad = cfg.attn_dim();
+        let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
+        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
         let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
         kernels.wot_bwd.write_input(0, &wot_input);
 
@@ -523,8 +520,9 @@ pub fn backward<T: ane_forward::TokenId>(
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // i. CPU dWo accumulation: dWo[dim,dim] += dx2[dim,seq] @ attn_out^T[dim,seq]
-        matmul_accum_at(&mut gr.dwo, &dx2, &ac.attn_out, dim, dim, seq);
+        // i. CPU dWo accumulation: dWo[dim,attn_dim] += dx2[dim,seq] @ attn_out^T[attn_dim,seq]
+        let ad = cfg.attn_dim();
+        matmul_accum_at(&mut gr.dwo, &dx2, &ac.attn_out, dim, ad, seq);
 
         // j. ANE sdpa_bwd1: pack(Q, K, V, da) -> (dV, probs_raw, dp_raw)
         let bwd1_input = ane_weights::pack_sdpa_bwd1(&ac.q, &ac.k, &ac.v, &da, cfg);
@@ -796,15 +794,22 @@ pub fn backward_lora_cpu<T: ane_forward::TokenId>(
     lora: &super::ane_lora::LoraModel,
     tokens: &[T],
 ) -> BackwardResultWithLora {
-    backward_lora_cpu_generic(model, fwd, lora, tokens)
+    backward_lora_cpu_generic(model, fwd, lora, tokens, 0.0, 1.0)
 }
 
 /// Backward pass generic over weight source (supports both full and quantized weights).
+///
+/// Includes training stability features: logit softcap backward and loss scaling.
+///
+/// `softcap`: must match the value used in forward (0.0 disables)
+/// `loss_scale`: multiply dlogits by this factor, divide LoRA grads at end (1.0 disables)
 pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::WeightSource>(
     model: &W,
     fwd: &ane_forward::ForwardResultWithLora,
     lora: &super::ane_lora::LoraModel,
     tokens: &[T],
+    softcap: f32,
+    loss_scale: f32,
 ) -> BackwardResultWithLora {
     use super::ane_lora;
 
@@ -815,9 +820,19 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     let seq = cfg.seq_len;
     let n_layers = model.n_layers();
     let scale = lora.scale();
+    let apply_loss_scale = (loss_scale - 1.0).abs() > f32::EPSILON;
 
     // Base model weights are frozen — skip the 5.9 GB gradient allocation.
     let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
+
+    // Clone and modify dlogits: apply softcap backward + loss scaling
+    let mut dlogits = fwd.base.dlogits.clone();
+    logit_softcap_bwd(&mut dlogits, &fwd.base.logits, softcap);
+    if apply_loss_scale {
+        for v in dlogits.iter_mut() {
+            *v *= loss_scale;
+        }
+    }
 
     // Reconstruct x_cur from last layer
     let last_act = &fwd.base.layer_acts[n_layers - 1];
@@ -841,7 +856,7 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     classifier_bwd(
         &mut dy,
         &mut _dcls,
-        &fwd.base.dlogits,
+        &dlogits,
         cls_w,
         &x_final,
         model.vocab_size(),
@@ -894,30 +909,57 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             // FFN backward through quantized weights
             let mut dsilu = vec![0.0f32; ql.w2.cols * seq];
             ane_forward::cpu_quantized_matmul_lhs_transposed_into(
-                &ql.w2, &dffn, seq, &mut dsilu, &mut quantized_workspace, false,
+                &ql.w2,
+                &dffn,
+                seq,
+                &mut dsilu,
+                &mut quantized_workspace,
+                false,
             );
             let mut dh1 = vec![0.0f32; hidden * seq];
             let mut dh3 = vec![0.0f32; hidden * seq];
             silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
             let mut dx_ffn = vec![0.0f32; ql.w1.cols * seq];
             ane_forward::cpu_quantized_matmul_lhs_transposed_into(
-                &ql.w1, &dh1, seq, &mut dx_ffn, &mut quantized_workspace, false,
+                &ql.w1,
+                &dh1,
+                seq,
+                &mut dx_ffn,
+                &mut quantized_workspace,
+                false,
             );
             ane_forward::cpu_quantized_matmul_lhs_transposed_into(
-                &ql.w3, &dh3, seq, &mut dx_ffn, &mut quantized_workspace, true,
+                &ql.w3,
+                &dh3,
+                seq,
+                &mut dx_ffn,
+                &mut quantized_workspace,
+                true,
             );
             let mut dx2 = vec![0.0f32; dim * seq];
             rmsnorm_bwd(
-                &mut dx2, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2,
-                &ql.rms_ffn, dim, seq, cfg.rms_eps,
+                &mut dx2,
+                &mut vec![0.0f32; dim],
+                &dx_ffn,
+                &ac.x2,
+                &ql.rms_ffn,
+                dim,
+                seq,
+                cfg.rms_eps,
             );
             ane_forward::vec_add_inplace(&mut dx2, &dy);
             // Skip attention backward entirely for GDN — gradient flows
             // through the residual connection only (dx2 already includes dy).
             let mut dx_rms1 = vec![0.0f32; dim * seq];
             rmsnorm_bwd(
-                &mut dx_rms1, &mut vec![0.0f32; dim], &dx2, &ac.layer_in,
-                &ql.rms_att, dim, seq, cfg.rms_eps,
+                &mut dx_rms1,
+                &mut vec![0.0f32; dim],
+                &dx2,
+                &ac.layer_in,
+                &ql.rms_att,
+                dim,
+                seq,
+                cfg.rms_eps,
             );
             dy = dx_rms1;
             continue;
@@ -1262,6 +1304,27 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         ane_forward::vec_add_inplace(&mut dy, &dx2);
     }
 
+    // Divide LoRA gradients by loss_scale to compensate for scaled dlogits
+    if apply_loss_scale {
+        let inv_scale = 1.0 / loss_scale;
+        for layer_grads in &mut lora_grads.layers {
+            let scale_grads = |g: &mut Option<ane_lora::LoraAdapterGrads>| {
+                if let Some(ref mut grads) = g {
+                    for v in grads.da.iter_mut() {
+                        *v *= inv_scale;
+                    }
+                    for v in grads.db.iter_mut() {
+                        *v *= inv_scale;
+                    }
+                }
+            };
+            scale_grads(&mut layer_grads.wq);
+            scale_grads(&mut layer_grads.wv);
+            scale_grads(&mut layer_grads.wo);
+            scale_grads(&mut layer_grads.w2);
+        }
+    }
+
     BackwardResultWithLora {
         model_grads: None,
         lora_grads,
@@ -1431,8 +1494,9 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         }
 
         // Continue backward chain for next layer
-        let wot = ane_weights::transpose_weight(&lw.wo, dim, dim);
-        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, dim, seq);
+        let ad = cfg.attn_dim();
+        let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
+        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
         let wot_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Wot);
         kernels.wot_bwd.write_input(0, &wot_input);
         kernels
@@ -1558,6 +1622,354 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         model_grads: Some(model_grads),
         lora_grads,
     })
+}
+
+// ---------------------------------------------------------------------------
+// ANE-accelerated backward (CPU attention backward + ANE FFN backward)
+// ---------------------------------------------------------------------------
+
+/// Logit softcap backward: chain-rule through cap * tanh(raw / cap).
+/// Multiplies dlogits by (1 - (logits / cap)²) where logits are post-softcap.
+pub fn logit_softcap_bwd(dlogits: &mut [f32], logits: &[f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    for (dl, l) in dlogits.iter_mut().zip(logits.iter()) {
+        let t = *l * inv_cap; // = tanh(raw/cap) since logits are capped
+        *dl *= 1.0 - t * t;
+    }
+}
+
+/// ANE-accelerated backward pass generic over weight source.
+///
+/// Uses ANE for FFN weight-transpose matmuls (W2^T, W1^T+W3^T) and CPU for
+/// attention backward (handles GQA, GDN, QK-norm, attn_output_gate).
+/// Includes training stability features: logit softcap backward, loss scaling,
+/// and scaled residual backward.
+///
+/// `softcap`: must match the value used in forward_ane_generic (0.0 disables)
+/// `loss_scale`: multiply dlogits by this factor, divide LoRA grads at end (1.0 disables)
+/// `residual_scale`: must match forward_ane_generic (1.0 disables)
+pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::WeightSource>(
+    bwd_kernels: &BackwardKernels,
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    tokens: &[T],
+    softcap: f32,
+    loss_scale: f32,
+    residual_scale: f32,
+) -> BackwardResultWithLora {
+    use super::ane_lora;
+
+    let cfg = model.cfg();
+    let dim = model.actual_dim();
+    let hidden = model.actual_hidden_dim();
+    let seq = cfg.seq_len;
+    let n_layers = model.n_layers();
+    let scale = lora.scale();
+    let apply_res_scale = (residual_scale - 1.0).abs() > f32::EPSILON;
+    let apply_loss_scale = (loss_scale - 1.0).abs() > f32::EPSILON;
+
+    let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
+
+    // Clone and modify dlogits: apply softcap backward + loss scaling
+    let mut dlogits = fwd.base.dlogits.clone();
+    logit_softcap_bwd(&mut dlogits, &fwd.base.logits, softcap);
+    if apply_loss_scale {
+        for v in dlogits.iter_mut() {
+            *v *= loss_scale;
+        }
+    }
+
+    // Reconstruct x_cur from last layer
+    let last_act = &fwd.base.layer_acts[n_layers - 1];
+    let mut x_cur = last_act.x2.clone();
+    ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
+    if apply_res_scale {
+        for v in x_cur.iter_mut() {
+            *v *= residual_scale;
+        }
+    }
+
+    let mut x_final = vec![0.0f32; dim * seq];
+    ane_forward::rmsnorm(
+        &mut x_final,
+        &x_cur,
+        model.rms_final(),
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
+
+    // Classifier backward
+    let cls_w = model.lm_head().unwrap_or(model.embed());
+    let mut dy = vec![0.0f32; dim * seq];
+    let mut _dcls = vec![0.0f32; cls_w.len()];
+    classifier_bwd(
+        &mut dy,
+        &mut _dcls,
+        &dlogits,
+        cls_w,
+        &x_final,
+        model.vocab_size(),
+        dim,
+        seq,
+    );
+
+    // Final RMSNorm backward
+    let mut dx_rms = vec![0.0f32; dim * seq];
+    rmsnorm_bwd(
+        &mut dx_rms,
+        &mut vec![0.0f32; dim],
+        &dy,
+        &x_cur,
+        model.rms_final(),
+        dim,
+        seq,
+        cfg.rms_eps,
+    );
+    dy = dx_rms;
+
+    // Per-layer backward (reverse)
+    for l in (0..n_layers).rev() {
+        let ac = &fwd.base.layer_acts[l];
+        let la = &fwd.lora_acts[l];
+
+        // Apply residual_scale to dy for FFN residual backward
+        let dz_ffn = if apply_res_scale {
+            dy.iter().map(|&v| v * residual_scale).collect::<Vec<_>>()
+        } else {
+            dy.clone()
+        };
+        let dffn = dz_ffn.clone();
+
+        // --- LoRA W2 backward (CPU) ---
+        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) = (
+            lora.layers[l].w2.as_ref(),
+            la.w2_x.as_ref(),
+            la.w2_h.as_ref(),
+            lora_grads.layers[l].w2.as_mut(),
+        ) {
+            let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
+            let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
+        }
+
+        // Dequantize layer for ANE FFN backward
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
+
+        // --- FFN backward on ANE: dsilu = dffn @ W2^T ---
+        let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
+        let w2t_input = ane_weights::pack_dyn_matmul(&dffn, &w2_for_pack, dim, hidden, seq);
+        let w2t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW2t);
+        bwd_kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
+        bwd_kernels
+            .ffn_bwd_w2t
+            .eval()
+            .unwrap_or_else(|e| tracing::warn!("ANE ffn_bwd_w2t failed: {e}"));
+        let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
+        bwd_kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
+        let dsilu: Vec<f32> = w2t_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // SiLU backward (CPU)
+        let mut dh1 = vec![0.0f32; hidden * seq];
+        let mut dh3 = vec![0.0f32; hidden * seq];
+        silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
+
+        // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T ---
+        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
+        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
+        let w13t_input = ane_weights::pack_ffn_bwd_w13t(&dh1, &dh3, &w1t, &w3t, cfg);
+        let w13t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW13t);
+        bwd_kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
+        bwd_kernels
+            .ffn_bwd_w13t
+            .eval()
+            .unwrap_or_else(|e| tracing::warn!("ANE ffn_bwd_w13t failed: {e}"));
+        let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
+        bwd_kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
+        let dx_ffn: Vec<f32> = w13t_out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // RMSNorm backward (FFN, CPU)
+        let mut dx2 = vec![0.0f32; dim * seq];
+        rmsnorm_bwd(
+            &mut dx2,
+            &mut vec![0.0f32; dim],
+            &dx_ffn,
+            &ac.x2,
+            &lw.rms_ffn,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
+        ane_forward::vec_add_inplace(&mut dx2, &dz_ffn);
+
+        // Apply residual_scale for attention residual backward
+        if apply_res_scale {
+            for v in dx2.iter_mut() {
+                *v *= residual_scale;
+            }
+        }
+
+        // --- LoRA Wo backward (CPU) ---
+        if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
+            lora.layers[l].wo.as_ref(),
+            la.wo_x.as_ref(),
+            la.wo_h.as_ref(),
+            lora_grads.layers[l].wo.as_mut(),
+        ) {
+            let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
+            let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
+            for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                *g += v;
+            }
+            for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                *g += v;
+            }
+        }
+
+        // --- Attention backward (CPU — handles GQA, GDN, QK-norm, attn_output_gate) ---
+        if lw.gdn.is_some() {
+            // GDN layers: skip attention backward, gradient flows through residual only
+            let mut dx_rms1 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx_rms1,
+                &mut vec![0.0f32; dim],
+                &dx2,
+                &ac.layer_in,
+                &lw.rms_att,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
+            dy = dx_rms1;
+            continue;
+        }
+
+        // CPU: da = dx2 @ Wo^T
+        let ad = cfg.attn_dim();
+        let da = ane_forward::cpu_matmul_lhs_transposed(&lw.wo, dim, ad, &dx2, seq);
+
+        // Attn output gate backward (Qwen3.5)
+        let (da, d_gate) = if cfg.attn_output_gate {
+            let gate_raw = ac.attn_gate.as_ref().unwrap();
+            let pre_gate = ac.attn_pre_gate.as_ref().unwrap();
+            let (d_attn, dg) = sigmoid_gate_backward(&da, gate_raw, pre_gate);
+            (d_attn, Some(dg))
+        } else {
+            (da, None)
+        };
+
+        // CPU SDPA backward
+        let (mut dq, mut dk, _dv) =
+            cpu_sdpa_backward(&da, &ac.q, &ac.k, &ac.v, cfg.n_heads, cfg.head_dim(), seq);
+
+        // RoPE backward
+        ane_forward::rope_backward(
+            &mut dq,
+            &mut dk,
+            cfg.n_heads,
+            cfg.head_dim(),
+            seq,
+            cfg.rope_theta,
+        );
+
+        // QK-norm backward
+        if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dq,
+                &mut vec![0.0f32; cfg.head_dim()],
+                q_pre,
+                q_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
+        }
+        if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
+            ane_forward::qk_rmsnorm_bwd(
+                &mut dk,
+                &mut vec![0.0f32; cfg.head_dim()],
+                k_pre,
+                k_nw,
+                cfg.n_heads,
+                cfg.head_dim(),
+                seq,
+                cfg.rms_eps,
+            );
+        }
+
+        // Merge d_gate back with dq for wq backward (Qwen3.5 attn_output_gate)
+        let dq_for_wq = if let Some(dg) = &d_gate {
+            ane_forward::merge_q_gate(&dq, dg, cfg.n_heads, cfg.head_dim(), seq)
+        } else {
+            dq
+        };
+
+        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
+        let mut dx_attn =
+            ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq_for_wq, seq);
+        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
+        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq);
+        ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
+        ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
+
+        // RMSNorm backward (attention)
+        let mut dx_rms1 = vec![0.0f32; dim * seq];
+        rmsnorm_bwd(
+            &mut dx_rms1,
+            &mut vec![0.0f32; dim],
+            &dx_attn,
+            &ac.layer_in,
+            &lw.rms_att,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
+        dy = dx_rms1;
+        ane_forward::vec_add_inplace(&mut dy, &dx2);
+    }
+
+    // Divide LoRA gradients by loss_scale to compensate for scaled dlogits
+    if apply_loss_scale {
+        let inv_scale = 1.0 / loss_scale;
+        for layer_grads in &mut lora_grads.layers {
+            let scale_grads = |g: &mut Option<ane_lora::LoraAdapterGrads>| {
+                if let Some(ref mut grads) = g {
+                    for v in grads.da.iter_mut() {
+                        *v *= inv_scale;
+                    }
+                    for v in grads.db.iter_mut() {
+                        *v *= inv_scale;
+                    }
+                }
+            };
+            scale_grads(&mut layer_grads.wq);
+            scale_grads(&mut layer_grads.wv);
+            scale_grads(&mut layer_grads.wo);
+            scale_grads(&mut layer_grads.w2);
+        }
+    }
+
+    BackwardResultWithLora {
+        model_grads: None,
+        lora_grads,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1957,8 +2369,8 @@ mod tests {
         let quantized_fwd =
             ane_forward::forward_cpu_generic(&quantized, Some(&lora), &tokens, &targets);
         let dense_fwd = ane_forward::forward_cpu_generic(&dense, Some(&lora), &tokens, &targets);
-        let quantized_bwd = backward_lora_cpu_generic(&quantized, &quantized_fwd, &lora, &tokens);
-        let dense_bwd = backward_lora_cpu_generic(&dense, &dense_fwd, &lora, &tokens);
+        let quantized_bwd = backward_lora_cpu_generic(&quantized, &quantized_fwd, &lora, &tokens, 0.0, 1.0);
+        let dense_bwd = backward_lora_cpu_generic(&dense, &dense_fwd, &lora, &tokens, 0.0, 1.0);
 
         let q_w2 = quantized_bwd.lora_grads.layers[0].w2.as_ref().unwrap();
         let d_w2 = dense_bwd.lora_grads.layers[0].w2.as_ref().unwrap();
@@ -2304,6 +2716,125 @@ mod tests {
         assert!(
             dembed_nonzero > 0,
             "dembed should have nonzero entries from embed_bwd"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Loss scaling: 2x dlogits should produce 2x gradients (linearity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_loss_scaling_produces_proportional_lora_gradients() {
+        let cfg = MilConfig {
+            dim: 8,
+            hidden_dim: 16,
+            n_heads: 4,
+            seq_len: 3,
+            n_kv_heads: 4,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            head_dim_explicit: 8 / 4,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: false,
+        };
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let vocab = 10;
+
+        let make_vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.173).sin() * 0.2)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make_vals(dim * dim, 0),
+                wk: make_vals(dim * dim, 100),
+                wv: make_vals(dim * dim, 200),
+                wo: make_vals(dim * dim, 300),
+                w1: make_vals(hidden * dim, 400),
+                w2: make_vals(dim * hidden, 500),
+                w3: make_vals(hidden * dim, 600),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_vals(vocab * dim, 700),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let lora = LoraModel::new(
+            LoraConfig {
+                rank: 4,
+                alpha: 4.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            dim,
+            hidden,
+        );
+
+        let tokens = vec![1u16, 2, 3];
+        let targets = vec![2u16, 3, 4];
+
+        // Run forward twice (identical — deterministic) to get independent results
+        let fwd_1x = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+        let mut fwd_2x = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+
+        // Scale dlogits on the second by 2x (simulates loss_scale=2.0)
+        for v in fwd_2x.base.dlogits.iter_mut() {
+            *v *= 2.0;
+        }
+
+        // Backward both
+        let bwd_1x = backward_lora_cpu_generic(&model, &fwd_1x, &lora, &tokens, 0.0, 1.0);
+        let bwd_2x = backward_lora_cpu_generic(&model, &fwd_2x, &lora, &tokens, 0.0, 1.0);
+
+        // All LoRA grads in 2x should be exactly 2x those in 1x (backward is linear in dlogits)
+        let check_proportional = |name: &str,
+                                   g1: &Option<crate::agent::ane_lora::LoraAdapterGrads>,
+                                   g2: &Option<crate::agent::ane_lora::LoraAdapterGrads>| {
+            if let (Some(g1), Some(g2)) = (g1, g2) {
+                for (i, (a, b)) in g1.da.iter().zip(g2.da.iter()).enumerate() {
+                    let expected = a * 2.0;
+                    let err = (b - expected).abs();
+                    assert!(
+                        err < 1e-4,
+                        "{name}.da[{i}]: 1x={a:.6}, 2x={b:.6}, expected={expected:.6}"
+                    );
+                }
+                for (i, (a, b)) in g1.db.iter().zip(g2.db.iter()).enumerate() {
+                    let expected = a * 2.0;
+                    let err = (b - expected).abs();
+                    assert!(
+                        err < 1e-4,
+                        "{name}.db[{i}]: 1x={a:.6}, 2x={b:.6}, expected={expected:.6}"
+                    );
+                }
+            }
+        };
+
+        check_proportional(
+            "wo",
+            &bwd_1x.lora_grads.layers[0].wo,
+            &bwd_2x.lora_grads.layers[0].wo,
+        );
+        check_proportional(
+            "w2",
+            &bwd_1x.lora_grads.layers[0].w2,
+            &bwd_2x.lora_grads.layers[0].w2,
         );
     }
 }

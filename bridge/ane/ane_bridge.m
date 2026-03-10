@@ -8,6 +8,10 @@
 #import <IOSurface/IOSurface.h>
 #include "ane_bridge.h"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 // --- Private class references ---
 static Class g_ANEDesc = nil;
 static Class g_ANEInMem = nil;
@@ -296,11 +300,24 @@ uint8_t *ane_bridge_build_weight_blob(const float *src, int rows, int cols,
     *(uint32_t*)(buf + 72) = wsize;
     *(uint32_t*)(buf + 80) = 128;
 
-    // Convert float32 -> float16
+    // Convert float32 -> float16 (NEON-vectorized: 4 values per cycle)
     _Float16 *fp16 = (_Float16 *)(buf + 128);
-    for (int i = 0; i < rows * cols; i++) {
+    int count = rows * cols;
+#if defined(__aarch64__)
+    int i = 0;
+    for (; i + 3 < count; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        float16x4_t h = vcvt_f16_f32(v);
+        vst1_f16((__fp16 *)(fp16 + i), h);
+    }
+    for (; i < count; i++) {
         fp16[i] = (_Float16)src[i];
     }
+#else
+    for (int i = 0; i < count; i++) {
+        fp16[i] = (_Float16)src[i];
+    }
+#endif
 
     *out_len = total;
     return buf;
@@ -318,10 +335,31 @@ uint8_t *ane_bridge_build_weight_blob_transposed(const float *src, int rows, int
     *(uint32_t*)(buf + 72) = wsize;
     *(uint32_t*)(buf + 80) = 128;
 
+    // Convert float32 -> float16 with transpose (NEON for inner loop)
     _Float16 *fp16 = (_Float16 *)(buf + 128);
+#if defined(__aarch64__)
+    for (int i = 0; i < rows; i++) {
+        int j = 0;
+        for (; j + 3 < cols; j += 4) {
+            float32x4_t v = vld1q_f32(src + i * cols + j);
+            float16x4_t h = vcvt_f16_f32(v);
+            // Scatter-store transposed (can't vectorize the scatter)
+            __fp16 tmp[4];
+            vst1_f16(tmp, h);
+            fp16[(j+0) * rows + i] = (_Float16)tmp[0];
+            fp16[(j+1) * rows + i] = (_Float16)tmp[1];
+            fp16[(j+2) * rows + i] = (_Float16)tmp[2];
+            fp16[(j+3) * rows + i] = (_Float16)tmp[3];
+        }
+        for (; j < cols; j++) {
+            fp16[j * rows + i] = (_Float16)src[i * cols + j];
+        }
+    }
+#else
     for (int i = 0; i < rows; i++)
         for (int j = 0; j < cols; j++)
             fp16[j * rows + i] = (_Float16)src[i * cols + j];
+#endif
 
     *out_len = total;
     return buf;

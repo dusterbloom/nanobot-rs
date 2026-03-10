@@ -151,6 +151,66 @@ pub struct AneTrainingConfig {
     pub linear_attn_indices: Vec<usize>,
     /// KV projection dim for GQA. `n_kv_heads * head_dim`. Equals `dim` for MHA.
     pub kv_dim: usize,
+    /// Logit softcapping cap (15.0 recommended, 0.0 disables). Default 15.0.
+    pub softcap: f32,
+    /// Loss scaling factor (256.0 recommended, 1.0 disables). Default 256.0.
+    pub loss_scale: f32,
+    /// Attention LoRA LR multiplier (0.05 recommended). Default 0.05.
+    pub lr_scale_attn: f32,
+    /// FFN LoRA LR multiplier (1.0 recommended). Default 1.0.
+    pub lr_scale_ffn: f32,
+    /// Residual scaling factor (1.0/sqrt(2*n_layers) recommended, 1.0 disables). Default: 0.0 = auto-compute.
+    pub residual_scale: f32,
+}
+
+/// Seq-len bucket sizes for ANE kernel compilation. Samples are padded to
+/// the nearest bucket. Keeps compilation count low (3 × 10 = 30 kernels).
+const BUCKET_SIZES: &[usize] = &[128, 256, 512];
+
+/// Pre-compiled forward + backward kernels for multiple seq_len buckets.
+pub struct BucketKernels {
+    pub buckets: Vec<(usize, super::ane_forward::CompiledKernels, super::ane_backward::BackwardKernels)>,
+}
+
+impl BucketKernels {
+    /// Compile kernel sets for buckets that cover the given sample lengths.
+    pub fn compile(sample_lens: &[usize], base_cfg: &super::ane_mil::MilConfig) -> Result<Self, String> {
+        let mut needed: Vec<usize> = Vec::new();
+        for &sl in sample_lens {
+            let bucket = BUCKET_SIZES.iter().copied().find(|&b| b >= sl)
+                .unwrap_or(*BUCKET_SIZES.last().unwrap());
+            if !needed.contains(&bucket) {
+                needed.push(bucket);
+            }
+        }
+        needed.sort();
+
+        let mut buckets = Vec::new();
+        for bucket_seq in needed {
+            let mut cfg = base_cfg.clone();
+            cfg.seq_len = bucket_seq;
+            let fwd = super::ane_forward::CompiledKernels::compile_forward(&cfg)?;
+            let bwd = super::ane_backward::BackwardKernels::compile_backward(&cfg, &fwd.mask_blob)?;
+            tracing::info!("ANE train: compiled kernels for seq_len={bucket_seq}");
+            buckets.push((bucket_seq, fwd, bwd));
+        }
+
+        Ok(BucketKernels { buckets })
+    }
+
+    /// Get the kernel set for a given sequence length (rounds up to nearest bucket).
+    pub fn get(&self, seq_len: usize) -> &(usize, super::ane_forward::CompiledKernels, super::ane_backward::BackwardKernels) {
+        self.buckets.iter()
+            .find(|(bs, _, _)| *bs >= seq_len)
+            .unwrap_or(self.buckets.last().unwrap())
+    }
+}
+
+/// Pad a token sequence to `target_len` with zeros.
+fn pad_to(tokens: &[u32], target_len: usize) -> Vec<u32> {
+    let mut padded = tokens.to_vec();
+    padded.resize(target_len, 0);
+    padded
 }
 
 /// Spawn a dedicated thread that trains LoRA on CPU/ANE, then sends
@@ -173,11 +233,19 @@ pub fn spawn_ane_training(
     std::thread::Builder::new()
         .name("ane-lora-train".into())
         .spawn(move || {
+            // Drop thread to background QoS so training doesn't compete with
+            // MLX inference for CPU time. On macOS this tells the scheduler to
+            // yield to higher-priority work (UI, inference, networking).
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+
             use super::ane_backward;
             use super::ane_forward;
             use super::ane_lora::{
-                self, load_lora_bin, lora_adam_update, save_lora_bin, LoraConfig, LoraModel,
-                LoraModelAdam,
+                self, load_lora_bin, lora_adam_update, lora_adam_update_split_lr, save_lora_bin,
+                LoraConfig, LoraModel, LoraModelAdam,
             };
             use super::ane_weights::{QuantizedModelWeights, WeightSource};
 
@@ -208,7 +276,8 @@ pub fn spawn_ane_training(
             let lora_dir = dirs::home_dir()
                 .unwrap_or_default()
                 .join(".nanobot/workspace/lora");
-            let model_key = cfg.model_dir
+            let model_key = cfg
+                .model_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "default".into());
@@ -238,11 +307,42 @@ pub fn spawn_ane_training(
                 }
             } else {
                 tracing::info!("ANE train: new LoRA for model {model_key}");
-                LoraModel::with_full_dims(LoraConfig::default(), n_layers, dim, cfg.mil_config.kv_dim(), cfg.mil_config.attn_dim(), cfg.mil_config.q_proj_dim(), hidden_dim)
+                LoraModel::with_full_dims(
+                    LoraConfig::default(),
+                    n_layers,
+                    dim,
+                    cfg.mil_config.kv_dim(),
+                    cfg.mil_config.attn_dim(),
+                    cfg.mil_config.q_proj_dim(),
+                    hidden_dim,
+                )
             };
             let mut adam = LoraModelAdam::zeros(&lora);
 
-            // 3. Train
+            // 3. Compile ANE kernels (bucket-based for variable seq_len)
+            let sample_lens: Vec<usize> = samples.iter().map(|(t, _)| t.len()).collect();
+            let bucket_kernels = match BucketKernels::compile(&sample_lens, &cfg.mil_config) {
+                Ok(bk) => {
+                    tracing::info!(
+                        "ANE train: compiled {} bucket(s) for ANE-accelerated training",
+                        bk.buckets.len()
+                    );
+                    Some(bk)
+                }
+                Err(e) => {
+                    tracing::warn!("ANE train: kernel compilation failed ({e}), falling back to CPU");
+                    None
+                }
+            };
+
+            let residual_scale = if cfg.residual_scale > 0.0 {
+                cfg.residual_scale
+            } else {
+                1.0 / (2.0 * n_layers as f32).sqrt()
+            };
+            let use_split_lr = cfg.lr_scale_attn != 1.0 || cfg.lr_scale_ffn != 1.0;
+
+            // 4. Train
             let n_samples = samples.len();
             let total_steps = n_samples * cfg.epochs;
             let patience = n_samples * 2;
@@ -251,8 +351,9 @@ pub fn spawn_ane_training(
             let mut stale_count = 0usize;
 
             tracing::info!(
-                "ANE train: {n_samples} samples, {total_steps} steps, lr={}",
-                cfg.lr
+                "ANE train: {n_samples} samples, {total_steps} steps, lr={}, mode={}",
+                cfg.lr,
+                if bucket_kernels.is_some() { "ANE" } else { "CPU" },
             );
 
             'outer: for _epoch in 0..cfg.epochs {
@@ -260,37 +361,95 @@ pub fn spawn_ane_training(
                     let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
                     let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
-                    // forward_cpu reads seq_len from cfg — update per sample
-                    model.cfg.seq_len = tokens_u32.len();
+                    let (fwd, bwd) = if let Some(ref bk) = bucket_kernels {
+                        // ANE path: pad to bucket, use ANE forward/backward
+                        let (bucket_seq, fwd_k, bwd_k) = bk.get(tokens_u32.len());
+                        let tok_pad = pad_to(&tokens_u32, *bucket_seq);
+                        let tgt_pad = pad_to(&targets_u32, *bucket_seq);
+                        model.cfg.seq_len = *bucket_seq;
 
-                    let fwd = ane_forward::forward_cpu_generic(
-                        &model,
-                        Some(&lora),
-                        &tokens_u32,
-                        &targets_u32,
-                    );
+                        let fwd = match ane_forward::forward_ane_generic(
+                            fwd_k,
+                            &model,
+                            Some(&lora),
+                            &tok_pad,
+                            &tgt_pad,
+                            cfg.softcap,
+                            residual_scale,
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::warn!("ANE forward failed ({e}), falling back to CPU");
+                                model.cfg.seq_len = tokens_u32.len();
+                                ane_forward::forward_cpu_generic(
+                                    &model,
+                                    Some(&lora),
+                                    &tokens_u32,
+                                    &targets_u32,
+                                )
+                            }
+                        };
+
+                        let bwd = ane_backward::backward_lora_ane_generic(
+                            bwd_k,
+                            &model,
+                            &fwd,
+                            &lora,
+                            &tok_pad,
+                            cfg.softcap,
+                            cfg.loss_scale,
+                            residual_scale,
+                        );
+                        (fwd, bwd)
+                    } else {
+                        // CPU fallback path (existing behavior)
+                        model.cfg.seq_len = tokens_u32.len();
+                        let fwd = ane_forward::forward_cpu_generic(
+                            &model,
+                            Some(&lora),
+                            &tokens_u32,
+                            &targets_u32,
+                        );
+                        let bwd = ane_backward::backward_lora_cpu_generic(
+                            &model, &fwd, &lora, &tokens_u32, cfg.softcap, cfg.loss_scale,
+                        );
+                        (fwd, bwd)
+                    };
+
                     let loss = fwd.base.loss;
-
                     if !loss.is_finite() {
                         tracing::warn!("ANE train: NaN/Inf loss at step {step}, stopping");
                         break 'outer;
                     }
 
-                    let bwd =
-                        ane_backward::backward_lora_cpu_generic(&model, &fwd, &lora, &tokens_u32);
-
                     step += 1;
-                    lora_adam_update(
-                        &mut lora,
-                        &bwd.lora_grads,
-                        &mut adam,
-                        step,
-                        cfg.lr,
-                        0.9,
-                        0.999,
-                        1e-8,
-                        0.01,
-                    );
+                    if use_split_lr {
+                        lora_adam_update_split_lr(
+                            &mut lora,
+                            &bwd.lora_grads,
+                            &mut adam,
+                            step,
+                            cfg.lr,
+                            cfg.lr_scale_attn,
+                            cfg.lr_scale_ffn,
+                            0.9,
+                            0.999,
+                            1e-8,
+                            0.01,
+                        );
+                    } else {
+                        lora_adam_update(
+                            &mut lora,
+                            &bwd.lora_grads,
+                            &mut adam,
+                            step,
+                            cfg.lr,
+                            0.9,
+                            0.999,
+                            1e-8,
+                            0.01,
+                        );
+                    }
 
                     // Early stopping
                     if loss < best_loss {
@@ -685,6 +844,11 @@ mod tests {
             lr: 1e-5,
             linear_attn_indices: vec![],
             kv_dim: 8 * 128, // n_kv_heads=8, head_dim=128
+            softcap: 15.0,
+            loss_scale: 256.0,
+            lr_scale_attn: 0.05,
+            lr_scale_ffn: 1.0,
+            residual_scale: 0.0,
         };
 
         eprintln!("spawning ANE training thread...");
@@ -805,6 +969,11 @@ mod tests {
             lr: 1e-5,
             linear_attn_indices: vec![],
             kv_dim: 8 * 128,
+            softcap: 15.0,
+            loss_scale: 256.0,
+            lr_scale_attn: 0.05,
+            lr_scale_ffn: 1.0,
+            residual_scale: 0.0,
         };
         let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets)], ane_tx);
 

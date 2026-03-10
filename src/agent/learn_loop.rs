@@ -242,6 +242,15 @@ impl LearnLoop for DefaultLearnLoop {
                 return;
             }
 
+            // Skip if a training thread is already running to avoid piling up
+            // CPU-bound forward passes (each one pins a core + allocates GBs).
+            if let Some(ref tc) = train_counters {
+                if tc.training_active.load(Ordering::Relaxed) {
+                    debug!("perplexity_gate: skipping — training already in progress");
+                    return;
+                }
+            }
+
             let epochs = pg_config.train_epochs;
             let min_exp = pg_config.min_experiences.max(1); // 0 would LIMIT 0 → empty
 
@@ -427,6 +436,11 @@ fn build_ane_training_config(
                 lr: 1e-5,
                 linear_attn_indices: mc.linear_attn_indices.clone(),
                 kv_dim: mc.n_kv_heads * mc.head_dim,
+                softcap: 15.0,
+                loss_scale: 256.0,
+                lr_scale_attn: 0.05,
+                lr_scale_ffn: 1.0,
+                residual_scale: 0.0,
             });
         }
     }
@@ -444,6 +458,11 @@ fn build_ane_training_config(
             lr: 1e-5,
             linear_attn_indices: mc.linear_attn_indices.clone(),
             kv_dim: mc.n_kv_heads * mc.head_dim,
+            softcap: 15.0,
+            loss_scale: 256.0,
+            lr_scale_attn: 0.05,
+            lr_scale_ffn: 1.0,
+            residual_scale: 0.0,
         });
     }
 
