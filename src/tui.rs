@@ -14,6 +14,17 @@ use crate::agent::agent_loop::SharedCoreHandle;
 use crate::config::loader::load_config;
 
 // ============================================================================
+// Utility
+// ============================================================================
+
+/// Strip scheme (`http://` / `https://`) and trailing slash from a URL for display.
+pub fn shorten_url(url: &str) -> &str {
+    url.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+}
+
+// ============================================================================
 // ANSI Escape Sequences
 // ============================================================================
 
@@ -631,10 +642,7 @@ pub(crate) fn print_omlx_splash(api_base: &str) {
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     print_logo();
-    let short = api_base
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/');
+    let short = shorten_url(api_base);
     print!("  {BOLD}{YELLOW}oMLX{RESET} {DIM}{short}{RESET}\r\n");
     print!(
         "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",

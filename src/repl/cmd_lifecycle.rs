@@ -342,9 +342,7 @@ impl ReplContext {
                     endpoint,
                     peer_type,
                 } => {
-                    let short = endpoint
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
+                    let short = crate::tui::shorten_url(endpoint)
                         .split('/')
                         .next()
                         .unwrap_or(endpoint);
@@ -361,9 +359,7 @@ impl ReplContext {
                 ModelSource::File { .. } => "~/models/".to_string(),
                 ModelSource::Mlx { .. } => "MLX (Apple Silicon GPU)".to_string(),
                 ModelSource::Omlx { ref endpoint } => {
-                    let short = endpoint
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
+                    let short = crate::tui::shorten_url(endpoint)
                         .split('/')
                         .next()
                         .unwrap_or(endpoint);

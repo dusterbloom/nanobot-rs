@@ -1081,6 +1081,7 @@ pub fn merge_lora_to_disk(
     // 5. Merge: for each LoRA pair, find the corresponding base weight and apply delta.
     let mut merged_weights = base_weights;
     let mut merged_count = 0;
+    let scale_arr = Array::from_f32(scale as f32);
 
     for (adapter_key, (lora_a, lora_b)) in &lora_pairs {
         let (Some(a), Some(b)) = (lora_a, lora_b) else {
@@ -1090,8 +1091,8 @@ pub fn merge_lora_to_disk(
 
         // The base weight key is adapter_key + ".weight"
         let base_key = format!("{}.weight", adapter_key);
-        let base_w = match merged_weights.get(&base_key) {
-            Some(w) => w.clone(),
+        let base_w = match merged_weights.remove(&base_key) {
+            Some(w) => w,
             None => {
                 warn!("No base weight for {}, skipping", base_key);
                 continue;
@@ -1101,7 +1102,6 @@ pub fn merge_lora_to_disk(
         // delta = scale * (B @ A)  — B is [out, rank], A is [rank, in]
         let delta = mlx_rs::ops::matmul(b, a)
             .map_err(|e| anyhow::anyhow!("matmul for {}: {e}", adapter_key))?;
-        let scale_arr = Array::from_f32(scale as f32);
         let scaled_delta = mlx_rs::ops::multiply(&delta, &scale_arr)
             .map_err(|e| anyhow::anyhow!("scale for {}: {e}", adapter_key))?;
 
@@ -1121,6 +1121,10 @@ pub fn merge_lora_to_disk(
     }
 
     info!("Merged {} LoRA targets into base weights", merged_count);
+
+    // Free adapter data before eval materializes all merged tensors.
+    drop(lora_pairs);
+    drop(adapter_weights);
 
     // 6. Create output directory and copy non-weight files.
     std::fs::create_dir_all(output_dir)?;
