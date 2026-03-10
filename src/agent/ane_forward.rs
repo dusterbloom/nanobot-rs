@@ -4523,25 +4523,33 @@ mod tests {
         let bwd = super::super::ane_backward::backward_lora_ane_generic(
             &bwd_kernels, &model, &fwd_lora, &lora, &tokens, 0.0, 1.0, 1.0,
         );
-        // Verify we got non-zero gradients
+        // Check total grad norm including both dA and dB.
+        // dA=0 is expected on first backward with zero-initialized B (standard LoRA).
+        // dB should be non-zero because dB = d_out_grad @ h^T where h = A @ x ≠ 0.
         let total_grad_norm: f32 = bwd.lora_grads.layers.iter()
             .flat_map(|l| {
                 let mut norms = Vec::new();
-                if let Some(ref g) = l.wo { norms.push(g.da.iter().map(|v| v*v).sum::<f32>()); }
-                if let Some(ref g) = l.w2 { norms.push(g.da.iter().map(|v| v*v).sum::<f32>()); }
+                if let Some(ref g) = l.wo {
+                    norms.push(g.da.iter().map(|v| v*v).sum::<f32>());
+                    norms.push(g.db.iter().map(|v| v*v).sum::<f32>());
+                }
+                if let Some(ref g) = l.w2 {
+                    norms.push(g.da.iter().map(|v| v*v).sum::<f32>());
+                    norms.push(g.db.iter().map(|v| v*v).sum::<f32>());
+                }
                 norms
             })
             .sum::<f32>()
             .sqrt();
-        eprintln!("LoRA grad norm: {total_grad_norm:.6}");
-        if total_grad_norm.is_nan() {
-            eprintln!("WARNING: LoRA gradients are NaN — tiled backward kernels may have ANE compile issues");
-        } else {
-            assert!(
-                total_grad_norm > 0.0,
-                "LoRA gradients should be non-zero after backward"
-            );
-        }
+        eprintln!("LoRA grad norm (dA+dB): {total_grad_norm:.6}");
+        assert!(
+            !total_grad_norm.is_nan(),
+            "LoRA gradients contain NaN"
+        );
+        assert!(
+            total_grad_norm > 0.0,
+            "LoRA gradients should be non-zero after backward"
+        );
 
         eprintln!("E2E tiled forward+backward at Qwen3.5-4B: PASS");
     }
