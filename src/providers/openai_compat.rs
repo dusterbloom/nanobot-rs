@@ -1366,7 +1366,8 @@ async fn parse_sse_stream(
 ) {
     let mut line_buffer = String::new();
     let mut full_content = String::new();
-    let mut full_reasoning = String::new();
+    let mut full_reasoning = String::new(); // API reasoning_content field only
+    let mut full_inline_thinking = String::new(); // inline <think> tags — never used as fallback
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = String::from("stop");
     let mut got_done = false;
@@ -1410,7 +1411,7 @@ async fn parse_sse_stream(
                 got_done = true;
                 let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
                 if !tail_reasoning.is_empty() {
-                    full_reasoning.push_str(&tail_reasoning);
+                    full_inline_thinking.push_str(&tail_reasoning);
                     let _ = tx.send(StreamChunk::ThinkingDelta(tail_reasoning));
                 }
                 if !tail_content.is_empty() {
@@ -1434,6 +1435,12 @@ async fn parse_sse_stream(
                     );
                     Some(full_reasoning.clone())
                 } else {
+                    if !full_inline_thinking.is_empty() {
+                        debug!(
+                            "Streaming: discarding inline <think> blocks ({} chars), not using as content fallback",
+                            full_inline_thinking.len()
+                        );
+                    }
                     None
                 };
 
@@ -1505,7 +1512,7 @@ async fn parse_sse_stream(
                                 let (visible, inline_reasoning) =
                                     split_thinking_from_content_delta(&mut split_state, content);
                                 if !inline_reasoning.is_empty() {
-                                    full_reasoning.push_str(&inline_reasoning);
+                                    full_inline_thinking.push_str(&inline_reasoning);
                                     let _ = tx.send(StreamChunk::ThinkingDelta(inline_reasoning));
                                 }
                                 if !visible.is_empty() {
@@ -1557,7 +1564,7 @@ async fn parse_sse_stream(
 
     let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
     if !tail_reasoning.is_empty() {
-        full_reasoning.push_str(&tail_reasoning);
+        full_inline_thinking.push_str(&tail_reasoning);
         let _ = tx.send(StreamChunk::ThinkingDelta(tail_reasoning));
     }
     if !tail_content.is_empty() {
@@ -1574,9 +1581,11 @@ async fn parse_sse_stream(
     warn!(
         content_len = full_content.len(),
         reasoning_len = full_reasoning.len(),
+        inline_thinking_len = full_inline_thinking.len(),
         tool_calls = tool_calls_acc.len(),
         "sse_stream_ended_without_done"
     );
+    // Fallback: only use API reasoning_content, never inline <think> blocks.
     let content = if !full_content.is_empty() {
         if !full_reasoning.is_empty() {
             debug!(
@@ -1592,6 +1601,12 @@ async fn parse_sse_stream(
         );
         Some(full_reasoning)
     } else {
+        if !full_inline_thinking.is_empty() {
+            debug!(
+                "Streaming (no DONE): discarding inline <think> blocks ({} chars), not using as fallback",
+                full_inline_thinking.len()
+            );
+        }
         None
     };
 

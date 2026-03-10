@@ -1095,23 +1095,18 @@ pub async fn run_tool_loop(
 pub fn format_results_for_context(
     result: &ToolRunResult,
     max_result_chars: usize,
-    mut gate: Option<&mut crate::agent::context_gate::ContentGate>,
+    gate: Option<&mut crate::agent::context_gate::ContentGate>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     for (_, tool_name, data) in &result.tool_results {
-        let sized = if let Some(gate) = gate.as_mut() {
-            gate.admit_simple(data).into_text()
-        } else {
-            // Legacy fallback: hard char truncation.
-            if data.len() > max_result_chars {
-                let end = crate::utils::helpers::floor_char_boundary(data, max_result_chars);
-                format!("{}… ({} chars total)", &data[..end], data.len())
-            } else {
-                data.clone()
-            }
-        };
-        parts.push(format!("[{}]: {}", tool_name, sized));
+        // Tool results are always passed through raw — never summarized or
+        // truncated.  If they overflow context, that is a context management
+        // concern, not a tool-result concern.  Summarising file reads causes
+        // models to retry the same read in a loop, burning iterations.
+        let _ = gate; // gate unused — keep parameter for API compat
+        let _ = max_result_chars;
+        parts.push(format!("[{}]: {}", tool_name, data));
     }
 
     if let Some(ref summary) = result.summary {

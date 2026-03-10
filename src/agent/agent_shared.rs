@@ -359,6 +359,8 @@ impl AgentLoopShared {
         // Trigger at 80% of the budget (ceiling), sent only once.
         let nudge_at = ((ctx.core.max_iterations as f64) * 0.8).ceil() as u32;
         let mut nudge_sent = false;
+        let mut consecutive_empty = 0u32; // text-only responses with no tool calls
+        const MAX_CONSECUTIVE_EMPTY: u32 = 3;
         while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx
@@ -437,6 +439,26 @@ impl AgentLoopShared {
                     // A validation error injected a corrective hint. Only count
                     // this against the validation budget, not the main iteration
                     // budget, so format corrections don't exhaust real work slots.
+                    consecutive_empty += 1;
+                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY {
+                        warn!(
+                            "loop_breaker: {} consecutive non-tool iterations, forcing stop",
+                            consecutive_empty
+                        );
+                        ctx.messages.push(json!({
+                            "role": "user",
+                            "content": format!(
+                                "[System] Loop detected: you produced {} consecutive responses without executing any tool calls. \
+                                 Your output may contain leaked thinking (<think> blocks) or text descriptions of actions instead of actual tool calls. \
+                                 Stop describing what you want to do — either use a tool call or give your final answer as plain text.",
+                                consecutive_empty
+                            )
+                        }));
+                        // Promote to a real iteration to make progress
+                        ctx.flow.retries.validation = 0;
+                        iteration += 1;
+                        continue;
+                    }
                     ctx.flow.retries.validation += 1;
                     if ctx.flow.retries.validation >= validation::MAX_VALIDATION_RETRIES as u32 {
                         // Exhausted validation retries — treat as a normal
@@ -459,8 +481,8 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Continue => {
-                    // Successful (non-validation) iteration — reset retry counter
-                    // and advance to the next main-budget slot.
+                    // Successful tool execution — reset both counters.
+                    consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
                     iteration += 1;
                     // Consume step budget if plan-guided.
@@ -481,6 +503,7 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Finished(content) => {
+                    consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
                     iteration += 1;
                     // In plan-guided mode, advance to next step.

@@ -312,38 +312,34 @@ fn test_aggregate_results_formatting() {
 }
 
 #[test]
-fn test_aggregate_results_truncation() {
+fn test_aggregate_results_passthrough() {
     let long_data = "x".repeat(3000);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "big_tool".into(), long_data)],
+        tool_results: vec![("id1".into(), "big_tool".into(), long_data.clone())],
         summary: None,
         iterations_used: 1,
         error: None,
     };
 
+    // Tool results are always passed through raw — never truncated.
     let formatted = format_results_for_context(&result, 2000, None);
-    assert!(formatted.contains("chars total"));
-    assert!(formatted.len() < 3000);
+    assert!(formatted.contains(&long_data));
 }
 
 #[test]
-fn test_slim_results_truncation() {
+fn test_results_passthrough_with_summary() {
+    let data = "x".repeat(500);
     let result = ToolRunResult {
-        tool_results: vec![("id1".into(), "read_file".into(), "x".repeat(500))],
+        tool_results: vec![("id1".into(), "read_file".into(), data.clone())],
         summary: Some("Found a large file.".to_string()),
         iterations_used: 1,
         error: None,
     };
 
-    // Slim mode: 200 char preview.
-    let slim = format_results_for_context(&result, 200, None);
-    assert!(slim.contains("500 chars total"));
-    assert!(slim.len() < 400);
-
-    // Full mode: 2000 char limit — 500 chars fits.
-    let full = format_results_for_context(&result, 2000, None);
-    assert!(!full.contains("chars total"));
-    assert!(full.contains(&"x".repeat(500)));
+    // Tool results passed through raw regardless of limit parameter.
+    let formatted = format_results_for_context(&result, 200, None);
+    assert!(formatted.contains(&data));
+    assert!(formatted.contains("Found a large file."));
 }
 
 // -- Message capturing mock for continuation message test --
