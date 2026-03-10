@@ -105,6 +105,8 @@ enum ModelSource {
     File { path: PathBuf },
     /// MLX model directory (safetensors, served via managed mlx-lm server).
     Mlx { path: PathBuf },
+    /// oMLX server (external, auto-discovery via LRU eviction).
+    Omlx { endpoint: String },
 }
 
 /// A model entry from any source, used by the unified model picker.
@@ -455,6 +457,8 @@ impl ReplContext {
             #[cfg(not(feature = "cluster"))]
             let covered_by_cluster = false;
 
+            let is_omlx = self.config.agents.defaults.local_backend == "omlx";
+
             if !base.is_empty() && !already_covered && !covered_by_cluster {
                 let models_url = {
                     let b = base.trim_end_matches('/');
@@ -466,8 +470,10 @@ impl ReplContext {
                 };
 
                 let client = reqwest::Client::new();
+                let api_key = &self.config.agents.defaults.local_api_key;
                 if let Ok(resp) = client
                     .get(&models_url)
+                    .header("Authorization", format!("Bearer {}", api_key))
                     .timeout(Duration::from_secs(3))
                     .send()
                     .await
@@ -485,15 +491,22 @@ impl ReplContext {
                                 }
                                 let is_active =
                                     crate::lms::is_model_available(&[id.clone()], &current_model);
-                                entries.push(ModelEntry {
-                                    id,
-                                    source: ModelSource::Remote {
+                                let source = if is_omlx {
+                                    ModelSource::Omlx {
+                                        endpoint: base.clone(),
+                                    }
+                                } else {
+                                    ModelSource::Remote {
                                         endpoint: base.clone(),
                                         #[cfg(feature = "cluster")]
                                         peer_type: crate::cluster::state::PeerType::Unknown,
                                         #[cfg(not(feature = "cluster"))]
                                         peer_type: (),
-                                    },
+                                    }
+                                };
+                                entries.push(ModelEntry {
+                                    id,
+                                    source,
                                     is_active,
                                     is_loaded: false,
                                 });

@@ -234,10 +234,11 @@ impl ReplContext {
         // /adapt requires LM Studio backend — it uses the LoRA adapter API
         // which mlx/vllm-mlx backends don't expose.
         let backend = &self.config.agents.defaults.local_backend;
-        if backend == "mlx" {
+        if backend == "mlx" || backend == "omlx" {
             println!(
-                "\n  /adapt is not available in MLX mode (backend: {backend}).\n  \
-                 Switch to LM Studio with /local lmstudio to use adapter commands.\n"
+                "\n  /adapt is not available in {} mode (backend: {backend}).\n  \
+                 Switch to LM Studio with /local lmstudio to use adapter commands.\n",
+                backend.to_uppercase()
             );
             return;
         }

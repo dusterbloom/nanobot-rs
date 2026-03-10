@@ -34,8 +34,13 @@ pub struct ProviderSpec {
 impl ProviderSpec {
     /// Create a spec for a local server.
     pub fn local(base_url: &str, model: Option<&str>) -> Self {
+        Self::local_with_key(base_url, model, "local")
+    }
+
+    /// Create a spec for a local server with a custom API key.
+    pub fn local_with_key(base_url: &str, model: Option<&str>, api_key: &str) -> Self {
         ProviderSpec {
-            api_key: "local".to_string(),
+            api_key: api_key.to_string(),
             api_base: Some(base_url.to_string()),
             model: model.map(String::from),
             jit_gate: None,

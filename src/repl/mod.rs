@@ -1074,6 +1074,9 @@ pub(crate) fn cmd_agent(
         // When localBackend is "mlx" and we're in local mode, skip all LM Studio
         // setup and use in-process MLX inference instead.
         let use_mlx_local = is_local && config.agents.defaults.local_backend == "mlx";
+        // When localBackend is "omlx", skip LM Studio spawn and peer probing —
+        // the user manages oMLX externally at localApiBase.
+        let use_omlx = is_local && config.agents.defaults.local_backend == "omlx";
         #[cfg(feature = "mlx")]
         if use_mlx_local {
             // Force inference_engine to "mlx" so the MLX provider path activates below.
@@ -1189,7 +1192,12 @@ pub(crate) fn cmd_agent(
             let mlx_lm_mode = config.agents.defaults.mlx_lm_url.as_deref();
             tui::print_mlx_splash(&mlx_model, mlx_lm_mode);
         }
-        if is_interactive && is_local && !use_mlx_local && !has_remote_local {
+        if is_interactive && use_omlx {
+            tui::register_resize_handler();
+            let base = &config.agents.defaults.local_api_base;
+            tui::print_omlx_splash(base);
+        }
+        if is_interactive && is_local && !use_mlx_local && !use_omlx && !has_remote_local {
             tui::register_resize_handler();
             tui::print_startup_splash(&local_port, is_local);
 
@@ -1295,8 +1303,8 @@ pub(crate) fn cmd_agent(
         // to a local llama.cpp server: requests would go to the configured remote
         // while the local server receives nothing.  Instead, warn and clear the
         // dead endpoint so the user knows what happened.
-        // Skip entirely when using MLX local backend — no LM Studio involved.
-        if !use_mlx_local && is_local && has_remote_local && !srv.lms_managed {
+        // Skip entirely when using MLX or oMLX local backend — no LM Studio involved.
+        if !use_mlx_local && !use_omlx && is_local && has_remote_local && !srv.lms_managed {
             let peer_url = config.agents.defaults.local_api_base.clone();
             let peer_host = extract_url_host(&peer_url);
             let peer_port = peer_url
@@ -1340,15 +1348,16 @@ pub(crate) fn cmd_agent(
 
         // Remote LM Studio base: proactively prewarm main/router/specialist models
         // to avoid first-turn latency spikes from JIT loading.
-        if !use_mlx_local && is_local && has_remote_local && !srv.lms_managed {
+        // Skip for oMLX — it uses LRU auto-eviction, not JIT loading.
+        if !use_mlx_local && !use_omlx && is_local && has_remote_local && !srv.lms_managed {
             prewarm_remote_lms_models(&config, &local_model_name).await;
         }
 
         // Auto-activate trio mode for local sessions when both router and
         // specialist models are configured.  The downgrade block below will
         // revert strict flags if the router turns out to be unreachable.
-        // Skip for MLX local — no LM Studio trio support.
-        if !use_mlx_local && commands::should_auto_activate_trio(
+        // Skip for MLX/oMLX local — no LM Studio trio support.
+        if !use_mlx_local && !use_omlx && commands::should_auto_activate_trio(
             is_local,
             &config.trio.router_model,
             &config.trio.specialist_model,
@@ -1368,7 +1377,7 @@ pub(crate) fn cmd_agent(
         // When no trio router is available, disable strict mode so the single model
         // can handle tools directly. Must happen BEFORE build_core_handle so the core
         // gets the updated tool_delegation_config.
-        if !use_mlx_local
+        if !use_mlx_local && !use_omlx
             && config.tool_delegation.strict_no_tools_main
             && config.tool_delegation.strict_router_schema
         {
@@ -1541,8 +1550,8 @@ pub(crate) fn cmd_agent(
         } else {
             // Interactive REPL mode.
             // Splash and LMS detection already happened above (before core build).
-            // Skip for MLX local — already printed MLX banner above.
-            if !use_mlx_local && (!is_local || has_remote_local) {
+            // Skip for MLX/oMLX local — already printed banner above.
+            if !use_mlx_local && !use_omlx && (!is_local || has_remote_local) {
                 tui::register_resize_handler();
                 tui::print_startup_splash(&local_port, is_local);
             }
@@ -1603,8 +1612,8 @@ pub(crate) fn cmd_agent(
             // This forces each model to load sequentially before any real requests,
             // avoiding concurrent model-switch crashes and cold-start latency.
             // Fires for any JIT server (localApiBase set), not just trio mode.
-            // Skip for MLX local — no remote JIT server involved.
-            if !use_mlx_local && has_remote_local && !ctx.srv.lms_managed {
+            // Skip for MLX/oMLX local — no remote JIT server involved.
+            if !use_mlx_local && !use_omlx && has_remote_local && !ctx.srv.lms_managed {
                 use crate::providers::jit_gate::warmup_jit_models;
 
                 let base = &ctx.config.agents.defaults.local_api_base;

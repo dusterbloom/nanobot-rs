@@ -625,6 +625,24 @@ pub(crate) fn print_mlx_splash(model_name: &str, mlx_lm_mode: Option<&str>) {
     loading_animation("Loading model");
 }
 
+/// oMLX startup splash: clear screen, ASCII logo, oMLX endpoint info.
+pub(crate) fn print_omlx_splash(api_base: &str) {
+    print!("{CLEAR_SCREEN}");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+    print_logo();
+    let short = api_base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    print!("  {BOLD}{YELLOW}oMLX{RESET} {DIM}{short}{RESET}\r\n");
+    print!(
+        "  {DIM}v{}  |  /local  /model  /voice  Ctrl+C quit{RESET}\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    print!("\r\n");
+}
+
 /// Full startup splash: clear screen, ASCII logo, mode info, hints.
 pub(crate) fn print_startup_splash(local_port: &str, is_local: bool) {
     // Clear the terminal for a fresh start.

@@ -996,6 +996,192 @@ fn find_model_recursive(root: &Path, needle: &str) -> Option<PathBuf> {
 }
 
 // =============================================================================
+// LoRA Merge-to-Disk Pipeline (for oMLX auto-discovery)
+// =============================================================================
+
+/// Result of a LoRA merge-to-disk operation.
+#[derive(Debug, Clone)]
+pub struct MergeResult {
+    /// Path to the new merged model directory.
+    pub output_dir: PathBuf,
+    /// Model name (directory stem).
+    pub model_name: String,
+    /// Number of weight tensors that were merged.
+    pub merged_count: usize,
+}
+
+/// Merge LoRA adapter weights into a base MLX model and save as a new model directory.
+///
+/// This enables oMLX auto-discovery: oMLX watches model directories and can serve
+/// the merged model without any REST API for model loading.
+///
+/// Steps:
+/// 1. Load base model weights from `*.safetensors` files
+/// 2. Load adapter weights from `adapters/adapters.safetensors`
+/// 3. For each LoRA target key, compute: `W_merged = W_base + (alpha/rank) * B @ A`
+/// 4. Copy all non-weight files (config.json, tokenizer.json, etc.) to output
+/// 5. Write merged weights as safetensors in the output directory
+#[cfg(feature = "mlx")]
+pub fn merge_lora_to_disk(
+    base_model_dir: &Path,
+    adapter_dir: &Path,
+    output_dir: &Path,
+) -> Result<MergeResult> {
+    use mlx_rs::Array;
+    use std::collections::HashMap;
+
+    // 1. Parse adapter_config.json for rank and alpha.
+    let adapter_config_path = adapter_dir.join("adapter_config.json");
+    let adapter_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&adapter_config_path)
+            .with_context(|| format!("reading {}", adapter_config_path.display()))?,
+    )?;
+    let rank = adapter_config["rank"]
+        .as_f64()
+        .unwrap_or(32.0);
+    let alpha = adapter_config["alpha"]
+        .as_f64()
+        .unwrap_or(rank);
+    let scale = alpha / rank;
+
+    info!(
+        "LoRA merge: rank={}, alpha={}, scale={:.4}",
+        rank, alpha, scale
+    );
+
+    // 2. Load base model weights.
+    let base_weights = crate::agent::mlx_lora::load_weights(base_model_dir)
+        .context("loading base model weights")?;
+
+    // 3. Load adapter weights.
+    let adapter_st_path = adapter_dir.join("adapters.safetensors");
+    let adapter_weights = Array::load_safetensors(&adapter_st_path)
+        .map_err(|e| anyhow::anyhow!("loading adapter weights: {e}"))?;
+
+    // 4. Group adapter weights by target: find pairs of lora_a.weight / lora_b.weight.
+    // Keys look like: "model.layers.0.self_attn.q_proj.lora_a.weight"
+    // or with prefix: "language_model.model.layers.0.self_attn.q_proj.lora_a.weight"
+    let mut lora_pairs: HashMap<String, (Option<&Array>, Option<&Array>)> = HashMap::new();
+    for (key, arr) in &adapter_weights {
+        let (base_key, is_a) = if key.ends_with(".lora_a.weight") {
+            (key.trim_end_matches(".lora_a.weight").to_string(), true)
+        } else if key.ends_with(".lora_b.weight") {
+            (key.trim_end_matches(".lora_b.weight").to_string(), false)
+        } else {
+            continue;
+        };
+        let entry = lora_pairs.entry(base_key).or_insert((None, None));
+        if is_a {
+            entry.0 = Some(arr);
+        } else {
+            entry.1 = Some(arr);
+        }
+    }
+
+    // 5. Merge: for each LoRA pair, find the corresponding base weight and apply delta.
+    let mut merged_weights = base_weights;
+    let mut merged_count = 0;
+
+    for (adapter_key, (lora_a, lora_b)) in &lora_pairs {
+        let (Some(a), Some(b)) = (lora_a, lora_b) else {
+            warn!("Incomplete LoRA pair for {}, skipping", adapter_key);
+            continue;
+        };
+
+        // The base weight key is adapter_key + ".weight"
+        let base_key = format!("{}.weight", adapter_key);
+        let base_w = match merged_weights.get(&base_key) {
+            Some(w) => w.clone(),
+            None => {
+                warn!("No base weight for {}, skipping", base_key);
+                continue;
+            }
+        };
+
+        // delta = scale * (B @ A)  — B is [out, rank], A is [rank, in]
+        let delta = mlx_rs::ops::matmul(b, a)
+            .map_err(|e| anyhow::anyhow!("matmul for {}: {e}", adapter_key))?;
+        let scale_arr = Array::from_f32(scale as f32);
+        let scaled_delta = mlx_rs::ops::multiply(&delta, &scale_arr)
+            .map_err(|e| anyhow::anyhow!("scale for {}: {e}", adapter_key))?;
+
+        // Cast delta to match base weight dtype if needed.
+        let scaled_delta = if base_w.dtype() != scaled_delta.dtype() {
+            scaled_delta
+                .as_dtype(base_w.dtype())
+                .map_err(|e| anyhow::anyhow!("dtype cast for {}: {e}", adapter_key))?
+        } else {
+            scaled_delta
+        };
+
+        let merged = mlx_rs::ops::add(&base_w, &scaled_delta)
+            .map_err(|e| anyhow::anyhow!("add for {}: {e}", adapter_key))?;
+        merged_weights.insert(base_key, merged);
+        merged_count += 1;
+    }
+
+    info!("Merged {} LoRA targets into base weights", merged_count);
+
+    // 6. Create output directory and copy non-weight files.
+    std::fs::create_dir_all(output_dir)?;
+
+    for entry in std::fs::read_dir(base_model_dir)?.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            // Copy everything except safetensors (we'll write merged ones).
+            if ext != "safetensors" {
+                let dest = output_dir.join(path.file_name().unwrap());
+                std::fs::copy(&path, &dest)?;
+            }
+        }
+    }
+
+    // 7. Eval all merged arrays to materialize lazy computation.
+    mlx_rs::transforms::eval(merged_weights.values())
+        .map_err(|e| anyhow::anyhow!("eval merged weights: {e}"))?;
+
+    // 8. Write merged weights as a single safetensors file.
+    let out_st_path = output_dir.join("model.safetensors");
+    Array::save_safetensors(
+        merged_weights.iter().map(|(k, v)| (k.as_str(), v)),
+        None,
+        &out_st_path,
+    )
+    .map_err(|e| anyhow::anyhow!("save merged safetensors: {e}"))?;
+
+    let model_name = output_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    info!(
+        "Merged model saved to {} ({} tensors, {} LoRA targets merged)",
+        output_dir.display(),
+        merged_weights.len(),
+        merged_count
+    );
+
+    Ok(MergeResult {
+        output_dir: output_dir.to_path_buf(),
+        model_name,
+        merged_count,
+    })
+}
+
+/// Stub when built without the `mlx` feature.
+#[cfg(not(feature = "mlx"))]
+pub fn merge_lora_to_disk(
+    _base_model_dir: &Path,
+    _adapter_dir: &Path,
+    _output_dir: &Path,
+) -> Result<MergeResult> {
+    anyhow::bail!(
+        "LoRA merge requires the 'mlx' feature. Rebuild with: cargo build --features mlx"
+    )
+}
+
+// =============================================================================
 // Perplexity Gate: trigger training on MLX server
 // =============================================================================
 

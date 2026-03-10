@@ -154,8 +154,10 @@ pub(super) fn make_local_providers(
         None
     };
 
+    let api_key = &config.agents.defaults.local_api_key;
+
     let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base_url, Some(&model_id))
+        factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
             .with_jit_gate_opt(jit_gate.clone())
             .with_timeout_config(&config.timeouts)
             .with_retry(config.retry.clone()),
@@ -173,7 +175,7 @@ pub(super) fn make_local_providers(
     let compaction: Option<Arc<dyn LLMProvider>> =
         compaction_port.map(|p| -> Arc<dyn LLMProvider> {
             factory::create_openai_compat(
-                factory::ProviderSpec::local(&local_base_url(config, p), None)
+                factory::ProviderSpec::local_with_key(&local_base_url(config, p), None, api_key)
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
                     .with_retry(config.retry.clone()),
@@ -191,7 +193,7 @@ pub(super) fn make_local_providers(
             // Use JIT gate if endpoint URL matches the shared base (same server).
             let gate = jit_gate.as_ref().filter(|_| ep.url == base_url).cloned();
             return Some(factory::create_openai_compat(factory::ProviderSpec {
-                api_key: role_name.to_string(),
+                api_key: api_key.to_string(),
                 api_base: Some(ep.url.clone()),
                 model: Some(ep.model.clone()),
                 jit_gate: gate,
@@ -209,7 +211,7 @@ pub(super) fn make_local_providers(
                 role_name
             };
             return Some(factory::create_openai_compat(
-                factory::ProviderSpec::local(&base_url, Some(model))
+                factory::ProviderSpec::local_with_key(&base_url, Some(model), api_key)
                     .with_jit_gate_opt(jit_gate.clone())
                     .with_timeout_config(&config.timeouts)
                     .with_retry(config.retry.clone()),
@@ -219,9 +221,13 @@ pub(super) fn make_local_providers(
         // Priority 3: separate port fallback
         fallback_port.map(|p| -> Arc<dyn LLMProvider> {
             factory::create_openai_compat(
-                factory::ProviderSpec::local(&local_base_url(config, p), Some(role_name))
-                    .with_timeout_config(&config.timeouts)
-                    .with_retry(config.retry.clone()),
+                factory::ProviderSpec::local_with_key(
+                    &local_base_url(config, p),
+                    Some(role_name),
+                    api_key,
+                )
+                .with_timeout_config(&config.timeouts)
+                .with_retry(config.retry.clone()),
             )
         })
     };

@@ -360,6 +360,15 @@ impl ReplContext {
                 }
                 ModelSource::File { .. } => "~/models/".to_string(),
                 ModelSource::Mlx { .. } => "MLX (Apple Silicon GPU)".to_string(),
+                ModelSource::Omlx { ref endpoint } => {
+                    let short = endpoint
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split('/')
+                        .next()
+                        .unwrap_or(endpoint);
+                    format!("oMLX ({})", short)
+                }
             };
             if group != current_group {
                 if !current_group.is_empty() {
@@ -596,6 +605,19 @@ impl ReplContext {
             #[cfg(not(feature = "mlx"))]
             ModelSource::Mlx { .. } => {
                 println!("  MLX support not compiled in (--features mlx).");
+            }
+            ModelSource::Omlx { ref endpoint } => {
+                // oMLX uses LRU auto-eviction — just update config, no load/unload.
+                self.config.agents.defaults.local_api_base = endpoint.clone();
+                self.config.agents.defaults.local_model = selected.id.clone();
+                self.config.agents.defaults.lms_main_model = selected.id.clone();
+                self.current_model_path = PathBuf::from(&selected.id);
+                self.persist_local_config();
+                self.apply_and_rebuild_with(true);
+                println!(
+                    "  Switched to {} (oMLX will load on first request).",
+                    selected.id
+                );
             }
         }
 

@@ -263,6 +263,10 @@ pub struct AgentDefaults {
     /// differentiation happens via the `model` field in each API request (JIT loading).
     #[serde(default)]
     pub local_api_base: String,
+    /// API key for local inference server (default: "local").
+    /// Required for servers like oMLX that enforce authentication.
+    #[serde(default = "default_local_api_key")]
+    pub local_api_key: String,
     /// Context window size for local models (default: 32768).
     /// Separate from maxContextTokens so cloud (512K) and local (32K) coexist.
     #[serde(default = "default_local_max_context_tokens")]
@@ -291,8 +295,9 @@ pub struct AgentDefaults {
     /// "mlx" uses the in-process MLX provider for Apple Silicon GPU inference.
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
-    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio)
-    /// or "mlx" (in-process MLX inference on Apple Silicon GPU).
+    /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio),
+    /// "mlx" (in-process MLX inference on Apple Silicon GPU), or
+    /// "omlx" (external oMLX server at `localApiBase`, no managed spawn).
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
     /// Path to MLX model directory (containing .safetensors + tokenizer.json).
@@ -404,6 +409,10 @@ fn default_inference_engine() -> String {
     "auto".to_string()
 }
 
+fn default_local_api_key() -> String {
+    "local".to_string()
+}
+
 fn default_local_backend() -> String {
     "lmstudio".to_string()
 }
@@ -451,6 +460,7 @@ impl Default for AgentDefaults {
             model: default_model(),
             local_model: default_local_model(),
             local_api_base: String::new(),
+            local_api_key: default_local_api_key(),
             local_max_context_tokens: default_local_max_context_tokens(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
