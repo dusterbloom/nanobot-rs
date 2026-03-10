@@ -3795,6 +3795,7 @@ dependencies = [
  "parking_lot",
  "petgraph 0.8.3",
  "qlora-rs",
+ "rayon",
  "regex",
  "reqwest",
  "rusqlite",

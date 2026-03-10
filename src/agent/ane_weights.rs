@@ -456,6 +456,91 @@ pub fn unpack_sdpa_bwd2(output: &[u8], cfg: &MilConfig) -> (Vec<f32>, Vec<f32>) 
 }
 
 // ---------------------------------------------------------------------------
+// Tiled DynMatmul packing / unpacking
+// ---------------------------------------------------------------------------
+
+/// Pack one OC-tile of a DynMatmul: act `[ic, seq]` + weight columns `[tile_start..tile_end]`.
+///
+/// Extracts weight columns from `w[ic, full_oc]` for the given tile, zero-pads if last tile
+/// is smaller than `tile_oc`. Returns bytes for IOSurface `[1, ic, 1, seq+tile_oc]` fp32.
+pub fn pack_dyn_matmul_oc_tile(
+    act: &[f32],
+    w: &[f32],
+    ic: usize,
+    full_oc: usize,
+    tile_oc: usize,
+    tile_start: usize,
+    seq: usize,
+) -> Vec<u8> {
+    let actual_oc = (full_oc - tile_start).min(tile_oc);
+    let sp = seq + tile_oc;
+    let mut buf = vec![0.0f32; ic * sp];
+    for d in 0..ic {
+        buf[d * sp..d * sp + seq].copy_from_slice(&act[d * seq..d * seq + seq]);
+        buf[d * sp + seq..d * sp + seq + actual_oc]
+            .copy_from_slice(&w[d * full_oc + tile_start..d * full_oc + tile_start + actual_oc]);
+        // remaining positions stay zero (padding)
+    }
+    f32_slice_to_bytes(&buf)
+}
+
+/// Unpack one OC-tile output and write into result buffer (concat along OC).
+///
+/// Copies the first `actual_oc` channels from tile output `[1, tile_oc, 1, seq]` into
+/// `result[tile_start*seq..]`.
+pub fn unpack_oc_tile(
+    out_bytes: &[u8],
+    result: &mut [f32],
+    tile_oc: usize,
+    tile_start: usize,
+    actual_oc: usize,
+    seq: usize,
+) {
+    let floats = bytes_to_f32_vec(out_bytes);
+    for ch in 0..actual_oc {
+        let src_off = ch * seq;
+        let dst_off = (tile_start + ch) * seq;
+        result[dst_off..dst_off + seq].copy_from_slice(&floats[src_off..src_off + seq]);
+    }
+}
+
+/// Pack one IC-tile of a DynMatmul: act channels `[tile_start..tile_end]` + weight rows.
+///
+/// Extracts activation channels and weight rows for the tile, zero-pads last tile.
+/// Returns bytes for IOSurface `[1, tile_ic, 1, seq+oc]` fp32.
+pub fn pack_dyn_matmul_ic_tile(
+    act: &[f32],
+    w: &[f32],
+    full_ic: usize,
+    oc: usize,
+    tile_ic: usize,
+    tile_start: usize,
+    seq: usize,
+) -> Vec<u8> {
+    let actual_ic = (full_ic - tile_start).min(tile_ic);
+    let sp = seq + oc;
+    let mut buf = vec![0.0f32; tile_ic * sp];
+    for d in 0..actual_ic {
+        let src_d = tile_start + d;
+        buf[d * sp..d * sp + seq].copy_from_slice(&act[src_d * seq..src_d * seq + seq]);
+        buf[d * sp + seq..d * sp + seq + oc]
+            .copy_from_slice(&w[src_d * oc..src_d * oc + oc]);
+    }
+    // remaining channels stay zero (padding)
+    f32_slice_to_bytes(&buf)
+}
+
+/// Unpack one IC-tile output and accumulate into result (reduction sum).
+///
+/// Adds tile output `[1, oc, 1, seq]` into `result[oc * seq]`.
+pub fn unpack_ic_tile_accum(out_bytes: &[u8], result: &mut [f32], oc: usize, seq: usize) {
+    let floats = bytes_to_f32_vec(out_bytes);
+    for i in 0..oc * seq {
+        result[i] += floats[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Model loading (llama2.c binary format)
 // ---------------------------------------------------------------------------
 

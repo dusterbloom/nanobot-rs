@@ -279,6 +279,106 @@ impl KernelSpec {
 }
 
 // ---------------------------------------------------------------------------
+// Tiling
+// ---------------------------------------------------------------------------
+
+/// Max fp16 elements that fit in ANE SRAM (~28 MB, leaving headroom for intermediates).
+const ANE_SRAM_FP16_ELEMS: usize = 14_000_000;
+
+/// Tile plan for a DynMatmul dimension that exceeds ANE SRAM.
+#[derive(Debug, Clone)]
+pub struct TilePlan {
+    /// Size of each tile (last tile is padded to this).
+    pub tile_size: usize,
+    /// Number of tiles.
+    pub n_tiles: usize,
+    /// Actual elements in the last tile (before padding).
+    pub last_actual: usize,
+    /// Original full dimension.
+    pub full_size: usize,
+}
+
+impl TilePlan {
+    /// Returns true if tiling is needed (more than 1 tile).
+    pub fn needs_tiling(&self) -> bool {
+        self.n_tiles > 1
+    }
+
+    /// Actual size of tile `t` (before padding).
+    pub fn actual_tile_size(&self, t: usize) -> usize {
+        if t == self.n_tiles - 1 {
+            self.last_actual
+        } else {
+            self.tile_size
+        }
+    }
+
+    /// Start offset for tile `t`.
+    pub fn tile_start(&self, t: usize) -> usize {
+        t * self.tile_size
+    }
+}
+
+/// Compute a tile plan for DynMatmul OC dimension.
+///
+/// IOSurface `[1, ic, 1, seq+oc]` cast to fp16 must fit in ANE SRAM:
+/// `ic * (seq + tile_oc) * 2 <= 28 MB` → `tile_oc <= ANE_SRAM_FP16_ELEMS / ic - seq`.
+pub fn compute_oc_tile_plan(ic: usize, oc: usize, seq: usize) -> TilePlan {
+    let max_oc = ANE_SRAM_FP16_ELEMS / ic - seq;
+    if oc <= max_oc {
+        return TilePlan {
+            tile_size: oc,
+            n_tiles: 1,
+            last_actual: oc,
+            full_size: oc,
+        };
+    }
+    // Round down to multiple of 128 for ANE alignment
+    let tile_oc = (max_oc / 128) * 128;
+    assert!(
+        tile_oc > 0,
+        "compute_oc_tile_plan: IC={ic} too large for ANE SRAM"
+    );
+    let n_tiles = (oc + tile_oc - 1) / tile_oc;
+    let last_actual = oc - (n_tiles - 1) * tile_oc;
+    TilePlan {
+        tile_size: tile_oc,
+        n_tiles,
+        last_actual,
+        full_size: oc,
+    }
+}
+
+/// Compute a tile plan for DynMatmul IC dimension (reduction tiling).
+///
+/// IOSurface `[1, tile_ic, 1, seq+oc]` cast to fp16 must fit:
+/// `tile_ic * (seq + oc) * 2 <= 28 MB` → `tile_ic <= ANE_SRAM_FP16_ELEMS / (seq + oc)`.
+pub fn compute_ic_tile_plan(ic: usize, oc: usize, seq: usize) -> TilePlan {
+    let max_ic = ANE_SRAM_FP16_ELEMS / (seq + oc);
+    if ic <= max_ic {
+        return TilePlan {
+            tile_size: ic,
+            n_tiles: 1,
+            last_actual: ic,
+            full_size: ic,
+        };
+    }
+    let tile_ic = (max_ic / 128) * 128;
+    assert!(
+        tile_ic > 0,
+        "compute_ic_tile_plan: OC={oc}+SEQ={seq} too large for ANE SRAM"
+    );
+    let n_tiles = (ic + tile_ic - 1) / tile_ic;
+    let last_actual = ic - (n_tiles - 1) * tile_ic;
+    TilePlan {
+        tile_size: tile_ic,
+        n_tiles,
+        last_actual,
+        full_size: ic,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Generator helpers
 // ---------------------------------------------------------------------------
 

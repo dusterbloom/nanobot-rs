@@ -198,14 +198,183 @@ fn matmul_accum_at(dw: &mut [f32], a: &[f32], b: &[f32], r: usize, c: usize, s: 
 // Compiled backward kernels
 // ---------------------------------------------------------------------------
 
+/// FFN backward kernels — fused (small models) or tiled (large models).
+pub enum FfnBwdKernels {
+    /// Fused kernels that fit in ANE SRAM.
+    Fused {
+        w2t: AneKernel,  // DynMatmul(dim, hidden) — dffn @ W2^T
+        w13t: AneKernel, // Fused dh1@W1^T + dh3@W3^T
+    },
+    /// Tiled DynMatmul kernels for models that exceed ANE SRAM.
+    Tiled {
+        /// DynMatmul(dim, tile_oc, seq) — for W2^T backward (OC-tiled, same as fwd W1/W3).
+        oc_kernel: AneKernel,
+        oc_plan: ane_mil::TilePlan,
+        oc_out_bytes: usize,
+        /// DynMatmul(tile_ic, dim, seq) — for W1^T/W3^T backward (IC-tiled, same as fwd W2).
+        ic_kernel: AneKernel,
+        ic_plan: ane_mil::TilePlan,
+        ic_out_bytes: usize,
+    },
+}
+
+impl FfnBwdKernels {
+    /// Execute backward W2^T: dsilu = dffn @ W2^T (output is [hidden, seq]).
+    ///
+    /// `w2_transposed` is W2 pre-transposed to [dim, hidden] layout.
+    pub fn eval_w2t(
+        &self,
+        dffn: &[f32],
+        w2_transposed: &[f32],
+        cfg: &MilConfig,
+    ) -> Result<Vec<f32>, String> {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let seq = cfg.seq_len;
+
+        match self {
+            FfnBwdKernels::Fused { w2t, .. } => {
+                let input = ane_weights::pack_dyn_matmul(dffn, w2_transposed, dim, hidden, seq);
+                let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
+                w2t.write_input(0, &input);
+                w2t.eval()?;
+                let mut out_buf = vec![0u8; spec.output_bytes];
+                w2t.read_output(0, &mut out_buf);
+                Ok(out_buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            }
+            FfnBwdKernels::Tiled {
+                oc_kernel,
+                oc_plan,
+                oc_out_bytes,
+                ..
+            } => {
+                // OC-tiled: dffn[dim,seq] @ W2^T[dim,hidden] → [hidden,seq]
+                // IC=dim, OC=hidden — same kernel/plan as forward W1/W3
+                let mut dsilu = vec![0.0f32; hidden * seq];
+                for t in 0..oc_plan.n_tiles {
+                    let start = oc_plan.tile_start(t);
+                    let actual = oc_plan.actual_tile_size(t);
+                    let tile_in = ane_weights::pack_dyn_matmul_oc_tile(
+                        dffn,
+                        w2_transposed,
+                        dim,
+                        hidden,
+                        oc_plan.tile_size,
+                        start,
+                        seq,
+                    );
+                    oc_kernel.write_input(0, &tile_in);
+                    oc_kernel.eval()?;
+                    let mut tile_out = vec![0u8; *oc_out_bytes];
+                    oc_kernel.read_output(0, &mut tile_out);
+                    ane_weights::unpack_oc_tile(
+                        &tile_out,
+                        &mut dsilu,
+                        oc_plan.tile_size,
+                        start,
+                        actual,
+                        seq,
+                    );
+                }
+                Ok(dsilu)
+            }
+        }
+    }
+
+    /// Execute backward W1^T + W3^T: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (output is [dim, seq]).
+    ///
+    /// `w1t`, `w3t` are pre-transposed to [hidden, dim] layout.
+    pub fn eval_w13t(
+        &self,
+        dh1: &[f32],
+        dh3: &[f32],
+        w1t: &[f32],
+        w3t: &[f32],
+        cfg: &MilConfig,
+    ) -> Result<Vec<f32>, String> {
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let seq = cfg.seq_len;
+
+        match self {
+            FfnBwdKernels::Fused { w13t, .. } => {
+                let input = ane_weights::pack_ffn_bwd_w13t(dh1, dh3, w1t, w3t, cfg);
+                let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
+                w13t.write_input(0, &input);
+                w13t.eval()?;
+                let mut out_buf = vec![0u8; spec.output_bytes];
+                w13t.read_output(0, &mut out_buf);
+                Ok(out_buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            }
+            FfnBwdKernels::Tiled {
+                ic_kernel,
+                ic_plan,
+                ic_out_bytes,
+                ..
+            } => {
+                // IC-tiled: dh1[hidden,seq] @ W1^T[hidden,dim] → [dim,seq]
+                // + dh3[hidden,seq] @ W3^T[hidden,dim] → [dim,seq]
+                // IC=hidden, OC=dim — same kernel/plan as forward W2
+                let mut result = vec![0.0f32; dim * seq];
+                // W1^T pass — accumulates into result
+                for t in 0..ic_plan.n_tiles {
+                    let start = ic_plan.tile_start(t);
+                    let tile_in = ane_weights::pack_dyn_matmul_ic_tile(
+                        dh1,
+                        w1t,
+                        hidden,
+                        dim,
+                        ic_plan.tile_size,
+                        start,
+                        seq,
+                    );
+                    ic_kernel.write_input(0, &tile_in);
+                    ic_kernel.eval()?;
+                    let mut tile_out = vec![0u8; *ic_out_bytes];
+                    ic_kernel.read_output(0, &mut tile_out);
+                    ane_weights::unpack_ic_tile_accum(&tile_out, &mut result, dim, seq);
+                }
+                // W3^T pass — accumulates into same result
+                for t in 0..ic_plan.n_tiles {
+                    let start = ic_plan.tile_start(t);
+                    let tile_in = ane_weights::pack_dyn_matmul_ic_tile(
+                        dh3,
+                        w3t,
+                        hidden,
+                        dim,
+                        ic_plan.tile_size,
+                        start,
+                        seq,
+                    );
+                    ic_kernel.write_input(0, &tile_in);
+                    ic_kernel.eval()?;
+                    let mut tile_out = vec![0u8; *ic_out_bytes];
+                    ic_kernel.read_output(0, &mut tile_out);
+                    ane_weights::unpack_ic_tile_accum(&tile_out, &mut result, dim, seq);
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
 /// Pre-compiled ANE kernels for backward pass (compile once, reuse every step).
 pub struct BackwardKernels {
-    pub ffn_bwd_w2t: AneKernel,  // DynMatmul(dim, hidden) — dffn @ W2^T
-    pub ffn_bwd_w13t: AneKernel, // Fused dh1@W1^T + dh3@W3^T
-    pub wot_bwd: AneKernel,      // DynMatmul(dim, attn_dim) — dx2 @ Wo^T
-    pub sdpa_bwd1: AneKernel,    // fp16: recompute softmax + dV + dp
-    pub sdpa_bwd2: AneKernel,    // fp16: softmax bwd → dQ, dK
-    pub qkv_bwd: AneKernel,      // Fused dq@Wq^T + dk@Wk^T + dv@Wv^T
+    /// FFN backward kernels — fused (small models) or tiled (large models).
+    pub ffn_bwd: FfnBwdKernels,
+    /// Wo^T backward (None at 4B where attention is CPU-only).
+    pub wot_bwd: Option<AneKernel>,
+    /// SDPA backward kernels (None at 4B where attention is CPU-only).
+    pub sdpa_bwd1: Option<AneKernel>,
+    pub sdpa_bwd2: Option<AneKernel>,
+    /// QKV backward (None at 4B where attention is CPU-only).
+    pub qkv_bwd: Option<AneKernel>,
 }
 
 impl BackwardKernels {
@@ -213,64 +382,124 @@ impl BackwardKernels {
     pub fn compile_backward(cfg: &MilConfig, mask_blob: &[u8]) -> Result<Self, String> {
         ane_bridge::ane_init()?;
 
-        // ffn_bwd_w2t: DynMatmul(dim, hidden)
-        let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
-        let ffn_bwd_w2t = AneKernel::compile(
-            &w2t_spec.mil_text,
-            None,
-            &[w2t_spec.input_bytes],
-            &[w2t_spec.output_bytes],
-        )?;
+        // FFN backward: check if fused kernels fit, otherwise tile
+        let oc_plan =
+            ane_mil::compute_oc_tile_plan(cfg.dim, cfg.hidden_dim, cfg.seq_len);
+        let ic_plan =
+            ane_mil::compute_ic_tile_plan(cfg.hidden_dim, cfg.dim, cfg.seq_len);
 
-        // ffn_bwd_w13t
-        let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
-        let ffn_bwd_w13t = AneKernel::compile(
-            &w13t_spec.mil_text,
-            None,
-            &[w13t_spec.input_bytes],
-            &[w13t_spec.output_bytes],
-        )?;
+        let ffn_bwd = if !oc_plan.needs_tiling() && !ic_plan.needs_tiling() {
+            // Fused kernels fit in SRAM
+            let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
+            let w2t = AneKernel::compile(
+                &w2t_spec.mil_text,
+                None,
+                &[w2t_spec.input_bytes],
+                &[w2t_spec.output_bytes],
+            )?;
+            let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
+            let w13t = AneKernel::compile(
+                &w13t_spec.mil_text,
+                None,
+                &[w13t_spec.input_bytes],
+                &[w13t_spec.output_bytes],
+            )?;
+            tracing::debug!(
+                "ANE FFN bwd: fused (dim={}, hidden={}, seq={})",
+                cfg.dim, cfg.hidden_dim, cfg.seq_len
+            );
+            FfnBwdKernels::Fused { w2t, w13t }
+        } else {
+            // Tiled: same DynMatmul kernels as forward
+            let oc_spec = KernelSpec::for_kernel(
+                cfg,
+                KernelType::DynMatmul {
+                    ic: cfg.dim,
+                    oc: oc_plan.tile_size,
+                },
+            );
+            let oc_kernel = AneKernel::compile(
+                &oc_spec.mil_text,
+                None,
+                &[oc_spec.input_bytes],
+                &[oc_spec.output_bytes],
+            )?;
+            let ic_spec = KernelSpec::for_kernel(
+                cfg,
+                KernelType::DynMatmul {
+                    ic: ic_plan.tile_size,
+                    oc: cfg.dim,
+                },
+            );
+            let ic_kernel = AneKernel::compile(
+                &ic_spec.mil_text,
+                None,
+                &[ic_spec.input_bytes],
+                &[ic_spec.output_bytes],
+            )?;
+            tracing::debug!(
+                "ANE FFN bwd: tiled (oc_tile={}, {} tiles; ic_tile={}, {} tiles)",
+                oc_plan.tile_size, oc_plan.n_tiles,
+                ic_plan.tile_size, ic_plan.n_tiles
+            );
+            FfnBwdKernels::Tiled {
+                oc_kernel,
+                oc_plan,
+                oc_out_bytes: oc_spec.output_bytes,
+                ic_kernel,
+                ic_plan,
+                ic_out_bytes: ic_spec.output_bytes,
+            }
+        };
 
-        // wot_bwd: DynMatmul(dim, attn_dim)
-        let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
-        let wot_bwd = AneKernel::compile(
-            &wot_spec.mil_text,
-            None,
-            &[wot_spec.input_bytes],
-            &[wot_spec.output_bytes],
-        )?;
+        // Attention backward kernels: best-effort (None if exceeds SRAM)
+        let wot_bwd = {
+            let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
+            AneKernel::compile(
+                &wot_spec.mil_text,
+                None,
+                &[wot_spec.input_bytes],
+                &[wot_spec.output_bytes],
+            )
+            .ok()
+        };
 
-        // sdpa_bwd1: needs causal mask (like sdpa_fwd)
-        let bwd1_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd1);
-        let sdpa_bwd1 = AneKernel::compile_multi_weights(
-            &bwd1_spec.mil_text,
-            &["@model_path/weights/mask.bin"],
-            &[mask_blob],
-            &[bwd1_spec.input_bytes],
-            &[bwd1_spec.output_bytes],
-        )?;
+        let sdpa_bwd1 = {
+            let bwd1_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd1);
+            AneKernel::compile_multi_weights(
+                &bwd1_spec.mil_text,
+                &["@model_path/weights/mask.bin"],
+                &[mask_blob],
+                &[bwd1_spec.input_bytes],
+                &[bwd1_spec.output_bytes],
+            )
+            .ok()
+        };
 
-        // sdpa_bwd2: no static weights
-        let bwd2_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd2);
-        let sdpa_bwd2 = AneKernel::compile(
-            &bwd2_spec.mil_text,
-            None,
-            &[bwd2_spec.input_bytes],
-            &[bwd2_spec.output_bytes],
-        )?;
+        let sdpa_bwd2 = {
+            let bwd2_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd2);
+            AneKernel::compile(
+                &bwd2_spec.mil_text,
+                None,
+                &[bwd2_spec.input_bytes],
+                &[bwd2_spec.output_bytes],
+            )
+            .ok()
+        };
 
-        // qkv_bwd
-        let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
-        let qkv_bwd = AneKernel::compile(
-            &qkv_spec.mil_text,
-            None,
-            &[qkv_spec.input_bytes],
-            &[qkv_spec.output_bytes],
-        )?;
+        let qkv_bwd = {
+            let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
+            AneKernel::compile(
+                &qkv_spec.mil_text,
+                None,
+                &[qkv_spec.input_bytes],
+                &[qkv_spec.output_bytes],
+            )
+            .ok()
+        };
 
         Ok(Self {
-            ffn_bwd_w2t,
-            ffn_bwd_w13t,
+            ffn_bwd,
             wot_bwd,
             sdpa_bwd1,
             sdpa_bwd2,
@@ -434,47 +663,25 @@ pub fn backward<T: ane_forward::TokenId>(
         // a. dffn = dy (gradient entering FFN residual path)
         let dffn = dy.clone();
 
-        // b. ANE ffn_bwd_w2t: dsilu = dffn @ W2^T
-        // w2 stored as [hidden, dim] row-major; transpose to [dim, hidden] for pack_dyn_matmul
+        // b. ANE ffn_bwd_w2t: dsilu = dffn @ W2^T (fused or tiled)
         let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let w2t_input = ane_weights::pack_dyn_matmul(&dffn, &w2_for_pack, dim, hidden, seq);
-        let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
-        kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
-
-        kernels
-            .ffn_bwd_w2t
-            .eval()
+        let dsilu = kernels
+            .ffn_bwd
+            .eval_w2t(&dffn, &w2_for_pack, cfg)
             .map_err(|e| format!("ffn_bwd_w2t eval: {e}"))?;
-        let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
-        kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
-        let dsilu: Vec<f32> = w2t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
 
         // c. CPU silu_bwd
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
-        // d. ANE ffn_bwd_w13t: dx_ffn = dh1@W1^T + dh3@W3^T
-        // w1, w3 stored as [dim, hidden] row-major; transpose to [hidden, dim] for pack
+        // d. ANE ffn_bwd_w13t: dx_ffn = dh1@W1^T + dh3@W3^T (fused or tiled)
         let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
         let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let w13t_input = ane_weights::pack_ffn_bwd_w13t(&dh1, &dh3, &w1t, &w3t, cfg);
-        let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
-        kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
-
-        kernels
-            .ffn_bwd_w13t
-            .eval()
+        let dx_ffn = kernels
+            .ffn_bwd
+            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
             .map_err(|e| format!("ffn_bwd_w13t eval: {e}"))?;
-        let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
-        kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
-        let dx_ffn: Vec<f32> = w13t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
 
         // e. CPU dW accumulation for FFN
         // dW2[dim, hidden] += dffn[dim, seq] @ gate^T[hidden, seq]
@@ -507,14 +714,11 @@ pub fn backward<T: ane_forward::TokenId>(
         let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
         let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
         let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
-        kernels.wot_bwd.write_input(0, &wot_input);
-
-        kernels
-            .wot_bwd
-            .eval()
-            .map_err(|e| format!("wot_bwd eval: {e}"))?;
+        let wot_kernel = kernels.wot_bwd.as_ref().expect("wot_bwd kernel required for MHA backward");
+        wot_kernel.write_input(0, &wot_input);
+        wot_kernel.eval().map_err(|e| format!("wot_bwd eval: {e}"))?;
         let mut wot_out = vec![0u8; wot_spec.output_bytes];
-        kernels.wot_bwd.read_output(0, &mut wot_out);
+        wot_kernel.read_output(0, &mut wot_out);
         let da: Vec<f32> = wot_out
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -527,14 +731,11 @@ pub fn backward<T: ane_forward::TokenId>(
         // j. ANE sdpa_bwd1: pack(Q, K, V, da) -> (dV, probs_raw, dp_raw)
         let bwd1_input = ane_weights::pack_sdpa_bwd1(&ac.q, &ac.k, &ac.v, &da, cfg);
         let bwd1_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd1);
-        kernels.sdpa_bwd1.write_input(0, &bwd1_input);
-
-        kernels
-            .sdpa_bwd1
-            .eval()
-            .map_err(|e| format!("sdpa_bwd1 eval: {e}"))?;
+        let bwd1_kernel = kernels.sdpa_bwd1.as_ref().expect("sdpa_bwd1 kernel required for MHA backward");
+        bwd1_kernel.write_input(0, &bwd1_input);
+        bwd1_kernel.eval().map_err(|e| format!("sdpa_bwd1 eval: {e}"))?;
         let mut bwd1_out = vec![0u8; bwd1_spec.output_bytes];
-        kernels.sdpa_bwd1.read_output(0, &mut bwd1_out);
+        bwd1_kernel.read_output(0, &mut bwd1_out);
         let (dv, _probs_f32, _dp_f32) = ane_weights::unpack_sdpa_bwd1(&bwd1_out, cfg);
 
         // k. ANE sdpa_bwd2: bridge fp16 data from bwd1 output + Q,K
@@ -563,14 +764,11 @@ pub fn backward<T: ane_forward::TokenId>(
         bwd2_input.extend_from_slice(&k_fp16);
 
         let bwd2_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaBwd2);
-        kernels.sdpa_bwd2.write_input(0, &bwd2_input);
-
-        kernels
-            .sdpa_bwd2
-            .eval()
-            .map_err(|e| format!("sdpa_bwd2 eval: {e}"))?;
+        let bwd2_kernel = kernels.sdpa_bwd2.as_ref().expect("sdpa_bwd2 kernel required for MHA backward");
+        bwd2_kernel.write_input(0, &bwd2_input);
+        bwd2_kernel.eval().map_err(|e| format!("sdpa_bwd2 eval: {e}"))?;
         let mut bwd2_out = vec![0u8; bwd2_spec.output_bytes];
-        kernels.sdpa_bwd2.read_output(0, &mut bwd2_out);
+        bwd2_kernel.read_output(0, &mut bwd2_out);
         let (dq, dk) = ane_weights::unpack_sdpa_bwd2(&bwd2_out, cfg);
 
         // l-pre. RoPE backward: un-rotate dQ, dK on CPU
@@ -623,14 +821,11 @@ pub fn backward<T: ane_forward::TokenId>(
         let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
         let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &wqt, &wkt, &wvt, cfg);
         let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
-        kernels.qkv_bwd.write_input(0, &qkv_input);
-
-        kernels
-            .qkv_bwd
-            .eval()
-            .map_err(|e| format!("qkv_bwd eval: {e}"))?;
+        let qkv_kernel = kernels.qkv_bwd.as_ref().expect("qkv_bwd kernel required for MHA backward");
+        qkv_kernel.write_input(0, &qkv_input);
+        qkv_kernel.eval().map_err(|e| format!("qkv_bwd eval: {e}"))?;
         let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
-        kernels.qkv_bwd.read_output(0, &mut qkv_out);
+        qkv_kernel.read_output(0, &mut qkv_out);
         let dx_attn: Vec<f32> = qkv_out
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1183,10 +1378,11 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         let mut dh3 = vec![0.0f32; hidden * seq];
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
-        // CPU: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (no explicit transposes)
-        let dx_w1 = ane_forward::cpu_matmul_lhs_transposed(&lw.w1, hidden, dim, &dh1, seq);
-        let dx_w3 = ane_forward::cpu_matmul_lhs_transposed(&lw.w3, hidden, dim, &dh3, seq);
-        let mut dx_ffn = dx_w1;
+        // CPU: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (parallel)
+        let (mut dx_ffn, dx_w3) = rayon::join(
+            || ane_forward::cpu_matmul_lhs_transposed(&lw.w1, hidden, dim, &dh1, seq),
+            || ane_forward::cpu_matmul_lhs_transposed(&lw.w3, hidden, dim, &dh3, seq),
+        );
         ane_forward::vec_add_inplace(&mut dx_ffn, &dx_w3);
 
         // RMSNorm backward (FFN)
@@ -1281,10 +1477,18 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             dq
         };
 
-        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (no explicit transposes)
-        let mut dx_attn = ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq_for_wq, seq);
-        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
-        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq);
+        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (parallel)
+        // wq is [q_proj_dim, dim] — q_proj_dim = 2*attn_dim when attn_output_gate
+        let qpd = cfg.q_proj_dim();
+        let (mut dx_attn, (dx_k, dx_v)) = rayon::join(
+            || ane_forward::cpu_matmul_lhs_transposed(&lw.wq, qpd, dim, &dq_for_wq, seq),
+            || {
+                rayon::join(
+                    || ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq),
+                    || ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq),
+                )
+            },
+        );
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
 
@@ -1429,19 +1633,10 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         // Replay base backward to get dx2 (gradient at attention residual point)
         let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let w2t_input = ane_weights::pack_dyn_matmul(&dffn, &w2_for_pack, dim, hidden, seq);
-        let w2t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW2t);
-        kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
-        kernels
-            .ffn_bwd_w2t
-            .eval()
+        let dsilu = kernels
+            .ffn_bwd
+            .eval_w2t(&dffn, &w2_for_pack, cfg)
             .map_err(|e| format!("lora ffn_bwd_w2t: {e}"))?;
-        let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
-        kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
-        let dsilu: Vec<f32> = w2t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
 
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
@@ -1449,19 +1644,10 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
         let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let w13t_input = ane_weights::pack_ffn_bwd_w13t(&dh1, &dh3, &w1t, &w3t, cfg);
-        let w13t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW13t);
-        kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
-        kernels
-            .ffn_bwd_w13t
-            .eval()
+        let dx_ffn = kernels
+            .ffn_bwd
+            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
             .map_err(|e| format!("lora ffn_bwd_w13t: {e}"))?;
-        let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
-        kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
-        let dx_ffn: Vec<f32> = w13t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
 
         let mut dx2 = vec![0.0f32; dim * seq];
         rmsnorm_bwd(
@@ -1498,13 +1684,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
         let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
         let wot_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Wot);
-        kernels.wot_bwd.write_input(0, &wot_input);
-        kernels
-            .wot_bwd
-            .eval()
-            .map_err(|e| format!("lora wot_bwd: {e}"))?;
+        let wot_kernel = kernels.wot_bwd.as_ref().expect("wot_bwd kernel required for MHA backward");
+        wot_kernel.write_input(0, &wot_input);
+        wot_kernel.eval().map_err(|e| format!("lora wot_bwd: {e}"))?;
         let mut wot_out = vec![0u8; wot_spec.output_bytes];
-        kernels.wot_bwd.read_output(0, &mut wot_out);
+        wot_kernel.read_output(0, &mut wot_out);
         let da_vec: Vec<f32> = wot_out
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1513,13 +1697,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         // SDPA backward (simplified — just propagate through attention for dy chain)
         let bwd1_input = ane_weights::pack_sdpa_bwd1(&ac.q, &ac.k, &ac.v, &da_vec, cfg);
         let bwd1_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::SdpaBwd1);
-        kernels.sdpa_bwd1.write_input(0, &bwd1_input);
-        kernels
-            .sdpa_bwd1
-            .eval()
-            .map_err(|e| format!("lora sdpa_bwd1: {e}"))?;
+        let bwd1_kernel = kernels.sdpa_bwd1.as_ref().expect("sdpa_bwd1 kernel required for MHA backward");
+        bwd1_kernel.write_input(0, &bwd1_input);
+        bwd1_kernel.eval().map_err(|e| format!("lora sdpa_bwd1: {e}"))?;
         let mut bwd1_out = vec![0u8; bwd1_spec.output_bytes];
-        kernels.sdpa_bwd1.read_output(0, &mut bwd1_out);
+        bwd1_kernel.read_output(0, &mut bwd1_out);
         let (dv, _, _) = ane_weights::unpack_sdpa_bwd1(&bwd1_out, cfg);
 
         let score_ch = cfg.score_ch();
@@ -1543,13 +1725,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         bwd2_input.extend_from_slice(&k_fp16);
 
         let bwd2_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::SdpaBwd2);
-        kernels.sdpa_bwd2.write_input(0, &bwd2_input);
-        kernels
-            .sdpa_bwd2
-            .eval()
-            .map_err(|e| format!("lora sdpa_bwd2: {e}"))?;
+        let bwd2_kernel = kernels.sdpa_bwd2.as_ref().expect("sdpa_bwd2 kernel required for MHA backward");
+        bwd2_kernel.write_input(0, &bwd2_input);
+        bwd2_kernel.eval().map_err(|e| format!("lora sdpa_bwd2: {e}"))?;
         let mut bwd2_out = vec![0u8; bwd2_spec.output_bytes];
-        kernels.sdpa_bwd2.read_output(0, &mut bwd2_out);
+        bwd2_kernel.read_output(0, &mut bwd2_out);
         let (mut dq, mut dk) = ane_weights::unpack_sdpa_bwd2(&bwd2_out, cfg);
 
         ane_forward::rope_backward(
@@ -1591,13 +1771,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
         let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &wqt, &wkt, &wvt, cfg);
         let qkv_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Qkvb);
-        kernels.qkv_bwd.write_input(0, &qkv_input);
-        kernels
-            .qkv_bwd
-            .eval()
-            .map_err(|e| format!("lora qkv_bwd: {e}"))?;
+        let qkv_kernel = kernels.qkv_bwd.as_ref().expect("qkv_bwd kernel required for MHA backward");
+        qkv_kernel.write_input(0, &qkv_input);
+        qkv_kernel.eval().map_err(|e| format!("lora qkv_bwd: {e}"))?;
         let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
-        kernels.qkv_bwd.read_output(0, &mut qkv_out);
+        qkv_kernel.read_output(0, &mut qkv_out);
         let dx_attn: Vec<f32> = qkv_out
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1745,15 +1923,51 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         };
         let dffn = dz_ffn.clone();
 
-        // --- LoRA W2 backward (CPU) ---
-        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg)) = (
-            lora.layers[l].w2.as_ref(),
-            la.w2_x.as_ref(),
-            la.w2_h.as_ref(),
-            lora_grads.layers[l].w2.as_mut(),
-        ) {
-            let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
-            let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+        // Dequantize layer (needed by both ANE and CPU parallel paths)
+        let lw_cow = model.layer(l);
+        let lw = &*lw_cow;
+
+        // --- PARALLEL: ANE ffn_bwd_w2t || LoRA W2 grad + W1/W3 pre-transpose ---
+        // ANE kernel is !Send, stays on calling thread. CPU work on a scoped thread.
+        let (dsilu, w2_grads, w1t, w3t) = std::thread::scope(|s| {
+            // Spawn CPU work: LoRA W2 backward + pre-transpose W1/W3
+            let cpu_handle = s.spawn(|| {
+                let w2_grads = if let (Some(w2_adapter), Some(w2_x), Some(w2_h)) = (
+                    lora.layers[l].w2.as_ref(),
+                    la.w2_x.as_ref(),
+                    la.w2_h.as_ref(),
+                ) {
+                    let scaled_dffn: Vec<f32> =
+                        dffn.iter().map(|&v| v * scale).collect();
+                    let (_dx, da, db) =
+                        w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                    Some((da, db))
+                } else {
+                    None
+                };
+                let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
+                let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
+                (w2_grads, w1t, w3t)
+            });
+
+            // Main thread: ANE ffn_bwd_w2t (dsilu = dffn @ W2^T) — fused or tiled
+            let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
+            let dsilu = bwd_kernels
+                .ffn_bwd
+                .eval_w2t(&dffn, &w2_for_pack, cfg)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
+                    vec![0.0f32; hidden * seq]
+                });
+
+            let (w2_grads, w1t, w3t) = cpu_handle.join().unwrap();
+            (dsilu, w2_grads, w1t, w3t)
+        });
+
+        // Accumulate W2 LoRA grads from parallel result
+        if let (Some((da, db)), Some(lg)) =
+            (w2_grads, lora_grads.layers[l].w2.as_mut())
+        {
             for (g, v) in lg.da.iter_mut().zip(da.iter()) {
                 *g += v;
             }
@@ -1762,47 +1976,20 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             }
         }
 
-        // Dequantize layer for ANE FFN backward
-        let lw_cow = model.layer(l);
-        let lw = &*lw_cow;
-
-        // --- FFN backward on ANE: dsilu = dffn @ W2^T ---
-        let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let w2t_input = ane_weights::pack_dyn_matmul(&dffn, &w2_for_pack, dim, hidden, seq);
-        let w2t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW2t);
-        bwd_kernels.ffn_bwd_w2t.write_input(0, &w2t_input);
-        bwd_kernels
-            .ffn_bwd_w2t
-            .eval()
-            .unwrap_or_else(|e| tracing::warn!("ANE ffn_bwd_w2t failed: {e}"));
-        let mut w2t_out = vec![0u8; w2t_spec.output_bytes];
-        bwd_kernels.ffn_bwd_w2t.read_output(0, &mut w2t_out);
-        let dsilu: Vec<f32> = w2t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
         // SiLU backward (CPU)
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
-        // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T ---
-        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
-        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let w13t_input = ane_weights::pack_ffn_bwd_w13t(&dh1, &dh3, &w1t, &w3t, cfg);
-        let w13t_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::FfnBwdW13t);
-        bwd_kernels.ffn_bwd_w13t.write_input(0, &w13t_input);
-        bwd_kernels
-            .ffn_bwd_w13t
-            .eval()
-            .unwrap_or_else(|e| tracing::warn!("ANE ffn_bwd_w13t failed: {e}"));
-        let mut w13t_out = vec![0u8; w13t_spec.output_bytes];
-        bwd_kernels.ffn_bwd_w13t.read_output(0, &mut w13t_out);
-        let dx_ffn: Vec<f32> = w13t_out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (fused or tiled) ---
+        // w1t, w3t already pre-transposed by the parallel CPU thread
+        let dx_ffn = bwd_kernels
+            .ffn_bwd
+            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
+            .unwrap_or_else(|e| {
+                tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
+                vec![0.0f32; dim * seq]
+            });
 
         // RMSNorm backward (FFN, CPU)
         let mut dx2 = vec![0.0f32; dim * seq];
@@ -1921,11 +2108,18 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             dq
         };
 
-        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T
-        let mut dx_attn =
-            ane_forward::cpu_matmul_lhs_transposed(&lw.wq, ad, dim, &dq_for_wq, seq);
-        let dx_k = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
-        let dx_v = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq);
+        // CPU: dx_attn = dq @ Wq^T + dk @ Wk^T + dv @ Wv^T (parallel)
+        // wq is [q_proj_dim, dim] — q_proj_dim = 2*attn_dim when attn_output_gate
+        let qpd = cfg.q_proj_dim();
+        let (mut dx_attn, (dx_k, dx_v)) = rayon::join(
+            || ane_forward::cpu_matmul_lhs_transposed(&lw.wq, qpd, dim, &dq_for_wq, seq),
+            || {
+                rayon::join(
+                    || ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq),
+                    || ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &_dv, seq),
+                )
+            },
+        );
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_k);
         ane_forward::vec_add_inplace(&mut dx_attn, &dx_v);
 
@@ -2836,5 +3030,220 @@ mod tests {
             &bwd_1x.lora_grads.layers[0].w2,
             &bwd_2x.lora_grads.layers[0].w2,
         );
+    }
+
+    /// Benchmark backward pass at Qwen3.5-4B MHA layer dimensions.
+    ///
+    /// Validates correctness (finite loss, nonzero grads, attn_output_gate + q_proj_dim)
+    /// and reports wall-clock timing for parallel vs sequential QKV/FFN matmuls.
+    ///
+    /// Run: cargo test --features ane --release --lib -- "bench_backward_qwen3_5_4b" --nocapture --test-threads=1
+    #[test]
+    fn bench_backward_qwen3_5_4b() {
+        use std::time::Instant;
+
+        let dim = 2560;
+        let hidden = 9216;
+        let n_heads: usize = 16;
+        let head_dim: usize = 256;
+        let seq = 128;
+        let vocab = 1024;
+        let ad = n_heads * head_dim; // 4096
+        let qpd = 2 * ad; // 8192 (attn_output_gate)
+
+        // Qwen3.5-4B MHA config (no GDN layers — benchmark one pure MHA layer)
+        let cfg = MilConfig {
+            dim,
+            hidden_dim: hidden,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads: 4,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let make = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make(qpd * dim, 0),
+                wk: make(ad * dim, 1000),
+                wv: make(ad * dim, 2000),
+                wo: make(dim * ad, 3000),
+                w1: make(hidden * dim, 4000),
+                w2: make(dim * hidden, 5000),
+                w3: make(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: Some(vec![1.0; head_dim]),
+                k_norm: Some(vec![1.0; head_dim]),
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let lora = super::super::ane_lora::LoraModel::with_full_dims(
+            super::super::ane_lora::LoraConfig {
+                rank: 16,
+                alpha: 16.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            dim,
+            ad, // kv_dim (expanded)
+            ad, // attn_dim
+            qpd,
+            hidden,
+        );
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        // Forward pass (CPU)
+        let fwd = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+        assert!(
+            fwd.base.loss.is_finite(),
+            "forward loss not finite: {}",
+            fwd.base.loss
+        );
+        eprintln!("forward loss: {:.4}", fwd.base.loss);
+
+        // Warmup backward (CPU path — ANE can't compile at these dims)
+        let _ = backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
+
+        // Benchmark full backward (includes rayon::join for QKV + FFN matmuls)
+        let n_iters = 5;
+        let t0 = Instant::now();
+        for _ in 0..n_iters {
+            let bwd = backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
+            std::hint::black_box(&bwd);
+        }
+        let total_ms = t0.elapsed().as_millis();
+        let per_iter_ms = total_ms as f64 / n_iters as f64;
+
+        // Micro-benchmark: sequential vs parallel QKV matmuls
+        let lw = &model.layers[0];
+        let dq_for_wq = make(qpd * seq, 9000);
+        let dk = make(ad * seq, 9100);
+        let dv = make(ad * seq, 9200);
+
+        let micro_n = 10;
+        let t_seq = Instant::now();
+        for _ in 0..micro_n {
+            let mut dx =
+                ane_forward::cpu_matmul_lhs_transposed(&lw.wq, qpd, dim, &dq_for_wq, seq);
+            let dxk = ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq);
+            let dxv = ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &dv, seq);
+            ane_forward::vec_add_inplace(&mut dx, &dxk);
+            ane_forward::vec_add_inplace(&mut dx, &dxv);
+            std::hint::black_box(&dx);
+        }
+        let seq_qkv_ms = t_seq.elapsed().as_millis() as f64 / micro_n as f64;
+
+        let t_par = Instant::now();
+        for _ in 0..micro_n {
+            let (mut dx, (dxk, dxv)) = rayon::join(
+                || ane_forward::cpu_matmul_lhs_transposed(&lw.wq, qpd, dim, &dq_for_wq, seq),
+                || {
+                    rayon::join(
+                        || ane_forward::cpu_matmul_lhs_transposed(&lw.wk, ad, dim, &dk, seq),
+                        || ane_forward::cpu_matmul_lhs_transposed(&lw.wv, ad, dim, &dv, seq),
+                    )
+                },
+            );
+            ane_forward::vec_add_inplace(&mut dx, &dxk);
+            ane_forward::vec_add_inplace(&mut dx, &dxv);
+            std::hint::black_box(&dx);
+        }
+        let par_qkv_ms = t_par.elapsed().as_millis() as f64 / micro_n as f64;
+
+        // Micro-benchmark: sequential vs parallel FFN W1^T / W3^T
+        let dh1 = make(hidden * seq, 9300);
+        let dh3 = make(hidden * seq, 9400);
+
+        let t_seq_ffn = Instant::now();
+        for _ in 0..micro_n {
+            let mut dx =
+                ane_forward::cpu_matmul_lhs_transposed(&lw.w1, hidden, dim, &dh1, seq);
+            let dxw3 =
+                ane_forward::cpu_matmul_lhs_transposed(&lw.w3, hidden, dim, &dh3, seq);
+            ane_forward::vec_add_inplace(&mut dx, &dxw3);
+            std::hint::black_box(&dx);
+        }
+        let seq_ffn_ms = t_seq_ffn.elapsed().as_millis() as f64 / micro_n as f64;
+
+        let t_par_ffn = Instant::now();
+        for _ in 0..micro_n {
+            let (mut dx, dxw3) = rayon::join(
+                || ane_forward::cpu_matmul_lhs_transposed(&lw.w1, hidden, dim, &dh1, seq),
+                || ane_forward::cpu_matmul_lhs_transposed(&lw.w3, hidden, dim, &dh3, seq),
+            );
+            ane_forward::vec_add_inplace(&mut dx, &dxw3);
+            std::hint::black_box(&dx);
+        }
+        let par_ffn_ms = t_par_ffn.elapsed().as_millis() as f64 / micro_n as f64;
+
+        eprintln!(
+            "\nQwen3.5-4B backward (1 MHA layer, seq={seq}, attn_output_gate=true):"
+        );
+        eprintln!(
+            "  Full backward: {n_iters} iters in {total_ms}ms ({per_iter_ms:.1}ms/iter)"
+        );
+        eprintln!(
+            "  QKV matmuls — seq: {seq_qkv_ms:.1}ms, par: {par_qkv_ms:.1}ms, \
+             speedup: {:.2}x",
+            seq_qkv_ms / par_qkv_ms
+        );
+        eprintln!(
+            "  FFN W1^T/W3^T — seq: {seq_ffn_ms:.1}ms, par: {par_ffn_ms:.1}ms, \
+             speedup: {:.2}x",
+            seq_ffn_ms / par_ffn_ms
+        );
+
+        // Verify grads are nonzero
+        let bwd = backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
+        let lg = &bwd.lora_grads.layers[0];
+        let w2_norm: f32 = lg
+            .w2
+            .as_ref()
+            .map(|g| {
+                g.da.iter()
+                    .chain(g.db.iter())
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt()
+            })
+            .unwrap_or(0.0);
+        let wo_norm: f32 = lg
+            .wo
+            .as_ref()
+            .map(|g| {
+                g.da.iter()
+                    .chain(g.db.iter())
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt()
+            })
+            .unwrap_or(0.0);
+        eprintln!("  W2 grad norm: {w2_norm:.6}, Wo grad norm: {wo_norm:.6}");
+        assert!(w2_norm > 0.0, "W2 LoRA grads are zero");
+        assert!(wo_norm > 0.0, "Wo LoRA grads are zero");
     }
 }

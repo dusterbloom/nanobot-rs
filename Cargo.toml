@@ -122,6 +122,9 @@ mime_guess = "2"
 # fp16 (half-precision) for ANE kernel I/O
 half = { version = "2", optional = true }
 
+# Data-parallel CPU gradient accumulation (overlaps with ANE evals)
+rayon = { version = "1.10", optional = true }
+
 # Memory-mapped file I/O for training data loader
 memmap2 = { version = "0.9", optional = true }
 
@@ -162,7 +165,7 @@ cluster = ["dep:mdns-sd"]
 semantic = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 knowledge-graph = ["dep:petgraph"]
 lora = ["dep:qlora-rs", "dep:candle-core"]
-ane = ["dep:half", "dep:memmap2"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
+ane = ["dep:half", "dep:memmap2", "dep:rayon"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
 mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:axum"]  # MLX GPU LoRA training (macOS Apple Silicon)
 
 [dependencies.jack-voice]
