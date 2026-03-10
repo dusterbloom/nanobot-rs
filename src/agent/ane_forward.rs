@@ -2322,6 +2322,23 @@ pub fn logit_softcap(logits: &mut [f32], cap: f32) {
     }
 }
 
+/// Clamp activations to fp16-safe range. Prevents ANE fp16 overflow from
+/// propagating NaN/Inf through the backward pass (Orion fix, arxiv 2603.06728).
+/// Well-behaved activations are orders of magnitude below fp16 max (65504);
+/// anything near the boundary indicates numerical instability.
+pub const FP16_MAX: f32 = 65504.0;
+
+#[inline]
+pub fn clamp_fp16(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        if v.is_nan() {
+            *v = 0.0;
+        } else {
+            *v = v.clamp(-FP16_MAX, FP16_MAX);
+        }
+    }
+}
+
 /// ANE-accelerated forward pass generic over weight source.
 ///
 /// Runs attention on CPU (handles GQA, GDN, QK-norm, attn_output_gate) and
@@ -2368,6 +2385,9 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
         // Dequantize layer (borrows for ModelWeights, allocates for QuantizedModelWeights)
         let lw_cow = model.layer(l);
         let lw = &*lw_cow;
+
+        // Clamp before RMSNorm to prevent fp16 overflow (Orion fix)
+        clamp_fp16(&mut x_cur);
 
         // RMSNorm before attention (CPU)
         let mut xnorm = vec![0.0f32; dim * seq];
@@ -2461,15 +2481,23 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
             }
         }
 
+        // Clamp before RMSNorm to prevent fp16 overflow (Orion fix)
+        clamp_fp16(&mut x2);
+
         // RMSNorm before FFN (CPU)
         let mut x2norm = vec![0.0f32; dim * seq];
         rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
 
         // --- FFN on ANE: W1+W3 (fused or tiled) ---
-        let (h1, h3, gate) = kernels.ffn.eval_w13(&x2norm, &lw.w1, &lw.w3, cfg)?;
+        let (mut h1, mut h3, mut gate) = kernels.ffn.eval_w13(&x2norm, &lw.w1, &lw.w3, cfg)?;
+        // Clamp ANE fp16 outputs before they're saved for backward
+        clamp_fp16(&mut h1);
+        clamp_fp16(&mut h3);
+        clamp_fp16(&mut gate);
 
         // --- FFN on ANE: W2 (fused or tiled) ---
         let mut ffn_out = kernels.ffn.eval_w2(&gate, &lw.w2, cfg)?;
+        clamp_fp16(&mut ffn_out);
 
         // LoRA on W2
         if let Some(ll) = lora_layer {
@@ -4005,6 +4033,25 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // ANE vs CPU forward: compare forward_ane_generic against forward_cpu_generic
+    #[test]
+    fn test_clamp_fp16_handles_extreme_values() {
+        let mut buf = vec![
+            -100000.0, -65504.0, -1.0, 0.0, 1.0, 65504.0, 100000.0,
+            f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+        ];
+        clamp_fp16(&mut buf);
+        assert_eq!(buf[0], -FP16_MAX);
+        assert_eq!(buf[1], -FP16_MAX);
+        assert_eq!(buf[2], -1.0);
+        assert_eq!(buf[3], 0.0);
+        assert_eq!(buf[4], 1.0);
+        assert_eq!(buf[5], FP16_MAX);
+        assert_eq!(buf[6], FP16_MAX);
+        assert_eq!(buf[7], 0.0, "NaN should become 0");
+        assert_eq!(buf[8], FP16_MAX, "+Inf should become fp16 max");
+        assert_eq!(buf[9], -FP16_MAX, "-Inf should become -fp16 max");
+    }
+
     // -----------------------------------------------------------------------
 
     #[test]

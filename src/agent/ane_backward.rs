@@ -580,6 +580,39 @@ impl ModelGradients {
 }
 
 // ---------------------------------------------------------------------------
+// Gradient sanitization
+// ---------------------------------------------------------------------------
+
+/// Replace NaN → 0 and ±Inf → ±65504 in LoRA gradients.
+/// Prevents corrupted ANE fp16 backward values from reaching the optimizer
+/// (Orion checkpoint sanitization technique, arxiv 2603.06728).
+fn sanitize_lora_grads(grads: &mut super::ane_lora::LoraModelGrads) {
+    let sanitize_buf = |buf: &mut [f32]| {
+        for v in buf.iter_mut() {
+            if v.is_nan() {
+                *v = 0.0;
+            } else if *v == f32::INFINITY {
+                *v = ane_forward::FP16_MAX;
+            } else if *v == f32::NEG_INFINITY {
+                *v = -ane_forward::FP16_MAX;
+            }
+        }
+    };
+    let sanitize_opt = |g: &mut Option<super::ane_lora::LoraAdapterGrads>| {
+        if let Some(ref mut grads) = g {
+            sanitize_buf(&mut grads.da);
+            sanitize_buf(&mut grads.db);
+        }
+    };
+    for lg in &mut grads.layers {
+        sanitize_opt(&mut lg.wq);
+        sanitize_opt(&mut lg.wv);
+        sanitize_opt(&mut lg.wo);
+        sanitize_opt(&mut lg.w2);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Full backward pass
 // ---------------------------------------------------------------------------
 
@@ -665,10 +698,11 @@ pub fn backward<T: ane_forward::TokenId>(
 
         // b. ANE ffn_bwd_w2t: dsilu = dffn @ W2^T (fused or tiled)
         let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let dsilu = kernels
+        let mut dsilu = kernels
             .ffn_bwd
             .eval_w2t(&dffn, &w2_for_pack, cfg)
             .map_err(|e| format!("ffn_bwd_w2t eval: {e}"))?;
+        ane_forward::clamp_fp16(&mut dsilu);
 
         // c. CPU silu_bwd
         let mut dh1 = vec![0.0f32; hidden * seq];
@@ -678,10 +712,11 @@ pub fn backward<T: ane_forward::TokenId>(
         // d. ANE ffn_bwd_w13t: dx_ffn = dh1@W1^T + dh3@W3^T (fused or tiled)
         let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
         let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let dx_ffn = kernels
+        let mut dx_ffn = kernels
             .ffn_bwd
             .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
             .map_err(|e| format!("ffn_bwd_w13t eval: {e}"))?;
+        ane_forward::clamp_fp16(&mut dx_ffn);
 
         // e. CPU dW accumulation for FFN
         // dW2[dim, hidden] += dffn[dim, seq] @ gate^T[hidden, seq]
@@ -1529,6 +1564,8 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         }
     }
 
+    sanitize_lora_grads(&mut lora_grads);
+
     BackwardResultWithLora {
         model_grads: None,
         lora_grads,
@@ -1633,10 +1670,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         // Replay base backward to get dx2 (gradient at attention residual point)
         let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
-        let dsilu = kernels
+        let mut dsilu = kernels
             .ffn_bwd
             .eval_w2t(&dffn, &w2_for_pack, cfg)
             .map_err(|e| format!("lora ffn_bwd_w2t: {e}"))?;
+        ane_forward::clamp_fp16(&mut dsilu);
 
         let mut dh1 = vec![0.0f32; hidden * seq];
         let mut dh3 = vec![0.0f32; hidden * seq];
@@ -1644,10 +1682,11 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
         let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-        let dx_ffn = kernels
+        let mut dx_ffn = kernels
             .ffn_bwd
             .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
             .map_err(|e| format!("lora ffn_bwd_w13t: {e}"))?;
+        ane_forward::clamp_fp16(&mut dx_ffn);
 
         let mut dx2 = vec![0.0f32; dim * seq];
         rmsnorm_bwd(
@@ -1964,6 +2003,10 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             (dsilu, w2_grads, w1t, w3t)
         });
 
+        // Clamp ANE backward outputs to prevent fp16 overflow propagation
+        let mut dsilu = dsilu;
+        ane_forward::clamp_fp16(&mut dsilu);
+
         // Accumulate W2 LoRA grads from parallel result
         if let (Some((da, db)), Some(lg)) =
             (w2_grads, lora_grads.layers[l].w2.as_mut())
@@ -1983,13 +2026,14 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
 
         // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (fused or tiled) ---
         // w1t, w3t already pre-transposed by the parallel CPU thread
-        let dx_ffn = bwd_kernels
+        let mut dx_ffn = bwd_kernels
             .ffn_bwd
             .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
             .unwrap_or_else(|e| {
                 tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
                 vec![0.0f32; dim * seq]
             });
+        ane_forward::clamp_fp16(&mut dx_ffn);
 
         // RMSNorm backward (FFN, CPU)
         let mut dx2 = vec![0.0f32; dim * seq];
@@ -2160,6 +2204,8 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         }
     }
 
+    sanitize_lora_grads(&mut lora_grads);
+
     BackwardResultWithLora {
         model_grads: None,
         lora_grads,
@@ -2247,6 +2293,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Round 1: rmsnorm_bwd
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_lora_grads_replaces_nan_and_inf() {
+        let lora = LoraModel::new(
+            LoraConfig {
+                rank: 4,
+                alpha: 4.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            1,
+            8,
+            16,
+        );
+        let mut grads = crate::agent::ane_lora::LoraModelGrads::zeros(&lora);
+        // Inject NaN and Inf into w2 adapter grads
+        if let Some(ref mut g) = grads.layers[0].w2 {
+            g.da[0] = f32::NAN;
+            g.da[1] = f32::INFINITY;
+            g.da[2] = f32::NEG_INFINITY;
+            g.da[3] = 42.0; // normal value, should be untouched
+        }
+        sanitize_lora_grads(&mut grads);
+        let g = grads.layers[0].w2.as_ref().unwrap();
+        assert_eq!(g.da[0], 0.0, "NaN should become 0");
+        assert_eq!(g.da[1], ane_forward::FP16_MAX, "+Inf should become fp16 max");
+        assert_eq!(g.da[2], -ane_forward::FP16_MAX, "-Inf should become -fp16 max");
+        assert_eq!(g.da[3], 42.0, "normal values should be untouched");
+    }
 
     #[test]
     fn test_rmsnorm_bwd_numerical_gradient() {
