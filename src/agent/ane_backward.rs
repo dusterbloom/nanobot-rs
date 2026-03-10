@@ -697,10 +697,10 @@ pub fn backward<T: ane_forward::TokenId>(
         let dffn = dy.clone();
 
         // b. ANE ffn_bwd_w2t: dsilu = dffn @ W2^T (fused or tiled)
-        let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
+        // W2 is [dim, hidden]; pack expects [ic=dim, oc=hidden] — pass directly.
         let mut dsilu = kernels
             .ffn_bwd
-            .eval_w2t(&dffn, &w2_for_pack, cfg)
+            .eval_w2t(&dffn, &lw.w2, cfg)
             .map_err(|e| format!("ffn_bwd_w2t eval: {e}"))?;
         ane_forward::clamp_fp16(&mut dsilu);
 
@@ -710,11 +710,10 @@ pub fn backward<T: ane_forward::TokenId>(
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
         // d. ANE ffn_bwd_w13t: dx_ffn = dh1@W1^T + dh3@W3^T (fused or tiled)
-        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
-        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
+        // W1/W3 are [hidden, dim]; pack expects [ic=hidden, oc=dim] — pass directly.
         let mut dx_ffn = kernels
             .ffn_bwd
-            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
+            .eval_w13t(&dh1, &dh3, &lw.w1, &lw.w3, cfg)
             .map_err(|e| format!("ffn_bwd_w13t eval: {e}"))?;
         ane_forward::clamp_fp16(&mut dx_ffn);
 
@@ -746,8 +745,7 @@ pub fn backward<T: ane_forward::TokenId>(
 
         // h. ANE wot_bwd: da = dx2 @ Wo^T
         let ad = cfg.attn_dim();
-        let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
-        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
+        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &lw.wo, dim, ad, seq);
         let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
         let wot_kernel = kernels.wot_bwd.as_ref().expect("wot_bwd kernel required for MHA backward");
         wot_kernel.write_input(0, &wot_input);
@@ -851,10 +849,7 @@ pub fn backward<T: ane_forward::TokenId>(
         matmul_accum_at(&mut gr.dwv, &dv, &ac.xnorm, dim, dim, seq);
 
         // m. ANE qkv_bwd: dx_attn = dq@Wq^T + dk@Wk^T + dv@Wv^T
-        let wqt = ane_weights::transpose_weight(&lw.wq, dim, dim);
-        let wkt = ane_weights::transpose_weight(&lw.wk, dim, dim);
-        let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
-        let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &wqt, &wkt, &wvt, cfg);
+        let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &lw.wq, &lw.wk, &lw.wv, cfg);
         let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
         let qkv_kernel = kernels.qkv_bwd.as_ref().expect("qkv_bwd kernel required for MHA backward");
         qkv_kernel.write_input(0, &qkv_input);
@@ -1669,10 +1664,9 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         }
 
         // Replay base backward to get dx2 (gradient at attention residual point)
-        let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
         let mut dsilu = kernels
             .ffn_bwd
-            .eval_w2t(&dffn, &w2_for_pack, cfg)
+            .eval_w2t(&dffn, &lw.w2, cfg)
             .map_err(|e| format!("lora ffn_bwd_w2t: {e}"))?;
         ane_forward::clamp_fp16(&mut dsilu);
 
@@ -1680,11 +1674,9 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
         let mut dh3 = vec![0.0f32; hidden * seq];
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
-        let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
-        let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
         let mut dx_ffn = kernels
             .ffn_bwd
-            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
+            .eval_w13t(&dh1, &dh3, &lw.w1, &lw.w3, cfg)
             .map_err(|e| format!("lora ffn_bwd_w13t: {e}"))?;
         ane_forward::clamp_fp16(&mut dx_ffn);
 
@@ -1720,8 +1712,7 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
 
         // Continue backward chain for next layer
         let ad = cfg.attn_dim();
-        let wot = ane_weights::transpose_weight(&lw.wo, dim, ad);
-        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &wot, dim, ad, seq);
+        let wot_input = ane_weights::pack_dyn_matmul(&dx2, &lw.wo, dim, ad, seq);
         let wot_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Wot);
         let wot_kernel = kernels.wot_bwd.as_ref().expect("wot_bwd kernel required for MHA backward");
         wot_kernel.write_input(0, &wot_input);
@@ -1805,10 +1796,7 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
             );
         }
 
-        let wqt = ane_weights::transpose_weight(&lw.wq, dim, dim);
-        let wkt = ane_weights::transpose_weight(&lw.wk, dim, dim);
-        let wvt = ane_weights::transpose_weight(&lw.wv, dim, dim);
-        let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &wqt, &wkt, &wvt, cfg);
+        let qkv_input = ane_weights::pack_qkvb(&dq, &dk, &dv, &lw.wq, &lw.wk, &lw.wv, cfg);
         let qkv_spec = ane_mil::KernelSpec::for_kernel(cfg, ane_mil::KernelType::Qkvb);
         let qkv_kernel = kernels.qkv_bwd.as_ref().expect("qkv_bwd kernel required for MHA backward");
         qkv_kernel.write_input(0, &qkv_input);
@@ -1984,16 +1972,17 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
                 } else {
                     None
                 };
-                let w1t = ane_weights::transpose_weight(&lw.w1, dim, hidden);
-                let w3t = ane_weights::transpose_weight(&lw.w3, dim, hidden);
-                (w2_grads, w1t, w3t)
+                // W1/W3 are [hidden, dim] — pass directly to backward packing
+                let w1_ref = lw.w1.clone();
+                let w3_ref = lw.w3.clone();
+                (w2_grads, w1_ref, w3_ref)
             });
 
             // Main thread: ANE ffn_bwd_w2t (dsilu = dffn @ W2^T) — fused or tiled
-            let w2_for_pack = ane_weights::transpose_weight(&lw.w2, hidden, dim);
+            // W2 is [dim, hidden] — pass directly to backward packing
             let dsilu = bwd_kernels
                 .ffn_bwd
-                .eval_w2t(&dffn, &w2_for_pack, cfg)
+                .eval_w2t(&dffn, &lw.w2, cfg)
                 .unwrap_or_else(|e| {
                     tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
                     vec![0.0f32; hidden * seq]
@@ -3319,5 +3308,258 @@ mod tests {
         eprintln!("  W2 grad norm: {w2_norm:.6}, Wo grad norm: {wo_norm:.6}");
         assert!(w2_norm > 0.0, "W2 LoRA grads are zero");
         assert!(wo_norm > 0.0, "Wo LoRA grads are zero");
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU vs ANE backward comparison — validates transpose fix end-to-end
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ane_backward_lora_matches_cpu_backward() {
+        use super::super::ane_lora::{LoraConfig, LoraKernels, LoraModel};
+        use super::super::ane_weights::LayerWeights;
+
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 64;
+        let vocab = 32;
+        let rank = 16;
+
+        let cfg = MilConfig::mha(dim, hidden, n_heads, seq);
+
+        // Compile ANE kernels
+        let fwd_kernels = match ane_forward::CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping CPU vs ANE backward test (ANE unavailable): {e}");
+                return;
+            }
+        };
+        let bwd_kernels = BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
+            .expect("compile_backward failed");
+        let lora_kernels = LoraKernels::compile(&cfg, rank).expect("LoRA kernels failed");
+
+        // Model with larger weights to expose transpose errors
+        let make_weight = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.1)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![LayerWeights {
+                wq: make_weight(dim * dim, 0),
+                wk: make_weight(dim * dim, 1000),
+                wv: make_weight(dim * dim, 2000),
+                wo: make_weight(dim * dim, 3000),
+                w1: make_weight(hidden * dim, 4000),
+                w2: make_weight(dim * hidden, 5000),
+                w3: make_weight(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_weight(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let lora = LoraModel::new(
+            LoraConfig {
+                rank,
+                ..LoraConfig::default()
+            },
+            1,
+            dim,
+            hidden,
+        );
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        // Shared CPU forward — isolates backward path differences
+        let fwd = ane_forward::forward_cpu(&model, Some(&lora), &tokens, &targets);
+        eprintln!("Forward loss: {:.6}", fwd.base.loss);
+
+        let cpu_bwd = backward_lora_cpu(&model, &fwd, &lora, &tokens);
+        let ane_bwd =
+            backward_with_lora(&bwd_kernels, &model, &fwd, &lora, &lora_kernels, &tokens)
+                .expect("ANE backward failed");
+
+        // Compare LoRA gradients
+        let compare_adapter = |name: &str, cpu: &Option<super::super::ane_lora::LoraAdapterGrads>, ane: &Option<super::super::ane_lora::LoraAdapterGrads>| {
+            let (cpu, ane) = match (cpu, ane) {
+                (Some(c), Some(a)) => (c, a),
+                (None, None) => return,
+                _ => panic!("{name}: one has grads, the other doesn't"),
+            };
+
+            let cpu_da_norm: f32 = cpu.da.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let ane_da_norm: f32 = ane.da.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let da_diff: f32 = cpu.da.iter().zip(ane.da.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+
+            let cpu_db_norm: f32 = cpu.db.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let ane_db_norm: f32 = ane.db.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let db_diff: f32 = cpu.db.iter().zip(ane.db.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+
+            let da_rel = if cpu_da_norm > 1e-10 { da_diff / cpu_da_norm } else { da_diff };
+            let db_rel = if cpu_db_norm > 1e-10 { db_diff / cpu_db_norm } else { db_diff };
+
+            eprintln!(
+                "  {name}.dA: cpu_norm={cpu_da_norm:.6}, ane_norm={ane_da_norm:.6}, rel_err={da_rel:.6}"
+            );
+            eprintln!(
+                "  {name}.dB: cpu_norm={cpu_db_norm:.6}, ane_norm={ane_db_norm:.6}, rel_err={db_rel:.6}"
+            );
+
+            assert!(da_rel < 0.5, "{name}.dA relative error too large: {da_rel}");
+            assert!(db_rel < 0.5, "{name}.dB relative error too large: {db_rel}");
+        };
+
+        for (i, (cpu_lg, ane_lg)) in cpu_bwd.lora_grads.layers.iter()
+            .zip(ane_bwd.lora_grads.layers.iter())
+            .enumerate()
+        {
+            eprintln!("Layer {i} LoRA gradient comparison:");
+            compare_adapter(&format!("L{i}.Wq"), &cpu_lg.wq, &ane_lg.wq);
+            compare_adapter(&format!("L{i}.Wv"), &cpu_lg.wv, &ane_lg.wv);
+            compare_adapter(&format!("L{i}.Wo"), &cpu_lg.wo, &ane_lg.wo);
+            compare_adapter(&format!("L{i}.W2"), &cpu_lg.w2, &ane_lg.w2);
+        }
+
+        // Also compare model gradients if ANE produced them
+        if let Some(ref ane_model_grads) = ane_bwd.model_grads {
+            let lg = &ane_model_grads.layers[0];
+            let norms = [
+                ("dwq", lg.dwq.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dwk", lg.dwk.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dwv", lg.dwv.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dwo", lg.dwo.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dw1", lg.dw1.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dw2", lg.dw2.iter().map(|v| v * v).sum::<f32>().sqrt()),
+                ("dw3", lg.dw3.iter().map(|v| v * v).sum::<f32>().sqrt()),
+            ];
+            for (name, norm) in &norms {
+                eprintln!("  ANE model grad {name} norm: {norm:.6}");
+                assert!(norm.is_finite(), "ANE model grad {name} is not finite");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Qwen3.5-0.8B LoRA training (CPU backward on real quantized model)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qwen3_5_0_8b_lora_training() {
+        use super::super::ane_lora::{lora_adam_update, LoraConfig, LoraModel, LoraModelAdam};
+        use super::super::ane_weights::{QuantizedModelWeights, WeightSource};
+
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+        if !model_dir.exists() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found at {}", model_dir.display());
+            return;
+        }
+
+        // Read config from model
+        let config_str = std::fs::read_to_string(model_dir.join("config.json"))
+            .expect("config.json");
+        let root: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let tc = root.get("text_config").unwrap_or(&root);
+
+        let dim = tc["hidden_size"].as_u64().unwrap() as usize;
+        let hidden_dim = tc["intermediate_size"].as_u64().unwrap() as usize;
+        let n_heads = tc["num_attention_heads"].as_u64().unwrap() as usize;
+        let n_kv_heads = tc["num_key_value_heads"].as_u64().unwrap() as usize;
+        let head_dim = tc["head_dim"].as_u64().unwrap_or((dim / n_heads) as u64) as usize;
+        let rms_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
+        let rope_cfg = tc.get("rope_parameters").or_else(|| tc.get("rope_scaling"));
+        let rope_theta = rope_cfg
+            .and_then(|r| r["rope_theta"].as_f64())
+            .unwrap_or(tc["rope_theta"].as_f64().unwrap_or(1e6));
+        let attn_output_gate = tc.get("attn_output_gate")
+            .and_then(|v| v.as_bool()).unwrap_or(false);
+        let layer_types: Vec<String> = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let n_layers = tc["num_hidden_layers"].as_u64()
+            .unwrap_or(layer_types.len() as u64) as usize;
+        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention").map(|(i, _)| i).collect();
+        let linear_n_heads = tc.get("linear_num_key_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_head_dim = tc.get("linear_key_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_n_value_heads = tc.get("linear_num_value_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc.get("linear_value_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let seq = 8; // short for test speed
+        let cfg = MilConfig {
+            dim, hidden_dim, n_heads, seq_len: seq, n_kv_heads,
+            rope_theta, rms_eps, has_lm_head: false, head_dim_explicit: head_dim,
+            linear_attn_indices, linear_n_heads, linear_head_dim,
+            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            attn_output_gate,
+        };
+
+        eprintln!(
+            "Qwen3.5-0.8B: dim={dim}, hidden={hidden_dim}, heads={n_heads}, kv={n_kv_heads}, \
+             head_dim={head_dim}, layers={n_layers}, gate={attn_output_gate}, \
+             linear_layers={}/{n_layers}",
+            cfg.linear_attn_indices.len()
+        );
+
+        eprintln!("Loading quantized model...");
+        let model = QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg)
+            .expect("model load failed");
+
+        let kv_dim = n_kv_heads * head_dim;
+        let ad = cfg.attn_dim();
+        let qpd = cfg.q_proj_dim();
+        let lora_cfg = LoraConfig { rank: 4, ..LoraConfig::default() };
+        let mut lora = LoraModel::with_full_dims(lora_cfg, n_layers, dim, kv_dim, ad, qpd, hidden_dim);
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        let tokens: Vec<u32> = (100..100 + seq as u32).collect();
+        let targets: Vec<u32> = (101..101 + seq as u32).collect();
+
+        let n_steps = 3;
+        let lr = 5e-4;
+        let mut losses = Vec::with_capacity(n_steps);
+
+        for step in 0..n_steps {
+            let fwd = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+            let bwd = backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
+            lora_adam_update(
+                &mut lora, &bwd.lora_grads, &mut adam,
+                step + 1, lr, 0.9, 0.999, 1e-8, 0.01,
+            );
+            eprintln!("  step {step}: loss={:.4}", fwd.base.loss);
+            losses.push(fwd.base.loss);
+        }
+
+        // Loss should be finite
+        for (i, &l) in losses.iter().enumerate() {
+            assert!(l.is_finite(), "step {i} loss not finite: {l}");
+        }
+
+        // Loss should decrease or at least not explode
+        assert!(
+            losses.last().unwrap() < &(losses[0] + 1.0),
+            "loss diverged: {:?}", losses
+        );
+
+        eprintln!("Qwen3.5-0.8B LoRA training: {} steps, losses={:.4?}", n_steps, losses);
     }
 }

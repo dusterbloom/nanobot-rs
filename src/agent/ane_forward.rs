@@ -495,6 +495,9 @@ pub enum FfnKernels {
 
 impl FfnKernels {
     /// Execute FFN W1+W3: xnorm → (h1, h3, gate).
+    ///
+    /// `w1`, `w3` are in standard `[out_features, in_features]` = `[hidden, dim]` layout.
+    /// The ANE packing expects `[dim, hidden]` (ic-major), so we transpose once per call.
     pub fn eval_w13(
         &self,
         xnorm: &[f32],
@@ -506,9 +509,15 @@ impl FfnKernels {
         let dim = cfg.dim;
         let seq = cfg.seq_len;
 
+        // Transpose weights from [hidden, dim] → [dim, hidden] for ANE packing.
+        // Dequantized weights are [out_features, in_features] (PyTorch convention),
+        // but the ANE DynMatmul kernel expects [in_features, out_features] (ic-major).
+        let w1_t = ane_weights::transpose_weight(w1, hidden, dim);
+        let w3_t = ane_weights::transpose_weight(w3, hidden, dim);
+
         match self {
             FfnKernels::Fused { w13, .. } => {
-                let input = ane_weights::pack_ffn_w13(xnorm, w1, w3, cfg);
+                let input = ane_weights::pack_ffn_w13(xnorm, &w1_t, &w3_t, cfg);
                 let spec = KernelSpec::for_kernel(cfg, KernelType::FfnW13);
                 w13.write_input(0, &input);
                 w13.eval()?;
@@ -529,7 +538,7 @@ impl FfnKernels {
                     let actual = oc_plan.actual_tile_size(t);
                     let tile_in = ane_weights::pack_dyn_matmul_oc_tile(
                         xnorm,
-                        w1,
+                        &w1_t,
                         dim,
                         hidden,
                         oc_plan.tile_size,
@@ -556,7 +565,7 @@ impl FfnKernels {
                     let actual = oc_plan.actual_tile_size(t);
                     let tile_in = ane_weights::pack_dyn_matmul_oc_tile(
                         xnorm,
-                        w3,
+                        &w3_t,
                         dim,
                         hidden,
                         oc_plan.tile_size,
@@ -589,6 +598,9 @@ impl FfnKernels {
     }
 
     /// Execute FFN W2: gate → ffn_out.
+    ///
+    /// `w2` is in standard `[out_features, in_features]` = `[dim, hidden]` layout.
+    /// The ANE packing expects `[hidden, dim]` (ic-major), so we transpose once per call.
     pub fn eval_w2(
         &self,
         gate: &[f32],
@@ -599,9 +611,12 @@ impl FfnKernels {
         let hidden = cfg.hidden_dim;
         let seq = cfg.seq_len;
 
+        // Transpose weight from [dim, hidden] → [hidden, dim] for ANE packing
+        let w2_t = ane_weights::transpose_weight(w2, dim, hidden);
+
         match self {
             FfnKernels::Fused { w2: w2_kernel, .. } => {
-                let input = ane_weights::pack_ffn_w2(gate, w2, cfg);
+                let input = ane_weights::pack_ffn_w2(gate, &w2_t, cfg);
                 let spec = KernelSpec::for_kernel(cfg, KernelType::FfnW2);
                 w2_kernel.write_input(0, &input);
                 w2_kernel.eval()?;
@@ -623,7 +638,7 @@ impl FfnKernels {
                     let start = ic_plan.tile_start(t);
                     let tile_in = ane_weights::pack_dyn_matmul_ic_tile(
                         gate,
-                        w2,
+                        &w2_t,
                         hidden,
                         dim,
                         ic_plan.tile_size,
@@ -4552,5 +4567,186 @@ mod tests {
         );
 
         eprintln!("E2E tiled forward+backward at Qwen3.5-4B: PASS");
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic: per-layer ANE fp16 vs CPU f32 precision comparison
+    // -----------------------------------------------------------------------
+
+    /// Wrapper that forces `forward_cpu_generic` to use the dequantized f32 path
+    /// (bypasses `quantized_layer` so attention+FFN both use f32 matmuls).
+    struct ForceF32View<'a, W: ane_weights::WeightSource>(&'a W);
+
+    impl<W: ane_weights::WeightSource> ane_weights::WeightSource for ForceF32View<'_, W> {
+        fn cfg(&self) -> &super::ane_mil::MilConfig { self.0.cfg() }
+        fn cfg_mut(&mut self) -> &mut super::ane_mil::MilConfig {
+            panic!("ForceF32View is read-only")
+        }
+        fn n_layers(&self) -> usize { self.0.n_layers() }
+        fn layer(&self, l: usize) -> std::borrow::Cow<'_, super::ane_weights::LayerWeights> {
+            self.0.layer(l)
+        }
+        fn quantized_layer(&self, _l: usize) -> Option<&super::ane_weights::QuantizedLayerWeights> {
+            None // force dequantized f32 path
+        }
+        fn embed(&self) -> &[f32] { self.0.embed() }
+        fn rms_final(&self) -> &[f32] { self.0.rms_final() }
+        fn vocab_size(&self) -> usize { self.0.vocab_size() }
+        fn lm_head(&self) -> Option<&[f32]> { self.0.lm_head() }
+        fn actual_dim(&self) -> usize { self.0.actual_dim() }
+        fn actual_hidden_dim(&self) -> usize { self.0.actual_hidden_dim() }
+    }
+
+    #[test]
+    fn test_ane_vs_cpu_per_layer_precision_4b() {
+        use super::super::ane_mil::MilConfig;
+        use super::super::ane_weights::{QuantizedModelWeights, WeightSource};
+        use std::path::Path;
+
+        let model_dir = Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/Jackrong/MLX-Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-4bit");
+        if !model_dir.exists() {
+            eprintln!("SKIP: Qwen3.5-4B MLX model not found at {}", model_dir.display());
+            return;
+        }
+
+        // Read config from model
+        let config_str = std::fs::read_to_string(model_dir.join("config.json"))
+            .expect("Failed to read config.json");
+        let root: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let tc = root.get("text_config").unwrap_or(&root);
+        let dim = tc["hidden_size"].as_u64().unwrap() as usize;
+        let hidden_dim = tc["intermediate_size"].as_u64().unwrap() as usize;
+        let n_heads = tc["num_attention_heads"].as_u64().unwrap() as usize;
+        let n_kv_heads = tc["num_key_value_heads"].as_u64().unwrap() as usize;
+        let head_dim = tc["head_dim"].as_u64().unwrap_or((dim / n_heads) as u64) as usize;
+        let rms_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
+        let rope_theta = tc["rope_theta"].as_f64().unwrap_or(1e6);
+        let vocab_size = tc["vocab_size"].as_u64().unwrap_or(
+            root["vocab_size"].as_u64().unwrap_or(248320)
+        ) as usize;
+        let attn_output_gate = tc.get("attn_output_gate")
+            .and_then(|v| v.as_bool()).unwrap_or(false);
+        let layer_types: Vec<String> = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let n_layers = tc["num_hidden_layers"].as_u64()
+            .unwrap_or(layer_types.len() as u64) as usize;
+        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention").map(|(i, _)| i).collect();
+        let linear_n_heads = tc.get("linear_num_key_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_head_dim = tc.get("linear_key_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_n_value_heads = tc.get("linear_num_value_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc.get("linear_value_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let seq = 32; // match E2E test (tiled kernels may need minimum seq)
+        let cfg = MilConfig {
+            dim, hidden_dim, n_heads, seq_len: seq, n_kv_heads,
+            rope_theta, rms_eps, has_lm_head: false, head_dim_explicit: head_dim,
+            linear_attn_indices, linear_n_heads, linear_head_dim,
+            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            attn_output_gate,
+        };
+        eprintln!("Config: dim={dim}, hidden={hidden_dim}, heads={n_heads}, kv={n_kv_heads}, hd={head_dim}, layers={n_layers}, seq={seq}");
+
+        // Compile ANE kernels
+        let fwd_kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("SKIP: ANE compile failed: {e}"); return; }
+        };
+
+        // Load model
+        let model = match QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("SKIP: weight load failed: {e}"); return; }
+        };
+
+        let tokens: Vec<u32> = (0..seq).map(|i| (i % vocab_size) as u32).collect();
+        let targets: Vec<u32> = (0..seq).map(|i| ((i + 1) % vocab_size) as u32).collect();
+
+        // CPU forward with dequantized f32 weights (same weights ANE uses)
+        let f32_view = ForceF32View(&model);
+        eprintln!("Running CPU f32 forward...");
+        let cpu_fwd = forward_cpu_generic(&f32_view, None, &tokens, &targets);
+        eprintln!("CPU f32 loss: {:.6}", cpu_fwd.base.loss);
+
+        // ANE forward (fp16 matmuls for FFN, f32 for attention)
+        eprintln!("Running ANE forward...");
+        let ane_fwd = forward_ane_generic(
+            &fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0,
+        ).expect("ANE forward failed");
+        eprintln!("ANE loss: {:.6}", ane_fwd.base.loss);
+
+        let loss_err = (cpu_fwd.base.loss - ane_fwd.base.loss).abs();
+        let loss_rel = loss_err / cpu_fwd.base.loss.abs().max(1e-8);
+        eprintln!("Loss delta: {loss_err:.6} (relative: {loss_rel:.4})");
+
+        // Helper: L2 norm
+        let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
+        // Helper: L2 norm of difference
+        let l2_diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+        };
+
+        eprintln!("\n{:>4} {:>12} {:>12} {:>12} {:>12} {:>12}", "L", "field", "cpu_norm", "ane_norm", "diff_norm", "rel_err");
+        eprintln!("{}", "-".repeat(72));
+
+        for (l, (ca, aa)) in cpu_fwd.base.layer_acts.iter()
+            .zip(ane_fwd.base.layer_acts.iter()).enumerate()
+        {
+            let fields: &[(&str, &[f32], &[f32])] = &[
+                ("layer_in", &ca.layer_in, &aa.layer_in),
+                ("xnorm",    &ca.xnorm,    &aa.xnorm),
+                ("o_out",    &ca.o_out,    &aa.o_out),
+                ("x2",       &ca.x2,       &aa.x2),
+                ("x2norm",   &ca.x2norm,   &aa.x2norm),
+                ("h1",       &ca.h1,       &aa.h1),
+                ("h3",       &ca.h3,       &aa.h3),
+                ("gate",     &ca.gate,     &aa.gate),
+                ("ffn_out",  &ca.ffn_out,  &aa.ffn_out),
+            ];
+
+            for &(name, cpu_v, ane_v) in fields {
+                if cpu_v.is_empty() { continue; }
+                let cn = l2(cpu_v);
+                let an = l2(ane_v);
+                let dn = l2_diff(cpu_v, ane_v);
+                let re = if cn > 1e-12 { dn / cn } else { 0.0 };
+                eprintln!("{l:>4} {name:>12} {cn:>12.4} {an:>12.4} {dn:>12.6} {re:>12.6}");
+            }
+            eprintln!("{}", "-".repeat(72));
+        }
+
+        // Logit comparison
+        let logit_diff = l2_diff(&cpu_fwd.base.logits, &ane_fwd.base.logits);
+        let logit_norm = l2(&cpu_fwd.base.logits);
+        let logit_rel = logit_diff / logit_norm.max(1e-12);
+        eprintln!("\nLogits: diff_norm={logit_diff:.4}, rel_err={logit_rel:.6}");
+        eprintln!("Final: CPU loss={:.6}, ANE loss={:.6}, delta={loss_err:.6}", cpu_fwd.base.loss, ane_fwd.base.loss);
+
+        // Layer 0 element-level h1 comparison (diagnose 2x norm issue)
+        let ca0 = &cpu_fwd.base.layer_acts[0];
+        let aa0 = &ane_fwd.base.layer_acts[0];
+        eprintln!("\nLayer 0 h1 element samples (first 8):");
+        for i in 0..8.min(ca0.h1.len()) {
+            eprintln!("  h1[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}", ca0.h1[i], aa0.h1[i], aa0.h1[i] / ca0.h1[i].max(1e-12));
+        }
+        eprintln!("Layer 0 h3 element samples (first 8):");
+        for i in 0..8.min(ca0.h3.len()) {
+            eprintln!("  h3[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}", ca0.h3[i], aa0.h3[i], aa0.h3[i] / ca0.h3[i].max(1e-12));
+        }
+        eprintln!("w1 len={}, w3 len={}, expected hidden*dim={}*{}={}",
+            model.layer(0).w1.len(), model.layer(0).w3.len(), cfg.hidden_dim, cfg.dim, cfg.hidden_dim * cfg.dim);
+
+        // Sanity: both losses should be finite
+        assert!(cpu_fwd.base.loss.is_finite(), "CPU loss not finite");
+        assert!(ane_fwd.base.loss.is_finite(), "ANE loss not finite");
     }
 }

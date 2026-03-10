@@ -786,13 +786,23 @@ impl ModelWeights {
             }
         };
 
-        /// Get a BF16 tensor directly (for layernorm weights, QK-norm)
-        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>, name: &str| -> io::Result<Vec<f32>> {
+        /// Get a small tensor directly (BF16 or F32) → Vec<f32>
+        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>,
+                        tensor_meta: &HashMap<String, (String, Vec<usize>)>,
+                        name: &str|
+         -> io::Result<Vec<f32>> {
             let name = resolve_tensor_name(tensors, name);
             let data = tensors.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
-            Ok(bf16_to_f32(data))
+            let dtype = tensor_meta.get(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
+            Ok(match dtype {
+                "F32" => data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => bf16_to_f32(data),
+            })
         };
 
         // Read config.json for group_size
@@ -898,11 +908,11 @@ impl ModelWeights {
                         group_size,
                         bits,
                     )?,
-                    a_log: get_bf16(&tensors, &format!("{la}.A_log"))?,
-                    dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
-                    norm_weight: get_bf16(&tensors, &format!("{la}.norm.weight"))?,
-                    conv_weight: get_bf16(&tensors, &format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias")).unwrap_or_default(),
+                    a_log: get_bf16(&tensors, &tensor_meta,&format!("{la}.A_log"))?,
+                    dt_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.dt_bias"))?,
+                    norm_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.norm.weight"))?,
+                    conv_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.weight"))?,
+                    conv_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // GDN layers have no separate q/k/v/o projections
                 (vec![], vec![], vec![], vec![], None, None, Some(gdn_w))
@@ -938,8 +948,8 @@ impl ModelWeights {
                 )?;
                 let wk = expand_kv(&wk_raw, kv_dim, attn_dim, hpg);
                 let wv = expand_kv(&wv_raw, kv_dim, attn_dim, hpg);
-                let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -1000,9 +1010,9 @@ impl ModelWeights {
             };
 
             // RMSNorm weights (BF16, not quantized)
-            let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
+            let rms_att = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.input_layernorm.weight"))?;
             let rms_ffn = get_bf16(
-                &tensors,
+                &tensors, &tensor_meta,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?;
 
@@ -1034,7 +1044,7 @@ impl ModelWeights {
             }
         }
 
-        let rms_final = get_bf16(&tensors, "model.norm.weight")?;
+        let rms_final = get_bf16(&tensors, &tensor_meta,"model.norm.weight")?;
 
         Ok(ModelWeights {
             cfg: cfg.clone(),
@@ -1165,12 +1175,22 @@ impl QuantizedModelWeights {
             }
         };
 
-        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>, name: &str| -> io::Result<Vec<f32>> {
+        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>,
+                        tensor_meta: &HashMap<String, (String, Vec<usize>)>,
+                        name: &str|
+         -> io::Result<Vec<f32>> {
             let name = resolve_tensor_name(tensors, name);
             let data = tensors.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
-            Ok(bf16_to_f32(data))
+            let dtype = tensor_meta.get(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
+            Ok(match dtype {
+                "F32" => data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => bf16_to_f32(data),
+            })
         };
 
         /// Dequantize a tensor to f32 (for embeddings that need random access as f32).
@@ -1272,11 +1292,11 @@ impl QuantizedModelWeights {
                         group_size,
                         bits,
                     )?,
-                    a_log: get_bf16(&tensors, &format!("{la}.A_log"))?,
-                    dt_bias: get_bf16(&tensors, &format!("{la}.dt_bias"))?,
-                    norm_weight: get_bf16(&tensors, &format!("{la}.norm.weight"))?,
-                    conv_weight: get_bf16(&tensors, &format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &format!("{la}.conv1d.bias")).unwrap_or_default(),
+                    a_log: get_bf16(&tensors, &tensor_meta,&format!("{la}.A_log"))?,
+                    dt_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.dt_bias"))?,
+                    norm_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.norm.weight"))?,
+                    conv_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.weight"))?,
+                    conv_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // Dummy empty tensors for MHA fields (not used for GDN layers)
                 let empty = QuantizedTensor {
@@ -1327,8 +1347,8 @@ impl QuantizedModelWeights {
                     group_size,
                     bits,
                 )?;
-                let q_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm = get_bf16(&tensors, &format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -1386,9 +1406,9 @@ impl QuantizedModelWeights {
                 (g, u, d)
             };
 
-            let rms_att = get_bf16(&tensors, &format!("{prefix}.input_layernorm.weight"))?;
+            let rms_att = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.input_layernorm.weight"))?;
             let rms_ffn = get_bf16(
-                &tensors,
+                &tensors, &tensor_meta,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?;
 
@@ -1424,7 +1444,7 @@ impl QuantizedModelWeights {
             }
         }
 
-        let rms_final = get_bf16(&tensors, "model.norm.weight")?;
+        let rms_final = get_bf16(&tensors, &tensor_meta,"model.norm.weight")?;
 
         Ok(QuantizedModelWeights {
             cfg: cfg.clone(),
