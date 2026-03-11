@@ -247,26 +247,28 @@ pub fn spawn_ane_training(
                 self, load_lora_bin, lora_adam_update, lora_adam_update_split_lr, save_lora_bin,
                 LoraConfig, LoraModel, LoraModelAdam,
             };
-            use super::ane_weights::{QuantizedModelWeights, WeightSource};
+            use super::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
 
             let t0 = std::time::Instant::now();
 
-            // 1. Load base model weights: quantized first, then dequantize all
-            // layers upfront so the training loop uses dense SGEMM (Accelerate
-            // + rayon) instead of per-row dequantization — ~3-5× faster.
+            // 1. Load quantized weights, then build a dense layer cache.
+            // Cached layers use dense SGEMM (Accelerate + rayon) for ~4× speedup.
+            // Memory-budget-aware: small models cache all layers, large models
+            // (e.g. 35B MoE) cache what fits and fall back to quantized path.
             let mut model = match QuantizedModelWeights::from_mlx_safetensors(
                 &cfg.model_dir,
                 &cfg.mil_config,
             ) {
                 Ok(m) => {
                     let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
-                    let dense = m.to_dense();
-                    let dense_mb = dense.dense_memory_bytes() as f64 / 1_048_576.0;
+                    let cached = DenseCachedModel::auto(m);
                     tracing::info!(
-                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB → dense {dense_mb:.1} MB)",
+                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
                         t0.elapsed().as_millis(),
+                        cached.cached_layer_count(),
+                        cached.n_layers(),
                     );
-                    dense
+                    cached
                 }
                 Err(e) => {
                     tracing::error!("ANE train: failed to load weights: {e}");
@@ -369,7 +371,7 @@ pub fn spawn_ane_training(
                         let (bucket_seq, fwd_k, bwd_k) = bk.get(tokens_u32.len());
                         let tok_pad = pad_to(&tokens_u32, *bucket_seq);
                         let tgt_pad = pad_to(&targets_u32, *bucket_seq);
-                        model.cfg.seq_len = *bucket_seq;
+                        model.cfg_mut().seq_len = *bucket_seq;
 
                         let fwd = match ane_forward::forward_ane_generic(
                             fwd_k,
@@ -383,7 +385,7 @@ pub fn spawn_ane_training(
                             Ok(f) => f,
                             Err(e) => {
                                 tracing::warn!("ANE forward failed ({e}), falling back to CPU");
-                                model.cfg.seq_len = tokens_u32.len();
+                                model.cfg_mut().seq_len = tokens_u32.len();
                                 ane_forward::forward_cpu_generic(
                                     &model,
                                     Some(&lora),
@@ -406,7 +408,7 @@ pub fn spawn_ane_training(
                         (fwd, bwd)
                     } else {
                         // CPU fallback path (existing behavior)
-                        model.cfg.seq_len = tokens_u32.len();
+                        model.cfg_mut().seq_len = tokens_u32.len();
                         let fwd = ane_forward::forward_cpu_generic(
                             &model,
                             Some(&lora),
@@ -1366,10 +1368,10 @@ mod tests {
         assert!(!samples.is_empty(), "should tokenize at least one sample");
         eprintln!("tokenized {} training samples", samples.len());
 
-        // Load quantized model, then dequantize all layers upfront for speed
+        // Load quantized model with dense layer cache for speed
         let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
             .expect("load model");
-        let mut model = quantized.to_dense();
+        let mut model = crate::agent::ane_weights::DenseCachedModel::auto(quantized);
         let n_layers = model.n_layers();
         let dim = mil_cfg.dim;
         let hidden = mil_cfg.hidden_dim;
@@ -1575,8 +1577,8 @@ mod tests {
         }
         let q_ms = t0.elapsed().as_millis() as f64 / iters as f64;
 
-        // Dequantize all layers upfront
-        let mut d_model = q_model.to_dense();
+        // Dense cached model (auto budget)
+        let mut d_model = crate::agent::ane_weights::DenseCachedModel::auto(q_model);
         d_model.cfg_mut().seq_len = tokens_u32.len();
         let _ = ane_forward::forward_cpu_generic(&d_model, Some(&lora), &tokens_u32, &targets_u32);
 
@@ -1600,10 +1602,9 @@ mod tests {
         let d_ms = t0.elapsed().as_millis() as f64 / iters as f64;
 
         let speedup = q_ms / d_ms;
-        eprintln!("quantized: {q_ms:.0}ms/step, dense: {d_ms:.0}ms/step, speedup: {speedup:.2}×");
         eprintln!(
-            "dense memory: {:.1} MB",
-            d_model.dense_memory_bytes() as f64 / 1_048_576.0
+            "quantized: {q_ms:.0}ms/step, cached: {d_ms:.0}ms/step ({}/{} layers), speedup: {speedup:.2}×",
+            d_model.cached_layer_count(), d_model.n_layers()
         );
     }
 }

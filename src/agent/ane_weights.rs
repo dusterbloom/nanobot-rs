@@ -1621,6 +1621,179 @@ impl QuantizedModelWeights {
             lm_head: self.lm_head.clone(),
         }
     }
+
+    /// Estimate dense f32 size of a single layer (used for memory budgeting).
+    pub fn dense_layer_bytes(&self, l: usize) -> usize {
+        let ql = &self.layers[l];
+        let hpg = self.heads_per_group;
+        let attn = if ql.gdn.is_some() {
+            0 // GDN: wq/wk/wv/wo are empty in dense form
+        } else {
+            // wq: rows*cols (q_proj_dim * dim), wk/wv expanded for GQA
+            let wq = ql.wq.rows * ql.wq.cols;
+            let wk = ql.wk.rows * hpg * ql.wk.cols; // expanded
+            let wv = ql.wv.rows * hpg * ql.wv.cols; // expanded
+            let wo = ql.wo.rows * ql.wo.cols;
+            (wq + wk + wv + wo) * 4
+        };
+        let ffn = (ql.w1.rows * ql.w1.cols + ql.w2.rows * ql.w2.cols + ql.w3.rows * ql.w3.cols) * 4;
+        let gdn = if let Some(g) = &ql.gdn {
+            (g.qkv_proj.rows * g.qkv_proj.cols
+                + g.a_proj.rows * g.a_proj.cols
+                + g.b_proj.rows * g.b_proj.cols
+                + g.z_proj.rows * g.z_proj.cols
+                + g.o_proj.rows * g.o_proj.cols
+                + g.a_log.len()
+                + g.dt_bias.len()
+                + g.norm_weight.len()
+                + g.conv_weight.len()
+                + g.conv_bias.len())
+                * 4
+        } else {
+            0
+        };
+        let norms = (ql.rms_att.len() + ql.rms_ffn.len()
+            + ql.q_norm.as_ref().map_or(0, |v| v.len())
+            + ql.k_norm.as_ref().map_or(0, |v| v.len()))
+            * 4;
+        attn + ffn + gdn + norms
+    }
+}
+
+/// Dense layer cache wrapping a quantized model for fast training.
+///
+/// Dequantizes layers into f32 up to a memory budget, then serves them via
+/// `Cow::Borrowed` (zero-copy) to the dense forward/backward path. Layers
+/// that don't fit in the budget fall back to per-row-block dequantization.
+///
+/// For small models (0.8B): caches all layers → ~4× speedup, ~2.9 GB.
+/// For large models (35B MoE): caches what fits within the budget.
+pub struct DenseCachedModel {
+    quantized: QuantizedModelWeights,
+    cache: Vec<Option<LayerWeights>>,
+    cached_count: usize,
+}
+
+impl DenseCachedModel {
+    /// Create a dense cache with automatic memory budgeting.
+    ///
+    /// Uses 50% of physical RAM (minus current quantized model) as the budget,
+    /// capping at the full dense size. Layers are cached in order (0..N-1)
+    /// until the budget is exhausted.
+    pub fn auto(quantized: QuantizedModelWeights) -> Self {
+        let phys_mem = Self::physical_memory_bytes();
+        // Reserve memory for quantized model + embed + LoRA/Adam + activations + headroom
+        let reserved = quantized.quantized_memory_bytes() + 2 * 1024 * 1024 * 1024; // +2 GB headroom
+        let budget = if phys_mem > reserved {
+            (phys_mem - reserved) / 2 // Use half of remaining
+        } else {
+            0
+        };
+        Self::with_budget(quantized, budget)
+    }
+
+    /// Create a dense cache with an explicit byte budget for layer storage.
+    pub fn with_budget(quantized: QuantizedModelWeights, budget: usize) -> Self {
+        let n = quantized.layers.len();
+        let mut cache: Vec<Option<LayerWeights>> = (0..n).map(|_| None).collect();
+        let mut used = 0usize;
+        let mut cached_count = 0;
+
+        for l in 0..n {
+            let layer_bytes = quantized.dense_layer_bytes(l);
+            if used + layer_bytes > budget {
+                break;
+            }
+            cache[l] = Some(quantized.dequantize_layer(l));
+            used += layer_bytes;
+            cached_count += 1;
+        }
+
+        tracing::info!(
+            "dense cache: {cached_count}/{n} layers cached ({:.1} MB / {:.1} MB budget)",
+            used as f64 / 1_048_576.0,
+            budget as f64 / 1_048_576.0,
+        );
+
+        Self {
+            quantized,
+            cache,
+            cached_count,
+        }
+    }
+
+    /// Number of layers currently cached in dense form.
+    pub fn cached_layer_count(&self) -> usize {
+        self.cached_count
+    }
+
+    #[cfg(target_os = "macos")]
+    fn physical_memory_bytes() -> usize {
+        unsafe {
+            let mut size: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let name = c"hw.memsize";
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut size as *mut u64 as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            );
+            size as usize
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn physical_memory_bytes() -> usize {
+        // Fallback: assume 16 GB
+        16 * 1024 * 1024 * 1024
+    }
+}
+
+impl WeightSource for DenseCachedModel {
+    fn cfg(&self) -> &MilConfig {
+        &self.quantized.cfg
+    }
+    fn cfg_mut(&mut self) -> &mut MilConfig {
+        &mut self.quantized.cfg
+    }
+    fn n_layers(&self) -> usize {
+        self.quantized.layers.len()
+    }
+    fn layer(&self, l: usize) -> std::borrow::Cow<'_, LayerWeights> {
+        if let Some(ref lw) = self.cache[l] {
+            std::borrow::Cow::Borrowed(lw)
+        } else {
+            std::borrow::Cow::Owned(self.quantized.dequantize_layer(l))
+        }
+    }
+    fn quantized_layer(&self, l: usize) -> Option<&QuantizedLayerWeights> {
+        // Return quantized ref only for uncached layers (forces quantized matmul path)
+        if self.cache[l].is_some() {
+            None
+        } else {
+            Some(&self.quantized.layers[l])
+        }
+    }
+    fn embed(&self) -> &[f32] {
+        &self.quantized.embed
+    }
+    fn rms_final(&self) -> &[f32] {
+        &self.quantized.rms_final
+    }
+    fn vocab_size(&self) -> usize {
+        self.quantized.vocab_size
+    }
+    fn lm_head(&self) -> Option<&[f32]> {
+        self.quantized.lm_head.as_deref()
+    }
+    fn actual_dim(&self) -> usize {
+        self.quantized.actual_dim()
+    }
+    fn actual_hidden_dim(&self) -> usize {
+        self.quantized.actual_hidden_dim()
+    }
 }
 
 /// Expand KV weights/activations from [kv_dim, in_dim] to [target_dim, in_dim]
