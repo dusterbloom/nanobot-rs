@@ -1438,6 +1438,23 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         );
         ane_forward::vec_add_inplace(&mut dx2, &dy);
 
+        // GDN layers: skip attention backward — gradient flows through residual only.
+        if lw.gdn.is_some() {
+            let mut dx_rms1 = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(
+                &mut dx_rms1,
+                &mut vec![0.0f32; dim],
+                &dx2,
+                &ac.layer_in,
+                &lw.rms_att,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
+            dy = dx_rms1;
+            continue;
+        }
+
         // LoRA Wo backward
         if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
             lora.layers[l].wo.as_ref(),

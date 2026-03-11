@@ -251,20 +251,22 @@ pub fn spawn_ane_training(
 
             let t0 = std::time::Instant::now();
 
-            // 1. Load base model weights in quantized form (QLoRA: ~4x less memory).
-            // Layer weights stay in 8-bit and are dequantized per-layer during
-            // forward/backward, keeping only one layer's f32 weights in memory.
+            // 1. Load base model weights: quantized first, then dequantize all
+            // layers upfront so the training loop uses dense SGEMM (Accelerate
+            // + rayon) instead of per-row dequantization — ~3-5× faster.
             let mut model = match QuantizedModelWeights::from_mlx_safetensors(
                 &cfg.model_dir,
                 &cfg.mil_config,
             ) {
                 Ok(m) => {
+                    let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
+                    let dense = m.to_dense();
+                    let dense_mb = dense.dense_memory_bytes() as f64 / 1_048_576.0;
                     tracing::info!(
-                        "ANE train: loaded quantized model in {}ms ({:.1} MB)",
+                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB → dense {dense_mb:.1} MB)",
                         t0.elapsed().as_millis(),
-                        m.quantized_memory_bytes() as f64 / 1_048_576.0,
                     );
-                    m
+                    dense
                 }
                 Err(e) => {
                     tracing::error!("ANE train: failed to load weights: {e}");
@@ -1364,9 +1366,10 @@ mod tests {
         assert!(!samples.is_empty(), "should tokenize at least one sample");
         eprintln!("tokenized {} training samples", samples.len());
 
-        // Load quantized model
-        let mut model = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+        // Load quantized model, then dequantize all layers upfront for speed
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
             .expect("load model");
+        let mut model = quantized.to_dense();
         let n_layers = model.n_layers();
         let dim = mil_cfg.dim;
         let hidden = mil_cfg.hidden_dim;
@@ -1493,5 +1496,114 @@ mod tests {
         );
 
         eprintln!("PASS: LoRA training produces measurable perplexity improvement");
+    }
+
+    /// Benchmark: quantized vs dense forward+backward per step.
+    /// Not a correctness test — just prints timing comparison.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn bench_quantized_vs_dense_step() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel};
+        use crate::agent::ane_weights::{QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let dir = qwen3_5_dir();
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(64);
+
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: "What is the capital of France?".into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: "The capital of France is Paris.".into(),
+            },
+        ];
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize");
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+
+        // Load quantized
+        let mut q_model =
+            QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg).expect("load");
+        let n_layers = q_model.n_layers();
+        let dim = mil_cfg.dim;
+        let hidden = mil_cfg.hidden_dim;
+
+        let lora = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+
+        // Warmup + time quantized path
+        q_model.cfg_mut().seq_len = tokens_u32.len();
+        let _ = ane_forward::forward_cpu_generic(&q_model, Some(&lora), &tokens_u32, &targets_u32);
+
+        let iters = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let fwd = ane_forward::forward_cpu_generic(
+                &q_model,
+                Some(&lora),
+                &tokens_u32,
+                &targets_u32,
+            );
+            let _ = crate::agent::ane_backward::backward_lora_cpu_generic(
+                &q_model,
+                &fwd,
+                &lora,
+                &tokens_u32,
+                15.0,
+                256.0,
+            );
+        }
+        let q_ms = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        // Dequantize all layers upfront
+        let mut d_model = q_model.to_dense();
+        d_model.cfg_mut().seq_len = tokens_u32.len();
+        let _ = ane_forward::forward_cpu_generic(&d_model, Some(&lora), &tokens_u32, &targets_u32);
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let fwd = ane_forward::forward_cpu_generic(
+                &d_model,
+                Some(&lora),
+                &tokens_u32,
+                &targets_u32,
+            );
+            let _ = crate::agent::ane_backward::backward_lora_cpu_generic(
+                &d_model,
+                &fwd,
+                &lora,
+                &tokens_u32,
+                15.0,
+                256.0,
+            );
+        }
+        let d_ms = t0.elapsed().as_millis() as f64 / iters as f64;
+
+        let speedup = q_ms / d_ms;
+        eprintln!("quantized: {q_ms:.0}ms/step, dense: {d_ms:.0}ms/step, speedup: {speedup:.2}×");
+        eprintln!(
+            "dense memory: {:.1} MB",
+            d_model.dense_memory_bytes() as f64 / 1_048_576.0
+        );
     }
 }

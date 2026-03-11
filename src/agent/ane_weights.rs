@@ -59,6 +59,41 @@ pub struct ModelWeights {
     pub lm_head: Option<Vec<f32>>, // [vocab * dim] untied classifier (Qwen)
 }
 
+impl ModelWeights {
+    /// Total f32 memory footprint in bytes.
+    pub fn dense_memory_bytes(&self) -> usize {
+        let layer_bytes: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                let attn = (l.wq.len() + l.wk.len() + l.wv.len() + l.wo.len()) * 4;
+                let ffn = (l.w1.len() + l.w2.len() + l.w3.len()) * 4;
+                let norm = (l.rms_att.len() + l.rms_ffn.len()) * 4;
+                let qk = l.q_norm.as_ref().map_or(0, |v| v.len() * 4)
+                    + l.k_norm.as_ref().map_or(0, |v| v.len() * 4);
+                let gdn = l.gdn.as_ref().map_or(0, |g| {
+                    (g.qkv_proj.len()
+                        + g.a_proj.len()
+                        + g.b_proj.len()
+                        + g.z_proj.len()
+                        + g.o_proj.len()
+                        + g.a_log.len()
+                        + g.dt_bias.len()
+                        + g.norm_weight.len()
+                        + g.conv_weight.len()
+                        + g.conv_bias.len())
+                        * 4
+                });
+                attn + ffn + norm + qk + gdn
+            })
+            .sum();
+        let embed_bytes = self.embed.len() * 4;
+        let rms_bytes = self.rms_final.len() * 4;
+        let lm_head_bytes = self.lm_head.as_ref().map_or(0, |v| v.len() * 4);
+        layer_bytes + embed_bytes + rms_bytes + lm_head_bytes
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MlxCheckpointMeta {
     group_size: usize,
@@ -1566,6 +1601,25 @@ impl QuantizedModelWeights {
         let embed_bytes = self.embed.len() * 4;
         let rms_bytes = self.rms_final.len() * 4;
         layer_bytes + embed_bytes + rms_bytes
+    }
+
+    /// Dequantize all layers into a dense `ModelWeights` for fast training.
+    ///
+    /// Trades memory (~4× more than quantized) for speed: eliminates per-row
+    /// dequantization during forward/backward, letting the training loop use
+    /// dense SGEMM (with Accelerate + rayon) for ~3-5× speedup.
+    pub fn to_dense(&self) -> ModelWeights {
+        let layers: Vec<LayerWeights> = (0..self.layers.len())
+            .map(|l| self.dequantize_layer(l))
+            .collect();
+        ModelWeights {
+            cfg: self.cfg.clone(),
+            layers,
+            rms_final: self.rms_final.clone(),
+            embed: self.embed.clone(),
+            vocab_size: self.vocab_size,
+            lm_head: self.lm_head.clone(),
+        }
     }
 }
 
