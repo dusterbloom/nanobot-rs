@@ -338,7 +338,7 @@ struct MemoryBenchResult {
 }
 
 struct BorrowedSingleLayerModel<'a> {
-    cfg: &'a nanobot::agent::ane_mil::MilConfig,
+    cfg: nanobot::agent::ane_mil::MilConfig,
     layer: &'a nanobot::agent::ane_weights::LayerWeights,
     rms_final: &'a [f32],
     embed: &'a [f32],
@@ -348,7 +348,11 @@ struct BorrowedSingleLayerModel<'a> {
 
 impl<'a> nanobot::agent::ane_weights::WeightSource for BorrowedSingleLayerModel<'a> {
     fn cfg(&self) -> &nanobot::agent::ane_mil::MilConfig {
-        self.cfg
+        &self.cfg
+    }
+
+    fn cfg_mut(&mut self) -> &mut nanobot::agent::ane_mil::MilConfig {
+        &mut self.cfg
     }
 
     fn n_layers(&self) -> usize {
@@ -1283,7 +1287,7 @@ fn bench_quantized_layer_forward_path() -> QuantizedLayerForwardBenchResult {
     };
     let dense_layer = quantized.dequantize_layer(0);
     let dense_model = BorrowedSingleLayerModel {
-        cfg: &cfg,
+        cfg: cfg.clone(),
         layer: &dense_layer,
         rms_final: &rms_final,
         embed: &embed,
@@ -1303,7 +1307,7 @@ fn bench_quantized_layer_forward_path() -> QuantizedLayerForwardBenchResult {
     let materialized_ms = measure_average_ms(1, 5, || {
         let old_layer = quantized.dequantize_layer(0);
         let old_model = BorrowedSingleLayerModel {
-            cfg: &cfg,
+            cfg: cfg.clone(),
             layer: &old_layer,
             rms_final: &rms_final,
             embed: &embed,
@@ -1560,7 +1564,7 @@ fn bench_checkpoint_quantized_forward_path(options: &Options) -> Option<Checkpoi
         let single_layer = single_layer_quantized_model(&quantized, layer_idx);
         let dense_layer = single_layer.dequantize_layer(0);
         let dense_model = BorrowedSingleLayerModel {
-            cfg: &single_layer.cfg,
+            cfg: single_layer.cfg.clone(),
             layer: &dense_layer,
             rms_final: &single_layer.rms_final,
             embed: &single_layer.embed,
@@ -1578,7 +1582,7 @@ fn bench_checkpoint_quantized_forward_path(options: &Options) -> Option<Checkpoi
         let materialized_ms = measure_average_ms(1, 5, || {
             let old_layer = single_layer.dequantize_layer(0);
             let old_model = BorrowedSingleLayerModel {
-                cfg: &single_layer.cfg,
+                cfg: single_layer.cfg.clone(),
                 layer: &old_layer,
                 rms_final: &single_layer.rms_final,
                 embed: &single_layer.embed,

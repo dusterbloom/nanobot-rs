@@ -785,6 +785,36 @@ fn create_agent_loop_inner(
         agent_loop.set_perplexity_gate(config.perplexity_gate.clone());
     }
 
+    // Resolve model dir for standalone ANE training (oMLX/LM Studio mode).
+    // When no in-process MLX is active, ANE training needs a model dir for
+    // weights + tokenizer. Also auto-enable perplexity gate so training fires.
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    {
+        let has_mlx_provider = {
+            #[cfg(feature = "mlx")]
+            { mlx.is_some() }
+            #[cfg(not(feature = "mlx"))]
+            { false }
+        };
+        if !has_mlx_provider {
+            let model_dir = resolve_mlx_model_dir(config);
+            if model_dir.join("config.json").exists() && model_dir.join("tokenizer.json").exists() {
+                tracing::info!(
+                    model_dir = %model_dir.display(),
+                    "ANE standalone training: model dir resolved"
+                );
+                agent_loop.set_ane_model_dir(Some(model_dir));
+                // Auto-enable perplexity gate if not already enabled.
+                if !agent_loop.has_perplexity_gate() {
+                    let mut gate_config = config.perplexity_gate.clone();
+                    gate_config.enabled = true;
+                    agent_loop.set_perplexity_gate(gate_config);
+                    tracing::info!("ANE standalone: perplexity gate auto-enabled");
+                }
+            }
+        }
+    }
+
     agent_loop
 }
 

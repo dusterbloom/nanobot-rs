@@ -21,7 +21,7 @@ pub mod ane_forward;
 pub mod ane_lora;
 #[cfg(feature = "ane")]
 pub mod ane_mil;
-#[cfg(all(feature = "ane", feature = "mlx"))]
+#[cfg(feature = "ane")]
 pub mod ane_mlx_bridge;
 #[cfg(feature = "ane")]
 pub mod ane_train;

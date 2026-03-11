@@ -69,6 +69,9 @@ pub(crate) struct DefaultLearnLoop {
     pub mlx_provider: Option<Arc<crate::providers::mlx::MlxProvider>>,
     /// Runtime counters for training status visibility in TUI.
     pub training_counters: Option<Arc<crate::agent::agent_core::RuntimeCounters>>,
+    /// Resolved model directory for standalone ANE training.
+    /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
+    pub ane_model_dir: Option<std::path::PathBuf>,
 }
 
 impl DefaultLearnLoop {
@@ -168,6 +171,7 @@ impl LearnLoop for DefaultLearnLoop {
         let eb_mutex = self.experience_buffer.as_ref()?.clone();
         let pg_config = self.perplexity_gate_config.clone();
         let train_counters = self.training_counters.clone();
+        let ane_model_dir = self.ane_model_dir.clone();
 
         #[cfg(feature = "mlx")]
         let mlx_provider = self.mlx_provider.clone();
@@ -274,9 +278,15 @@ impl LearnLoop for DefaultLearnLoop {
 
             // ANE split-silicon training: train on CPU/ANE thread,
             // hot-swap weights into MLX GPU model when done.
+            // Fires when EITHER mlx_provider OR ane_model_dir is set.
             #[cfg(all(feature = "ane", feature = "mlx"))]
-            if let Some(ref mlx) = mlx_provider {
-                let model_dir = std::path::Path::new(mlx.model_path());
+            {
+                let model_dir_opt = if let Some(ref mlx) = mlx_provider {
+                    Some(std::path::PathBuf::from(mlx.model_path()))
+                } else {
+                    ane_model_dir.clone()
+                };
+                if let Some(ref model_dir) = model_dir_opt {
                 if let Some(ane_cfg) = build_ane_training_config(Some(model_dir)) {
                     let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
                         std::path::Path::new(&ane_cfg.model_dir),
@@ -316,7 +326,7 @@ impl LearnLoop for DefaultLearnLoop {
                         }
                     }
                     if !samples.is_empty() {
-                        let mlx_tx = mlx.model_tx();
+                        let mlx_tx = mlx_provider.as_ref().map(|mlx| mlx.model_tx());
                         // Signal training start.
                         if let Some(ref tc) = train_counters {
                             tc.training_active.store(true, Ordering::Relaxed);
@@ -332,10 +342,12 @@ impl LearnLoop for DefaultLearnLoop {
                         );
                         let eb_for_done = eb_mutex.clone();
                         let n_exps = ids.len();
-                        // Spawn a watcher that clears training_active when the
-                        // ANE thread completes. mark_exported only runs after
-                        // training succeeds (returns true).
-                        tokio::task::spawn_blocking(move || {
+                        info!(
+                            "perplexity_gate: ANE split-silicon training spawned ({n_exps} experiences)"
+                        );
+                        // Wait for the ANE thread to finish on the blocking pool,
+                        // then clear training_active and mark experiences exported.
+                        let _ = tokio::task::spawn_blocking(move || {
                             let ok = handle.join().unwrap_or(false);
                             if let Some(ref tc) = tc_for_done {
                                 tc.training_active.store(false, Ordering::Relaxed);
@@ -354,14 +366,15 @@ impl LearnLoop for DefaultLearnLoop {
                                     "perplexity_gate: ANE training failed, experiences NOT marked exported"
                                 );
                             }
-                        });
-                        info!(
-                            "perplexity_gate: ANE split-silicon training spawned ({n_exps} experiences)"
-                        );
+                        }).await;
                         return;
                     }
                 }
+                }
             }
+            // Suppress unused-variable warning when ANE features are off.
+            #[cfg(not(all(feature = "ane", feature = "mlx")))]
+            let _ = &ane_model_dir;
 
             // HTTP-only training fallback (short timeout, no model worker contention).
             // In-process MLX training is skipped — it sends ModelRequest::Train to
@@ -420,7 +433,7 @@ pub(crate) async fn query_perplexity(
 ///
 /// Returns `None` if no ANE-compatible model is available.
 #[cfg(all(feature = "ane", feature = "mlx"))]
-fn build_ane_training_config(
+pub(crate) fn build_ane_training_config(
     model_dir: Option<&std::path::Path>,
 ) -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
     use crate::agent::mlx_lora::ModelConfig;
@@ -640,6 +653,7 @@ mod tests {
             #[cfg(feature = "mlx")]
             mlx_provider: None,
             training_counters: None,
+            ane_model_dir: None,
         };
         let outcome = make_test_outcome();
         // Should not panic even with no calibrator and audit disabled.

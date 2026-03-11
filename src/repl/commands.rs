@@ -697,7 +697,15 @@ impl ReplContext {
                 self.cmd_adapt(arg).await;
             }
             "/train" => {
-                self.cmd_train_status();
+                match arg.trim() {
+                    "" | "status" => self.cmd_train_status(),
+                    "run" => self.cmd_train_run().await,
+                    "enable" => self.cmd_train_toggle(true),
+                    "disable" => self.cmd_train_toggle(false),
+                    "list" => self.cmd_train_list(),
+                    "merge" => self.cmd_train_merge().await,
+                    _ => println!("\n  Usage: /train [status|run|enable|disable|list|merge]\n"),
+                }
             }
             "/skill" | "/skills" => {
                 self.cmd_skill(arg).await;

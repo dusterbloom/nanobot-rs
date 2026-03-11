@@ -801,4 +801,311 @@ impl ReplContext {
         }
         println!();
     }
+
+    /// /train enable | /train disable — toggle the perplexity gate.
+    pub(super) fn cmd_train_toggle(&mut self, enable: bool) {
+        let mut pg = self.config.perplexity_gate.clone();
+        pg.enabled = enable;
+        self.agent_loop.set_perplexity_gate(pg);
+        println!(
+            "\n  Perplexity gate: {}\n",
+            if enable { "enabled" } else { "disabled" }
+        );
+    }
+
+    /// /train list — list LoRA adapter files on disk.
+    pub(super) fn cmd_train_list(&self) {
+        let lora_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nanobot/workspace/lora");
+        if !lora_dir.is_dir() {
+            println!("\n  No LoRA adapters found ({})\n", lora_dir.display());
+            return;
+        }
+        let mut entries: Vec<_> = match std::fs::read_dir(&lora_dir) {
+            Ok(rd) => rd
+                .flatten()
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "bin")
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(e) => {
+                println!("\n  Failed to read lora dir: {e}\n");
+                return;
+            }
+        };
+        if entries.is_empty() {
+            println!("\n  No LoRA adapters found in {}\n", lora_dir.display());
+            return;
+        }
+        entries.sort_by_key(|e| e.file_name());
+        println!("\n  LoRA Adapters ({}):\n", lora_dir.display());
+        println!("  {:<40} {:>10} {}", "MODEL", "SIZE", "MODIFIED");
+        for entry in &entries {
+            let name = entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".bin")
+                .unwrap_or(&entry.file_name().to_string_lossy())
+                .to_string();
+            let meta = entry.metadata().ok();
+            let size = meta
+                .as_ref()
+                .map(|m| format!("{:.1} KB", m.len() as f64 / 1024.0))
+                .unwrap_or_else(|| "?".into());
+            let modified = meta
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let elapsed = t.elapsed().unwrap_or_default();
+                    if elapsed.as_secs() < 3600 {
+                        format!("{}m ago", elapsed.as_secs() / 60)
+                    } else if elapsed.as_secs() < 86400 {
+                        format!("{}h ago", elapsed.as_secs() / 3600)
+                    } else {
+                        format!("{}d ago", elapsed.as_secs() / 86400)
+                    }
+                })
+                .unwrap_or_else(|| "?".into());
+            println!("  {:<40} {:>10} {}", name, size, modified);
+        }
+        println!();
+    }
+
+    /// /train run — manually trigger ANE training on pending experiences.
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub(super) async fn cmd_train_run(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        // 1. Check experience buffer for pending data.
+        let eb = match crate::agent::lora_bridge::ExperienceBuffer::open_default() {
+            Ok(eb) => eb,
+            Err(e) => {
+                println!("\n  Failed to open experience buffer: {e}\n");
+                return;
+            }
+        };
+        let stats = match eb.stats() {
+            Ok(s) => s,
+            Err(e) => {
+                println!("\n  Failed to read experience stats: {e}\n");
+                return;
+            }
+        };
+        if stats.unexported == 0 {
+            println!("\n  No pending experiences to train on.\n");
+            return;
+        }
+
+        // 2. Resolve model directory.
+        let model_dir = {
+            #[cfg(feature = "mlx")]
+            {
+                if let Some(ref mlx) = self.mlx_handle {
+                    std::path::PathBuf::from(mlx.provider.model_path())
+                } else {
+                    cli::resolve_mlx_model_dir(&self.config)
+                }
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                println!("\n  MLX feature required for model resolution.\n");
+                return;
+            }
+        };
+
+        if !model_dir.join("config.json").exists() || !model_dir.join("tokenizer.json").exists() {
+            println!(
+                "\n  Model dir missing config.json or tokenizer.json: {}\n",
+                model_dir.display()
+            );
+            return;
+        }
+
+        // 3. Build ANE training config.
+        let ane_cfg =
+            match crate::agent::learn_loop::build_ane_training_config(Some(&model_dir)) {
+                Some(cfg) => cfg,
+                None => {
+                    println!("\n  Failed to build ANE training config for {}\n", model_dir.display());
+                    return;
+                }
+            };
+
+        // 4. Load tokenizer and tokenize pending experiences.
+        let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(&model_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("\n  Failed to load tokenizer: {e}\n");
+                return;
+            }
+        };
+
+        let min_exp = self.config.perplexity_gate.min_experiences.max(1);
+        let exps = match eb.top_unexported(min_exp) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("\n  Failed to read experiences: {e}\n");
+                return;
+            }
+        };
+        if exps.is_empty() {
+            println!("\n  No unexported experiences found.\n");
+            return;
+        }
+
+        let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
+        let mut samples = Vec::new();
+        for exp in &exps {
+            let messages = vec![
+                crate::agent::mlx_server::ChatMessage {
+                    role: "user".into(),
+                    content: exp.prompt.clone(),
+                },
+                crate::agent::mlx_server::ChatMessage {
+                    role: "assistant".into(),
+                    content: exp.response.clone(),
+                },
+            ];
+            if let Ok(pair) =
+                crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+            {
+                samples.push(pair);
+            }
+        }
+        if samples.is_empty() {
+            println!("\n  All experiences failed tokenization.\n");
+            return;
+        }
+
+        // 5. Check if training is already active.
+        let counters = &self.core_handle.counters;
+        if counters.training_active.load(Ordering::Relaxed) {
+            println!("\n  Training already in progress.\n");
+            return;
+        }
+
+        // 6. Spawn training thread.
+        let mlx_tx = {
+            #[cfg(feature = "mlx")]
+            {
+                self.mlx_handle
+                    .as_ref()
+                    .map(|h| h.provider.model_tx())
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                None::<()>
+            }
+        };
+
+        counters.training_active.store(true, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        counters.training_started_ms.store(now_ms, Ordering::Relaxed);
+
+        let n_samples = samples.len();
+        let n_exps = ids.len();
+        let tc = counters.clone();
+        let handle = crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx);
+
+        // Spawn a watcher to mark experiences exported when training completes.
+        tokio::task::spawn_blocking(move || {
+            let ok = handle.join().unwrap_or(false);
+            tc.training_active.store(false, Ordering::Relaxed);
+            if ok {
+                tc.training_steps_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
+                    let _ = eb.mark_exported(&ids);
+                }
+            }
+        });
+
+        println!(
+            "\n  Training started: {} samples from {} experiences\n  Model: {}\n  Use /train to check progress.\n",
+            n_samples, n_exps, model_dir.display()
+        );
+    }
+
+    /// /train run — stub when ANE features are not available.
+    #[cfg(not(all(feature = "ane", feature = "mlx")))]
+    pub(super) async fn cmd_train_run(&mut self) {
+        println!("\n  ANE training requires both 'ane' and 'mlx' features.\n");
+    }
+
+    /// /train merge — merge LoRA adapter into base model.
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub(super) async fn cmd_train_merge(&self) {
+        // 1. Resolve model directory.
+        let model_dir = {
+            #[cfg(feature = "mlx")]
+            {
+                if let Some(ref mlx) = self.mlx_handle {
+                    std::path::PathBuf::from(mlx.provider.model_path())
+                } else {
+                    cli::resolve_mlx_model_dir(&self.config)
+                }
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                println!("\n  MLX feature required.\n");
+                return;
+            }
+        };
+
+        // 2. Find the LoRA .bin file for this model.
+        let model_key = model_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "default".into());
+        let lora_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".nanobot/workspace/lora");
+        let lora_path = lora_dir.join(format!("{model_key}.bin"));
+        if !lora_path.exists() {
+            println!(
+                "\n  No LoRA adapter found for model '{}'\n  Expected: {}\n",
+                model_key,
+                lora_path.display()
+            );
+            return;
+        }
+
+        // 3. Build output directory.
+        let output_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(format!(".nanobot/workspace/merged/{model_key}"));
+
+        println!(
+            "\n  Merging LoRA into base model...\n  Base: {}\n  LoRA: {}\n  Output: {}\n",
+            model_dir.display(),
+            lora_path.display(),
+            output_dir.display()
+        );
+
+        // 4. Call merge_lora_to_disk.
+        match crate::agent::lora_bridge::merge_lora_to_disk(&model_dir, &lora_dir, &output_dir) {
+            Ok(result) => {
+                println!(
+                    "  Merge complete: {} tensors merged\n  Output: {}\n\n  Point oMLX/LM Studio at this directory to use the merged model.\n",
+                    result.merged_count,
+                    result.output_dir.display()
+                );
+            }
+            Err(e) => {
+                println!("\n  Merge failed: {e}\n");
+            }
+        }
+    }
+
+    /// /train merge — stub when features are not available.
+    #[cfg(not(all(feature = "ane", feature = "mlx")))]
+    pub(super) async fn cmd_train_merge(&self) {
+        println!("\n  LoRA merge requires both 'ane' and 'mlx' features.\n");
+    }
 }

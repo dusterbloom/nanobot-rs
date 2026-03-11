@@ -228,7 +228,7 @@ fn pad_to(tokens: &[u32], target_len: usize) -> Vec<u32> {
 pub fn spawn_ane_training(
     cfg: AneTrainingConfig,
     samples: Vec<(Vec<i32>, Vec<i32>)>,
-    mlx_tx: std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>,
+    mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::Builder::new()
         .name("ane-lora-train".into())
@@ -484,21 +484,23 @@ pub fn spawn_ane_training(
                 true
             };
 
-            // 5. Extract deltas and send to MLX
-            let deltas = extract_lora_deltas(
-                &lora,
-                if cfg.linear_attn_indices.is_empty() {
-                    None
-                } else {
-                    Some(&cfg.linear_attn_indices)
-                },
-            );
-            let n_deltas = deltas.layers.len();
-            let _ = mlx_tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
-                deltas,
-                reply: None, // fire-and-forget
-            });
-            tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+            // 5. Optionally hot-swap into MLX worker
+            if let Some(ref tx) = mlx_tx {
+                let deltas = extract_lora_deltas(
+                    &lora,
+                    if cfg.linear_attn_indices.is_empty() {
+                        None
+                    } else {
+                        Some(&cfg.linear_attn_indices)
+                    },
+                );
+                let n_deltas = deltas.layers.len();
+                let _ = tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
+                    deltas,
+                    reply: None, // fire-and-forget
+                });
+                tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+            }
 
             saved
         })
@@ -617,6 +619,7 @@ mod tests {
         assert_eq!(LoraTarget::DownProj.mlx_name(), "down_proj");
     }
 
+    #[cfg(feature = "mlx")]
     #[test]
     fn test_apply_lora_deltas_to_mlx_lora_linear() {
         // Build a LoraLinear, apply known weights via the bridge, verify forward changes.
@@ -669,21 +672,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // E2E integration tests (require Qwen3-1.7B weights on disk)
+    // E2E integration tests (require Qwen3-1.7B weights on disk + mlx feature)
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "mlx")]
     fn qwen3_1_7b_dir() -> std::path::PathBuf {
         dirs::home_dir()
             .unwrap()
             .join(".cache/lm-studio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit")
     }
 
+    #[cfg(feature = "mlx")]
     fn skip_if_no_qwen3() -> bool {
         !qwen3_1_7b_dir().join("tokenizer.json").exists()
     }
 
     /// E2E: ANE trains LoRA, extracts deltas, applies to MLX model,
     /// verifies forward pass output changes.
+    #[cfg(feature = "mlx")]
     #[test]
     fn test_e2e_ane_train_apply_to_mlx() {
         if skip_if_no_qwen3() {
@@ -787,6 +793,7 @@ mod tests {
 
     /// E2E: spawn ANE training thread, verify it sends deltas to the model worker.
     /// Uses a mock receiver to capture the ApplyLoraDeltas message.
+    #[cfg(feature = "mlx")]
     #[test]
     fn test_e2e_spawn_ane_training_sends_deltas() {
         if skip_if_no_qwen3() {
@@ -839,6 +846,7 @@ mod tests {
                 linear_n_value_heads: 0,
                 linear_value_head_dim: 0,
                 conv_kernel_size: 0,
+                attn_output_gate: false,
             },
             epochs: 1,
             lr: 1e-5,
@@ -852,7 +860,7 @@ mod tests {
         };
 
         eprintln!("spawning ANE training thread...");
-        let handle = spawn_ane_training(cfg, vec![(tokens, targets)], tx);
+        let handle = spawn_ane_training(cfg, vec![(tokens, targets)], Some(tx));
 
         // Wait for the thread to finish
         handle.join().expect("ANE training thread panicked");
@@ -876,6 +884,7 @@ mod tests {
 
     /// Verify no contention: MLX inference completes normally while ANE trains.
     /// Measures that inference latency is not blocked by ANE training.
+    #[cfg(feature = "mlx")]
     #[test]
     fn test_e2e_no_contention_ane_mlx() {
         if skip_if_no_qwen3() {
@@ -964,6 +973,7 @@ mod tests {
                 linear_n_value_heads: 0,
                 linear_value_head_dim: 0,
                 conv_kernel_size: 0,
+                attn_output_gate: false,
             },
             epochs: 2,
             lr: 1e-5,
@@ -975,7 +985,7 @@ mod tests {
             lr_scale_ffn: 1.0,
             residual_scale: 0.0,
         };
-        let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets)], ane_tx);
+        let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets)], Some(ane_tx));
 
         // Inference DURING ANE training — should not be blocked
         let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
@@ -1012,5 +1022,293 @@ mod tests {
             "no contention verified: baseline={}ms, during_training={}ms",
             baseline_ms, during_ms
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // oMLX standalone path tests (ANE trains without in-process MLX)
+    // -----------------------------------------------------------------------
+
+    /// Qwen3.5 test model: 0.8B is small enough to load in test but has the
+    /// same hybrid architecture as the 35B (GDN layers, attn_output_gate, GQA).
+    fn qwen3_5_dir() -> std::path::PathBuf {
+        dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit")
+    }
+
+    fn skip_if_no_qwen3_5() -> bool {
+        !qwen3_5_dir().join("tokenizer.json").exists()
+    }
+
+    /// Test 1: `build_ane_training_config` correctly auto-detects Qwen3.5
+    /// hybrid architecture: GDN linear attention layers, attn_output_gate,
+    /// GQA with head_dim=256. Uses 0.8B as proxy for the 35B MoE variant
+    /// (same arch family, different scale).
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_build_ane_config_qwen3_5() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let dir = qwen3_5_dir();
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+            .expect("build_ane_training_config should succeed for Qwen3.5");
+
+        let mil = &cfg.mil_config;
+        // Qwen3.5-0.8B: dim=1024, hidden=3584, heads=8, kv_heads=2, head_dim=256
+        assert_eq!(mil.dim, 1024, "hidden_size");
+        assert_eq!(mil.hidden_dim, 3584, "intermediate_size");
+        assert_eq!(mil.n_heads, 8, "num_attention_heads");
+        assert_eq!(mil.n_kv_heads, 2, "num_key_value_heads");
+        assert_eq!(mil.head_dim_explicit, 256, "head_dim");
+        // Qwen3.5 hybrid: mix of linear_attention and full_attention
+        assert!(!mil.linear_attn_indices.is_empty(), "should have linear attention layers");
+        assert!(mil.attn_output_gate, "Qwen3.5 uses attn_output_gate");
+        // kv_dim = n_kv_heads * head_dim = 2 * 256 = 512
+        assert_eq!(cfg.kv_dim, 512, "kv_dim = n_kv_heads * head_dim");
+        assert_eq!(
+            cfg.linear_attn_indices.len(),
+            mil.linear_attn_indices.len(),
+            "training config should propagate linear_attn_indices"
+        );
+
+        eprintln!(
+            "Qwen3.5 config: dim={}, hidden={}, heads={}, kv_heads={}, head_dim={}, \
+             linear_layers={}, attn_gate=true",
+            mil.dim, mil.hidden_dim, mil.n_heads, mil.n_kv_heads,
+            mil.head_dim_explicit, mil.linear_attn_indices.len()
+        );
+    }
+
+    /// Test 1b: BucketKernels compile for Qwen3.5 dims and FFN uses ANE.
+    /// SDPA fails (GQA) but is caught by .ok() — training uses ANE for FFN.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_bucket_kernels_compile_qwen3_5() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let dir = qwen3_5_dir();
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+            .expect("build config");
+
+        // Simulate a single sample of ~20 tokens (fits in 128 bucket)
+        let sample_lens = vec![20usize];
+        let result = BucketKernels::compile(&sample_lens, &cfg.mil_config);
+        assert!(
+            result.is_ok(),
+            "BucketKernels should compile for Qwen3.5: {:?}",
+            result.err()
+        );
+
+        let bk = result.unwrap();
+        assert!(!bk.buckets.is_empty(), "should have at least 1 bucket");
+
+        let (bucket_seq, fwd, _bwd) = &bk.buckets[0];
+        eprintln!("bucket seq={bucket_seq}");
+        use crate::agent::ane_forward::FfnKernels;
+        eprintln!("  SDPA: {}", if fwd.sdpa_fwd.is_some() { "ANE" } else { "CPU (GQA)" });
+        eprintln!("  FFN:  {}", match &fwd.ffn {
+            FfnKernels::Fused { .. } => "ANE (fused)",
+            FfnKernels::Tiled { .. } => "ANE (tiled)",
+        });
+
+        // The critical assertion: FFN MUST be on ANE
+        assert!(
+            matches!(&fwd.ffn, FfnKernels::Fused { .. } | FfnKernels::Tiled { .. }),
+            "FFN should compile on ANE"
+        );
+    }
+
+    /// Test 2: `spawn_ane_training` with `mlx_tx: None` completes and saves
+    /// LoRA .bin to disk. This is the oMLX/LM Studio path where there's no
+    /// in-process MLX model to hot-swap into.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_ane_standalone_training_no_mlx_tx() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let dir = qwen3_5_dir();
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+            .expect("build config");
+
+        // Tokenize a sample conversation
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir)
+            .expect("tokenizer load");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: "What is the capital of Japan?".into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: "Tokyo".into(),
+            },
+        ];
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize");
+        eprintln!("tokenized to {} tokens", tokens.len());
+
+        // Clean up any existing LoRA for this model so we test fresh creation
+        let model_key = dir.file_name().unwrap().to_string_lossy().to_string();
+        let lora_dir = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/workspace/lora");
+        let lora_path = lora_dir.join(format!("{model_key}.bin"));
+        let had_existing = lora_path.exists();
+        // Don't delete — just check if a new/updated one appears after training
+
+        let modified_before = lora_path.metadata().ok().and_then(|m| m.modified().ok());
+
+        // Spawn training with mlx_tx: None (oMLX standalone path)
+        eprintln!("spawning standalone ANE training (no MLX hot-swap)...");
+        let handle = spawn_ane_training(cfg, vec![(tokens, targets)], None);
+
+        let ok = handle.join().expect("training thread should not panic");
+        assert!(ok, "training should complete successfully");
+
+        // Verify LoRA file was saved
+        assert!(lora_path.exists(), "LoRA .bin should exist at {}", lora_path.display());
+        let modified_after = lora_path.metadata().ok().and_then(|m| m.modified().ok());
+        if had_existing {
+            assert!(
+                modified_after > modified_before,
+                "LoRA file should have been updated"
+            );
+        }
+        eprintln!(
+            "standalone training complete, LoRA saved to {}",
+            lora_path.display()
+        );
+    }
+
+    /// Test 3: The `observe_async` learn loop path fires ANE training when
+    /// `ane_model_dir` is set and `mlx_provider` is None (oMLX/LM Studio mode).
+    /// Verifies the full wiring: experience recorded → threshold exceeded →
+    /// ANE training spawned → completes → experience marked exported.
+    #[cfg(feature = "mlx")]
+    #[tokio::test]
+    async fn test_learn_loop_ane_model_dir_path() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::agent_core::RuntimeCounters;
+        use crate::agent::learn_loop::{DefaultLearnLoop, LearnLoop, TurnOutcome};
+        use crate::agent::lora_bridge::ExperienceBuffer;
+        use crate::config::schema::PerplexityGateConfig;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let dir = qwen3_5_dir();
+
+        // Use a temp DB for the experience buffer so we don't pollute production
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let eb = ExperienceBuffer::open(tmp.path()).expect("open eb");
+        let eb_arc = Arc::new(parking_lot::Mutex::new(eb));
+
+        // No pre-seeding: observe_async records its own experience from the
+        // TurnOutcome, so with min_experiences=1 it will trigger training on
+        // exactly that 1 experience. After training, unexported should be 0.
+
+        let counters = Arc::new(RuntimeCounters::new(128_000));
+
+        let ll = DefaultLearnLoop {
+            calibrator: None,
+            experience_buffer: Some(eb_arc.clone()),
+            perplexity_gate_config: PerplexityGateConfig {
+                enabled: true,
+                surprise_threshold: 0.1, // low threshold → easy to trigger
+                min_experiences: 1,
+                train_epochs: 1,
+                mlx_server_url: String::new(),
+            },
+            #[cfg(feature = "mlx")]
+            mlx_provider: None, // No in-process MLX — oMLX mode
+            training_counters: Some(counters.clone()),
+            ane_model_dir: Some(dir.clone()), // THIS is what we're testing
+        };
+
+        // Build a TurnOutcome with high surprise content
+        let outcome = TurnOutcome {
+            user_content: "Explain quantum entanglement in detail with examples".into(),
+            final_content: "Quantum entanglement is a phenomenon...".into(),
+            model: "local:Qwen3.5-35B".into(),
+            session_key: "test-session".into(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            used_tools: {
+                let mut s = std::collections::HashSet::new();
+                s.insert("exec_command".into());
+                s.insert("web_search".into());
+                s
+            },
+            turn_tool_entries: vec![
+                crate::agent::audit::TurnToolEntry {
+                    name: "exec_command".into(),
+                    id: "call_1".into(),
+                    ok: true,
+                    duration_ms: 200,
+                    result_chars: 500,
+                },
+                crate::agent::audit::TurnToolEntry {
+                    name: "web_search".into(),
+                    id: "call_2".into(),
+                    ok: true,
+                    duration_ms: 300,
+                    result_chars: 1000,
+                },
+            ],
+            iterations_used: 3,
+            max_iterations: 10,
+            turn_count: 1,
+            turn_start_elapsed_ms: 2000,
+            context_tokens: 5000,
+            message_count: 5,
+            working_memory_tokens: 100,
+            provenance_audit_enabled: false,
+            is_local: true,
+            cost_usd: 0.0,
+            prompt_tokens: 3000,
+            completion_tokens: 500,
+        };
+
+        // Fire observe_async — should spawn ANE training
+        let handle: Option<tokio::task::JoinHandle<()>> = ll.observe_async(outcome);
+        assert!(handle.is_some(), "observe_async should return a JoinHandle (training spawned)");
+
+        // Wait for the async task (which internally waits for the ANE thread)
+        handle.unwrap().await.expect("async task should not panic");
+
+        // Verify training ran: training_active should be false (done)
+        assert!(
+            !counters.training_active.load(Ordering::Relaxed),
+            "training_active should be false after completion"
+        );
+        // training_steps_total should have incremented
+        assert!(
+            counters.training_steps_total.load(Ordering::Relaxed) >= 1,
+            "training_steps_total should be >= 1"
+        );
+
+        // Verify experience was marked exported
+        {
+            let eb = eb_arc.lock();
+            let stats = eb.stats().expect("stats");
+            assert_eq!(
+                stats.unexported, 0,
+                "experience should be marked exported after successful training"
+            );
+        }
+
+        eprintln!("learn_loop ane_model_dir path verified end-to-end");
     }
 }

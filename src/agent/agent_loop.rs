@@ -219,6 +219,7 @@ impl AgentLoop {
                     #[cfg(feature = "mlx")]
                     mlx_provider: None,
                     training_counters: None,
+                    ane_model_dir: None,
                 })
             },
             #[cfg(feature = "cluster")]
@@ -232,6 +233,7 @@ impl AgentLoop {
             perplexity_gate_config: Default::default(),
             #[cfg(feature = "mlx")]
             mlx_provider: None,
+            ane_model_dir: None,
         });
         // Rebuild learn_loop now that shared fields are accessible.
         {
@@ -243,6 +245,7 @@ impl AgentLoop {
                 #[cfg(feature = "mlx")]
                 mlx_provider: s.mlx_provider.clone(),
                 training_counters: Some(s.core_handle.counters.clone()),
+                ane_model_dir: s.ane_model_dir.clone(),
             });
         }
 
@@ -270,6 +273,7 @@ impl AgentLoop {
             #[cfg(feature = "mlx")]
             mlx_provider: shared.mlx_provider.clone(),
             training_counters: Some(shared.core_handle.counters.clone()),
+            ane_model_dir: shared.ane_model_dir.clone(),
         });
     }
 
@@ -286,6 +290,24 @@ impl AgentLoop {
             perplexity_gate_config: shared.perplexity_gate_config.clone(),
             mlx_provider: Some(provider),
             training_counters: Some(shared.core_handle.counters.clone()),
+            ane_model_dir: shared.ane_model_dir.clone(),
+        });
+    }
+
+    /// Set the model directory for standalone ANE training (no in-process MLX).
+    pub fn set_ane_model_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_ane_model_dir called after shared Arc was cloned");
+        shared.ane_model_dir = dir.clone();
+        // Rebuild learn_loop with updated model dir.
+        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+            calibrator: shared.calibrator.clone(),
+            experience_buffer: shared.experience_buffer.clone(),
+            perplexity_gate_config: shared.perplexity_gate_config.clone(),
+            #[cfg(feature = "mlx")]
+            mlx_provider: shared.mlx_provider.clone(),
+            training_counters: Some(shared.core_handle.counters.clone()),
+            ane_model_dir: dir,
         });
     }
 

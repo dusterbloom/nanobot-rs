@@ -388,28 +388,37 @@ impl BackwardKernels {
         let ic_plan =
             ane_mil::compute_ic_tile_plan(cfg.hidden_dim, cfg.dim, cfg.seq_len);
 
-        let ffn_bwd = if !oc_plan.needs_tiling() && !ic_plan.needs_tiling() {
-            // Fused kernels fit in SRAM
-            let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
-            let w2t = AneKernel::compile(
-                &w2t_spec.mil_text,
-                None,
-                &[w2t_spec.input_bytes],
-                &[w2t_spec.output_bytes],
-            )?;
-            let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
-            let w13t = AneKernel::compile(
-                &w13t_spec.mil_text,
-                None,
-                &[w13t_spec.input_bytes],
-                &[w13t_spec.output_bytes],
-            )?;
-            tracing::debug!(
-                "ANE FFN bwd: fused (dim={}, hidden={}, seq={})",
-                cfg.dim, cfg.hidden_dim, cfg.seq_len
-            );
-            FfnBwdKernels::Fused { w2t, w13t }
-        } else {
+        let ffn_bwd = 'ffn_bwd: {
+            // Try fused backward kernels first when SRAM check says they fit.
+            // Fall back to tiled if the ANE compiler rejects the fused MIL.
+            if !oc_plan.needs_tiling() && !ic_plan.needs_tiling() {
+                let w2t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
+                if let Ok(w2t) = AneKernel::compile(
+                    &w2t_spec.mil_text,
+                    None,
+                    &[w2t_spec.input_bytes],
+                    &[w2t_spec.output_bytes],
+                ) {
+                    let w13t_spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
+                    if let Ok(w13t) = AneKernel::compile(
+                        &w13t_spec.mil_text,
+                        None,
+                        &[w13t_spec.input_bytes],
+                        &[w13t_spec.output_bytes],
+                    ) {
+                        tracing::debug!(
+                            "ANE FFN bwd: fused (dim={}, hidden={}, seq={})",
+                            cfg.dim, cfg.hidden_dim, cfg.seq_len
+                        );
+                        break 'ffn_bwd FfnBwdKernels::Fused { w2t, w13t };
+                    }
+                }
+                tracing::debug!(
+                    "ANE FFN bwd: fused compile failed (dim={}, hidden={}), falling back to tiled",
+                    cfg.dim, cfg.hidden_dim
+                );
+            }
+
             // Tiled: same DynMatmul kernels as forward
             let oc_spec = KernelSpec::for_kernel(
                 cfg,

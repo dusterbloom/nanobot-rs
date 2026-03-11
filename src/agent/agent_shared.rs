@@ -102,6 +102,9 @@ pub(crate) struct AgentLoopShared {
     /// In-process MLX provider for direct perplexity scoring + training (no HTTP).
     #[cfg(feature = "mlx")]
     pub(crate) mlx_provider: Option<std::sync::Arc<crate::providers::mlx::MlxProvider>>,
+    /// Resolved model directory for standalone ANE training.
+    /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
+    pub(crate) ane_model_dir: Option<std::path::PathBuf>,
 }
 
 /// Per-message state that flows through the three processing phases.

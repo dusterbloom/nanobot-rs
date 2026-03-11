@@ -703,30 +703,41 @@ impl CompiledKernels {
         let ic_plan =
             ane_mil::compute_ic_tile_plan(cfg.hidden_dim, cfg.dim, cfg.seq_len);
 
-        let ffn = if !oc_plan.needs_tiling() && !ic_plan.needs_tiling() {
-            // Everything fits — use fused kernels
-            let w13_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW13);
-            let w13 = AneKernel::compile(
-                &w13_spec.mil_text,
-                None,
-                &[w13_spec.input_bytes],
-                &[w13_spec.output_bytes],
-            )?;
-            let w2_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW2);
-            let w2 = AneKernel::compile(
-                &w2_spec.mil_text,
-                None,
-                &[w2_spec.input_bytes],
-                &[w2_spec.output_bytes],
-            )?;
-            tracing::debug!(
-                "ANE FFN: fused (dim={}, hidden={}, seq={})",
-                cfg.dim,
-                cfg.hidden_dim,
-                cfg.seq_len
-            );
-            FfnKernels::Fused { w13, w2 }
-        } else {
+        let ffn = 'ffn: {
+            // Try fused kernels first when SRAM check says they fit.
+            // Fall back to tiled if the ANE compiler rejects the fused MIL
+            // (e.g. Qwen3.5 dim=1024/hidden=3584 fused kernel is too complex).
+            if !oc_plan.needs_tiling() && !ic_plan.needs_tiling() {
+                let w13_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW13);
+                if let Ok(w13) = AneKernel::compile(
+                    &w13_spec.mil_text,
+                    None,
+                    &[w13_spec.input_bytes],
+                    &[w13_spec.output_bytes],
+                ) {
+                    let w2_spec = KernelSpec::for_kernel(cfg, KernelType::FfnW2);
+                    if let Ok(w2) = AneKernel::compile(
+                        &w2_spec.mil_text,
+                        None,
+                        &[w2_spec.input_bytes],
+                        &[w2_spec.output_bytes],
+                    ) {
+                        tracing::debug!(
+                            "ANE FFN: fused (dim={}, hidden={}, seq={})",
+                            cfg.dim,
+                            cfg.hidden_dim,
+                            cfg.seq_len
+                        );
+                        break 'ffn FfnKernels::Fused { w13, w2 };
+                    }
+                }
+                tracing::debug!(
+                    "ANE FFN: fused compile failed (dim={}, hidden={}), falling back to tiled",
+                    cfg.dim,
+                    cfg.hidden_dim
+                );
+            }
+
             // Tiled: compile DynMatmul kernels at tile dimensions
             let oc_spec = KernelSpec::for_kernel(
                 cfg,
@@ -3142,6 +3153,41 @@ mod tests {
 
         let k = kernels.unwrap();
         assert!(!k.mask_blob.is_empty(), "mask blob should not be empty");
+    }
+
+    /// Qwen3.5-0.8B dims compile all FFN kernels on ANE. SDPA fails (GQA
+    /// attn_dim≠dim) but compile_forward handles that gracefully via .ok().
+    #[test]
+    fn test_compiled_kernels_qwen3_5() {
+        use super::ane_bridge;
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let mut cfg = MilConfig::mha(1024, 3584, 8, 128);
+        cfg.n_kv_heads = 2;
+        cfg.head_dim_explicit = 256;
+        cfg.rope_theta = 1_000_000.0;
+        cfg.rms_eps = 1e-6;
+        cfg.attn_output_gate = true;
+
+        let kernels = CompiledKernels::compile_forward(&cfg);
+        assert!(
+            kernels.is_ok(),
+            "compile_forward failed for Qwen3.5 dims: {:?}",
+            kernels.err()
+        );
+
+        let k = kernels.unwrap();
+        // SDPA fails for GQA (attn_dim=2048 ≠ dim=1024), handled gracefully
+        assert!(k.sdpa_fwd.is_none(), "SDPA should be None for GQA dims");
+        // FFN kernels compile — fused or tiled both work
+        eprintln!("FFN type: {}", match &k.ffn {
+            FfnKernels::Fused { .. } => "fused",
+            FfnKernels::Tiled { .. } => "tiled",
+        });
     }
 
     // -----------------------------------------------------------------------
