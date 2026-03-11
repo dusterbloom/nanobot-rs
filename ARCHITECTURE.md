@@ -149,9 +149,18 @@ Modules extracted from or supporting `agent_loop.rs`:
 | `bulletin.rs` | Status bulletin injection |
 | `system_state.rs` | System state introspection |
 | `agent_profiles.rs` | Subagent profile loading and management |
-| `lora_bridge.rs` | LoRA adapter hot-swap bridge (Phase 3) |
+| `lora_bridge.rs` | LoRA adapter hot-swap bridge, experience buffer, heuristic surprise gate |
+| `learn_loop.rs` | Unified learning dispatch: `LearnLoop` trait, `DefaultLearnLoop`, perplexity gate → ANE/HTTP training |
 | `mlx_lora.rs` | MLX model loading, tokenizer, LoRA config, Gated Delta Net, attention (feature = "mlx") |
 | `mlx_server.rs` | Model worker thread, chat template, tokenization, training loop (feature = "mlx") |
+| `ane_mil.rs` | MIL program generation for ANE kernels: SDPA, FFN (fused/tiled), DynMatmul, backward kernels (feature = "ane") |
+| `ane_forward.rs` | ANE forward pass: `CompiledKernels`, `forward_ane_generic` (FFN on ANE, attention on CPU) (feature = "ane") |
+| `ane_backward.rs` | ANE backward pass: `BackwardKernels`, LoRA gradient computation (feature = "ane") |
+| `ane_mlx_bridge.rs` | ANE↔MLX LoRA weight bridge, `BucketKernels`, `spawn_ane_training` (feature = "ane") |
+| `ane_weights.rs` | `WeightSource` trait, quantized model loading, weight packing/unpacking (feature = "ane") |
+| `ane_lora.rs` | LoRA model/adapter structs, Adam optimizer, binary serialization (feature = "ane") |
+| `ane_bridge.rs` | Low-level ANE hardware interface: compile, eval, IOSurface management (feature = "ane") |
+| `ane_train.rs` | CPU-only training fallback path (feature = "ane") |
 | `process_tree.rs` | Persistent execution tree for multi-step processes (Phase 2) |
 | `step_voter.rs` | MAKER voting for step validation (Phase 2) |
 | `reflector.rs` | Self-reflection and learning extraction |
@@ -734,7 +743,7 @@ VoiceAgent event loop (pure state machine)
 - `default` - Core functionality
 - `voice` - Voice mode + realtime pipeline (requires jack-voice, crossterm, lingua). Enables `/voice` REPL mode and `nanobot realtime` continuous/PTT voice sessions.
 - `mlx` - In-process Apple Silicon GPU inference via MLX. Loads Qwen3.5-2B (8-bit) into GPU memory, serves chat/perplexity/LoRA training from the same model worker thread. No HTTP server needed. Perplexity gate auto-enables for online learning. Requires: `mlx-rs`, `tokenizers`, Apple Silicon Mac. Config: `inferenceEngine: "mlx"`.
-- `ane` - Apple Neural Engine kernels for attention, RoPE, LoRA (experimental). Requires Apple Silicon.
+- `ane` - Apple Neural Engine accelerated LoRA training. Compiles MIL programs for FFN forward/backward kernels on ANE; attention runs on CPU (supports GQA, QK-norm, attn_output_gate). `BucketKernels` pre-compiles for multiple seq_len buckets. `spawn_ane_training` runs QLoRA on a background thread with CPU fallback. Standalone mode (`ane_model_dir`) works with oMLX/LM Studio (no in-process MLX needed). `/train` REPL commands for manual control. Requires Apple Silicon.
 
 ---
 
