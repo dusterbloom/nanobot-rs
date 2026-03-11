@@ -417,6 +417,7 @@ pub(crate) fn print_help() {
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
     println!("  /adapt          - LoRA adapter management (status, run, scale)");
     println!("  /train          - Training status, /train run|enable|disable|list|merge");
+    println!("  /feedback, /fb  - Rate last response good|bad for training quality");
     println!("  /skill, /sk     - Manage skills (list, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");

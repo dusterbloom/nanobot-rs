@@ -165,7 +165,7 @@ pub struct AneTrainingConfig {
 
 /// Seq-len bucket sizes for ANE kernel compilation. Samples are padded to
 /// the nearest bucket. Keeps compilation count low (3 × 10 = 30 kernels).
-const BUCKET_SIZES: &[usize] = &[128, 256, 512];
+const BUCKET_SIZES: &[usize] = &[128, 256, 512, 1024];
 
 /// Pre-compiled forward + backward kernels for multiple seq_len buckets.
 pub struct BucketKernels {
@@ -224,10 +224,13 @@ fn pad_to(tokens: &[u32], target_len: usize) -> Vec<u32> {
 /// 5. Sends `ApplyLoraDeltas` to MLX model worker
 ///
 /// Returns `JoinHandle<bool>` — `true` if training completed and LoRA was saved.
+///
+/// Each sample is `(tokens, targets, quality_weight)` where quality_weight
+/// scales the loss gradient (0.0–1.0). Higher quality samples contribute more.
 #[cfg(feature = "mlx")]
 pub fn spawn_ane_training(
     cfg: AneTrainingConfig,
-    samples: Vec<(Vec<i32>, Vec<i32>)>,
+    samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
     mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::Builder::new()
@@ -324,7 +327,7 @@ pub fn spawn_ane_training(
             let mut adam = LoraModelAdam::zeros(&lora);
 
             // 3. Compile ANE kernels (bucket-based for variable seq_len)
-            let sample_lens: Vec<usize> = samples.iter().map(|(t, _)| t.len()).collect();
+            let sample_lens: Vec<usize> = samples.iter().map(|(t, _, _)| t.len()).collect();
             let bucket_kernels = match BucketKernels::compile(&sample_lens, &cfg.mil_config) {
                 Ok(bk) => {
                     tracing::info!(
@@ -362,9 +365,14 @@ pub fn spawn_ane_training(
             );
 
             'outer: for _epoch in 0..cfg.epochs {
-                for (tokens, targets) in &samples {
+                for (tokens, targets, sample_quality) in &samples {
                     let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
                     let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+                    // Quality weight scales loss_scale: high-quality samples get full
+                    // gradient, low-quality samples get reduced gradient contribution.
+                    // Floor at 0.1 so even low-quality samples contribute minimally.
+                    let quality_scale = sample_quality.max(0.1);
+                    let effective_loss_scale = cfg.loss_scale * quality_scale;
 
                     let (fwd, bwd) = if let Some(ref bk) = bucket_kernels {
                         // ANE path: pad to bucket, use ANE forward/backward
@@ -402,7 +410,7 @@ pub fn spawn_ane_training(
                             &lora,
                             &tok_pad,
                             cfg.softcap,
-                            cfg.loss_scale,
+                            effective_loss_scale,
                             residual_scale,
                         );
                         (fwd, bwd)
@@ -416,7 +424,7 @@ pub fn spawn_ane_training(
                             &targets_u32,
                         );
                         let bwd = ane_backward::backward_lora_cpu_generic(
-                            &model, &fwd, &lora, &tokens_u32, cfg.softcap, cfg.loss_scale,
+                            &model, &fwd, &lora, &tokens_u32, cfg.softcap, effective_loss_scale,
                         );
                         (fwd, bwd)
                     };
@@ -869,7 +877,7 @@ mod tests {
         };
 
         eprintln!("spawning ANE training thread...");
-        let handle = spawn_ane_training(cfg, vec![(tokens, targets)], Some(tx));
+        let handle = spawn_ane_training(cfg, vec![(tokens, targets, 1.0)], Some(tx));
 
         // Wait for the thread to finish
         handle.join().expect("ANE training thread panicked");
@@ -994,7 +1002,7 @@ mod tests {
             lr_scale_ffn: 1.0,
             residual_scale: 0.0,
         };
-        let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets)], Some(ane_tx));
+        let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets, 1.0)], Some(ane_tx));
 
         // Inference DURING ANE training — should not be blocked
         let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
@@ -1179,7 +1187,7 @@ mod tests {
 
         // Spawn training with mlx_tx: None (oMLX standalone path)
         eprintln!("spawning standalone ANE training (no MLX hot-swap)...");
-        let handle = spawn_ane_training(cfg, vec![(tokens, targets)], None);
+        let handle = spawn_ane_training(cfg, vec![(tokens, targets, 1.0)], None);
 
         let ok = handle.join().expect("training thread should not panic");
         assert!(ok, "training should complete successfully");

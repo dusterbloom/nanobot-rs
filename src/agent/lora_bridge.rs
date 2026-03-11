@@ -204,6 +204,25 @@ impl ExperienceBuffer {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Update the quality score of an experience by ID.
+    pub fn update_quality(&self, id: i64, quality: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE experiences SET quality = ?1 WHERE id = ?2",
+            params![quality, id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the ID of the most recently inserted experience.
+    pub fn last_experience_id(&self) -> Result<Option<i64>> {
+        let id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(id) FROM experiences",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
     /// Get buffer statistics.
     pub fn stats(&self) -> Result<BufferStats> {
         let total: i64 = self
@@ -251,6 +270,54 @@ pub struct BufferStats {
 // =============================================================================
 // Surprise Detection (heuristic)
 // =============================================================================
+
+/// Compute an implicit quality score from turn signals.
+///
+/// Returns 0.0–1.0 indicating how likely this turn was successful:
+/// - All tool calls succeeded (ok=true) → higher quality
+/// - Fewer iterations used (efficient) → higher quality
+/// - Has reasoning trace (careful thinking) → slight boost
+/// - Non-trivial response length → slight boost
+pub fn compute_quality(
+    tool_entries: &[crate::agent::audit::TurnToolEntry],
+    iterations_used: u32,
+    max_iterations: u32,
+    has_reasoning: bool,
+    response_len: usize,
+) -> f64 {
+    let mut score = 0.2; // base credit for all turns
+
+    // Tool success: all tools ok → +0.3, any failure → +0.0
+    if !tool_entries.is_empty() {
+        let all_ok = tool_entries.iter().all(|e| e.ok);
+        if all_ok {
+            score += 0.3;
+        }
+    } else {
+        // No tool calls = simple chat, give partial credit
+        score += 0.15;
+    }
+
+    // Iteration efficiency: used < 50% of budget → +0.2, scales linearly
+    if max_iterations > 0 {
+        let ratio = iterations_used as f64 / max_iterations as f64;
+        score += 0.2 * (1.0 - ratio).max(0.0);
+    }
+
+    // Reasoning trace present → +0.1 (model was deliberate)
+    if has_reasoning {
+        score += 0.1;
+    }
+
+    // Non-trivial response → +0.2 (not empty or too short)
+    if response_len > 50 {
+        score += 0.2;
+    } else if response_len > 10 {
+        score += 0.1;
+    }
+
+    score.min(1.0)
+}
 
 /// Compute a surprise score for an experience.
 ///
@@ -1806,5 +1873,87 @@ mod tests {
             1,
             "should record when both tools and content present"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Quality signal tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_compute_quality_all_tools_ok() {
+        use crate::agent::audit::TurnToolEntry;
+        let entries = vec![
+            TurnToolEntry { name: "read_file".into(), id: "c1".into(), ok: true, duration_ms: 50, result_chars: 100 },
+            TurnToolEntry { name: "exec_command".into(), id: "c2".into(), ok: true, duration_ms: 200, result_chars: 500 },
+        ];
+        let q = compute_quality(&entries, 2, 10, false, 200);
+        // base 0.2 + tools_ok 0.3 + efficiency 0.2*(1-0.2)=0.16 + response 0.2 = 0.86
+        assert!(q > 0.8, "all-ok tools + efficient + long response → high quality, got {q}");
+    }
+
+    #[test]
+    fn test_compute_quality_tool_failure() {
+        use crate::agent::audit::TurnToolEntry;
+        let entries = vec![
+            TurnToolEntry { name: "exec_command".into(), id: "c1".into(), ok: false, duration_ms: 100, result_chars: 50 },
+        ];
+        let q = compute_quality(&entries, 5, 10, false, 200);
+        // base 0.2 + tools_ok 0.0 + efficiency 0.2*0.5=0.1 + response 0.2 = 0.5
+        assert!(q < 0.6, "tool failure → lower quality, got {q}");
+    }
+
+    #[test]
+    fn test_compute_quality_simple_chat() {
+        let q = compute_quality(&[], 1, 10, false, 100);
+        // base 0.2 + no_tools 0.15 + efficiency 0.2*0.9=0.18 + response 0.2 = 0.73
+        assert!(q > 0.6 && q < 0.85, "simple chat → medium-high quality, got {q}");
+    }
+
+    #[test]
+    fn test_compute_quality_range() {
+        use crate::agent::audit::TurnToolEntry;
+        // Worst case: tool failure, max iterations, short response, no reasoning
+        let worst = compute_quality(
+            &[TurnToolEntry { name: "x".into(), id: "c".into(), ok: false, duration_ms: 0, result_chars: 0 }],
+            10, 10, false, 5,
+        );
+        assert!(worst >= 0.2 && worst <= 1.0, "worst={worst}");
+
+        // Best case: tools ok, 1 iteration, reasoning, long response
+        let best = compute_quality(
+            &[TurnToolEntry { name: "x".into(), id: "c".into(), ok: true, duration_ms: 0, result_chars: 0 }],
+            1, 10, true, 500,
+        );
+        assert!(best >= 0.9 && best <= 1.0, "best={best}");
+    }
+
+    #[test]
+    fn test_update_quality_and_last_id() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("experience.db");
+        let buffer = ExperienceBuffer::open(&db_path).unwrap();
+
+        // No experiences yet
+        assert_eq!(buffer.last_experience_id().unwrap(), None);
+
+        // Record two experiences
+        buffer.record("p1", "[]", "r1", true, 0.5, "m").unwrap();
+        buffer.record("p2", "[]", "r2", true, 0.5, "m").unwrap();
+
+        // last_experience_id should return the latest
+        let last_id = buffer.last_experience_id().unwrap().unwrap();
+        assert_eq!(last_id, 2);
+
+        // Update quality of the last experience
+        buffer.update_quality(last_id, 1.0).unwrap();
+
+        // Verify it was updated
+        let exps = buffer.top_unexported(10).unwrap();
+        let updated = exps.iter().find(|e| e.id == last_id).unwrap();
+        assert!((updated.quality - 1.0).abs() < f64::EPSILON);
+
+        // First experience should still have original quality
+        let first = exps.iter().find(|e| e.id == 1).unwrap();
+        assert!((first.quality - 0.5).abs() < f64::EPSILON);
     }
 }

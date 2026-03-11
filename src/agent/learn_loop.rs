@@ -206,6 +206,15 @@ impl LearnLoop for DefaultLearnLoop {
                 serde_json::to_string(&tool_entries_json).unwrap_or_else(|_| "[]".into())
             };
 
+            // Implicit quality score from turn signals.
+            let quality = crate::agent::lora_bridge::compute_quality(
+                &outcome.turn_tool_entries,
+                outcome.iterations_used,
+                outcome.max_iterations,
+                outcome.reasoning_trace.is_some(),
+                outcome.final_content.len(),
+            );
+
             // Heuristic surprise (zero model contention).
             //
             // Model-based perplexity (in-process or HTTP) blocks the model
@@ -236,7 +245,7 @@ impl LearnLoop for DefaultLearnLoop {
                     &trace_json,
                     &outcome.final_content,
                     true,
-                    1.0,
+                    quality,
                     &outcome.model,
                     surprise,
                 ) {
@@ -273,7 +282,7 @@ impl LearnLoop for DefaultLearnLoop {
             let epochs = pg_config.train_epochs;
             let min_exp = pg_config.min_experiences.max(1); // 0 would LIMIT 0 → empty
 
-            // Collect experiences under lock.
+            // Collect experiences under lock (prompt, trace, response, quality).
             let (exps_data, ids) = {
                 let eb = eb_mutex.lock();
                 let exps = match eb.top_unexported(min_exp) {
@@ -283,9 +292,9 @@ impl LearnLoop for DefaultLearnLoop {
                 if exps.is_empty() {
                     return;
                 }
-                let data: Vec<(String, String, String)> = exps
+                let data: Vec<(String, String, String, f64)> = exps
                     .iter()
-                    .map(|e| (e.prompt.clone(), e.tool_trace.clone(), e.response.clone()))
+                    .map(|e| (e.prompt.clone(), e.tool_trace.clone(), e.response.clone(), e.quality))
                     .collect();
                 let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
                 (data, ids)
@@ -322,8 +331,8 @@ impl LearnLoop for DefaultLearnLoop {
                             return;
                         }
                     };
-                    let mut samples = Vec::new();
-                    for (prompt, trace, response) in &exps_data {
+                    let mut samples: Vec<(Vec<i32>, Vec<i32>, f32)> = Vec::new();
+                    for (prompt, trace, response, q) in &exps_data {
                         // Check if trace contains rich messages (has "role" keys)
                         let rich = serde_json::from_str::<Vec<serde_json::Value>>(trace)
                             .ok()
@@ -344,7 +353,7 @@ impl LearnLoop for DefaultLearnLoop {
                             crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
                         };
                         if let Ok(pair) = pair {
-                            samples.push(pair);
+                            samples.push((pair.0, pair.1, *q as f32));
                         }
                     }
                     if !samples.is_empty() {
@@ -510,7 +519,7 @@ pub(crate) fn build_ane_training_config(
 /// timeout. This path is used when ANE split-silicon training is unavailable
 /// and in-process MLX training would block inference.
 async fn try_http_train(
-    exps_data: &[(String, String, String)],
+    exps_data: &[(String, String, String, f64)],
     ids: &[i64],
     eb_arc: &Arc<parking_lot::Mutex<ExperienceBuffer>>,
     epochs: usize,
@@ -529,7 +538,7 @@ async fn try_http_train(
 
     let conversations: Vec<serde_json::Value> = exps_data
         .iter()
-        .map(|(p, _trace, r)| {
+        .map(|(p, _trace, r, _quality)| {
             serde_json::json!([
                 {"role": "user", "content": p},
                 {"role": "assistant", "content": r}
@@ -830,5 +839,34 @@ mod tests {
         let min_exp: usize = 0;
         let effective = min_exp.max(1);
         assert_eq!(effective, 1);
+    }
+
+    /// Quality score is computed from TurnOutcome signals, not hardcoded.
+    #[test]
+    fn test_quality_derived_from_turn_signals() {
+        use crate::agent::audit::TurnToolEntry;
+
+        // High-quality turn: all tools ok, low iterations, long response
+        let good_entries = vec![
+            TurnToolEntry { name: "read_file".into(), id: "c1".into(), ok: true, duration_ms: 50, result_chars: 100 },
+        ];
+        let good_q = crate::agent::lora_bridge::compute_quality(
+            &good_entries, 1, 10, true, 500,
+        );
+
+        // Low-quality turn: tool failed, max iterations, short response
+        let bad_entries = vec![
+            TurnToolEntry { name: "exec".into(), id: "c1".into(), ok: false, duration_ms: 100, result_chars: 0 },
+        ];
+        let bad_q = crate::agent::lora_bridge::compute_quality(
+            &bad_entries, 10, 10, false, 5,
+        );
+
+        assert!(
+            good_q > bad_q,
+            "successful turn ({good_q:.2}) should have higher quality than failed turn ({bad_q:.2})"
+        );
+        assert!(good_q > 0.7, "good turn quality should be high: {good_q}");
+        assert!(bad_q < 0.5, "bad turn quality should be low: {bad_q}");
     }
 }

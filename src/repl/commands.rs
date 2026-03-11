@@ -583,6 +583,7 @@ pub(crate) fn normalize_alias(cmd: &str) -> &str {
         "/c" => "/clear",
         "/cl" => "/cluster",
         "/sk" => "/skill",
+        "/fb" => "/feedback",
         other => other,
     }
 }
@@ -706,6 +707,9 @@ impl ReplContext {
                     "merge" => self.cmd_train_merge().await,
                     _ => println!("\n  Usage: /train [status|run|enable|disable|list|merge]\n"),
                 }
+            }
+            "/feedback" => {
+                self.cmd_feedback(arg.trim());
             }
             "/skill" | "/skills" => {
                 self.cmd_skill(arg).await;

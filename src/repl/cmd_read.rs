@@ -734,6 +734,40 @@ impl ReplContext {
         }
     }
 
+    /// /feedback good|bad — rate the last assistant response for training quality.
+    pub(super) fn cmd_feedback(&self, arg: &str) {
+        let quality = match arg {
+            "good" | "g" | "+" => 1.0,
+            "bad" | "b" | "-" => 0.0,
+            _ => {
+                println!("\n  Usage: /feedback good|bad  (aliases: g/b, +/-)");
+                println!("  Rates the last response for LoRA training quality.\n");
+                return;
+            }
+        };
+
+        let eb = match crate::agent::lora_bridge::ExperienceBuffer::open_default() {
+            Ok(eb) => eb,
+            Err(e) => {
+                println!("\n  Failed to open experience buffer: {e}\n");
+                return;
+            }
+        };
+
+        match eb.last_experience_id() {
+            Ok(Some(id)) => {
+                if let Err(e) = eb.update_quality(id, quality) {
+                    println!("\n  Failed to update quality: {e}\n");
+                } else {
+                    let label = if quality > 0.5 { "good" } else { "bad" };
+                    println!("\n  Marked experience #{id} as {label} (quality={quality:.1})\n");
+                }
+            }
+            Ok(None) => println!("\n  No experiences recorded yet.\n"),
+            Err(e) => println!("\n  Error reading experiences: {e}\n"),
+        }
+    }
+
     /// /train — show ANE/HTTP training status.
     pub(super) fn cmd_train_status(&self) {
         let counters = &self.core_handle.counters;
@@ -972,7 +1006,7 @@ impl ReplContext {
             if let Ok(pair) =
                 crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
             {
-                samples.push(pair);
+                samples.push((pair.0, pair.1, exp.quality as f32));
             }
         }
         if samples.is_empty() {
