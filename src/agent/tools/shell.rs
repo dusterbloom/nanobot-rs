@@ -95,6 +95,16 @@ impl ExecTool {
         }
     }
 
+    /// Resolve the effective timeout: per-call override (capped at 600s) or config default.
+    fn effective_timeout(&self, params: &HashMap<String, serde_json::Value>) -> u64 {
+        const MAX_TIMEOUT: u64 = 600;
+        params
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .map(|t| t.min(MAX_TIMEOUT).max(1))
+            .unwrap_or(self.timeout)
+    }
+
     /// Normalize a command string for safety analysis.
     ///
     /// - Collapse multiple whitespace to single space.
@@ -324,6 +334,10 @@ impl Tool for ExecTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 60, max: 600). Use for long-running commands like builds, tests, or downloads."
                 }
             },
             "required": ["command"]
@@ -343,7 +357,8 @@ impl Tool for ExecTool {
             return error;
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(self.timeout), async {
+        let timeout = self.effective_timeout(&params);
+        let result = tokio::time::timeout(Duration::from_secs(timeout), async {
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(command)
@@ -387,7 +402,7 @@ impl Tool for ExecTool {
         let mut output = match result {
             Ok(s) => s,
             Err(_) => {
-                format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps.", self.timeout)
+                format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout)
             }
         };
 
@@ -430,7 +445,8 @@ impl Tool for ExecTool {
         });
 
         let start = std::time::Instant::now();
-        let timeout_dur = Duration::from_secs(self.timeout);
+        let timeout = self.effective_timeout(&params);
+        let timeout_dur = Duration::from_secs(timeout);
 
         let result = tokio::time::timeout(timeout_dur, async {
             let mut child = match Command::new("sh")
@@ -543,7 +559,7 @@ impl Tool for ExecTool {
 
         let mut output = match result {
             Ok(s) => s,
-            Err(_) => format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps.", self.timeout),
+            Err(_) => format!("Error: Command timed out after {} seconds. Hint: try a simpler command or break it into smaller steps, or set a longer timeout.", timeout),
         };
 
         let max_len = self.max_output_chars;
