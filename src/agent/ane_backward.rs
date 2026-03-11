@@ -1184,18 +1184,7 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             ane_forward::vec_add_inplace(&mut dx2, &dy);
             // Skip attention backward entirely for GDN — gradient flows
             // through the residual connection only (dx2 already includes dy).
-            let mut dx_rms1 = vec![0.0f32; dim * seq];
-            rmsnorm_bwd(
-                &mut dx_rms1,
-                &mut vec![0.0f32; dim],
-                &dx2,
-                &ac.layer_in,
-                &ql.rms_att,
-                dim,
-                seq,
-                cfg.rms_eps,
-            );
-            dy = dx_rms1;
+            dy = dx2;
             continue;
         }
 
@@ -1440,18 +1429,7 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
 
         // GDN layers: skip attention backward — gradient flows through residual only.
         if lw.gdn.is_some() {
-            let mut dx_rms1 = vec![0.0f32; dim * seq];
-            rmsnorm_bwd(
-                &mut dx_rms1,
-                &mut vec![0.0f32; dim],
-                &dx2,
-                &ac.layer_in,
-                &lw.rms_att,
-                dim,
-                seq,
-                cfg.rms_eps,
-            );
-            dy = dx_rms1;
+            dy = dx2;
             continue;
         }
 
@@ -2090,19 +2068,9 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
 
         // --- Attention backward (CPU — handles GQA, GDN, QK-norm, attn_output_gate) ---
         if lw.gdn.is_some() {
-            // GDN layers: skip attention backward, gradient flows through residual only
-            let mut dx_rms1 = vec![0.0f32; dim * seq];
-            rmsnorm_bwd(
-                &mut dx_rms1,
-                &mut vec![0.0f32; dim],
-                &dx2,
-                &ac.layer_in,
-                &lw.rms_att,
-                dim,
-                seq,
-                cfg.rms_eps,
-            );
-            dy = dx_rms1;
+            // GDN layers: skip attention backward, gradient flows through residual only.
+            // x2 = layer_in + gdn_out, so d_layer_in = dx2 (residual) + d_gdn (skipped=0).
+            dy = dx2;
             continue;
         }
 

@@ -1607,4 +1607,163 @@ mod tests {
             d_model.cached_layer_count(), d_model.n_layers()
         );
     }
+
+    /// Test: Qwen3.5-35B-A3B training with DenseCachedModel.
+    /// Validates the full pipeline on a large MoE model: load → cache → fwd → bwd → LoRA update → loss decreases.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_35b_training_step() {
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-4bit not found");
+            return;
+        }
+
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel};
+        use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(32); // shorter seq for speed
+
+        // Load + cache
+        let t0 = std::time::Instant::now();
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load 35B");
+        let load_ms = t0.elapsed().as_millis();
+        let q_mb = quantized.quantized_memory_bytes() as f64 / 1_048_576.0;
+        eprintln!("loaded quantized in {load_ms}ms ({q_mb:.1} MB)");
+
+        let t0 = std::time::Instant::now();
+        let mut model = DenseCachedModel::auto(quantized);
+        let cache_ms = t0.elapsed().as_millis();
+        eprintln!(
+            "dense cache: {}/{} layers in {cache_ms}ms",
+            model.cached_layer_count(),
+            model.n_layers()
+        );
+
+        // Tokenize a sample
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: "What is 2+2?".into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: "4".into(),
+            },
+        ];
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize");
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+        eprintln!("tokens: {} ids", tokens_u32.len());
+
+        let n_layers = model.n_layers();
+        let dim = model.actual_dim();
+        let hidden = model.actual_hidden_dim();
+        eprintln!("dims: dim={dim}, hidden={hidden}, mil_cfg.dim={}, mil_cfg.hidden_dim={}", mil_cfg.dim, mil_cfg.hidden_dim);
+
+        // Baseline loss (no LoRA)
+        model.cfg_mut().seq_len = tokens_u32.len();
+        let baseline_fwd = ane_forward::forward_cpu_generic(&model, None, &tokens_u32, &targets_u32);
+        let baseline_loss = baseline_fwd.base.loss;
+        eprintln!("baseline loss (no LoRA): {baseline_loss:.4}");
+        assert!(baseline_loss.is_finite(), "baseline loss should be finite");
+
+        // Train LoRA for a few steps
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam = crate::agent::ane_lora::LoraModelAdam::zeros(&lora);
+        let lr = 1e-4;
+        let epochs = 10;
+        let mut best_loss = f32::INFINITY;
+        let mut best_lora = lora.clone();
+
+        // Verify first step produces non-zero dB gradients (dA is zero when B=0, which is correct)
+        let fwd = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens_u32, &targets_u32);
+        let bwd = crate::agent::ane_backward::backward_lora_cpu_generic(
+            &model, &fwd, &lora, &tokens_u32, 15.0, 256.0,
+        );
+        let has_db_grads = bwd.lora_grads.layers.iter().any(|lg| {
+            lg.w2.as_ref().map_or(false, |g| g.db.iter().any(|&v| v != 0.0))
+        });
+        assert!(has_db_grads, "first step should produce non-zero dB gradients");
+        eprintln!("step 0: loss={:.4}, dB grads non-zero ✓", fwd.base.loss);
+
+        // Apply first step
+        crate::agent::ane_lora::lora_adam_update(
+            &mut lora, &bwd.lora_grads, &mut adam,
+            1, lr, 0.9, 0.999, 1e-8, 0.01,
+        );
+
+        // Continue training
+        for step in 2..=epochs {
+            let fwd = ane_forward::forward_cpu_generic(
+                &model, Some(&lora), &tokens_u32, &targets_u32,
+            );
+            let bwd = crate::agent::ane_backward::backward_lora_cpu_generic(
+                &model, &fwd, &lora, &tokens_u32, 15.0, 256.0,
+            );
+            crate::agent::ane_lora::lora_adam_update(
+                &mut lora, &bwd.lora_grads, &mut adam,
+                step, lr, 0.9, 0.999, 1e-8, 0.01,
+            );
+            let loss = fwd.base.loss;
+            if loss < best_loss {
+                best_loss = loss;
+                best_lora = lora.clone();
+            }
+            if step % 2 == 0 {
+                eprintln!("  step {step}, loss={loss:.4} (best={best_loss:.4})");
+            }
+        }
+        lora = best_lora;
+
+        // Verify dA gradients are now non-zero (B has been updated from dB)
+        let fwd_after = ane_forward::forward_cpu_generic(
+            &model, Some(&lora), &tokens_u32, &targets_u32,
+        );
+        let bwd_after = crate::agent::ane_backward::backward_lora_cpu_generic(
+            &model, &fwd_after, &lora, &tokens_u32, 15.0, 256.0,
+        );
+        let has_da_grads = bwd_after.lora_grads.layers.iter().any(|lg| {
+            lg.w2.as_ref().map_or(false, |g| g.da.iter().any(|&v| v != 0.0))
+        });
+        assert!(has_da_grads, "after training, dA gradients should be non-zero (B is no longer zero)");
+
+        // Evaluate with best LoRA
+        let eval_fwd = ane_forward::forward_cpu_generic(
+            &model, Some(&lora), &tokens_u32, &targets_u32,
+        );
+        let trained_loss = eval_fwd.base.loss;
+        let improvement = (baseline_loss - trained_loss) / baseline_loss;
+        eprintln!(
+            "baseline={baseline_loss:.4}, trained={trained_loss:.4}, improvement={:.1}%",
+            improvement * 100.0,
+        );
+        assert!(
+            trained_loss < baseline_loss,
+            "LoRA training should reduce loss: baseline={baseline_loss:.4}, trained={trained_loss:.4}"
+        );
+
+        eprintln!(
+            "PASS: 35B training ({epochs} steps, {}/{} cached)",
+            model.cached_layer_count(),
+            model.n_layers()
+        );
+    }
 }
