@@ -97,9 +97,77 @@ pub fn cleanup_stale_pids() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main agent singleton guard
+// ---------------------------------------------------------------------------
+
+/// Path to the main agent PID file: `~/.nanobot/agent.pid`.
+/// Kept outside `pids/` so `cleanup_stale_pids()` (which kills child servers)
+/// does not accidentally kill the running agent itself.
+fn agent_pid_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nanobot")
+        .join("agent.pid")
+}
+
+/// If a previous agent process is still alive, kill it gracefully before we
+/// take over. Then write our own PID so the *next* launch can do the same.
+/// Call this early in `cmd_agent` / `run_gateway_async`.
+pub fn acquire_agent_singleton() {
+    let path = agent_pid_path();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Ok(old_pid) = contents.trim().parse::<u32>() {
+            let alive = unsafe { libc::kill(old_pid as i32, 0) == 0 };
+            if alive && old_pid != std::process::id() {
+                tracing::warn!(old_pid, "killing stale agent process (singleton guard)");
+                graceful_kill(old_pid);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&PathBuf::from(".")));
+    let _ = std::fs::write(&path, std::process::id().to_string());
+    tracing::debug!(pid = std::process::id(), "agent singleton acquired");
+}
+
+/// Remove the agent PID file on clean shutdown.
+pub fn release_agent_singleton() {
+    let path = agent_pid_path();
+    // Only remove if the file contains our own PID (another instance may have
+    // already overwritten it).
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = contents.trim().parse::<u32>() {
+            if pid == std::process::id() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_agent_singleton_acquire_release() {
+        // acquire writes our PID, release removes it.
+        acquire_agent_singleton();
+        let contents = std::fs::read_to_string(agent_pid_path()).unwrap();
+        assert_eq!(contents.trim().parse::<u32>().unwrap(), std::process::id());
+
+        release_agent_singleton();
+        assert!(!agent_pid_path().exists());
+    }
+
+    #[test]
+    fn test_agent_singleton_stale_pid_cleaned() {
+        // Write a dead PID, acquire should overwrite it with ours.
+        let _ = std::fs::write(agent_pid_path(), "4000000");
+        acquire_agent_singleton();
+        let contents = std::fs::read_to_string(agent_pid_path()).unwrap();
+        assert_eq!(contents.trim().parse::<u32>().unwrap(), std::process::id());
+        release_agent_singleton();
+    }
 
     #[test]
     fn test_pid_file_roundtrip_and_stale_cleanup() {

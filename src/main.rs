@@ -459,6 +459,7 @@ fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         agent::pid_file::cleanup_stale_pids();
+        agent::pid_file::release_agent_singleton();
         tui::force_exit_raw_mode();
         print!("\x1b[r"); // reset scroll region
         print!("\x1b[?25h"); // show cursor

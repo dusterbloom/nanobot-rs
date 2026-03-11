@@ -416,7 +416,7 @@ pub(crate) fn print_help() {
     println!("  /provenance     - Toggle provenance display on/off");
     println!("  /cluster, /cl   - Show cluster peers, models, and routing status");
     println!("  /adapt          - LoRA adapter management (status, run, scale)");
-    println!("  /train          - Show ANE/HTTP training status and experience stats");
+    println!("  /train          - Training status, /train run|enable|disable|list|merge");
     println!("  /skill, /sk     - Manage skills (list, add, remove)");
     println!("  /help, /h       - Show this help");
     println!("  Ctrl+C          - Exit\n");
@@ -1014,6 +1014,9 @@ pub(crate) fn cmd_agent(
     resume: Option<String>,
     continue_session: bool,
 ) {
+    // Singleton guard: kill any stale agent process from a previous crashed run.
+    crate::agent::pid_file::acquire_agent_singleton();
+
     let mut config = load_config(None);
 
     // Resolve voice language: CLI --lang > config voice.language > None (auto)
@@ -1977,6 +1980,7 @@ pub(crate) fn cmd_agent(
             // Safety net: kill any managed child processes whose Drop may not
             // have fired (e.g. Arc still held elsewhere).
             crate::agent::pid_file::cleanup_stale_pids();
+            crate::agent::pid_file::release_agent_singleton();
 
             // On exit, force a reflection pass if any working memory has
             // accumulated — threshold=0 means "reflect if there is anything".

@@ -742,6 +742,9 @@ pub(crate) async fn run_gateway_async(
     use std::time::Duration;
     use tracing::{info, warn};
 
+    // Singleton guard: kill any stale agent process from a previous crashed run.
+    crate::agent::pid_file::acquire_agent_singleton();
+
     // Auto-start SearXNG if configured
     if config.tools.web.search.provider == "searxng" && config.tools.web.search.auto_start {
         match crate::searxng::ensure_searxng(&config.tools.web.search.searxng_url).await {
@@ -933,6 +936,7 @@ pub(crate) async fn run_gateway_async(
     // Safety net: kill any managed child processes whose Drop may not
     // have fired (e.g. Arc still held elsewhere).
     crate::agent::pid_file::cleanup_stale_pids();
+    crate::agent::pid_file::release_agent_singleton();
 }
 
 // ============================================================================
