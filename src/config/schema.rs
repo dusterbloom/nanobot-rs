@@ -1780,7 +1780,6 @@ pub enum TtsEngineConfig {
     #[default]
     Pocket,
     Kokoro,
-    Magpie,
 }
 
 /// Configuration for voice mode TTS/STT.

@@ -93,9 +93,7 @@ pub struct RealtimeSession {
     /// Multilingual TTS engine (Kokoro — supports 8 languages).
     #[cfg(feature = "voice")]
     tts_multi: Option<Arc<Mutex<TextToSpeech>>>,
-    /// Magpie TTS engine (fr/it/vi — better quality for these languages).
     #[cfg(feature = "voice")]
-    tts_magpie: Option<Arc<Mutex<TextToSpeech>>>,
     #[cfg(feature = "voice")]
     capture: Option<AudioCapture>,
     running: Arc<AtomicBool>,
@@ -208,40 +206,24 @@ impl RealtimeSession {
                 None
             }
         };
-        // Disabled: Magpie has issues (slow TTFT, ticking, ordering). Use Kokoro instead.
-        let tts_magpie = None;
-        // let tts_magpie = match tokio::task::spawn_blocking(|| {
-        //     TextToSpeech::with_engine(TtsEngine::Magpie)
         // })
         // .await
         // {
         //     Ok(Ok(tts)) => {
-        //         tracing::info!("Magpie TTS ready (fr/it/vi)");
         //         Some(Arc::new(Mutex::new(tts)))
         //     }
         //     Ok(Err(e)) => {
-        //         tracing::warn!("Magpie TTS init failed: {}", e);
         //         None
         //     }
         //     Err(e) => {
-        //         tracing::warn!("Magpie TTS spawn error: {}", e);
         //         None
         //     }
         // };
 
         tracing::info!(
-            "TTS ready (en: {}, multi: {}, magpie: {})",
+            "TTS ready (en: {}, multi: {})",
             if tts_en.is_some() { "Pocket" } else { "none" },
-            if tts_multi.is_some() {
-                "Kokoro"
-            } else {
-                "none"
-            },
-            if tts_magpie.is_some() {
-                "Magpie"
-            } else {
-                "none"
-            }
+            if tts_multi.is_some() { "Kokoro" } else { "none" },
         );
 
         Ok(Self {
@@ -251,7 +233,6 @@ impl RealtimeSession {
             stt: Some(stt),
             tts_en,
             tts_multi,
-            tts_magpie,
             capture: None,
             running: Arc::new(AtomicBool::new(false)),
         })
@@ -469,19 +450,16 @@ impl RealtimeSession {
     }
 
     /// Get clones of all TTS engine handles for external use (e.g., voice agent playback).
-    /// Returns (English/Pocket, Multilingual/Kokoro, Magpie/fr-it-vi).
     #[cfg(feature = "voice")]
     pub fn tts_handles(
         &self,
     ) -> (
         Option<Arc<Mutex<TextToSpeech>>>,
         Option<Arc<Mutex<TextToSpeech>>>,
-        Option<Arc<Mutex<TextToSpeech>>>,
     ) {
         (
             self.tts_en.clone(),
             self.tts_multi.clone(),
-            self.tts_magpie.clone(),
         )
     }
 

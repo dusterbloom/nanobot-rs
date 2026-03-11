@@ -34,7 +34,6 @@ pub(crate) fn cmd_realtime(
     let tts_engine = match engine.to_lowercase().as_str() {
         "pocket" => TtsEngineConfig::Pocket,
         "kokoro" => TtsEngineConfig::Kokoro,
-        "magpie" => TtsEngineConfig::Magpie,
         _ => {
             eprintln!("Unknown TTS engine: {}. Using pocket.", engine);
             TtsEngineConfig::Pocket
@@ -236,7 +235,6 @@ pub(crate) fn cmd_realtime_server(port: u16, engine: String, voice: String, host
     let tts_engine = match engine.to_lowercase().as_str() {
         "pocket" => TtsEngineConfig::Pocket,
         "kokoro" => TtsEngineConfig::Kokoro,
-        "magpie" => TtsEngineConfig::Magpie,
         _ => {
             eprintln!("Unknown TTS engine: {}. Using pocket.", engine);
             TtsEngineConfig::Pocket
