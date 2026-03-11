@@ -348,6 +348,7 @@ pub fn spawn_ane_training(
             let patience = n_samples * 2;
             let mut step = 0usize;
             let mut best_loss = f32::INFINITY;
+            let mut best_lora = lora.clone();
             let mut stale_count = 0usize;
 
             tracing::info!(
@@ -451,9 +452,10 @@ pub fn spawn_ane_training(
                         );
                     }
 
-                    // Early stopping
+                    // Best-checkpoint tracking + early stopping
                     if loss < best_loss {
                         best_loss = loss;
+                        best_lora = lora.clone();
                         stale_count = 0;
                     } else {
                         stale_count += 1;
@@ -468,6 +470,9 @@ pub fn spawn_ane_training(
                     }
                 }
             }
+
+            // Restore best checkpoint
+            lora = best_lora;
 
             let train_ms = t0.elapsed().as_millis();
             tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
@@ -1310,5 +1315,183 @@ mod tests {
         }
 
         eprintln!("learn_loop ane_model_dir path verified end-to-end");
+    }
+
+    /// Test 4: Before/after eval — train LoRA on a set of samples, then measure
+    /// whether perplexity on those samples decreases with the LoRA applied.
+    /// This validates the entire pipeline: training produces a LoRA that actually
+    /// improves the model's predictions on the training distribution.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_ane_lora_improves_perplexity() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel, load_lora_bin, save_lora_bin};
+        use crate::agent::ane_weights::{QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let dir = qwen3_5_dir();
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(64);
+
+        // Tokenize training samples
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        // Single sample overfit test: if LoRA can't memorize one sample,
+        // the gradient computation is wrong.
+        let train_convos = vec![
+            ("What is the capital of France?", "The capital of France is Paris."),
+        ];
+        let mut samples: Vec<(Vec<i32>, Vec<i32>)> = Vec::new();
+        for (user, assistant) in &train_convos {
+            let messages = vec![
+                crate::agent::mlx_server::ChatMessage {
+                    role: "user".into(),
+                    content: user.to_string(),
+                },
+                crate::agent::mlx_server::ChatMessage {
+                    role: "assistant".into(),
+                    content: assistant.to_string(),
+                },
+            ];
+            if let Ok(pair) = crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages) {
+                samples.push(pair);
+            }
+        }
+        assert!(!samples.is_empty(), "should tokenize at least one sample");
+        eprintln!("tokenized {} training samples", samples.len());
+
+        // Load quantized model
+        let mut model = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load model");
+        let n_layers = model.n_layers();
+        let dim = mil_cfg.dim;
+        let hidden = mil_cfg.hidden_dim;
+
+        // 1. Measure BASELINE loss (no LoRA)
+        let mut baseline_losses = Vec::new();
+        for (tokens, targets) in &samples {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd = ane_forward::forward_cpu_generic(&model, None, &tokens_u32, &targets_u32);
+            baseline_losses.push(fwd.base.loss);
+            eprintln!("  baseline loss (sample {}): {:.4}", baseline_losses.len(), fwd.base.loss);
+        }
+        let avg_baseline = baseline_losses.iter().sum::<f32>() / baseline_losses.len() as f32;
+        eprintln!("average baseline loss: {avg_baseline:.4}");
+
+        // 2. Train LoRA (use spawn_ane_training for realistic end-to-end)
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+            .expect("build ANE config");
+        // Use a temporary LoRA path so we don't pollute the workspace
+        let tmp_dir = tempfile::TempDir::new().expect("tempdir");
+        let lora_path = tmp_dir.path().join("test_eval.bin");
+
+        // Train directly (inline, not via spawn, for control over LoRA path)
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam = crate::agent::ane_lora::LoraModelAdam::zeros(&lora);
+
+        let epochs = 20; // Overfit single sample
+        let lr = 1e-4;  // Higher LR for single-sample memorization test
+        let mut step = 0usize;
+        let mut best_loss = f32::INFINITY;
+        let mut best_lora = lora.clone();
+        for _epoch in 0..epochs {
+            for (tokens, targets) in &samples {
+                let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+                let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+                model.cfg_mut().seq_len = tokens_u32.len();
+
+                let fwd = ane_forward::forward_cpu_generic(
+                    &model, Some(&lora), &tokens_u32, &targets_u32,
+                );
+                let bwd = crate::agent::ane_backward::backward_lora_cpu_generic(
+                    &model, &fwd, &lora, &tokens_u32, 15.0, 256.0,
+                );
+                step += 1;
+                crate::agent::ane_lora::lora_adam_update(
+                    &mut lora, &bwd.lora_grads, &mut adam,
+                    step, lr, 0.9, 0.999, 1e-8, 0.01,
+                );
+                let loss = fwd.base.loss;
+                if loss < best_loss {
+                    best_loss = loss;
+                    best_lora = lora.clone();
+                }
+                if step % 5 == 0 {
+                    eprintln!("  train step {step}, loss={loss:.4} (best={best_loss:.4})");
+                }
+            }
+        }
+        lora = best_lora;
+        eprintln!("training complete: {step} steps, using best checkpoint (loss={best_loss:.4})");
+
+        // 3. Measure loss WITH LoRA
+        let mut lora_losses = Vec::new();
+        for (tokens, targets) in &samples {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd = ane_forward::forward_cpu_generic(
+                &model, Some(&lora), &tokens_u32, &targets_u32,
+            );
+            lora_losses.push(fwd.base.loss);
+            eprintln!("  with-LoRA loss (sample {}): {:.4}", lora_losses.len(), fwd.base.loss);
+        }
+        let avg_lora = lora_losses.iter().sum::<f32>() / lora_losses.len() as f32;
+        eprintln!("average with-LoRA loss: {avg_lora:.4}");
+
+        // 4. Assert improvement
+        let improvement = (avg_baseline - avg_lora) / avg_baseline;
+        eprintln!(
+            "improvement: {:.1}% (baseline={avg_baseline:.4}, with_lora={avg_lora:.4})",
+            improvement * 100.0
+        );
+        assert!(
+            avg_lora < avg_baseline,
+            "LoRA should reduce loss: baseline={avg_baseline:.4}, with_lora={avg_lora:.4}"
+        );
+        // Require at least 2% improvement to confirm the LoRA is meaningfully better,
+        // not just noise. Single-sample few-shot training produces modest gains.
+        assert!(
+            improvement > 0.02,
+            "LoRA improvement should be >2%: got {:.1}%",
+            improvement * 100.0
+        );
+
+        // 5. Verify save/load roundtrip preserves the improvement
+        save_lora_bin(&lora, &lora_path).expect("save LoRA");
+        let loaded_lora = load_lora_bin(&lora_path).expect("load LoRA");
+        let mut roundtrip_losses = Vec::new();
+        for (tokens, targets) in &samples {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd = ane_forward::forward_cpu_generic(
+                &model, Some(&loaded_lora), &tokens_u32, &targets_u32,
+            );
+            roundtrip_losses.push(fwd.base.loss);
+        }
+        let avg_roundtrip = roundtrip_losses.iter().sum::<f32>() / roundtrip_losses.len() as f32;
+        let roundtrip_drift = (avg_roundtrip - avg_lora).abs() / avg_lora;
+        eprintln!("roundtrip loss: {avg_roundtrip:.4} (drift: {:.2}%)", roundtrip_drift * 100.0);
+        assert!(
+            roundtrip_drift < 0.01,
+            "save/load roundtrip should preserve loss within 1%: original={avg_lora:.4}, roundtrip={avg_roundtrip:.4}"
+        );
+
+        eprintln!("PASS: LoRA training produces measurable perplexity improvement");
     }
 }

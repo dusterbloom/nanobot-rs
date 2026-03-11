@@ -24,6 +24,7 @@ use super::ane_weights;
 // ---------------------------------------------------------------------------
 
 /// LoRA configuration with JIT LoRA proven defaults.
+#[derive(Clone)]
 pub struct LoraConfig {
     pub rank: usize,
     pub alpha: f32,
@@ -58,6 +59,7 @@ impl LoraConfig {
 ///   B: [d_out, rank] row-major — B[o * rank + r]
 ///
 /// B is zero-initialized so the model starts unmodified (JIT LoRA pattern).
+#[derive(Clone)]
 pub struct LoraAdapter {
     pub a: Vec<f32>,
     pub b: Vec<f32>,
@@ -178,6 +180,7 @@ impl LoraAdapter {
 
 /// LoRA adapters for one transformer layer.
 /// Targets: wq, wv, wo (attention) + w2 (FFN down_proj).
+#[derive(Clone)]
 pub struct LoraLayerAdapters {
     pub wq: Option<LoraAdapter>,
     pub wv: Option<LoraAdapter>,
@@ -186,6 +189,7 @@ pub struct LoraLayerAdapters {
 }
 
 /// Full model LoRA adapter set.
+#[derive(Clone)]
 pub struct LoraModel {
     pub layers: Vec<LoraLayerAdapters>,
     pub config: LoraConfig,
@@ -310,12 +314,14 @@ impl LoraLayerActivations {
 // ---------------------------------------------------------------------------
 
 /// Per-adapter gradients.
+#[derive(Clone)]
 pub struct LoraAdapterGrads {
     pub da: Vec<f32>,
     pub db: Vec<f32>,
 }
 
 /// Per-layer LoRA gradients.
+#[derive(Clone)]
 pub struct LoraLayerGrads {
     pub wq: Option<LoraAdapterGrads>,
     pub wv: Option<LoraAdapterGrads>,
@@ -324,6 +330,7 @@ pub struct LoraLayerGrads {
 }
 
 /// Full model LoRA gradients.
+#[derive(Clone)]
 pub struct LoraModelGrads {
     pub layers: Vec<LoraLayerGrads>,
 }
@@ -476,7 +483,55 @@ pub fn lora_clip_gradients_per_param(grads: &mut LoraModelGrads, clip: f32) {
     }
 }
 
-/// Apply Adam updates to all LoRA parameters.
+/// Clip gradient norm of all LoRA parameters (max_norm clipping).
+///
+/// Computes the global L2 norm across all adapter gradients and scales
+/// them uniformly if the norm exceeds `max_norm`. This is critical for
+/// training stability per maderix/ANE research (max_norm=1.0).
+pub fn clip_lora_grad_norm(grads: &mut LoraModelGrads, max_norm: f32) -> f32 {
+    let mut total_sq = 0.0f64;
+    let accumulate = |g: &Option<LoraAdapterGrads>, acc: &mut f64| {
+        if let Some(ref grads) = g {
+            for &v in &grads.da {
+                *acc += (v as f64) * (v as f64);
+            }
+            for &v in &grads.db {
+                *acc += (v as f64) * (v as f64);
+            }
+        }
+    };
+    for lg in &grads.layers {
+        accumulate(&lg.wq, &mut total_sq);
+        accumulate(&lg.wv, &mut total_sq);
+        accumulate(&lg.wo, &mut total_sq);
+        accumulate(&lg.w2, &mut total_sq);
+    }
+    let norm = total_sq.sqrt() as f32;
+    if norm > max_norm {
+        let scale = max_norm / norm;
+        let clip = |g: &mut Option<LoraAdapterGrads>| {
+            if let Some(ref mut grads) = g {
+                for v in &mut grads.da {
+                    *v *= scale;
+                }
+                for v in &mut grads.db {
+                    *v *= scale;
+                }
+            }
+        };
+        for lg in &mut grads.layers {
+            clip(&mut lg.wq);
+            clip(&mut lg.wv);
+            clip(&mut lg.wo);
+            clip(&mut lg.w2);
+        }
+    }
+    norm
+}
+
+/// Apply Adam updates to all LoRA parameters with gradient clipping.
+///
+/// Clips gradient norm to 1.0 before the Adam step for training stability.
 pub fn lora_adam_update(
     lora: &mut LoraModel,
     grads: &LoraModelGrads,
@@ -488,6 +543,10 @@ pub fn lora_adam_update(
     eps: f32,
     wd: f32,
 ) {
+    // Gradient clipping (max_norm=1.0) — critical for training stability
+    let mut grads_clipped = grads.clone();
+    clip_lora_grad_norm(&mut grads_clipped, 1.0);
+
     for l in 0..lora.layers.len() {
         let update_adapter = |adapter: &mut Option<LoraAdapter>,
                               grad: &Option<LoraAdapterGrads>,
@@ -499,22 +558,22 @@ pub fn lora_adam_update(
         };
         update_adapter(
             &mut lora.layers[l].wq,
-            &grads.layers[l].wq,
+            &grads_clipped.layers[l].wq,
             &mut adam.layers[l].wq,
         );
         update_adapter(
             &mut lora.layers[l].wv,
-            &grads.layers[l].wv,
+            &grads_clipped.layers[l].wv,
             &mut adam.layers[l].wv,
         );
         update_adapter(
             &mut lora.layers[l].wo,
-            &grads.layers[l].wo,
+            &grads_clipped.layers[l].wo,
             &mut adam.layers[l].wo,
         );
         update_adapter(
             &mut lora.layers[l].w2,
-            &grads.layers[l].w2,
+            &grads_clipped.layers[l].w2,
             &mut adam.layers[l].w2,
         );
     }
@@ -538,6 +597,10 @@ pub fn lora_adam_update_split_lr(
     eps: f32,
     wd: f32,
 ) {
+    // Gradient clipping (max_norm=1.0) — critical for training stability
+    let mut grads_clipped = grads.clone();
+    clip_lora_grad_norm(&mut grads_clipped, 1.0);
+
     let lr_attn = base_lr * lr_scale_attn;
     let lr_ffn = base_lr * lr_scale_ffn;
 
@@ -553,25 +616,25 @@ pub fn lora_adam_update_split_lr(
         };
         update_adapter(
             &mut lora.layers[l].wq,
-            &grads.layers[l].wq,
+            &grads_clipped.layers[l].wq,
             &mut adam.layers[l].wq,
             lr_attn,
         );
         update_adapter(
             &mut lora.layers[l].wv,
-            &grads.layers[l].wv,
+            &grads_clipped.layers[l].wv,
             &mut adam.layers[l].wv,
             lr_attn,
         );
         update_adapter(
             &mut lora.layers[l].wo,
-            &grads.layers[l].wo,
+            &grads_clipped.layers[l].wo,
             &mut adam.layers[l].wo,
             lr_attn,
         );
         update_adapter(
             &mut lora.layers[l].w2,
-            &grads.layers[l].w2,
+            &grads_clipped.layers[l].w2,
             &mut adam.layers[l].w2,
             lr_ffn,
         );
