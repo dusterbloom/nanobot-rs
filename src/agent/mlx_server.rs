@@ -618,6 +618,93 @@ pub fn tokenize_conversation(
     Ok((input, target))
 }
 
+/// Format a rich conversation (with tool calls and tool results) as ChatML text.
+///
+/// Handles all message roles from the session DB format:
+/// - `user`/`system`/`developer` → standard ChatML role block
+/// - `assistant` with `tool_calls` → content + `<tool_call>` blocks
+/// - `tool` → tool name + result content (provenance VERBATIM markers stripped)
+pub fn format_rich_chatml(messages: &[serde_json::Value]) -> String {
+    let mut text = String::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        text.push_str(IM_START);
+        text.push_str(role);
+        text.push('\n');
+
+        match role {
+            "assistant" => {
+                if !content.is_empty() {
+                    text.push_str(content);
+                }
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tool_calls {
+                        let func = tc.get("function").unwrap_or(tc);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let args_raw = func
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        // Parse args string into clean JSON (stored as escaped string in DB)
+                        let args = serde_json::from_str::<serde_json::Value>(args_raw)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        text.push_str("\n<tool_call>\n");
+                        text.push_str(
+                            &serde_json::json!({"name": name, "arguments": args}).to_string(),
+                        );
+                        text.push_str("\n</tool_call>");
+                    }
+                }
+            }
+            "tool" => {
+                let tool_name = msg.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if !tool_name.is_empty() {
+                    text.push_str(tool_name);
+                    text.push('\n');
+                }
+                // Strip provenance VERBATIM markers for cleaner training data
+                let clean = content
+                    .replace("[VERBATIM TOOL OUTPUT — do not paraphrase]\n", "")
+                    .replace("\n[END TOOL OUTPUT]", "");
+                text.push_str(clean.trim());
+            }
+            _ => {
+                text.push_str(content);
+            }
+        }
+
+        text.push_str(IM_END);
+        text.push('\n');
+    }
+    text
+}
+
+/// Tokenize a rich conversation for training.
+///
+/// Like [`tokenize_conversation`] but handles `tool_calls` on assistant messages
+/// and `tool` role messages with result content. Takes raw JSON messages matching
+/// the session DB format.
+pub fn tokenize_rich_conversation(
+    tokenizer: &MlxTokenizer,
+    messages: &[serde_json::Value],
+) -> Result<(Vec<i32>, Vec<i32>), String> {
+    let text = format_rich_chatml(messages);
+    let tokens = tokenizer
+        .encode(&text)
+        .map_err(|e| format!("tokenize: {e}"))?;
+    if tokens.len() < 2 {
+        return Err("conversation too short".into());
+    }
+    let input = tokens[..tokens.len() - 1].to_vec();
+    let target = tokens[1..].to_vec();
+    Ok((input, target))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers: OpenAI-compat
 // ---------------------------------------------------------------------------
@@ -1079,5 +1166,94 @@ mod tests {
             prompt,
             "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
+    }
+
+    #[test]
+    fn test_format_rich_chatml_with_tool_calls() {
+        use serde_json::json;
+        let messages = vec![
+            json!({"role": "user", "content": "What's the weather?"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\": \"weather London\"}"
+                    },
+                    "id": "123",
+                    "type": "function"
+                }]
+            }),
+            json!({"role": "tool", "name": "web_search", "content": "Partly cloudy, 18\u{00b0}C"}),
+            json!({"role": "assistant", "content": "It's partly cloudy at 18\u{00b0}C in London."}),
+        ];
+
+        let text = format_rich_chatml(&messages);
+
+        // User message
+        assert!(text.contains("<|im_start|>user\nWhat's the weather?<|im_end|>"));
+        // Tool call block with parsed args
+        assert!(text.contains("<tool_call>"));
+        assert!(text.contains("\"name\":\"web_search\""));
+        assert!(text.contains("\"query\":\"weather London\""));
+        assert!(text.contains("</tool_call>"));
+        // Tool result with name header
+        assert!(text.contains("<|im_start|>tool\nweb_search\nPartly cloudy"));
+        // Final assistant response
+        assert!(text.contains("<|im_start|>assistant\nIt's partly cloudy"));
+    }
+
+    #[test]
+    fn test_format_rich_chatml_strips_verbatim_markers() {
+        use serde_json::json;
+        let messages = vec![json!({
+            "role": "tool",
+            "name": "exec_command",
+            "content": "[VERBATIM TOOL OUTPUT — do not paraphrase]\nHello World\n[END TOOL OUTPUT]"
+        })];
+
+        let text = format_rich_chatml(&messages);
+
+        assert!(text.contains("Hello World"));
+        assert!(!text.contains("VERBATIM"));
+        assert!(!text.contains("END TOOL OUTPUT"));
+    }
+
+    #[test]
+    fn test_format_rich_chatml_plain_conversation() {
+        use serde_json::json;
+        let messages = vec![
+            json!({"role": "user", "content": "Hello"}),
+            json!({"role": "assistant", "content": "Hi there!"}),
+        ];
+
+        let text = format_rich_chatml(&messages);
+
+        assert_eq!(
+            text,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there!<|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn test_format_rich_chatml_multiple_tool_calls() {
+        use serde_json::json;
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "Let me check both.",
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": "{\"path\": \"/a.txt\"}"}, "id": "1", "type": "function"},
+                {"function": {"name": "read_file", "arguments": "{\"path\": \"/b.txt\"}"}, "id": "2", "type": "function"},
+            ]
+        })];
+
+        let text = format_rich_chatml(&messages);
+
+        // Should have two tool_call blocks
+        let tool_call_count = text.matches("<tool_call>").count();
+        assert_eq!(tool_call_count, 2);
+        assert!(text.contains("/a.txt"));
+        assert!(text.contains("/b.txt"));
     }
 }

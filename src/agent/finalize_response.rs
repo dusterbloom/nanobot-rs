@@ -240,6 +240,14 @@ impl AgentLoopShared {
             }
         }
 
+        // Capture reasoning trace BEFORE sanitization strips <think> blocks.
+        // Training data benefits from seeing the model's reasoning process.
+        let reasoning_trace = if ctx.final_content.contains("<think>") {
+            Some(ctx.final_content.clone())
+        } else {
+            None
+        };
+
         ctx.final_content = crate::agent::sanitize::sanitize_reasoning_output(&ctx.final_content);
 
         // Construct TurnOutcome AFTER all post-processing (rescue, provenance,
@@ -247,6 +255,8 @@ impl AgentLoopShared {
         let outcome = TurnOutcome {
             user_content: ctx.user_content.clone(),
             final_content: ctx.final_content.clone(),
+            reasoning_trace,
+            turn_messages: new_messages.clone(),
             model: ctx.core.model.clone(),
             session_key: ctx.session_key.clone(),
             workspace: ctx.core.workspace.clone(),

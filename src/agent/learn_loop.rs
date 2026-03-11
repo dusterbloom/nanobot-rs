@@ -23,6 +23,12 @@ use crate::config::schema::PerplexityGateConfig;
 pub(crate) struct TurnOutcome {
     pub user_content: String,
     pub final_content: String,
+    /// Raw assistant output before `sanitize_reasoning_output()` strips `<think>` blocks.
+    /// Present only when reasoning traces were detected.
+    pub reasoning_trace: Option<String>,
+    /// Full messages from this turn (user → assistant → tool → assistant), including
+    /// tool_calls JSON and tool result content. Used for rich training data.
+    pub turn_messages: Vec<serde_json::Value>,
     pub model: String,
     pub session_key: String,
     pub workspace: PathBuf,
@@ -177,19 +183,28 @@ impl LearnLoop for DefaultLearnLoop {
         let mlx_provider = self.mlx_provider.clone();
 
         let handle = tokio::spawn(async move {
-            let tool_entries_json: Vec<serde_json::Value> = outcome
-                .turn_tool_entries
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "name": e.name,
-                        "ok": e.ok,
-                        "duration_ms": e.duration_ms,
+            // Store rich turn messages (with tool_calls + tool results) when available,
+            // falling back to metadata-only trace for turns without tool calls.
+            // The rich format is detected during training by checking for "role" keys.
+            let has_tool_messages = outcome.turn_messages.iter().any(|m| {
+                m.get("role").and_then(|v| v.as_str()) == Some("tool")
+            });
+            let trace_json = if has_tool_messages {
+                serde_json::to_string(&outcome.turn_messages).unwrap_or_else(|_| "[]".into())
+            } else {
+                let tool_entries_json: Vec<serde_json::Value> = outcome
+                    .turn_tool_entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "ok": e.ok,
+                            "duration_ms": e.duration_ms,
+                        })
                     })
-                })
-                .collect();
-            let trace_json =
-                serde_json::to_string(&tool_entries_json).unwrap_or_else(|_| "[]".into());
+                    .collect();
+                serde_json::to_string(&tool_entries_json).unwrap_or_else(|_| "[]".into())
+            };
 
             // Heuristic surprise (zero model contention).
             //
@@ -268,9 +283,9 @@ impl LearnLoop for DefaultLearnLoop {
                 if exps.is_empty() {
                     return;
                 }
-                let data: Vec<(String, String)> = exps
+                let data: Vec<(String, String, String)> = exps
                     .iter()
-                    .map(|e| (e.prompt.clone(), e.response.clone()))
+                    .map(|e| (e.prompt.clone(), e.tool_trace.clone(), e.response.clone()))
                     .collect();
                 let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
                 (data, ids)
@@ -308,20 +323,27 @@ impl LearnLoop for DefaultLearnLoop {
                         }
                     };
                     let mut samples = Vec::new();
-                    for (prompt, response) in &exps_data {
-                        let messages = vec![
-                            crate::agent::mlx_server::ChatMessage {
-                                role: "user".into(),
-                                content: prompt.clone(),
-                            },
-                            crate::agent::mlx_server::ChatMessage {
-                                role: "assistant".into(),
-                                content: response.clone(),
-                            },
-                        ];
-                        if let Ok(pair) =
+                    for (prompt, trace, response) in &exps_data {
+                        // Check if trace contains rich messages (has "role" keys)
+                        let rich = serde_json::from_str::<Vec<serde_json::Value>>(trace)
+                            .ok()
+                            .filter(|msgs| msgs.first().map_or(false, |m| m.get("role").is_some()));
+                        let pair = if let Some(messages) = rich {
+                            crate::agent::mlx_server::tokenize_rich_conversation(&tokenizer, &messages)
+                        } else {
+                            let messages = vec![
+                                crate::agent::mlx_server::ChatMessage {
+                                    role: "user".into(),
+                                    content: prompt.clone(),
+                                },
+                                crate::agent::mlx_server::ChatMessage {
+                                    role: "assistant".into(),
+                                    content: response.clone(),
+                                },
+                            ];
                             crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
-                        {
+                        };
+                        if let Ok(pair) = pair {
                             samples.push(pair);
                         }
                     }
@@ -488,7 +510,7 @@ pub(crate) fn build_ane_training_config(
 /// timeout. This path is used when ANE split-silicon training is unavailable
 /// and in-process MLX training would block inference.
 async fn try_http_train(
-    exps_data: &[(String, String)],
+    exps_data: &[(String, String, String)],
     ids: &[i64],
     eb_arc: &Arc<parking_lot::Mutex<ExperienceBuffer>>,
     epochs: usize,
@@ -507,7 +529,7 @@ async fn try_http_train(
 
     let conversations: Vec<serde_json::Value> = exps_data
         .iter()
-        .map(|(p, r)| {
+        .map(|(p, _trace, r)| {
             serde_json::json!([
                 {"role": "user", "content": p},
                 {"role": "assistant", "content": r}
@@ -563,6 +585,8 @@ mod tests {
         let outcome = TurnOutcome {
             user_content: "hello".into(),
             final_content: "world".into(),
+            reasoning_trace: None,
+            turn_messages: vec![],
             model: "gpt-4".into(),
             session_key: "sess-1".into(),
             workspace: PathBuf::from("/tmp"),
@@ -708,6 +732,8 @@ mod tests {
         TurnOutcome {
             user_content: "test".into(),
             final_content: "response".into(),
+            reasoning_trace: None,
+            turn_messages: vec![],
             model: "test-model".into(),
             session_key: "test-session".into(),
             workspace: PathBuf::from("/tmp"),

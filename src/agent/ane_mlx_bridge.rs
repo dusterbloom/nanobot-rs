@@ -1251,6 +1251,8 @@ mod tests {
         let outcome = TurnOutcome {
             user_content: "Explain quantum entanglement in detail with examples".into(),
             final_content: "Quantum entanglement is a phenomenon...".into(),
+            reasoning_trace: None,
+            turn_messages: vec![],
             model: "local:Qwen3.5-35B".into(),
             session_key: "test-session".into(),
             workspace: std::path::PathBuf::from("/tmp"),
@@ -1764,6 +1766,388 @@ mod tests {
             "PASS: 35B training ({epochs} steps, {}/{} cached)",
             model.cached_layer_count(),
             model.n_layers()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Offline training from session DB
+    // -----------------------------------------------------------------------
+
+    /// Extract training-ready conversation windows from sessions.db.
+    ///
+    /// Opens the DB in read-only mode, finds sessions with tool-call exchanges,
+    /// and returns windows of messages suitable for training.
+    #[cfg(feature = "mlx")]
+    fn extract_training_conversations_from_db(
+        db_path: &std::path::Path,
+        max_conversations: usize,
+        max_window: usize,
+    ) -> Vec<Vec<serde_json::Value>> {
+        use rusqlite::{params, Connection};
+        use serde_json::json;
+
+        let conn = match Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        // Find sessions that have tool messages (these are the rich ones)
+        let session_ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT session_id FROM messages \
+                     WHERE role = 'tool' ORDER BY session_id DESC LIMIT ?1",
+                )
+                .unwrap();
+            stmt.query_map(params![max_conversations * 3], |row| row.get(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+
+        let mut conversations = Vec::new();
+
+        for session_id in &session_ids {
+            let messages: Vec<serde_json::Value> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT role, content, tool_calls, tool_call_id, tool_name \
+                         FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+                    )
+                    .unwrap();
+                stmt.query_map(params![session_id], |row| {
+                    let role: String = row.get(0)?;
+                    let content: Option<String> = row.get(1)?;
+                    let tool_calls: Option<String> = row.get(2)?;
+                    let tool_call_id: Option<String> = row.get(3)?;
+                    let tool_name: Option<String> = row.get(4)?;
+
+                    let mut msg = json!({
+                        "role": role,
+                        "content": content.unwrap_or_default(),
+                    });
+                    if let Some(tc) = tool_calls {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&tc) {
+                            msg["tool_calls"] = parsed;
+                        }
+                    }
+                    if let Some(id) = tool_call_id {
+                        msg["tool_call_id"] = json!(id);
+                    }
+                    if let Some(name) = tool_name {
+                        msg["name"] = json!(name);
+                    }
+                    Ok(msg)
+                })
+                .unwrap()
+                .flatten()
+                .collect()
+            };
+
+            // Filter to trainable roles only
+            let trainable = ["user", "assistant", "tool"];
+            let filtered: Vec<&serde_json::Value> = messages
+                .iter()
+                .filter(|m| {
+                    let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                    trainable.contains(&role)
+                })
+                .filter(|m| {
+                    // Skip very long messages (would blow up seq_len)
+                    let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    content.len() < 2000
+                })
+                .collect();
+
+            // Extract conversation windows centered on tool-call exchanges
+            let mut i = 0;
+            while i < filtered.len() && conversations.len() < max_conversations {
+                let role = filtered[i]
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if role != "user" {
+                    i += 1;
+                    continue;
+                }
+
+                let mut window: Vec<serde_json::Value> = vec![filtered[i].clone()];
+                let mut j = i + 1;
+                let mut has_tool = false;
+
+                while j < filtered.len() && window.len() < max_window {
+                    let r = filtered[j]
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if r == "user" {
+                        break;
+                    }
+                    if r == "tool" {
+                        has_tool = true;
+                    }
+                    window.push(filtered[j].clone());
+                    j += 1;
+                }
+
+                // Prefer windows with tool exchanges, but accept any user→assistant pair
+                if window.len() >= 2 && (has_tool || conversations.is_empty()) {
+                    conversations.push(window);
+                }
+
+                i = j;
+            }
+
+            if conversations.len() >= max_conversations {
+                break;
+            }
+        }
+
+        conversations
+    }
+
+    /// Phase 1 test: train on real session data from sessions.db.
+    ///
+    /// Proves we can:
+    /// 1. Read multi-turn conversations with tool calls from the session DB
+    /// 2. Tokenize them with the full ChatML template (user/assistant/tool roles)
+    /// 3. Run LoRA training and observe loss reduction
+    ///
+    /// Skips gracefully if sessions.db is missing/empty or no model available.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_offline_training_from_sessions() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let db_path = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/sessions.db");
+        if !db_path.exists() {
+            eprintln!("SKIP: sessions.db not found");
+            return;
+        }
+
+        // 1. Extract conversations from session DB
+        let conversations = extract_training_conversations_from_db(&db_path, 5, 15);
+        if conversations.is_empty() {
+            eprintln!("SKIP: no training conversations found in sessions.db");
+            return;
+        }
+        let has_tool = conversations.iter().any(|conv| {
+            conv.iter()
+                .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        });
+        eprintln!(
+            "extracted {} conversations (has_tool={})",
+            conversations.len(),
+            has_tool,
+        );
+        for (i, conv) in conversations.iter().enumerate() {
+            let roles: Vec<&str> = conv
+                .iter()
+                .map(|m| m.get("role").and_then(|v| v.as_str()).unwrap_or("?"))
+                .collect();
+            eprintln!("  conv {i}: {} messages, roles={:?}", conv.len(), roles);
+        }
+
+        // 2. Tokenize with rich ChatML template
+        let dir = qwen3_5_dir();
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let mut samples: Vec<(Vec<i32>, Vec<i32>)> = Vec::new();
+        for conv in &conversations {
+            match crate::agent::mlx_server::tokenize_rich_conversation(&tokenizer, conv) {
+                Ok(pair) => {
+                    // Skip samples that exceed max bucket size
+                    if pair.0.len() <= 1024 {
+                        samples.push(pair);
+                    } else {
+                        eprintln!(
+                            "  skipping sample with {} tokens (exceeds 1024 limit)",
+                            pair.0.len()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("  tokenize failed: {e}"),
+            }
+        }
+        assert!(
+            !samples.is_empty(),
+            "should tokenize at least one conversation from sessions.db"
+        );
+        eprintln!(
+            "tokenized {} samples (token lengths: {:?})",
+            samples.len(),
+            samples.iter().map(|(t, _)| t.len()).collect::<Vec<_>>(),
+        );
+
+        // 3. Load model
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel, LoraModelAdam};
+        use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(64);
+
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load model");
+        let mut model = DenseCachedModel::auto(quantized);
+        let n_layers = model.n_layers();
+        let dim = mil_cfg.dim;
+        let hidden = mil_cfg.hidden_dim;
+        eprintln!(
+            "model loaded: {} layers, dim={dim}, {}/{} cached",
+            n_layers,
+            model.cached_layer_count(),
+            n_layers,
+        );
+
+        // 4. Measure baseline loss
+        let mut baseline_losses = Vec::new();
+        for (i, (tokens, targets)) in samples.iter().enumerate() {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd =
+                ane_forward::forward_cpu_generic(&model, None, &tokens_u32, &targets_u32);
+            baseline_losses.push(fwd.base.loss);
+            eprintln!("  baseline sample {i}: loss={:.4}, tokens={}", fwd.base.loss, tokens.len());
+        }
+        let avg_baseline =
+            baseline_losses.iter().sum::<f32>() / baseline_losses.len() as f32;
+        eprintln!("average baseline loss: {avg_baseline:.4}");
+
+        // 5. Train LoRA with per-epoch evaluation
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        let epochs = 20;
+        let lr = 3e-5; // Lower LR for multi-sample stability (1e-4 diverges)
+        let mut step = 0usize;
+        let mut best_avg_loss = f32::INFINITY;
+        let mut best_lora = lora.clone();
+
+        // Pre-convert samples to u32 for reuse
+        let samples_u32: Vec<(Vec<u32>, Vec<u32>)> = samples
+            .iter()
+            .map(|(t, g)| {
+                (
+                    t.iter().map(|&x| x as u32).collect(),
+                    g.iter().map(|&x| x as u32).collect(),
+                )
+            })
+            .collect();
+
+        for epoch in 0..epochs {
+            for (tokens_u32, targets_u32) in &samples_u32 {
+                model.cfg_mut().seq_len = tokens_u32.len();
+
+                let fwd = ane_forward::forward_cpu_generic(
+                    &model,
+                    Some(&lora),
+                    tokens_u32,
+                    targets_u32,
+                );
+                let bwd = crate::agent::ane_backward::backward_lora_cpu_generic(
+                    &model, &fwd, &lora, tokens_u32, 15.0, 256.0,
+                );
+                step += 1;
+                crate::agent::ane_lora::lora_adam_update(
+                    &mut lora,
+                    &bwd.lora_grads,
+                    &mut adam,
+                    step,
+                    lr,
+                    0.9,
+                    0.999,
+                    1e-8,
+                    0.01,
+                );
+            }
+
+            // Evaluate on all samples at end of each epoch
+            let mut epoch_loss = 0.0f32;
+            for (tokens_u32, targets_u32) in &samples_u32 {
+                model.cfg_mut().seq_len = tokens_u32.len();
+                let fwd = ane_forward::forward_cpu_generic(
+                    &model,
+                    Some(&lora),
+                    tokens_u32,
+                    targets_u32,
+                );
+                epoch_loss += fwd.base.loss;
+            }
+            let avg_loss = epoch_loss / samples_u32.len() as f32;
+            if avg_loss < best_avg_loss {
+                best_avg_loss = avg_loss;
+                best_lora = lora.clone();
+            }
+            if (epoch + 1) % 5 == 0 {
+                eprintln!(
+                    "  epoch {}, avg_loss={avg_loss:.4} (best={best_avg_loss:.4})",
+                    epoch + 1,
+                );
+            }
+        }
+        lora = best_lora;
+        eprintln!(
+            "training complete: {step} steps, best_avg_loss={best_avg_loss:.4}"
+        );
+
+        // 6. Measure trained loss
+        let mut trained_losses = Vec::new();
+        for (i, (tokens, targets)) in samples.iter().enumerate() {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd = ane_forward::forward_cpu_generic(
+                &model,
+                Some(&lora),
+                &tokens_u32,
+                &targets_u32,
+            );
+            trained_losses.push(fwd.base.loss);
+            eprintln!("  trained sample {i}: loss={:.4}", fwd.base.loss);
+        }
+        let avg_trained =
+            trained_losses.iter().sum::<f32>() / trained_losses.len() as f32;
+
+        // 7. Assert improvement
+        let improvement = (avg_baseline - avg_trained) / avg_baseline;
+        eprintln!(
+            "RESULT: baseline={avg_baseline:.4}, trained={avg_trained:.4}, \
+             improvement={:.1}%",
+            improvement * 100.0,
+        );
+        assert!(
+            avg_trained < avg_baseline,
+            "LoRA should reduce loss on session data: \
+             baseline={avg_baseline:.4}, trained={avg_trained:.4}"
+        );
+        assert!(
+            improvement > 0.02,
+            "expected >2% improvement on session data, got {:.1}%",
+            improvement * 100.0,
+        );
+
+        eprintln!(
+            "PASS: offline training from sessions.db ({} samples, {step} steps, {:.1}% improvement)",
+            samples.len(),
+            improvement * 100.0,
         );
     }
 }
