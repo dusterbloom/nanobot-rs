@@ -135,6 +135,156 @@ fn resolve_weight_base<V>(tensors: &std::collections::HashMap<String, V>, base: 
 }
 
 // ---------------------------------------------------------------------------
+// Memory-mapped safetensors store
+// ---------------------------------------------------------------------------
+
+/// Memory-mapped safetensors store for on-demand tensor access.
+///
+/// Instead of reading entire safetensors files into heap memory (via `std::fs::read`),
+/// this mmaps each file and provides zero-copy access to individual tensors. MoE expert
+/// weights can be skipped entirely, reducing peak memory from ~19 GB to ~4 GB for models
+/// like Qwen3.5-35B where experts dominate file size.
+struct MmapTensorStore {
+    _mmaps: Vec<memmap2::Mmap>,
+    /// tensor_name → (mmap_index, byte_start, byte_end)
+    offsets: std::collections::HashMap<String, (usize, usize, usize)>,
+    /// tensor_name → (dtype, shape)
+    meta: std::collections::HashMap<String, (String, Vec<usize>)>,
+}
+
+impl MmapTensorStore {
+    /// Open all safetensors files in `dir`, building an mmap-backed index.
+    ///
+    /// When `skip_experts` is true, tensors whose names contain `.experts.` are
+    /// excluded from the index (their pages are never faulted in by the OS).
+    fn open(dir: &Path, skip_experts: bool) -> io::Result<Self> {
+        use std::collections::HashMap;
+
+        let mut st_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+            .collect();
+        st_files.sort();
+
+        if st_files.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no safetensors files",
+            ));
+        }
+
+        let mut mmaps = Vec::with_capacity(st_files.len());
+        let mut offsets = HashMap::new();
+        let mut meta = HashMap::new();
+        let mut skipped = 0usize;
+
+        for st_path in &st_files {
+            let file = std::fs::File::open(st_path)?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let mmap_idx = mmaps.len();
+
+            if mmap.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file too small",
+                ));
+            }
+            let hdr_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+            let hdr_json: serde_json::Value =
+                serde_json::from_slice(&mmap[8..8 + hdr_size]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
+                })?;
+            let data_start = 8 + hdr_size;
+
+            if let serde_json::Value::Object(map) = hdr_json {
+                for (name, m) in &map {
+                    if name == "__metadata__" {
+                        continue;
+                    }
+                    if skip_experts && name.contains(".experts.") {
+                        skipped += 1;
+                        continue;
+                    }
+                    let dtype = m["dtype"].as_str().unwrap_or("").to_string();
+                    let shape: Vec<usize> = m["shape"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let data_offsets = m["data_offsets"].as_array().unwrap();
+                    let start = data_offsets[0].as_u64().unwrap() as usize;
+                    let end = data_offsets[1].as_u64().unwrap() as usize;
+                    offsets.insert(name.clone(), (mmap_idx, data_start + start, data_start + end));
+                    meta.insert(name.clone(), (dtype, shape));
+                }
+            }
+
+            mmaps.push(mmap);
+        }
+
+        if skipped > 0 {
+            tracing::debug!("mmap tensor store: skipped {skipped} expert tensors");
+        }
+        tracing::debug!(
+            "mmap tensor store: indexed {} tensors from {} files",
+            offsets.len(),
+            mmaps.len()
+        );
+
+        Ok(Self {
+            _mmaps: mmaps,
+            offsets,
+            meta,
+        })
+    }
+
+    /// Get raw bytes for a tensor (zero-copy slice into the mmap).
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        let &(idx, start, end) = self.offsets.get(name)?;
+        Some(&self._mmaps[idx][start..end])
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.offsets.contains_key(name)
+    }
+
+    fn meta(&self, name: &str) -> Option<&(String, Vec<usize>)> {
+        self.meta.get(name)
+    }
+
+    /// Resolve weight base name, trying `language_model.` prefix fallback.
+    fn resolve_weight_base(&self, base: &str) -> String {
+        let direct_weight = format!("{base}.weight");
+        if self.contains_key(&direct_weight) {
+            return base.to_string();
+        }
+        let prefixed = format!("language_model.{base}");
+        let prefixed_weight = format!("{prefixed}.weight");
+        if self.contains_key(&prefixed_weight) {
+            prefixed
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// Resolve tensor name, trying `language_model.` prefix fallback.
+    fn resolve_tensor_name(&self, name: &str) -> String {
+        let prefixed = format!("language_model.{name}");
+        if self.contains_key(name) {
+            name.to_string()
+        } else if self.contains_key(&prefixed) {
+            prefixed
+        } else {
+            name.to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RoPE blob generation
 // ---------------------------------------------------------------------------
 
@@ -665,64 +815,9 @@ impl ModelWeights {
     /// Handles 8-bit quantized weights (U32-packed + BF16 scales/biases, group_size=64).
     /// Expands KV weights for GQA (replicates each KV head `heads_per_group` times).
     pub fn from_mlx_safetensors(dir: &Path, cfg: &MilConfig) -> io::Result<Self> {
-        use std::collections::HashMap;
-
-        // Find safetensors files
-        let mut st_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
-            .collect();
-        st_files.sort();
-
-        if st_files.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no safetensors files",
-            ));
-        }
-
-        // Parse all safetensors files into a name→data map
-        let mut tensors: HashMap<String, Vec<u8>> = HashMap::new();
-        let mut tensor_meta: HashMap<String, (String, Vec<usize>)> = HashMap::new(); // name → (dtype, shape)
-
-        for st_path in &st_files {
-            let data = std::fs::read(st_path)?;
-            if data.len() < 8 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
-            }
-            let hdr_size = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-            let hdr_json: serde_json::Value = serde_json::from_slice(&data[8..8 + hdr_size])
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
-                })?;
-            let data_start = 8 + hdr_size;
-
-            if let serde_json::Value::Object(map) = hdr_json {
-                for (name, meta) in &map {
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let dtype = meta["dtype"].as_str().unwrap_or("").to_string();
-                    let shape: Vec<usize> = meta["shape"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let offsets = meta["data_offsets"].as_array().unwrap();
-                    let start = offsets[0].as_u64().unwrap() as usize;
-                    let end = offsets[1].as_u64().unwrap() as usize;
-                    tensors.insert(
-                        name.clone(),
-                        data[data_start + start..data_start + end].to_vec(),
-                    );
-                    tensor_meta.insert(name.clone(), (dtype, shape));
-                }
-            }
-        }
+        // Mmap all safetensors files, skipping MoE expert tensors to avoid OOM on
+        // large models like Qwen3.5-35B (19 GB on disk, but only shared_expert used).
+        let store = MmapTensorStore::open(dir, true)?;
 
         /// BF16 bytes → f32 vec
         fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
@@ -737,23 +832,16 @@ impl ModelWeights {
         /// Get a dequantized weight tensor by base name (e.g. "model.layers.0.self_attn.q_proj")
         ///
         /// `bits` — quantization width (4 or 8). Determines packing: 8 or 4 values per u32.
-        let get_weight = |tensors: &HashMap<String, Vec<u8>>,
-                          tensor_meta: &HashMap<String, (String, Vec<usize>)>,
-                          base: &str,
-                          group_size: usize,
-                          bits: usize|
-         -> io::Result<Vec<f32>> {
-            let base = resolve_weight_base(tensors, base);
+        let get_weight = |base: &str, group_size: usize, bits: usize| -> io::Result<Vec<f32>> {
+            let base = store.resolve_weight_base(base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
 
-            if let (Some(w), Some(s), Some(b)) = (
-                tensors.get(&w_key),
-                tensors.get(&s_key),
-                tensors.get(&b_key),
-            ) {
-                let (_, shape) = tensor_meta.get(&w_key).unwrap();
+            if let (Some(w), Some(s), Some(b)) =
+                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+            {
+                let (_, shape) = store.meta(&w_key).unwrap();
                 let rows = shape[0];
                 let packed_cols = shape[1];
                 let elems_per_u32 = 32 / bits;
@@ -763,12 +851,8 @@ impl ModelWeights {
                 Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
             } else {
                 // Try non-quantized (BF16)
-                let key = base.to_string();
-                if let Some(data) = tensors.get(&format!("{base}.weight")).or(tensors.get(&key)) {
-                    let (dtype, _) = tensor_meta
-                        .get(&format!("{base}.weight"))
-                        .or(tensor_meta.get(&key))
-                        .unwrap();
+                if let Some(data) = store.get(&format!("{base}.weight")) {
+                    let (dtype, _) = store.meta(&format!("{base}.weight")).unwrap();
                     if dtype == "BF16" {
                         Ok(bf16_to_f32(data))
                     } else {
@@ -787,15 +871,12 @@ impl ModelWeights {
         };
 
         /// Get a small tensor directly (BF16 or F32) → Vec<f32>
-        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>,
-                        tensor_meta: &HashMap<String, (String, Vec<usize>)>,
-                        name: &str|
-         -> io::Result<Vec<f32>> {
-            let name = resolve_tensor_name(tensors, name);
-            let data = tensors.get(&name).ok_or_else(|| {
+        let get_bf16 = |name: &str| -> io::Result<Vec<f32>> {
+            let name = store.resolve_tensor_name(name);
+            let data = store.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
-            let dtype = tensor_meta.get(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
+            let dtype = store.meta(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
             Ok(match dtype {
                 "F32" => data
                     .chunks_exact(4)
@@ -823,13 +904,7 @@ impl ModelWeights {
         let hpg = cfg.heads_per_group();
 
         // Embedding (quantized or bf16)
-        let embed_raw = get_weight(
-            &tensors,
-            &tensor_meta,
-            "model.embed_tokens",
-            group_size,
-            bits,
-        )?;
+        let embed_raw = get_weight("model.embed_tokens", group_size, bits)?;
         // embed_raw is [vocab, dim] row-major → we need [dim, vocab] col-major (our format: embed[d * vocab + v])
         // Actually our format: embed[v * dim + d] for embed_lookup which does: out[d * seq + t] = embed[token * dim + d]
         // So we need [vocab, dim] row-major — that's what we already have.
@@ -873,83 +948,33 @@ impl ModelWeights {
                 // GDN layers: load from linear_attn.* prefix, MHA projections are empty
                 let la = format!("{prefix}.linear_attn");
                 let gdn_w = GdnLayerWeights {
-                    qkv_proj: get_weight(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_qkv"),
-                        group_size,
-                        bits,
-                    )?,
-                    a_proj: get_weight(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_a"),
-                        group_size,
-                        bits,
-                    )?,
-                    b_proj: get_weight(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_b"),
-                        group_size,
-                        bits,
-                    )?,
-                    z_proj: get_weight(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_z"),
-                        group_size,
-                        bits,
-                    )?,
-                    o_proj: get_weight(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.out_proj"),
-                        group_size,
-                        bits,
-                    )?,
-                    a_log: get_bf16(&tensors, &tensor_meta,&format!("{la}.A_log"))?,
-                    dt_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.dt_bias"))?,
-                    norm_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.norm.weight"))?,
-                    conv_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.bias")).unwrap_or_default(),
+                    qkv_proj: get_weight(&format!("{la}.in_proj_qkv"), group_size, bits)?,
+                    a_proj: get_weight(&format!("{la}.in_proj_a"), group_size, bits)?,
+                    b_proj: get_weight(&format!("{la}.in_proj_b"), group_size, bits)?,
+                    z_proj: get_weight(&format!("{la}.in_proj_z"), group_size, bits)?,
+                    o_proj: get_weight(&format!("{la}.out_proj"), group_size, bits)?,
+                    a_log: get_bf16(&format!("{la}.A_log"))?,
+                    dt_bias: get_bf16(&format!("{la}.dt_bias"))?,
+                    norm_weight: get_bf16(&format!("{la}.norm.weight"))?,
+                    conv_weight: get_bf16(&format!("{la}.conv1d.weight"))?,
+                    conv_bias: get_bf16(&format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // GDN layers have no separate q/k/v/o projections
                 (vec![], vec![], vec![], vec![], None, None, Some(gdn_w))
             } else {
                 // MHA layers: standard q_proj/k_proj/v_proj/o_proj
-                let wq = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.q_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wk_raw = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.k_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wv_raw = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.v_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wo = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.o_proj"),
-                    group_size,
-                    bits,
-                )?;
+                let wq = get_weight(&format!("{prefix}.self_attn.q_proj"), group_size, bits)?;
+                let wk_raw =
+                    get_weight(&format!("{prefix}.self_attn.k_proj"), group_size, bits)?;
+                let wv_raw =
+                    get_weight(&format!("{prefix}.self_attn.v_proj"), group_size, bits)?;
+                let wo = get_weight(&format!("{prefix}.self_attn.o_proj"), group_size, bits)?;
                 let wk = expand_kv(&wk_raw, kv_dim, attn_dim, hpg);
                 let wv = expand_kv(&wv_raw, kv_dim, attn_dim, hpg);
-                let q_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm =
+                    get_bf16(&format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm =
+                    get_bf16(&format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -959,30 +984,9 @@ impl ModelWeights {
             //   2. mlp.shared_expert.gate_proj (MoE — train shared expert only)
             //   3. mlp.gate_up_proj (fused gate+up, split in half)
             let try_load_ffn = |pfx: &str| -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-                let g = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{pfx}.gate_proj"),
-                    group_size,
-                    bits,
-                )
-                .ok()?;
-                let u = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{pfx}.up_proj"),
-                    group_size,
-                    bits,
-                )
-                .ok()?;
-                let d = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{pfx}.down_proj"),
-                    group_size,
-                    bits,
-                )
-                .ok()?;
+                let g = get_weight(&format!("{pfx}.gate_proj"), group_size, bits).ok()?;
+                let u = get_weight(&format!("{pfx}.up_proj"), group_size, bits).ok()?;
+                let d = get_weight(&format!("{pfx}.down_proj"), group_size, bits).ok()?;
                 Some((g, u, d))
             };
             let (w1, w3, w2) = if let Some(ffn) = try_load_ffn(&format!("{prefix}.mlp")) {
@@ -991,30 +995,16 @@ impl ModelWeights {
                 ffn
             } else {
                 // Fused gate_up_proj: [2*hidden_dim, dim] → split in half by rows
-                let fused = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.mlp.gate_up_proj"),
-                    group_size,
-                    bits,
-                )?;
+                let fused =
+                    get_weight(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
                 let mid = fused.len() / 2;
-                let d = get_weight(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.mlp.down_proj"),
-                    group_size,
-                    bits,
-                )?;
+                let d = get_weight(&format!("{prefix}.mlp.down_proj"), group_size, bits)?;
                 (fused[..mid].to_vec(), fused[mid..].to_vec(), d)
             };
 
             // RMSNorm weights (BF16, not quantized)
-            let rms_att = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.input_layernorm.weight"))?;
-            let rms_ffn = get_bf16(
-                &tensors, &tensor_meta,
-                &format!("{prefix}.post_attention_layernorm.weight"),
-            )?;
+            let rms_att = get_bf16(&format!("{prefix}.input_layernorm.weight"))?;
+            let rms_ffn = get_bf16(&format!("{prefix}.post_attention_layernorm.weight"))?;
 
             layers.push(LayerWeights {
                 wq,
@@ -1044,7 +1034,7 @@ impl ModelWeights {
             }
         }
 
-        let rms_final = get_bf16(&tensors, &tensor_meta,"model.norm.weight")?;
+        let rms_final = get_bf16("model.norm.weight")?;
 
         Ok(ModelWeights {
             cfg: cfg.clone(),
@@ -1068,62 +1058,9 @@ impl QuantizedModelWeights {
     /// - 1.7B model: ~7.6 GB → ~1.9 GB (quantized + norms + embed)
     /// - 9B model: doesn't fit → ~3 GB
     pub fn from_mlx_safetensors(dir: &Path, cfg: &MilConfig) -> io::Result<Self> {
-        use std::collections::HashMap;
-
-        let mut st_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
-            .collect();
-        st_files.sort();
-
-        if st_files.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no safetensors files",
-            ));
-        }
-
-        let mut tensors: HashMap<String, Vec<u8>> = HashMap::new();
-        let mut tensor_meta: HashMap<String, (String, Vec<usize>)> = HashMap::new();
-
-        for st_path in &st_files {
-            let data = std::fs::read(st_path)?;
-            if data.len() < 8 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
-            }
-            let hdr_size = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-            let hdr_json: serde_json::Value = serde_json::from_slice(&data[8..8 + hdr_size])
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
-                })?;
-            let data_start = 8 + hdr_size;
-
-            if let serde_json::Value::Object(map) = hdr_json {
-                for (name, meta) in &map {
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let dtype = meta["dtype"].as_str().unwrap_or("").to_string();
-                    let shape: Vec<usize> = meta["shape"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let offsets = meta["data_offsets"].as_array().unwrap();
-                    let start = offsets[0].as_u64().unwrap() as usize;
-                    let end = offsets[1].as_u64().unwrap() as usize;
-                    tensors.insert(
-                        name.clone(),
-                        data[data_start + start..data_start + end].to_vec(),
-                    );
-                    tensor_meta.insert(name.clone(), (dtype, shape));
-                }
-            }
-        }
+        // Mmap all safetensors files, skipping MoE expert tensors to avoid OOM on
+        // large models like Qwen3.5-35B (19 GB on disk, but only shared_expert used).
+        let store = MmapTensorStore::open(dir, true)?;
 
         fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
             data.chunks_exact(2)
@@ -1136,30 +1073,23 @@ impl QuantizedModelWeights {
 
         /// Get a quantized tensor WITHOUT dequantizing.
         /// Returns QuantizedTensor with raw bytes + scales + biases.
-        let get_quantized = |tensors: &HashMap<String, Vec<u8>>,
-                             tensor_meta: &HashMap<String, (String, Vec<usize>)>,
-                             base: &str,
-                             group_size: usize,
-                             bits: usize|
-         -> io::Result<QuantizedTensor> {
-            let base = resolve_weight_base(tensors, base);
+        let get_quantized = |base: &str, group_size: usize, bits: usize| -> io::Result<QuantizedTensor> {
+            let base = store.resolve_weight_base(base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
 
-            if let (Some(w), Some(s), Some(b)) = (
-                tensors.get(&w_key),
-                tensors.get(&s_key),
-                tensors.get(&b_key),
-            ) {
-                let (_, shape) = tensor_meta.get(&w_key).unwrap();
+            if let (Some(w), Some(s), Some(b)) =
+                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+            {
+                let (_, shape) = store.meta(&w_key).unwrap();
                 let rows = shape[0];
                 let packed_cols = shape[1];
                 let elems_per_u32 = 32 / bits;
                 let cols = packed_cols * elems_per_u32;
 
                 Ok(QuantizedTensor {
-                    data: w.clone(),
+                    data: w.to_vec(),
                     scales: bf16_to_f32(s),
                     biases: bf16_to_f32(b),
                     rows,
@@ -1175,15 +1105,12 @@ impl QuantizedModelWeights {
             }
         };
 
-        let get_bf16 = |tensors: &HashMap<String, Vec<u8>>,
-                        tensor_meta: &HashMap<String, (String, Vec<usize>)>,
-                        name: &str|
-         -> io::Result<Vec<f32>> {
-            let name = resolve_tensor_name(tensors, name);
-            let data = tensors.get(&name).ok_or_else(|| {
+        let get_bf16 = |name: &str| -> io::Result<Vec<f32>> {
+            let name = store.resolve_tensor_name(name);
+            let data = store.get(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing: {name}"))
             })?;
-            let dtype = tensor_meta.get(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
+            let dtype = store.meta(&name).map(|(d, _)| d.as_str()).unwrap_or("BF16");
             Ok(match dtype {
                 "F32" => data
                     .chunks_exact(4)
@@ -1194,29 +1121,22 @@ impl QuantizedModelWeights {
         };
 
         /// Dequantize a tensor to f32 (for embeddings that need random access as f32).
-        let get_weight_f32 = |tensors: &HashMap<String, Vec<u8>>,
-                              tensor_meta: &HashMap<String, (String, Vec<usize>)>,
-                              base: &str,
-                              group_size: usize,
-                              bits: usize|
-         -> io::Result<Vec<f32>> {
-            let base = resolve_weight_base(tensors, base);
+        let get_weight_f32 = |base: &str, group_size: usize, bits: usize| -> io::Result<Vec<f32>> {
+            let base = store.resolve_weight_base(base);
             let w_key = format!("{base}.weight");
             let s_key = format!("{base}.scales");
             let b_key = format!("{base}.biases");
-            if let (Some(w), Some(s), Some(b)) = (
-                tensors.get(&w_key),
-                tensors.get(&s_key),
-                tensors.get(&b_key),
-            ) {
-                let (_, shape) = tensor_meta.get(&w_key).unwrap();
+            if let (Some(w), Some(s), Some(b)) =
+                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+            {
+                let (_, shape) = store.meta(&w_key).unwrap();
                 let rows = shape[0];
                 let elems_per_u32 = 32 / bits;
                 let cols = shape[1] * elems_per_u32;
                 let sc = bf16_to_f32(s);
                 let bi = bf16_to_f32(b);
                 Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
-            } else if let Some(data) = tensors.get(&format!("{base}.weight")) {
+            } else if let Some(data) = store.get(&format!("{base}.weight")) {
                 Ok(bf16_to_f32(data))
             } else {
                 Err(io::Error::new(
@@ -1239,13 +1159,7 @@ impl QuantizedModelWeights {
         let hpg = cfg.heads_per_group();
 
         // Embedding — must be f32 (accessed every step, random access pattern)
-        let embed_raw = get_weight_f32(
-            &tensors,
-            &tensor_meta,
-            "model.embed_tokens",
-            group_size,
-            bits,
-        )?;
+        let embed_raw = get_weight_f32("model.embed_tokens", group_size, bits)?;
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -1257,46 +1171,16 @@ impl QuantizedModelWeights {
                 // GDN layers: load from linear_attn.* prefix
                 let la = format!("{prefix}.linear_attn");
                 let gdn_w = QuantizedGdnLayerWeights {
-                    qkv_proj: get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_qkv"),
-                        group_size,
-                        bits,
-                    )?,
-                    a_proj: get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_a"),
-                        group_size,
-                        bits,
-                    )?,
-                    b_proj: get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_b"),
-                        group_size,
-                        bits,
-                    )?,
-                    z_proj: get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.in_proj_z"),
-                        group_size,
-                        bits,
-                    )?,
-                    o_proj: get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{la}.out_proj"),
-                        group_size,
-                        bits,
-                    )?,
-                    a_log: get_bf16(&tensors, &tensor_meta,&format!("{la}.A_log"))?,
-                    dt_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.dt_bias"))?,
-                    norm_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.norm.weight"))?,
-                    conv_weight: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.weight"))?,
-                    conv_bias: get_bf16(&tensors, &tensor_meta,&format!("{la}.conv1d.bias")).unwrap_or_default(),
+                    qkv_proj: get_quantized(&format!("{la}.in_proj_qkv"), group_size, bits)?,
+                    a_proj: get_quantized(&format!("{la}.in_proj_a"), group_size, bits)?,
+                    b_proj: get_quantized(&format!("{la}.in_proj_b"), group_size, bits)?,
+                    z_proj: get_quantized(&format!("{la}.in_proj_z"), group_size, bits)?,
+                    o_proj: get_quantized(&format!("{la}.out_proj"), group_size, bits)?,
+                    a_log: get_bf16(&format!("{la}.A_log"))?,
+                    dt_bias: get_bf16(&format!("{la}.dt_bias"))?,
+                    norm_weight: get_bf16(&format!("{la}.norm.weight"))?,
+                    conv_weight: get_bf16(&format!("{la}.conv1d.weight"))?,
+                    conv_bias: get_bf16(&format!("{la}.conv1d.bias")).unwrap_or_default(),
                 };
                 // Dummy empty tensors for MHA fields (not used for GDN layers)
                 let empty = QuantizedTensor {
@@ -1319,36 +1203,12 @@ impl QuantizedModelWeights {
                 )
             } else {
                 // MHA layers: standard q_proj/k_proj/v_proj/o_proj
-                let wq = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.q_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wk = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.k_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wv = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.v_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let wo = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.self_attn.o_proj"),
-                    group_size,
-                    bits,
-                )?;
-                let q_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let wq = get_quantized(&format!("{prefix}.self_attn.q_proj"), group_size, bits)?;
+                let wk = get_quantized(&format!("{prefix}.self_attn.k_proj"), group_size, bits)?;
+                let wv = get_quantized(&format!("{prefix}.self_attn.v_proj"), group_size, bits)?;
+                let wo = get_quantized(&format!("{prefix}.self_attn.o_proj"), group_size, bits)?;
+                let q_norm = get_bf16(&format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -1357,30 +1217,9 @@ impl QuantizedModelWeights {
             // Same fallback chain as f32 path: dense → shared_expert (MoE) → fused
             let try_load_ffn_q =
                 |pfx: &str| -> Option<(QuantizedTensor, QuantizedTensor, QuantizedTensor)> {
-                    let g = get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{pfx}.gate_proj"),
-                        group_size,
-                        bits,
-                    )
-                    .ok()?;
-                    let u = get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{pfx}.up_proj"),
-                        group_size,
-                        bits,
-                    )
-                    .ok()?;
-                    let d = get_quantized(
-                        &tensors,
-                        &tensor_meta,
-                        &format!("{pfx}.down_proj"),
-                        group_size,
-                        bits,
-                    )
-                    .ok()?;
+                    let g = get_quantized(&format!("{pfx}.gate_proj"), group_size, bits).ok()?;
+                    let u = get_quantized(&format!("{pfx}.up_proj"), group_size, bits).ok()?;
+                    let d = get_quantized(&format!("{pfx}.down_proj"), group_size, bits).ok()?;
                     Some((g, u, d))
                 };
             let (w1, w3, w2) = if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp")) {
@@ -1388,29 +1227,15 @@ impl QuantizedModelWeights {
             } else if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp.shared_expert")) {
                 ffn
             } else {
-                let fused = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.mlp.gate_up_proj"),
-                    group_size,
-                    bits,
-                )?;
+                let fused =
+                    get_quantized(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
                 let (g, u) = fused.split_rows_half();
-                let d = get_quantized(
-                    &tensors,
-                    &tensor_meta,
-                    &format!("{prefix}.mlp.down_proj"),
-                    group_size,
-                    bits,
-                )?;
+                let d = get_quantized(&format!("{prefix}.mlp.down_proj"), group_size, bits)?;
                 (g, u, d)
             };
 
-            let rms_att = get_bf16(&tensors, &tensor_meta,&format!("{prefix}.input_layernorm.weight"))?;
-            let rms_ffn = get_bf16(
-                &tensors, &tensor_meta,
-                &format!("{prefix}.post_attention_layernorm.weight"),
-            )?;
+            let rms_att = get_bf16(&format!("{prefix}.input_layernorm.weight"))?;
+            let rms_ffn = get_bf16(&format!("{prefix}.post_attention_layernorm.weight"))?;
 
             layers.push(QuantizedLayerWeights {
                 wq,
@@ -1444,7 +1269,7 @@ impl QuantizedModelWeights {
             }
         }
 
-        let rms_final = get_bf16(&tensors, &tensor_meta,"model.norm.weight")?;
+        let rms_final = get_bf16("model.norm.weight")?;
 
         Ok(QuantizedModelWeights {
             cfg: cfg.clone(),
