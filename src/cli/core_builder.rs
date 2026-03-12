@@ -266,30 +266,40 @@ pub(super) fn make_local_providers(
 
 /// Resolve the MLX model directory from config or default location.
 ///
-/// When `mlxModelDir` is `"auto"`, scans `~/.cache/lm-studio/models/` for
-/// directories containing `tokenizer.json` + `*.safetensors` (no `.gguf`).
+/// Priority:
+/// 1. Explicit `mlxModelDir` path — always trusted (user override)
+/// 2. `"auto"` — match `localModel` first, then scan for any MLX dir
+/// 3. Unset — match `localModel`, then scan, then hardcoded default
 #[cfg(feature = "mlx")]
 pub(crate) fn resolve_mlx_model_dir(config: &Config) -> std::path::PathBuf {
     if let Some(ref dir) = config.agents.defaults.mlx_model_dir {
         if dir == "auto" {
+            // "auto" — try localModel match first, then generic scan.
+            if let Some(found) = resolve_from_local_model(config) {
+                return found;
+            }
             if let Some(found) = auto_detect_mlx_model_dir() {
                 return found;
             }
             tracing::warn!("mlxModelDir=auto but no MLX model found, using default");
         } else {
+            // Explicit path — trust the user.
             let path = std::path::PathBuf::from(dir);
-            if path.join("tokenizer.json").exists() {
-                return path;
+            if !path.join("tokenizer.json").exists() {
+                tracing::warn!(
+                    configured = %path.display(),
+                    "mlxModelDir has no tokenizer.json on disk"
+                );
             }
-            // Configured dir doesn't exist or has no tokenizer — try auto-detect.
-            tracing::warn!(
-                configured = %path.display(),
-                "mlxModelDir not found on disk, auto-detecting"
-            );
-            if let Some(found) = auto_detect_mlx_model_dir() {
-                tracing::info!(found = %found.display(), "auto-detected MLX model");
-                return found;
-            }
+            return path;
+        }
+    } else {
+        // No mlxModelDir configured — resolve from localModel.
+        if let Some(found) = resolve_from_local_model(config) {
+            return found;
+        }
+        if let Some(found) = auto_detect_mlx_model_dir() {
+            return found;
         }
     }
     dirs::home_dir()
@@ -297,45 +307,119 @@ pub(crate) fn resolve_mlx_model_dir(config: &Config) -> std::path::PathBuf {
         .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit")
 }
 
+/// Try to find an MLX model dir that matches `config.localModel`.
+///
+/// Strips the GGUF suffix from the model name, then searches `~/.cache/lm-studio/models/`
+/// for an MLX directory whose name matches (case-insensitive).
+#[cfg(feature = "mlx")]
+fn resolve_from_local_model(config: &Config) -> Option<std::path::PathBuf> {
+    let local_model = &config.agents.defaults.local_model;
+    if local_model.is_empty() {
+        return None;
+    }
+    let found = find_mlx_dir_for_model(local_model)?;
+    tracing::info!(
+        local_model = %local_model,
+        resolved = %found.display(),
+        "resolved MLX model dir from localModel"
+    );
+    Some(found)
+}
+
+/// Search `~/.cache/lm-studio/models/` for an MLX model directory matching `model_name`.
+///
+/// Filesystem wrapper around `best_matching_dir` — collects all MLX dirs on disk,
+/// then delegates to the pure matching function.
+#[cfg(feature = "mlx")]
+pub(crate) fn find_mlx_dir_for_model(model_name: &str) -> Option<std::path::PathBuf> {
+    let base = dirs::home_dir()?.join(".cache/lm-studio/models");
+    if !base.is_dir() {
+        return None;
+    }
+    let mut all_mlx_dirs = Vec::new();
+    collect_mlx_dirs_recursive(&base, &mut all_mlx_dirs);
+    best_matching_dir(model_name, &all_mlx_dirs)
+}
+
+/// Pure matching: find the best candidate directory for a model name.
+///
+/// Strips GGUF suffix, then does case-insensitive matching against directory names.
+/// Prefers exact match, then substring match (shortest dir name wins on ties).
+pub(crate) fn best_matching_dir(
+    model_name: &str,
+    candidates: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let needle = strip_gguf_suffix(model_name).to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+
+    // Exact dir-name match.
+    for d in candidates {
+        if let Some(name) = d.file_name() {
+            if name.to_string_lossy().to_lowercase() == needle {
+                return Some(d.clone());
+            }
+        }
+    }
+
+    // Dir name contains needle — pick shortest (most specific) on ties.
+    let mut matches: Vec<_> = candidates
+        .iter()
+        .filter(|d| {
+            d.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if !matches.is_empty() {
+        matches.sort_by_key(|d| d.file_name().map(|n| n.len()).unwrap_or(usize::MAX));
+        return Some(matches.remove(0));
+    }
+
+    None
+}
+
 /// Scan `~/.cache/lm-studio/models/` for an MLX model directory.
 ///
 /// An MLX dir has `tokenizer.json` + at least one `.safetensors` file and no `.gguf`.
+/// Returns the first match (alphabetically sorted) — prefer `find_mlx_dir_for_model`
+/// when `localModel` is known.
 #[cfg(feature = "mlx")]
 pub(crate) fn auto_detect_mlx_model_dir() -> Option<std::path::PathBuf> {
     let base = dirs::home_dir()?.join(".cache/lm-studio/models");
     if !base.is_dir() {
         return None;
     }
-    find_mlx_dir_recursive(&base)
+    let mut dirs = Vec::new();
+    collect_mlx_dirs_recursive(&base, &mut dirs);
+    dirs.into_iter().next()
 }
 
-/// Recursively find a directory that looks like an MLX model.
+/// Recursively collect all MLX model directories under `dir`.
+///
+/// Results are sorted alphabetically for deterministic ordering.
 #[cfg(feature = "mlx")]
-fn find_mlx_dir_recursive(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
+fn collect_mlx_dirs_recursive(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
     let mut subdirs: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
-    // Sort for deterministic selection across runs/machines.
     subdirs.sort();
-    let mut mlx_dirs = Vec::new();
     for path in &subdirs {
         if is_mlx_model_dir(path) {
-            mlx_dirs.push(path.clone());
+            out.push(path.clone());
         }
     }
-    if !mlx_dirs.is_empty() {
-        return Some(mlx_dirs.remove(0));
-    }
-    // Recurse into subdirs
     for sub in subdirs {
-        if let Some(found) = find_mlx_dir_recursive(&sub) {
-            return Some(found);
-        }
+        collect_mlx_dirs_recursive(&sub, out);
     }
-    None
 }
 
 /// Re-export from mlx_lm — single canonical check for MLX model directories.
@@ -792,9 +876,13 @@ fn create_agent_loop_inner(
     {
         let has_mlx_provider = {
             #[cfg(feature = "mlx")]
-            { mlx.is_some() }
+            {
+                mlx.is_some()
+            }
             #[cfg(not(feature = "mlx"))]
-            { false }
+            {
+                false
+            }
         };
         if !has_mlx_provider {
             let model_dir = resolve_mlx_model_dir(config);
@@ -919,5 +1007,84 @@ mod tests {
             );
         }
         assert!(model_config_from_preset("unknown").is_none());
+    }
+}
+
+#[cfg(test)]
+mod matching_tests {
+    use super::*;
+
+    fn fake_dirs(names: &[&str]) -> Vec<std::path::PathBuf> {
+        names
+            .iter()
+            .map(|n| std::path::PathBuf::from(format!("/models/mlx-community/{n}")))
+            .collect()
+    }
+
+    #[test]
+    fn test_match_exact_name() {
+        let dirs = fake_dirs(&[
+            "Qwen3.5-0.8B-8bit",
+            "Qwen3.5-2B-MLX-8bit",
+            "Qwen3.5-35B-A3B-4bit",
+        ]);
+        let found = best_matching_dir("Qwen3.5-35B-A3B-4bit", &dirs).unwrap();
+        assert!(found.ends_with("Qwen3.5-35B-A3B-4bit"));
+    }
+
+    #[test]
+    fn test_match_case_insensitive() {
+        let dirs = fake_dirs(&["Qwen3.5-35B-A3B-4bit"]);
+        let found = best_matching_dir("qwen3.5-35b-a3b-4bit", &dirs).unwrap();
+        assert!(found.ends_with("Qwen3.5-35B-A3B-4bit"));
+    }
+
+    #[test]
+    fn test_match_strips_gguf_suffix() {
+        let dirs = fake_dirs(&["Qwen3.5-0.8B-8bit", "Qwen3.5-2B-MLX-8bit"]);
+        let found = best_matching_dir("Qwen3.5-0.8B-Q4_K_M.gguf", &dirs).unwrap();
+        assert!(
+            found.ends_with("Qwen3.5-0.8B-8bit"),
+            "should match after stripping GGUF quant: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_match_prefers_shortest_on_tie() {
+        let dirs = fake_dirs(&["Qwen3.5-2B-MLX-8bit", "Qwen3.5-2B-MLX-8bit-extra-long-name"]);
+        let found = best_matching_dir("Qwen3.5-2B", &dirs).unwrap();
+        assert!(
+            found.ends_with("Qwen3.5-2B-MLX-8bit"),
+            "should prefer shorter (more specific) dir: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_match_no_false_positive_size_prefix() {
+        // "2B" must NOT match "32B".
+        let dirs = fake_dirs(&["Qwen3.5-32B-4bit"]);
+        assert!(
+            best_matching_dir("Qwen3.5-2B", &dirs).is_none(),
+            "needle '2B' should not match dir '32B'"
+        );
+    }
+
+    #[test]
+    fn test_match_returns_none_for_unknown() {
+        let dirs = fake_dirs(&["Qwen3.5-0.8B-8bit", "Qwen3.5-2B-MLX-8bit"]);
+        assert!(best_matching_dir("nonexistent-99B", &dirs).is_none());
+    }
+
+    #[test]
+    fn test_match_empty_candidates() {
+        assert!(best_matching_dir("Qwen3.5-2B", &[]).is_none());
+    }
+
+    #[test]
+    fn test_match_empty_model_name() {
+        let dirs = fake_dirs(&["Qwen3.5-2B-MLX-8bit"]);
+        assert!(best_matching_dir("", &dirs).is_none());
     }
 }

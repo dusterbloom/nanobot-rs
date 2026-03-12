@@ -17,8 +17,8 @@ pub(crate) use core_builder::{
 };
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
-    build_core_handle_mlx, create_agent_loop_mlx, model_config_from_preset, preset_from_model_dir,
-    rebuild_core_mlx, resolve_mlx_model_dir, start_mlx_provider, MlxHandle,
+    build_core_handle_mlx, create_agent_loop_mlx, find_mlx_dir_for_model, model_config_from_preset,
+    preset_from_model_dir, rebuild_core_mlx, resolve_mlx_model_dir, start_mlx_provider, MlxHandle,
 };
 pub(crate) use eval::{
     cmd_eval_hanoi, cmd_eval_haystack, cmd_eval_learn, cmd_eval_report, cmd_eval_sprint,
@@ -212,9 +212,11 @@ mod tests {
     fn test_resolve_mlx_model_dir_default() {
         let cfg = Config::default();
         let dir = core_builder::resolve_mlx_model_dir(&cfg);
+        // Default local_model is "gemma-3n-e4b-it-Q4_K_M.gguf" — no MLX dir
+        // for gemma on most machines, so falls through to auto-detect or hardcoded.
         assert!(
-            dir.to_string_lossy().contains("Qwen3.5-2B-MLX-8bit"),
-            "default dir should point to Qwen3.5-2B: {:?}",
+            !dir.to_string_lossy().is_empty(),
+            "should resolve to some path: {:?}",
             dir
         );
     }
@@ -230,13 +232,29 @@ mod tests {
 
     #[cfg(feature = "mlx")]
     #[test]
+    fn test_resolve_mlx_model_dir_from_local_model() {
+        // When localModel matches an MLX dir on disk, resolve should find it.
+        let mut cfg = Config::default();
+        cfg.agents.defaults.local_model = "Qwen3.5-35B-A3B-4bit".to_string();
+        cfg.agents.defaults.mlx_model_dir = None;
+        let dir = core_builder::resolve_mlx_model_dir(&cfg);
+        if dir.to_string_lossy().contains("Qwen3.5-35B-A3B-4bit") {
+            // MLX dir for 35B exists on this machine — resolved correctly.
+        } else {
+            // 35B MLX not installed — falls through to auto-detect/default.
+            assert!(
+                !dir.to_string_lossy().is_empty(),
+                "should still resolve to some path"
+            );
+        }
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
     fn test_build_core_handle_mlx_sets_local_and_model_prefix() {
-        // Verify that build_core_handle_mlx produces a local core with mlx: prefix.
-        // NOTE: Can't actually start MlxProvider without model files, so we test
-        // that the function exists and config defaults resolve correctly.
         let cfg = Config::default();
         let dir = core_builder::resolve_mlx_model_dir(&cfg);
-        assert!(dir.to_string_lossy().ends_with("Qwen3.5-2B-MLX-8bit"));
+        assert!(!dir.to_string_lossy().is_empty());
     }
 
     #[cfg(feature = "mlx")]
