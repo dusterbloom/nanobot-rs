@@ -220,14 +220,11 @@ impl MmapTensorStore {
             let mmap_idx = mmaps.len();
 
             if mmap.len() < 8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "file too small",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
             }
             let hdr_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-            let hdr_json: serde_json::Value =
-                serde_json::from_slice(&mmap[8..8 + hdr_size]).map_err(|e| {
+            let hdr_json: serde_json::Value = serde_json::from_slice(&mmap[8..8 + hdr_size])
+                .map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("bad header: {e}"))
                 })?;
             let data_start = 8 + hdr_size;
@@ -253,7 +250,10 @@ impl MmapTensorStore {
                     let data_offsets = m["data_offsets"].as_array().unwrap();
                     let start = data_offsets[0].as_u64().unwrap() as usize;
                     let end = data_offsets[1].as_u64().unwrap() as usize;
-                    offsets.insert(name.clone(), (mmap_idx, data_start + start, data_start + end));
+                    offsets.insert(
+                        name.clone(),
+                        (mmap_idx, data_start + start, data_start + end),
+                    );
                     meta.insert(name.clone(), (dtype, shape));
                 }
             }
@@ -541,9 +541,9 @@ pub fn pack_ffn_bwd_w13t(
     f32_slice_to_bytes(&buf)
 }
 
-/// Pack dq + dk + dv + Wq^T + Wk^T + Wv^T into `[1, dim, 1, 3*seq+3*dim]` fp32 layout.
+/// Pack dq + dk + dv + Wq^T + Wk^T + Wv^T into `[1, q_proj_dim, 1, 3*seq+3*dim]` fp32 layout.
 ///
-/// Per channel d (0..dim):
+/// Per channel d (0..q_proj_dim):
 ///   sp[0..seq]                    = dq[d*seq..d*seq+seq]
 ///   sp[seq..2*seq]                = dk[d*seq..d*seq+seq]
 ///   sp[2*seq..3*seq]              = dv[d*seq..d*seq+seq]
@@ -559,42 +559,50 @@ pub fn pack_qkvb(
     wvt: &[f32],
     cfg: &MilConfig,
 ) -> Vec<u8> {
+    let qpd = cfg.q_proj_dim();
+    let ad = cfg.attn_dim();
     let dim = cfg.dim;
     let seq = cfg.seq_len;
     let sp = 3 * seq + 3 * dim;
-    assert_eq!(dq.len(), dim * seq);
-    assert_eq!(dk.len(), dim * seq);
-    assert_eq!(dv.len(), dim * seq);
-    assert_eq!(wqt.len(), dim * dim);
-    assert_eq!(wkt.len(), dim * dim);
-    assert_eq!(wvt.len(), dim * dim);
+    assert_eq!(dq.len(), qpd * seq);
+    assert_eq!(dk.len(), ad * seq);
+    assert_eq!(dv.len(), ad * seq);
+    assert_eq!(wqt.len(), qpd * dim);
+    assert_eq!(wkt.len(), ad * dim);
+    assert_eq!(wvt.len(), ad * dim);
 
-    let mut buf = vec![0.0f32; dim * sp];
-    for d in 0..dim {
+    let mut buf = vec![0.0f32; qpd * sp];
+    for d in 0..qpd {
         buf[d * sp..d * sp + seq].copy_from_slice(&dq[d * seq..d * seq + seq]);
-        buf[d * sp + seq..d * sp + 2 * seq].copy_from_slice(&dk[d * seq..d * seq + seq]);
-        buf[d * sp + 2 * seq..d * sp + 3 * seq].copy_from_slice(&dv[d * seq..d * seq + seq]);
-        buf[d * sp + 3 * seq..d * sp + 3 * seq + dim].copy_from_slice(&wqt[d * dim..d * dim + dim]);
-        buf[d * sp + 3 * seq + dim..d * sp + 3 * seq + 2 * dim]
-            .copy_from_slice(&wkt[d * dim..d * dim + dim]);
-        buf[d * sp + 3 * seq + 2 * dim..d * sp + 3 * seq + 3 * dim]
-            .copy_from_slice(&wvt[d * dim..d * dim + dim]);
+        if d < ad {
+            buf[d * sp + seq..d * sp + 2 * seq].copy_from_slice(&dk[d * seq..d * seq + seq]);
+            buf[d * sp + 2 * seq..d * sp + 3 * seq]
+                .copy_from_slice(&dv[d * seq..d * seq + seq]);
+        }
+        buf[d * sp + 3 * seq..d * sp + 3 * seq + dim]
+            .copy_from_slice(&wqt[d * dim..d * dim + dim]);
+        if d < ad {
+            buf[d * sp + 3 * seq + dim..d * sp + 3 * seq + 2 * dim]
+                .copy_from_slice(&wkt[d * dim..d * dim + dim]);
+            buf[d * sp + 3 * seq + 2 * dim..d * sp + 3 * seq + 3 * dim]
+                .copy_from_slice(&wvt[d * dim..d * dim + dim]);
+        }
     }
     f32_slice_to_bytes(&buf)
 }
 
-/// Pack Q, K, V, da into `[1, 4*dim, 1, seq]` fp16 layout (channel stacking).
+/// Pack Q, K, V, da into `[1, 4*attn_dim, 1, seq]` fp16 layout (channel stacking).
 ///
-/// Each slice is [dim, seq] fp32, converted to fp16 and stacked channel-wise.
+/// Each slice is [attn_dim, seq] fp32, converted to fp16 and stacked channel-wise.
 pub fn pack_sdpa_bwd1(q: &[f32], k: &[f32], v: &[f32], da: &[f32], cfg: &MilConfig) -> Vec<u8> {
-    let dim = cfg.dim;
+    let attn_dim = cfg.attn_dim();
     let seq = cfg.seq_len;
-    assert_eq!(q.len(), dim * seq);
-    assert_eq!(k.len(), dim * seq);
-    assert_eq!(v.len(), dim * seq);
-    assert_eq!(da.len(), dim * seq);
+    assert_eq!(q.len(), attn_dim * seq);
+    assert_eq!(k.len(), attn_dim * seq);
+    assert_eq!(v.len(), attn_dim * seq);
+    assert_eq!(da.len(), attn_dim * seq);
 
-    let in_ch = 4 * dim;
+    let in_ch = 4 * attn_dim;
     let mut buf = vec![0u8; in_ch * seq * 2]; // fp16
     let write_block = |buf: &mut Vec<u8>, ch_off: usize, data: &[f32]| {
         for i in 0..data.len() {
@@ -604,9 +612,9 @@ pub fn pack_sdpa_bwd1(q: &[f32], k: &[f32], v: &[f32], da: &[f32], cfg: &MilConf
         }
     };
     write_block(&mut buf, 0, q);
-    write_block(&mut buf, dim, k);
-    write_block(&mut buf, 2 * dim, v);
-    write_block(&mut buf, 3 * dim, da);
+    write_block(&mut buf, attn_dim, k);
+    write_block(&mut buf, 2 * attn_dim, v);
+    write_block(&mut buf, 3 * attn_dim, da);
     buf
 }
 
@@ -614,29 +622,30 @@ pub fn pack_sdpa_bwd1(q: &[f32], k: &[f32], v: &[f32], da: &[f32], cfg: &MilConf
 // Output unpacking for backward kernels
 // ---------------------------------------------------------------------------
 
-/// Unpack SDPA bwd1 output: `[1, dim+2*score_ch, 1, seq]` fp16 -> (dV, probs, dp).
+/// Unpack SDPA bwd1 output: `[1, attn_dim+2*score_ch, 1, seq]` fp16 -> (dV, probs, dp).
 pub fn unpack_sdpa_bwd1(output: &[u8], cfg: &MilConfig) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let dim = cfg.dim;
+    let attn_dim = cfg.attn_dim();
     let seq = cfg.seq_len;
     let score_ch = cfg.score_ch();
     let floats = fp16_bytes_to_f32(output);
-    assert_eq!(floats.len(), (dim + 2 * score_ch) * seq);
+    assert_eq!(floats.len(), (attn_dim + 2 * score_ch) * seq);
 
-    let dv = floats[0..dim * seq].to_vec();
-    let probs = floats[dim * seq..(dim + score_ch) * seq].to_vec();
-    let dp = floats[(dim + score_ch) * seq..(dim + 2 * score_ch) * seq].to_vec();
+    let dv = floats[0..attn_dim * seq].to_vec();
+    let probs = floats[attn_dim * seq..(attn_dim + score_ch) * seq].to_vec();
+    let dp =
+        floats[(attn_dim + score_ch) * seq..(attn_dim + 2 * score_ch) * seq].to_vec();
     (dv, probs, dp)
 }
 
-/// Unpack SDPA bwd2 output: `[1, 2*dim, 1, seq]` fp16 -> (dQ, dK).
+/// Unpack SDPA bwd2 output: `[1, 2*attn_dim, 1, seq]` fp16 -> (dQ, dK).
 pub fn unpack_sdpa_bwd2(output: &[u8], cfg: &MilConfig) -> (Vec<f32>, Vec<f32>) {
-    let dim = cfg.dim;
+    let attn_dim = cfg.attn_dim();
     let seq = cfg.seq_len;
     let floats = fp16_bytes_to_f32(output);
-    assert_eq!(floats.len(), 2 * dim * seq);
+    assert_eq!(floats.len(), 2 * attn_dim * seq);
 
-    let dq = floats[0..dim * seq].to_vec();
-    let dk = floats[dim * seq..2 * dim * seq].to_vec();
+    let dq = floats[0..attn_dim * seq].to_vec();
+    let dk = floats[attn_dim * seq..2 * attn_dim * seq].to_vec();
     (dq, dk)
 }
 
@@ -665,6 +674,36 @@ pub fn pack_dyn_matmul_oc_tile(
         buf[d * sp + seq..d * sp + seq + actual_oc]
             .copy_from_slice(&w[d * full_oc + tile_start..d * full_oc + tile_start + actual_oc]);
         // remaining positions stay zero (padding)
+    }
+    f32_slice_to_bytes(&buf)
+}
+
+/// Pack one OC-tile of a DynMatmul directly from row-major `[oc, ic]` weights.
+///
+/// This avoids materializing a full transpose when the source tensor is stored
+/// in the standard PyTorch/Safetensors `[out_features, in_features]` layout.
+pub fn pack_dyn_matmul_oc_tile_row_major(
+    act: &[f32],
+    w_row_major: &[f32],
+    ic: usize,
+    full_oc: usize,
+    tile_oc: usize,
+    tile_start: usize,
+    seq: usize,
+) -> Vec<u8> {
+    assert_eq!(
+        w_row_major.len(),
+        full_oc * ic,
+        "pack_dyn_matmul_oc_tile_row_major: weight size mismatch"
+    );
+    let actual_oc = (full_oc - tile_start).min(tile_oc);
+    let sp = seq + tile_oc;
+    let mut buf = vec![0.0f32; ic * sp];
+    for d in 0..ic {
+        buf[d * sp..d * sp + seq].copy_from_slice(&act[d * seq..d * seq + seq]);
+        for oc in 0..actual_oc {
+            buf[d * sp + seq + oc] = w_row_major[(tile_start + oc) * ic + d];
+        }
     }
     f32_slice_to_bytes(&buf)
 }
@@ -708,8 +747,7 @@ pub fn pack_dyn_matmul_ic_tile(
     for d in 0..actual_ic {
         let src_d = tile_start + d;
         buf[d * sp..d * sp + seq].copy_from_slice(&act[src_d * seq..src_d * seq + seq]);
-        buf[d * sp + seq..d * sp + seq + oc]
-            .copy_from_slice(&w[src_d * oc..src_d * oc + oc]);
+        buf[d * sp + seq..d * sp + seq + oc].copy_from_slice(&w[src_d * oc..src_d * oc + oc]);
     }
     // remaining channels stay zero (padding)
     f32_slice_to_bytes(&buf)
@@ -999,17 +1037,13 @@ impl ModelWeights {
             } else {
                 // MHA layers: standard q_proj/k_proj/v_proj/o_proj
                 let wq = get_weight(&format!("{prefix}.self_attn.q_proj"), group_size, bits)?;
-                let wk_raw =
-                    get_weight(&format!("{prefix}.self_attn.k_proj"), group_size, bits)?;
-                let wv_raw =
-                    get_weight(&format!("{prefix}.self_attn.v_proj"), group_size, bits)?;
+                let wk_raw = get_weight(&format!("{prefix}.self_attn.k_proj"), group_size, bits)?;
+                let wv_raw = get_weight(&format!("{prefix}.self_attn.v_proj"), group_size, bits)?;
                 let wo = get_weight(&format!("{prefix}.self_attn.o_proj"), group_size, bits)?;
                 let wk = expand_kv(&wk_raw, kv_dim, attn_dim, hpg);
                 let wv = expand_kv(&wv_raw, kv_dim, attn_dim, hpg);
-                let q_norm =
-                    get_bf16(&format!("{prefix}.self_attn.q_norm.weight")).ok();
-                let k_norm =
-                    get_bf16(&format!("{prefix}.self_attn.k_norm.weight")).ok();
+                let q_norm = get_bf16(&format!("{prefix}.self_attn.q_norm.weight")).ok();
+                let k_norm = get_bf16(&format!("{prefix}.self_attn.k_norm.weight")).ok();
                 (wq, wk, wv, wo, q_norm, k_norm, None)
             };
 
@@ -1030,8 +1064,7 @@ impl ModelWeights {
                 ffn
             } else {
                 // Fused gate_up_proj: [2*hidden_dim, dim] → split in half by rows
-                let fused =
-                    get_weight(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let fused = get_weight(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
                 let mid = fused.len() / 2;
                 let d = get_weight(&format!("{prefix}.mlp.down_proj"), group_size, bits)?;
                 (fused[..mid].to_vec(), fused[mid..].to_vec(), d)
@@ -1108,37 +1141,38 @@ impl QuantizedModelWeights {
 
         /// Get a quantized tensor WITHOUT dequantizing.
         /// Returns QuantizedTensor with raw bytes + scales + biases.
-        let get_quantized = |base: &str, group_size: usize, bits: usize| -> io::Result<QuantizedTensor> {
-            let base = store.resolve_weight_base(base);
-            let w_key = format!("{base}.weight");
-            let s_key = format!("{base}.scales");
-            let b_key = format!("{base}.biases");
+        let get_quantized =
+            |base: &str, group_size: usize, bits: usize| -> io::Result<QuantizedTensor> {
+                let base = store.resolve_weight_base(base);
+                let w_key = format!("{base}.weight");
+                let s_key = format!("{base}.scales");
+                let b_key = format!("{base}.biases");
 
-            if let (Some(w), Some(s), Some(b)) =
-                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
-            {
-                let (_, shape) = store.meta(&w_key).unwrap();
-                let rows = shape[0];
-                let packed_cols = shape[1];
-                let elems_per_u32 = 32 / bits;
-                let cols = packed_cols * elems_per_u32;
+                if let (Some(w), Some(s), Some(b)) =
+                    (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+                {
+                    let (_, shape) = store.meta(&w_key).unwrap();
+                    let rows = shape[0];
+                    let packed_cols = shape[1];
+                    let elems_per_u32 = 32 / bits;
+                    let cols = packed_cols * elems_per_u32;
 
-                Ok(QuantizedTensor {
-                    data: w.to_vec(),
-                    scales: bf16_to_f32(s),
-                    biases: bf16_to_f32(b),
-                    rows,
-                    cols,
-                    group_size,
-                    bits,
-                })
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("missing quantized tensor: {base} (need .weight/.scales/.biases)"),
-                ))
-            }
-        };
+                    Ok(QuantizedTensor {
+                        data: w.to_vec(),
+                        scales: bf16_to_f32(s),
+                        biases: bf16_to_f32(b),
+                        rows,
+                        cols,
+                        group_size,
+                        bits,
+                    })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("missing quantized tensor: {base} (need .weight/.scales/.biases)"),
+                    ))
+                }
+            };
 
         let get_bf16 = |name: &str| -> io::Result<Vec<f32>> {
             let name = store.resolve_tensor_name(name);
@@ -1262,8 +1296,7 @@ impl QuantizedModelWeights {
             } else if let Some(ffn) = try_load_ffn_q(&format!("{prefix}.mlp.shared_expert")) {
                 ffn
             } else {
-                let fused =
-                    get_quantized(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
+                let fused = get_quantized(&format!("{prefix}.mlp.gate_up_proj"), group_size, bits)?;
                 let (g, u) = fused.split_rows_half();
                 let d = get_quantized(&format!("{prefix}.mlp.down_proj"), group_size, bits)?;
                 (g, u, d)
@@ -1652,7 +1685,8 @@ impl QuantizedModelWeights {
         } else {
             0
         };
-        let norms = (ql.rms_att.len() + ql.rms_ffn.len()
+        let norms = (ql.rms_att.len()
+            + ql.rms_ffn.len()
             + ql.q_norm.as_ref().map_or(0, |v| v.len())
             + ql.k_norm.as_ref().map_or(0, |v| v.len()))
             * 4;
@@ -2120,7 +2154,11 @@ impl ModelWeights {
 // ---------------------------------------------------------------------------
 
 fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
-    data.iter().flat_map(|f| f.to_le_bytes()).collect()
+    let mut bytes = vec![0u8; data.len() * 4];
+    for (dst, &value) in bytes.chunks_exact_mut(4).zip(data.iter()) {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
@@ -2523,6 +2561,61 @@ mod tests {
         assert_eq!(output.len(), dim * seq);
         let nonzero = output.iter().filter(|v| v.abs() > 1e-10).count();
         assert!(nonzero > 0, "qkvb output is all zeros");
+    }
+
+    #[test]
+    fn test_qkvb_pack_eval_over_parameterized_attention() {
+        init_ane();
+
+        let mut cfg = test_cfg();
+        cfg.dim = 64;
+        cfg.n_heads = 4;
+        cfg.head_dim_explicit = 32;
+        cfg.attn_output_gate = true;
+        cfg.seq_len = 16;
+
+        let dim = cfg.dim;
+        let ad = cfg.attn_dim();
+        let qpd = cfg.q_proj_dim();
+        let seq = cfg.seq_len;
+
+        let dq: Vec<f32> = (0..qpd * seq).map(|i| (i % 41) as f32 * 0.001).collect();
+        let dk: Vec<f32> = (0..ad * seq).map(|i| (i % 29) as f32 * 0.001).collect();
+        let dv: Vec<f32> = (0..ad * seq).map(|i| (i % 37) as f32 * 0.001).collect();
+
+        let mut wq_t = vec![0.0f32; qpd * dim];
+        let mut wk_t = vec![0.0f32; ad * dim];
+        let mut wv_t = vec![0.0f32; ad * dim];
+        for i in 0..dim {
+            wq_t[i * dim + i] = 1.0;
+            if i < ad {
+                wk_t[i * dim + (i % dim)] = 1.0;
+                wv_t[i * dim + (i % dim)] = 1.0;
+            }
+        }
+
+        let input_buf = pack_qkvb(&dq, &dk, &dv, &wq_t, &wk_t, &wv_t, &cfg);
+        let spec = KernelSpec::for_kernel(&cfg, KernelType::Qkvb);
+        let kernel = AneKernel::compile(
+            &spec.mil_text,
+            None,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )
+        .expect("qkvb compile failed for over-parameterized attention");
+
+        kernel.write_input(0, &input_buf);
+        kernel
+            .eval()
+            .expect("qkvb eval failed for over-parameterized attention");
+
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        let output = bytes_to_f32_vec(&out_buf);
+
+        assert_eq!(output.len(), dim * seq);
+        let nonzero = output.iter().filter(|v| v.abs() > 1e-10).count();
+        assert!(nonzero > 0, "qkvb output is all zeros for over-parameterized attention");
     }
 
     #[test]

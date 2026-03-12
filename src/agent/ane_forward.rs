@@ -476,10 +476,7 @@ pub fn vec_add_inplace(dst: &mut [f32], src: &[f32]) {
 /// FFN kernel strategy — fused (small models) or tiled (large models).
 pub enum FfnKernels {
     /// Fused kernels that fit in ANE SRAM.
-    Fused {
-        w13: AneKernel,
-        w2: AneKernel,
-    },
+    Fused { w13: AneKernel, w2: AneKernel },
     /// Tiled DynMatmul kernels for models that exceed ANE SRAM.
     Tiled {
         /// DynMatmul(dim, tile_oc, seq) — for W1, W3 (output-concat).
@@ -601,12 +598,7 @@ impl FfnKernels {
     ///
     /// `w2` is in standard `[out_features, in_features]` = `[dim, hidden]` layout.
     /// The ANE packing expects `[hidden, dim]` (ic-major), so we transpose once per call.
-    pub fn eval_w2(
-        &self,
-        gate: &[f32],
-        w2: &[f32],
-        cfg: &MilConfig,
-    ) -> Result<Vec<f32>, String> {
+    pub fn eval_w2(&self, gate: &[f32], w2: &[f32], cfg: &MilConfig) -> Result<Vec<f32>, String> {
         let dim = cfg.dim;
         let hidden = cfg.hidden_dim;
         let seq = cfg.seq_len;
@@ -657,10 +649,203 @@ impl FfnKernels {
     }
 }
 
+struct OcDynMatmulKernel {
+    kernel: AneKernel,
+    oc_plan: ane_mil::TilePlan,
+    output_bytes: usize,
+    ic: usize,
+    oc: usize,
+    seq: usize,
+}
+
+impl OcDynMatmulKernel {
+    fn compile(cfg: &MilConfig, ic: usize, oc: usize) -> Result<Self, String> {
+        let oc_plan = ane_mil::compute_oc_tile_plan(ic, oc, cfg.seq_len);
+        let spec = KernelSpec::for_kernel(
+            cfg,
+            KernelType::DynMatmul {
+                ic,
+                oc: oc_plan.tile_size,
+            },
+        );
+        let kernel = AneKernel::compile(
+            &spec.mil_text,
+            None,
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        )?;
+        Ok(Self {
+            kernel,
+            oc_plan,
+            output_bytes: spec.output_bytes,
+            ic,
+            oc,
+            seq: cfg.seq_len,
+        })
+    }
+
+    fn eval_row_major(&self, act: &[f32], w_row_major: &[f32]) -> Result<Vec<f32>, String> {
+        assert_eq!(act.len(), self.ic * self.seq);
+        assert_eq!(w_row_major.len(), self.oc * self.ic);
+
+        let mut result = vec![0.0f32; self.oc * self.seq];
+        for t in 0..self.oc_plan.n_tiles {
+            let start = self.oc_plan.tile_start(t);
+            let actual = self.oc_plan.actual_tile_size(t);
+            let tile_in = ane_weights::pack_dyn_matmul_oc_tile_row_major(
+                act,
+                w_row_major,
+                self.ic,
+                self.oc,
+                self.oc_plan.tile_size,
+                start,
+                self.seq,
+            );
+            self.kernel.write_input(0, &tile_in);
+            self.kernel.eval()?;
+            let mut tile_out = vec![0u8; self.output_bytes];
+            self.kernel.read_output(0, &mut tile_out);
+            ane_weights::unpack_oc_tile(
+                &tile_out,
+                &mut result,
+                self.oc_plan.tile_size,
+                start,
+                actual,
+                self.seq,
+            );
+        }
+        Ok(result)
+    }
+}
+
+pub struct MhaProjForwardKernels {
+    q: OcDynMatmulKernel,
+    k: OcDynMatmulKernel,
+    v: OcDynMatmulKernel,
+    o: OcDynMatmulKernel,
+}
+
+impl MhaProjForwardKernels {
+    fn compile(cfg: &MilConfig) -> Result<Self, String> {
+        Ok(Self {
+            q: OcDynMatmulKernel::compile(cfg, cfg.dim, cfg.q_proj_dim())?,
+            k: OcDynMatmulKernel::compile(cfg, cfg.dim, cfg.attn_dim())?,
+            v: OcDynMatmulKernel::compile(cfg, cfg.dim, cfg.attn_dim())?,
+            o: OcDynMatmulKernel::compile(cfg, cfg.attn_dim(), cfg.dim)?,
+        })
+    }
+
+    fn eval_qkv(
+        &self,
+        xnorm: &[f32],
+        lw: &ane_weights::LayerWeights,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let mut q = self.q.eval_row_major(xnorm, &lw.wq)?;
+        let mut k = self.k.eval_row_major(xnorm, &lw.wk)?;
+        let mut v = self.v.eval_row_major(xnorm, &lw.wv)?;
+        clamp_fp16(&mut q);
+        clamp_fp16(&mut k);
+        clamp_fp16(&mut v);
+        Ok((q, k, v))
+    }
+
+    fn eval_o(&self, attn_out: &[f32], lw: &ane_weights::LayerWeights) -> Result<Vec<f32>, String> {
+        let mut out = self.o.eval_row_major(attn_out, &lw.wo)?;
+        clamp_fp16(&mut out);
+        Ok(out)
+    }
+}
+
+pub struct GdnProjForwardKernels {
+    qkv: OcDynMatmulKernel,
+    a: OcDynMatmulKernel,
+    b: OcDynMatmulKernel,
+    z: OcDynMatmulKernel,
+    o: OcDynMatmulKernel,
+}
+
+impl GdnProjForwardKernels {
+    fn compile(cfg: &MilConfig) -> Result<Self, String> {
+        let value_dim = cfg.linear_n_value_heads * cfg.linear_value_head_dim;
+        let qkv_dim = 2 * cfg.linear_n_heads * cfg.linear_head_dim + value_dim;
+        let h_v = cfg.linear_n_value_heads;
+        Ok(Self {
+            qkv: OcDynMatmulKernel::compile(cfg, cfg.dim, qkv_dim)?,
+            a: OcDynMatmulKernel::compile(cfg, cfg.dim, h_v)?,
+            b: OcDynMatmulKernel::compile(cfg, cfg.dim, h_v)?,
+            z: OcDynMatmulKernel::compile(cfg, cfg.dim, value_dim)?,
+            o: OcDynMatmulKernel::compile(cfg, value_dim, cfg.dim)?,
+        })
+    }
+
+    fn eval_inputs(
+        &self,
+        xnorm: &[f32],
+        gdn: &ane_weights::GdnLayerWeights,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let mut qkv_raw = self
+            .qkv
+            .eval_row_major(xnorm, &gdn.qkv_proj)
+            .map_err(|e| format!("GDN qkv_proj failed: {e}"))?;
+        let mut a_raw = self
+            .a
+            .eval_row_major(xnorm, &gdn.a_proj)
+            .map_err(|e| format!("GDN a_proj failed: {e}"))?;
+        let mut b_raw = self
+            .b
+            .eval_row_major(xnorm, &gdn.b_proj)
+            .map_err(|e| format!("GDN b_proj failed: {e}"))?;
+        let mut z = self
+            .z
+            .eval_row_major(xnorm, &gdn.z_proj)
+            .map_err(|e| format!("GDN z_proj failed: {e}"))?;
+        clamp_fp16(&mut qkv_raw);
+        clamp_fp16(&mut a_raw);
+        clamp_fp16(&mut b_raw);
+        clamp_fp16(&mut z);
+        Ok((qkv_raw, a_raw, b_raw, z))
+    }
+
+    fn eval_layer(
+        &self,
+        gdn: &ane_weights::GdnLayerWeights,
+        xnorm: &[f32],
+        cfg: &MilConfig,
+    ) -> Result<Vec<f32>, String> {
+        let (qkv_raw, a_raw, b_raw, z) = self.eval_inputs(xnorm, gdn)?;
+        let mut o_err = None;
+        let out = cpu_gdn_forward_post_proj(
+            &qkv_raw,
+            &a_raw,
+            &b_raw,
+            &z,
+            &gdn.a_log,
+            &gdn.dt_bias,
+            &gdn.norm_weight,
+            &gdn.conv_weight,
+            &gdn.conv_bias,
+            cfg,
+            |gated| match self.o.eval_row_major(gated, &gdn.o_proj) {
+                Ok(out) => out,
+                Err(e) => {
+                    o_err = Some(format!("ANE GDN o_proj failed: {e}"));
+                    vec![0.0f32; cfg.dim * cfg.seq_len]
+                }
+            },
+        );
+        if let Some(err) = o_err {
+            return Err(err);
+        }
+        Ok(out)
+    }
+}
+
 /// Pre-compiled ANE kernels (compile once at init, reuse every step).
 pub struct CompiledKernels {
     /// SDPA forward kernel (None at 4B where IOSurface exceeds ANE SRAM).
     pub sdpa_fwd: Option<AneKernel>,
+    pub mha_proj_fwd: Option<MhaProjForwardKernels>,
+    pub gdn_proj_fwd: Option<GdnProjForwardKernels>,
     /// FFN kernels — fused (small models) or tiled (large models).
     pub ffn: FfnKernels,
     pub mask_blob: Vec<u8>,
@@ -680,8 +865,9 @@ impl CompiledKernels {
         let (rope_cos_blob, rope_sin_blob) =
             ane_weights::generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
 
-        // SDPA: try to compile, None if it exceeds SRAM
-        let sdpa_fwd = {
+        // The fused forward SDPA kernel only supports square attention projections.
+        // Qwen-style over-parameterized/gated attention uses the generic CPU path.
+        let sdpa_fwd = if cfg.attn_dim() == cfg.dim && !cfg.attn_output_gate {
             let spec = KernelSpec::for_kernel(cfg, KernelType::SdpaFwd);
             AneKernel::compile_multi_weights(
                 &spec.mil_text,
@@ -695,13 +881,26 @@ impl CompiledKernels {
                 &[spec.output_bytes],
             )
             .ok()
+        } else {
+            tracing::debug!(
+                "ANE SDPA fwd: skipped for attn_dim={} dim={} gate={}",
+                cfg.attn_dim(),
+                cfg.dim,
+                cfg.attn_output_gate
+            );
+            None
+        };
+
+        let mha_proj_fwd = MhaProjForwardKernels::compile(cfg).ok();
+        let gdn_proj_fwd = if cfg.linear_attn_indices.is_empty() {
+            None
+        } else {
+            GdnProjForwardKernels::compile(cfg).ok()
         };
 
         // FFN: check if fused kernels fit, otherwise use tiled
-        let oc_plan =
-            ane_mil::compute_oc_tile_plan(cfg.dim, cfg.hidden_dim, cfg.seq_len);
-        let ic_plan =
-            ane_mil::compute_ic_tile_plan(cfg.hidden_dim, cfg.dim, cfg.seq_len);
+        let oc_plan = ane_mil::compute_oc_tile_plan(cfg.dim, cfg.hidden_dim, cfg.seq_len);
+        let ic_plan = ane_mil::compute_ic_tile_plan(cfg.hidden_dim, cfg.dim, cfg.seq_len);
 
         let ffn = 'ffn: {
             // Try fused kernels first when SRAM check says they fit.
@@ -784,6 +983,8 @@ impl CompiledKernels {
 
         Ok(Self {
             sdpa_fwd,
+            mha_proj_fwd,
+            gdn_proj_fwd,
             ffn,
             mask_blob,
             rope_cos_blob,
@@ -892,7 +1093,8 @@ pub fn forward_with_lora<T: TokenId>(
         // SDPA forward (ANE if kernel compiled, else CPU)
         let [mut o_out, q, k, v, attn_out, _xnorm_pass] =
             if let Some(sdpa_kernel) = kernels.sdpa_fwd.as_ref() {
-                let sdpa_input = ane_weights::pack_sdpa_fwd(&xnorm, &lw.wq, &lw.wk, &lw.wv, &lw.wo, cfg);
+                let sdpa_input =
+                    ane_weights::pack_sdpa_fwd(&xnorm, &lw.wq, &lw.wk, &lw.wv, &lw.wo, cfg);
                 let sdpa_spec = KernelSpec::for_kernel(cfg, KernelType::SdpaFwd);
                 sdpa_kernel.write_input(0, &sdpa_input);
                 sdpa_kernel.eval()?;
@@ -902,7 +1104,10 @@ pub fn forward_with_lora<T: TokenId>(
             } else {
                 // CPU fallback (4B+ models where SDPA exceeds ANE SRAM).
                 // Note: does not handle attn_output_gate/QK-norm — use forward_ane_generic for those.
-                debug_assert!(!cfg.attn_output_gate, "forward_with_lora CPU SDPA does not support attn_output_gate");
+                debug_assert!(
+                    !cfg.attn_output_gate,
+                    "forward_with_lora CPU SDPA does not support attn_output_gate"
+                );
                 let ad = cfg.attn_dim();
                 let n_heads = cfg.n_heads;
                 let head_dim = cfg.head_dim();
@@ -2420,83 +2625,123 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
         rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
 
         // --- Attention (CPU — handles GDN, GQA, QK-norm, attn_output_gate) ---
-        let (q, k, v, attn_out, o_out, q_pre_norm, k_pre_norm, attn_gate_saved, attn_pre_gate_saved) =
-            if let Some(gdn_w) = &lw.gdn {
-                let gdn_out = cpu_gdn_forward(gdn_w, &xnorm, cfg);
-                let empty = vec![0.0f32; 0];
-                (
-                    empty.clone(),
-                    empty.clone(),
-                    empty,
-                    gdn_out.clone(),
-                    gdn_out,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+        let (
+            q,
+            k,
+            v,
+            attn_out,
+            o_out,
+            q_pre_norm,
+            k_pre_norm,
+            attn_gate_saved,
+            attn_pre_gate_saved,
+        ) = if let Some(gdn_w) = &lw.gdn {
+            let gdn_out = if let Some(gdn_proj) = kernels.gdn_proj_fwd.as_ref() {
+                gdn_proj
+                    .eval_layer(gdn_w, &xnorm, cfg)
+                    .map_err(|e| format!("layer {l} GDN ANE forward failed: {e}"))?
             } else {
-                let ad = cfg.attn_dim();
-                let qpd = cfg.q_proj_dim();
-                let q_full = cpu_matmul(&lw.wq, &xnorm, qpd, dim, seq);
-                let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
-                    split_q_gate(&q_full, n_heads, head_dim, seq)
-                } else {
-                    (q_full, vec![])
-                };
-                let mut k = cpu_matmul(&lw.wk, &xnorm, ad, dim, seq);
-                let v = cpu_matmul(&lw.wv, &xnorm, ad, dim, seq);
-
-                let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
-                    Some(qk_rmsnorm_fwd(
-                        &mut q, q_norm_w, n_heads, head_dim, seq, cfg.rms_eps,
-                    ))
-                } else {
-                    None
-                };
-                let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
-                    Some(qk_rmsnorm_fwd(
-                        &mut k, k_norm_w, n_heads, head_dim, seq, cfg.rms_eps,
-                    ))
-                } else {
-                    None
-                };
-
-                cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
-                let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
-
-                let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
-                    let pre_gate = attn_out.clone();
-                    apply_sigmoid_gate(&mut attn_out, &attn_gate_raw);
-                    (Some(pre_gate), Some(attn_gate_raw))
-                } else {
-                    (None, None)
-                };
-
-                let mut o_out = cpu_matmul(&lw.wo, &attn_out, dim, ad, seq);
-
-                // LoRA on Wo
-                if let Some(ll) = lora_layer {
-                    if let Some(wo_adapter) = ll.wo.as_ref() {
-                        let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
-                        super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
-                        lora_layer_acts.wo_x = Some(attn_out.clone());
-                        lora_layer_acts.wo_h = Some(wo_h);
-                    }
-                }
-
+                cpu_gdn_forward(gdn_w, &xnorm, cfg)
+            };
+            let empty = vec![0.0f32; 0];
+            (
+                empty.clone(),
+                empty.clone(),
+                empty,
+                gdn_out.clone(),
+                gdn_out,
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            let ad = cfg.attn_dim();
+            let qpd = cfg.q_proj_dim();
+            let (q_full, mut k, mut v) = if let Some(mha_proj) = kernels.mha_proj_fwd.as_ref() {
+                let (q_full, k, v) = mha_proj
+                    .eval_qkv(&xnorm, lw)
+                    .map_err(|e| format!("layer {l} MHA qkv ANE forward failed: {e}"))?;
+                (q_full, k, v)
+            } else {
                 (
-                    q,
-                    k,
-                    v,
-                    attn_out,
-                    o_out,
-                    q_pre_norm,
-                    k_pre_norm,
-                    attn_gate_saved,
-                    attn_pre_gate_saved,
+                    cpu_matmul(&lw.wq, &xnorm, qpd, dim, seq),
+                    cpu_matmul(&lw.wk, &xnorm, ad, dim, seq),
+                    cpu_matmul(&lw.wv, &xnorm, ad, dim, seq),
                 )
             };
+            let (mut q, attn_gate_raw) = if cfg.attn_output_gate {
+                split_q_gate(&q_full, n_heads, head_dim, seq)
+            } else {
+                (q_full, vec![])
+            };
+
+            let q_pre_norm = if let Some(q_norm_w) = &lw.q_norm {
+                Some(qk_rmsnorm_fwd(
+                    &mut q,
+                    q_norm_w,
+                    n_heads,
+                    head_dim,
+                    seq,
+                    cfg.rms_eps,
+                ))
+            } else {
+                None
+            };
+            let k_pre_norm = if let Some(k_norm_w) = &lw.k_norm {
+                Some(qk_rmsnorm_fwd(
+                    &mut k,
+                    k_norm_w,
+                    n_heads,
+                    head_dim,
+                    seq,
+                    cfg.rms_eps,
+                ))
+            } else {
+                None
+            };
+
+            cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
+            let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+            let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
+                let pre_gate = attn_out.clone();
+                apply_sigmoid_gate(&mut attn_out, &attn_gate_raw);
+                (Some(pre_gate), Some(attn_gate_raw))
+            } else {
+                (None, None)
+            };
+
+            let mut o_out = if let Some(mha_proj) = kernels.mha_proj_fwd.as_ref() {
+                mha_proj
+                    .eval_o(&attn_out, lw)
+                    .map_err(|e| format!("layer {l} MHA o_proj ANE forward failed: {e}"))?
+            } else {
+                cpu_matmul(&lw.wo, &attn_out, dim, ad, seq)
+            };
+
+            // LoRA on Wo
+            if let Some(ll) = lora_layer {
+                if let Some(wo_adapter) = ll.wo.as_ref() {
+                    let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
+                    super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                    lora_layer_acts.wo_x = Some(attn_out.clone());
+                    lora_layer_acts.wo_h = Some(wo_h);
+                }
+            }
+
+            (
+                q,
+                k,
+                v,
+                attn_out,
+                o_out,
+                q_pre_norm,
+                k_pre_norm,
+                attn_gate_saved,
+                attn_pre_gate_saved,
+            )
+        };
 
         // Residual (attention) + optional scaling
         let mut x2 = x_cur.clone();
@@ -2515,14 +2760,20 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
         rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
 
         // --- FFN on ANE: W1+W3 (fused or tiled) ---
-        let (mut h1, mut h3, mut gate) = kernels.ffn.eval_w13(&x2norm, &lw.w1, &lw.w3, cfg)?;
+        let (mut h1, mut h3, mut gate) = kernels
+            .ffn
+            .eval_w13(&x2norm, &lw.w1, &lw.w3, cfg)
+            .map_err(|e| format!("layer {l} FFN w13 ANE forward failed: {e}"))?;
         // Clamp ANE fp16 outputs before they're saved for backward
         clamp_fp16(&mut h1);
         clamp_fp16(&mut h3);
         clamp_fp16(&mut gate);
 
         // --- FFN on ANE: W2 (fused or tiled) ---
-        let mut ffn_out = kernels.ffn.eval_w2(&gate, &lw.w2, cfg)?;
+        let mut ffn_out = kernels
+            .ffn
+            .eval_w2(&gate, &lw.w2, cfg)
+            .map_err(|e| format!("layer {l} FFN w2 ANE forward failed: {e}"))?;
         clamp_fp16(&mut ffn_out);
 
         // LoRA on W2
@@ -3184,10 +3435,79 @@ mod tests {
         // SDPA fails for GQA (attn_dim=2048 ≠ dim=1024), handled gracefully
         assert!(k.sdpa_fwd.is_none(), "SDPA should be None for GQA dims");
         // FFN kernels compile — fused or tiled both work
-        eprintln!("FFN type: {}", match &k.ffn {
-            FfnKernels::Fused { .. } => "fused",
-            FfnKernels::Tiled { .. } => "tiled",
-        });
+        eprintln!(
+            "FFN type: {}",
+            match &k.ffn {
+                FfnKernels::Fused { .. } => "fused",
+                FfnKernels::Tiled { .. } => "tiled",
+            }
+        );
+    }
+
+    /// Qwen3.5-35B-A3B uses the same hybrid attention pattern as smaller
+    /// Qwen3.5 variants, but with a much smaller MoE shared-expert FFN
+    /// (hidden=512) and more extreme GQA (16 Q heads, 2 KV heads).
+    ///
+    /// This test validates which ANE kernels are actually available for the
+    /// shape used by ANE training, so MoE regressions are caught directly.
+    #[test]
+    fn test_compiled_kernels_qwen3_5_35b_a3b() {
+        use super::super::ane_backward::BackwardKernels;
+        use super::ane_bridge;
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let linear_attn_indices: Vec<usize> = (0..40).filter(|i| i % 4 != 3).collect();
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 512,
+            n_heads: 16,
+            seq_len: 128,
+            n_kv_heads: 2,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 256,
+            linear_attn_indices,
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            linear_n_value_heads: 32,
+            linear_value_head_dim: 128,
+            conv_kernel_size: 4,
+            attn_output_gate: true,
+        };
+
+        let fwd = CompiledKernels::compile_forward(&cfg);
+        assert!(
+            fwd.is_ok(),
+            "compile_forward failed for Qwen3.5-35B-A3B dims: {:?}",
+            fwd.err()
+        );
+        let fwd = fwd.unwrap();
+        eprintln!(
+            "35B-A3B forward kernels: sdpa_fwd={}",
+            fwd.sdpa_fwd.is_some()
+        );
+
+        let bwd = BackwardKernels::compile_backward(&cfg, &fwd.mask_blob);
+        assert!(
+            bwd.is_ok(),
+            "compile_backward failed for Qwen3.5-35B-A3B dims: {:?}",
+            bwd.err()
+        );
+        let bwd = bwd.unwrap();
+        eprintln!(
+            "35B-A3B backward kernels: wot_bwd={} sdpa_bwd1={} sdpa_bwd2={} qkv_bwd={}",
+            bwd.wot_bwd.is_some(),
+            bwd.sdpa_bwd1.is_some(),
+            bwd.sdpa_bwd2.is_some(),
+            bwd.qkv_bwd.is_some()
+        );
+        assert!(bwd.sdpa_bwd1.is_some(), "sdpa_bwd1 should compile for 35B-A3B");
+        assert!(bwd.sdpa_bwd2.is_some(), "sdpa_bwd2 should compile for 35B-A3B");
     }
 
     // -----------------------------------------------------------------------
@@ -4026,6 +4346,386 @@ mod tests {
         assert!(max_abs_diff(&shared_out, &expanded_out) < 1e-5);
     }
 
+    #[test]
+    fn test_gdn_projection_ane_matches_cpu() {
+        let dim = 64;
+        let seq = 16;
+        let h_k = 4;
+        let d_k = 16;
+        let h_v = 32;
+        let d_v = 8;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = 4;
+
+        let cfg = super::ane_mil::MilConfig {
+            dim,
+            hidden_dim: 128,
+            n_heads: h_k,
+            seq_len: seq,
+            n_kv_heads: h_k,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            head_dim_explicit: dim / h_k,
+            linear_attn_indices: vec![0],
+            linear_n_heads: h_k,
+            linear_head_dim: d_k,
+            linear_n_value_heads: h_v,
+            linear_value_head_dim: d_v,
+            conv_kernel_size: kernel,
+            attn_output_gate: false,
+        };
+
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping GDN ANE projection test: {e}");
+                return;
+            }
+        };
+        let gdn_proj = kernels
+            .gdn_proj_fwd
+            .as_ref()
+            .expect("GDN projection kernels should compile");
+
+        let mut rng_state = 11u64;
+        let mut next_f32 = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let rand_vec = |n: usize, rng: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..n).map(|_| rng()).collect()
+        };
+
+        let gdn_w = super::ane_weights::GdnLayerWeights {
+            qkv_proj: rand_vec(qkv_dim * dim, &mut next_f32),
+            a_proj: rand_vec(h_v * dim, &mut next_f32),
+            b_proj: rand_vec(h_v * dim, &mut next_f32),
+            z_proj: rand_vec(value_dim * dim, &mut next_f32),
+            o_proj: rand_vec(dim * value_dim, &mut next_f32),
+            a_log: rand_vec(h_v, &mut next_f32),
+            dt_bias: rand_vec(h_v, &mut next_f32),
+            norm_weight: rand_vec(d_v, &mut next_f32),
+            conv_weight: rand_vec(qkv_dim * kernel, &mut next_f32),
+            conv_bias: rand_vec(qkv_dim, &mut next_f32),
+        };
+        let xnorm: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i as f32) * 0.17 - 0.2).sin())
+            .collect();
+
+        let ane_out = gdn_proj
+            .eval_layer(&gdn_w, &xnorm, &cfg)
+            .expect("ANE GDN projection path failed");
+        let cpu_out = cpu_gdn_forward(&gdn_w, &xnorm, &cfg);
+        let max_err = max_abs_diff(&ane_out, &cpu_out);
+        assert!(max_err < 0.1, "GDN ANE projections drifted too far: max_err={max_err}");
+    }
+
+    #[test]
+    fn test_oc_dyn_matmul_large_gdn_qkv_bucket_seq_smoke() {
+        use super::ane_bridge;
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 512,
+            n_heads: 16,
+            seq_len: 128,
+            n_kv_heads: 2,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 256,
+            linear_attn_indices: vec![0],
+            linear_n_heads: 16,
+            linear_head_dim: 128,
+            linear_n_value_heads: 32,
+            linear_value_head_dim: 128,
+            conv_kernel_size: 4,
+            attn_output_gate: true,
+        };
+        let qkv_dim = 2 * cfg.linear_n_heads * cfg.linear_head_dim
+            + cfg.linear_n_value_heads * cfg.linear_value_head_dim;
+
+        let kernel = match OcDynMatmulKernel::compile(&cfg, cfg.dim, qkv_dim) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping large OC DynMatmul smoke: {e}");
+                return;
+            }
+        };
+
+        let mut rng_state = 13u64;
+        let mut next_f32 = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
+        };
+        let rand_vec = |n: usize, rng: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..n).map(|_| rng()).collect()
+        };
+
+        let act = rand_vec(cfg.dim * cfg.seq_len, &mut next_f32);
+        let w = rand_vec(qkv_dim * cfg.dim, &mut next_f32);
+        let out = kernel.eval_row_major(&act, &w);
+        assert!(
+            out.is_ok(),
+            "large-shape OC DynMatmul should eval on ANE: {:?}",
+            out.err()
+        );
+        assert_eq!(out.unwrap().len(), qkv_dim * cfg.seq_len);
+    }
+
+    #[test]
+    fn test_mha_projection_ane_matches_cpu_over_parameterized_attention() {
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 32;
+        let head_dim = 32;
+        let ad = n_heads * head_dim;
+        let qpd = 2 * ad;
+
+        let cfg = MilConfig {
+            dim,
+            hidden_dim: hidden,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads: 4,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping MHA ANE projection test: {e}");
+                return;
+            }
+        };
+        let mha_proj = kernels
+            .mha_proj_fwd
+            .as_ref()
+            .expect("MHA projection kernels should compile");
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+        let lw = super::ane_weights::LayerWeights {
+            wq: make_small(qpd * dim, 0),
+            wk: make_small(ad * dim, 1000),
+            wv: make_small(ad * dim, 2000),
+            wo: make_small(dim * ad, 3000),
+            w1: make_small(hidden * dim, 4000),
+            w2: make_small(dim * hidden, 5000),
+            w3: make_small(hidden * dim, 6000),
+            rms_att: vec![1.0; dim],
+            rms_ffn: vec![1.0; dim],
+            q_norm: None,
+            k_norm: None,
+            gdn: None,
+        };
+        let xnorm = make_small(dim * seq, 7000);
+        let attn_out = make_small(ad * seq, 8000);
+
+        let (ane_q, ane_k, ane_v) = mha_proj.eval_qkv(&xnorm, &lw).expect("ANE qkv failed");
+        let cpu_q = cpu_matmul(&lw.wq, &xnorm, qpd, dim, seq);
+        let cpu_k = cpu_matmul(&lw.wk, &xnorm, ad, dim, seq);
+        let cpu_v = cpu_matmul(&lw.wv, &xnorm, ad, dim, seq);
+        assert!(max_abs_diff(&ane_q, &cpu_q) < 0.05);
+        assert!(max_abs_diff(&ane_k, &cpu_k) < 0.05);
+        assert!(max_abs_diff(&ane_v, &cpu_v) < 0.05);
+
+        let ane_o = mha_proj.eval_o(&attn_out, &lw).expect("ANE o_proj failed");
+        let cpu_o = cpu_matmul(&lw.wo, &attn_out, dim, ad, seq);
+        let max_err = max_abs_diff(&ane_o, &cpu_o);
+        assert!(max_err < 0.05, "ANE MHA projections drifted too far: max_err={max_err}");
+    }
+
+    #[test]
+    fn test_ane_forward_gdn_matches_cpu_small_model() {
+        let dim = 64;
+        let hidden = 128;
+        let seq = 16;
+        let vocab = 32;
+        let h_k = 4;
+        let d_k = 16;
+        let h_v = 32;
+        let d_v = 8;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * h_k * d_k + value_dim;
+        let kernel = 4;
+
+        let cfg = MilConfig {
+            dim,
+            hidden_dim: hidden,
+            n_heads: h_k,
+            seq_len: seq,
+            n_kv_heads: h_k,
+            rope_theta: 10000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: dim / h_k,
+            linear_attn_indices: vec![0],
+            linear_n_heads: h_k,
+            linear_head_dim: d_k,
+            linear_n_value_heads: h_v,
+            linear_value_head_dim: d_v,
+            conv_kernel_size: kernel,
+            attn_output_gate: false,
+        };
+
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE GDN forward compare: {e}");
+                return;
+            }
+        };
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![super::ane_weights::LayerWeights {
+                wq: vec![],
+                wk: vec![],
+                wv: vec![],
+                wo: vec![],
+                w1: make_small(hidden * dim, 1000),
+                w2: make_small(dim * hidden, 2000),
+                w3: make_small(hidden * dim, 3000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: Some(super::ane_weights::GdnLayerWeights {
+                    qkv_proj: make_small(qkv_dim * dim, 4000),
+                    a_proj: make_small(h_v * dim, 5000),
+                    b_proj: make_small(h_v * dim, 6000),
+                    z_proj: make_small(value_dim * dim, 7000),
+                    o_proj: make_small(dim * value_dim, 8000),
+                    a_log: make_small(h_v, 9000),
+                    dt_bias: make_small(h_v, 10000),
+                    norm_weight: vec![1.0; d_v],
+                    conv_weight: make_small(qkv_dim * kernel, 11000),
+                    conv_bias: make_small(qkv_dim, 12000),
+                }),
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_small(vocab * dim, 13000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        let cpu = forward_cpu_generic(&model, None, &tokens, &targets);
+        let ane = forward_ane_generic(&kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+            .expect("ANE GDN forward failed");
+
+        assert!((cpu.base.loss - ane.base.loss).abs() < 0.5);
+        assert!(max_abs_diff(&cpu.base.logits, &ane.base.logits) < 1.0);
+    }
+
+    #[test]
+    fn test_ane_forward_over_parameterized_attention_matches_cpu() {
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let seq = 32;
+        let vocab = 32;
+        let head_dim = 32;
+        let ad = n_heads * head_dim;
+        let qpd = 2 * ad;
+
+        let cfg = MilConfig {
+            dim,
+            hidden_dim: hidden,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads: 4,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let kernels = match CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE Qwen forward compare: {e}");
+                return;
+            }
+        };
+
+        let make_small = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.01)
+                .collect()
+        };
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![super::ane_weights::LayerWeights {
+                wq: make_small(qpd * dim, 0),
+                wk: make_small(ad * dim, 1000),
+                wv: make_small(ad * dim, 2000),
+                wo: make_small(dim * ad, 3000),
+                w1: make_small(hidden * dim, 4000),
+                w2: make_small(dim * hidden, 5000),
+                w3: make_small(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make_small(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        let cpu = forward_cpu_generic(&model, None, &tokens, &targets);
+        let ane = forward_ane_generic(&kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+            .expect("ANE Qwen forward failed");
+
+        assert!((cpu.base.loss - ane.base.loss).abs() < 0.5);
+        assert!(max_abs_diff(&cpu.base.logits, &ane.base.logits) < 1.0);
+    }
+
     // -----------------------------------------------------------------------
     // Logit softcap: roundtrip and numerical gradient
     // -----------------------------------------------------------------------
@@ -4097,8 +4797,16 @@ mod tests {
     #[test]
     fn test_clamp_fp16_handles_extreme_values() {
         let mut buf = vec![
-            -100000.0, -65504.0, -1.0, 0.0, 1.0, 65504.0, 100000.0,
-            f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+            -100000.0,
+            -65504.0,
+            -1.0,
+            0.0,
+            1.0,
+            65504.0,
+            100000.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
         ];
         clamp_fp16(&mut buf);
         assert_eq!(buf[0], -FP16_MAX);
@@ -4172,9 +4880,8 @@ mod tests {
         let cpu_result = forward_cpu_generic(&model, None, &tokens, &targets);
 
         // ANE forward (softcap=0 disables, residual_scale=1.0 disables)
-        let ane_result =
-            forward_ane_generic(&kernels, &model, None, &tokens, &targets, 0.0, 1.0)
-                .expect("ANE forward failed");
+        let ane_result = forward_ane_generic(&kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+            .expect("ANE forward failed");
 
         // Compare loss — ANE uses fp16 intermediates for FFN matmuls, so allow tolerance
         let loss_err = (cpu_result.base.loss - ane_result.base.loss).abs();
@@ -4293,7 +5000,10 @@ mod tests {
         );
 
         // Activations should have same shape
-        assert_eq!(cpu_result.base.layer_acts.len(), ane_result.base.layer_acts.len());
+        assert_eq!(
+            cpu_result.base.layer_acts.len(),
+            ane_result.base.layer_acts.len()
+        );
         assert_eq!(cpu_result.lora_acts.len(), ane_result.lora_acts.len());
     }
 
@@ -4304,9 +5014,7 @@ mod tests {
     #[test]
     fn test_ane_training_loop_loss_decreases() {
         use super::super::ane_backward::{self, BackwardKernels};
-        use super::super::ane_lora::{
-            self, LoraConfig, LoraModel, LoraModelAdam,
-        };
+        use super::super::ane_lora::{self, LoraConfig, LoraModel, LoraModelAdam};
         use super::super::ane_weights::LayerWeights;
 
         let dim = 64;
@@ -4383,7 +5091,13 @@ mod tests {
 
             // ANE forward (no softcap/residual_scale for clean comparison)
             let fwd = forward_ane_generic(
-                &fwd_kernels, &model, Some(&lora), &tokens, &targets, 0.0, 1.0,
+                &fwd_kernels,
+                &model,
+                Some(&lora),
+                &tokens,
+                &targets,
+                0.0,
+                1.0,
             )
             .expect("ANE forward failed");
 
@@ -4393,7 +5107,14 @@ mod tests {
 
             // ANE backward for LoRA gradients
             let bwd = ane_backward::backward_lora_ane_generic(
-                &bwd_kernels, &model, &fwd, &lora, &tokens, 0.0, 1.0, 1.0,
+                &bwd_kernels,
+                &model,
+                &fwd,
+                &lora,
+                &tokens,
+                0.0,
+                1.0,
+                1.0,
             );
 
             // Adam update with split LR (attn 0.05x, FFN 1.0x)
@@ -4442,7 +5163,10 @@ mod tests {
         let model_dir = Path::new(&std::env::var("HOME").unwrap())
             .join(".cache/lm-studio/models/Jackrong/MLX-Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-4bit");
         if !model_dir.exists() {
-            eprintln!("SKIP: Qwen3.5-4B MLX model not found at {}", model_dir.display());
+            eprintln!(
+                "SKIP: Qwen3.5-4B MLX model not found at {}",
+                model_dir.display()
+            );
             return;
         }
 
@@ -4458,36 +5182,70 @@ mod tests {
         let head_dim = tc["head_dim"].as_u64().unwrap_or((dim / n_heads) as u64) as usize;
         let rms_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
         let rope_theta = tc["rope_theta"].as_f64().unwrap_or(1e6);
-        let vocab_size = tc["vocab_size"].as_u64().unwrap_or(
-            root["vocab_size"].as_u64().unwrap_or(248320)
-        ) as usize;
-        let attn_output_gate = tc.get("attn_output_gate")
-            .and_then(|v| v.as_bool()).unwrap_or(false);
-        let layer_types: Vec<String> = tc.get("layer_types")
+        let vocab_size = tc["vocab_size"]
+            .as_u64()
+            .unwrap_or(root["vocab_size"].as_u64().unwrap_or(248320))
+            as usize;
+        let attn_output_gate = tc
+            .get("attn_output_gate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let layer_types: Vec<String> = tc
+            .get("layer_types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let n_layers = tc["num_hidden_layers"].as_u64()
+        let n_layers = tc["num_hidden_layers"]
+            .as_u64()
             .unwrap_or(layer_types.len() as u64) as usize;
-        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
-            .filter(|(_, t)| t.as_str() == "linear_attention").map(|(i, _)| i).collect();
-        let linear_n_heads = tc.get("linear_num_key_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_head_dim = tc.get("linear_key_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_n_value_heads = tc.get("linear_num_value_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
-        let linear_value_head_dim = tc.get("linear_value_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
-        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_attn_indices: Vec<usize> = layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention")
+            .map(|(i, _)| i)
+            .collect();
+        let linear_n_heads = tc
+            .get("linear_num_key_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_head_dim = tc
+            .get("linear_key_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_n_value_heads = tc
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
 
         let seq = 32; // small seq for test speed
         let cfg = MilConfig {
-            dim, hidden_dim, n_heads, seq_len: seq, n_kv_heads,
-            rope_theta, rms_eps, has_lm_head: false, head_dim_explicit: head_dim,
-            linear_attn_indices, linear_n_heads, linear_head_dim,
-            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            dim,
+            hidden_dim,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads,
+            rope_theta,
+            rms_eps,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices,
+            linear_n_heads,
+            linear_head_dim,
+            linear_n_value_heads,
+            linear_value_head_dim,
+            conv_kernel_size,
             attn_output_gate,
         };
         eprintln!("Config from model: dim={dim}, hidden={hidden_dim}, n_heads={n_heads}, \
@@ -4523,7 +5281,10 @@ mod tests {
             }
         };
         assert!(
-            matches!(bwd_kernels.ffn_bwd, super::super::ane_backward::FfnBwdKernels::Tiled { .. }),
+            matches!(
+                bwd_kernels.ffn_bwd,
+                super::super::ane_backward::FfnBwdKernels::Tiled { .. }
+            ),
             "Expected tiled FFN backward kernels"
         );
         eprintln!("Backward kernels compiled — tiled path confirmed");
@@ -4549,15 +5310,14 @@ mod tests {
         eprintln!("CPU loss: {:.6}", cpu_fwd.base.loss);
 
         eprintln!("Running ANE tiled forward...");
-        let ane_fwd = match forward_ane_generic(
-            &fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("ANE forward failed: {e}");
-                panic!("ANE tiled forward should not fail");
-            }
-        };
+        let ane_fwd =
+            match forward_ane_generic(&fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("ANE forward failed: {e}");
+                    panic!("ANE tiled forward should not fail");
+                }
+            };
         eprintln!("ANE loss: {:.6}", ane_fwd.base.loss);
 
         let loss_err = (cpu_fwd.base.loss - ane_fwd.base.loss).abs();
@@ -4567,46 +5327,70 @@ mod tests {
         assert!(
             loss_err < 5.0,
             "ANE vs CPU loss mismatch too large: cpu={:.4}, ane={:.4}, delta={loss_err:.4}",
-            cpu_fwd.base.loss, ane_fwd.base.loss
+            cpu_fwd.base.loss,
+            ane_fwd.base.loss
         );
 
         // 4. Backward through tiled path (just verify no panics)
         eprintln!("Running ANE tiled backward...");
         let lora = LoraModel::with_full_dims(
-            LoraConfig { rank: 16, alpha: 16.0, target_modules: vec!["wo".into(), "w2".into()] },
-            model.n_layers(), cfg.dim, cfg.kv_dim(), cfg.attn_dim(), cfg.q_proj_dim(), cfg.hidden_dim,
+            LoraConfig {
+                rank: 16,
+                alpha: 16.0,
+                target_modules: vec!["wo".into(), "w2".into()],
+            },
+            model.n_layers(),
+            cfg.dim,
+            cfg.kv_dim(),
+            cfg.attn_dim(),
+            cfg.q_proj_dim(),
+            cfg.hidden_dim,
         );
         // Re-run forward with LoRA for backward
         let fwd_lora = forward_ane_generic(
-            &fwd_kernels, &model, Some(&lora), &tokens, &targets, 0.0, 1.0,
-        ).expect("ANE forward with LoRA failed");
+            &fwd_kernels,
+            &model,
+            Some(&lora),
+            &tokens,
+            &targets,
+            0.0,
+            1.0,
+        )
+        .expect("ANE forward with LoRA failed");
 
         let bwd = super::super::ane_backward::backward_lora_ane_generic(
-            &bwd_kernels, &model, &fwd_lora, &lora, &tokens, 0.0, 1.0, 1.0,
+            &bwd_kernels,
+            &model,
+            &fwd_lora,
+            &lora,
+            &tokens,
+            0.0,
+            1.0,
+            1.0,
         );
         // Check total grad norm including both dA and dB.
         // dA=0 is expected on first backward with zero-initialized B (standard LoRA).
         // dB should be non-zero because dB = d_out_grad @ h^T where h = A @ x ≠ 0.
-        let total_grad_norm: f32 = bwd.lora_grads.layers.iter()
+        let total_grad_norm: f32 = bwd
+            .lora_grads
+            .layers
+            .iter()
             .flat_map(|l| {
                 let mut norms = Vec::new();
                 if let Some(ref g) = l.wo {
-                    norms.push(g.da.iter().map(|v| v*v).sum::<f32>());
-                    norms.push(g.db.iter().map(|v| v*v).sum::<f32>());
+                    norms.push(g.da.iter().map(|v| v * v).sum::<f32>());
+                    norms.push(g.db.iter().map(|v| v * v).sum::<f32>());
                 }
                 if let Some(ref g) = l.w2 {
-                    norms.push(g.da.iter().map(|v| v*v).sum::<f32>());
-                    norms.push(g.db.iter().map(|v| v*v).sum::<f32>());
+                    norms.push(g.da.iter().map(|v| v * v).sum::<f32>());
+                    norms.push(g.db.iter().map(|v| v * v).sum::<f32>());
                 }
                 norms
             })
             .sum::<f32>()
             .sqrt();
         eprintln!("LoRA grad norm (dA+dB): {total_grad_norm:.6}");
-        assert!(
-            !total_grad_norm.is_nan(),
-            "LoRA gradients contain NaN"
-        );
+        assert!(!total_grad_norm.is_nan(), "LoRA gradients contain NaN");
         assert!(
             total_grad_norm > 0.0,
             "LoRA gradients should be non-zero after backward"
@@ -4624,23 +5408,39 @@ mod tests {
     struct ForceF32View<'a, W: ane_weights::WeightSource>(&'a W);
 
     impl<W: ane_weights::WeightSource> ane_weights::WeightSource for ForceF32View<'_, W> {
-        fn cfg(&self) -> &super::ane_mil::MilConfig { self.0.cfg() }
+        fn cfg(&self) -> &super::ane_mil::MilConfig {
+            self.0.cfg()
+        }
         fn cfg_mut(&mut self) -> &mut super::ane_mil::MilConfig {
             panic!("ForceF32View is read-only")
         }
-        fn n_layers(&self) -> usize { self.0.n_layers() }
+        fn n_layers(&self) -> usize {
+            self.0.n_layers()
+        }
         fn layer(&self, l: usize) -> std::borrow::Cow<'_, super::ane_weights::LayerWeights> {
             self.0.layer(l)
         }
         fn quantized_layer(&self, _l: usize) -> Option<&super::ane_weights::QuantizedLayerWeights> {
             None // force dequantized f32 path
         }
-        fn embed(&self) -> &[f32] { self.0.embed() }
-        fn rms_final(&self) -> &[f32] { self.0.rms_final() }
-        fn vocab_size(&self) -> usize { self.0.vocab_size() }
-        fn lm_head(&self) -> Option<&[f32]> { self.0.lm_head() }
-        fn actual_dim(&self) -> usize { self.0.actual_dim() }
-        fn actual_hidden_dim(&self) -> usize { self.0.actual_hidden_dim() }
+        fn embed(&self) -> &[f32] {
+            self.0.embed()
+        }
+        fn rms_final(&self) -> &[f32] {
+            self.0.rms_final()
+        }
+        fn vocab_size(&self) -> usize {
+            self.0.vocab_size()
+        }
+        fn lm_head(&self) -> Option<&[f32]> {
+            self.0.lm_head()
+        }
+        fn actual_dim(&self) -> usize {
+            self.0.actual_dim()
+        }
+        fn actual_hidden_dim(&self) -> usize {
+            self.0.actual_hidden_dim()
+        }
     }
 
     #[test]
@@ -4652,7 +5452,10 @@ mod tests {
         let model_dir = Path::new(&std::env::var("HOME").unwrap())
             .join(".cache/lm-studio/models/Jackrong/MLX-Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-4bit");
         if !model_dir.exists() {
-            eprintln!("SKIP: Qwen3.5-4B MLX model not found at {}", model_dir.display());
+            eprintln!(
+                "SKIP: Qwen3.5-4B MLX model not found at {}",
+                model_dir.display()
+            );
             return;
         }
 
@@ -4668,36 +5471,70 @@ mod tests {
         let head_dim = tc["head_dim"].as_u64().unwrap_or((dim / n_heads) as u64) as usize;
         let rms_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
         let rope_theta = tc["rope_theta"].as_f64().unwrap_or(1e6);
-        let vocab_size = tc["vocab_size"].as_u64().unwrap_or(
-            root["vocab_size"].as_u64().unwrap_or(248320)
-        ) as usize;
-        let attn_output_gate = tc.get("attn_output_gate")
-            .and_then(|v| v.as_bool()).unwrap_or(false);
-        let layer_types: Vec<String> = tc.get("layer_types")
+        let vocab_size = tc["vocab_size"]
+            .as_u64()
+            .unwrap_or(root["vocab_size"].as_u64().unwrap_or(248320))
+            as usize;
+        let attn_output_gate = tc
+            .get("attn_output_gate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let layer_types: Vec<String> = tc
+            .get("layer_types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let n_layers = tc["num_hidden_layers"].as_u64()
+        let n_layers = tc["num_hidden_layers"]
+            .as_u64()
             .unwrap_or(layer_types.len() as u64) as usize;
-        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
-            .filter(|(_, t)| t.as_str() == "linear_attention").map(|(i, _)| i).collect();
-        let linear_n_heads = tc.get("linear_num_key_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_head_dim = tc.get("linear_key_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_n_value_heads = tc.get("linear_num_value_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
-        let linear_value_head_dim = tc.get("linear_value_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
-        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_attn_indices: Vec<usize> = layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention")
+            .map(|(i, _)| i)
+            .collect();
+        let linear_n_heads = tc
+            .get("linear_num_key_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_head_dim = tc
+            .get("linear_key_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_n_value_heads = tc
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
 
         let seq = 32; // match E2E test (tiled kernels may need minimum seq)
         let cfg = MilConfig {
-            dim, hidden_dim, n_heads, seq_len: seq, n_kv_heads,
-            rope_theta, rms_eps, has_lm_head: false, head_dim_explicit: head_dim,
-            linear_attn_indices, linear_n_heads, linear_head_dim,
-            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            dim,
+            hidden_dim,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads,
+            rope_theta,
+            rms_eps,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices,
+            linear_n_heads,
+            linear_head_dim,
+            linear_n_value_heads,
+            linear_value_head_dim,
+            conv_kernel_size,
             attn_output_gate,
         };
         eprintln!("Config: dim={dim}, hidden={hidden_dim}, heads={n_heads}, kv={n_kv_heads}, hd={head_dim}, layers={n_layers}, seq={seq}");
@@ -4705,13 +5542,19 @@ mod tests {
         // Compile ANE kernels
         let fwd_kernels = match CompiledKernels::compile_forward(&cfg) {
             Ok(k) => k,
-            Err(e) => { eprintln!("SKIP: ANE compile failed: {e}"); return; }
+            Err(e) => {
+                eprintln!("SKIP: ANE compile failed: {e}");
+                return;
+            }
         };
 
         // Load model
         let model = match QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg) {
             Ok(m) => m,
-            Err(e) => { eprintln!("SKIP: weight load failed: {e}"); return; }
+            Err(e) => {
+                eprintln!("SKIP: weight load failed: {e}");
+                return;
+            }
         };
 
         let tokens: Vec<u32> = (0..seq).map(|i| (i % vocab_size) as u32).collect();
@@ -4725,9 +5568,8 @@ mod tests {
 
         // ANE forward (fp16 matmuls for FFN, f32 for attention)
         eprintln!("Running ANE forward...");
-        let ane_fwd = forward_ane_generic(
-            &fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0,
-        ).expect("ANE forward failed");
+        let ane_fwd = forward_ane_generic(&fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+            .expect("ANE forward failed");
         eprintln!("ANE loss: {:.6}", ane_fwd.base.loss);
 
         let loss_err = (cpu_fwd.base.loss - ane_fwd.base.loss).abs();
@@ -4738,29 +5580,42 @@ mod tests {
         let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
         // Helper: L2 norm of difference
         let l2_diff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).powi(2))
+                .sum::<f32>()
+                .sqrt()
         };
 
-        eprintln!("\n{:>4} {:>12} {:>12} {:>12} {:>12} {:>12}", "L", "field", "cpu_norm", "ane_norm", "diff_norm", "rel_err");
+        eprintln!(
+            "\n{:>4} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "L", "field", "cpu_norm", "ane_norm", "diff_norm", "rel_err"
+        );
         eprintln!("{}", "-".repeat(72));
 
-        for (l, (ca, aa)) in cpu_fwd.base.layer_acts.iter()
-            .zip(ane_fwd.base.layer_acts.iter()).enumerate()
+        for (l, (ca, aa)) in cpu_fwd
+            .base
+            .layer_acts
+            .iter()
+            .zip(ane_fwd.base.layer_acts.iter())
+            .enumerate()
         {
             let fields: &[(&str, &[f32], &[f32])] = &[
                 ("layer_in", &ca.layer_in, &aa.layer_in),
-                ("xnorm",    &ca.xnorm,    &aa.xnorm),
-                ("o_out",    &ca.o_out,    &aa.o_out),
-                ("x2",       &ca.x2,       &aa.x2),
-                ("x2norm",   &ca.x2norm,   &aa.x2norm),
-                ("h1",       &ca.h1,       &aa.h1),
-                ("h3",       &ca.h3,       &aa.h3),
-                ("gate",     &ca.gate,     &aa.gate),
-                ("ffn_out",  &ca.ffn_out,  &aa.ffn_out),
+                ("xnorm", &ca.xnorm, &aa.xnorm),
+                ("o_out", &ca.o_out, &aa.o_out),
+                ("x2", &ca.x2, &aa.x2),
+                ("x2norm", &ca.x2norm, &aa.x2norm),
+                ("h1", &ca.h1, &aa.h1),
+                ("h3", &ca.h3, &aa.h3),
+                ("gate", &ca.gate, &aa.gate),
+                ("ffn_out", &ca.ffn_out, &aa.ffn_out),
             ];
 
             for &(name, cpu_v, ane_v) in fields {
-                if cpu_v.is_empty() { continue; }
+                if cpu_v.is_empty() {
+                    continue;
+                }
                 let cn = l2(cpu_v);
                 let an = l2(ane_v);
                 let dn = l2_diff(cpu_v, ane_v);
@@ -4775,21 +5630,40 @@ mod tests {
         let logit_norm = l2(&cpu_fwd.base.logits);
         let logit_rel = logit_diff / logit_norm.max(1e-12);
         eprintln!("\nLogits: diff_norm={logit_diff:.4}, rel_err={logit_rel:.6}");
-        eprintln!("Final: CPU loss={:.6}, ANE loss={:.6}, delta={loss_err:.6}", cpu_fwd.base.loss, ane_fwd.base.loss);
+        eprintln!(
+            "Final: CPU loss={:.6}, ANE loss={:.6}, delta={loss_err:.6}",
+            cpu_fwd.base.loss, ane_fwd.base.loss
+        );
 
         // Layer 0 element-level h1 comparison (diagnose 2x norm issue)
         let ca0 = &cpu_fwd.base.layer_acts[0];
         let aa0 = &ane_fwd.base.layer_acts[0];
         eprintln!("\nLayer 0 h1 element samples (first 8):");
         for i in 0..8.min(ca0.h1.len()) {
-            eprintln!("  h1[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}", ca0.h1[i], aa0.h1[i], aa0.h1[i] / ca0.h1[i].max(1e-12));
+            eprintln!(
+                "  h1[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}",
+                ca0.h1[i],
+                aa0.h1[i],
+                aa0.h1[i] / ca0.h1[i].max(1e-12)
+            );
         }
         eprintln!("Layer 0 h3 element samples (first 8):");
         for i in 0..8.min(ca0.h3.len()) {
-            eprintln!("  h3[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}", ca0.h3[i], aa0.h3[i], aa0.h3[i] / ca0.h3[i].max(1e-12));
+            eprintln!(
+                "  h3[{i}]: cpu={:.6}, ane={:.6}, ratio={:.4}",
+                ca0.h3[i],
+                aa0.h3[i],
+                aa0.h3[i] / ca0.h3[i].max(1e-12)
+            );
         }
-        eprintln!("w1 len={}, w3 len={}, expected hidden*dim={}*{}={}",
-            model.layer(0).w1.len(), model.layer(0).w3.len(), cfg.hidden_dim, cfg.dim, cfg.hidden_dim * cfg.dim);
+        eprintln!(
+            "w1 len={}, w3 len={}, expected hidden*dim={}*{}={}",
+            model.layer(0).w1.len(),
+            model.layer(0).w3.len(),
+            cfg.hidden_dim,
+            cfg.dim,
+            cfg.hidden_dim * cfg.dim
+        );
 
         // Sanity: both losses should be finite
         assert!(cpu_fwd.base.loss.is_finite(), "CPU loss not finite");
