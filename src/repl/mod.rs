@@ -1430,7 +1430,9 @@ pub(crate) fn cmd_agent(
         // which serves as both the main LLM and the perplexity/training backend.
         #[cfg(feature = "mlx")]
         let mlx_handle: Option<cli::MlxHandle> =
-            if config.agents.defaults.inference_engine == "mlx" {
+            if config.agents.defaults.inference_engine == "mlx"
+                && config.agents.defaults.local_backend != "omlx"
+            {
                 match cli::start_mlx_provider(&config) {
                     Ok(h) => Some(h),
                     Err(e) => {

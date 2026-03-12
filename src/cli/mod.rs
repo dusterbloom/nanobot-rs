@@ -677,9 +677,11 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
     }
 
     // MLX in-process provider (when inference_engine == "mlx" or localBackend == "mlx").
+    // Skip when localBackend is "omlx" — oMLX is an external server, no in-process MLX needed.
     #[cfg(feature = "mlx")]
-    let mlx_handle: Option<MlxHandle> = if config.agents.defaults.inference_engine == "mlx"
-        || config.agents.defaults.local_backend == "mlx"
+    let mlx_handle: Option<MlxHandle> = if (config.agents.defaults.inference_engine == "mlx"
+        || config.agents.defaults.local_backend == "mlx")
+        && config.agents.defaults.local_backend != "omlx"
     {
         match start_mlx_provider(&config) {
             Ok(h) => Some(h),
