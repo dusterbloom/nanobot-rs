@@ -460,6 +460,12 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         agent::pid_file::cleanup_stale_pids();
         agent::pid_file::release_agent_singleton();
+        // Best-effort: kill any background ffplay from webradio skill.
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "ffplay.*-nodisp"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         tui::force_exit_raw_mode();
         print!("\x1b[r"); // reset scroll region
         print!("\x1b[?25h"); // show cursor

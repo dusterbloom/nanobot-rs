@@ -373,6 +373,21 @@ impl SkillsLoader {
             .collect()
     }
 
+    /// Get cleanup commands from all skills that declare one in frontmatter.
+    pub fn get_cleanup_commands(&self) -> Vec<(String, String)> {
+        let mut commands = Vec::new();
+        for skill in self.list_skills(false) {
+            if let Some(meta) = self.get_skill_metadata(&skill.name) {
+                if let Some(cmd) = meta.get("cleanup") {
+                    if !cmd.is_empty() {
+                        commands.push((skill.name.clone(), cmd.clone()));
+                    }
+                }
+            }
+        }
+        commands
+    }
+
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
@@ -999,6 +1014,28 @@ mod tests {
         // Should be multi-line (header + 2 skills).
         assert!(index.lines().count() >= 3);
     }
+
+    // ----- get_cleanup_commands -----
+
+    #[test]
+    fn test_get_cleanup_commands_returns_cleanup_field() {
+        let frontmatter = "description: A skill with cleanup\ncleanup: /usr/bin/stop-thing";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let cmds = loader.get_cleanup_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].0, "test-skill");
+        assert_eq!(cmds[0].1, "/usr/bin/stop-thing");
+    }
+
+    #[test]
+    fn test_get_cleanup_commands_skips_skills_without_cleanup() {
+        let frontmatter = "description: Normal skill";
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let cmds = loader.get_cleanup_commands();
+        assert!(cmds.is_empty());
+    }
+
+    // ----- name index -----
 
     #[test]
     fn test_name_index_is_discovery_only() {

@@ -1980,6 +1980,22 @@ pub(crate) fn cmd_agent(
 
             ctx.srv.shutdown();
 
+            // Run skill cleanup commands (e.g. stop background audio).
+            {
+                let ws = ctx.config.workspace_path();
+                let loader = crate::agent::skills::SkillsLoader::new(&ws, None);
+                for (name, cmd) in loader.get_cleanup_commands() {
+                    debug!(skill = %name, cmd = %cmd, "running skill cleanup");
+                    let expanded = cmd.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
+                    let _ = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&expanded)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+
             // Safety net: kill any managed child processes whose Drop may not
             // have fired (e.g. Arc still held elsewhere).
             crate::agent::pid_file::cleanup_stale_pids();
