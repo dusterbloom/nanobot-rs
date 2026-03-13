@@ -959,14 +959,16 @@ impl ReplContext {
         }
 
         // 3. Build ANE training config.
-        let ane_cfg =
-            match crate::agent::learn_loop::build_ane_training_config(Some(&model_dir)) {
-                Some(cfg) => cfg,
-                None => {
-                    println!("\n  Failed to build ANE training config for {}\n", model_dir.display());
-                    return;
-                }
-            };
+        let ane_cfg = match crate::agent::learn_loop::build_ane_training_config(Some(&model_dir)) {
+            Some(cfg) => cfg,
+            None => {
+                println!(
+                    "\n  Failed to build ANE training config for {}\n",
+                    model_dir.display()
+                );
+                return;
+            }
+        };
 
         // 4. Load tokenizer and tokenize pending experiences.
         let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(&model_dir) {
@@ -1003,8 +1005,7 @@ impl ReplContext {
                     content: exp.response.clone(),
                 },
             ];
-            if let Ok(pair) =
-                crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+            if let Ok(pair) = crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
             {
                 samples.push((pair.0, pair.1, exp.quality as f32));
             }
@@ -1025,9 +1026,7 @@ impl ReplContext {
         let mlx_tx = {
             #[cfg(feature = "mlx")]
             {
-                self.mlx_handle
-                    .as_ref()
-                    .map(|h| h.provider.model_tx())
+                self.mlx_handle.as_ref().map(|h| h.provider.model_tx())
             }
             #[cfg(not(feature = "mlx"))]
             {
@@ -1040,20 +1039,25 @@ impl ReplContext {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        counters.training_started_ms.store(now_ms, Ordering::Relaxed);
+        counters
+            .training_started_ms
+            .store(now_ms, Ordering::Relaxed);
 
         let n_samples = samples.len();
         let n_exps = ids.len();
         let tc = counters.clone();
-        let handle = crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx);
+        let handle = if let Some(trainer) = self.agent_loop.ane_trainer() {
+            trainer.spawn_training(ane_cfg, samples, mlx_tx)
+        } else {
+            crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx)
+        };
 
         // Spawn a watcher to mark experiences exported when training completes.
         tokio::task::spawn_blocking(move || {
             let ok = handle.join().unwrap_or(false);
             tc.training_active.store(false, Ordering::Relaxed);
             if ok {
-                tc.training_steps_total
-                    .fetch_add(1, Ordering::Relaxed);
+                tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
                 if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
                     let _ = eb.mark_exported(&ids);
                 }

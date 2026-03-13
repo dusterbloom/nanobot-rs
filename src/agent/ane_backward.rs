@@ -641,7 +641,6 @@ pub fn backward<T: ane_forward::TokenId>(
     let dim = cfg.dim;
     let hidden = cfg.hidden_dim;
     let seq = cfg.seq_len;
-    let vocab = model.vocab_size;
     let n_layers = model.layers.len();
 
     let mut grads = ModelGradients::zeros(model);
@@ -652,35 +651,12 @@ pub fn backward<T: ane_forward::TokenId>(
     let mut x_cur = last_act.x2.clone();
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
 
-    // Reconstruct x_final (output of final rmsnorm) for classifier_bwd
-    let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(
-        &mut x_final,
-        &x_cur,
-        &model.rms_final,
-        dim,
-        seq,
-        cfg.rms_eps,
-    );
-
-    // 1. Classifier backward: dy = cls_w^T @ dlogits, dcls_w += dlogits @ x_final^T
-    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
-    let dcls_w = if model.lm_head.is_some() {
-        grads.dlm_head.as_mut().unwrap()
-    } else {
-        &mut grads.dembed
-    };
-    let mut dy = vec![0.0f32; dim * seq];
-    classifier_bwd(
-        &mut dy,
-        dcls_w,
-        &fwd.dlogits,
-        cls_w,
-        &x_final,
-        vocab,
-        dim,
-        seq,
-    );
+    // 1. Classifier backward: fused CE already computed classifier_dy = cls_w^T @ dlogits.
+    //    dcls_w (classifier weight gradient) requires dlogits, which the fused path doesn't
+    //    materialize. This is fine: backward() is only called from LoRA training where base
+    //    model weight gradients (dcls_w, dembed) are unused. For tied weights, embed_bwd
+    //    accumulates the embedding gradient from the layer stack.
+    let mut dy = fwd.classifier_dy.clone();
 
     // 2. Final RMSNorm backward
     let mut dx_rms = vec![0.0f32; dim * seq];
@@ -1138,7 +1114,9 @@ fn mha_backward_ane_dx_attn(
         .as_ref()
         .ok_or_else(|| "wot_bwd kernel missing".to_string())?;
     wot_kernel.write_input(0, &wot_input);
-    wot_kernel.eval().map_err(|e| format!("wot_bwd eval: {e}"))?;
+    wot_kernel
+        .eval()
+        .map_err(|e| format!("wot_bwd eval: {e}"))?;
     let mut wot_out = vec![0u8; wot_spec.output_bytes];
     wot_kernel.read_output(0, &mut wot_out);
     let da_raw: Vec<f32> = wot_out
@@ -1249,7 +1227,9 @@ fn mha_backward_ane_dx_attn(
         .as_ref()
         .ok_or_else(|| "qkv_bwd kernel missing".to_string())?;
     qkv_kernel.write_input(0, &qkv_input);
-    qkv_kernel.eval().map_err(|e| format!("qkv_bwd eval: {e}"))?;
+    qkv_kernel
+        .eval()
+        .map_err(|e| format!("qkv_bwd eval: {e}"))?;
     let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
     qkv_kernel.read_output(0, &mut qkv_out);
     Ok(qkv_out
@@ -1281,8 +1261,8 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     model: &W,
     fwd: &ane_forward::ForwardResultWithLora,
     lora: &super::ane_lora::LoraModel,
-    tokens: &[T],
-    softcap: f32,
+    _tokens: &[T],
+    _softcap: f32,
     loss_scale: f32,
 ) -> BackwardResultWithLora {
     use super::ane_lora;
@@ -1299,44 +1279,18 @@ pub fn backward_lora_cpu_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     // Base model weights are frozen — skip the 5.9 GB gradient allocation.
     let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
 
-    // Clone and modify dlogits: apply softcap backward + loss scaling
-    let mut dlogits = fwd.base.dlogits.clone();
-    logit_softcap_bwd(&mut dlogits, &fwd.base.logits, softcap);
+    // Use fused CE gradient directly (softcap chain rule already baked in)
+    let mut dy = fwd.base.classifier_dy.clone();
     if apply_loss_scale {
-        for v in dlogits.iter_mut() {
+        for v in dy.iter_mut() {
             *v *= loss_scale;
         }
     }
 
-    // Reconstruct x_cur from last layer
+    // Reconstruct x_cur from last layer (needed for rmsnorm_bwd)
     let last_act = &fwd.base.layer_acts[n_layers - 1];
     let mut x_cur = last_act.x2.clone();
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
-
-    let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(
-        &mut x_final,
-        &x_cur,
-        model.rms_final(),
-        dim,
-        seq,
-        cfg.rms_eps,
-    );
-
-    // Classifier backward
-    let cls_w = model.lm_head().unwrap_or(model.embed());
-    let mut dy = vec![0.0f32; dim * seq];
-    let mut _dcls = vec![0.0f32; cls_w.len()];
-    classifier_bwd(
-        &mut dy,
-        &mut _dcls,
-        &dlogits,
-        cls_w,
-        &x_final,
-        model.vocab_size(),
-        dim,
-        seq,
-    );
 
     // Final RMSNorm backward
     let mut dx_rms = vec![0.0f32; dim * seq];
@@ -1839,46 +1793,23 @@ pub fn backward_with_lora<T: ane_forward::TokenId>(
     // residual). The base backward already ran but doesn't expose intermediates,
     // so we replay the chain here. This is ~2x cost but correct.
     let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
+
+    // Use fused CE gradient directly, then rmsnorm_bwd
     let last_act = &fwd.base.layer_acts[n_layers - 1];
     let mut x_cur = last_act.x2.clone();
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
 
-    let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(
-        &mut x_final,
-        &x_cur,
-        &model.rms_final,
-        dim,
-        seq,
-        cfg.rms_eps,
-    );
-
-    let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
     let mut dy = vec![0.0f32; dim * seq];
-    let mut _dcls = vec![0.0f32; cls_w.len()];
-    classifier_bwd(
-        &mut dy,
-        &mut _dcls,
-        &fwd.base.dlogits,
-        cls_w,
-        &x_final,
-        model.vocab_size,
-        dim,
-        seq,
-    );
-
-    let mut dx_rms = vec![0.0f32; dim * seq];
     rmsnorm_bwd(
-        &mut dx_rms,
+        &mut dy,
         &mut vec![0.0f32; dim],
-        &dy,
+        &fwd.base.classifier_dy,
         &x_cur,
         &model.rms_final,
         dim,
         seq,
         cfg.rms_eps,
     );
-    dy = dx_rms;
 
     let hidden = cfg.hidden_dim;
     for l in (0..n_layers).rev() {
@@ -2130,6 +2061,33 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
     loss_scale: f32,
     residual_scale: f32,
 ) -> BackwardResultWithLora {
+    backward_lora_ane_generic_with_lora_kernels(
+        bwd_kernels,
+        model,
+        fwd,
+        lora,
+        tokens,
+        softcap,
+        loss_scale,
+        residual_scale,
+        None,
+    )
+}
+
+pub fn backward_lora_ane_generic_with_lora_kernels<
+    T: ane_forward::TokenId,
+    W: ane_weights::WeightSource,
+>(
+    bwd_kernels: &BackwardKernels,
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    _tokens: &[T],
+    _softcap: f32,
+    loss_scale: f32,
+    residual_scale: f32,
+    lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
+) -> BackwardResultWithLora {
     use super::ane_lora;
 
     let cfg = model.cfg();
@@ -2143,16 +2101,15 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
 
     let mut lora_grads = ane_lora::LoraModelGrads::zeros(lora);
 
-    // Clone and modify dlogits: apply softcap backward + loss scaling
-    let mut dlogits = fwd.base.dlogits.clone();
-    logit_softcap_bwd(&mut dlogits, &fwd.base.logits, softcap);
+    // Use fused CE gradient directly (softcap chain rule already baked in)
+    let mut dy = fwd.base.classifier_dy.clone();
     if apply_loss_scale {
-        for v in dlogits.iter_mut() {
+        for v in dy.iter_mut() {
             *v *= loss_scale;
         }
     }
 
-    // Reconstruct x_cur from last layer
+    // Reconstruct x_cur from last layer (needed for rmsnorm_bwd)
     let last_act = &fwd.base.layer_acts[n_layers - 1];
     let mut x_cur = last_act.x2.clone();
     ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
@@ -2161,31 +2118,6 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             *v *= residual_scale;
         }
     }
-
-    let mut x_final = vec![0.0f32; dim * seq];
-    ane_forward::rmsnorm(
-        &mut x_final,
-        &x_cur,
-        model.rms_final(),
-        dim,
-        seq,
-        cfg.rms_eps,
-    );
-
-    // Classifier backward
-    let cls_w = model.lm_head().unwrap_or(model.embed());
-    let mut dy = vec![0.0f32; dim * seq];
-    let mut _dcls = vec![0.0f32; cls_w.len()];
-    classifier_bwd(
-        &mut dy,
-        &mut _dcls,
-        &dlogits,
-        cls_w,
-        &x_final,
-        model.vocab_size(),
-        dim,
-        seq,
-    );
 
     // Final RMSNorm backward
     let mut dx_rms = vec![0.0f32; dim * seq];
@@ -2217,13 +2149,16 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
         // Dequantize layer (needed by both ANE and CPU parallel paths)
         let lw_cow = model.layer(l);
         let lw = &*lw_cow;
+        let use_ane_w2_grads = lora_kernels.and_then(|k| k.w2.as_ref()).is_some();
 
         // --- PARALLEL: ANE ffn_bwd_w2t || LoRA W2 grad + W1/W3 pre-transpose ---
         // ANE kernel is !Send, stays on calling thread. CPU work on a scoped thread.
         let (dsilu, w2_grads, w1t, w3t) = std::thread::scope(|s| {
             // Spawn CPU work: LoRA W2 backward + pre-transpose W1/W3
             let cpu_handle = s.spawn(|| {
-                let w2_grads = if let (Some(w2_adapter), Some(w2_x), Some(w2_h)) = (
+                let w2_grads = if use_ane_w2_grads {
+                    None
+                } else if let (Some(w2_adapter), Some(w2_x), Some(w2_h)) = (
                     lora.layers[l].w2.as_ref(),
                     la.w2_x.as_ref(),
                     la.w2_h.as_ref(),
@@ -2265,6 +2200,35 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             }
             for (g, v) in lg.db.iter_mut().zip(db.iter()) {
                 *g += v;
+            }
+        }
+        if let (Some(w2_adapter), Some(w2_x), Some(w2_h), Some(lg), Some(k)) = (
+            lora.layers[l].w2.as_ref(),
+            la.w2_x.as_ref(),
+            la.w2_h.as_ref(),
+            lora_grads.layers[l].w2.as_mut(),
+            lora_kernels.and_then(|k| k.w2.as_ref()),
+        ) {
+            let scaled_dffn: Vec<f32> = dffn.iter().map(|&v| v * scale).collect();
+            match k.eval(w2_adapter, &scaled_dffn, w2_x, w2_h, seq) {
+                Ok((da, db)) => {
+                    for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                        *g += v;
+                    }
+                    for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                        *g += v;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("ANE LoRA W2 grads fell back to CPU: {e}");
+                    let (_dx, da, db) = w2_adapter.backward_cpu(&scaled_dffn, w2_x, w2_h, seq);
+                    for (g, v) in lg.da.iter_mut().zip(da.iter()) {
+                        *g += v;
+                    }
+                    for (g, v) in lg.db.iter_mut().zip(db.iter()) {
+                        *g += v;
+                    }
+                }
             }
         }
 
@@ -2313,7 +2277,23 @@ pub fn backward_lora_ane_generic<T: ane_forward::TokenId, W: ane_weights::Weight
             lora_grads.layers[l].wo.as_mut(),
         ) {
             let scaled_dx2: Vec<f32> = dx2.iter().map(|&v| v * scale).collect();
-            let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
+            let grads = if let Some(k) = lora_kernels.and_then(|k| k.wo.as_ref()) {
+                match k.eval(wo_adapter, &scaled_dx2, wo_x, wo_h, seq) {
+                    Ok((da, db)) => Some((da, db)),
+                    Err(e) => {
+                        tracing::warn!("ANE LoRA Wo grads fell back to CPU: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (da, db) = if let Some(grads) = grads {
+                grads
+            } else {
+                let (_dx, da, db) = wo_adapter.backward_cpu(&scaled_dx2, wo_x, wo_h, seq);
+                (da, db)
+            };
             for (g, v) in lg.da.iter_mut().zip(da.iter()) {
                 *g += v;
             }
@@ -2943,9 +2923,18 @@ mod tests {
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
         let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
 
-        let fwd = ane_forward::forward_ane_generic(&fwd_kernels, &model, Some(&lora), &tokens, &targets, 0.0, 1.0)
-            .expect("forward_ane_generic failed");
-        let bwd = backward_lora_ane_generic(&bwd_kernels, &model, &fwd, &lora, &tokens, 0.0, 1.0, 1.0);
+        let fwd = ane_forward::forward_ane_generic(
+            &fwd_kernels,
+            &model,
+            Some(&lora),
+            &tokens,
+            &targets,
+            0.0,
+            1.0,
+        )
+        .expect("forward_ane_generic failed");
+        let bwd =
+            backward_lora_ane_generic(&bwd_kernels, &model, &fwd, &lora, &tokens, 0.0, 1.0, 1.0);
 
         let w2 = bwd.lora_grads.layers[0].w2.as_ref().expect("w2 grads");
         let nonzero = w2
@@ -2954,7 +2943,10 @@ mod tests {
             .chain(w2.db.iter())
             .filter(|v| v.abs() > 1e-12)
             .count();
-        assert!(nonzero > 0, "LoRA grads should be nonzero for over-parameterized attention");
+        assert!(
+            nonzero > 0,
+            "LoRA grads should be nonzero for over-parameterized attention"
+        );
     }
 
     #[test]
@@ -3291,6 +3283,12 @@ mod tests {
     // Round 6: untied classifier (lm_head)
     // -----------------------------------------------------------------------
 
+    /// Validates classifier_bwd produces correct dcls_w for untied lm_head.
+    ///
+    /// With fused CE, backward() no longer materializes dlogits and skips dcls_w
+    /// (LoRA training doesn't need base weight gradients). This test validates
+    /// the unfused classifier_forward → cross_entropy_loss → classifier_bwd path
+    /// directly, ensuring it remains correct for any future full-model training.
     #[test]
     fn test_untied_classifier_gradients() {
         let dim = 64;
@@ -3308,8 +3306,6 @@ mod tests {
                 return;
             }
         };
-        let bwd_kernels = BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
-            .expect("compile_backward failed");
 
         let make_small = |n: usize, seed: usize| -> Vec<f32> {
             (0..n)
@@ -3342,24 +3338,38 @@ mod tests {
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
         let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
 
+        // Run forward to get activations (x_final reconstruction)
         let fwd =
             ane_forward::forward(&fwd_kernels, &model, &tokens, &targets).expect("forward failed");
         assert!(fwd.loss.is_finite(), "loss not finite");
 
-        let grads = backward(&bwd_kernels, &model, &fwd, &tokens).expect("backward failed");
+        // Reconstruct x_final from last layer activations
+        let n_layers = model.layers.len();
+        let last_act = &fwd.layer_acts[n_layers - 1];
+        let mut x_cur = last_act.x2.clone();
+        ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
+        let mut x_final = vec![0.0f32; dim * seq];
+        ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
 
-        // dlm_head should exist and have nonzero entries
-        let dlm = grads.dlm_head.as_ref().expect("dlm_head should be Some");
-        assert_eq!(dlm.len(), vocab * dim);
-        let nonzero = dlm.iter().filter(|v| v.abs() > 1e-15).count();
+        // Unfused path: classifier_forward → cross_entropy_loss → classifier_bwd
+        let lm_head = model.lm_head.as_ref().unwrap();
+        let mut logits = vec![0.0f32; vocab * seq];
+        ane_forward::classifier_forward(&mut logits, lm_head, &x_final, vocab, dim, seq);
+
+        let (_loss, dlogits) = ane_forward::cross_entropy_loss(&logits, &targets, vocab, seq);
+
+        let mut dy = vec![0.0f32; dim * seq];
+        let mut dlm_head = vec![0.0f32; vocab * dim];
+        classifier_bwd(&mut dy, &mut dlm_head, &dlogits, lm_head, &x_final, vocab, dim, seq);
+
+        // dlm_head should have nonzero gradients
+        assert_eq!(dlm_head.len(), vocab * dim);
+        let nonzero = dlm_head.iter().filter(|v| v.abs() > 1e-15).count();
         assert!(nonzero > 0, "dlm_head should have nonzero gradients");
 
-        // dembed should still get gradients from embed_bwd (not from classifier)
-        let dembed_nonzero = grads.dembed.iter().filter(|v| v.abs() > 1e-15).count();
-        assert!(
-            dembed_nonzero > 0,
-            "dembed should have nonzero entries from embed_bwd"
-        );
+        // dy (gradient flowing back through the classifier) should be nonzero
+        let dy_nonzero = dy.iter().filter(|v| v.abs() > 1e-15).count();
+        assert!(dy_nonzero > 0, "dy from classifier_bwd should be nonzero");
     }
 
     // -----------------------------------------------------------------------
@@ -3436,8 +3446,8 @@ mod tests {
         let fwd_1x = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
         let mut fwd_2x = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
 
-        // Scale dlogits on the second by 2x (simulates loss_scale=2.0)
-        for v in fwd_2x.base.dlogits.iter_mut() {
+        // Scale classifier_dy on the second by 2x (simulates loss_scale=2.0)
+        for v in fwd_2x.base.classifier_dy.iter_mut() {
             *v *= 2.0;
         }
 

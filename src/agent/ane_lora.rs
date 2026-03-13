@@ -9,8 +9,10 @@
 //! - Batch size 1 (optimal for Apple Silicon memory bandwidth)
 //!
 //! LoRA forward:  h = A @ x,  δy = B @ h,  y_total = y_base + scale * δy
-//! LoRA backward: ANE for input grads, CPU for weight grads (rank is small)
+//! LoRA backward: ANE for input grads, with optional ANE weight grads and Muon
+//! updates for strict accelerator-only LoRA math.
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
@@ -374,6 +376,43 @@ impl LoraModelGrads {
             zero_opt(&mut lg.w2);
         }
     }
+
+    /// Element-wise add gradients from `other` into `self`.
+    pub fn add_from(&mut self, other: &LoraModelGrads) {
+        for (lg, og) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let add_opt =
+                |dst: &mut Option<LoraAdapterGrads>, src: &Option<LoraAdapterGrads>| {
+                    if let (Some(d), Some(s)) = (dst.as_mut(), src.as_ref()) {
+                        for (dv, sv) in d.da.iter_mut().zip(s.da.iter()) {
+                            *dv += sv;
+                        }
+                        for (dv, sv) in d.db.iter_mut().zip(s.db.iter()) {
+                            *dv += sv;
+                        }
+                    }
+                };
+            add_opt(&mut lg.wq, &og.wq);
+            add_opt(&mut lg.wv, &og.wv);
+            add_opt(&mut lg.wo, &og.wo);
+            add_opt(&mut lg.w2, &og.w2);
+        }
+    }
+
+    /// Multiply all gradients by scalar `s`.
+    pub fn scale(&mut self, s: f32) {
+        for lg in &mut self.layers {
+            let scale_opt = |g: &mut Option<LoraAdapterGrads>| {
+                if let Some(g) = g.as_mut() {
+                    g.da.iter_mut().for_each(|v| *v *= s);
+                    g.db.iter_mut().for_each(|v| *v *= s);
+                }
+            };
+            scale_opt(&mut lg.wq);
+            scale_opt(&mut lg.wv);
+            scale_opt(&mut lg.wo);
+            scale_opt(&mut lg.w2);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,12 +420,14 @@ impl LoraModelGrads {
 // ---------------------------------------------------------------------------
 
 /// Adam state for one LoRA adapter (A and B matrices).
+#[derive(Clone)]
 pub struct LoraAdapterAdam {
     pub a: AdamState,
     pub b: AdamState,
 }
 
 /// Per-layer LoRA Adam state.
+#[derive(Clone)]
 pub struct LoraLayerAdam {
     pub wq: Option<LoraAdapterAdam>,
     pub wv: Option<LoraAdapterAdam>,
@@ -395,6 +436,7 @@ pub struct LoraLayerAdam {
 }
 
 /// Full model LoRA Adam state.
+#[derive(Clone)]
 pub struct LoraModelAdam {
     pub layers: Vec<LoraLayerAdam>,
 }
@@ -421,6 +463,53 @@ impl LoraModelAdam {
             })
             .collect();
         LoraModelAdam { layers }
+    }
+}
+
+/// Muon state for one LoRA adapter (momentum buffers for A and B matrices).
+#[derive(Clone)]
+pub struct LoraAdapterMuon {
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+}
+
+/// Per-layer LoRA Muon state.
+#[derive(Clone)]
+pub struct LoraLayerMuon {
+    pub wq: Option<LoraAdapterMuon>,
+    pub wv: Option<LoraAdapterMuon>,
+    pub wo: Option<LoraAdapterMuon>,
+    pub w2: Option<LoraAdapterMuon>,
+}
+
+/// Full model LoRA Muon state.
+#[derive(Clone)]
+pub struct LoraModelMuon {
+    pub layers: Vec<LoraLayerMuon>,
+}
+
+impl LoraModelMuon {
+    /// Create zero-initialized Muon state matching LoRA model shape.
+    pub fn zeros(lora: &LoraModel) -> Self {
+        let layers = lora
+            .layers
+            .iter()
+            .map(|la| {
+                let make_muon = |adapter: &Option<LoraAdapter>| -> Option<LoraAdapterMuon> {
+                    adapter.as_ref().map(|a| LoraAdapterMuon {
+                        a: vec![0.0; a.rank * a.d_in],
+                        b: vec![0.0; a.d_out * a.rank],
+                    })
+                };
+                LoraLayerMuon {
+                    wq: make_muon(&la.wq),
+                    wv: make_muon(&la.wv),
+                    wo: make_muon(&la.wo),
+                    w2: make_muon(&la.w2),
+                }
+            })
+            .collect();
+        LoraModelMuon { layers }
     }
 }
 
@@ -638,6 +727,868 @@ pub fn lora_adam_update_split_lr(
             &mut adam.layers[l].w2,
             lr_ffn,
         );
+    }
+}
+
+const MUON_EPS: f32 = 1e-7;
+// ANE stays directionally correct for the first Polar-Express step, but
+// diverges on later fp16 iterations. Use a single stable orthogonalization
+// step instead of a nominally stronger schedule that corrupts the update.
+const MUON_NS_STEPS: usize = 1;
+const MUON_NORM_PAD: f32 = 1.02;
+const MUON_POLAR_EXPRESS_COEFFS: [(f32, f32, f32); 5] = [
+    (8.156554, -22.483294, 15.87877),
+    (4.04293, -2.8089175, 0.5000178),
+    (3.8916678, -2.772484, 0.50606483),
+    (3.2857537, -2.3681295, 0.46449023),
+    (2.3465414, -1.7097828, 0.4232355),
+];
+
+fn gen_muon_update_mil(rows: usize, cols: usize, beta: f32, lr: f32, wd: f32) -> String {
+    let transpose = rows > cols;
+    let ortho_rows = rows.min(cols);
+    let ortho_cols = rows.max(cols);
+    let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    let wd_scale = 1.0 - lr * wd;
+    let one_minus_beta = 1.0 - beta;
+    let mut m = String::with_capacity(24_576);
+    m.push_str(concat!(
+        "program(1.3)\n",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, ",
+        "{\"coremlc-version\", \"3505.4.1\"}, ",
+        "{\"coremltools-component-milinternal\", \"\"}, ",
+        "{\"coremltools-version\", \"9.0\"}})]\n",
+        "{\n",
+    ));
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> p, tensor<fp32, [1, {rows}, 1, {cols}]> g, tensor<fp32, [1, {rows}, 1, {cols}]> m0) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> ph = cast(dtype=to16,x=p)[name=string(\"ph\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> gh = cast(dtype=to16,x=g)[name=string(\"gh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> mh = cast(dtype=to16,x=m0)[name=string(\"mh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 beta = const()[name=string(\"beta\"), val=fp16({beta})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 one_mb = const()[name=string(\"one_mb\"), val=fp16({one_minus_beta})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 lr = const()[name=string(\"lr\"), val=fp16({lr})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 scale = const()[name=string(\"scale\"), val=fp16({scale})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 wd_scale = const()[name=string(\"wd_scale\"), val=fp16({wd_scale})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 eps = const()[name=string(\"eps\"), val=fp16({MUON_EPS})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 norm_pad_inv = const()[name=string(\"norm_pad_inv\"), val=fp16({})];",
+        1.0f32 / MUON_NORM_PAD
+    );
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> rmat = const()[name=string(\"rmat\"), val=tensor<int32, [4]>([1,1,{rows},{cols}])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_beta = mul(x=mh,y=beta)[name=string(\"m_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> g_beta = mul(x=gh,y=one_mb)[name=string(\"g_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_new = add(x=m_beta,y=g_beta)[name=string(\"m_new\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_new_beta = mul(x=m_new,y=beta)[name=string(\"m_new_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u0 = add(x=m_new_beta,y=g_beta)[name=string(\"u0\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{rows},{cols}]> ur = reshape(shape=rmat,x=u0)[name=string(\"ur\")];"
+    );
+    if transpose {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{cols},{rows}]> x0 = transpose(perm=pm,x=ur)[name=string(\"x0\")];"
+        );
+    } else {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x0 = reshape(shape=rmat,x=u0)[name=string(\"x0\")];"
+        );
+    }
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> x0u = l2_norm(x=x0,epsilon=eps)[name=string(\"x0u\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> x0n = mul(x=x0u,y=norm_pad_inv)[name=string(\"x0n\")];"
+    );
+    for step in 0..MUON_NS_STEPS {
+        let (a_coeff, b_coeff, c_coeff) = MUON_POLAR_EXPRESS_COEFFS[step];
+        let x_in = if step == 0 {
+            "x0n".to_string()
+        } else {
+            format!("x{step}n")
+        };
+        let scalar_a = format!("muon_a_{step}");
+        let scalar_b = format!("muon_b_{step}");
+        let scalar_c = format!("muon_c_{step}");
+        let a_name = format!("a{step}");
+        let a2_name = format!("a2_{step}");
+        let ba_name = format!("ba{step}");
+        let ca_name = format!("ca{step}");
+        let bmix_name = format!("bmix{step}");
+        let bx_name = format!("bx{step}");
+        let ax_name = format!("ax{step}");
+        let x_out = format!("x{}n", step + 1);
+        let _ = writeln!(
+            m,
+            "        fp16 {scalar_a} = const()[name=string(\"{scalar_a}\"), val=fp16({a_coeff})];"
+        );
+        let _ = writeln!(
+            m,
+            "        fp16 {scalar_b} = const()[name=string(\"{scalar_b}\"), val=fp16({b_coeff})];"
+        );
+        let _ = writeln!(
+            m,
+            "        fp16 {scalar_c} = const()[name=string(\"{scalar_c}\"), val=fp16({c_coeff})];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> {a_name} = matmul(transpose_x=bF,transpose_y=bT,x={x_in},y={x_in})[name=string(\"{a_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> {a2_name} = matmul(transpose_x=bF,transpose_y=bF,x={a_name},y={a_name})[name=string(\"{a2_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> {ba_name} = mul(x={a_name},y={scalar_b})[name=string(\"{ba_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> {ca_name} = mul(x={a2_name},y={scalar_c})[name=string(\"{ca_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> {bmix_name} = add(x={ba_name},y={ca_name})[name=string(\"{bmix_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> {bx_name} = matmul(transpose_x=bF,transpose_y=bF,x={bmix_name},y={x_in})[name=string(\"{bx_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> {ax_name} = mul(x={x_in},y={scalar_a})[name=string(\"{ax_name}\")];"
+        );
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> {x_out} = add(x={ax_name},y={bx_name})[name=string(\"{x_out}\")];"
+        );
+    }
+    let final_x = format!("x{}n", MUON_NS_STEPS);
+    if transpose {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x_final_t = transpose(perm=pm,x={final_x})[name=string(\"x_final_t\")];"
+        );
+    } else {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x_final_t = reshape(shape=rmat,x={final_x})[name=string(\"x_final_t\")];"
+        );
+    }
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> rout = const()[name=string(\"rout\"), val=tensor<int32, [4]>([1,{rows},1,{cols}])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_ortho = reshape(shape=rout,x=x_final_t)[name=string(\"u_ortho\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_scaled = mul(x=u_ortho,y=scale)[name=string(\"u_scaled\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> p_decay = mul(x=ph,y=wd_scale)[name=string(\"p_decay\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_lr = mul(x=u_scaled,y=lr)[name=string(\"u_lr\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> p_new = sub(x=p_decay,y=u_lr)[name=string(\"p_new\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> p_out = cast(dtype=to32,x=p_new)[name=string(\"p_out\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> m_out = cast(dtype=to32,x=m_new)[name=string(\"m_out\")];"
+    );
+    let _ = writeln!(m, "    }} -> (p_out, m_out);");
+    m.push_str("}\n");
+    m
+}
+
+struct MuonMatrixKernel {
+    momentum_kernel: AneKernel,
+    ortho_kernel: AneKernel,
+    param_kernel: AneKernel,
+    tensor_bytes: usize,
+    rows: usize,
+    cols: usize,
+}
+
+fn gen_muon_momentum_mil(rows: usize, cols: usize, beta: f32) -> String {
+    let one_minus_beta = 1.0 - beta;
+    let mut m = String::with_capacity(4096);
+    m.push_str(concat!(
+        "program(1.3)\n",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, ",
+        "{\"coremlc-version\", \"3505.4.1\"}, ",
+        "{\"coremltools-component-milinternal\", \"\"}, ",
+        "{\"coremltools-version\", \"9.0\"}})]\n",
+        "{\n",
+    ));
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> g, tensor<fp32, [1, {rows}, 1, {cols}]> m0) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> gh = cast(dtype=to16,x=g)[name=string(\"gh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> mh = cast(dtype=to16,x=m0)[name=string(\"mh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 beta = const()[name=string(\"beta\"), val=fp16({beta})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 one_mb = const()[name=string(\"one_mb\"), val=fp16({one_minus_beta})];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_beta = mul(x=mh,y=beta)[name=string(\"m_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> g_beta = mul(x=gh,y=one_mb)[name=string(\"g_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_new = add(x=m_beta,y=g_beta)[name=string(\"m_new\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> m_new_beta = mul(x=m_new,y=beta)[name=string(\"m_new_beta\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u0 = add(x=m_new_beta,y=g_beta)[name=string(\"u0\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> u_out = cast(dtype=to32,x=u0)[name=string(\"u_out\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> m_out = cast(dtype=to32,x=m_new)[name=string(\"m_out\")];"
+    );
+    let _ = writeln!(m, "    }} -> (u_out, m_out);");
+    m.push_str("}\n");
+    m
+}
+
+fn gen_muon_ortho_mil(rows: usize, cols: usize) -> String {
+    let transpose = rows > cols;
+    let ortho_rows = rows.min(cols);
+    let ortho_cols = rows.max(cols);
+    let mut m = String::with_capacity(12_288);
+    let (a_coeff, b_coeff, c_coeff) = MUON_POLAR_EXPRESS_COEFFS[0];
+    m.push_str(concat!(
+        "program(1.3)\n",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, ",
+        "{\"coremlc-version\", \"3505.4.1\"}, ",
+        "{\"coremltools-component-milinternal\", \"\"}, ",
+        "{\"coremltools-version\", \"9.0\"}})]\n",
+        "{\n",
+    ));
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> u0) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> uh = cast(dtype=to16,x=u0)[name=string(\"uh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 eps = const()[name=string(\"eps\"), val=fp16({MUON_EPS})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 norm_pad_inv = const()[name=string(\"norm_pad_inv\"), val=fp16({})];",
+        1.0f32 / MUON_NORM_PAD
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 a = const()[name=string(\"a\"), val=fp16({a_coeff})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 b = const()[name=string(\"b\"), val=fp16({b_coeff})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 c = const()[name=string(\"c\"), val=fp16({c_coeff})];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> rmat = const()[name=string(\"rmat\"), val=tensor<int32, [4]>([1,1,{rows},{cols}])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{rows},{cols}]> ur = reshape(shape=rmat,x=uh)[name=string(\"ur\")];"
+    );
+    if transpose {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{cols},{rows}]> x0 = transpose(perm=pm,x=ur)[name=string(\"x0\")];"
+        );
+    } else {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x0 = reshape(shape=rmat,x=uh)[name=string(\"x0\")];"
+        );
+    }
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> x0u = l2_norm(x=x0,epsilon=eps)[name=string(\"x0u\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> x0n = mul(x=x0u,y=norm_pad_inv)[name=string(\"x0n\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> a0 = matmul(transpose_x=bF,transpose_y=bT,x=x0n,y=x0n)[name=string(\"a0\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> a2 = matmul(transpose_x=bF,transpose_y=bF,x=a0,y=a0)[name=string(\"a2\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> ba = mul(x=a0,y=b)[name=string(\"ba\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> ca = mul(x=a2,y=c)[name=string(\"ca\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_rows}]> bb = add(x=ba,y=ca)[name=string(\"bb\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> bx = matmul(transpose_x=bF,transpose_y=bF,x=bb,y=x0n)[name=string(\"bx\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> ax = mul(x=x0n,y=a)[name=string(\"ax\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,{ortho_rows},{ortho_cols}]> x1 = add(x=ax,y=bx)[name=string(\"x1\")];"
+    );
+    if transpose {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x_final = transpose(perm=pm,x=x1)[name=string(\"x_final\")];"
+        );
+    } else {
+        let _ = writeln!(
+            m,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x_final = reshape(shape=rmat,x=x1)[name=string(\"x_final\")];"
+        );
+    }
+    let _ = writeln!(
+        m,
+        "        tensor<int32, [4]> rout = const()[name=string(\"rout\"), val=tensor<int32, [4]>([1,{rows},1,{cols}])];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_ortho = reshape(shape=rout,x=x_final)[name=string(\"u_ortho\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> u_out = cast(dtype=to32,x=u_ortho)[name=string(\"u_out\")];"
+    );
+    let _ = writeln!(m, "    }} -> (u_out);");
+    m.push_str("}\n");
+    m
+}
+
+fn gen_muon_param_update_mil(rows: usize, cols: usize, lr: f32, wd: f32) -> String {
+    let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    let wd_scale = 1.0 - lr * wd;
+    let mut m = String::with_capacity(4096);
+    m.push_str(concat!(
+        "program(1.3)\n",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, ",
+        "{\"coremlc-version\", \"3505.4.1\"}, ",
+        "{\"coremltools-component-milinternal\", \"\"}, ",
+        "{\"coremltools-version\", \"9.0\"}})]\n",
+        "{\n",
+    ));
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> p, tensor<fp32, [1, {rows}, 1, {cols}]> u) {{"
+    );
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> ph = cast(dtype=to16,x=p)[name=string(\"ph\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> uh = cast(dtype=to16,x=u)[name=string(\"uh\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 lr = const()[name=string(\"lr\"), val=fp16({lr})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 scale = const()[name=string(\"scale\"), val=fp16({scale})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 wd_scale = const()[name=string(\"wd_scale\"), val=fp16({wd_scale})];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> p_decay = mul(x=ph,y=wd_scale)[name=string(\"p_decay\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_scaled = mul(x=uh,y=scale)[name=string(\"u_scaled\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> u_lr = mul(x=u_scaled,y=lr)[name=string(\"u_lr\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{rows},1,{cols}]> p_new = sub(x=p_decay,y=u_lr)[name=string(\"p_new\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp32, [1,{rows},1,{cols}]> p_out = cast(dtype=to32,x=p_new)[name=string(\"p_out\")];"
+    );
+    let _ = writeln!(m, "    }} -> (p_out);");
+    m.push_str("}\n");
+    m
+}
+
+impl MuonMatrixKernel {
+    fn compile(rows: usize, cols: usize, beta: f32, lr: f32, wd: f32) -> Result<Self, String> {
+        ane_bridge::ane_init()?;
+        let tensor_bytes = rows * cols * 4;
+        let momentum_kernel = AneKernel::compile(
+            &gen_muon_momentum_mil(rows, cols, beta),
+            None,
+            &[tensor_bytes, tensor_bytes],
+            &[tensor_bytes, tensor_bytes],
+        )?;
+        let ortho_kernel = AneKernel::compile(
+            &gen_muon_ortho_mil(rows, cols),
+            None,
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )?;
+        let param_kernel = AneKernel::compile(
+            &gen_muon_param_update_mil(rows, cols, lr, wd),
+            None,
+            &[tensor_bytes, tensor_bytes],
+            &[tensor_bytes],
+        )?;
+        Ok(Self {
+            momentum_kernel,
+            ortho_kernel,
+            param_kernel,
+            tensor_bytes,
+            rows,
+            cols,
+        })
+    }
+
+    fn eval(
+        &self,
+        param: &[f32],
+        grad: &[f32],
+        momentum: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        assert_eq!(param.len(), self.rows * self.cols);
+        assert_eq!(grad.len(), self.rows * self.cols);
+        assert_eq!(momentum.len(), self.rows * self.cols);
+        self.momentum_kernel
+            .write_input(0, &ane_weights::f32_slice_to_bytes(grad));
+        self.momentum_kernel
+            .write_input(1, &ane_weights::f32_slice_to_bytes(momentum));
+        self.momentum_kernel.eval()?;
+        let mut u0_out = vec![0u8; self.tensor_bytes];
+        let mut mom_out = vec![0u8; self.tensor_bytes];
+        self.momentum_kernel.read_output(0, &mut u0_out);
+        self.momentum_kernel.read_output(1, &mut mom_out);
+        let u0 = ane_weights::bytes_to_f32_vec(&u0_out);
+        let m_new = ane_weights::bytes_to_f32_vec(&mom_out);
+
+        self.ortho_kernel
+            .write_input(0, &ane_weights::f32_slice_to_bytes(&u0));
+        self.ortho_kernel.eval()?;
+        let mut u_out = vec![0u8; self.tensor_bytes];
+        self.ortho_kernel.read_output(0, &mut u_out);
+        let u_ortho = ane_weights::bytes_to_f32_vec(&u_out);
+
+        self.param_kernel
+            .write_input(0, &ane_weights::f32_slice_to_bytes(param));
+        self.param_kernel
+            .write_input(1, &ane_weights::f32_slice_to_bytes(&u_ortho));
+        self.param_kernel.eval()?;
+        let mut param_out = vec![0u8; self.tensor_bytes];
+        self.param_kernel.read_output(0, &mut param_out);
+        Ok((
+            ane_weights::bytes_to_f32_vec(&param_out),
+            m_new,
+        ))
+    }
+}
+
+pub(crate) struct AdapterMuonKernels {
+    a: MuonMatrixKernel,
+    b: MuonMatrixKernel,
+}
+
+pub struct LoraMuonKernels {
+    pub(crate) wq: Option<AdapterMuonKernels>,
+    pub(crate) wv: Option<AdapterMuonKernels>,
+    pub(crate) wo: Option<AdapterMuonKernels>,
+    pub(crate) w2: Option<AdapterMuonKernels>,
+}
+
+impl LoraMuonKernels {
+    pub fn compile(
+        lora: &LoraModel,
+        lr_attn: f32,
+        lr_ffn: f32,
+        momentum: f32,
+        wd: f32,
+    ) -> Result<Self, String> {
+        let compile_adapter =
+            |adapter: Option<&LoraAdapter>, lr: f32| -> Result<Option<AdapterMuonKernels>, String> {
+                if let Some(adapter) = adapter {
+                    Ok(Some(AdapterMuonKernels {
+                        a: MuonMatrixKernel::compile(adapter.rank, adapter.d_in, momentum, lr, wd)?,
+                        b: MuonMatrixKernel::compile(adapter.d_out, adapter.rank, momentum, lr, wd)?,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            };
+        let first_wq = lora.layers.iter().find_map(|layer| layer.wq.as_ref());
+        let first_wv = lora.layers.iter().find_map(|layer| layer.wv.as_ref());
+        let first_wo = lora.layers.iter().find_map(|layer| layer.wo.as_ref());
+        let first_w2 = lora.layers.iter().find_map(|layer| layer.w2.as_ref());
+        Ok(Self {
+            wq: compile_adapter(first_wq, lr_attn)?,
+            wv: compile_adapter(first_wv, lr_attn)?,
+            wo: compile_adapter(first_wo, lr_attn)?,
+            w2: compile_adapter(first_w2, lr_ffn)?,
+        })
+    }
+}
+
+fn update_adapter_muon(
+    adapter: &mut Option<LoraAdapter>,
+    grad: &Option<LoraAdapterGrads>,
+    state: &mut Option<LoraAdapterMuon>,
+    kernels: &Option<AdapterMuonKernels>,
+) -> Result<(), String> {
+    if let (Some(adapter), Some(grad), Some(state), Some(kernels)) = (
+        adapter.as_mut(),
+        grad.as_ref(),
+        state.as_mut(),
+        kernels.as_ref(),
+    ) {
+        let (new_a, new_ma) = kernels.a.eval(&adapter.a, &grad.da, &state.a)?;
+        let (new_b, new_mb) = kernels.b.eval(&adapter.b, &grad.db, &state.b)?;
+        adapter.a = new_a;
+        adapter.b = new_b;
+        state.a = new_ma;
+        state.b = new_mb;
+    }
+    Ok(())
+}
+
+pub fn lora_muon_update_ane(
+    lora: &mut LoraModel,
+    grads: &LoraModelGrads,
+    muon: &mut LoraModelMuon,
+    kernels: &LoraMuonKernels,
+) -> Result<(), String> {
+    for l in 0..lora.layers.len() {
+        update_adapter_muon(
+            &mut lora.layers[l].wq,
+            &grads.layers[l].wq,
+            &mut muon.layers[l].wq,
+            &kernels.wq,
+        )?;
+        update_adapter_muon(
+            &mut lora.layers[l].wv,
+            &grads.layers[l].wv,
+            &mut muon.layers[l].wv,
+            &kernels.wv,
+        )?;
+        update_adapter_muon(
+            &mut lora.layers[l].wo,
+            &grads.layers[l].wo,
+            &mut muon.layers[l].wo,
+            &kernels.wo,
+        )?;
+        update_adapter_muon(
+            &mut lora.layers[l].w2,
+            &grads.layers[l].w2,
+            &mut muon.layers[l].w2,
+            &kernels.w2,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) struct AdapterWeightGradKernels {
+    bt: AneKernel,
+    bt_out_bytes: usize,
+    da: AneKernel,
+    da_out_bytes: usize,
+    db: AneKernel,
+    db_out_bytes: usize,
+}
+
+impl AdapterWeightGradKernels {
+    fn compile(cfg: &MilConfig, adapter: &LoraAdapter) -> Result<Self, String> {
+        let bt_spec = KernelSpec::for_kernel(
+            cfg,
+            KernelType::DynMatmul {
+                ic: adapter.d_out,
+                oc: adapter.rank,
+            },
+        );
+        let bt = AneKernel::compile(
+            &bt_spec.mil_text,
+            None,
+            &[bt_spec.input_bytes],
+            &[bt_spec.output_bytes],
+        )?;
+
+        let mut da_cfg = cfg.clone();
+        da_cfg.seq_len = adapter.d_in;
+        let da_spec = KernelSpec::for_kernel(
+            &da_cfg,
+            KernelType::DynMatmul {
+                ic: cfg.seq_len,
+                oc: adapter.rank,
+            },
+        );
+        let da = AneKernel::compile(
+            &da_spec.mil_text,
+            None,
+            &[da_spec.input_bytes],
+            &[da_spec.output_bytes],
+        )?;
+
+        let mut db_cfg = cfg.clone();
+        db_cfg.seq_len = adapter.rank;
+        let db_spec = KernelSpec::for_kernel(
+            &db_cfg,
+            KernelType::DynMatmul {
+                ic: cfg.seq_len,
+                oc: adapter.d_out,
+            },
+        );
+        let db = AneKernel::compile(
+            &db_spec.mil_text,
+            None,
+            &[db_spec.input_bytes],
+            &[db_spec.output_bytes],
+        )?;
+
+        Ok(Self {
+            bt,
+            bt_out_bytes: bt_spec.output_bytes,
+            da,
+            da_out_bytes: da_spec.output_bytes,
+            db,
+            db_out_bytes: db_spec.output_bytes,
+        })
+    }
+
+    pub fn eval(
+        &self,
+        adapter: &LoraAdapter,
+        d_out_grad: &[f32],
+        x: &[f32],
+        h: &[f32],
+        seq: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let bt_input =
+            ane_weights::pack_dyn_matmul(d_out_grad, &adapter.b, adapter.d_out, adapter.rank, seq);
+        self.bt.write_input(0, &bt_input);
+        self.bt.eval()?;
+        let mut dh_out = vec![0u8; self.bt_out_bytes];
+        self.bt.read_output(0, &mut dh_out);
+        let mut dh = ane_weights::bytes_to_f32_vec(&dh_out);
+        super::ane_forward::clamp_fp16(&mut dh);
+
+        let x_t = ane_weights::transpose_weight(x, adapter.d_in, seq);
+        let dh_t = ane_weights::transpose_weight(&dh, adapter.rank, seq);
+        let da_input = ane_weights::pack_dyn_matmul(&x_t, &dh_t, seq, adapter.rank, adapter.d_in);
+        self.da.write_input(0, &da_input);
+        self.da.eval()?;
+        let mut da_out = vec![0u8; self.da_out_bytes];
+        self.da.read_output(0, &mut da_out);
+        let da = ane_weights::bytes_to_f32_vec(&da_out);
+
+        let h_t = ane_weights::transpose_weight(h, adapter.rank, seq);
+        let dout_t = ane_weights::transpose_weight(d_out_grad, adapter.d_out, seq);
+        let db_input =
+            ane_weights::pack_dyn_matmul(&h_t, &dout_t, seq, adapter.d_out, adapter.rank);
+        self.db.write_input(0, &db_input);
+        self.db.eval()?;
+        let mut db_out = vec![0u8; self.db_out_bytes];
+        self.db.read_output(0, &mut db_out);
+        let db = ane_weights::bytes_to_f32_vec(&db_out);
+
+        Ok((da, db))
+    }
+}
+
+pub struct LoraWeightGradKernels {
+    pub(crate) wq: Option<AdapterWeightGradKernels>,
+    pub(crate) wv: Option<AdapterWeightGradKernels>,
+    pub(crate) wo: Option<AdapterWeightGradKernels>,
+    pub(crate) w2: Option<AdapterWeightGradKernels>,
+}
+
+impl LoraWeightGradKernels {
+    pub fn compile(cfg: &MilConfig, lora: &LoraModel) -> Result<Self, String> {
+        let compile_adapter =
+            |adapter: Option<&LoraAdapter>| -> Result<Option<AdapterWeightGradKernels>, String> {
+                if let Some(adapter) = adapter {
+                    AdapterWeightGradKernels::compile(cfg, adapter).map(Some)
+                } else {
+                    Ok(None)
+                }
+            };
+        Ok(Self {
+            wq: compile_adapter(lora.layers.iter().find_map(|layer| layer.wq.as_ref()))?,
+            wv: compile_adapter(lora.layers.iter().find_map(|layer| layer.wv.as_ref()))?,
+            wo: compile_adapter(lora.layers.iter().find_map(|layer| layer.wo.as_ref()))?,
+            w2: compile_adapter(lora.layers.iter().find_map(|layer| layer.w2.as_ref()))?,
+        })
     }
 }
 
@@ -1089,6 +2040,7 @@ pub fn load_lora_bin(path: &Path) -> io::Result<LoraModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ane_forward;
 
     #[test]
     fn test_lora_adapter_new_shapes() {
@@ -1241,6 +2193,36 @@ mod tests {
         }
         grads.zero();
         assert_eq!(grads.layers[0].w2.as_ref().unwrap().da[0], 0.0);
+    }
+
+    #[test]
+    fn test_lora_grads_add_from_and_scale() {
+        let cfg = LoraConfig {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["w2".into()],
+        };
+        let lora = LoraModel::new(cfg, 1, 4, 8);
+        let mut accum = LoraModelGrads::zeros(&lora);
+        let mut g1 = LoraModelGrads::zeros(&lora);
+        let mut g2 = LoraModelGrads::zeros(&lora);
+        // g1: da[0]=3.0, db[0]=1.0
+        g1.layers[0].w2.as_mut().unwrap().da[0] = 3.0;
+        g1.layers[0].w2.as_mut().unwrap().db[0] = 1.0;
+        // g2: da[0]=5.0, db[0]=3.0
+        g2.layers[0].w2.as_mut().unwrap().da[0] = 5.0;
+        g2.layers[0].w2.as_mut().unwrap().db[0] = 3.0;
+
+        accum.add_from(&g1);
+        accum.add_from(&g2);
+        // accum: da[0]=8.0, db[0]=4.0
+        assert_eq!(accum.layers[0].w2.as_ref().unwrap().da[0], 8.0);
+        assert_eq!(accum.layers[0].w2.as_ref().unwrap().db[0], 4.0);
+
+        accum.scale(0.5);
+        // averaged: da[0]=4.0, db[0]=2.0
+        assert_eq!(accum.layers[0].w2.as_ref().unwrap().da[0], 4.0);
+        assert_eq!(accum.layers[0].w2.as_ref().unwrap().db[0], 2.0);
     }
 
     #[test]
@@ -1429,6 +2411,438 @@ mod tests {
         assert!(max_db_err < 0.5, "dB max error: {max_db_err}");
     }
 
+    fn muon_update_cpu_reference(
+        param: &[f32],
+        grad: &[f32],
+        momentum: &[f32],
+        rows: usize,
+        cols: usize,
+        beta: f32,
+        lr: f32,
+        wd: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut m_new = vec![0.0f32; param.len()];
+        let one_minus_beta = 1.0 - beta;
+        for i in 0..param.len() {
+            m_new[i] = beta * momentum[i] + one_minus_beta * grad[i];
+        }
+        let mut update = vec![0.0f32; grad.len()];
+        for i in 0..grad.len() {
+            update[i] = beta * m_new[i] + one_minus_beta * grad[i];
+        }
+
+        let transpose = rows > cols;
+        let ortho_rows = rows.min(cols);
+        let ortho_cols = rows.max(cols);
+        let mut x = if transpose {
+            ane_weights::transpose_weight(&update, rows, cols)
+        } else {
+            update.clone()
+        };
+        let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(MUON_EPS) * MUON_NORM_PAD;
+        for v in &mut x {
+            *v /= norm;
+        }
+        for &(a_coeff, b_coeff, c_coeff) in MUON_POLAR_EXPRESS_COEFFS.iter().take(MUON_NS_STEPS) {
+            let x_t = ane_weights::transpose_weight(&x, ortho_rows, ortho_cols);
+            let a = ane_forward::cpu_matmul(&x, &x_t, ortho_rows, ortho_cols, ortho_rows);
+            let a2 = ane_forward::cpu_matmul(&a, &a, ortho_rows, ortho_rows, ortho_rows);
+            let mut bmix = vec![0.0f32; ortho_rows * ortho_rows];
+            for i in 0..bmix.len() {
+                bmix[i] = b_coeff * a[i] + c_coeff * a2[i];
+            }
+            let bx = ane_forward::cpu_matmul(&bmix, &x, ortho_rows, ortho_rows, ortho_cols);
+            for i in 0..x.len() {
+                x[i] = a_coeff * x[i] + bx[i];
+            }
+        }
+        let update_ortho = if transpose {
+            ane_weights::transpose_weight(&x, ortho_rows, ortho_cols)
+        } else {
+            x
+        };
+        let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+        let mut p_new = param.to_vec();
+        for i in 0..p_new.len() {
+            p_new[i] = p_new[i] * (1.0 - lr * wd) - lr * scale * update_ortho[i];
+        }
+        (p_new, m_new)
+    }
+
+    #[test]
+    fn test_lora_weight_grads_ane_match_cpu() {
+        let mil_cfg = MilConfig::mha(64, 128, 4, 16);
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig {
+                rank: 16,
+                ..LoraConfig::default()
+            },
+            1,
+            64,
+            64,
+            64,
+            64,
+            128,
+        );
+        let kernels = match LoraWeightGradKernels::compile(&mil_cfg, &lora) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping ANE LoRA weight-grad test: {e}");
+                return;
+            }
+        };
+
+        let adapter = lora.layers[0].wo.as_mut().unwrap();
+        for v in adapter.b.iter_mut() {
+            *v = 0.01;
+        }
+        let seq = 16;
+        let x: Vec<f32> = (0..adapter.d_in * seq)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let (_, h) = adapter.forward_cpu(&x, seq);
+        let d_out_grad: Vec<f32> = (0..adapter.d_out * seq)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let (_dx_cpu, da_cpu, db_cpu) = adapter.backward_cpu(&d_out_grad, &x, &h, seq);
+        let (da_ane, db_ane) = kernels
+            .wo
+            .as_ref()
+            .unwrap()
+            .eval(adapter, &d_out_grad, &x, &h, seq)
+            .expect("ANE weight grads failed");
+
+        let max_da_err = da_cpu
+            .iter()
+            .zip(da_ane.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_db_err = db_cpu
+            .iter()
+            .zip(db_ane.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_da_err < 0.5, "ANE dA max error: {max_da_err}");
+        assert!(max_db_err < 0.5, "ANE dB max error: {max_db_err}");
+    }
+
+    #[test]
+    fn test_muon_matrix_kernel_matches_cpu_reference() {
+        let rows = 32;
+        let cols = 64;
+        let beta = 0.95;
+        let lr = 0.02;
+        let wd = 0.01;
+        let kernel = match MuonMatrixKernel::compile(rows, cols, beta, lr, wd) {
+            Ok(kernel) => kernel,
+            Err(e) => {
+                eprintln!("Skipping ANE Muon kernel test: {e}");
+                return;
+            }
+        };
+
+        let param: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.007).sin()).collect();
+        let grad: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.011).cos()).collect();
+        let momentum: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.013).sin() * 0.1)
+            .collect();
+
+        let (cpu_param, cpu_mom) =
+            muon_update_cpu_reference(&param, &grad, &momentum, rows, cols, beta, lr, wd);
+        let (ane_param, ane_mom) = kernel
+            .eval(&param, &grad, &momentum)
+            .expect("ANE Muon update failed");
+
+        let max_mom_err = cpu_mom
+            .iter()
+            .zip(ane_mom.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let cpu_delta: Vec<f32> = param
+            .iter()
+            .zip(cpu_param.iter())
+            .map(|(before, after)| before - after)
+            .collect();
+        let ane_delta: Vec<f32> = param
+            .iter()
+            .zip(ane_param.iter())
+            .map(|(before, after)| before - after)
+            .collect();
+        let dot = cpu_delta
+            .iter()
+            .zip(ane_delta.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        let cpu_norm = cpu_delta.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let ane_norm = ane_delta.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cosine = dot / (cpu_norm * ane_norm).max(1e-8);
+        let max_param_err = cpu_param
+            .iter()
+            .zip(ane_param.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let wrong_order_delta: Vec<f32> = param
+            .iter()
+            .zip(ane_mom.iter())
+            .map(|(before, after)| before - after)
+            .collect();
+        let wrong_order_cosine = cpu_delta
+            .iter()
+            .zip(wrong_order_delta.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            / (cpu_norm
+                * wrong_order_delta
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    .sqrt())
+                .max(1e-8);
+
+        eprintln!(
+            "ANE Muon debug: cosine={cosine:.4} max_param_err={max_param_err:.4} max_mom_err={max_mom_err:.4} wrong_order_cosine={wrong_order_cosine:.4}"
+        );
+
+        assert!(
+            cosine > 0.9,
+            "ANE Muon update direction drifted too far: cosine={cosine:.4}"
+        );
+        assert!(max_mom_err < 0.1, "ANE Muon momentum max error: {max_mom_err}");
+    }
+
+    #[test]
+    fn test_muon_l2_norm_matches_cpu_reference() {
+        let rows = 32usize;
+        let cols = 64usize;
+        let mut mil = String::new();
+        mil.push_str("program(1.3)\n");
+        mil.push_str("[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n");
+        mil.push_str("{\n");
+        let _ = writeln!(
+            mil,
+            "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> x) {{"
+        );
+        mil.push_str("        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n");
+        mil.push_str("        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n");
+        let _ = writeln!(
+            mil,
+            "        fp16 eps = const()[name=string(\"eps\"), val=fp16({})];",
+            MUON_EPS
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,{rows},1,{cols}]> xh = cast(dtype=to16,x=x)[name=string(\"xh\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<int32, [4]> r = const()[name=string(\"r\"), val=tensor<int32, [4]>([1,1,{rows},{cols}])];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<int32, [4]> rout = const()[name=string(\"rout\"), val=tensor<int32, [4]>([1,{rows},1,{cols}])];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> xr = reshape(shape=r,x=xh)[name=string(\"xr\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> xn = l2_norm(x=xr,epsilon=eps)[name=string(\"xn\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,{rows},1,{cols}]> xo = reshape(shape=rout,x=xn)[name=string(\"xo\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp32, [1,{rows},1,{cols}]> y = cast(dtype=to32,x=xo)[name=string(\"y\")];"
+        );
+        mil.push_str("    } -> (y);\n");
+        mil.push_str("}\n");
+        let tensor_bytes = rows * cols * 4;
+        if let Err(e) = ane_bridge::ane_init() {
+            eprintln!("Skipping ANE l2_norm Muon test: {e}");
+            return;
+        }
+        let kernel = match AneKernel::compile(&mil, None, &[tensor_bytes], &[tensor_bytes]) {
+            Ok(kernel) => kernel,
+            Err(e) => {
+                eprintln!("Skipping ANE l2_norm Muon test: {e}");
+                return;
+            }
+        };
+
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.011).sin() * 0.5 + (i as f32 * 0.003).cos())
+            .collect();
+        kernel.write_input(0, &ane_weights::f32_slice_to_bytes(&x));
+        if let Err(e) = kernel.eval() {
+            eprintln!("Skipping ANE l2_norm Muon test after eval failure: {e}");
+            return;
+        }
+        let mut out = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut out);
+        let y = ane_weights::bytes_to_f32_vec(&out);
+
+        let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt().max(MUON_EPS);
+        let y_cpu: Vec<f32> = x.iter().map(|v| *v / norm).collect();
+        let max_err = y
+            .iter()
+            .zip(y_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.02, "ANE l2_norm max error: {max_err}");
+    }
+
+    #[test]
+    fn test_muon_polar_step_matches_cpu_reference() {
+        let rows = 32usize;
+        let cols = 64usize;
+        let (a_coeff, b_coeff, c_coeff) = MUON_POLAR_EXPRESS_COEFFS[0];
+        let mut mil = String::new();
+        mil.push_str("program(1.3)\n");
+        mil.push_str("[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n");
+        mil.push_str("{\n");
+        let _ = writeln!(
+            mil,
+            "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> x) {{"
+        );
+        mil.push_str("        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n");
+        mil.push_str("        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n");
+        let _ = writeln!(
+            mil,
+            "        fp16 a = const()[name=string(\"a\"), val=fp16({a_coeff})];"
+        );
+        let _ = writeln!(
+            mil,
+            "        fp16 b = const()[name=string(\"b\"), val=fp16({b_coeff})];"
+        );
+        let _ = writeln!(
+            mil,
+            "        fp16 c = const()[name=string(\"c\"), val=fp16({c_coeff})];"
+        );
+        mil.push_str("        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n");
+        mil.push_str("        bool bT = const()[name=string(\"bT\"), val=bool(true)];\n");
+        let _ = writeln!(
+            mil,
+            "        tensor<int32, [4]> r = const()[name=string(\"r\"), val=tensor<int32, [4]>([1,1,{rows},{cols}])];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<int32, [4]> rout = const()[name=string(\"rout\"), val=tensor<int32, [4]>([1,{rows},1,{cols}])];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,{rows},1,{cols}]> xh = cast(dtype=to16,x=x)[name=string(\"xh\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> xr = reshape(shape=r,x=xh)[name=string(\"xr\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{rows}]> a0 = matmul(transpose_x=bF,transpose_y=bT,x=xr,y=xr)[name=string(\"a0\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{rows}]> a2 = matmul(transpose_x=bF,transpose_y=bF,x=a0,y=a0)[name=string(\"a2\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{rows}]> ba = mul(x=a0,y=b)[name=string(\"ba\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{rows}]> ca = mul(x=a2,y=c)[name=string(\"ca\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{rows}]> bb = add(x=ba,y=ca)[name=string(\"bb\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> bx = matmul(transpose_x=bF,transpose_y=bF,x=bb,y=xr)[name=string(\"bx\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> ax = mul(x=xr,y=a)[name=string(\"ax\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,1,{rows},{cols}]> x1 = add(x=ax,y=bx)[name=string(\"x1\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp16, [1,{rows},1,{cols}]> xo = reshape(shape=rout,x=x1)[name=string(\"xo\")];"
+        );
+        let _ = writeln!(
+            mil,
+            "        tensor<fp32, [1,{rows},1,{cols}]> y = cast(dtype=to32,x=xo)[name=string(\"y\")];"
+        );
+        mil.push_str("    } -> (y);\n");
+        mil.push_str("}\n");
+
+        let tensor_bytes = rows * cols * 4;
+        if let Err(e) = ane_bridge::ane_init() {
+            eprintln!("Skipping ANE Muon polar-step test: {e}");
+            return;
+        }
+        let kernel = match AneKernel::compile(&mil, None, &[tensor_bytes], &[tensor_bytes]) {
+            Ok(kernel) => kernel,
+            Err(e) => {
+                eprintln!("Skipping ANE Muon polar-step test: {e}");
+                return;
+            }
+        };
+
+        let x_raw: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.009).sin() + (i as f32 * 0.004).cos() * 0.25)
+            .collect();
+        let norm = x_raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(MUON_EPS) * MUON_NORM_PAD;
+        let x: Vec<f32> = x_raw.iter().map(|v| *v / norm).collect();
+
+        kernel.write_input(0, &ane_weights::f32_slice_to_bytes(&x));
+        if let Err(e) = kernel.eval() {
+            eprintln!("Skipping ANE Muon polar-step test after eval failure: {e}");
+            return;
+        }
+        let mut out = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut out);
+        let y = ane_weights::bytes_to_f32_vec(&out);
+
+        let a = ane_forward::cpu_matmul(&x, &ane_weights::transpose_weight(&x, rows, cols), rows, cols, rows);
+        let a2 = ane_forward::cpu_matmul(&a, &a, rows, rows, rows);
+        let mut bb = vec![0.0f32; rows * rows];
+        for i in 0..bb.len() {
+            bb[i] = b_coeff * a[i] + c_coeff * a2[i];
+        }
+        let bx = ane_forward::cpu_matmul(&bb, &x, rows, rows, cols);
+        let mut y_cpu = vec![0.0f32; rows * cols];
+        for i in 0..y_cpu.len() {
+            y_cpu[i] = a_coeff * x[i] + bx[i];
+        }
+
+        let max_err = y
+            .iter()
+            .zip(y_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.1, "ANE Muon polar-step max error: {max_err}");
+    }
+
+    #[test]
+    fn test_muon_matrix_kernel_compiles_for_rank_downproj_shape() {
+        let rows = 1024;
+        let cols = 32;
+        match MuonMatrixKernel::compile(rows, cols, 0.95, 2.5e-4, 0.01) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Skipping/downproj compile failed: {e}");
+                panic!("ANE Muon downproj shape should compile");
+            }
+        }
+    }
+
     // --- ANE dimension validation tests ---
 
     #[test]
@@ -1614,16 +3028,30 @@ mod tests {
 
         // Split: attn gets 0.05x, FFN gets 1.0x
         lora_adam_update_split_lr(
-            &mut lora_split, &grads, &mut adam_split,
-            1, base_lr, 0.05, 1.0,
-            0.9, 0.999, 1e-8, 0.0,
+            &mut lora_split,
+            &grads,
+            &mut adam_split,
+            1,
+            base_lr,
+            0.05,
+            1.0,
+            0.9,
+            0.999,
+            1e-8,
+            0.0,
         );
 
         // Uniform: everything at 1.0x
         lora_adam_update(
-            &mut lora_uniform, &grads, &mut adam_uniform,
-            1, base_lr,
-            0.9, 0.999, 1e-8, 0.0,
+            &mut lora_uniform,
+            &grads,
+            &mut adam_uniform,
+            1,
+            base_lr,
+            0.9,
+            0.999,
+            1e-8,
+            0.0,
         );
 
         // FFN (w2) should get identical updates under both
@@ -1642,19 +3070,26 @@ mod tests {
         // The uniform model moved more than the split model (5x more)
         // since Adam step 1 with beta1=0.9 b2=0.999: the update magnitude
         // is proportional to lr. Compare the total displacement.
-        let split_delta: f32 = split_wq_a.iter()
+        let split_delta: f32 = split_wq_a
+            .iter()
             .zip(lora_split.layers[0].wq.as_ref().unwrap().a.iter())
             .map(|(a, _)| a.abs())
             .sum();
-        let uniform_delta: f32 = uniform_wq_a.iter()
+        let uniform_delta: f32 = uniform_wq_a
+            .iter()
             .zip(lora_uniform.layers[0].wq.as_ref().unwrap().a.iter())
             .map(|(a, _)| a.abs())
             .sum();
         // With 0.05x scale, attn update should differ from 1.0x
         // They can't be equal
-        let wq_differs = split_wq_a.iter().zip(uniform_wq_a.iter())
+        let wq_differs = split_wq_a
+            .iter()
+            .zip(uniform_wq_a.iter())
             .any(|(s, u)| (s - u).abs() > 1e-10);
-        assert!(wq_differs, "wq should get different updates with 0.05x attn scale");
+        assert!(
+            wq_differs,
+            "wq should get different updates with 0.05x attn scale"
+        );
     }
 
     // --- Micro-benchmarks (run with `cargo test --features ane --release -- bench_ --nocapture`) ---

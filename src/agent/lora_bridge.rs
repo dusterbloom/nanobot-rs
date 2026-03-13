@@ -215,11 +215,9 @@ impl ExperienceBuffer {
 
     /// Get the ID of the most recently inserted experience.
     pub fn last_experience_id(&self) -> Result<Option<i64>> {
-        let id: Option<i64> = self.conn.query_row(
-            "SELECT MAX(id) FROM experiences",
-            [],
-            |r| r.get(0),
-        )?;
+        let id: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(id) FROM experiences", [], |r| r.get(0))?;
         Ok(id)
     }
 
@@ -1103,12 +1101,8 @@ pub fn merge_lora_to_disk(
         &std::fs::read_to_string(&adapter_config_path)
             .with_context(|| format!("reading {}", adapter_config_path.display()))?,
     )?;
-    let rank = adapter_config["rank"]
-        .as_f64()
-        .unwrap_or(32.0);
-    let alpha = adapter_config["alpha"]
-        .as_f64()
-        .unwrap_or(rank);
+    let rank = adapter_config["rank"].as_f64().unwrap_or(32.0);
+    let alpha = adapter_config["alpha"].as_f64().unwrap_or(rank);
     let scale = alpha / rank;
 
     info!(
@@ -1247,9 +1241,7 @@ pub fn merge_lora_to_disk(
     _adapter_dir: &Path,
     _output_dir: &Path,
 ) -> Result<MergeResult> {
-    anyhow::bail!(
-        "LoRA merge requires the 'mlx' feature. Rebuild with: cargo build --features mlx"
-    )
+    anyhow::bail!("LoRA merge requires the 'mlx' feature. Rebuild with: cargo build --features mlx")
 }
 
 // =============================================================================
@@ -1883,20 +1875,39 @@ mod tests {
     fn test_compute_quality_all_tools_ok() {
         use crate::agent::audit::TurnToolEntry;
         let entries = vec![
-            TurnToolEntry { name: "read_file".into(), id: "c1".into(), ok: true, duration_ms: 50, result_chars: 100 },
-            TurnToolEntry { name: "exec_command".into(), id: "c2".into(), ok: true, duration_ms: 200, result_chars: 500 },
+            TurnToolEntry {
+                name: "read_file".into(),
+                id: "c1".into(),
+                ok: true,
+                duration_ms: 50,
+                result_chars: 100,
+            },
+            TurnToolEntry {
+                name: "exec_command".into(),
+                id: "c2".into(),
+                ok: true,
+                duration_ms: 200,
+                result_chars: 500,
+            },
         ];
         let q = compute_quality(&entries, 2, 10, false, 200);
         // base 0.2 + tools_ok 0.3 + efficiency 0.2*(1-0.2)=0.16 + response 0.2 = 0.86
-        assert!(q > 0.8, "all-ok tools + efficient + long response → high quality, got {q}");
+        assert!(
+            q > 0.8,
+            "all-ok tools + efficient + long response → high quality, got {q}"
+        );
     }
 
     #[test]
     fn test_compute_quality_tool_failure() {
         use crate::agent::audit::TurnToolEntry;
-        let entries = vec![
-            TurnToolEntry { name: "exec_command".into(), id: "c1".into(), ok: false, duration_ms: 100, result_chars: 50 },
-        ];
+        let entries = vec![TurnToolEntry {
+            name: "exec_command".into(),
+            id: "c1".into(),
+            ok: false,
+            duration_ms: 100,
+            result_chars: 50,
+        }];
         let q = compute_quality(&entries, 5, 10, false, 200);
         // base 0.2 + tools_ok 0.0 + efficiency 0.2*0.5=0.1 + response 0.2 = 0.5
         assert!(q < 0.6, "tool failure → lower quality, got {q}");
@@ -1906,7 +1917,10 @@ mod tests {
     fn test_compute_quality_simple_chat() {
         let q = compute_quality(&[], 1, 10, false, 100);
         // base 0.2 + no_tools 0.15 + efficiency 0.2*0.9=0.18 + response 0.2 = 0.73
-        assert!(q > 0.6 && q < 0.85, "simple chat → medium-high quality, got {q}");
+        assert!(
+            q > 0.6 && q < 0.85,
+            "simple chat → medium-high quality, got {q}"
+        );
     }
 
     #[test]
@@ -1914,15 +1928,33 @@ mod tests {
         use crate::agent::audit::TurnToolEntry;
         // Worst case: tool failure, max iterations, short response, no reasoning
         let worst = compute_quality(
-            &[TurnToolEntry { name: "x".into(), id: "c".into(), ok: false, duration_ms: 0, result_chars: 0 }],
-            10, 10, false, 5,
+            &[TurnToolEntry {
+                name: "x".into(),
+                id: "c".into(),
+                ok: false,
+                duration_ms: 0,
+                result_chars: 0,
+            }],
+            10,
+            10,
+            false,
+            5,
         );
         assert!(worst >= 0.2 && worst <= 1.0, "worst={worst}");
 
         // Best case: tools ok, 1 iteration, reasoning, long response
         let best = compute_quality(
-            &[TurnToolEntry { name: "x".into(), id: "c".into(), ok: true, duration_ms: 0, result_chars: 0 }],
-            1, 10, true, 500,
+            &[TurnToolEntry {
+                name: "x".into(),
+                id: "c".into(),
+                ok: true,
+                duration_ms: 0,
+                result_chars: 0,
+            }],
+            1,
+            10,
+            true,
+            500,
         );
         assert!(best >= 0.9 && best <= 1.0, "best={best}");
     }

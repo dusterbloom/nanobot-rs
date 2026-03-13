@@ -359,7 +359,8 @@ fn split_fused_gate_up(
     group_size: i32,
     bits: i32,
 ) -> Result<(QuantizedLinear, QuantizedLinear), anyhow::Error> {
-    let fused = load_quantized_linear(weights, &format!("{prefix}.gate_up_proj"), group_size, bits)?;
+    let fused =
+        load_quantized_linear(weights, &format!("{prefix}.gate_up_proj"), group_size, bits)?;
 
     // Split weight [2*H, packed_cols], scales [2*H, n_groups], biases [2*H, n_groups] at row midpoint
     let w_parts = fused.inner.weight.split(2, 0)?;
@@ -890,11 +891,7 @@ impl ModelConfig {
             || dir_name.contains("reasoning")
             || dir_name.contains("distill");
 
-        let is_moe = tc
-            .get("num_experts")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 1;
+        let is_moe = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) > 1;
 
         tracing::info!(
             model_type,
@@ -1659,12 +1656,15 @@ impl MlxLoraMLP {
         let bits = cfg.bits;
 
         // Fallback chain: dense → shared_expert (MoE) → fused gate_up_proj
-        let mut try_load_mlp = |pfx: &str| -> Option<(QuantizedLinear, QuantizedLinear, QuantizedLinear)> {
-            let g = load_quantized_linear(weights, &format!("{pfx}.gate_proj"), gs, bits).ok()?;
-            let u = load_quantized_linear(weights, &format!("{pfx}.up_proj"), gs, bits).ok()?;
-            let d = load_quantized_linear(weights, &format!("{pfx}.down_proj"), gs, bits).ok()?;
-            Some((g, u, d))
-        };
+        let mut try_load_mlp =
+            |pfx: &str| -> Option<(QuantizedLinear, QuantizedLinear, QuantizedLinear)> {
+                let g =
+                    load_quantized_linear(weights, &format!("{pfx}.gate_proj"), gs, bits).ok()?;
+                let u = load_quantized_linear(weights, &format!("{pfx}.up_proj"), gs, bits).ok()?;
+                let d =
+                    load_quantized_linear(weights, &format!("{pfx}.down_proj"), gs, bits).ok()?;
+                Some((g, u, d))
+            };
         let (gate_proj, up_proj, down_proj_base) = if let Some(mlp) = try_load_mlp(prefix) {
             mlp
         } else {
@@ -1926,8 +1926,12 @@ impl MlxLinearAttention {
         let mut outputs: Vec<Array> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            let g_t = g.index((.., t, .., ..)).reshape(&[batch, h_k, kv_repeat, 1, 1])?;
-            let beta_t = beta.index((.., t, .., ..)).reshape(&[batch, h_k, kv_repeat, 1])?;
+            let g_t = g
+                .index((.., t, .., ..))
+                .reshape(&[batch, h_k, kv_repeat, 1, 1])?;
+            let beta_t = beta
+                .index((.., t, .., ..))
+                .reshape(&[batch, h_k, kv_repeat, 1])?;
             let q_t = q.index((.., t, .., ..)).reshape(&[batch, h_k, 1, 1, d_k])?;
             let k_t = k.index((.., t, .., ..)).reshape(&[batch, h_k, 1, 1, d_k])?;
             let v_t = v.index((.., t, .., .., ..)); // [B, H_k, R, D_v]
@@ -1947,7 +1951,10 @@ impl MlxLinearAttention {
         let y = mlx_rs::ops::stack_axis(&outputs, 1)?;
 
         // 7. RMSNormGated: norm on last dim (D_v), then silu(z) * normed
-        let z = self.in_proj_z.forward(x)?.reshape(&[batch, seq_len, h_v, d_v])?;
+        let z = self
+            .in_proj_z
+            .forward(x)?
+            .reshape(&[batch, seq_len, h_v, d_v])?;
         let y_flat = y.reshape(&[-1, d_v])?;
         let y_normed = self
             .norm
@@ -4338,6 +4345,83 @@ pub fn export_adapters(
     Ok(n_params)
 }
 
+/// Export ANE-trained LoRA weights directly in mlx-lm adapter format.
+///
+/// Unlike [`export_adapters`], this does not require an in-process MLX model.
+/// It writes the same `adapters.safetensors` + `adapter_config.json` pair from
+/// the ANE LoRA tensors so managed mlx-lm inference can reload them live.
+#[cfg(feature = "ane")]
+pub fn export_ane_adapters(
+    lora: &crate::agent::ane_lora::LoraModel,
+    model_config: &ModelConfig,
+    linear_attn_indices: Option<&[usize]>,
+    output_dir: &Path,
+) -> Result<usize, anyhow::Error> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let linear = linear_attn_indices.unwrap_or(&model_config.linear_attn_indices);
+    let pfx = model_config.weight_prefix;
+    let mut tensors: Vec<(String, Array)> = Vec::new();
+
+    for (layer_idx, layer) in lora.layers.iter().enumerate() {
+        let is_linear = linear.contains(&layer_idx);
+
+        let mut push_adapter = |path: &str, adapter: &crate::agent::ane_lora::LoraAdapter| {
+            tensors.push((
+                format!("{pfx}.layers.{layer_idx}.{path}.lora_a.weight"),
+                Array::from_slice(&adapter.a, &[adapter.rank as i32, adapter.d_in as i32]),
+            ));
+            tensors.push((
+                format!("{pfx}.layers.{layer_idx}.{path}.lora_b.weight"),
+                Array::from_slice(&adapter.b, &[adapter.d_out as i32, adapter.rank as i32]),
+            ));
+        };
+
+        if !is_linear {
+            if let Some(adapter) = &layer.wq {
+                push_adapter("self_attn.q_proj", adapter);
+            }
+            if let Some(adapter) = &layer.wv {
+                push_adapter("self_attn.v_proj", adapter);
+            }
+            if let Some(adapter) = &layer.wo {
+                push_adapter("self_attn.o_proj", adapter);
+            }
+        }
+
+        if let Some(adapter) = &layer.w2 {
+            push_adapter("mlp.down_proj", adapter);
+        }
+    }
+
+    let n_params = tensors.len();
+    let safetensors_path = output_dir.join("adapters.safetensors");
+    Array::save_safetensors(
+        tensors.iter().map(|(k, v)| (k.as_str(), v)),
+        None,
+        &safetensors_path,
+    )
+    .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
+
+    let lora_layers = (0..model_config.n_layers)
+        .filter(|i| !model_config.is_linear_attn_layer(*i))
+        .count();
+    let adapter_config = serde_json::json!({
+        "alpha": lora.config.alpha,
+        "dropout": 0.0,
+        "keys": LORA_KEYS,
+        "lora_layers": lora_layers,
+        "rank": lora.config.rank,
+        "num_layers": model_config.n_layers,
+    });
+    let config_path = output_dir.join("adapter_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+
+    tracing::info!(tensors = n_params, path = %output_dir.display(), "exported ANE adapter tensors");
+
+    Ok(n_params)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5117,6 +5201,76 @@ mod tests {
         assert_eq!(config_json["num_layers"], 24);
 
         eprintln!("exported {} adapter tensors (Qwen3.5-2B)", n);
+    }
+
+    #[cfg(feature = "ane")]
+    #[test]
+    fn test_export_ane_adapters_qwen3_5_2b_layout() {
+        let cfg = ModelConfig::qwen3_5_2b();
+        let lora = crate::agent::ane_lora::LoraModel::with_full_dims(
+            crate::agent::ane_lora::LoraConfig::default(),
+            cfg.n_layers,
+            cfg.dim,
+            cfg.n_kv_heads * cfg.head_dim,
+            cfg.n_heads * cfg.head_dim,
+            if cfg.attn_output_gate {
+                2 * cfg.n_heads * cfg.head_dim
+            } else {
+                cfg.n_heads * cfg.head_dim
+            },
+            cfg.hidden_dim,
+        );
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let n = export_ane_adapters(&lora, &cfg, Some(&cfg.linear_attn_indices), tmpdir.path())
+            .expect("ANE export failed");
+
+        assert_eq!(
+            n, 84,
+            "Qwen3.5-2B ANE export should match mlx-lm tensor count"
+        );
+
+        let st_path = tmpdir.path().join("adapters.safetensors");
+        let loaded = Array::load_safetensors(&st_path).expect("load back failed");
+        assert_eq!(loaded.len(), n);
+
+        for key in loaded.keys() {
+            assert!(
+                key.starts_with("language_model.model.layers."),
+                "key should start with Qwen3.5 weight prefix, got: {key}"
+            );
+            assert!(
+                key.ends_with(".weight"),
+                "key should end with .weight, got: {key}"
+            );
+        }
+        assert!(
+            loaded
+                .keys()
+                .any(|k| k.contains(".mlp.down_proj.lora_a.weight")),
+            "expected down_proj LoRA weights in export"
+        );
+        assert!(
+            !loaded
+                .keys()
+                .any(|k| k.contains(".layers.0.self_attn.q_proj.lora_a.weight")),
+            "linear-attention layers should not export attention LoRA weights"
+        );
+        assert!(
+            loaded
+                .keys()
+                .any(|k| k.contains(".layers.3.self_attn.q_proj.lora_a.weight")),
+            "full-attention layers should export attention LoRA weights"
+        );
+
+        let config_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config_json["rank"], 32);
+        assert_eq!(config_json["alpha"], 32.0);
+        assert_eq!(config_json["lora_layers"], 6);
+        assert_eq!(config_json["num_layers"], 24);
     }
 
     /// Regression test: train on a real-length tokenized sequence (64 tokens)

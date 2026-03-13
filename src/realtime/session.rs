@@ -223,7 +223,11 @@ impl RealtimeSession {
         tracing::info!(
             "TTS ready (en: {}, multi: {})",
             if tts_en.is_some() { "Pocket" } else { "none" },
-            if tts_multi.is_some() { "Kokoro" } else { "none" },
+            if tts_multi.is_some() {
+                "Kokoro"
+            } else {
+                "none"
+            },
         );
 
         Ok(Self {
@@ -457,10 +461,7 @@ impl RealtimeSession {
         Option<Arc<Mutex<TextToSpeech>>>,
         Option<Arc<Mutex<TextToSpeech>>>,
     ) {
-        (
-            self.tts_en.clone(),
-            self.tts_multi.clone(),
-        )
+        (self.tts_en.clone(), self.tts_multi.clone())
     }
 
     /// Check if SmartTurn is available.

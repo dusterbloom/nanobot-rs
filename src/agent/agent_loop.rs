@@ -220,6 +220,14 @@ impl AgentLoop {
                     mlx_provider: None,
                     training_counters: None,
                     ane_model_dir: None,
+                    #[cfg(all(feature = "ane", feature = "mlx"))]
+                    ane_trainer: None,
+                    #[cfg(all(feature = "ane", feature = "mlx"))]
+                    ane_optimizer_override: None,
+                    #[cfg(all(feature = "ane", feature = "mlx"))]
+                    ane_lr_override: None,
+                    #[cfg(all(feature = "ane", feature = "mlx"))]
+                    ane_strict_ane: false,
                 })
             },
             #[cfg(feature = "cluster")]
@@ -234,6 +242,10 @@ impl AgentLoop {
             #[cfg(feature = "mlx")]
             mlx_provider: None,
             ane_model_dir: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: Some(Arc::new(
+                crate::agent::ane_mlx_bridge::PersistentAneTrainer::new(),
+            )),
         });
         // Rebuild learn_loop now that shared fields are accessible.
         {
@@ -246,6 +258,14 @@ impl AgentLoop {
                 mlx_provider: s.mlx_provider.clone(),
                 training_counters: Some(s.core_handle.counters.clone()),
                 ane_model_dir: s.ane_model_dir.clone(),
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_trainer: s.ane_trainer.clone(),
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_optimizer_override: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_lr_override: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_strict_ane: false,
             });
         }
 
@@ -274,6 +294,14 @@ impl AgentLoop {
             mlx_provider: shared.mlx_provider.clone(),
             training_counters: Some(shared.core_handle.counters.clone()),
             ane_model_dir: shared.ane_model_dir.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: shared.ane_trainer.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
         });
     }
 
@@ -291,6 +319,14 @@ impl AgentLoop {
             mlx_provider: Some(provider),
             training_counters: Some(shared.core_handle.counters.clone()),
             ane_model_dir: shared.ane_model_dir.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: shared.ane_trainer.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
         });
     }
 
@@ -308,7 +344,20 @@ impl AgentLoop {
             mlx_provider: shared.mlx_provider.clone(),
             training_counters: Some(shared.core_handle.counters.clone()),
             ane_model_dir: dir,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: shared.ane_trainer.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
         });
+    }
+
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub fn ane_trainer(&self) -> Option<Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>> {
+        self.shared.ane_trainer.clone()
     }
 
     /// Set the cluster router for distributed inference routing.

@@ -542,29 +542,33 @@ pub fn run_model_worker(
             #[cfg(feature = "ane")]
             ModelRequest::ApplyLoraDeltas { deltas, reply } => {
                 prompt_cache = None;
-                use mlx_rs::Array;
                 let result: Result<usize, String> = (|| {
-                    let m = model.as_mut().ok_or("in-process model not loaded")?;
                     let mut applied = 0usize;
-                    for delta in &deltas.layers {
-                        if delta.layer_idx >= m.layers.len() {
+                    if let Some(m) = model.as_mut() {
+                        applied = super::ane_mlx_bridge::apply_lora_deltas(m, &deltas)?;
+                    }
+
+                    let adapter_dir = model_dir.join("adapters");
+                    if let Some(ref hook) = post_train_hook {
+                        if adapter_dir.join("adapters.safetensors").exists() {
+                            hook();
+                        } else if applied == 0 {
                             return Err(format!(
-                                "layer {} out of range ({})",
-                                delta.layer_idx,
-                                m.layers.len()
+                                "managed adapter reload requested but {} is missing",
+                                adapter_dir.join("adapters.safetensors").display()
                             ));
-                        }
-                        let d = &delta.delta;
-                        let new_a = Array::from_slice(&d.a, &[d.rank as i32, d.d_in as i32]);
-                        let new_b = Array::from_slice(&d.b, &[d.d_out as i32, d.rank as i32]);
-                        if m.layers[delta.layer_idx].apply_lora_weights(
-                            delta.target.mlx_name(),
-                            new_a,
-                            new_b,
-                        ) {
-                            applied += 1;
+                        } else {
+                            tracing::warn!(
+                                path = %adapter_dir.display(),
+                                "ANE delta apply updated in-process model but adapter export is missing"
+                            );
                         }
                     }
+
+                    if applied == 0 && model.is_none() && post_train_hook.is_none() {
+                        return Err("in-process model not loaded".into());
+                    }
+
                     Ok(applied)
                 })();
                 if let Ok(n) = &result {

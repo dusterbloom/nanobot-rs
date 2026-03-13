@@ -105,6 +105,9 @@ pub(crate) struct AgentLoopShared {
     /// Resolved model directory for standalone ANE training.
     /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
     pub(crate) ane_model_dir: Option<std::path::PathBuf>,
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub(crate) ane_trainer:
+        Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
 }
 
 /// Per-message state that flows through the three processing phases.

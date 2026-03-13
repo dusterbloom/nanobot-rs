@@ -347,7 +347,7 @@ pub fn generate_rope_blobs(seq: usize, head_dim: usize, theta: f64) -> (Vec<u8>,
 }
 
 /// Build an ANE blob with 128-byte header + fp16 data (same format as causal mask).
-fn build_fp16_blob(data: &[f32]) -> Vec<u8> {
+pub(crate) fn build_fp16_blob(data: &[f32]) -> Vec<u8> {
     let data_bytes = data.len() * 2;
     let header_bytes = 128;
     let mut blob = vec![0u8; header_bytes + data_bytes];
@@ -503,6 +503,58 @@ pub fn pack_ffn_w2(act: &[f32], w2: &[f32], cfg: &MilConfig) -> Vec<u8> {
     pack_dyn_matmul(act, w2, cfg.hidden_dim, cfg.dim, cfg.seq_len)
 }
 
+/// Pack xnorm + W1_t + W3_t + W2_orig into `[1, dim, 1, seq + 3*hidden]` fp32 layout
+/// for the fully-fused FFN kernel.
+///
+/// - `w1_t` and `w3_t` are ic-major `[dim, hidden]` (already transposed by caller).
+/// - `w2_orig` is the ORIGINAL weight `[dim, hidden]` (out_features=dim, in_features=hidden).
+pub fn pack_fused_ffn(
+    xnorm: &[f32],
+    w1_t: &[f32],
+    w3_t: &[f32],
+    w2_orig: &[f32],
+    cfg: &MilConfig,
+) -> Vec<u8> {
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let sp = seq + 3 * hidden;
+    assert_eq!(xnorm.len(), dim * seq);
+    assert_eq!(w1_t.len(), dim * hidden);
+    assert_eq!(w3_t.len(), dim * hidden);
+    assert_eq!(w2_orig.len(), dim * hidden);
+
+    let mut buf = vec![0.0f32; dim * sp];
+    for d in 0..dim {
+        let row = d * sp;
+        buf[row..row + seq].copy_from_slice(&xnorm[d * seq..(d + 1) * seq]);
+        buf[row + seq..row + seq + hidden].copy_from_slice(&w1_t[d * hidden..(d + 1) * hidden]);
+        buf[row + seq + hidden..row + seq + 2 * hidden]
+            .copy_from_slice(&w3_t[d * hidden..(d + 1) * hidden]);
+        buf[row + seq + 2 * hidden..row + seq + 3 * hidden]
+            .copy_from_slice(&w2_orig[d * hidden..(d + 1) * hidden]);
+    }
+    f32_slice_to_bytes(&buf)
+}
+
+/// Unpack fused FFN output: `[1, 3*hidden+dim, 1, seq]` fp32 -> (h1, h3, gate, ffn_out).
+pub fn unpack_fused_ffn(
+    output: &[u8],
+    cfg: &MilConfig,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let hidden = cfg.hidden_dim;
+    let dim = cfg.dim;
+    let seq = cfg.seq_len;
+    let floats = bytes_to_f32_vec(output);
+    assert_eq!(floats.len(), (3 * hidden + dim) * seq);
+
+    let h1 = floats[0..hidden * seq].to_vec();
+    let h3 = floats[hidden * seq..2 * hidden * seq].to_vec();
+    let gate = floats[2 * hidden * seq..3 * hidden * seq].to_vec();
+    let ffn_out = floats[3 * hidden * seq..(3 * hidden + dim) * seq].to_vec();
+    (h1, h3, gate, ffn_out)
+}
+
 // ---------------------------------------------------------------------------
 // Backward packing
 // ---------------------------------------------------------------------------
@@ -576,11 +628,9 @@ pub fn pack_qkvb(
         buf[d * sp..d * sp + seq].copy_from_slice(&dq[d * seq..d * seq + seq]);
         if d < ad {
             buf[d * sp + seq..d * sp + 2 * seq].copy_from_slice(&dk[d * seq..d * seq + seq]);
-            buf[d * sp + 2 * seq..d * sp + 3 * seq]
-                .copy_from_slice(&dv[d * seq..d * seq + seq]);
+            buf[d * sp + 2 * seq..d * sp + 3 * seq].copy_from_slice(&dv[d * seq..d * seq + seq]);
         }
-        buf[d * sp + 3 * seq..d * sp + 3 * seq + dim]
-            .copy_from_slice(&wqt[d * dim..d * dim + dim]);
+        buf[d * sp + 3 * seq..d * sp + 3 * seq + dim].copy_from_slice(&wqt[d * dim..d * dim + dim]);
         if d < ad {
             buf[d * sp + 3 * seq + dim..d * sp + 3 * seq + 2 * dim]
                 .copy_from_slice(&wkt[d * dim..d * dim + dim]);
@@ -632,8 +682,7 @@ pub fn unpack_sdpa_bwd1(output: &[u8], cfg: &MilConfig) -> (Vec<f32>, Vec<f32>, 
 
     let dv = floats[0..attn_dim * seq].to_vec();
     let probs = floats[attn_dim * seq..(attn_dim + score_ch) * seq].to_vec();
-    let dp =
-        floats[(attn_dim + score_ch) * seq..(attn_dim + 2 * score_ch) * seq].to_vec();
+    let dp = floats[(attn_dim + score_ch) * seq..(attn_dim + 2 * score_ch) * seq].to_vec();
     (dv, probs, dp)
 }
 
@@ -2153,7 +2202,7 @@ impl ModelWeights {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = vec![0u8; data.len() * 4];
     for (dst, &value) in bytes.chunks_exact_mut(4).zip(data.iter()) {
         dst.copy_from_slice(&value.to_le_bytes());
@@ -2161,7 +2210,7 @@ fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
     bytes
 }
 
-fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
+pub(crate) fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -2615,7 +2664,10 @@ mod tests {
 
         assert_eq!(output.len(), dim * seq);
         let nonzero = output.iter().filter(|v| v.abs() > 1e-10).count();
-        assert!(nonzero > 0, "qkvb output is all zeros for over-parameterized attention");
+        assert!(
+            nonzero > 0,
+            "qkvb output is all zeros for over-parameterized attention"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! Name mapping: ANE wq/wv/wo/w2 → MLX q_proj/v_proj/o_proj/down_proj
 
 use super::ane_lora::{LoraAdapter, LoraModel};
+#[cfg(feature = "mlx")]
+use super::ane_weights::WeightSource;
 
 /// A single LoRA adapter's weights ready for transfer.
 pub struct AdapterDelta {
@@ -143,6 +145,13 @@ pub fn apply_lora_deltas(
 // ---------------------------------------------------------------------------
 
 /// Configuration for the ANE training thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AneTrainingOptimizer {
+    AdamW,
+    AneMuon,
+}
+
+#[derive(Debug, Clone)]
 pub struct AneTrainingConfig {
     pub model_dir: std::path::PathBuf,
     pub mil_config: super::ane_mil::MilConfig,
@@ -161,6 +170,12 @@ pub struct AneTrainingConfig {
     pub lr_scale_ffn: f32,
     /// Residual scaling factor (1.0/sqrt(2*n_layers) recommended, 1.0 disables). Default: 0.0 = auto-compute.
     pub residual_scale: f32,
+    /// Optimizer used for LoRA updates.
+    pub optimizer: AneTrainingOptimizer,
+    /// If true, fail the run instead of silently falling back on ANE compile/eval errors.
+    pub strict_ane: bool,
+    /// Number of micro-batches to accumulate before one optimizer step (default: 1).
+    pub accum_steps: usize,
 }
 
 /// Seq-len bucket sizes for ANE kernel compilation. Samples are padded to
@@ -177,11 +192,28 @@ pub struct BucketKernels {
 }
 
 impl BucketKernels {
+    pub fn empty() -> Self {
+        BucketKernels {
+            buckets: Vec::new(),
+        }
+    }
+
     /// Compile kernel sets for buckets that cover the given sample lengths.
     pub fn compile(
         sample_lens: &[usize],
         base_cfg: &super::ane_mil::MilConfig,
     ) -> Result<Self, String> {
+        let mut buckets = Self::empty();
+        buckets.ensure(sample_lens, base_cfg)?;
+        Ok(buckets)
+    }
+
+    /// Compile only buckets that are not already cached.
+    pub fn ensure(
+        &mut self,
+        sample_lens: &[usize],
+        base_cfg: &super::ane_mil::MilConfig,
+    ) -> Result<usize, String> {
         let mut needed: Vec<usize> = Vec::new();
         for &sl in sample_lens {
             let bucket = BUCKET_SIZES
@@ -189,23 +221,25 @@ impl BucketKernels {
                 .copied()
                 .find(|&b| b >= sl)
                 .unwrap_or(*BUCKET_SIZES.last().unwrap());
-            if !needed.contains(&bucket) {
+            if !needed.contains(&bucket) && !self.buckets.iter().any(|(bs, _, _)| *bs == bucket) {
                 needed.push(bucket);
             }
         }
         needed.sort();
 
-        let mut buckets = Vec::new();
+        let mut compiled = 0usize;
         for bucket_seq in needed {
             let mut cfg = base_cfg.clone();
             cfg.seq_len = bucket_seq;
             let fwd = super::ane_forward::CompiledKernels::compile_forward(&cfg)?;
             let bwd = super::ane_backward::BackwardKernels::compile_backward(&cfg, &fwd.mask_blob)?;
             tracing::info!("ANE train: compiled kernels for seq_len={bucket_seq}");
-            buckets.push((bucket_seq, fwd, bwd));
+            self.buckets.push((bucket_seq, fwd, bwd));
+            compiled += 1;
         }
+        self.buckets.sort_by_key(|(bucket_seq, _, _)| *bucket_seq);
 
-        Ok(BucketKernels { buckets })
+        Ok(compiled)
     }
 
     /// Get the kernel set for a given sequence length (rounds up to nearest bucket).
@@ -231,6 +265,825 @@ fn pad_to(tokens: &[u32], target_len: usize) -> Vec<u32> {
     padded
 }
 
+#[cfg(feature = "mlx")]
+struct PreparedTrainingSample {
+    tokens_u32: Vec<u32>,
+    targets_u32: Vec<u32>,
+    tok_pad: Vec<u32>,
+    tgt_pad: Vec<u32>,
+    bucket_seq: usize,
+    effective_loss_scale: f32,
+}
+
+#[cfg(feature = "mlx")]
+fn prepare_training_samples(
+    samples: &[(Vec<i32>, Vec<i32>, f32)],
+    bucket_kernels: Option<&BucketKernels>,
+    loss_scale: f32,
+) -> Vec<PreparedTrainingSample> {
+    let mut prepared = Vec::with_capacity(samples.len());
+    for (tokens, targets, sample_quality) in samples {
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+        let quality_scale = sample_quality.max(0.1);
+        let effective_loss_scale = loss_scale * quality_scale;
+
+        if let Some(bk) = bucket_kernels {
+            let (bucket_seq, _, _) = bk.get(tokens_u32.len());
+            prepared.push(PreparedTrainingSample {
+                tok_pad: pad_to(&tokens_u32, *bucket_seq),
+                tgt_pad: pad_to(&targets_u32, *bucket_seq),
+                tokens_u32,
+                targets_u32,
+                bucket_seq: *bucket_seq,
+                effective_loss_scale,
+            });
+        } else {
+            prepared.push(PreparedTrainingSample {
+                tok_pad: Vec::new(),
+                tgt_pad: Vec::new(),
+                bucket_seq: tokens_u32.len(),
+                tokens_u32,
+                targets_u32,
+                effective_loss_scale,
+            });
+        }
+    }
+    prepared
+}
+
+#[cfg(feature = "mlx")]
+fn lora_storage_paths(model_dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let lora_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".nanobot/workspace/lora");
+    let model_key = model_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "default".into());
+    let lora_path = lora_dir.join(format!("{model_key}.bin"));
+    (lora_dir, lora_path)
+}
+
+#[cfg(feature = "mlx")]
+fn load_or_init_lora(
+    cfg: &AneTrainingConfig,
+    n_layers: usize,
+    lora_path: &std::path::Path,
+) -> super::ane_lora::LoraModel {
+    use super::ane_lora::{load_lora_bin, LoraConfig, LoraModel};
+
+    let dim = cfg.mil_config.dim;
+    let hidden_dim = cfg.mil_config.hidden_dim;
+
+    if lora_path.exists() {
+        match load_lora_bin(lora_path) {
+            Ok(l) if l.layers.len() == n_layers => {
+                tracing::info!("ANE train: restored LoRA from {}", lora_path.display());
+                return l;
+            }
+            _ => {
+                tracing::warn!("ANE train: stale LoRA file, reinitializing");
+            }
+        }
+    } else {
+        let model_key = cfg
+            .model_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "default".into());
+        tracing::info!("ANE train: new LoRA for model {model_key}");
+    }
+
+    LoraModel::with_full_dims(
+        LoraConfig::default(),
+        n_layers,
+        dim,
+        cfg.mil_config.kv_dim(),
+        cfg.mil_config.attn_dim(),
+        cfg.mil_config.q_proj_dim(),
+        hidden_dim,
+    )
+}
+
+#[cfg(feature = "mlx")]
+fn compatible_mil_config(lhs: &super::ane_mil::MilConfig, rhs: &super::ane_mil::MilConfig) -> bool {
+    lhs.dim == rhs.dim
+        && lhs.hidden_dim == rhs.hidden_dim
+        && lhs.n_heads == rhs.n_heads
+        && lhs.n_kv_heads == rhs.n_kv_heads
+        && lhs.rope_theta.to_bits() == rhs.rope_theta.to_bits()
+        && lhs.rms_eps.to_bits() == rhs.rms_eps.to_bits()
+        && lhs.has_lm_head == rhs.has_lm_head
+        && lhs.head_dim_explicit == rhs.head_dim_explicit
+        && lhs.linear_attn_indices == rhs.linear_attn_indices
+        && lhs.linear_n_heads == rhs.linear_n_heads
+        && lhs.linear_head_dim == rhs.linear_head_dim
+        && lhs.linear_n_value_heads == rhs.linear_n_value_heads
+        && lhs.linear_value_head_dim == rhs.linear_value_head_dim
+        && lhs.conv_kernel_size == rhs.conv_kernel_size
+        && lhs.attn_output_gate == rhs.attn_output_gate
+}
+
+#[cfg(feature = "mlx")]
+fn compatible_training_target(lhs: &AneTrainingConfig, rhs: &AneTrainingConfig) -> bool {
+    lhs.model_dir == rhs.model_dir
+        && compatible_mil_config(&lhs.mil_config, &rhs.mil_config)
+        && lhs.linear_attn_indices == rhs.linear_attn_indices
+        && lhs.kv_dim == rhs.kv_dim
+}
+
+#[cfg(feature = "mlx")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PersistentAneTrainerStats {
+    pub model_loads: usize,
+    pub bucket_compiles: usize,
+    pub completed_runs: usize,
+}
+
+#[cfg(feature = "mlx")]
+#[derive(Default)]
+struct PersistentAneTrainerStatCounters {
+    model_loads: std::sync::atomic::AtomicUsize,
+    bucket_compiles: std::sync::atomic::AtomicUsize,
+    completed_runs: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "mlx")]
+impl PersistentAneTrainerStatCounters {
+    fn snapshot(&self) -> PersistentAneTrainerStats {
+        use std::sync::atomic::Ordering;
+
+        PersistentAneTrainerStats {
+            model_loads: self.model_loads.load(Ordering::Relaxed),
+            bucket_compiles: self.bucket_compiles.load(Ordering::Relaxed),
+            completed_runs: self.completed_runs.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "mlx")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MuonKernelSignature {
+    lr_attn_bits: u32,
+    lr_ffn_bits: u32,
+}
+
+#[cfg(feature = "mlx")]
+impl MuonKernelSignature {
+    fn from_cfg(cfg: &AneTrainingConfig) -> Self {
+        Self {
+            lr_attn_bits: (cfg.lr * cfg.lr_scale_attn).to_bits(),
+            lr_ffn_bits: (cfg.lr * cfg.lr_scale_ffn).to_bits(),
+        }
+    }
+}
+
+#[cfg(feature = "mlx")]
+struct AneTrainerSession {
+    cfg: AneTrainingConfig,
+    model: super::ane_weights::DenseCachedModel,
+    lora_dir: std::path::PathBuf,
+    lora_path: std::path::PathBuf,
+    lora: super::ane_lora::LoraModel,
+    adam: super::ane_lora::LoraModelAdam,
+    muon: Option<super::ane_lora::LoraModelMuon>,
+    muon_kernels: Option<super::ane_lora::LoraMuonKernels>,
+    muon_kernel_signature: Option<MuonKernelSignature>,
+    bucket_kernels: BucketKernels,
+    bucket_lora_grad_kernels: Vec<(usize, super::ane_lora::LoraWeightGradKernels)>,
+}
+
+#[cfg(feature = "mlx")]
+impl AneTrainerSession {
+    fn new(
+        cfg: &AneTrainingConfig,
+        stats: &PersistentAneTrainerStatCounters,
+    ) -> Result<Self, String> {
+        use super::ane_lora::LoraModelAdam;
+        use super::ane_weights::{DenseCachedModel, QuantizedModelWeights};
+
+        let t0 = std::time::Instant::now();
+        let model =
+            match QuantizedModelWeights::from_mlx_safetensors(&cfg.model_dir, &cfg.mil_config) {
+                Ok(m) => {
+                    let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
+                    let cached = DenseCachedModel::auto(m);
+                    tracing::info!(
+                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
+                        t0.elapsed().as_millis(),
+                        cached.cached_layer_count(),
+                        cached.n_layers(),
+                    );
+                    cached
+                }
+                Err(e) => return Err(format!("failed to load weights: {e}")),
+            };
+        use std::sync::atomic::Ordering;
+        stats.model_loads.fetch_add(1, Ordering::Relaxed);
+
+        let (lora_dir, lora_path) = lora_storage_paths(&cfg.model_dir);
+        let lora = load_or_init_lora(cfg, model.n_layers(), &lora_path);
+        let adam = LoraModelAdam::zeros(&lora);
+
+        Ok(Self {
+            cfg: cfg.clone(),
+            model,
+            lora_dir,
+            lora_path,
+            lora,
+            adam,
+            muon: None,
+            muon_kernels: None,
+            muon_kernel_signature: None,
+            bucket_kernels: BucketKernels::empty(),
+            bucket_lora_grad_kernels: Vec::new(),
+        })
+    }
+
+    fn matches_config(&self, cfg: &AneTrainingConfig) -> bool {
+        compatible_training_target(&self.cfg, cfg)
+    }
+
+    fn ensure_bucket_kernels(
+        &mut self,
+        sample_lens: &[usize],
+        stats: &PersistentAneTrainerStatCounters,
+    ) -> Result<(), String> {
+        let compiled = self.bucket_kernels.ensure(sample_lens, &self.cfg.mil_config)?;
+        if compiled > 0 {
+            use std::sync::atomic::Ordering;
+            stats.bucket_compiles.fetch_add(compiled, Ordering::Relaxed);
+            tracing::info!(
+                "ANE train: cached {} bucket(s) total after compiling {compiled} new bucket(s)",
+                self.bucket_kernels.buckets.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_muon_grad_kernels(&mut self) -> Result<(), String> {
+        use super::ane_lora::LoraWeightGradKernels;
+
+        for (bucket_seq, _, _) in &self.bucket_kernels.buckets {
+            if self
+                .bucket_lora_grad_kernels
+                .iter()
+                .any(|(seq_len, _)| *seq_len == *bucket_seq)
+            {
+                continue;
+            }
+            let mut grad_cfg = self.cfg.mil_config.clone();
+            grad_cfg.seq_len = *bucket_seq;
+            let kernels = LoraWeightGradKernels::compile(&grad_cfg, &self.lora)?;
+            self.bucket_lora_grad_kernels.push((*bucket_seq, kernels));
+        }
+        self.bucket_lora_grad_kernels
+            .sort_by_key(|(seq_len, _)| *seq_len);
+        Ok(())
+    }
+
+    fn ensure_optimizer_state(&mut self, cfg: &AneTrainingConfig) -> Result<(), String> {
+        use super::ane_lora::{LoraModelAdam, LoraModelMuon, LoraMuonKernels};
+
+        match cfg.optimizer {
+            AneTrainingOptimizer::AdamW => {
+                self.adam = LoraModelAdam::zeros(&self.lora);
+            }
+            AneTrainingOptimizer::AneMuon => {
+                self.muon = Some(LoraModelMuon::zeros(&self.lora));
+            }
+        }
+
+        if cfg.optimizer == AneTrainingOptimizer::AneMuon {
+            let sig = MuonKernelSignature::from_cfg(cfg);
+            if self.muon_kernel_signature != Some(sig) {
+                self.muon_kernels = Some(LoraMuonKernels::compile(
+                    &self.lora,
+                    cfg.lr * cfg.lr_scale_attn,
+                    cfg.lr * cfg.lr_scale_ffn,
+                    0.95,
+                    0.01,
+                )?);
+                self.muon_kernel_signature = Some(sig);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn save_and_publish(
+        &self,
+        cfg: &AneTrainingConfig,
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+    ) -> bool {
+        use super::ane_lora::save_lora_bin;
+
+        let saved = if let Err(e) = std::fs::create_dir_all(&self.lora_dir) {
+            tracing::warn!("ANE train: failed to create lora dir: {e}");
+            false
+        } else if let Err(e) = save_lora_bin(&self.lora, &self.lora_path) {
+            tracing::warn!("ANE train: failed to save LoRA: {e}");
+            false
+        } else {
+            tracing::info!("ANE train: saved LoRA to {}", self.lora_path.display());
+            true
+        };
+
+        if saved {
+            match crate::agent::mlx_lora::ModelConfig::from_config_json(&cfg.model_dir) {
+                Some(model_cfg) => {
+                    let adapter_dir = cfg.model_dir.join("adapters");
+                    match crate::agent::mlx_lora::export_ane_adapters(
+                        &self.lora,
+                        &model_cfg,
+                        Some(&cfg.linear_attn_indices),
+                        &adapter_dir,
+                    ) {
+                        Ok(n) => {
+                            tracing::info!(
+                                tensors = n,
+                                path = %adapter_dir.display(),
+                                "ANE train: exported mlx-lm adapters"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("ANE train: failed to export mlx-lm adapters: {e}");
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "ANE train: failed to parse config.json for adapter export at {}",
+                        cfg.model_dir.display()
+                    );
+                }
+            }
+        }
+
+        if let Some(ref tx) = mlx_tx {
+            let deltas = extract_lora_deltas(
+                &self.lora,
+                if cfg.linear_attn_indices.is_empty() {
+                    None
+                } else {
+                    Some(&cfg.linear_attn_indices)
+                },
+            );
+            let n_deltas = deltas.layers.len();
+            let _ = tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
+                deltas,
+                reply: None,
+            });
+            tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+        }
+
+        saved
+    }
+
+    fn train(
+        &mut self,
+        cfg: &AneTrainingConfig,
+        samples: &[(Vec<i32>, Vec<i32>, f32)],
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+        stats: &PersistentAneTrainerStatCounters,
+    ) -> bool {
+        use super::ane_backward;
+        use super::ane_forward;
+        use super::ane_lora::{
+            lora_adam_update, lora_adam_update_split_lr, lora_muon_update_ane,
+        };
+
+        let t0 = std::time::Instant::now();
+        let sample_lens: Vec<usize> = samples.iter().map(|(tokens, _, _)| tokens.len()).collect();
+        let use_ane = match self.ensure_bucket_kernels(&sample_lens, stats) {
+            Ok(()) => !self.bucket_kernels.buckets.is_empty(),
+            Err(e) => {
+                if cfg.strict_ane || cfg.optimizer == AneTrainingOptimizer::AneMuon {
+                    tracing::error!("ANE train: kernel compilation failed in strict mode: {e}");
+                    return false;
+                }
+                tracing::warn!("ANE train: kernel compilation failed ({e}), falling back to CPU");
+                false
+            }
+        };
+
+        if let Err(e) = self.ensure_optimizer_state(cfg) {
+            tracing::error!("ANE train: optimizer setup failed: {e}");
+            return false;
+        }
+
+        if cfg.optimizer == AneTrainingOptimizer::AneMuon {
+            if !use_ane {
+                tracing::error!("ANE train: Muon requires compiled ANE bucket kernels");
+                return false;
+            }
+            if let Err(e) = self.ensure_muon_grad_kernels() {
+                tracing::error!("ANE train: failed to compile Muon LoRA grad kernels: {e}");
+                return false;
+            }
+        }
+
+        let n_layers = self.model.n_layers();
+        let residual_scale = if cfg.residual_scale > 0.0 {
+            cfg.residual_scale
+        } else {
+            1.0f32 / (2.0f32 * n_layers as f32).sqrt()
+        };
+        let use_split_lr = cfg.lr_scale_attn != 1.0 || cfg.lr_scale_ffn != 1.0;
+
+        let accum = cfg.accum_steps.max(1);
+        let n_samples = samples.len();
+        let steps_per_epoch = (n_samples + accum - 1) / accum;
+        let total_opt_steps = steps_per_epoch * cfg.epochs;
+        let patience = steps_per_epoch * 2;
+        let mut opt_step = 0usize;
+        let mut best_loss = f32::INFINITY;
+        let mut stale_count = 0usize;
+
+        let bucket_kernels = if use_ane {
+            Some(&self.bucket_kernels)
+        } else {
+            None
+        };
+        let prepared_samples =
+            prepare_training_samples(samples, bucket_kernels, cfg.loss_scale);
+
+        tracing::info!(
+            "ANE train: {n_samples} samples, {total_opt_steps} optimizer steps (accum={accum}), lr={}, mode={}, optimizer={:?}",
+            cfg.lr,
+            if use_ane { "ANE" } else { "CPU" },
+            cfg.optimizer,
+        );
+
+        let bucket_lora_grad_kernels = &self.bucket_lora_grad_kernels;
+        let muon_kernels = self.muon_kernels.as_ref();
+        let model = &mut self.model;
+        let lora = &mut self.lora;
+        let adam = &mut self.adam;
+        let muon = &mut self.muon;
+        let mut best_lora = lora.clone();
+        let mut best_adam = if cfg.optimizer == AneTrainingOptimizer::AdamW {
+            Some(adam.clone())
+        } else {
+            None
+        };
+        let mut best_muon = if cfg.optimizer == AneTrainingOptimizer::AneMuon {
+            muon.clone()
+        } else {
+            None
+        };
+        let mut grad_accum = super::ane_lora::LoraModelGrads::zeros(lora);
+
+        let mut total_fwd_us = 0u64;
+        let mut total_bwd_us = 0u64;
+        let mut total_opt_us = 0u64;
+        let mut total_clone_us = 0u64;
+        let mut sample_count = 0u64;
+
+        'outer: for _epoch in 0..cfg.epochs {
+            for chunk in prepared_samples.chunks(accum) {
+                grad_accum.zero();
+                let mut chunk_loss = 0.0f32;
+
+                for sample in chunk {
+                    let t_fwd = std::time::Instant::now();
+                    let (fwd, bwd) = if let Some(bk) = bucket_kernels {
+                        let (_, fwd_k, bwd_k) = bk.get(sample.tokens_u32.len());
+                        model.cfg_mut().seq_len = sample.bucket_seq;
+
+                        match ane_forward::forward_ane_generic(
+                            fwd_k,
+                            model,
+                            Some(lora),
+                            &sample.tok_pad,
+                            &sample.tgt_pad,
+                            cfg.softcap,
+                            residual_scale,
+                        ) {
+                            Ok(fwd) => {
+                                let bwd = if cfg.optimizer == AneTrainingOptimizer::AneMuon {
+                                    let grad_kernels = bucket_lora_grad_kernels
+                                        .iter()
+                                        .find(|(seq_len, _)| *seq_len == sample.bucket_seq)
+                                        .map(|(_, kernels)| kernels)
+                                        .expect("Muon bucket grad kernels should exist");
+                                    ane_backward::backward_lora_ane_generic_with_lora_kernels(
+                                        bwd_k,
+                                        model,
+                                        &fwd,
+                                        lora,
+                                        &sample.tok_pad,
+                                        cfg.softcap,
+                                        sample.effective_loss_scale,
+                                        residual_scale,
+                                        Some(grad_kernels),
+                                    )
+                                } else {
+                                    ane_backward::backward_lora_ane_generic(
+                                        bwd_k,
+                                        model,
+                                        &fwd,
+                                        lora,
+                                        &sample.tok_pad,
+                                        cfg.softcap,
+                                        sample.effective_loss_scale,
+                                        residual_scale,
+                                    )
+                                };
+                                (fwd, bwd)
+                            }
+                            Err(e) => {
+                                if cfg.strict_ane || cfg.optimizer == AneTrainingOptimizer::AneMuon {
+                                    tracing::error!("ANE forward failed in strict mode: {e}");
+                                    return false;
+                                }
+                                tracing::warn!("ANE forward failed ({e}), falling back to CPU");
+                                model.cfg_mut().seq_len = sample.tokens_u32.len();
+                                let fwd = ane_forward::forward_cpu_generic(
+                                    model,
+                                    Some(lora),
+                                    &sample.tokens_u32,
+                                    &sample.targets_u32,
+                                );
+                                let bwd = ane_backward::backward_lora_cpu_generic(
+                                    model,
+                                    &fwd,
+                                    lora,
+                                    &sample.tokens_u32,
+                                    cfg.softcap,
+                                    sample.effective_loss_scale,
+                                );
+                                (fwd, bwd)
+                            }
+                        }
+                    } else {
+                        model.cfg_mut().seq_len = sample.tokens_u32.len();
+                        let fwd = ane_forward::forward_cpu_generic(
+                            model,
+                            Some(lora),
+                            &sample.tokens_u32,
+                            &sample.targets_u32,
+                        );
+                        let bwd = ane_backward::backward_lora_cpu_generic(
+                            model,
+                            &fwd,
+                            lora,
+                            &sample.tokens_u32,
+                            cfg.softcap,
+                            sample.effective_loss_scale,
+                        );
+                        (fwd, bwd)
+                    };
+
+                    let fwd_bwd_us = t_fwd.elapsed().as_micros() as u64;
+                    total_fwd_us += fwd_bwd_us;
+                    sample_count += 1;
+
+                    let loss = fwd.base.loss;
+                    if !loss.is_finite() {
+                        tracing::warn!("ANE train: NaN/Inf loss at opt_step {opt_step}, stopping");
+                        break 'outer;
+                    }
+                    chunk_loss += loss;
+                    grad_accum.add_from(&bwd.lora_grads);
+                }
+
+                let chunk_len = chunk.len();
+                if chunk_len > 1 {
+                    grad_accum.scale(1.0 / chunk_len as f32);
+                }
+                chunk_loss /= chunk_len as f32;
+
+                opt_step += 1;
+                let t_opt = std::time::Instant::now();
+                match cfg.optimizer {
+                    AneTrainingOptimizer::AdamW => {
+                        if use_split_lr {
+                            lora_adam_update_split_lr(
+                                lora,
+                                &grad_accum,
+                                adam,
+                                opt_step,
+                                cfg.lr,
+                                cfg.lr_scale_attn,
+                                cfg.lr_scale_ffn,
+                                0.9,
+                                0.999,
+                                1e-8,
+                                0.01,
+                            );
+                        } else {
+                            lora_adam_update(
+                                lora,
+                                &grad_accum,
+                                adam,
+                                opt_step,
+                                cfg.lr,
+                                0.9,
+                                0.999,
+                                1e-8,
+                                0.01,
+                            );
+                        }
+                    }
+                    AneTrainingOptimizer::AneMuon => {
+                        let Some(muon_state) = muon.as_mut() else {
+                            tracing::error!("ANE train: missing Muon state");
+                            return false;
+                        };
+                        let Some(muon_kernels) = muon_kernels else {
+                            tracing::error!("ANE train: missing Muon kernels");
+                            return false;
+                        };
+                        if let Err(e) =
+                            lora_muon_update_ane(lora, &grad_accum, muon_state, muon_kernels)
+                        {
+                            tracing::error!("ANE train: Muon update failed: {e}");
+                            return false;
+                        }
+                    }
+                }
+
+                total_opt_us += t_opt.elapsed().as_micros() as u64;
+
+                let t_clone = std::time::Instant::now();
+                if chunk_loss < best_loss {
+                    best_loss = chunk_loss;
+                    best_lora = lora.clone();
+                    match cfg.optimizer {
+                        AneTrainingOptimizer::AdamW => {
+                            best_adam = Some(adam.clone());
+                        }
+                        AneTrainingOptimizer::AneMuon => {
+                            best_muon = muon.clone();
+                        }
+                    }
+                    stale_count = 0;
+                } else {
+                    stale_count += 1;
+                }
+                total_clone_us += t_clone.elapsed().as_micros() as u64;
+
+                if stale_count >= patience {
+                    tracing::info!("ANE train: early stop at opt_step {opt_step}, loss={chunk_loss:.4}");
+                    break 'outer;
+                }
+
+                if opt_step % 5 == 0 || opt_step == total_opt_steps {
+                    tracing::debug!("ANE train: step {opt_step}/{total_opt_steps}, loss={chunk_loss:.4}");
+                }
+            }
+        }
+
+        *lora = best_lora;
+        match cfg.optimizer {
+            AneTrainingOptimizer::AdamW => {
+                if let Some(best) = best_adam {
+                    *adam = best;
+                }
+            }
+            AneTrainingOptimizer::AneMuon => {
+                *muon = best_muon;
+            }
+        }
+
+        let train_ms = t0.elapsed().as_millis();
+        if sample_count > 0 {
+            let fwd_bwd_ms = total_fwd_us as f64 / sample_count as f64 / 1000.0;
+            let opt_ms = total_opt_us as f64 / opt_step.max(1) as f64 / 1000.0;
+            let clone_ms = total_clone_us as f64 / opt_step.max(1) as f64 / 1000.0;
+            let fwd_bwd_pct = total_fwd_us as f64 / (total_fwd_us + total_opt_us + total_clone_us).max(1) as f64 * 100.0;
+            tracing::info!(
+                "ANE train profile: {sample_count} samples, fwd+bwd={fwd_bwd_ms:.1}ms/sample ({fwd_bwd_pct:.0}%), opt={opt_ms:.1}ms/step, clone={clone_ms:.1}ms/step, total={train_ms}ms",
+            );
+            eprintln!(
+                "ANE train profile: {sample_count} samples, fwd+bwd={fwd_bwd_ms:.1}ms/sample ({fwd_bwd_pct:.0}%), opt={opt_ms:.1}ms/step, clone={clone_ms:.1}ms/step, total={train_ms}ms",
+            );
+        }
+        tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
+
+        self.save_and_publish(cfg, mlx_tx)
+    }
+}
+
+#[cfg(feature = "mlx")]
+enum PersistentTrainerCommand {
+    Train {
+        cfg: AneTrainingConfig,
+        samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
+}
+
+#[cfg(feature = "mlx")]
+fn persistent_trainer_worker(
+    rx: std::sync::mpsc::Receiver<PersistentTrainerCommand>,
+    stats: std::sync::Arc<PersistentAneTrainerStatCounters>,
+) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+
+    let mut session: Option<AneTrainerSession> = None;
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            PersistentTrainerCommand::Train {
+                cfg,
+                samples,
+                mlx_tx,
+                reply,
+            } => {
+                let needs_reload = session
+                    .as_ref()
+                    .map(|existing| !existing.matches_config(&cfg))
+                    .unwrap_or(true);
+                if needs_reload {
+                    session = match AneTrainerSession::new(&cfg, stats.as_ref()) {
+                        Ok(new_session) => Some(new_session),
+                        Err(e) => {
+                            tracing::error!("ANE train: {e}");
+                            let _ = reply.send(false);
+                            continue;
+                        }
+                    };
+                }
+
+                let ok = session
+                    .as_mut()
+                    .map(|existing| existing.train(&cfg, &samples, mlx_tx, stats.as_ref()))
+                    .unwrap_or(false);
+                if ok {
+                    use std::sync::atomic::Ordering;
+                    stats.completed_runs.fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = reply.send(ok);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mlx")]
+#[derive(Clone)]
+pub struct PersistentAneTrainer {
+    tx: std::sync::mpsc::SyncSender<PersistentTrainerCommand>,
+    stats: std::sync::Arc<PersistentAneTrainerStatCounters>,
+}
+
+#[cfg(feature = "mlx")]
+impl Default for PersistentAneTrainer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "mlx")]
+impl PersistentAneTrainer {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let stats = std::sync::Arc::new(PersistentAneTrainerStatCounters::default());
+        let worker_stats = stats.clone();
+        std::thread::Builder::new()
+            .name("ane-lora-train-worker".into())
+            .spawn(move || persistent_trainer_worker(rx, worker_stats))
+            .expect("failed to spawn persistent ANE training worker");
+        Self { tx, stats }
+    }
+
+    pub fn spawn_training(
+        &self,
+        cfg: AneTrainingConfig,
+        samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+    ) -> std::thread::JoinHandle<bool> {
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("ane-lora-train".into())
+            .spawn(move || {
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                let sent = tx.send(PersistentTrainerCommand::Train {
+                    cfg,
+                    samples,
+                    mlx_tx,
+                    reply: reply_tx,
+                });
+                if sent.is_err() {
+                    tracing::error!("ANE train: persistent worker is unavailable");
+                    return false;
+                }
+                reply_rx.recv().unwrap_or(false)
+            })
+            .expect("failed to spawn ANE training wait thread")
+    }
+
+    pub fn stats(&self) -> PersistentAneTrainerStats {
+        self.stats.snapshot()
+    }
+}
+
 /// Spawn a dedicated thread that trains LoRA on CPU/ANE, then sends
 /// the resulting deltas to the MLX model worker via `ApplyLoraDeltas`.
 ///
@@ -254,290 +1107,15 @@ pub fn spawn_ane_training(
     std::thread::Builder::new()
         .name("ane-lora-train".into())
         .spawn(move || {
-            // Drop thread to background QoS so training doesn't compete with
-            // MLX inference for CPU time. On macOS this tells the scheduler to
-            // yield to higher-priority work (UI, inference, networking).
-            #[cfg(target_os = "macos")]
-            unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-            }
-
-            use super::ane_backward;
-            use super::ane_forward;
-            use super::ane_lora::{
-                self, load_lora_bin, lora_adam_update, lora_adam_update_split_lr, save_lora_bin,
-                LoraConfig, LoraModel, LoraModelAdam,
-            };
-            use super::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
-
-            let t0 = std::time::Instant::now();
-
-            // 1. Load quantized weights, then build a dense layer cache.
-            // Cached layers use dense SGEMM (Accelerate + rayon) for ~4× speedup.
-            // Memory-budget-aware: small models cache all layers, large models
-            // (e.g. 35B MoE) cache what fits and fall back to quantized path.
-            let mut model = match QuantizedModelWeights::from_mlx_safetensors(
-                &cfg.model_dir,
-                &cfg.mil_config,
-            ) {
-                Ok(m) => {
-                    let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
-                    let cached = DenseCachedModel::auto(m);
-                    tracing::info!(
-                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
-                        t0.elapsed().as_millis(),
-                        cached.cached_layer_count(),
-                        cached.n_layers(),
-                    );
-                    cached
-                }
+            let stats = PersistentAneTrainerStatCounters::default();
+            let mut session = match AneTrainerSession::new(&cfg, &stats) {
+                Ok(session) => session,
                 Err(e) => {
-                    tracing::error!("ANE train: failed to load weights: {e}");
+                    tracing::error!("ANE train: {e}");
                     return false;
                 }
             };
-
-            // 2. Initialize or restore LoRA (per-model file keyed by dir name)
-            let lora_dir = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".nanobot/workspace/lora");
-            let model_key = cfg
-                .model_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "default".into());
-            let lora_path = lora_dir.join(format!("{model_key}.bin"));
-            let n_layers = model.n_layers();
-            let dim = cfg.mil_config.dim;
-            let hidden_dim = cfg.mil_config.hidden_dim;
-
-            let mut lora = if lora_path.exists() {
-                match load_lora_bin(&lora_path) {
-                    Ok(l) if l.layers.len() == n_layers => {
-                        tracing::info!("ANE train: restored LoRA from {}", lora_path.display());
-                        l
-                    }
-                    _ => {
-                        tracing::warn!("ANE train: stale LoRA file, reinitializing");
-                        LoraModel::with_full_dims(
-                            LoraConfig::default(),
-                            n_layers,
-                            dim,
-                            cfg.mil_config.kv_dim(),
-                            cfg.mil_config.attn_dim(),
-                            cfg.mil_config.q_proj_dim(),
-                            hidden_dim,
-                        )
-                    }
-                }
-            } else {
-                tracing::info!("ANE train: new LoRA for model {model_key}");
-                LoraModel::with_full_dims(
-                    LoraConfig::default(),
-                    n_layers,
-                    dim,
-                    cfg.mil_config.kv_dim(),
-                    cfg.mil_config.attn_dim(),
-                    cfg.mil_config.q_proj_dim(),
-                    hidden_dim,
-                )
-            };
-            let mut adam = LoraModelAdam::zeros(&lora);
-
-            // 3. Compile ANE kernels (bucket-based for variable seq_len)
-            let sample_lens: Vec<usize> = samples.iter().map(|(t, _, _)| t.len()).collect();
-            let bucket_kernels = match BucketKernels::compile(&sample_lens, &cfg.mil_config) {
-                Ok(bk) => {
-                    tracing::info!(
-                        "ANE train: compiled {} bucket(s) for ANE-accelerated training",
-                        bk.buckets.len()
-                    );
-                    Some(bk)
-                }
-                Err(e) => {
-                    tracing::warn!("ANE train: kernel compilation failed ({e}), falling back to CPU");
-                    None
-                }
-            };
-
-            let residual_scale = if cfg.residual_scale > 0.0 {
-                cfg.residual_scale
-            } else {
-                1.0 / (2.0 * n_layers as f32).sqrt()
-            };
-            let use_split_lr = cfg.lr_scale_attn != 1.0 || cfg.lr_scale_ffn != 1.0;
-
-            // 4. Train
-            let n_samples = samples.len();
-            let total_steps = n_samples * cfg.epochs;
-            let patience = n_samples * 2;
-            let mut step = 0usize;
-            let mut best_loss = f32::INFINITY;
-            let mut best_lora = lora.clone();
-            let mut stale_count = 0usize;
-
-            tracing::info!(
-                "ANE train: {n_samples} samples, {total_steps} steps, lr={}, mode={}",
-                cfg.lr,
-                if bucket_kernels.is_some() { "ANE" } else { "CPU" },
-            );
-
-            'outer: for _epoch in 0..cfg.epochs {
-                for (tokens, targets, sample_quality) in &samples {
-                    let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-                    let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
-                    // Quality weight scales loss_scale: high-quality samples get full
-                    // gradient, low-quality samples get reduced gradient contribution.
-                    // Floor at 0.1 so even low-quality samples contribute minimally.
-                    let quality_scale = sample_quality.max(0.1);
-                    let effective_loss_scale = cfg.loss_scale * quality_scale;
-
-                    let (fwd, bwd) = if let Some(ref bk) = bucket_kernels {
-                        // ANE path: pad to bucket, use ANE forward/backward
-                        let (bucket_seq, fwd_k, bwd_k) = bk.get(tokens_u32.len());
-                        let tok_pad = pad_to(&tokens_u32, *bucket_seq);
-                        let tgt_pad = pad_to(&targets_u32, *bucket_seq);
-                        model.cfg_mut().seq_len = *bucket_seq;
-
-                        let fwd = match ane_forward::forward_ane_generic(
-                            fwd_k,
-                            &model,
-                            Some(&lora),
-                            &tok_pad,
-                            &tgt_pad,
-                            cfg.softcap,
-                            residual_scale,
-                        ) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                tracing::warn!("ANE forward failed ({e}), falling back to CPU");
-                                model.cfg_mut().seq_len = tokens_u32.len();
-                                ane_forward::forward_cpu_generic(
-                                    &model,
-                                    Some(&lora),
-                                    &tokens_u32,
-                                    &targets_u32,
-                                )
-                            }
-                        };
-
-                        let bwd = ane_backward::backward_lora_ane_generic(
-                            bwd_k,
-                            &model,
-                            &fwd,
-                            &lora,
-                            &tok_pad,
-                            cfg.softcap,
-                            effective_loss_scale,
-                            residual_scale,
-                        );
-                        (fwd, bwd)
-                    } else {
-                        // CPU fallback path (existing behavior)
-                        model.cfg_mut().seq_len = tokens_u32.len();
-                        let fwd = ane_forward::forward_cpu_generic(
-                            &model,
-                            Some(&lora),
-                            &tokens_u32,
-                            &targets_u32,
-                        );
-                        let bwd = ane_backward::backward_lora_cpu_generic(
-                            &model, &fwd, &lora, &tokens_u32, cfg.softcap, effective_loss_scale,
-                        );
-                        (fwd, bwd)
-                    };
-
-                    let loss = fwd.base.loss;
-                    if !loss.is_finite() {
-                        tracing::warn!("ANE train: NaN/Inf loss at step {step}, stopping");
-                        break 'outer;
-                    }
-
-                    step += 1;
-                    if use_split_lr {
-                        lora_adam_update_split_lr(
-                            &mut lora,
-                            &bwd.lora_grads,
-                            &mut adam,
-                            step,
-                            cfg.lr,
-                            cfg.lr_scale_attn,
-                            cfg.lr_scale_ffn,
-                            0.9,
-                            0.999,
-                            1e-8,
-                            0.01,
-                        );
-                    } else {
-                        lora_adam_update(
-                            &mut lora,
-                            &bwd.lora_grads,
-                            &mut adam,
-                            step,
-                            cfg.lr,
-                            0.9,
-                            0.999,
-                            1e-8,
-                            0.01,
-                        );
-                    }
-
-                    // Best-checkpoint tracking + early stopping
-                    if loss < best_loss {
-                        best_loss = loss;
-                        best_lora = lora.clone();
-                        stale_count = 0;
-                    } else {
-                        stale_count += 1;
-                    }
-                    if stale_count >= patience {
-                        tracing::info!("ANE train: early stop at step {step}, loss={loss:.4}");
-                        break 'outer;
-                    }
-
-                    if step % 5 == 0 || step == total_steps {
-                        tracing::debug!("ANE train: step {step}/{total_steps}, loss={loss:.4}");
-                    }
-                }
-            }
-
-            // Restore best checkpoint
-            lora = best_lora;
-
-            let train_ms = t0.elapsed().as_millis();
-            tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
-
-            // 4. Save LoRA to disk
-            let saved = if let Err(e) = std::fs::create_dir_all(&lora_dir) {
-                tracing::warn!("ANE train: failed to create lora dir: {e}");
-                false
-            } else if let Err(e) = save_lora_bin(&lora, &lora_path) {
-                tracing::warn!("ANE train: failed to save LoRA: {e}");
-                false
-            } else {
-                tracing::info!("ANE train: saved LoRA to {}", lora_path.display());
-                true
-            };
-
-            // 5. Optionally hot-swap into MLX worker
-            if let Some(ref tx) = mlx_tx {
-                let deltas = extract_lora_deltas(
-                    &lora,
-                    if cfg.linear_attn_indices.is_empty() {
-                        None
-                    } else {
-                        Some(&cfg.linear_attn_indices)
-                    },
-                );
-                let n_deltas = deltas.layers.len();
-                let _ = tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
-                    deltas,
-                    reply: None, // fire-and-forget
-                });
-                tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
-            }
-
-            saved
+            session.train(&cfg, &samples, mlx_tx, &stats)
         })
         .expect("failed to spawn ANE training thread")
 }
@@ -706,6 +1284,65 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_prepare_training_samples_bucket_padding_and_quality_floor() {
+        use crate::agent::ane_mil::MilConfig;
+
+        if crate::agent::ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        let cfg = MilConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            seq_len: 64,
+            n_kv_heads: 4,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 16,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: false,
+        };
+        let buckets = BucketKernels::compile(&[59], &cfg).expect("bucket compile");
+        let samples = vec![(vec![1; 59], vec![2; 59], 0.02)];
+
+        let prepared = prepare_training_samples(&samples, Some(&buckets), 256.0);
+        assert_eq!(prepared.len(), 1);
+        let sample = &prepared[0];
+        assert_eq!(sample.tokens_u32.len(), 59);
+        assert_eq!(sample.targets_u32.len(), 59);
+        assert_eq!(sample.bucket_seq, 128);
+        assert_eq!(sample.tok_pad.len(), 128);
+        assert_eq!(sample.tgt_pad.len(), 128);
+        assert!(sample.tok_pad[59..].iter().all(|&t| t == 0));
+        assert!(sample.tgt_pad[59..].iter().all(|&t| t == 0));
+        assert_eq!(sample.effective_loss_scale, 25.6);
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_prepare_training_samples_without_buckets_keeps_raw_tokens() {
+        let samples = vec![(vec![7, 8, 9], vec![8, 9, 10], 0.5)];
+        let prepared = prepare_training_samples(&samples, None, 256.0);
+        assert_eq!(prepared.len(), 1);
+        let sample = &prepared[0];
+        assert_eq!(sample.bucket_seq, 3);
+        assert!(sample.tok_pad.is_empty());
+        assert!(sample.tgt_pad.is_empty());
+        assert_eq!(sample.tokens_u32, vec![7, 8, 9]);
+        assert_eq!(sample.targets_u32, vec![8, 9, 10]);
+        assert_eq!(sample.effective_loss_scale, 128.0);
+    }
+
     // -----------------------------------------------------------------------
     // E2E integration tests (require Qwen3-1.7B weights on disk + mlx feature)
     // -----------------------------------------------------------------------
@@ -740,7 +1377,6 @@ mod tests {
         use crate::agent::ane_mil::MilConfig;
         use crate::agent::ane_weights::ModelWeights;
         use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, MlxLoraModel, ModelConfig};
-        use mlx_rs::module::Module;
 
         let model_dir = qwen3_1_7b_dir();
         let mil_cfg = MilConfig {
@@ -892,6 +1528,9 @@ mod tests {
             lr_scale_attn: 0.05,
             lr_scale_ffn: 1.0,
             residual_scale: 0.0,
+            optimizer: AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            accum_steps: 1,
         };
 
         eprintln!("spawning ANE training thread...");
@@ -928,7 +1567,7 @@ mod tests {
         }
 
         use crate::agent::ane_mil::MilConfig;
-        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, MlxLoraModel, ModelConfig};
+        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, ModelConfig};
         use crate::agent::mlx_server::{ModelRequest, TrainState};
         use std::sync::Arc;
 
@@ -1019,6 +1658,9 @@ mod tests {
             lr_scale_attn: 0.05,
             lr_scale_ffn: 1.0,
             residual_scale: 0.0,
+            optimizer: AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            accum_steps: 1,
         };
         let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets, 1.0)], Some(ane_tx));
 
@@ -1075,6 +1717,277 @@ mod tests {
         !qwen3_5_dir().join("tokenizer.json").exists()
     }
 
+    fn qwen3_5_alias_dir(
+        tag: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let unique = tmp.path().file_name().unwrap().to_string_lossy();
+        let alias_name = format!(
+            "Qwen3.5-0.8B-8bit-{tag}-{}-{unique}",
+            std::process::id()
+        );
+        let alias_dir = tmp.path().join(alias_name);
+        symlink(qwen3_5_dir(), &alias_dir).expect("symlink model dir");
+        let model_key = alias_dir.file_name().unwrap().to_string_lossy().to_string();
+        let lora_path = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/workspace/lora")
+            .join(format!("{model_key}.bin"));
+        (tmp, alias_dir, lora_path)
+    }
+
+    fn qwen3_5_overlay_dir(
+        tag: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let unique = tmp.path().file_name().unwrap().to_string_lossy();
+        let overlay_name = format!(
+            "Qwen3.5-0.8B-8bit-{tag}-overlay-{}-{unique}",
+            std::process::id()
+        );
+        let overlay_dir = tmp.path().join(overlay_name);
+        std::fs::create_dir_all(&overlay_dir).expect("create overlay dir");
+
+        for entry in std::fs::read_dir(qwen3_5_dir()).expect("read model dir") {
+            let entry = entry.expect("dir entry");
+            let src = entry.path();
+            let dst = overlay_dir.join(entry.file_name());
+            symlink(&src, &dst).unwrap_or_else(|e| {
+                panic!(
+                    "symlink {} -> {} failed: {e}",
+                    src.display(),
+                    dst.display()
+                )
+            });
+        }
+
+        let model_key = overlay_dir.file_name().unwrap().to_string_lossy().to_string();
+        let lora_path = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/workspace/lora")
+            .join(format!("{model_key}.bin"));
+        (tmp, overlay_dir, lora_path)
+    }
+
+    fn dir_size_bytes(path: &std::path::Path) -> u64 {
+        fn walk(path: &std::path::Path) -> u64 {
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(_) => return 0,
+            };
+            if meta.file_type().is_symlink() {
+                return 0;
+            }
+            if meta.is_file() {
+                return meta.len();
+            }
+            if meta.is_dir() {
+                return std::fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|it| it.filter_map(Result::ok))
+                    .map(|entry| walk(&entry.path()))
+                    .sum();
+            }
+            0
+        }
+
+        walk(path)
+    }
+
+    fn current_rss_bytes() -> u64 {
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .expect("ps rss");
+        let kb = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        kb * 1024
+    }
+
+    fn peak_rss_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(rc, 0, "getrusage should succeed");
+        let usage = unsafe { usage.assume_init() };
+        #[cfg(target_os = "macos")]
+        {
+            usage.ru_maxrss as u64
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (usage.ru_maxrss as u64) * 1024
+        }
+    }
+
+    #[cfg(feature = "ane")]
+    fn manual_ane_muon_step_metrics(
+        model_dir: &std::path::Path,
+        cfg: &AneTrainingConfig,
+        tokens: &[u32],
+        targets: &[u32],
+    ) -> (u128, u128, f32, f32, usize, usize, u64, u64) {
+        use crate::agent::ane_backward;
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{
+            lora_muon_update_ane, LoraConfig, LoraModel, LoraModelMuon, LoraMuonKernels,
+            LoraWeightGradKernels,
+        };
+        use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
+
+        let sample_len = tokens.len();
+        let bucket_kernels =
+            BucketKernels::compile(&[sample_len], &cfg.mil_config).expect("bucket compile");
+        let (bucket_seq, fwd_k, bwd_k) = bucket_kernels.get(sample_len);
+
+        let mut grad_cfg = cfg.mil_config.clone();
+        grad_cfg.seq_len = *bucket_seq;
+
+        let quantized =
+            QuantizedModelWeights::from_mlx_safetensors(model_dir, &cfg.mil_config).expect("load");
+        let quantized_bytes = quantized.quantized_memory_bytes() as u64;
+        let dense_layer_bytes: Vec<u64> = (0..quantized.layers.len())
+            .map(|l| quantized.dense_layer_bytes(l) as u64)
+            .collect();
+        let quantized_mb = quantized_bytes as f64 / 1_048_576.0;
+        let mut model = DenseCachedModel::auto(quantized);
+        let cached_layers = model.cached_layer_count();
+        let dense_cached_bytes: u64 = dense_layer_bytes.iter().take(cached_layers).sum();
+
+        model.cfg_mut().seq_len = *bucket_seq;
+        let n_layers = model.n_layers();
+        let dim = model.actual_dim();
+        let hidden = model.actual_hidden_dim();
+        let residual_scale = if cfg.residual_scale > 0.0 {
+            cfg.residual_scale
+        } else {
+            1.0 / (2.0 * n_layers as f32).sqrt()
+        };
+
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            cfg.mil_config.kv_dim(),
+            cfg.mil_config.attn_dim(),
+            cfg.mil_config.q_proj_dim(),
+            hidden,
+        );
+        let mut muon_state = LoraModelMuon::zeros(&lora);
+        let grad_kernels =
+            LoraWeightGradKernels::compile(&grad_cfg, &lora).expect("grad kernels compile");
+        let muon_kernels = LoraMuonKernels::compile(
+            &lora,
+            cfg.lr * cfg.lr_scale_attn,
+            cfg.lr * cfg.lr_scale_ffn,
+            0.95,
+            0.01,
+        )
+        .expect("muon kernels compile");
+
+        let tok_pad = pad_to(tokens, *bucket_seq);
+        let tgt_pad = pad_to(targets, *bucket_seq);
+
+        let step = |lora: &mut LoraModel, muon_state: &mut LoraModelMuon| -> (u128, f32) {
+            let t0 = std::time::Instant::now();
+            let fwd = ane_forward::forward_ane_generic(
+                fwd_k,
+                &model,
+                Some(lora),
+                &tok_pad,
+                &tgt_pad,
+                cfg.softcap,
+                residual_scale,
+            )
+            .expect("manual ANE forward should succeed");
+            let bwd = ane_backward::backward_lora_ane_generic_with_lora_kernels(
+                bwd_k,
+                &model,
+                &fwd,
+                lora,
+                &tok_pad,
+                cfg.softcap,
+                cfg.loss_scale,
+                residual_scale,
+                Some(&grad_kernels),
+            );
+            lora_muon_update_ane(lora, &bwd.lora_grads, muon_state, &muon_kernels)
+                .expect("manual Muon update should succeed");
+            (t0.elapsed().as_millis(), fwd.base.loss)
+        };
+
+        let (step1_ms, step1_loss) = step(&mut lora, &mut muon_state);
+        let (step2_ms, step2_loss) = step(&mut lora, &mut muon_state);
+
+        eprintln!(
+            "ANE in-process baseline: quantized={quantized_mb:.1}MB cached_layers={cached_layers}/{}",
+            model.n_layers()
+        );
+
+        (
+            step1_ms,
+            step2_ms,
+            step1_loss,
+            step2_loss,
+            cached_layers,
+            model.n_layers(),
+            quantized_bytes,
+            dense_cached_bytes,
+        )
+    }
+
+    fn qwen3_5_tokenize_pair(
+        model_dir: &std::path::Path,
+        user: &str,
+        assistant: &str,
+    ) -> (Vec<i32>, Vec<i32>) {
+        let tokenizer =
+            crate::agent::mlx_lora::MlxTokenizer::load(model_dir).expect("tokenizer load");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: user.into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: assistant.into(),
+            },
+        ];
+        crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages).expect("tokenize")
+    }
+
+    fn qwen3_5_eval_avg_loss(
+        model_dir: &std::path::Path,
+        lora: Option<&crate::agent::ane_lora::LoraModel>,
+        samples: &[(Vec<i32>, Vec<i32>)],
+    ) -> f32 {
+        use crate::agent::ane_forward;
+        use crate::agent::ane_weights::{QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let mc = ModelConfig::from_config_json(model_dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(64);
+        let quantized =
+            QuantizedModelWeights::from_mlx_safetensors(model_dir, &mil_cfg).expect("load model");
+        let mut model = crate::agent::ane_weights::DenseCachedModel::auto(quantized);
+        let mut losses = Vec::with_capacity(samples.len());
+        for (tokens, targets) in samples {
+            let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+            model.cfg_mut().seq_len = tokens_u32.len();
+            let fwd = ane_forward::forward_cpu_generic(&model, lora, &tokens_u32, &targets_u32);
+            losses.push(fwd.base.loss);
+        }
+        losses.iter().sum::<f32>() / losses.len() as f32
+    }
+
     /// Test 1: `build_ane_training_config` correctly auto-detects Qwen3.5
     /// hybrid architecture: GDN linear attention layers, attn_output_gate,
     /// GQA with head_dim=256. Uses 0.8B as proxy for the 35B MoE variant
@@ -1124,6 +2037,269 @@ mod tests {
         );
     }
 
+    /// Release-only benchmark harness for the current ANE training baseline.
+    ///
+    /// Prints:
+    /// - full model disk footprint
+    /// - quantized bytes loaded by the trainer
+    /// - LoRA disk footprint
+    /// - cold first-run wall time
+    /// - repeated-run wall time (same process, no persistent trainer)
+    /// - in-process first-step vs second-step timings with preloaded model/kernels
+    /// - current/peak RSS deltas
+    /// - baseline vs post-train loss delta
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "local benchmark; run in release with --features ane,mlx on a machine with Qwen3.5-0.8B"]
+    fn bench_qwen3_5_0_8b_ane_training_baseline() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_lora::load_lora_bin;
+
+        let (_overlay_tmp, overlay_dir, lora_path) = qwen3_5_overlay_dir("ane-bench");
+        let prompt = "Answer exactly in one sentence: What is the capital of France?";
+        let response = "The capital of France is Paris, and that is the complete answer.";
+        let sample = qwen3_5_tokenize_pair(&overlay_dir, prompt, response);
+        let eval_samples = vec![sample.clone()];
+        let baseline_loss = qwen3_5_eval_avg_loss(&overlay_dir, None, &eval_samples);
+
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir))
+            .expect("build config");
+        cfg.optimizer = AneTrainingOptimizer::AneMuon;
+        cfg.strict_ane = true;
+        cfg.lr = 2.5e-4;
+        cfg.epochs = 20;
+
+        let train_samples = vec![
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+        ];
+
+        let model_disk_bytes = dir_size_bytes(&qwen3_5_dir());
+        let rss_before = current_rss_bytes();
+        let peak_before = peak_rss_bytes();
+
+        let t0 = std::time::Instant::now();
+        let ok = spawn_ane_training(cfg.clone(), train_samples.clone(), None)
+            .join()
+            .expect("first training thread should not panic");
+        let cold_run_ms = t0.elapsed().as_millis();
+        assert!(ok, "first training run should succeed");
+
+        assert!(lora_path.exists(), "first training run should save LoRA");
+        let lora_bytes = lora_path.metadata().expect("lora metadata").len();
+        let adapter_bytes = dir_size_bytes(&overlay_dir.join("adapters"));
+        let lora = load_lora_bin(&lora_path).expect("load trained lora");
+        let post_loss = qwen3_5_eval_avg_loss(&overlay_dir, Some(&lora), &eval_samples);
+        let rss_after_first = current_rss_bytes();
+        let peak_after_first = peak_rss_bytes();
+
+        let t1 = std::time::Instant::now();
+        let ok2 = spawn_ane_training(cfg.clone(), train_samples, None)
+            .join()
+            .expect("second training thread should not panic");
+        let second_run_ms = t1.elapsed().as_millis();
+        assert!(ok2, "second training run should succeed");
+
+        let rss_after_second = current_rss_bytes();
+        let peak_after_second = peak_rss_bytes();
+
+        let tokens_u32: Vec<u32> = sample.0.iter().map(|&t| t as u32).collect();
+        let targets_u32: Vec<u32> = sample.1.iter().map(|&t| t as u32).collect();
+        let (
+            step1_ms,
+            step2_ms,
+            step1_loss,
+            step2_loss,
+            cached_layers,
+            total_layers,
+            quantized_bytes,
+            dense_cached_bytes,
+        ) = manual_ane_muon_step_metrics(&overlay_dir, &cfg, &tokens_u32, &targets_u32);
+
+        let improvement_pct = ((baseline_loss - post_loss) / baseline_loss.max(1e-6)) * 100.0;
+        let metrics = serde_json::json!({
+            "model_disk_mb": model_disk_bytes as f64 / 1_048_576.0,
+            "quantized_loaded_mb": quantized_bytes as f64 / 1_048_576.0,
+            "dense_cached_mb_est": dense_cached_bytes as f64 / 1_048_576.0,
+            "cached_layers": cached_layers,
+            "total_layers": total_layers,
+            "lora_disk_mb": lora_bytes as f64 / 1_048_576.0,
+            "adapter_disk_mb": adapter_bytes as f64 / 1_048_576.0,
+            "cold_run_ms": cold_run_ms,
+            "second_run_ms": second_run_ms,
+            "preloaded_step1_ms": step1_ms,
+            "preloaded_step2_ms": step2_ms,
+            "rss_before_mb": rss_before as f64 / 1_048_576.0,
+            "rss_after_first_mb": rss_after_first as f64 / 1_048_576.0,
+            "rss_after_second_mb": rss_after_second as f64 / 1_048_576.0,
+            "peak_rss_delta_first_mb": (peak_after_first.saturating_sub(peak_before)) as f64 / 1_048_576.0,
+            "peak_rss_delta_second_mb": (peak_after_second.saturating_sub(peak_before)) as f64 / 1_048_576.0,
+            "baseline_loss": baseline_loss,
+            "post_loss": post_loss,
+            "improvement_pct": improvement_pct,
+            "preloaded_step1_loss": step1_loss,
+            "preloaded_step2_loss": step2_loss,
+        });
+        eprintln!("ANE benchmark baseline: {metrics}");
+
+        assert!(
+            post_loss < baseline_loss,
+            "benchmark training should reduce loss: baseline={baseline_loss:.4}, post={post_loss:.4}"
+        );
+        assert!(step2_loss.is_finite(), "preloaded second-step loss should be finite");
+    }
+
+    /// Regression: the persistent trainer must reuse the loaded 0.8B model
+    /// and cached bucket kernels across consecutive runs with the same config.
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "local persistent-trainer regression; run with --features ane,mlx on a machine with Qwen3.5-0.8B"]
+    fn test_persistent_ane_trainer_reuses_loaded_model() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let (_alias_tmp, alias_dir, _lora_path) = qwen3_5_alias_dir("persistent-reuse");
+        let prompt = "Answer exactly in one sentence: What is the capital of France?";
+        let response = "The capital of France is Paris, and that is the complete answer.";
+        let sample = qwen3_5_tokenize_pair(&alias_dir, prompt, response);
+
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir))
+            .expect("build config");
+        cfg.optimizer = AneTrainingOptimizer::AneMuon;
+        cfg.strict_ane = true;
+        cfg.lr = 2.5e-4;
+        cfg.epochs = 1;
+
+        let trainer = PersistentAneTrainer::new();
+        let train_samples = vec![(sample.0.clone(), sample.1.clone(), 1.0)];
+
+        let ok1 = trainer
+            .spawn_training(cfg.clone(), train_samples.clone(), None)
+            .join()
+            .expect("first persistent run should not panic");
+        assert!(ok1, "first persistent trainer run should succeed");
+        let stats1 = trainer.stats();
+        assert_eq!(stats1.model_loads, 1, "first run should load the model once");
+        assert!(
+            stats1.bucket_compiles >= 1,
+            "first run should compile at least one bucket"
+        );
+
+        let ok2 = trainer
+            .spawn_training(cfg, train_samples, None)
+            .join()
+            .expect("second persistent run should not panic");
+        assert!(ok2, "second persistent trainer run should succeed");
+        let stats2 = trainer.stats();
+        assert_eq!(
+            stats2.model_loads, 1,
+            "persistent trainer should reuse the loaded model on the second run"
+        );
+        assert_eq!(
+            stats2.bucket_compiles, stats1.bucket_compiles,
+            "persistent trainer should reuse bucket kernels on the second run"
+        );
+        assert_eq!(
+            stats2.completed_runs, 2,
+            "persistent trainer should report two completed runs"
+        );
+    }
+
+    /// Release-only benchmark for the long-lived ANE trainer warm path.
+    ///
+    /// Prints:
+    /// - first vs second persistent-run wall time
+    /// - model/bucket reuse counters from the trainer
+    /// - baseline vs post-train loss delta
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "local benchmark; run in release with --features ane,mlx on a machine with Qwen3.5-0.8B"]
+    fn bench_qwen3_5_0_8b_ane_training_persistent() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_lora::load_lora_bin;
+
+        let (_overlay_tmp, overlay_dir, lora_path) = qwen3_5_overlay_dir("ane-persistent");
+        let prompt = "Answer exactly in one sentence: What is the capital of France?";
+        let response = "The capital of France is Paris, and that is the complete answer.";
+        let sample = qwen3_5_tokenize_pair(&overlay_dir, prompt, response);
+        let eval_samples = vec![sample.clone()];
+        let baseline_loss = qwen3_5_eval_avg_loss(&overlay_dir, None, &eval_samples);
+
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir))
+            .expect("build config");
+        cfg.optimizer = AneTrainingOptimizer::AneMuon;
+        cfg.strict_ane = true;
+        cfg.lr = 2.5e-4;
+        cfg.epochs = 20;
+
+        let train_samples = vec![
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+        ];
+
+        let trainer = PersistentAneTrainer::new();
+
+        let t0 = std::time::Instant::now();
+        let ok1 = trainer
+            .spawn_training(cfg.clone(), train_samples.clone(), None)
+            .join()
+            .expect("first persistent training thread should not panic");
+        let first_run_ms = t0.elapsed().as_millis();
+        assert!(ok1, "first persistent training run should succeed");
+
+        let t1 = std::time::Instant::now();
+        let ok2 = trainer
+            .spawn_training(cfg, train_samples, None)
+            .join()
+            .expect("second persistent training thread should not panic");
+        let second_run_ms = t1.elapsed().as_millis();
+        assert!(ok2, "second persistent training run should succeed");
+
+        let stats = trainer.stats();
+        let lora = load_lora_bin(&lora_path).expect("load trained lora");
+        let post_loss = qwen3_5_eval_avg_loss(&overlay_dir, Some(&lora), &eval_samples);
+        let improvement_pct = ((baseline_loss - post_loss) / baseline_loss.max(1e-6)) * 100.0;
+        let metrics = serde_json::json!({
+            "persistent_first_run_ms": first_run_ms,
+            "persistent_second_run_ms": second_run_ms,
+            "persistent_model_loads": stats.model_loads,
+            "persistent_bucket_compiles": stats.bucket_compiles,
+            "persistent_completed_runs": stats.completed_runs,
+            "baseline_loss": baseline_loss,
+            "post_loss": post_loss,
+            "improvement_pct": improvement_pct,
+        });
+        eprintln!("ANE benchmark persistent: {metrics}");
+
+        assert_eq!(stats.model_loads, 1, "persistent trainer should load the model once");
+        assert_eq!(
+            stats.completed_runs, 2,
+            "persistent trainer should report two completed runs"
+        );
+        assert!(
+            second_run_ms < first_run_ms,
+            "persistent warm run should be faster than the first run: first={first_run_ms}ms second={second_run_ms}ms"
+        );
+        assert!(
+            post_loss.is_finite(),
+            "persistent benchmark should report a finite post-train loss"
+        );
+    }
+
     /// Test 1b: BucketKernels compile for Qwen3.5 dims and FFN uses ANE.
     /// SDPA fails (GQA) but is caught by .ok() — training uses ANE for FFN.
     #[cfg(feature = "mlx")]
@@ -1164,6 +2340,7 @@ mod tests {
         eprintln!(
             "  FFN:  {}",
             match &fwd.ffn {
+                FfnKernels::FullyFused { .. } => "ANE (fully-fused)",
                 FfnKernels::Fused { .. } => "ANE (fused)",
                 FfnKernels::Tiled { .. } => "ANE (tiled)",
             }
@@ -1246,6 +2423,66 @@ mod tests {
         );
     }
 
+    /// Offline proof: real Qwen3.5-0.8B ANE Muon training run lowers loss on
+    /// its own training sample using the full `spawn_ane_training` path.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_ane_muon_offline_qwen3_5_0_8b_reduces_loss() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_lora::load_lora_bin;
+
+        let (_alias_tmp, alias_dir, lora_path) = qwen3_5_alias_dir("ane-muon-offline");
+        let prompt = "Answer exactly in one sentence: What is the capital of France?";
+        let response = "The capital of France is Paris, and that is the complete answer.";
+        let sample = qwen3_5_tokenize_pair(&alias_dir, prompt, response);
+        let eval_samples = vec![sample.clone()];
+        let baseline = qwen3_5_eval_avg_loss(&alias_dir, None, &eval_samples);
+
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir))
+            .expect("build config");
+        cfg.optimizer = AneTrainingOptimizer::AneMuon;
+        cfg.strict_ane = true;
+        cfg.lr = 2.5e-4;
+        cfg.epochs = 20;
+
+        let train_samples = vec![
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+            (sample.0.clone(), sample.1.clone(), 1.0),
+        ];
+
+        let handle = spawn_ane_training(cfg, train_samples, None);
+        let ok = handle.join().expect("training thread should not panic");
+        assert!(ok, "ANE Muon offline training should succeed");
+        assert!(
+            lora_path.exists(),
+            "ANE Muon offline training should save LoRA at {}",
+            lora_path.display()
+        );
+
+        let lora = load_lora_bin(&lora_path).expect("load trained lora");
+        let post = qwen3_5_eval_avg_loss(&alias_dir, Some(&lora), &eval_samples);
+        let improvement = (baseline - post) / baseline.max(1e-6);
+        eprintln!(
+            "ANE Muon offline: baseline_loss={baseline:.4} post_loss={post:.4} improvement={:.2}%",
+            improvement * 100.0
+        );
+        assert!(
+            post < baseline,
+            "ANE Muon offline loss should decrease: baseline={baseline:.4}, post={post:.4}"
+        );
+        assert!(
+            improvement > 0.0,
+            "ANE Muon offline improvement should be positive: got {:.2}%",
+            improvement * 100.0
+        );
+    }
+
     /// Test 3: The `observe_async` learn loop path fires ANE training when
     /// `ane_model_dir` is set and `mlx_provider` is None (oMLX/LM Studio mode).
     /// Verifies the full wiring: experience recorded → threshold exceeded →
@@ -1292,6 +2529,14 @@ mod tests {
             mlx_provider: None, // No in-process MLX — oMLX mode
             training_counters: Some(counters.clone()),
             ane_model_dir: Some(dir.clone()), // THIS is what we're testing
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: Some(Arc::new(PersistentAneTrainer::new())),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
         };
 
         // Build a TurnOutcome with high surprise content
@@ -1371,6 +2616,140 @@ mod tests {
         }
 
         eprintln!("learn_loop ane_model_dir path verified end-to-end");
+    }
+
+    /// Online proof: the live learn-loop path records experiences, triggers ANE
+    /// Muon training, and produces a saved LoRA that lowers loss.
+    #[cfg(feature = "mlx")]
+    #[tokio::test]
+    async fn test_learn_loop_ane_muon_reduces_loss_online() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::agent_core::RuntimeCounters;
+        use crate::agent::ane_lora::load_lora_bin;
+        use crate::agent::learn_loop::{DefaultLearnLoop, LearnLoop, TurnOutcome};
+        use crate::agent::lora_bridge::ExperienceBuffer;
+        use crate::config::schema::PerplexityGateConfig;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let (_alias_tmp, alias_dir, lora_path) = qwen3_5_alias_dir("ane-muon-online");
+        let prompt = "Answer exactly in one sentence: What is the capital of France?";
+        let response = "The capital of France is Paris, and that is the complete answer.";
+        let sample = qwen3_5_tokenize_pair(&alias_dir, prompt, response);
+        let eval_samples = vec![sample.clone()];
+        let baseline = qwen3_5_eval_avg_loss(&alias_dir, None, &eval_samples);
+
+        let tmp_db = tempfile::NamedTempFile::new().expect("tempfile");
+        let eb = ExperienceBuffer::open(tmp_db.path()).expect("open eb");
+        eb.record(prompt, "[]", response, true, 1.0, "local:Qwen3.5-0.8B")
+            .expect("seed exp 1");
+        eb.record(prompt, "[]", response, true, 1.0, "local:Qwen3.5-0.8B")
+            .expect("seed exp 2");
+        eb.record(prompt, "[]", response, true, 1.0, "local:Qwen3.5-0.8B")
+            .expect("seed exp 3");
+        let eb_arc = Arc::new(parking_lot::Mutex::new(eb));
+        let counters = Arc::new(RuntimeCounters::new(128_000));
+
+        let ll = DefaultLearnLoop {
+            calibrator: None,
+            experience_buffer: Some(eb_arc.clone()),
+            perplexity_gate_config: PerplexityGateConfig {
+                enabled: true,
+                surprise_threshold: 0.0,
+                min_experiences: 4,
+                train_epochs: 20,
+                mlx_server_url: String::new(),
+            },
+            #[cfg(feature = "mlx")]
+            mlx_provider: None,
+            training_counters: Some(counters.clone()),
+            ane_model_dir: Some(alias_dir.clone()),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: Some(Arc::new(PersistentAneTrainer::new())),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: Some(AneTrainingOptimizer::AneMuon),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: Some(2.5e-4),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: true,
+        };
+
+        let outcome = TurnOutcome {
+            user_content: prompt.into(),
+            final_content: response.into(),
+            reasoning_trace: Some("Deliberate exact-answer turn.".into()),
+            turn_messages: vec![],
+            model: "local:Qwen3.5-0.8B".into(),
+            session_key: "ane-muon-online".into(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            used_tools: {
+                let mut tools = std::collections::HashSet::new();
+                tools.insert("read_file".into());
+                tools
+            },
+            turn_tool_entries: vec![crate::agent::audit::TurnToolEntry {
+                name: "read_file".into(),
+                id: "call_1".into(),
+                ok: true,
+                duration_ms: 12,
+                result_chars: 128,
+            }],
+            iterations_used: 0,
+            max_iterations: 1,
+            turn_count: 1,
+            turn_start_elapsed_ms: 250,
+            context_tokens: 256,
+            message_count: 2,
+            working_memory_tokens: 0,
+            provenance_audit_enabled: false,
+            is_local: true,
+            cost_usd: 0.0,
+            prompt_tokens: 64,
+            completion_tokens: 16,
+        };
+
+        let handle = ll.observe_async(outcome).expect("learn loop should spawn");
+        handle.await.expect("learn loop task should not panic");
+
+        assert!(
+            !counters.training_active.load(Ordering::Relaxed),
+            "training should be inactive after learn loop completes"
+        );
+        assert!(
+            counters.training_steps_total.load(Ordering::Relaxed) >= 1,
+            "learn loop should record at least one completed ANE training run"
+        );
+        assert!(
+            lora_path.exists(),
+            "learn loop should save LoRA at {}",
+            lora_path.display()
+        );
+        assert_eq!(
+            eb_arc.lock().stats().expect("stats").unexported,
+            0,
+            "all queued experiences should be marked exported after successful training"
+        );
+
+        let lora = load_lora_bin(&lora_path).expect("load trained lora");
+        let post = qwen3_5_eval_avg_loss(&alias_dir, Some(&lora), &eval_samples);
+        let improvement = (baseline - post) / baseline.max(1e-6);
+        eprintln!(
+            "ANE Muon online: baseline_loss={baseline:.4} post_loss={post:.4} improvement={:.2}%",
+            improvement * 100.0
+        );
+        assert!(
+            post < baseline,
+            "ANE Muon online loss should decrease: baseline={baseline:.4}, post={post:.4}"
+        );
+        assert!(
+            improvement > 0.0,
+            "ANE Muon online improvement should be positive: got {:.2}%",
+            improvement * 100.0
+        );
     }
 
     /// Test 4: Before/after eval — train LoRA on a set of samples, then measure
@@ -1924,8 +3303,8 @@ mod tests {
         let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
         assert!(!tokens_u32.is_empty(), "tokenization should produce tokens");
 
-        let bucket_kernels =
-            BucketKernels::compile(&[tokens_u32.len()], &train_cfg.mil_config).expect("bucket compile");
+        let bucket_kernels = BucketKernels::compile(&[tokens_u32.len()], &train_cfg.mil_config)
+            .expect("bucket compile");
         let (bucket_seq, bucket_fwd_k, bucket_bwd_k) = bucket_kernels.get(tokens_u32.len());
         eprintln!(
             "35B ANE smoke: sample_len={} bucket_seq={}",
@@ -1939,8 +3318,8 @@ mod tests {
         let tok_pad = pad_to(&tokens_u32, *bucket_seq);
         let tgt_pad = pad_to(&targets_u32, *bucket_seq);
 
-        let quantized =
-            QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config).expect("load 35B");
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config)
+            .expect("load 35B");
         let mut model = DenseCachedModel::auto(quantized);
         model.cfg_mut().seq_len = *bucket_seq;
 
@@ -1992,7 +3371,10 @@ mod tests {
                 .as_ref()
                 .map_or(false, |g| g.db.iter().any(|&v| v != 0.0))
         });
-        assert!(has_db_grads, "ANE backward should produce non-zero dB gradients");
+        assert!(
+            has_db_grads,
+            "ANE backward should produce non-zero dB gradients"
+        );
 
         let lora_b_norm_before: f32 = lora
             .layers
@@ -2058,6 +3440,180 @@ mod tests {
             "35B ANE smoke: initial_loss={initial_loss:.4}, post_loss={post_loss:.4}, cached={}/{}",
             model.cached_layer_count(),
             model.n_layers()
+        );
+    }
+
+    /// Test: adapter export produces correct tensor count for 35B MoE layout.
+    ///
+    /// 35B: 40 layers, 30 GDN + 10 MHA.
+    /// GDN layers: only down_proj → 30 × 2 = 60 tensors
+    /// MHA layers: q_proj + v_proj + o_proj + down_proj → 10 × 4 × 2 = 80 tensors
+    /// Total: 140
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_export_ane_adapters_35b_moe_layout() {
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("config.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-4bit not found");
+            return;
+        }
+
+        let cfg =
+            crate::agent::mlx_lora::ModelConfig::from_config_json(&dir).expect("parse config");
+        assert_eq!(cfg.n_layers, 40);
+        assert_eq!(cfg.linear_attn_indices.len(), 30);
+        assert_eq!(cfg.hidden_dim, 512); // MoE intermediate size
+
+        let lora = crate::agent::ane_lora::LoraModel::with_full_dims(
+            crate::agent::ane_lora::LoraConfig::default(),
+            cfg.n_layers,
+            cfg.dim,
+            cfg.n_kv_heads * cfg.head_dim,
+            cfg.n_heads * cfg.head_dim,
+            if cfg.attn_output_gate {
+                2 * cfg.n_heads * cfg.head_dim
+            } else {
+                cfg.n_heads * cfg.head_dim
+            },
+            cfg.hidden_dim,
+        );
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let n = crate::agent::mlx_lora::export_ane_adapters(
+            &lora,
+            &cfg,
+            Some(&cfg.linear_attn_indices),
+            tmpdir.path(),
+        )
+        .expect("35B ANE export failed");
+
+        assert_eq!(
+            n, 140,
+            "35B MoE: 30 GDN×2 + 10 MHA×8 = 140 tensors"
+        );
+
+        let loaded =
+            mlx_rs::Array::load_safetensors(&tmpdir.path().join("adapters.safetensors"))
+                .expect("load back");
+        assert_eq!(loaded.len(), 140);
+
+        // GDN layer 0 should only have down_proj
+        assert!(
+            loaded
+                .keys()
+                .any(|k| k.contains(".layers.0.mlp.down_proj.lora_a.weight")),
+            "GDN layer 0 should have down_proj"
+        );
+        assert!(
+            !loaded
+                .keys()
+                .any(|k| k.contains(".layers.0.self_attn.q_proj.lora_a.weight")),
+            "GDN layer 0 should NOT have attention LoRA"
+        );
+
+        // MHA layer 3 (every 4th is MHA in Qwen3.5) should have attention LoRA
+        assert!(
+            loaded
+                .keys()
+                .any(|k| k.contains(".layers.3.self_attn.q_proj.lora_a.weight")),
+            "MHA layer 3 should have attention LoRA"
+        );
+
+        let config_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config_json["num_layers"], 40);
+        assert_eq!(config_json["lora_layers"], 10); // only MHA layers count
+        assert_eq!(config_json["rank"], 32);
+        eprintln!("PASS: 35B MoE adapter export — 140 tensors, correct layout");
+    }
+
+    /// Test: full `spawn_ane_training` pipeline on 35B MoE with mlx_tx=None.
+    ///
+    /// Exercises the production oMLX path end-to-end:
+    /// load weights → dense cache → compile kernels → train → save LoRA →
+    /// export adapters.safetensors → verify adapter file on disk.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_35b_spawn_ane_training_standalone() {
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-4bit not found");
+            return;
+        }
+
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+            .expect("build 35B config");
+
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage {
+                role: "user".into(),
+                content: "What is 2+2?".into(),
+            },
+            crate::agent::mlx_server::ChatMessage {
+                role: "assistant".into(),
+                content: "4".into(),
+            },
+        ];
+        let (tokens, targets) =
+            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                .expect("tokenize");
+        eprintln!("35B standalone: tokenized to {} tokens", tokens.len());
+
+        // Clean adapter dir so we verify fresh export
+        let adapter_dir = dir.join("adapters");
+        let adapters_file = adapter_dir.join("adapters.safetensors");
+        let modified_before = adapters_file.metadata().ok().and_then(|m| m.modified().ok());
+
+        let t0 = std::time::Instant::now();
+        let handle = spawn_ane_training(cfg, vec![(tokens, targets, 1.0)], None);
+        let ok = handle.join().expect("training thread should not panic");
+        let elapsed = t0.elapsed();
+
+        assert!(ok, "35B spawn_ane_training should complete successfully");
+        eprintln!("35B standalone: completed in {:.1}s", elapsed.as_secs_f64());
+
+        // Verify LoRA .bin saved
+        let model_key = dir.file_name().unwrap().to_string_lossy().to_string();
+        let lora_path = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/workspace/lora")
+            .join(format!("{model_key}.bin"));
+        assert!(
+            lora_path.exists(),
+            "LoRA .bin should exist at {}",
+            lora_path.display()
+        );
+
+        // Verify adapters.safetensors exported
+        assert!(
+            adapters_file.exists(),
+            "adapters.safetensors should exist at {}",
+            adapters_file.display()
+        );
+        let modified_after = adapters_file.metadata().ok().and_then(|m| m.modified().ok());
+        assert!(
+            modified_after > modified_before,
+            "adapters.safetensors should have been updated"
+        );
+
+        // Verify adapter_config.json
+        let config_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config_json["num_layers"], 40);
+        assert_eq!(config_json["lora_layers"], 10);
+
+        eprintln!(
+            "PASS: 35B spawn_ane_training standalone — LoRA saved + adapters exported in {:.1}s",
+            elapsed.as_secs_f64()
         );
     }
 

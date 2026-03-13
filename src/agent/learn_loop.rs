@@ -78,6 +78,14 @@ pub(crate) struct DefaultLearnLoop {
     /// Resolved model directory for standalone ANE training.
     /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
     pub ane_model_dir: Option<std::path::PathBuf>,
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub ane_trainer: Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub ane_optimizer_override: Option<crate::agent::ane_mlx_bridge::AneTrainingOptimizer>,
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub ane_lr_override: Option<f32>,
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub ane_strict_ane: bool,
 }
 
 impl DefaultLearnLoop {
@@ -178,6 +186,14 @@ impl LearnLoop for DefaultLearnLoop {
         let pg_config = self.perplexity_gate_config.clone();
         let train_counters = self.training_counters.clone();
         let ane_model_dir = self.ane_model_dir.clone();
+        #[cfg(all(feature = "ane", feature = "mlx"))]
+        let ane_trainer = self.ane_trainer.clone();
+        #[cfg(all(feature = "ane", feature = "mlx"))]
+        let ane_optimizer_override = self.ane_optimizer_override;
+        #[cfg(all(feature = "ane", feature = "mlx"))]
+        let ane_lr_override = self.ane_lr_override;
+        #[cfg(all(feature = "ane", feature = "mlx"))]
+        let ane_strict_ane = self.ane_strict_ane;
 
         #[cfg(feature = "mlx")]
         let mlx_provider = self.mlx_provider.clone();
@@ -186,9 +202,10 @@ impl LearnLoop for DefaultLearnLoop {
             // Store rich turn messages (with tool_calls + tool results) when available,
             // falling back to metadata-only trace for turns without tool calls.
             // The rich format is detected during training by checking for "role" keys.
-            let has_tool_messages = outcome.turn_messages.iter().any(|m| {
-                m.get("role").and_then(|v| v.as_str()) == Some("tool")
-            });
+            let has_tool_messages = outcome
+                .turn_messages
+                .iter()
+                .any(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"));
             let trace_json = if has_tool_messages {
                 serde_json::to_string(&outcome.turn_messages).unwrap_or_else(|_| "[]".into())
             } else {
@@ -294,7 +311,14 @@ impl LearnLoop for DefaultLearnLoop {
                 }
                 let data: Vec<(String, String, String, f64)> = exps
                     .iter()
-                    .map(|e| (e.prompt.clone(), e.tool_trace.clone(), e.response.clone(), e.quality))
+                    .map(|e| {
+                        (
+                            e.prompt.clone(),
+                            e.tool_trace.clone(),
+                            e.response.clone(),
+                            e.quality,
+                        )
+                    })
                     .collect();
                 let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
                 (data, ids)
@@ -311,74 +335,94 @@ impl LearnLoop for DefaultLearnLoop {
                     ane_model_dir.clone()
                 };
                 if let Some(ref model_dir) = model_dir_opt {
-                if let Some(ane_cfg) = build_ane_training_config(Some(model_dir)) {
-                    let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
-                        std::path::Path::new(&ane_cfg.model_dir),
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            debug!("perplexity_gate: ANE tokenizer load failed: {e}");
-                            // Fall through to HTTP training (no model worker contention)
-                            try_http_train(
-                                &exps_data,
-                                &ids,
-                                &eb_mutex,
-                                epochs,
-                                &pg_config.mlx_server_url,
-                                &train_counters,
-                            )
-                            .await;
-                            return;
+                    if let Some(mut ane_cfg) = build_ane_training_config(Some(model_dir)) {
+                        ane_cfg.epochs = epochs.max(1);
+                        if let Some(optimizer) = ane_optimizer_override {
+                            ane_cfg.optimizer = optimizer;
                         }
-                    };
-                    let mut samples: Vec<(Vec<i32>, Vec<i32>, f32)> = Vec::new();
-                    for (prompt, trace, response, q) in &exps_data {
-                        // Check if trace contains rich messages (has "role" keys)
-                        let rich = serde_json::from_str::<Vec<serde_json::Value>>(trace)
-                            .ok()
-                            .filter(|msgs| msgs.first().map_or(false, |m| m.get("role").is_some()));
-                        let pair = if let Some(messages) = rich {
-                            crate::agent::mlx_server::tokenize_rich_conversation(&tokenizer, &messages)
-                        } else {
-                            let messages = vec![
-                                crate::agent::mlx_server::ChatMessage {
-                                    role: "user".into(),
-                                    content: prompt.clone(),
-                                },
-                                crate::agent::mlx_server::ChatMessage {
-                                    role: "assistant".into(),
-                                    content: response.clone(),
-                                },
-                            ];
-                            crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+                        if let Some(lr) = ane_lr_override {
+                            ane_cfg.lr = lr;
+                        }
+                        if ane_strict_ane {
+                            ane_cfg.strict_ane = true;
+                        }
+                        let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
+                            std::path::Path::new(&ane_cfg.model_dir),
+                        ) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                debug!("perplexity_gate: ANE tokenizer load failed: {e}");
+                                // Fall through to HTTP training (no model worker contention)
+                                try_http_train(
+                                    &exps_data,
+                                    &ids,
+                                    &eb_mutex,
+                                    epochs,
+                                    &pg_config.mlx_server_url,
+                                    &train_counters,
+                                )
+                                .await;
+                                return;
+                            }
                         };
-                        if let Ok(pair) = pair {
-                            samples.push((pair.0, pair.1, *q as f32));
+                        let mut samples: Vec<(Vec<i32>, Vec<i32>, f32)> = Vec::new();
+                        for (prompt, trace, response, q) in &exps_data {
+                            // Check if trace contains rich messages (has "role" keys)
+                            let rich = serde_json::from_str::<Vec<serde_json::Value>>(trace)
+                                .ok()
+                                .filter(|msgs| {
+                                    msgs.first().map_or(false, |m| m.get("role").is_some())
+                                });
+                            let pair = if let Some(messages) = rich {
+                                crate::agent::mlx_server::tokenize_rich_conversation(
+                                    &tokenizer, &messages,
+                                )
+                            } else {
+                                let messages = vec![
+                                    crate::agent::mlx_server::ChatMessage {
+                                        role: "user".into(),
+                                        content: prompt.clone(),
+                                    },
+                                    crate::agent::mlx_server::ChatMessage {
+                                        role: "assistant".into(),
+                                        content: response.clone(),
+                                    },
+                                ];
+                                crate::agent::mlx_server::tokenize_conversation(
+                                    &tokenizer, &messages,
+                                )
+                            };
+                            if let Ok(pair) = pair {
+                                samples.push((pair.0, pair.1, *q as f32));
+                            }
                         }
-                    }
-                    if !samples.is_empty() {
-                        let mlx_tx = mlx_provider.as_ref().map(|mlx| mlx.model_tx());
-                        // Signal training start.
-                        if let Some(ref tc) = train_counters {
-                            tc.training_active.store(true, Ordering::Relaxed);
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            tc.training_started_ms.store(now_ms, Ordering::Relaxed);
-                        }
-                        let tc_for_done = train_counters.clone();
-                        let handle = crate::agent::ane_mlx_bridge::spawn_ane_training(
-                            ane_cfg, samples, mlx_tx,
-                        );
-                        let eb_for_done = eb_mutex.clone();
-                        let n_exps = ids.len();
-                        info!(
+                        if !samples.is_empty() {
+                            let mlx_tx = mlx_provider.as_ref().map(|mlx| mlx.model_tx());
+                            // Signal training start.
+                            if let Some(ref tc) = train_counters {
+                                tc.training_active.store(true, Ordering::Relaxed);
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                tc.training_started_ms.store(now_ms, Ordering::Relaxed);
+                            }
+                            let tc_for_done = train_counters.clone();
+                            let handle = if let Some(ref trainer) = ane_trainer {
+                                trainer.spawn_training(ane_cfg, samples, mlx_tx)
+                            } else {
+                                crate::agent::ane_mlx_bridge::spawn_ane_training(
+                                    ane_cfg, samples, mlx_tx,
+                                )
+                            };
+                            let eb_for_done = eb_mutex.clone();
+                            let n_exps = ids.len();
+                            info!(
                             "perplexity_gate: ANE split-silicon training spawned ({n_exps} experiences)"
                         );
-                        // Wait for the ANE thread to finish on the blocking pool,
-                        // then clear training_active and mark experiences exported.
-                        let _ = tokio::task::spawn_blocking(move || {
+                            // Wait for the ANE thread to finish on the blocking pool,
+                            // then clear training_active and mark experiences exported.
+                            let _ = tokio::task::spawn_blocking(move || {
                             let ok = handle.join().unwrap_or(false);
                             if let Some(ref tc) = tc_for_done {
                                 tc.training_active.store(false, Ordering::Relaxed);
@@ -398,9 +442,9 @@ impl LearnLoop for DefaultLearnLoop {
                                 );
                             }
                         }).await;
-                        return;
+                            return;
+                        }
                     }
-                }
                 }
             }
             // Suppress unused-variable warning when ANE features are off.
@@ -485,6 +529,9 @@ pub(crate) fn build_ane_training_config(
                 lr_scale_attn: 0.05,
                 lr_scale_ffn: 1.0,
                 residual_scale: 0.0,
+                optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
+                strict_ane: false,
+                accum_steps: 1,
             });
         }
     }
@@ -507,6 +554,9 @@ pub(crate) fn build_ane_training_config(
             lr_scale_attn: 0.05,
             lr_scale_ffn: 1.0,
             residual_scale: 0.0,
+            optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            accum_steps: 1,
         });
     }
 
@@ -687,6 +737,14 @@ mod tests {
             mlx_provider: None,
             training_counters: None,
             ane_model_dir: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
         };
         let outcome = make_test_outcome();
         // Should not panic even with no calibrator and audit disabled.
@@ -847,20 +905,24 @@ mod tests {
         use crate::agent::audit::TurnToolEntry;
 
         // High-quality turn: all tools ok, low iterations, long response
-        let good_entries = vec![
-            TurnToolEntry { name: "read_file".into(), id: "c1".into(), ok: true, duration_ms: 50, result_chars: 100 },
-        ];
-        let good_q = crate::agent::lora_bridge::compute_quality(
-            &good_entries, 1, 10, true, 500,
-        );
+        let good_entries = vec![TurnToolEntry {
+            name: "read_file".into(),
+            id: "c1".into(),
+            ok: true,
+            duration_ms: 50,
+            result_chars: 100,
+        }];
+        let good_q = crate::agent::lora_bridge::compute_quality(&good_entries, 1, 10, true, 500);
 
         // Low-quality turn: tool failed, max iterations, short response
-        let bad_entries = vec![
-            TurnToolEntry { name: "exec".into(), id: "c1".into(), ok: false, duration_ms: 100, result_chars: 0 },
-        ];
-        let bad_q = crate::agent::lora_bridge::compute_quality(
-            &bad_entries, 10, 10, false, 5,
-        );
+        let bad_entries = vec![TurnToolEntry {
+            name: "exec".into(),
+            id: "c1".into(),
+            ok: false,
+            duration_ms: 100,
+            result_chars: 0,
+        }];
+        let bad_q = crate::agent::lora_bridge::compute_quality(&bad_entries, 10, 10, false, 5);
 
         assert!(
             good_q > bad_q,

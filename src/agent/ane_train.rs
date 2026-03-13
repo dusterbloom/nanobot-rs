@@ -16,6 +16,7 @@ use super::ane_weights::{LayerWeights, ModelWeights};
 // ---------------------------------------------------------------------------
 
 /// Per-parameter Adam optimizer state (first and second moments).
+#[derive(Clone)]
 pub struct AdamState {
     pub m: Vec<f32>, // first moment
     pub v: Vec<f32>, // second moment

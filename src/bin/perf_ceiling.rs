@@ -1299,7 +1299,7 @@ fn bench_quantized_layer_forward_path() -> QuantizedLayerForwardBenchResult {
 
     let dense_ref = forward_cpu_generic(&dense_model, None, &tokens, &targets);
     let current_ref = forward_cpu_generic(&quantized, None, &tokens, &targets);
-    let max_diff = max_abs_diff(&dense_ref.base.logits, &current_ref.base.logits);
+    let max_diff = max_abs_diff(&dense_ref.base.classifier_dy, &current_ref.base.classifier_dy);
 
     let dense_ms = measure_average_ms(1, 5, || {
         black_box(forward_cpu_generic(&dense_model, None, &tokens, &targets));
@@ -1574,7 +1574,7 @@ fn bench_checkpoint_quantized_forward_path(options: &Options) -> Option<Checkpoi
 
         let dense_ref = forward_cpu_generic(&dense_model, None, &tokens, &targets);
         let current_ref = forward_cpu_generic(&single_layer, None, &tokens, &targets);
-        let max_diff = max_abs_diff(&dense_ref.base.logits, &current_ref.base.logits);
+        let max_diff = max_abs_diff(&dense_ref.base.classifier_dy, &current_ref.base.classifier_dy);
 
         let dense_ms = measure_average_ms(1, 5, || {
             black_box(forward_cpu_generic(&dense_model, None, &tokens, &targets));
