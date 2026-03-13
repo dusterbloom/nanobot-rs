@@ -1,0 +1,13 @@
+# Quality Gate enforcement via Clippy
+# These thresholds are stricter than Clippy defaults to match our Quality Gates.
+# See CLAUDE.md "Quality Gates" section for the reasoning.
+
+# G1: Bool -> Enum — flag ANY bool parameter (default is 3, we want 1)
+max-fn-params-bools = 1
+max-struct-bools = 2
+
+# G3: Nest -> Guard — cognitive complexity threshold (default 25, we want 15)
+cognitive-complexity-threshold = 15
+
+# G4: Grow -> Split — function length limit (default 100, we want 60)
+too-many-lines-threshold = 60

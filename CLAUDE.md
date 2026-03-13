@@ -2,6 +2,41 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Quality Gates (MANDATORY — check before writing ANY function)
+
+Before writing or modifying any function, run through these gates. If a gate triggers, resolve it BEFORE writing the implementation. These gates exist because AI assistants (including you) systematically optimize for "make it work in this session" over "keep the codebase healthy across sessions." These gates counteract that bias.
+
+**G1 — BOOL → ENUM:** Adding a `bool` parameter, field, or `let mut flag` in a loop?
+- Ask: "Can this represent more than 2 downstream behaviors?" → Define an enum.
+- Ask: "Does this flag change meaning during execution?" → It's a state machine. Name the states as enum variants.
+- *Why:* A bool throws away information. Every downstream if/else is the code trying to recover what the bool discarded.
+
+**G2 — SECOND USE → EXTRACT:** About to write logic that already exists elsewhere?
+- The **second** occurrence triggers extraction, not the third. Search with `ast-grep` before writing.
+- *Why:* Duplicated logic drifts. Two copies today become three divergent copies next month.
+
+**G3 — NEST → GUARD:** Is the happy path more than 2 indentation levels deep?
+- Invert conditions, use early returns: `let Some(x) = y else { return; };`
+- The real work stays at the top level. Validation and error cases exit early.
+- *Why:* Nesting hides logic. If the "real work" is at indent level 4, the reader has to hold 4 conditions in their head.
+
+**G4 — GROW → SPLIT:** Is a function doing more than one nameable thing, or exceeding ~40 lines?
+- If a block of code could have a name, make it a function with that name.
+- *Why:* Long functions accrete because each session adds "just one more check." Split proactively.
+
+**G5 — BRANCH → TYPE:** Adding an if/else that selects between two strategies or code paths?
+- That branch should be a trait impl or enum variant dispatched via `match`, not an inline conditional.
+- Especially true when the **same condition is tested in multiple places** across the codebase.
+- *Why:* Inline branches distribute a single decision across many locations. A type centralizes it.
+
+**Decision tree when in doubt:** Define the states → Name the transitions → Let `match` enforce exhaustive handling.
+
+**Enforcement (two layers):**
+- `cargo clippy` — handles G1 (bool params), G3 (cognitive complexity), G4 (function length) via `clippy.toml`
+- `./quality-sentinel.sh` — catches what clippy misses: mutable bool flags (G1), else-if chains 3+ (G5)
+- `./quality-sentinel.sh --full` — runs both together
+- See `.planning/phases/06-state-driven-refactor/AUDIT.md` for the inventory of existing violations.
+
 ## Project
 
 **nanobot** - A lightweight personal AI assistant framework in Rust, ported from [nanobot](https://github.com/HKUDS/nanobot) (Python, MIT). Binary name: `nanobot`.
