@@ -548,31 +548,29 @@ pub fn rope_backward(
     debug_assert_eq!(dq.len(), dim * seq);
     debug_assert_eq!(dk.len(), dim * seq);
 
-    // dq/dk layout: [dim, seq] = [n_heads*head_dim, seq]
-    // For head h, dimension d within head: channel = h*head_dim + d
-    // Split d into first-half (d < half_hd) and second-half (d >= half_hd)
-    for h in 0..n_heads {
-        for t in 0..seq {
-            for i in 0..half_hd {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
-                let angle = t as f64 * freq;
-                let cos_v = angle.cos() as f32;
-                let sin_v = angle.sin() as f32;
+    let (cos_tab, sin_tab) = precompute_rope_table(seq, head_dim, theta);
 
-                let ch1 = (h * head_dim + i) * seq + t;
-                let ch2 = (h * head_dim + half_hd + i) * seq + t;
+    for i in 0..half_hd {
+        let cos_row = &cos_tab[i * seq..(i + 1) * seq];
+        let sin_row = &sin_tab[i * seq..(i + 1) * seq];
 
-                // Un-rotate dQ
-                let dq1 = dq[ch1];
-                let dq2 = dq[ch2];
-                dq[ch1] = dq1 * cos_v + dq2 * sin_v;
-                dq[ch2] = -dq1 * sin_v + dq2 * cos_v;
+        for h in 0..n_heads {
+            let ch1_base = (h * head_dim + i) * seq;
+            let ch2_base = (h * head_dim + half_hd + i) * seq;
 
-                // Un-rotate dK
-                let dk1 = dk[ch1];
-                let dk2 = dk[ch2];
-                dk[ch1] = dk1 * cos_v + dk2 * sin_v;
-                dk[ch2] = -dk1 * sin_v + dk2 * cos_v;
+            for t in 0..seq {
+                let cos_v = cos_row[t];
+                let sin_v = sin_row[t];
+
+                let dq1 = dq[ch1_base + t];
+                let dq2 = dq[ch2_base + t];
+                dq[ch1_base + t] = dq1 * cos_v + dq2 * sin_v;
+                dq[ch2_base + t] = -dq1 * sin_v + dq2 * cos_v;
+
+                let dk1 = dk[ch1_base + t];
+                let dk2 = dk[ch2_base + t];
+                dk[ch1_base + t] = dk1 * cos_v + dk2 * sin_v;
+                dk[ch2_base + t] = -dk1 * sin_v + dk2 * cos_v;
             }
         }
     }
@@ -1845,32 +1843,57 @@ pub fn cpu_matmul_lhs_transposed(
     out
 }
 
+/// Precompute sin/cos tables for RoPE. Layout: `[half_hd, seq]`.
+///
+/// `table[i * seq + t] = f(t / theta^(2i / head_dim))` where f is cos or sin.
+/// Shared across all heads — compute once, reuse n_heads times.
+fn precompute_rope_table(seq: usize, head_dim: usize, theta: f64) -> (Vec<f32>, Vec<f32>) {
+    let half_hd = head_dim / 2;
+    let mut cos_tab = vec![0.0f32; half_hd * seq];
+    let mut sin_tab = vec![0.0f32; half_hd * seq];
+
+    for i in 0..half_hd {
+        let inv_freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+        let row = i * seq;
+        for t in 0..seq {
+            let angle = t as f64 * inv_freq;
+            cos_tab[row + t] = angle.cos() as f32;
+            sin_tab[row + t] = angle.sin() as f32;
+        }
+    }
+
+    (cos_tab, sin_tab)
+}
+
 /// CPU RoPE rotation (half-convention, channels-first layout).
 ///
-/// q/k: [dim, seq] where dim = n_heads * head_dim.
-/// Modifies q and k in-place.
+/// q/k: `[dim, seq]` where `dim = n_heads * head_dim`.
+/// Modifies q and k in-place. Uses precomputed sin/cos tables shared across heads.
 fn cpu_rope(q: &mut [f32], k: &mut [f32], n_heads: usize, head_dim: usize, seq: usize, theta: f64) {
     let half_hd = head_dim / 2;
-    for h in 0..n_heads {
-        for t in 0..seq {
-            for i in 0..half_hd {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
-                let angle = t as f64 * freq;
-                let cos_v = angle.cos() as f32;
-                let sin_v = angle.sin() as f32;
+    let (cos_tab, sin_tab) = precompute_rope_table(seq, head_dim, theta);
 
-                let ch1 = (h * head_dim + i) * seq + t;
-                let ch2 = (h * head_dim + half_hd + i) * seq + t;
+    for i in 0..half_hd {
+        let cos_row = &cos_tab[i * seq..(i + 1) * seq];
+        let sin_row = &sin_tab[i * seq..(i + 1) * seq];
 
-                let q1 = q[ch1];
-                let q2 = q[ch2];
-                q[ch1] = q1 * cos_v - q2 * sin_v;
-                q[ch2] = q1 * sin_v + q2 * cos_v;
+        for h in 0..n_heads {
+            let ch1_base = (h * head_dim + i) * seq;
+            let ch2_base = (h * head_dim + half_hd + i) * seq;
 
-                let k1 = k[ch1];
-                let k2 = k[ch2];
-                k[ch1] = k1 * cos_v - k2 * sin_v;
-                k[ch2] = k1 * sin_v + k2 * cos_v;
+            for t in 0..seq {
+                let cos_v = cos_row[t];
+                let sin_v = sin_row[t];
+
+                let q1 = q[ch1_base + t];
+                let q2 = q[ch2_base + t];
+                q[ch1_base + t] = q1 * cos_v - q2 * sin_v;
+                q[ch2_base + t] = q1 * sin_v + q2 * cos_v;
+
+                let k1 = k[ch1_base + t];
+                let k2 = k[ch2_base + t];
+                k[ch1_base + t] = k1 * cos_v - k2 * sin_v;
+                k[ch2_base + t] = k1 * sin_v + k2 * cos_v;
             }
         }
     }
@@ -1878,8 +1901,10 @@ fn cpu_rope(q: &mut [f32], k: &mut [f32], n_heads: usize, head_dim: usize, seq: 
 
 /// CPU scaled dot-product attention with causal mask.
 ///
-/// q, k, v: [dim, seq] where dim = n_heads * head_dim.
-/// Returns: attn_out [dim, seq].
+/// q, k, v: `[dim, seq]` where `dim = n_heads * head_dim`.
+/// Returns: `attn_out [dim, seq]`.
+///
+/// Uses BLAS gemm for score computation (Q^T @ K) and value multiply (V @ probs^T).
 fn cpu_sdpa(
     q: &[f32],
     k: &[f32],
@@ -1890,50 +1915,44 @@ fn cpu_sdpa(
 ) -> Vec<f32> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0.0f32; n_heads * head_dim * seq];
+    let hd_seq = head_dim * seq;
 
     for h in 0..n_heads {
-        // Compute scores[s1, s2] = sum_d q[h,d,s1] * k[h,d,s2] * scale
+        let hoff = h * hd_seq;
+        let q_h = &q[hoff..hoff + hd_seq];
+        let k_h = &k[hoff..hoff + hd_seq];
+        let v_h = &v[hoff..hoff + hd_seq];
+        let out_h = &mut out[hoff..hoff + hd_seq];
+
+        // 1. Scores = scale * Q_h^T @ K_h → [seq, seq]
         let mut scores = vec![0.0f32; seq * seq];
+        cpu_gemm(&mut scores, q_h, true, k_h, false, seq, seq, head_dim, scale, 0.0);
+
+        // 2. Causal mask: set upper triangle to -inf
         for s1 in 0..seq {
-            for s2 in 0..seq {
-                if s2 > s1 {
-                    scores[s1 * seq + s2] = f32::NEG_INFINITY; // causal mask
-                } else {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        let qi = q[(h * head_dim + d) * seq + s1];
-                        let ki = k[(h * head_dim + d) * seq + s2];
-                        dot += qi * ki;
-                    }
-                    scores[s1 * seq + s2] = dot * scale;
-                }
+            for s2 in (s1 + 1)..seq {
+                scores[s1 * seq + s2] = f32::NEG_INFINITY;
             }
         }
 
-        // Softmax per row
+        // 3. Softmax per row
         for s1 in 0..seq {
             let row = &mut scores[s1 * seq..(s1 + 1) * seq];
             let max_v = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = (*v - max_v).exp();
-                sum += *v;
+            for val in row.iter_mut() {
+                *val = (*val - max_v).exp();
+                sum += *val;
             }
-            for v in row.iter_mut() {
-                *v /= sum;
+            let inv_sum = 1.0 / sum;
+            for val in row.iter_mut() {
+                *val *= inv_sum;
             }
         }
 
-        // out[h,d,s1] = sum_s2 scores[s1,s2] * v[h,d,s2]
-        for d in 0..head_dim {
-            for s1 in 0..seq {
-                let mut acc = 0.0f32;
-                for s2 in 0..seq {
-                    acc += scores[s1 * seq + s2] * v[(h * head_dim + d) * seq + s2];
-                }
-                out[(h * head_dim + d) * seq + s1] = acc;
-            }
-        }
+        // 4. Output = V_h @ probs^T → [head_dim, seq]
+        // out_h[d, s1] = sum_s2 probs[s1, s2] * V_h[d, s2]
+        cpu_gemm(out_h, v_h, false, &scores, true, head_dim, seq, seq, 1.0, 0.0);
     }
     out
 }

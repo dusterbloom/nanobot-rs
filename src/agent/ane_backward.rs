@@ -910,6 +910,9 @@ pub struct BackwardResultWithLora {
 ///
 /// All tensors [dim, seq] where dim = n_heads * head_dim.
 /// Recomputes attention probabilities from saved Q, K.
+/// SDPA backward: computes dQ, dK, dV from upstream gradient d_out.
+///
+/// Uses BLAS gemm for all matrix operations (score recomputation, dV, dP, dQ, dK).
 fn cpu_sdpa_backward(
     d_out: &[f32],
     q: &[f32],
@@ -924,62 +927,50 @@ fn cpu_sdpa_backward(
     let mut dq = vec![0.0f32; dim * seq];
     let mut dk = vec![0.0f32; dim * seq];
     let mut dv = vec![0.0f32; dim * seq];
+    let hd_seq = head_dim * seq;
 
     for h in 0..n_heads {
-        // Recompute attention probs
-        let mut scores = vec![0.0f32; seq * seq];
+        let hoff = h * hd_seq;
+        let q_h = &q[hoff..hoff + hd_seq];
+        let k_h = &k[hoff..hoff + hd_seq];
+        let v_h = &v[hoff..hoff + hd_seq];
+        let do_h = &d_out[hoff..hoff + hd_seq];
+        let dq_h = &mut dq[hoff..hoff + hd_seq];
+        let dk_h = &mut dk[hoff..hoff + hd_seq];
+        let dv_h = &mut dv[hoff..hoff + hd_seq];
+
+        // 1. Recompute probs = softmax(scale * Q_h^T @ K_h, causal)
+        let mut probs = vec![0.0f32; seq * seq];
+        ane_forward::cpu_gemm(&mut probs, q_h, true, k_h, false, seq, seq, head_dim, scale, 0.0);
         for s1 in 0..seq {
-            for s2 in 0..seq {
-                if s2 > s1 {
-                    scores[s1 * seq + s2] = f32::NEG_INFINITY;
-                } else {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[(h * head_dim + d) * seq + s1] * k[(h * head_dim + d) * seq + s2];
-                    }
-                    scores[s1 * seq + s2] = dot * scale;
-                }
+            for s2 in (s1 + 1)..seq {
+                probs[s1 * seq + s2] = f32::NEG_INFINITY;
             }
         }
-        // Softmax
-        let mut probs = vec![0.0f32; seq * seq];
         for s1 in 0..seq {
-            let row = &scores[s1 * seq..(s1 + 1) * seq];
+            let row = &mut probs[s1 * seq..(s1 + 1) * seq];
             let max_v = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for s2 in 0..seq {
-                probs[s1 * seq + s2] = (row[s2] - max_v).exp();
-                sum += probs[s1 * seq + s2];
+            for val in row.iter_mut() {
+                *val = (*val - max_v).exp();
+                sum += *val;
             }
-            for s2 in 0..seq {
-                probs[s1 * seq + s2] /= sum;
-            }
-        }
-
-        // dV[h,d,s2] = sum_s1 probs[s1,s2] * dO[h,d,s1]
-        for d in 0..head_dim {
-            for s2 in 0..seq {
-                let mut acc = 0.0f32;
-                for s1 in 0..seq {
-                    acc += probs[s1 * seq + s2] * d_out[(h * head_dim + d) * seq + s1];
-                }
-                dv[(h * head_dim + d) * seq + s2] = acc;
+            let inv_sum = 1.0 / sum;
+            for val in row.iter_mut() {
+                *val *= inv_sum;
             }
         }
 
-        // dP[s1,s2] = sum_d dO[h,d,s1] * V[h,d,s2]
+        // 2. dV = dO_h @ probs → [head_dim, seq]
+        // dV_h[d, s2] = sum_s1 dO_h[d, s1] * probs[s1, s2]
+        ane_forward::cpu_gemm(dv_h, do_h, false, &probs, false, head_dim, seq, seq, 1.0, 0.0);
+
+        // 3. dP = dO_h^T @ V_h → [seq, seq]
+        // dP[s1, s2] = sum_d dO_h[d, s1] * V_h[d, s2]
         let mut dp = vec![0.0f32; seq * seq];
-        for s1 in 0..seq {
-            for s2 in 0..seq {
-                let mut acc = 0.0f32;
-                for d in 0..head_dim {
-                    acc += d_out[(h * head_dim + d) * seq + s1] * v[(h * head_dim + d) * seq + s2];
-                }
-                dp[s1 * seq + s2] = acc;
-            }
-        }
+        ane_forward::cpu_gemm(&mut dp, do_h, true, v_h, false, seq, seq, head_dim, 1.0, 0.0);
 
-        // dS = probs * (dP - sum_s2(probs * dP))  (softmax backward)
+        // 4. Softmax backward: dS = probs * (dP - row_sum(probs .* dP))
         let mut ds = vec![0.0f32; seq * seq];
         for s1 in 0..seq {
             let mut dot_sum = 0.0f32;
@@ -991,27 +982,13 @@ fn cpu_sdpa_backward(
             }
         }
 
-        // dQ[h,d,s1] = scale * sum_s2 dS[s1,s2] * K[h,d,s2]
-        for d in 0..head_dim {
-            for s1 in 0..seq {
-                let mut acc = 0.0f32;
-                for s2 in 0..seq {
-                    acc += ds[s1 * seq + s2] * k[(h * head_dim + d) * seq + s2];
-                }
-                dq[(h * head_dim + d) * seq + s1] = acc * scale;
-            }
-        }
+        // 5. dQ = scale * K_h @ dS^T → [head_dim, seq]
+        // dQ_h[d, s1] = scale * sum_s2 K_h[d, s2] * dS[s1, s2]
+        ane_forward::cpu_gemm(dq_h, k_h, false, &ds, true, head_dim, seq, seq, scale, 0.0);
 
-        // dK[h,d,s2] = scale * sum_s1 dS[s1,s2] * Q[h,d,s1]
-        for d in 0..head_dim {
-            for s2 in 0..seq {
-                let mut acc = 0.0f32;
-                for s1 in 0..seq {
-                    acc += ds[s1 * seq + s2] * q[(h * head_dim + d) * seq + s1];
-                }
-                dk[(h * head_dim + d) * seq + s2] = acc * scale;
-            }
-        }
+        // 6. dK = scale * Q_h @ dS → [head_dim, seq]
+        // dK_h[d, s2] = scale * sum_s1 Q_h[d, s1] * dS[s1, s2]
+        ane_forward::cpu_gemm(dk_h, q_h, false, &ds, false, head_dim, seq, seq, scale, 0.0);
     }
 
     (dq, dk, dv)
