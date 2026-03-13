@@ -265,6 +265,14 @@ fn pad_to(tokens: &[u32], target_len: usize) -> Vec<u32> {
     padded
 }
 
+/// Pad targets with IGNORE_INDEX (u32::MAX) — positions beyond the real
+/// sequence length are excluded from loss and gradient computation.
+fn pad_targets_to(targets: &[u32], target_len: usize) -> Vec<u32> {
+    let mut padded = targets.to_vec();
+    padded.resize(target_len, u32::MAX);
+    padded
+}
+
 #[cfg(feature = "mlx")]
 struct PreparedTrainingSample {
     tokens_u32: Vec<u32>,
@@ -292,7 +300,7 @@ fn prepare_training_samples(
             let (bucket_seq, _, _) = bk.get(tokens_u32.len());
             prepared.push(PreparedTrainingSample {
                 tok_pad: pad_to(&tokens_u32, *bucket_seq),
-                tgt_pad: pad_to(&targets_u32, *bucket_seq),
+                tgt_pad: pad_targets_to(&targets_u32, *bucket_seq),
                 tokens_u32,
                 targets_u32,
                 bucket_seq: *bucket_seq,
@@ -1324,7 +1332,7 @@ mod tests {
         assert_eq!(sample.tok_pad.len(), 128);
         assert_eq!(sample.tgt_pad.len(), 128);
         assert!(sample.tok_pad[59..].iter().all(|&t| t == 0));
-        assert!(sample.tgt_pad[59..].iter().all(|&t| t == 0));
+        assert!(sample.tgt_pad[59..].iter().all(|&t| t == u32::MAX));
         assert_eq!(sample.effective_loss_scale, 25.6);
     }
 
@@ -1893,7 +1901,7 @@ mod tests {
         .expect("muon kernels compile");
 
         let tok_pad = pad_to(tokens, *bucket_seq);
-        let tgt_pad = pad_to(targets, *bucket_seq);
+        let tgt_pad = pad_targets_to(targets, *bucket_seq);
 
         let step = |lora: &mut LoraModel, muon_state: &mut LoraModelMuon| -> (u128, f32) {
             let t0 = std::time::Instant::now();
@@ -2446,7 +2454,7 @@ mod tests {
             .expect("build config");
         cfg.optimizer = AneTrainingOptimizer::AneMuon;
         cfg.strict_ane = true;
-        cfg.lr = 2.5e-4;
+        cfg.lr = 5e-3;
         cfg.epochs = 20;
 
         let train_samples = vec![
@@ -3316,7 +3324,7 @@ mod tests {
         assert!(bucket_bwd_k.sdpa_bwd2.is_some(), "sdpa_bwd2 should compile");
         assert!(bucket_bwd_k.qkv_bwd.is_some(), "qkv_bwd should compile");
         let tok_pad = pad_to(&tokens_u32, *bucket_seq);
-        let tgt_pad = pad_to(&targets_u32, *bucket_seq);
+        let tgt_pad = pad_targets_to(&targets_u32, *bucket_seq);
 
         let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config)
             .expect("load 35B");

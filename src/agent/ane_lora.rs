@@ -748,7 +748,8 @@ fn gen_muon_update_mil(rows: usize, cols: usize, beta: f32, lr: f32, wd: f32) ->
     let transpose = rows > cols;
     let ortho_rows = rows.min(cols);
     let ortho_cols = rows.max(cols);
-    let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    // LoRA adapters: skip fan-ratio scale (see gen_muon_param_update_mil)
+    let scale = 1.0f32;
     let wd_scale = 1.0 - lr * wd;
     let one_minus_beta = 1.0 - beta;
     let mut m = String::with_capacity(24_576);
@@ -1216,7 +1217,10 @@ fn gen_muon_ortho_mil(rows: usize, cols: usize) -> String {
 }
 
 fn gen_muon_param_update_mil(rows: usize, cols: usize, lr: f32, wd: f32) -> String {
-    let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+    // For LoRA adapters the Muon fan-ratio scale sqrt(max(rows/cols,1)) is
+    // inappropriate — extreme aspect ratios (e.g. 1024×4) amplify updates by
+    // 16×. LoRA's alpha/rank already calibrates variance, so use scale=1.0.
+    let scale = 1.0f32;
     let wd_scale = 1.0 - lr * wd;
     let mut m = String::with_capacity(4096);
     m.push_str(concat!(
@@ -2461,7 +2465,8 @@ mod tests {
         } else {
             x
         };
-        let scale = ((rows as f32 / cols as f32).max(1.0)).sqrt();
+        // LoRA adapters: skip fan-ratio scale (see gen_muon_param_update_mil)
+        let scale = 1.0f32;
         let mut p_new = param.to_vec();
         for i in 0..p_new.len() {
             p_new[i] = p_new[i] * (1.0 - lr * wd) - lr * scale * update_ortho[i];

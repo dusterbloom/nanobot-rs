@@ -208,9 +208,16 @@ pub fn cross_entropy_loss<T: TokenId>(
 
     let mut dlogits = vec![0.0f32; vocab * seq];
     let mut total_loss = 0.0f32;
-    let inv_seq = 1.0 / seq as f32;
+    let mut valid_count = 0usize;
 
     for t in 0..seq {
+        let tgt = targets[t].as_usize();
+        // Skip padding positions (target out of vocab range)
+        if tgt >= vocab {
+            continue;
+        }
+        valid_count += 1;
+
         // Gather column t: col[v] = logits[v*seq + t]
         let mut col = vec![0.0f32; vocab];
         for v in 0..vocab {
@@ -229,22 +236,25 @@ pub fn cross_entropy_loss<T: TokenId>(
         }
 
         // NLL loss
-        let tgt = targets[t].as_usize();
         total_loss -= (col[tgt] + 1e-10).ln();
 
-        // Gradient: softmax - one_hot, divided by seq
+        // Gradient: softmax - one_hot (divided by valid_count later)
         col[tgt] -= 1.0;
-        for v in 0..vocab {
-            col[v] *= inv_seq;
-        }
 
-        // Scatter back
+        // Scatter back (gradient scaling deferred)
         for v in 0..vocab {
             dlogits[v * seq + t] = col[v];
         }
     }
 
-    (total_loss * inv_seq, dlogits)
+    // Average over valid (non-padding) positions only
+    let n = valid_count.max(1) as f32;
+    let inv_n = 1.0 / n;
+    for v in &mut dlogits {
+        *v *= inv_n;
+    }
+
+    (total_loss * inv_n, dlogits)
 }
 
 /// Classifier: logits[V,S] = embed[V,D] @ x[D,S].
@@ -317,7 +327,13 @@ pub fn fused_classifier_ce<T: TokenId>(
 
     let has_softcap = softcap > 0.0;
     let inv_cap = if has_softcap { 1.0 / softcap } else { 0.0 };
-    let inv_seq = 1.0 / seq as f32;
+    // Count valid (non-padding) positions — targets >= vocab are ignored
+    let valid_count = targets
+        .iter()
+        .filter(|t| t.as_usize() < vocab)
+        .count()
+        .max(1);
+    let inv_n = 1.0 / valid_count as f32;
     let n_tiles = (vocab + CE_TILE - 1) / CE_TILE;
 
     // Per-position online log-sum-exp state (512 bytes at seq=128 — negligible)
@@ -367,11 +383,11 @@ pub fn fused_classifier_ce<T: TokenId>(
         has_softcap,
         softcap,
         inv_cap,
-        inv_seq,
+        inv_n,
         loss_scale,
     );
 
-    loss * inv_seq
+    loss * inv_n
 }
 
 /// Pass 1: tile GEMMs + online log-sum-exp accumulation.
@@ -485,6 +501,13 @@ fn fused_ce_pass2_grad<T: TokenId>(
         // Per-position: softmax prob → dlogit, accumulate loss at target
         for t in 0..seq {
             let tgt = targets[t].as_usize();
+            // Skip padding positions (target out-of-vocab)
+            if tgt >= vocab {
+                for r in 0..tile_rows {
+                    tile_buf[r * seq + t] = 0.0;
+                }
+                continue;
+            }
             for r in 0..tile_rows {
                 let idx = r * seq + t;
                 let logit = tile_buf[idx];
