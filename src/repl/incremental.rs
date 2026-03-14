@@ -24,8 +24,9 @@ enum StreamState {
         highlighter: HighlightLines<'static>,
     },
     /// Thinking deltas (dimmed). Transition in when we see `\x1b[90m`,
-    /// transition out on `\x1b[0m\n\n`.
-    Thinking { lines_printed: usize },
+    /// transition out on `\x1b[0m\n\n`. Routed through `line_buffer` so
+    /// tool events and resizes can't destroy the display.
+    Thinking { marker_printed: bool },
 }
 
 /// Incremental line renderer that prints formatted text as it streams.
@@ -77,77 +78,48 @@ impl IncrementalRenderer {
         if delta.starts_with("\x1b[90m") {
             if !matches!(self.state, StreamState::Thinking { .. }) {
                 self.clear_partial_internal();
-                self.state = StreamState::Thinking { lines_printed: 0 };
+                self.state = StreamState::Thinking { marker_printed: false };
             }
-            // Print the thinking prefix dim
-            print!("\r\x1b[K{}", delta);
-            std::io::stdout().flush().ok();
-            self.has_partial = true;
+            // The prefix is display-only ANSI — don't buffer.
             return;
         }
 
-        // Detect thinking end: agent_loop sends "\x1b[0m\n\n" before normal text.
+        // Thinking content: buffer through normal pipeline so tool events
+        // and resizes can clear/restore correctly via line_buffer.
         if matches!(self.state, StreamState::Thinking { .. }) {
             if let Some(reset_pos) = delta.find("\x1b[0m") {
+                // Buffer content before the reset marker.
                 let before_reset = &delta[..reset_pos];
-                let lines_printed = match &mut self.state {
-                    StreamState::Thinking { lines_printed } => lines_printed,
-                    _ => unreachable!(),
-                };
-
-                for ch in before_reset.chars() {
-                    if ch == '\n' {
-                        println!("\r");
-                        *lines_printed += 1;
+                if !before_reset.is_empty() {
+                    self.line_buffer.push_str(before_reset);
+                    self.flush_lines();
+                }
+                // Flush remaining partial as a permanent thinking line.
+                if !self.line_buffer.is_empty() {
+                    if self.has_partial {
+                        self.erase_partial_rows();
                         self.has_partial = false;
-                    } else {
-                        print!("{}", ch);
-                        self.has_partial = true;
+                        self.partial_rows = 0;
                     }
+                    let remaining = std::mem::take(&mut self.line_buffer);
+                    self.render_line(&remaining);
                 }
-
-                // Exit dim mode and preserve the blank separator lines.
-                print!("\x1b[0m");
-                let after_reset = &delta[reset_pos + "\x1b[0m".len()..];
-                let mut split_at = 0usize;
-                for (idx, ch) in after_reset.char_indices() {
-                    if ch == '\n' || ch == '\r' {
-                        split_at = idx + ch.len_utf8();
-                    } else {
-                        break;
-                    }
-                }
-                if split_at > 0 {
-                    print!("{}", &after_reset[..split_at]);
-                }
-                std::io::stdout().flush().ok();
-
-                self.has_partial = false;
+                // Blank separator, then transition to Prose.
+                println!();
                 self.state = StreamState::Prose;
 
-                // Process any content after the reset/newline suffix.
-                let remaining = &after_reset[split_at..];
+                // Process remaining content after reset + trailing newlines.
+                let after_reset = &delta[reset_pos + "\x1b[0m".len()..];
+                let remaining =
+                    after_reset.trim_start_matches(|c: char| c == '\n' || c == '\r');
                 if !remaining.is_empty() {
                     self.push(remaining);
                 }
                 return;
             }
-            // Still in thinking — print dim
-            let lines_printed = match &mut self.state {
-                StreamState::Thinking { lines_printed } => lines_printed,
-                _ => unreachable!(),
-            };
-            for ch in delta.chars() {
-                if ch == '\n' {
-                    println!("\r");
-                    *lines_printed += 1;
-                    self.has_partial = false;
-                } else {
-                    print!("{}", ch);
-                    self.has_partial = true;
-                }
-            }
-            std::io::stdout().flush().ok();
+            // Still thinking — buffer and flush through normal pipeline.
+            self.line_buffer.push_str(delta);
+            self.flush_lines();
             return;
         }
 
@@ -212,8 +184,10 @@ impl IncrementalRenderer {
 
     /// Render a single completed line based on current state.
     fn render_line(&mut self, line: &str) {
-        // Count words for stats
-        self.total_words += line.split_whitespace().count();
+        // Count words for stats (exclude thinking — internal reasoning).
+        if !matches!(self.state, StreamState::Thinking { .. }) {
+            self.total_words += line.split_whitespace().count();
+        }
 
         // Table buffering: collect table lines and render via termimad
         if matches!(self.state, StreamState::Prose) {
@@ -226,9 +200,9 @@ impl IncrementalRenderer {
             }
         }
 
-        // Check for code fence transitions
+        // Check for code fence transitions (not during thinking — plain text)
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
+        if !matches!(self.state, StreamState::Thinking { .. }) && trimmed.starts_with("```") {
             match &self.state {
                 StreamState::CodeBlock { .. } => {
                     // Closing fence: print footer rule, transition to Prose
@@ -300,9 +274,18 @@ impl IncrementalRenderer {
                     }
                 }
             }
-            StreamState::Thinking { .. } => {
-                // Shouldn't reach here — thinking is handled in push()
-                println!("\r\x1b[2m{}\x1b[0m", line);
+            StreamState::Thinking {
+                ref mut marker_printed,
+            } => {
+                if line.trim().is_empty() && !*marker_printed {
+                    return;
+                }
+                if !*marker_printed {
+                    *marker_printed = true;
+                    println!("\r\x1b[2m\u{1f9e0} {}\x1b[0m", line);
+                } else {
+                    println!("\r  \x1b[2m{}\x1b[0m", line);
+                }
             }
         }
         std::io::stdout().flush().ok();
@@ -319,6 +302,12 @@ impl IncrementalRenderer {
             }
             let remaining = std::mem::take(&mut self.line_buffer);
             self.render_line(&remaining);
+        }
+
+        // Close any open thinking block (stream ended mid-thinking).
+        if matches!(self.state, StreamState::Thinking { .. }) {
+            println!();
+            self.state = StreamState::Prose;
         }
 
         // Close any open code block
