@@ -558,6 +558,7 @@ impl AgentLoopShared {
                 consecutive_all_blocked: 0,
                 llm_call_start: None,
                 retries: crate::agent::agent_loop::RetryState::new(),
+                restore_thinking_budget: None,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),

@@ -606,14 +606,17 @@ impl AgentLoopShared {
             }
         }
 
-        // Retry with thinking disabled.
+        // Retry with thinking temporarily disabled — restore after this iteration.
         if !ctx.flow.retries.empty_think_retried {
             ctx.flow.retries.empty_think_retried = true;
+            let saved = counters.thinking_budget.load(Ordering::Relaxed);
             warn!(
                 finish_reason = %response.finish_reason,
+                saved_budget = saved,
                 "empty_llm_response: thinking consumed entire output, retrying with thinking off"
             );
             counters.thinking_budget.store(0, Ordering::Relaxed);
+            ctx.flow.restore_thinking_budget = Some(saved);
             return StepResult::Done(IterationOutcome::Continue);
         }
 

@@ -207,6 +207,8 @@ pub(crate) struct FlowControl {
     pub(crate) llm_call_start: Option<std::time::Instant>,
     /// Typed retry counters — each failure mode has a named field with its own cap.
     pub(crate) retries: RetryState,
+    /// Saved thinking budget to restore after a thinking-off retry iteration.
+    pub(crate) restore_thinking_budget: Option<u32>,
 }
 
 /// Shared handles for background compaction coordination.
@@ -487,6 +489,10 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Continue => {
+                    // Restore thinking budget after a thinking-off retry.
+                    if let Some(saved) = ctx.flow.restore_thinking_budget.take() {
+                        ctx.counters.thinking_budget.store(saved, Ordering::Relaxed);
+                    }
                     // Successful tool execution — reset both counters.
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
@@ -509,6 +515,10 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Finished(content) => {
+                    // Restore thinking budget after a thinking-off retry.
+                    if let Some(saved) = ctx.flow.restore_thinking_budget.take() {
+                        ctx.counters.thinking_budget.store(saved, Ordering::Relaxed);
+                    }
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
                     iteration += 1;
