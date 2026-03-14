@@ -210,6 +210,14 @@ pub struct RuntimeCounters {
     pub training_steps_total: AtomicU64,
     /// Timestamp (epoch ms) when the current training step started. 0 = idle.
     pub training_started_ms: AtomicU64,
+    /// Current optimizer step within the active training run (1-based).
+    pub training_current_step: AtomicU64,
+    /// Total optimizer steps planned for the active training run.
+    pub training_total_steps: AtomicU64,
+    /// Current loss value × 10000 (stored as integer for atomic access).
+    pub training_loss_x10k: AtomicU64,
+    /// Set to true to request the training loop to stop early (e.g. on shutdown).
+    pub training_cancel: AtomicBool,
 }
 
 impl RuntimeCounters {
@@ -243,6 +251,10 @@ impl RuntimeCounters {
             training_active: AtomicBool::new(false),
             training_steps_total: AtomicU64::new(0),
             training_started_ms: AtomicU64::new(0),
+            training_current_step: AtomicU64::new(0),
+            training_total_steps: AtomicU64::new(0),
+            training_loss_x10k: AtomicU64::new(0),
+            training_cancel: AtomicBool::new(false),
         }
     }
 }

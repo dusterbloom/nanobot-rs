@@ -790,6 +790,7 @@ pub(crate) async fn run_gateway_async(
         lcm_config.enabled = true;
     }
 
+    let shutdown_counters = core_handle.counters.clone();
     let mut agent_loop = AgentLoop::new(
         core_handle,
         inbound_rx,
@@ -948,6 +949,9 @@ pub(crate) async fn run_gateway_async(
             }
         }
     }
+
+    // Signal training to stop so it doesn't block shutdown.
+    shutdown_counters.training_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
 
     agent_loop.stop();
     heartbeat.stop().await;

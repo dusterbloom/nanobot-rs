@@ -656,6 +656,17 @@ impl AneTrainerSession {
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         stats: &PersistentAneTrainerStatCounters,
     ) -> bool {
+        self.train_with_progress(cfg, samples, mlx_tx, stats, None)
+    }
+
+    fn train_with_progress(
+        &mut self,
+        cfg: &AneTrainingConfig,
+        samples: &[(Vec<i32>, Vec<i32>, f32)],
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+        stats: &PersistentAneTrainerStatCounters,
+        runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+    ) -> bool {
         use super::ane_backward;
         use super::ane_forward;
         use super::ane_lora::{
@@ -708,6 +719,12 @@ impl AneTrainerSession {
         let mut opt_step = 0usize;
         let mut best_loss = f32::INFINITY;
         let mut stale_count = 0usize;
+
+        // Publish total steps so TUI can show progress from the start.
+        if let Some(rc) = runtime_counters {
+            rc.training_total_steps.store(total_opt_steps as u64, std::sync::atomic::Ordering::Relaxed);
+            rc.training_current_step.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let bucket_kernels = if use_ane {
             Some(&self.bucket_kernels)
@@ -938,6 +955,17 @@ impl AneTrainerSession {
                     break 'outer;
                 }
 
+                // Update TUI progress counters and check for cancellation.
+                if let Some(rc) = runtime_counters {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    rc.training_current_step.store(opt_step as u64, Relaxed);
+                    rc.training_loss_x10k.store((chunk_loss * 10000.0) as u64, Relaxed);
+                    if rc.training_cancel.load(Relaxed) {
+                        tracing::info!("ANE train: cancelled at step {opt_step}/{total_opt_steps}");
+                        break 'outer;
+                    }
+                }
+
                 if opt_step % 5 == 0 || opt_step == total_opt_steps {
                     tracing::debug!("ANE train: step {opt_step}/{total_opt_steps}, loss={chunk_loss:.4}");
                 }
@@ -979,6 +1007,7 @@ enum PersistentTrainerCommand {
         samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         reply: std::sync::mpsc::SyncSender<bool>,
+        runtime_counters: Option<std::sync::Arc<super::agent_core::RuntimeCounters>>,
     },
 }
 
@@ -1001,6 +1030,7 @@ fn persistent_trainer_worker(
                 samples,
                 mlx_tx,
                 reply,
+                runtime_counters,
             } => {
                 let needs_reload = session
                     .as_ref()
@@ -1019,7 +1049,7 @@ fn persistent_trainer_worker(
 
                 let ok = session
                     .as_mut()
-                    .map(|existing| existing.train(&cfg, &samples, mlx_tx, stats.as_ref()))
+                    .map(|existing| existing.train_with_progress(&cfg, &samples, mlx_tx, stats.as_ref(), runtime_counters.as_deref()))
                     .unwrap_or(false);
                 if ok {
                     use std::sync::atomic::Ordering;
@@ -1064,6 +1094,16 @@ impl PersistentAneTrainer {
         samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
     ) -> std::thread::JoinHandle<bool> {
+        self.spawn_training_with_progress(cfg, samples, mlx_tx, None)
+    }
+
+    pub fn spawn_training_with_progress(
+        &self,
+        cfg: AneTrainingConfig,
+        samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
+        mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+        runtime_counters: Option<std::sync::Arc<super::agent_core::RuntimeCounters>>,
+    ) -> std::thread::JoinHandle<bool> {
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("ane-lora-train".into())
@@ -1074,6 +1114,7 @@ impl PersistentAneTrainer {
                     samples,
                     mlx_tx,
                     reply: reply_tx,
+                    runtime_counters,
                 });
                 if sent.is_err() {
                     tracing::error!("ANE train: persistent worker is unavailable");

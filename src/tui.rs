@@ -531,25 +531,24 @@ pub(crate) fn print_status_bar(
         .training_steps_total
         .load(Ordering::Relaxed);
     if core_handle.counters.training_active.load(Ordering::Relaxed) {
-        let started = core_handle
-            .counters
-            .training_started_ms
-            .load(Ordering::Relaxed);
-        let elapsed_s = if started > 0 {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            (now_ms.saturating_sub(started)) / 1000
+        let cur = core_handle.counters.training_current_step.load(Ordering::Relaxed);
+        let total = core_handle.counters.training_total_steps.load(Ordering::Relaxed);
+        let loss_x10k = core_handle.counters.training_loss_x10k.load(Ordering::Relaxed);
+        let loss = loss_x10k as f64 / 10000.0;
+        if total > 0 {
+            let pct = (cur * 100).checked_div(total).unwrap_or(0);
+            parts.push(format!(
+                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} ({cur}/{total} loss={loss:.3} #{}){}",
+                train_total + 1,
+                RESET
+            ));
         } else {
-            0
-        };
-        parts.push(format!(
-            "{YELLOW}train:{BOLD}active{RESET}{DIM} ({}s, #{}){}",
-            elapsed_s,
-            train_total + 1,
-            RESET
-        ));
+            parts.push(format!(
+                "{YELLOW}train:{BOLD}starting{RESET}{DIM} (#{}){}",
+                train_total + 1,
+                RESET
+            ));
+        }
     } else if train_total > 0 {
         parts.push(format!("{DIM}train:#{train_total}{RESET}"));
     }

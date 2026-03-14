@@ -424,7 +424,7 @@ impl LearnLoop for DefaultLearnLoop {
                             }
                             let tc_for_done = train_counters.clone();
                             let handle = if let Some(ref trainer) = ane_trainer {
-                                trainer.spawn_training(ane_cfg, samples, mlx_tx)
+                                trainer.spawn_training_with_progress(ane_cfg, samples, mlx_tx, train_counters.clone())
                             } else {
                                 crate::agent::ane_mlx_bridge::spawn_ane_training(
                                     ane_cfg, samples, mlx_tx,
@@ -441,6 +441,9 @@ impl LearnLoop for DefaultLearnLoop {
                             let ok = handle.join().unwrap_or(false);
                             if let Some(ref tc) = tc_for_done {
                                 tc.training_active.store(false, Ordering::Relaxed);
+                                tc.training_current_step.store(0, Ordering::Relaxed);
+                                tc.training_total_steps.store(0, Ordering::Relaxed);
+                                tc.training_loss_x10k.store(0, Ordering::Relaxed);
                                 if ok {
                                     tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
                                 }
