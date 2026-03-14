@@ -979,8 +979,14 @@ impl ReplContext {
             }
         };
 
-        let min_exp = self.config.perplexity_gate.min_experiences.max(1);
-        let exps = match eb.top_unexported(min_exp) {
+        // Collect ALL successful experiences for training (not just unexported).
+        // LoRA warm-starts from previous checkpoint, so we need the full dataset
+        // to prevent drift. Track unexported IDs for mark_exported after training.
+        let unexported_ids: Vec<i64> = match eb.top_unexported(200) {
+            Ok(e) => e.iter().map(|e| e.id).collect(),
+            Err(_) => vec![],
+        };
+        let exps = match eb.all_for_training(200) {
             Ok(e) => e,
             Err(e) => {
                 println!("\n  Failed to read experiences: {e}\n");
@@ -988,11 +994,11 @@ impl ReplContext {
             }
         };
         if exps.is_empty() {
-            println!("\n  No unexported experiences found.\n");
+            println!("\n  No experiences found.\n");
             return;
         }
 
-        let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
+        let ids = unexported_ids;
         let mut samples = Vec::new();
         for exp in &exps {
             let messages = vec![
@@ -1061,11 +1067,12 @@ impl ReplContext {
                 if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
                     let _ = eb.mark_exported(&ids);
                 }
+                crate::agent::learn_loop::omlx_try_reload_from_config();
             }
         });
 
         println!(
-            "\n  Training started: {} samples from {} experiences\n  Model: {}\n  Use /train to check progress.\n",
+            "\n  Training started: {} samples ({} newly unexported)\n  Model: {}\n  Use /train to check progress.\n",
             n_samples, n_exps, model_dir.display()
         );
     }

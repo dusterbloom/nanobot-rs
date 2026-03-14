@@ -2127,7 +2127,7 @@ fn default_mlx_server_url() -> String {
     "http://127.0.0.1:8766".to_string()
 }
 fn default_train_epochs() -> usize {
-    15
+    3
 }
 
 impl Default for PerplexityGateConfig {

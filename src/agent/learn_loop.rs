@@ -299,17 +299,28 @@ impl LearnLoop for DefaultLearnLoop {
             let epochs = pg_config.train_epochs;
             let min_exp = pg_config.min_experiences.max(1); // 0 would LIMIT 0 → empty
 
-            // Collect experiences under lock (prompt, trace, response, quality).
+            // Collect top experiences for training, not just unexported.
+            // LoRA warm-starts from the previous checkpoint, so training only on
+            // new samples causes drift from what earlier data taught. The unexported
+            // IDs are tracked separately so we can mark them exported after training.
+            // Cap at 30 for auto-triggered runs (~10min on 35B). /train run has no cap.
+            const AUTO_BATCH_CAP: usize = 30;
             let (exps_data, ids) = {
                 let eb = eb_mutex.lock();
-                let exps = match eb.top_unexported(min_exp) {
+                // IDs of unexported experiences — for mark_exported after training.
+                let unexported_ids: Vec<i64> = match eb.top_unexported(AUTO_BATCH_CAP) {
+                    Ok(e) => e.iter().map(|e| e.id).collect(),
+                    Err(_) => return,
+                };
+                // Top experiences by quality for training data.
+                let all = match eb.all_for_training(AUTO_BATCH_CAP) {
                     Ok(e) => e,
                     Err(_) => return,
                 };
-                if exps.is_empty() {
+                if all.is_empty() {
                     return;
                 }
-                let data: Vec<(String, String, String, f64)> = exps
+                let data: Vec<(String, String, String, f64)> = all
                     .iter()
                     .map(|e| {
                         (
@@ -320,8 +331,12 @@ impl LearnLoop for DefaultLearnLoop {
                         )
                     })
                     .collect();
-                let ids: Vec<i64> = exps.iter().map(|e| e.id).collect();
-                (data, ids)
+                info!(
+                    "perplexity_gate: training on {} experiences ({} newly unexported)",
+                    data.len(),
+                    unexported_ids.len()
+                );
+                (data, unexported_ids)
             };
 
             // ANE split-silicon training: train on CPU/ANE thread,
@@ -436,6 +451,8 @@ impl LearnLoop for DefaultLearnLoop {
                                 info!(
                                     "perplexity_gate: ANE training completed ({n_exps} experiences)"
                                 );
+                                // Trigger oMLX/LM Studio model reload so it picks up new adapters.
+                                omlx_try_reload_from_config();
                             } else {
                                 warn!(
                                     "perplexity_gate: ANE training failed, experiences NOT marked exported"
@@ -561,6 +578,43 @@ pub(crate) fn build_ane_training_config(
     }
 
     None
+}
+
+/// After training, unload the model on oMLX/LM Studio so the next inference
+/// request forces a reload — which picks up newly exported adapters.
+/// Reads connection info from the global config file.
+pub(crate) fn omlx_try_reload_from_config() {
+    let config = crate::config::loader::load_config(None);
+    let defaults = &config.agents.defaults;
+    if defaults.local_api_base.is_empty() || defaults.local_model.is_empty() {
+        return;
+    }
+    let base = defaults.local_api_base.trim_end_matches("/v1").trim_end_matches('/');
+    let model_id = &defaults.local_model;
+    let url = format!("{base}/v1/models/{model_id}/unload");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let api_key = &defaults.local_api_key;
+    let mut req = client.post(&url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    match req.send() {
+        Ok(resp) if resp.status().is_success() => {
+            info!("oMLX: unloaded {model_id} for adapter reload (next request reloads with adapters)");
+        }
+        Ok(resp) => {
+            debug!("oMLX: unload {model_id} returned {}", resp.status());
+        }
+        Err(e) => {
+            debug!("oMLX: unload {model_id} failed: {e}");
+        }
+    }
 }
 
 /// HTTP-only training (no model worker contention).
