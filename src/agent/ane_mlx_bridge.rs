@@ -965,9 +965,6 @@ impl AneTrainerSession {
             tracing::info!(
                 "ANE train profile: {sample_count} samples, fwd+bwd={fwd_bwd_ms:.1}ms/sample ({fwd_bwd_pct:.0}%), opt={opt_ms:.1}ms/step, clone={clone_ms:.1}ms/step, total={train_ms}ms",
             );
-            eprintln!(
-                "ANE train profile: {sample_count} samples, fwd+bwd={fwd_bwd_ms:.1}ms/sample ({fwd_bwd_pct:.0}%), opt={opt_ms:.1}ms/step, clone={clone_ms:.1}ms/step, total={train_ms}ms",
-            );
         }
         tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
 

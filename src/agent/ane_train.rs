@@ -544,7 +544,7 @@ pub fn train(
 
             // Log
             if adam_t % cfg.log_interval == 0 {
-                eprintln!(
+                tracing::info!(
                     "step {}/{} | loss {:.4} | lr {:.6} | grad_norm {:.4}",
                     adam_t,
                     cfg.total_steps / cfg.accum_steps,
@@ -559,7 +559,7 @@ pub fn train(
                 if adam_t % cfg.ckpt_interval == 0 {
                     save_checkpoint(path, model, &adam, adam_t, adam_t, last_loss)
                         .map_err(|e| format!("checkpoint save failed: {e}"))?;
-                    eprintln!("checkpoint saved at step {adam_t}");
+                    tracing::info!("checkpoint saved at step {adam_t}");
                 }
             }
 
@@ -567,7 +567,7 @@ pub fn train(
             if cfg.early_stop_loss > 0.0 && last_loss < cfg.early_stop_loss {
                 patience_counter += 1;
                 if patience_counter >= cfg.early_stop_patience.max(1) {
-                    eprintln!(
+                    tracing::info!(
                         "early stopping at step {adam_t}: loss {last_loss:.4} < {:.4}",
                         cfg.early_stop_loss
                     );
