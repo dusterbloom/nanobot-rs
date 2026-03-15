@@ -110,6 +110,32 @@ pub(crate) struct AgentLoopShared {
         Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
 }
 
+impl AgentLoopShared {
+    /// Build a `LearnLoop` from the current state of shared fields.
+    ///
+    /// Called after construction and whenever a learn-loop-affecting field
+    /// changes (perplexity gate, MLX provider, ANE model dir).
+    pub(crate) fn rebuild_learn_loop(&mut self) {
+        self.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+            calibrator: self.calibrator.clone(),
+            experience_buffer: self.experience_buffer.clone(),
+            perplexity_gate_config: self.perplexity_gate_config.clone(),
+            #[cfg(feature = "mlx")]
+            mlx_provider: self.mlx_provider.clone(),
+            training_counters: Some(self.core_handle.counters.clone()),
+            ane_model_dir: self.ane_model_dir.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_trainer: self.ane_trainer.clone(),
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_optimizer_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_lr_override: None,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            ane_strict_ane: false,
+        });
+    }
+}
+
 /// Per-message state that flows through the three processing phases.
 ///
 /// Owns all per-turn mutable state that previously lived as local variables
@@ -185,6 +211,24 @@ pub(crate) struct TurnContext {
     pub(crate) reasoning: SharedEngine,
 }
 
+impl TurnContext {
+    /// Check whether this turn has been cancelled (e.g. user pressed Esc in REPL).
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation_token
+            .as_ref()
+            .map_or(false, |t| t.is_cancelled())
+    }
+
+    /// Restore thinking budget if a previous iteration temporarily disabled it.
+    pub(crate) fn restore_thinking_budget(&mut self) {
+        if let Some(saved) = self.flow.restore_thinking_budget.take() {
+            self.counters
+                .thinking_budget
+                .store(saved, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal booleans (not a linear state machine):
@@ -241,10 +285,7 @@ enum IterationPhase {
     /// Validate response, rescue pass, error check, token telemetry.
     Processing { response: LLMResponse },
     /// Route and execute tool calls (delegated or inline).
-    Executing {
-        response: LLMResponse,
-        tool_calls: Vec<ToolCallRequest>,
-    },
+    Executing { response: LLMResponse },
 }
 
 /// Outcome of a single iteration, returned to the outer loop.
@@ -371,11 +412,7 @@ impl AgentLoopShared {
         const MAX_CONSECUTIVE_EMPTY: u32 = 3;
         while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
-            if ctx
-                .cancellation_token
-                .as_ref()
-                .map_or(false, |t| t.is_cancelled())
-            {
+            if ctx.is_cancelled() {
                 debug!("agent loop: cancelled before iteration {}", iteration);
                 break;
             }
@@ -489,10 +526,7 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Continue => {
-                    // Restore thinking budget after a thinking-off retry.
-                    if let Some(saved) = ctx.flow.restore_thinking_budget.take() {
-                        ctx.counters.thinking_budget.store(saved, Ordering::Relaxed);
-                    }
+                    ctx.restore_thinking_budget();
                     // Successful tool execution — reset both counters.
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
@@ -515,10 +549,7 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Finished(content) => {
-                    // Restore thinking budget after a thinking-off retry.
-                    if let Some(saved) = ctx.flow.restore_thinking_budget.take() {
-                        ctx.counters.thinking_budget.store(saved, Ordering::Relaxed);
-                    }
+                    ctx.restore_thinking_budget();
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
                     iteration += 1;
@@ -604,10 +635,9 @@ impl AgentLoopShared {
                 IterationPhase::Processing { response } => {
                     self.step_process_response(ctx, response).await
                 }
-                IterationPhase::Executing {
-                    response,
-                    tool_calls,
-                } => self.step_execute_tools(ctx, response, tool_calls).await,
+                IterationPhase::Executing { response } => {
+                    self.step_execute_tools(ctx, response).await
+                }
             } {
                 StepResult::Next(next_phase) => phase = next_phase,
                 StepResult::Done(outcome) => return outcome,
@@ -741,9 +771,10 @@ impl AgentLoopShared {
     // Step 2: PreCall — build tool defs, trim, compaction, repair, preflight
     // -----------------------------------------------------------------------
 
-    /// Response boundary injection, tool definition filtering, message
-    /// trimming, background compaction spawn, protocol repair, pre-flight
-    /// context size check, router preflight, adaptive max_tokens.
+    /// Pre-LLM-call orchestrator: delegates to [`select_tool_definitions`],
+    /// [`manage_compaction`], and [`compute_adaptive_max_tokens`], with
+    /// inline steps for response boundary, trimming, grounding, rendering,
+    /// emergency trim, and router preflight.
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
         trio_mode = ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main,
@@ -751,7 +782,6 @@ impl AgentLoopShared {
         msg_count = ctx.messages.len(),
     ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
-        let counters = &self.core_handle.counters;
 
         // Response boundary: suppress exec/write_file tools to force text output.
         let boundary_active = ctx.flow.force_response
@@ -778,20 +808,145 @@ impl AgentLoopShared {
             ctx.flow.force_response = false;
         }
 
+        // Select and filter tool definitions for this turn.
+        let (mut tool_defs, saved_tool_defs) =
+            self.select_tool_definitions(ctx, boundary_active);
+        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(&tool_defs)
+        };
+
+        // Trim messages to fit context budget.
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
+            &ctx.messages,
+            tool_def_tokens,
+            ctx.turn_count,
+            ctx.core.max_message_age_turns,
+        );
+
+        // Spawn background compaction when threshold exceeded.
+        self.manage_compaction(ctx, tool_def_tokens).await;
+
+        // Proactive grounding: inject relevant knowledge before LLM call.
+        if self.proprioception_config.proactive_retrieval && iteration == 0 {
+            if let Some(user_text) = last_user_message(&ctx.messages) {
+                if !user_text.is_empty() {
+                    let intent = crate::agent::proactive::extract_intent(&user_text);
+                    if intent.confidence >= 0.2 {
+                        let budget = (ctx.core.token_budget.max_context() / 20).min(500);
+                        let learning_context = ctx.core.learning.get_learning_context();
+                        let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
+                        let ks_ref = ks_guard.as_deref();
+                        let payload = crate::agent::proactive::retrieve_grounding(
+                            &intent,
+                            ks_ref,
+                            &learning_context,
+                            budget,
+                        );
+                        if let Some(text) =
+                            crate::agent::proactive::format_grounding_message(&payload)
+                        {
+                            debug!(
+                                category = ?intent.category,
+                                confidence = intent.confidence,
+                                snippets = payload.knowledge_snippets.len(),
+                                estimated_tokens = payload.estimated_tokens,
+                                "proactive_grounding_injected"
+                            );
+                            ctx.messages.push(serde_json::json!({
+                                "role": if ctx.core.is_local { "user" } else { "system" },
+                                "content": text,
+                                "_synthetic": true,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Render protocol-correct wire format for the LLM call.
+        // `ctx.messages` retains raw format (with metadata) for trimming/LCM.
+        // `ctx.rendered_messages` is what gets sent to the provider.
+        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+
+        // Pre-flight context size check: emergency trim if we're about to
+        // exceed the model's context window. The 95% threshold leaves room
+        // for the response tokens.
+        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages);
+        let max_ctx = ctx.core.token_budget.max_context();
+        if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
+            warn!(
+                estimated_tokens = estimated,
+                max_context = max_ctx,
+                model = %ctx.core.model,
+                "context_overflow_emergency_trim"
+            );
+            // tool_def_tokens=0 is conservative (trims more aggressively).
+            ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
+            // Re-render after trim to rebuild protocol-correct wire format.
+            ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        }
+
+        // Router-first preflight for strict trio mode.
+        match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await {
+            crate::agent::router::PreflightResult::Continue => {
+                return StepResult::Done(IterationOutcome::Continue);
+            }
+            crate::agent::router::PreflightResult::Break(msg) => {
+                return StepResult::Done(IterationOutcome::Finished(msg));
+            }
+            crate::agent::router::PreflightResult::Passthrough => {
+                // Router decided not to handle this request — restore tools so
+                // the main model can still call them directly as a fallback.
+                // Without this, tool_defs was cleared in the trio stripping block
+                // above and the main model would answer "I cannot directly do X"
+                // instead of calling list_dir, exec, etc.
+                if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
+                    debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
+                    tool_defs = saved_tool_defs;
+                }
+            }
+            crate::agent::router::PreflightResult::Pipeline(_steps_json) => {
+                info!("[trio] pipeline action received");
+                // Message already injected by router_preflight.
+                // Continue to main model — full pipeline execution TBD.
+            }
+        }
+
+        // Adaptive max_tokens: size the response budget to the task.
+        let effective_max_tokens = self.compute_adaptive_max_tokens(ctx);
+
+        StepResult::Next(IterationPhase::Calling {
+            tool_defs,
+            max_tokens: effective_max_tokens,
+        })
+    }
+
+    /// Select and filter tool definitions for this turn.
+    ///
+    /// Returns `(active_defs, saved_defs)` where `saved_defs` preserves the
+    /// pre-trio-stripping state for router passthrough fallback.
+    fn select_tool_definitions(
+        &self,
+        ctx: &mut TurnContext,
+        boundary_active: bool,
+    ) -> (Vec<Value>, Vec<Value>) {
         // Filter tool definitions to relevant tools.
         // Local models get a minimal set to conserve context tokens.
         let current_phase = self.system_state.load_full().task_phase;
         let mut tool_defs = if ctx.core.is_local {
-            ctx.tools
-                .get_local_definitions(&ctx.messages, &ctx.used_tools)
+            ctx.tools.get_local_definitions()
         } else if self.proprioception_config.enabled
             && self.proprioception_config.dynamic_tool_scoping
         {
             ctx.tools
                 .get_scoped_definitions(&current_phase, &ctx.messages, &ctx.used_tools)
         } else {
-            ctx.tools
-                .get_relevant_definitions(&ctx.messages, &ctx.used_tools)
+            // Cloud models have 100K+ context — give them all registered
+            // tools instead of keyword-gated subsets that hide capabilities.
+            ctx.tools.get_definitions()
         };
         // Save tool_defs before potential stripping so we can restore them if
         // the router preflight returns Passthrough (router said "respond") — in
@@ -856,42 +1011,37 @@ impl AgentLoopShared {
                 name != "exec" && name != "write_file"
             });
         }
-        // Apply ToolGate size-class filtering (main agent loop only;
-        // subagents handle their own tools_filter in SubagentManager).
-        // Lane policy can override the effective size class (e.g. Answer
-        // lane forces Small/tiny tier regardless of actual model size).
-        let effective_size = ctx
-            .core
-            .lane
-            .policy()
-            .tools
-            .effective_size_class(ctx.core.model_capabilities.size_class);
-        if let Some(allowed) = ToolGate::filter(effective_size, None) {
-            let allowed_set: std::collections::HashSet<&str> =
-                allowed.iter().map(|s| s.as_str()).collect();
-            tool_defs.retain(|def| {
-                def.pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .map_or(false, |name| allowed_set.contains(name))
-            });
+        // ToolGate: size-class filtering for cloud models only.
+        // Local models already get condensed descriptions (~350 tokens for
+        // 12 tools, <1.1% of 32K context) and real availability is gated
+        // by `is_available()`, so ToolGate would only remove useful tools.
+        if !ctx.core.is_local {
+            let effective_size = ctx
+                .core
+                .lane
+                .policy()
+                .tools
+                .effective_size_class(ctx.core.model_capabilities.size_class);
+            if let Some(allowed) = ToolGate::filter(effective_size, None) {
+                let allowed_set: std::collections::HashSet<&str> =
+                    allowed.iter().map(|s| s.as_str()).collect();
+                tool_defs.retain(|def| {
+                    def.pointer("/function/name")
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |name| allowed_set.contains(name))
+                });
+            }
         }
-        let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
-            None
-        } else {
-            Some(&tool_defs)
-        };
 
-        // Trim messages to fit context budget.
-        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-        ctx.messages = ctx.core.token_budget.trim_to_fit_with_age(
-            &ctx.messages,
-            tool_def_tokens,
-            ctx.turn_count,
-            ctx.core.max_message_age_turns,
-        );
+        (tool_defs, saved_tool_defs)
+    }
 
-        // Spawn background compaction when threshold exceeded.
-        // When LCM is enabled, use the LCM engine's control loop instead.
+    /// Spawn background compaction when threshold exceeded.
+    ///
+    /// When LCM is enabled, uses the LCM engine's control loop (with DAG,
+    /// summary persistence, and auto-expand). Otherwise falls back to core
+    /// compaction (gradient/audience-aware/simple).
+    async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
         if self.lcm_config.enabled {
             // LCM path: get or create per-session engine, check thresholds.
             // On first creation, restore DAG from DB summary_nodes table,
@@ -1186,149 +1336,83 @@ impl AgentLoopShared {
                 in_flight.store(false, Ordering::SeqCst);
             });
         }
+    }
 
-        // Proactive grounding: inject relevant knowledge before LLM call.
-        if self.proprioception_config.proactive_retrieval && iteration == 0 {
-            if let Some(user_text) = last_user_message(&ctx.messages) {
-                if !user_text.is_empty() {
-                    let intent = crate::agent::proactive::extract_intent(&user_text);
-                    if intent.confidence >= 0.2 {
-                        let budget = (ctx.core.token_budget.max_context() / 20).min(500);
-                        let learning_context = ctx.core.learning.get_learning_context();
-                        let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
-                        let ks_ref = ks_guard.as_deref();
-                        let payload = crate::agent::proactive::retrieve_grounding(
-                            &intent,
-                            ks_ref,
-                            &learning_context,
-                            budget,
-                        );
-                        if let Some(text) =
-                            crate::agent::proactive::format_grounding_message(&payload)
-                        {
-                            debug!(
-                                category = ?intent.category,
-                                confidence = intent.confidence,
-                                snippets = payload.knowledge_snippets.len(),
-                                estimated_tokens = payload.estimated_tokens,
-                                "proactive_grounding_injected"
-                            );
-                            ctx.messages.push(serde_json::json!({
-                                "role": if ctx.core.is_local { "user" } else { "system" },
-                                "content": text,
-                                "_synthetic": true,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Render protocol-correct wire format for the LLM call.
-        // `ctx.messages` retains raw format (with metadata) for trimming/LCM.
-        // `ctx.rendered_messages` is what gets sent to the provider.
-        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-
-        // Pre-flight context size check: emergency trim if we're about to
-        // exceed the model's context window. The 95% threshold leaves room
-        // for the response tokens.
-        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages);
-        let max_ctx = ctx.core.token_budget.max_context();
-        if max_ctx > 0 && estimated > (max_ctx as f64 * 0.95) as usize {
-            warn!(
-                estimated_tokens = estimated,
-                max_context = max_ctx,
-                model = %ctx.core.model,
-                "context_overflow_emergency_trim"
-            );
-            // tool_def_tokens=0 is conservative (trims more aggressively).
-            ctx.messages = ctx.core.token_budget.trim_to_fit(&ctx.messages, 0);
-            // Re-render after trim to rebuild protocol-correct wire format.
-            ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-        }
-
-        // Router-first preflight for strict trio mode.
-        match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await {
-            crate::agent::router::PreflightResult::Continue => {
-                return StepResult::Done(IterationOutcome::Continue);
-            }
-            crate::agent::router::PreflightResult::Break(msg) => {
-                return StepResult::Done(IterationOutcome::Finished(msg));
-            }
-            crate::agent::router::PreflightResult::Passthrough => {
-                // Router decided not to handle this request — restore tools so
-                // the main model can still call them directly as a fallback.
-                // Without this, tool_defs was cleared in the trio stripping block
-                // above and the main model would answer "I cannot directly do X"
-                // instead of calling list_dir, exec, etc.
-                if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
-                    debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
-                    tool_defs = saved_tool_defs;
-                }
-            }
-            crate::agent::router::PreflightResult::Pipeline(_steps_json) => {
-                info!("[trio] pipeline action received");
-                // Message already injected by router_preflight.
-                // Continue to main model — full pipeline execution TBD.
-            }
-        }
-
-        // Adaptive max_tokens: size the response budget to the task.
-        let effective_max_tokens = {
-            let base = ctx.core.max_tokens;
-            // Check for /long override (temporary boost).
-            let had_long = counters
-                .long_mode_turns
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 {
-                        Some(v - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok();
-            let user_text = ctx
-                .messages
-                .last()
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            // Count recent tool calls: if tool-heavy, use smaller budget.
-            let recent_tool_calls = ctx
-                .messages
-                .iter()
-                .rev()
-                .take(6)
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-                .count();
-            let thinking_budget = {
-                let stored = counters.thinking_budget.load(Ordering::Relaxed);
-                if stored > 0 {
-                    Some(stored)
+    /// Compute effective max_tokens for this LLM call.
+    ///
+    /// Takes into account: `/long` override, user message complexity,
+    /// recent tool call density, and thinking budget.
+    fn compute_adaptive_max_tokens(&self, ctx: &TurnContext) -> u32 {
+        let counters = &self.core_handle.counters;
+        let base = ctx.core.max_tokens;
+        // Check for /long override (temporary boost).
+        let had_long = counters
+            .long_mode_turns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v > 0 {
+                    Some(v - 1)
                 } else {
                     None
                 }
-            };
-            adaptive_max_tokens(
-                base,
-                had_long,
-                user_text,
-                recent_tool_calls,
-                ctx.core.is_local,
-                thinking_budget,
-                &ctx.core.adaptive_tokens,
-            )
+            })
+            .is_ok();
+        let user_text = ctx
+            .messages
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        // Count recent tool calls: if tool-heavy, use smaller budget.
+        let recent_tool_calls = ctx
+            .messages
+            .iter()
+            .rev()
+            .take(6)
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .count();
+        let thinking_budget = {
+            let stored = counters.thinking_budget.load(Ordering::Relaxed);
+            if stored > 0 {
+                Some(stored)
+            } else {
+                None
+            }
         };
-
-        StepResult::Next(IterationPhase::Calling {
-            tool_defs,
-            max_tokens: effective_max_tokens,
-        })
+        adaptive_max_tokens(
+            base,
+            had_long,
+            user_text,
+            recent_tool_calls,
+            ctx.core.is_local,
+            thinking_budget,
+            &ctx.core.adaptive_tokens,
+        )
     }
 
     // -----------------------------------------------------------------------
     // Step 3: Calling — invoke the LLM (streaming or blocking)
     // -----------------------------------------------------------------------
+
+    /// Handle an LLM provider error: retry once if retryable, otherwise return error.
+    async fn handle_llm_error(
+        e: anyhow::Error,
+        ctx: &mut TurnContext,
+        counters: &RuntimeCounters,
+        label: &str,
+    ) -> StepResult {
+        if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
+            ctx.flow.retries.api_retried = true;
+            warn!(model = %ctx.core.model, error = %e, "{label}_retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            return StepResult::Done(IterationOutcome::Continue);
+        }
+        counters.inference_active.store(false, Ordering::Relaxed);
+        error!(model = %ctx.core.model, error = %e, "{label}_failed");
+        StepResult::Done(IterationOutcome::Error(format!(
+            "I encountered an error: {}",
+            e
+        )))
+    }
 
     /// Thinking budget calculation, inference_active flag, streaming path
     /// (with cancellation support) or blocking path.
@@ -1402,18 +1486,7 @@ impl AgentLoopShared {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
-                        ctx.flow.retries.api_retried = true;
-                        warn!(model = %ctx.core.model, error = %e, "llm_stream_call_failed_retrying");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        return StepResult::Done(IterationOutcome::Continue);
-                    }
-                    counters.inference_active.store(false, Ordering::Relaxed);
-                    error!(model = %ctx.core.model, error = %e, "llm_stream_call_failed");
-                    return StepResult::Done(IterationOutcome::Error(format!(
-                        "I encountered an error: {}",
-                        e
-                    )));
+                    return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
                 }
             };
 
@@ -1482,11 +1555,7 @@ impl AgentLoopShared {
                 None => {
                     counters.inference_active.store(false, Ordering::Relaxed);
                     // Stream ended without Done — either cancelled or genuine error.
-                    if ctx
-                        .cancellation_token
-                        .as_ref()
-                        .map_or(false, |t| t.is_cancelled())
-                    {
+                    if ctx.is_cancelled() {
                         // Cancelled mid-stream — exit cleanly.
                         return StepResult::Done(IterationOutcome::Finished(String::new()));
                     }
@@ -1514,18 +1583,7 @@ impl AgentLoopShared {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
-                        ctx.flow.retries.api_retried = true;
-                        warn!(model = %ctx.core.model, error = %e, "llm_call_failed_retrying");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        return StepResult::Done(IterationOutcome::Continue);
-                    }
-                    counters.inference_active.store(false, Ordering::Relaxed);
-                    error!(model = %ctx.core.model, error = %e, "llm_call_failed");
-                    return StepResult::Done(IterationOutcome::Error(format!(
-                        "I encountered an error: {}",
-                        e
-                    )));
+                    return Self::handle_llm_error(e, ctx, counters, "llm_call").await;
                 }
             }
         };
@@ -1552,7 +1610,7 @@ impl AgentLoopShared {
     /// Route tool calls through the router, check context pressure,
     /// delegation decision + execute, inline fallback, priority message
     /// check, cancellation check.
-    #[instrument(name = "step_execute_tools", skip(self, ctx, response, _tool_calls), fields(
+    #[instrument(name = "step_execute_tools", skip(self, ctx, response), fields(
         delegation_enabled = ctx.core.tool_delegation_config.enabled,
         n_tool_calls = response.tool_calls.len(),
     ))]
@@ -1560,7 +1618,6 @@ impl AgentLoopShared {
         &self,
         ctx: &mut TurnContext,
         response: LLMResponse,
-        _tool_calls: Vec<ToolCallRequest>,
     ) -> StepResult {
         let counters = &self.core_handle.counters;
 
@@ -1718,11 +1775,7 @@ impl AgentLoopShared {
         }
 
         // Check cancellation between tool call iterations.
-        if ctx
-            .cancellation_token
-            .as_ref()
-            .map_or(false, |t| t.is_cancelled())
-        {
+        if ctx.is_cancelled() {
             return StepResult::Done(IterationOutcome::Finished(String::new()));
         }
 
