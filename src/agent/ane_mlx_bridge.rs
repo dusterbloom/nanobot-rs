@@ -243,18 +243,19 @@ impl BucketKernels {
     }
 
     /// Get the kernel set for a given sequence length (rounds up to nearest bucket).
+    /// Returns `None` if no buckets are compiled.
     pub fn get(
         &self,
         seq_len: usize,
-    ) -> &(
+    ) -> Option<&(
         usize,
         super::ane_forward::CompiledKernels,
         super::ane_backward::BackwardKernels,
-    ) {
+    )> {
         self.buckets
             .iter()
             .find(|(bs, _, _)| *bs >= seq_len)
-            .unwrap_or(self.buckets.last().unwrap())
+            .or_else(|| self.buckets.last())
     }
 }
 
@@ -297,15 +298,18 @@ fn prepare_training_samples(
         let effective_loss_scale = loss_scale * quality_scale;
 
         if let Some(bk) = bucket_kernels {
-            let (bucket_seq, _, _) = bk.get(tokens_u32.len());
-            prepared.push(PreparedTrainingSample {
-                tok_pad: pad_to(&tokens_u32, *bucket_seq),
-                tgt_pad: pad_targets_to(&targets_u32, *bucket_seq),
-                tokens_u32,
-                targets_u32,
-                bucket_seq: *bucket_seq,
-                effective_loss_scale,
-            });
+            if let Some((bucket_seq, _, _)) = bk.get(tokens_u32.len()) {
+                prepared.push(PreparedTrainingSample {
+                    tok_pad: pad_to(&tokens_u32, *bucket_seq),
+                    tgt_pad: pad_targets_to(&targets_u32, *bucket_seq),
+                    tokens_u32,
+                    targets_u32,
+                    bucket_seq: *bucket_seq,
+                    effective_loss_scale,
+                });
+            } else {
+                tracing::warn!("ANE train: no bucket for sample len={}, skipping", tokens_u32.len());
+            }
         } else {
             prepared.push(PreparedTrainingSample {
                 tok_pad: Vec::new(),
@@ -774,7 +778,10 @@ impl AneTrainerSession {
                 for sample in chunk {
                     let t_fwd = std::time::Instant::now();
                     let (fwd, bwd) = if let Some(bk) = bucket_kernels {
-                        let (_, fwd_k, bwd_k) = bk.get(sample.tokens_u32.len());
+                        let Some((_, fwd_k, bwd_k)) = bk.get(sample.tokens_u32.len()) else {
+                            tracing::error!("ANE train: no bucket kernel for sample len={}", sample.tokens_u32.len());
+                            continue;
+                        };
                         model.cfg_mut().seq_len = sample.bucket_seq;
 
                         match ane_forward::forward_ane_generic(
@@ -788,11 +795,18 @@ impl AneTrainerSession {
                         ) {
                             Ok(fwd) => {
                                 let bwd = if cfg.optimizer == AneTrainingOptimizer::AneMuon {
-                                    let grad_kernels = bucket_lora_grad_kernels
+                                    let Some(grad_kernels) = bucket_lora_grad_kernels
                                         .iter()
                                         .find(|(seq_len, _)| *seq_len == sample.bucket_seq)
                                         .map(|(_, kernels)| kernels)
-                                        .expect("Muon bucket grad kernels should exist");
+                                    else {
+                                        tracing::error!(
+                                            "ANE train: no Muon grad kernels for bucket_seq={}, available={:?}",
+                                            sample.bucket_seq,
+                                            bucket_lora_grad_kernels.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                                        );
+                                        continue;
+                                    };
                                     ane_backward::backward_lora_ane_generic_with_lora_kernels(
                                         bwd_k,
                                         model,
@@ -1891,7 +1905,9 @@ mod tests {
         let sample_len = tokens.len();
         let bucket_kernels =
             BucketKernels::compile(&[sample_len], &cfg.mil_config).expect("bucket compile");
-        let (bucket_seq, fwd_k, bwd_k) = bucket_kernels.get(sample_len);
+        let (bucket_seq, fwd_k, bwd_k) = bucket_kernels
+            .get(sample_len)
+            .expect("just-compiled bucket must exist");
 
         let mut grad_cfg = cfg.mil_config.clone();
         grad_cfg.seq_len = *bucket_seq;
@@ -3351,7 +3367,9 @@ mod tests {
 
         let bucket_kernels = BucketKernels::compile(&[tokens_u32.len()], &train_cfg.mil_config)
             .expect("bucket compile");
-        let (bucket_seq, bucket_fwd_k, bucket_bwd_k) = bucket_kernels.get(tokens_u32.len());
+        let (bucket_seq, bucket_fwd_k, bucket_bwd_k) = bucket_kernels
+            .get(tokens_u32.len())
+            .expect("just-compiled bucket must exist");
         eprintln!(
             "35B ANE smoke: sample_len={} bucket_seq={}",
             tokens_u32.len(),
