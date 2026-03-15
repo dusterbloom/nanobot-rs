@@ -44,13 +44,15 @@ pub struct ClusterDiscovery {
     config: ClusterConfig,
     state: ClusterState,
     client: reqwest::Client,
+    /// API key for localhost probes (from `localApiKey` config).
+    local_api_key: String,
 }
 
 impl ClusterDiscovery {
     /// Create a new discovery engine.
     ///
     /// The HTTP client is pre-configured with a short connect/request timeout.
-    pub fn new(config: ClusterConfig, state: ClusterState) -> Self {
+    pub fn new(config: ClusterConfig, state: ClusterState, local_api_key: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
@@ -61,6 +63,7 @@ impl ClusterDiscovery {
             config,
             state,
             client,
+            local_api_key,
         }
     }
 
@@ -281,8 +284,9 @@ impl ClusterDiscovery {
                 .map(|ep| {
                     let ep = ep.clone();
                     let client = self.client.clone();
+                    let api_key = self.local_api_key.clone();
                     async move {
-                        let peer = probe_endpoint_with_client(&client, &ep).await;
+                        let peer = probe_endpoint_with_client(&client, &ep, &api_key).await;
                         (ep, peer)
                     }
                 })
@@ -314,8 +318,9 @@ impl ClusterDiscovery {
             .into_iter()
             .map(|ep| {
                 let client = self.client.clone();
+                let api_key = self.local_api_key.clone();
                 async move {
-                    let peer = probe_endpoint_with_client(&client, &ep).await;
+                    let peer = probe_endpoint_with_client(&client, &ep, &api_key).await;
                     peer
                 }
             })
@@ -343,13 +348,14 @@ pub async fn probe_endpoint(endpoint: &str) -> Option<ClusterPeer> {
         .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
         .build()
         .unwrap_or_default();
-    probe_endpoint_with_client(&client, endpoint).await
+    probe_endpoint_with_client(&client, endpoint, "").await
 }
 
 /// Inner probe that reuses a shared `reqwest::Client`.
 async fn probe_endpoint_with_client(
     client: &reqwest::Client,
     endpoint: &str,
+    local_api_key: &str,
 ) -> Option<ClusterPeer> {
     let url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
 
@@ -358,6 +364,10 @@ async fn probe_endpoint_with_client(
     let mut req = client.get(&url);
     if extract_port(endpoint) == Some(1337) {
         req = req.header("Host", "localhost");
+    }
+    // Send API key for localhost probes (oMLX requires auth).
+    if !local_api_key.is_empty() && is_localhost(endpoint) {
+        req = req.bearer_auth(local_api_key);
     }
     let result = timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), req.send()).await;
 
@@ -477,6 +487,15 @@ pub fn detect_peer_type(
 }
 
 /// Extract the port number from a URL like `http://192.168.1.5:52415`.
+fn is_localhost(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url)
+        .to_lowercase();
+    rest.starts_with("127.0.0.1") || rest.starts_with("localhost")
+}
+
 fn extract_port(url: &str) -> Option<u16> {
     // Strip scheme.
     let rest = url
@@ -1125,7 +1144,7 @@ eth0\t00000000\tC01AA8C0\t0003\n";
             prefer_cluster: true,
         };
         let state = ClusterState::new();
-        let discovery = ClusterDiscovery::new(config, state.clone());
+        let discovery = ClusterDiscovery::new(config, state.clone(), String::new());
         discovery.discover_once().await;
         assert_eq!(state.peer_count().await, 0);
     }

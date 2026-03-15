@@ -822,6 +822,7 @@ pub(crate) async fn run_gateway_async(
         let discovery = crate::cluster::discovery::ClusterDiscovery::new(
             config.cluster.clone(),
             cluster_state.clone(),
+            config.agents.defaults.local_api_key.clone(),
         );
         let _discovery_handle = discovery.run();
         tracing::info!("cluster_discovery_started");
