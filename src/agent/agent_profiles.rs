@@ -296,8 +296,6 @@ pub fn profiles_summary(profiles: &HashMap<String, AgentProfile>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::capabilities::inherit_capabilities;
-
     #[test]
     fn test_parse_profile_basic() {
         let content = r#"---
@@ -391,13 +389,14 @@ Do stuff."#;
         let tools = profile
             .tools
             .expect("capabilities should produce a tools list");
-        // read -> [list_dir, read_file], http -> [browser, web_search], skills -> [read_skill]
+        // read -> [list_dir, read_file], http -> [browser, web_fetch, web_search], skills -> [read_skill]
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"list_dir".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"browser".to_string()));
         assert!(tools.contains(&"read_skill".to_string()));
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         // Verify sorted
         for i in 1..tools.len() {
             assert!(tools[i] >= tools[i - 1], "tools should be sorted");
@@ -467,20 +466,6 @@ Do stuff."#;
         // inherit flag is recorded but explicit capabilities win for tools
         assert!(profile.inherit);
         assert!(profile.deny_capabilities.contains(&Capability::Http));
-    }
-
-    #[test]
-    fn test_inherit_capabilities_integration() {
-        // Simulate a spawn-time resolution: parent has Read + Http + Write,
-        // child profile says inherit=true, deny=[write].
-        let parent_caps = vec![Capability::Read, Capability::Http, Capability::Write];
-        let deny = vec![Capability::Write];
-        let resolved = inherit_capabilities(&parent_caps, &deny);
-        let tool_names = resolve_capabilities(&resolved);
-        assert!(tool_names.contains(&"read_file".to_string()));
-        assert!(tool_names.contains(&"browser".to_string()));
-        assert!(!tool_names.contains(&"write_file".to_string()));
-        assert!(!tool_names.contains(&"edit_file".to_string()));
     }
 
     #[test]

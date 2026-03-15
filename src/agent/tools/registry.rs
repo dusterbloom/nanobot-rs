@@ -70,8 +70,6 @@ impl ToolConfig {
 /// Allows dynamic registration and execution of tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
-    /// When true, tool descriptions are truncated to first sentence to save tokens.
-    pub condensed: bool,
 }
 
 impl ToolRegistry {
@@ -215,7 +213,6 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
-            condensed: false,
         }
     }
 
@@ -346,16 +343,11 @@ impl ToolRegistry {
     ///
     /// Tools where [`Tool::is_available`] returns `false` are excluded.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
-        let mut defs: Vec<serde_json::Value> = self
-            .tools
+        self.tools
             .values()
             .filter(|tool| tool.is_available())
             .map(|tool| tool.to_schema())
-            .collect();
-        if self.condensed {
-            Self::condense_definitions(&mut defs);
-        }
-        defs
+            .collect()
     }
 
     /// Get tool definitions for only the named tools, in OpenAI format.
@@ -364,16 +356,11 @@ impl ToolRegistry {
     /// are silently skipped.
     pub fn definitions_for(&self, names: &[String]) -> Vec<serde_json::Value> {
         let name_set: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
-        let mut defs: Vec<serde_json::Value> = self
-            .tools
+        self.tools
             .values()
             .filter(|tool| tool.is_available() && name_set.contains(tool.name()))
             .map(|tool| tool.to_schema())
-            .collect();
-        if self.condensed {
-            Self::condense_definitions(&mut defs);
-        }
-        defs
+            .collect()
     }
 
     /// Truncate tool descriptions to their first sentence to save tokens.
@@ -388,10 +375,29 @@ impl ToolRegistry {
         }
     }
 
-    /// Condense a description to its first sentence.
+    /// Condense a description to its first two sentences for richer guidance.
+    ///
+    /// A single sentence (e.g. "Execute a shell command.") often drops critical
+    /// context like safe/blocked commands or output format hints that help
+    /// local models use tools correctly.
     fn condense_description(desc: &str) -> String {
-        if let Some((first, _)) = desc.split_once('.') {
-            format!("{}.", first)
+        let bytes = desc.as_bytes();
+        let mut sentences = 0u8;
+        let mut end = 0usize;
+        for i in 0..bytes.len() {
+            if bytes[i] == b'.' {
+                let next = bytes.get(i + 1).copied();
+                if matches!(next, Some(b' ') | Some(b'\n') | None) {
+                    sentences += 1;
+                    end = i + 1;
+                    if sentences >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        if end > 0 && end < desc.len() {
+            desc[..end].trim().to_string()
         } else {
             desc.to_string()
         }
@@ -576,37 +582,19 @@ impl ToolRegistry {
             return self.get_definitions();
         }
 
-        let mut defs: Vec<serde_json::Value> = self
-            .tools
+        self.tools
             .iter()
             .filter(|(name, tool)| relevant.contains(name.as_str()) && tool.is_available())
             .map(|(_, tool)| tool.to_schema())
-            .collect();
-        if self.condensed {
-            Self::condense_definitions(&mut defs);
-        }
-        defs
-    }
-
-    /// Get tool definitions filtered by relevance to the current context.
-    pub fn get_relevant_definitions(
-        &self,
-        messages: &[serde_json::Value],
-        used_tools: &HashSet<String>,
-    ) -> Vec<serde_json::Value> {
-        self.collect_filtered_definitions(Self::CORE_TOOLS, messages, used_tools, 5)
+            .collect()
     }
 
     /// Get tool definitions for local models.
     ///
-    /// Returns ALL registered + available tools with condensed (first-sentence)
+    /// Returns ALL registered + available tools with condensed (two-sentence)
     /// descriptions. Registration is the source of truth — no hardcoded subset.
     /// Token cost is ~350 tokens for 12 tools, affordable even in 32K context.
-    pub fn get_local_definitions(
-        &self,
-        _messages: &[serde_json::Value],
-        _used_tools: &HashSet<String>,
-    ) -> Vec<serde_json::Value> {
+    pub fn get_local_definitions(&self) -> Vec<serde_json::Value> {
         let mut defs: Vec<serde_json::Value> = self
             .tools
             .values()
@@ -666,24 +654,6 @@ impl ToolRegistry {
         self.collect_filtered_definitions(&core, messages, used_tools, 5)
     }
 
-    /// Get tool definitions scoped for the delegation model (strict).
-    ///
-    /// Only returns tools appropriate for the current phase.
-    /// For phases with no specific tool set, returns all tools.
-    pub fn get_delegation_definitions(&self, phase: &TaskPhase) -> Vec<serde_json::Value> {
-        match Self::tools_for_phase(phase) {
-            Some(phase_tools) => {
-                let allowed: HashSet<&str> = phase_tools.iter().copied().collect();
-                self.tools
-                    .iter()
-                    .filter(|(name, tool)| allowed.contains(name.as_str()) && tool.is_available())
-                    .map(|(_, tool)| tool.to_schema())
-                    .collect()
-            }
-            None => self.get_definitions(),
-        }
-    }
-
     /// Get list of registered tool names.
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
@@ -703,99 +673,6 @@ impl ToolRegistry {
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Toolset resolution (pure functions — no &self, no IO)
-// ---------------------------------------------------------------------------
-
-/// Built-in toolset definitions.
-fn builtin_toolsets() -> HashMap<&'static str, Vec<&'static str>> {
-    let mut m = HashMap::new();
-    m.insert(
-        "core",
-        vec!["read_file", "write_file", "edit_file", "list_dir", "exec"],
-    );
-    m.insert("web", vec!["web_search", "web_fetch", "browser"]);
-    m.insert(
-        "memory",
-        vec!["recall", "remember", "read_skill", "session_search"],
-    );
-    m.insert(
-        "read_only",
-        vec![
-            "read_file",
-            "list_dir",
-            "web_search",
-            "browser",
-            "recall",
-            "read_skill",
-            "session_search",
-        ],
-    );
-    m
-}
-
-/// Resolve a toolset name to a list of tool names.
-///
-/// Custom sets are in `custom_sets`. References starting with `@` expand to
-/// other sets (built-in or custom). `available_tools` is the list of all
-/// registered tool names (reserved for future validation).
-///
-/// Returns the resolved, deduplicated (order-preserving) list of tool names,
-/// or an error message if the set is unknown or a cycle is detected.
-pub fn resolve_toolset(
-    name: &str,
-    custom_sets: &HashMap<String, Vec<String>>,
-    available_tools: &[String],
-) -> Result<Vec<String>, String> {
-    let mut result = Vec::new();
-    let mut visited = HashSet::new();
-    resolve_toolset_inner(
-        name,
-        custom_sets,
-        available_tools,
-        &mut result,
-        &mut visited,
-    )?;
-    // Dedup while preserving insertion order.
-    let mut seen = HashSet::new();
-    result.retain(|t| seen.insert(t.clone()));
-    Ok(result)
-}
-
-fn resolve_toolset_inner(
-    name: &str,
-    custom_sets: &HashMap<String, Vec<String>>,
-    available_tools: &[String],
-    result: &mut Vec<String>,
-    visited: &mut HashSet<String>,
-) -> Result<(), String> {
-    // Check for cycles before recursing.
-    if !visited.insert(name.to_string()) {
-        return Err(format!("Cycle detected in toolset resolution: {}", name));
-    }
-
-    let builtins = builtin_toolsets();
-
-    // Custom sets take precedence over built-ins.
-    let entries: Vec<&str> = if let Some(tools) = custom_sets.get(name) {
-        tools.iter().map(|s| s.as_str()).collect()
-    } else if let Some(tools) = builtins.get(name) {
-        tools.clone()
-    } else {
-        return Err(format!("Unknown toolset: {}", name));
-    };
-
-    for entry in entries {
-        if let Some(ref_name) = entry.strip_prefix('@') {
-            resolve_toolset_inner(ref_name, custom_sets, available_tools, result, visited)?;
-        } else {
-            result.push(entry.to_string());
-        }
-    }
-
-    Ok(())
 }
 
 impl Default for ToolRegistry {
@@ -1308,51 +1185,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // get_relevant_definitions tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_relevant_defs_always_includes_core_tools() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("write_file")));
-        registry.register(Box::new(MockTool::new("exec")));
-        registry.register(Box::new(MockTool::new("web_search")));
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-        let defs = registry.get_relevant_definitions(&messages, &used);
-
-        // Core tools should be included; web_search should not (no keyword).
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-        assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"write_file".to_string()));
-        assert!(names.contains(&"exec".to_string()));
-        assert!(!names.contains(&"web_search".to_string()));
-    }
-
-    #[test]
-    fn test_relevant_defs_keyword_trigger() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("web_search")));
-
-        let messages =
-            vec![serde_json::json!({"role": "user", "content": "search for Rust async patterns"})];
-        let used = HashSet::new();
-        let defs = registry.get_relevant_definitions(&messages, &used);
-
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-        assert!(names.contains(&"web_search".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
     // condense_description tests
     // -----------------------------------------------------------------------
 
@@ -1361,7 +1193,7 @@ mod tests {
         let desc = "Read a file from disk. Supports binary and text files. Very useful.";
         assert_eq!(
             ToolRegistry::condense_description(desc),
-            "Read a file from disk."
+            "Read a file from disk. Supports binary and text files."
         );
     }
 
@@ -1375,60 +1207,12 @@ mod tests {
     }
 
     #[test]
-    fn test_condensed_mode_modifies_definitions() {
+    fn test_get_definitions_preserves_full_descriptions() {
         let mut registry = ToolRegistry::new();
-        registry.condensed = true;
-
-        // MockTool's description is "A mock tool for testing" (no period).
-        registry.register(Box::new(MockTool::new("test_tool")));
-        let defs = registry.get_definitions();
-        assert_eq!(defs.len(), 1);
-        let desc = defs[0]["function"]["description"].as_str().unwrap();
-        // No period in original, so condense_description returns it unchanged.
-        assert_eq!(desc, "A mock tool for testing");
-    }
-
-    #[test]
-    fn test_condensed_mode_truncates_in_relevant_defs() {
-        let mut registry = ToolRegistry::new();
-        registry.condensed = true;
-        registry.register(Box::new(MockTool::new("read_file"))); // core tool
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-        let defs = registry.get_relevant_definitions(&messages, &used);
-        assert_eq!(defs.len(), 1);
-        let desc = defs[0]["function"]["description"].as_str().unwrap();
-        // MockTool desc has no period, so it's unchanged.
-        assert_eq!(desc, "A mock tool for testing");
-    }
-
-    #[test]
-    fn test_non_condensed_mode_preserves_full_descriptions() {
-        let mut registry = ToolRegistry::new();
-        // condensed defaults to false
         registry.register(Box::new(MockTool::new("test_tool")));
         let defs = registry.get_definitions();
         let desc = defs[0]["function"]["description"].as_str().unwrap();
         assert_eq!(desc, "A mock tool for testing");
-    }
-
-    #[test]
-    fn test_relevant_defs_includes_used_tools() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("browser")));
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let mut used = HashSet::new();
-        used.insert("browser".to_string());
-
-        let defs = registry.get_relevant_definitions(&messages, &used);
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-        assert!(names.contains(&"browser".to_string()));
     }
 
     #[tokio::test]
@@ -1525,47 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delegation_defs_file_editing_strict() {
-        let mut registry = ToolRegistry::new();
-        for name in &[
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "exec",
-            "web_search",
-            "message",
-        ] {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        let defs = registry.get_delegation_definitions(&TaskPhase::FileEditing);
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        // Strict: only phase tools, no web_search or message
-        assert_eq!(names.len(), 5);
-        assert!(names.contains("read_file"));
-        assert!(names.contains("write_file"));
-        assert!(names.contains("edit_file"));
-        assert!(!names.contains("web_search"));
-        assert!(!names.contains("message"));
-    }
-
-    #[test]
-    fn test_delegation_defs_idle_returns_all() {
-        let mut registry = ToolRegistry::new();
-        for name in &["read_file", "web_search", "exec"] {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        let defs = registry.get_delegation_definitions(&TaskPhase::Idle);
-        assert_eq!(defs.len(), 3); // All tools returned for Idle
-    }
-
-    #[test]
     fn test_scoped_defs_includes_phase_and_used() {
         let mut registry = ToolRegistry::new();
         for name in &[
@@ -1615,11 +1358,7 @@ mod tests {
             registry.register(Box::new(MockTool::new(name)));
         }
 
-        // Bland message, empty used_tools — everything still shows.
-        let messages = vec![serde_json::json!({"role": "user", "content": "fix the bug"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
         let names: HashSet<String> = defs
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
@@ -1710,24 +1449,6 @@ mod tests {
     }
 
     #[test]
-    fn test_unavailable_tool_excluded_from_relevant_definitions() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(UnavailableTool));
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "read some file"})];
-        let used = HashSet::new();
-        let defs = registry.get_relevant_definitions(&messages, &used);
-
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(!names.contains(&"unavailable_test".to_string()));
-    }
-
-    #[test]
     fn test_unavailable_tool_excluded_from_local_definitions() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
@@ -1735,9 +1456,7 @@ mod tests {
         registry.register(Box::new(MockTool::new("exec")));
         registry.register(Box::new(UnavailableTool));
 
-        let messages = vec![serde_json::json!({"role": "user", "content": "fix the bug"})];
-        let used = HashSet::new();
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
 
         let names: Vec<String> = defs
             .iter()
@@ -1745,134 +1464,6 @@ mod tests {
             .collect();
 
         assert!(!names.contains(&"unavailable_test".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_toolset tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_resolve_builtin_core() {
-        let result = resolve_toolset("core", &HashMap::new(), &[]).unwrap();
-        assert!(result.contains(&"read_file".to_string()));
-        assert!(result.contains(&"exec".to_string()));
-        assert!(result.contains(&"write_file".to_string()));
-        assert!(result.contains(&"edit_file".to_string()));
-        assert!(result.contains(&"list_dir".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_builtin_web() {
-        let result = resolve_toolset("web", &HashMap::new(), &[]).unwrap();
-        assert!(result.contains(&"web_search".to_string()));
-        assert!(result.contains(&"browser".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_builtin_memory() {
-        let result = resolve_toolset("memory", &HashMap::new(), &[]).unwrap();
-        assert!(result.contains(&"recall".to_string()));
-        assert!(result.contains(&"remember".to_string()));
-        assert!(result.contains(&"read_skill".to_string()));
-        assert!(result.contains(&"session_search".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_builtin_read_only() {
-        let result = resolve_toolset("read_only", &HashMap::new(), &[]).unwrap();
-        assert!(result.contains(&"read_file".to_string()));
-        assert!(result.contains(&"list_dir".to_string()));
-        assert!(result.contains(&"web_search".to_string()));
-        // write/exec not included
-        assert!(!result.contains(&"write_file".to_string()));
-        assert!(!result.contains(&"exec".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_custom_set() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "my_set".to_string(),
-            vec!["read_file".to_string(), "web_search".to_string()],
-        );
-        let result = resolve_toolset("my_set", &custom, &[]).unwrap();
-        assert_eq!(result, vec!["read_file", "web_search"]);
-    }
-
-    #[test]
-    fn test_resolve_at_ref() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "telegram".to_string(),
-            vec![
-                "@core".to_string(),
-                "@web".to_string(),
-                "recall".to_string(),
-            ],
-        );
-        let result = resolve_toolset("telegram", &custom, &[]).unwrap();
-        assert!(result.contains(&"read_file".to_string())); // from @core
-        assert!(result.contains(&"web_search".to_string())); // from @web
-        assert!(result.contains(&"recall".to_string())); // direct
-    }
-
-    #[test]
-    fn test_resolve_dedup() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "both".to_string(),
-            vec!["@core".to_string(), "read_file".to_string()],
-        );
-        let result = resolve_toolset("both", &custom, &[]).unwrap();
-        // read_file should appear only once
-        assert_eq!(
-            result.iter().filter(|t| t.as_str() == "read_file").count(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_resolve_cycle_detection() {
-        let mut custom = HashMap::new();
-        custom.insert("a".to_string(), vec!["@b".to_string()]);
-        custom.insert("b".to_string(), vec!["@a".to_string()]);
-        let result = resolve_toolset("a", &custom, &[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Cycle"));
-    }
-
-    #[test]
-    fn test_resolve_unknown_set() {
-        let result = resolve_toolset("nonexistent", &HashMap::new(), &[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unknown toolset"));
-    }
-
-    #[test]
-    fn test_resolve_custom_overrides_builtin() {
-        // A custom set with the same name as a builtin should shadow it.
-        let mut custom = HashMap::new();
-        custom.insert("core".to_string(), vec!["only_this_tool".to_string()]);
-        let result = resolve_toolset("core", &custom, &[]).unwrap();
-        assert_eq!(result, vec!["only_this_tool"]);
-    }
-
-    #[test]
-    fn test_resolve_nested_at_refs() {
-        // Custom set referencing another custom set via @
-        let mut custom = HashMap::new();
-        custom.insert(
-            "base".to_string(),
-            vec!["tool_a".to_string(), "tool_b".to_string()],
-        );
-        custom.insert(
-            "extended".to_string(),
-            vec!["@base".to_string(), "tool_c".to_string()],
-        );
-        let result = resolve_toolset("extended", &custom, &[]).unwrap();
-        assert!(result.contains(&"tool_a".to_string()));
-        assert!(result.contains(&"tool_b".to_string()));
-        assert!(result.contains(&"tool_c".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1914,38 +1505,6 @@ mod tests {
         assert!(!def_names.contains(&"unavailable_test".to_string()));
     }
 
-    /// Test 2: Toolset resolves @core and custom additions correctly.
-    ///
-    /// Verifies the full chain: custom toolset referencing @core built-in,
-    /// expanding to the correct tool names, with recall added on top.
-    #[test]
-    fn test_integration_toolset_resolves_with_builtins() {
-        let mut custom = HashMap::new();
-        custom.insert(
-            "agent_set".to_string(),
-            vec!["@core".to_string(), "recall".to_string()],
-        );
-
-        let result = resolve_toolset("agent_set", &custom, &[]).unwrap();
-
-        // Should include all core tools (read_file, write_file, edit_file, list_dir, exec).
-        assert!(result.contains(&"read_file".to_string()));
-        assert!(result.contains(&"write_file".to_string()));
-        assert!(result.contains(&"edit_file".to_string()));
-        assert!(result.contains(&"list_dir".to_string()));
-        assert!(result.contains(&"exec".to_string()));
-        // Plus the custom addition.
-        assert!(result.contains(&"recall".to_string()));
-        // Should NOT include web tools (not in @core).
-        assert!(!result.contains(&"web_search".to_string()));
-        assert!(!result.contains(&"browser".to_string()));
-        // Each tool appears exactly once despite @core + explicit recall.
-        assert_eq!(
-            result.iter().filter(|t| t.as_str() == "read_file").count(),
-            1
-        );
-    }
-
     /// Test 3: Full chain — profile capabilities -> resolved tools -> no forbidden tools.
     ///
     /// Simulates what happens when a subagent profile declares Read + Memory + Skills
@@ -1974,42 +1533,6 @@ mod tests {
         assert!(!allowed_tools.contains(&"web_search".to_string()));
         assert!(!allowed_tools.contains(&"browser".to_string()));
         assert!(!allowed_tools.contains(&"spawn".to_string()));
-    }
-
-    /// Test 4: Inherited capabilities minus deny list, resolved to tool names.
-    ///
-    /// Verifies the full chain: parent has broad access, child inherits but
-    /// strips Write and Execute, and the resulting tool set matches expectations.
-    #[test]
-    fn test_integration_inherited_capabilities_deny_list() {
-        use crate::agent::capabilities::{inherit_capabilities, resolve_capabilities, Capability};
-
-        // Parent has broad access.
-        let parent_caps = vec![
-            Capability::Read,
-            Capability::Write,
-            Capability::Execute,
-            Capability::Http,
-            Capability::Memory,
-        ];
-
-        // Child inherits but denies Write and Execute.
-        let child_caps =
-            inherit_capabilities(&parent_caps, &[Capability::Write, Capability::Execute]);
-        let child_tools = resolve_capabilities(&child_caps);
-
-        // Child should have read, http, and memory tools.
-        assert!(child_tools.contains(&"read_file".to_string()));
-        assert!(child_tools.contains(&"list_dir".to_string()));
-        assert!(child_tools.contains(&"web_search".to_string()));
-        assert!(child_tools.contains(&"browser".to_string()));
-        assert!(child_tools.contains(&"recall".to_string()));
-        assert!(child_tools.contains(&"remember".to_string()));
-
-        // Child should NOT have write or execute tools.
-        assert!(!child_tools.contains(&"write_file".to_string()));
-        assert!(!child_tools.contains(&"edit_file".to_string()));
-        assert!(!child_tools.contains(&"exec".to_string()));
     }
 
     /// Test 5: CodeExecutionTool availability gating via is_available().
@@ -2118,11 +1641,7 @@ mod tests {
             registry.register(Box::new(MockTool::new(name)));
         }
 
-        // Bland message — no keywords that would trigger anything.
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
         let names: HashSet<String> = defs
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
@@ -2147,10 +1666,7 @@ mod tests {
         registry.register(Box::new(MockTool::new("web_search")));
         registry.register(Box::new(UnavailableTool)); // unavailable_test
 
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
         let names: HashSet<String> = defs
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
@@ -2164,17 +1680,14 @@ mod tests {
         );
     }
 
-    /// Local definitions must have condensed (first-sentence) descriptions
+    /// Local definitions must have condensed (two-sentence) descriptions
     /// to save tokens without hiding tools.
     #[test]
     fn test_local_defs_are_condensed() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
 
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
         assert_eq!(defs.len(), 1);
 
         let desc = defs[0]["function"]["description"].as_str().unwrap();
@@ -2185,33 +1698,40 @@ mod tests {
         assert_eq!(desc, "A mock tool for testing");
     }
 
-    /// Verify condensation actually truncates multi-sentence descriptions.
+    /// Verify condensation truncates to two sentences (not one, not all).
     #[test]
     fn test_local_defs_condense_truncates_multi_sentence() {
-        // Use a real tool that has a multi-sentence description.
-        // WebSearchTool: "Search the web. Returns titles, URLs, and snippets. ..."
+        // Use a real tool that has a 3-sentence description.
+        // WebSearchTool: "Search the web. Returns titles, URLs, and snippets. Use web_fetch..."
         let tool = super::WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
         let full_desc = tool.description().to_string();
+        // Count sentences in full description (periods followed by space).
+        let sentence_breaks = full_desc.matches(". ").count();
         assert!(
-            full_desc.contains(". "),
-            "WebSearchTool should have multi-sentence description"
+            sentence_breaks >= 2,
+            "WebSearchTool should have 3+ sentences, got {} breaks in: {}",
+            sentence_breaks, full_desc,
         );
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
 
-        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
+        let defs = registry.get_local_definitions();
         let condensed_desc = defs[0]["function"]["description"].as_str().unwrap();
 
-        // Should be truncated to first sentence.
+        // Should keep two sentences but drop the third.
+        assert!(condensed_desc.ends_with('.'), "Should end with period");
         assert!(
-            !condensed_desc.contains(". "),
-            "Local definition should be condensed to first sentence, got: {}",
-            condensed_desc,
+            condensed_desc.len() < full_desc.len(),
+            "Condensed should be shorter than full: {} vs {}",
+            condensed_desc.len(), full_desc.len(),
         );
-        assert!(condensed_desc.ends_with('.'));
+        // Two sentences means exactly one ". " break in the condensed output.
+        let condensed_breaks = condensed_desc.matches(". ").count();
+        assert_eq!(
+            condensed_breaks, 1,
+            "Two-sentence condensation should have 1 internal break, got {}: {}",
+            condensed_breaks, condensed_desc,
+        );
     }
 }

@@ -208,28 +208,24 @@ impl AgentLoop {
                     };
                 cal
             },
-            learn_loop: {
-                // Placeholder -- rebuilt in set_perplexity_gate / after all fields are set.
-                // At construction time, calibrator and experience_buffer are not yet Arc-cloneable
-                // from the struct itself, so we initialize with empty observers.
-                Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-                    calibrator: None,
-                    experience_buffer: None,
-                    perplexity_gate_config: Default::default(),
-                    #[cfg(feature = "mlx")]
-                    mlx_provider: None,
-                    training_counters: None,
-                    ane_model_dir: None,
-                    #[cfg(all(feature = "ane", feature = "mlx"))]
-                    ane_trainer: None,
-                    #[cfg(all(feature = "ane", feature = "mlx"))]
-                    ane_optimizer_override: None,
-                    #[cfg(all(feature = "ane", feature = "mlx"))]
-                    ane_lr_override: None,
-                    #[cfg(all(feature = "ane", feature = "mlx"))]
-                    ane_strict_ane: false,
-                })
-            },
+            // Placeholder — rebuilt below once shared fields are accessible.
+            learn_loop: Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
+                calibrator: None,
+                experience_buffer: None,
+                perplexity_gate_config: Default::default(),
+                #[cfg(feature = "mlx")]
+                mlx_provider: None,
+                training_counters: None,
+                ane_model_dir: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_trainer: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_optimizer_override: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_lr_override: None,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                ane_strict_ane: false,
+            }),
             #[cfg(feature = "cluster")]
             cluster_router: None,
             knowledge_store: crate::agent::knowledge_store::KnowledgeStore::open_default()
@@ -250,23 +246,7 @@ impl AgentLoop {
         // Rebuild learn_loop now that shared fields are accessible.
         {
             let s = Arc::get_mut(&mut shared).expect("learn_loop init: shared Arc not yet cloned");
-            s.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-                calibrator: s.calibrator.clone(),
-                experience_buffer: s.experience_buffer.clone(),
-                perplexity_gate_config: s.perplexity_gate_config.clone(),
-                #[cfg(feature = "mlx")]
-                mlx_provider: s.mlx_provider.clone(),
-                training_counters: Some(s.core_handle.counters.clone()),
-                ane_model_dir: s.ane_model_dir.clone(),
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_trainer: s.ane_trainer.clone(),
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_optimizer_override: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_lr_override: None,
-                #[cfg(all(feature = "ane", feature = "mlx"))]
-                ane_strict_ane: false,
-            });
+            s.rebuild_learn_loop();
         }
 
         Self {
@@ -285,24 +265,7 @@ impl AgentLoop {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_perplexity_gate called after shared Arc was cloned");
         shared.perplexity_gate_config = config;
-        // Rebuild learn_loop with updated config.
-        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-            calibrator: shared.calibrator.clone(),
-            experience_buffer: shared.experience_buffer.clone(),
-            perplexity_gate_config: shared.perplexity_gate_config.clone(),
-            #[cfg(feature = "mlx")]
-            mlx_provider: shared.mlx_provider.clone(),
-            training_counters: Some(shared.core_handle.counters.clone()),
-            ane_model_dir: shared.ane_model_dir.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_trainer: shared.ane_trainer.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_optimizer_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_lr_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_strict_ane: false,
-        });
+        shared.rebuild_learn_loop();
     }
 
     /// Set the in-process MLX provider for direct perplexity + training.
@@ -310,49 +273,16 @@ impl AgentLoop {
     pub fn set_mlx_provider(&mut self, provider: Arc<crate::providers::mlx::MlxProvider>) {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_mlx_provider called after shared Arc was cloned");
-        shared.mlx_provider = Some(provider.clone());
-        // Rebuild learn_loop with updated MLX provider.
-        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-            calibrator: shared.calibrator.clone(),
-            experience_buffer: shared.experience_buffer.clone(),
-            perplexity_gate_config: shared.perplexity_gate_config.clone(),
-            mlx_provider: Some(provider),
-            training_counters: Some(shared.core_handle.counters.clone()),
-            ane_model_dir: shared.ane_model_dir.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_trainer: shared.ane_trainer.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_optimizer_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_lr_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_strict_ane: false,
-        });
+        shared.mlx_provider = Some(provider);
+        shared.rebuild_learn_loop();
     }
 
     /// Set the model directory for standalone ANE training (no in-process MLX).
     pub fn set_ane_model_dir(&mut self, dir: Option<std::path::PathBuf>) {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_ane_model_dir called after shared Arc was cloned");
-        shared.ane_model_dir = dir.clone();
-        // Rebuild learn_loop with updated model dir.
-        shared.learn_loop = Arc::new(crate::agent::learn_loop::DefaultLearnLoop {
-            calibrator: shared.calibrator.clone(),
-            experience_buffer: shared.experience_buffer.clone(),
-            perplexity_gate_config: shared.perplexity_gate_config.clone(),
-            #[cfg(feature = "mlx")]
-            mlx_provider: shared.mlx_provider.clone(),
-            training_counters: Some(shared.core_handle.counters.clone()),
-            ane_model_dir: dir,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_trainer: shared.ane_trainer.clone(),
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_optimizer_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_lr_override: None,
-            #[cfg(all(feature = "ane", feature = "mlx"))]
-            ane_strict_ane: false,
-        });
+        shared.ane_model_dir = dir;
+        shared.rebuild_learn_loop();
     }
 
     #[cfg(all(feature = "ane", feature = "mlx"))]

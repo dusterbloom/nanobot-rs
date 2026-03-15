@@ -21,6 +21,7 @@ fn balanced_capabilities() -> &'static [Capability] {
         Capability::Write,
         Capability::Memory,
         Capability::Execute,
+        Capability::Spawn,
     ]
 }
 

@@ -884,8 +884,7 @@ pub(crate) async fn router_preflight(
         return PreflightResult::Passthrough;
     }
     let tool_list = if ctx.core.is_local {
-        ctx.tools
-            .get_local_definitions(&ctx.messages, &ctx.used_tools)
+        ctx.tools.get_local_definitions()
             .iter()
             .filter_map(|d| {
                 d.pointer("/function/name")

@@ -295,11 +295,7 @@ impl AgentLoopShared {
                         *content = stripped;
                     }
                 }
-                let tool_calls = response.tool_calls.clone();
-                StepResult::Next(IterationPhase::Executing {
-                    response,
-                    tool_calls,
-                })
+                StepResult::Next(IterationPhase::Executing { response })
             }
 
             ResponseKind::Text(content) => {

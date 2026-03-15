@@ -24,7 +24,7 @@ impl Capability {
             Capability::Read => &["read_file", "list_dir"],
             Capability::Write => &["write_file", "edit_file"],
             Capability::Execute => &["exec"],
-            Capability::Http => &["web_search", "browser"],
+            Capability::Http => &["web_search", "web_fetch", "browser"],
             Capability::Memory => &["recall", "remember", "session_search"],
             Capability::Spawn => &["spawn"],
             Capability::Skills => &["read_skill"],
@@ -33,19 +33,6 @@ impl Capability {
             Capability::Code => &["execute_code"],
         }
     }
-}
-
-/// Resolve inherited capabilities: start from parent's capabilities and
-/// remove any in the `deny` list.
-///
-/// When a subagent profile sets `inherit: true`, it starts with the parent's
-/// full capability set and narrows it by removing anything in `deny_capabilities`.
-pub fn inherit_capabilities(parent_caps: &[Capability], deny: &[Capability]) -> Vec<Capability> {
-    parent_caps
-        .iter()
-        .filter(|c| !deny.contains(c))
-        .cloned()
-        .collect()
 }
 
 /// Resolve a list of capabilities to a deduplicated, sorted list of tool names.
@@ -78,6 +65,7 @@ mod tests {
         let tools = resolve_capabilities(&[Capability::Read, Capability::Http]);
         assert!(tools.contains(&"read_file".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
+        assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"browser".to_string()));
     }
 
@@ -120,50 +108,6 @@ mod tests {
         assert_eq!(json, "\"read\"");
         let parsed: Capability = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, Capability::Read);
-    }
-
-    // ----- inherit_capabilities -----
-
-    #[test]
-    fn test_inherit_minus_removes_denied() {
-        let parent = vec![
-            Capability::Read,
-            Capability::Write,
-            Capability::Execute,
-            Capability::Http,
-        ];
-        let deny = vec![Capability::Write, Capability::Execute];
-        let result = inherit_capabilities(&parent, &deny);
-        assert!(result.contains(&Capability::Read));
-        assert!(result.contains(&Capability::Http));
-        assert!(!result.contains(&Capability::Write));
-        assert!(!result.contains(&Capability::Execute));
-    }
-
-    #[test]
-    fn test_inherit_empty_deny_keeps_all() {
-        let parent = vec![Capability::Read, Capability::Http];
-        let result = inherit_capabilities(&parent, &[]);
-        assert_eq!(result.len(), 2);
-        assert!(result.contains(&Capability::Read));
-        assert!(result.contains(&Capability::Http));
-    }
-
-    #[test]
-    fn test_inherit_deny_all() {
-        let parent = vec![Capability::Read];
-        let result = inherit_capabilities(&parent, &[Capability::Read]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_inherit_deny_not_in_parent_is_noop() {
-        // Denying a capability not held by parent should have no effect.
-        let parent = vec![Capability::Read];
-        let deny = vec![Capability::Http]; // parent doesn't have Http
-        let result = inherit_capabilities(&parent, &deny);
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(&Capability::Read));
     }
 
     #[test]
