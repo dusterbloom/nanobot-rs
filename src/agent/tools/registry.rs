@@ -13,7 +13,7 @@ use super::{
     WriteFileTool,
 };
 use crate::agent::system_state::TaskPhase;
-use crate::config::schema::{CodeExecutionConfig, JinaReaderConfig};
+use crate::config::schema::CodeExecutionConfig;
 
 /// Configuration for building a standard tool registry.
 ///
@@ -284,7 +284,6 @@ impl ToolRegistry {
         if should_include("web_fetch") {
             self.register(Box::new(WebFetchTool::new(
                 config.max_tool_result_chars,
-                None,
             )));
         }
         if should_include("browser") {
@@ -470,11 +469,7 @@ impl ToolRegistry {
         "spawn",
     ];
 
-    /// Minimal tool set for local models — saves context tokens.
-    const LOCAL_CORE_TOOLS: &'static [&'static str] =
-        &["read_file", "write_file", "list_dir", "exec"];
-
-    /// Keyword-to-tool mapping for context-triggered tool selection.
+    /// Keyword-to-tool mapping for context-triggered tool selection (cloud path).
     const KEYWORD_TRIGGERS: &'static [(&'static [&'static str], &'static str)] = &[
         (
             &[
@@ -602,14 +597,24 @@ impl ToolRegistry {
         self.collect_filtered_definitions(Self::CORE_TOOLS, messages, used_tools, 5)
     }
 
-    /// Get tool definitions for local models — smaller core set with keyword
-    /// expansion to conserve context tokens.
+    /// Get tool definitions for local models.
+    ///
+    /// Returns ALL registered + available tools with condensed (first-sentence)
+    /// descriptions. Registration is the source of truth — no hardcoded subset.
+    /// Token cost is ~350 tokens for 12 tools, affordable even in 32K context.
     pub fn get_local_definitions(
         &self,
-        messages: &[serde_json::Value],
-        used_tools: &HashSet<String>,
+        _messages: &[serde_json::Value],
+        _used_tools: &HashSet<String>,
     ) -> Vec<serde_json::Value> {
-        self.collect_filtered_definitions(Self::LOCAL_CORE_TOOLS, messages, used_tools, 3)
+        let mut defs: Vec<serde_json::Value> = self
+            .tools
+            .values()
+            .filter(|tool| tool.is_available())
+            .map(|tool| tool.to_schema())
+            .collect();
+        Self::condense_definitions(&mut defs);
+        defs
     }
 
     /// Extract text content from the last N messages for keyword scanning.
@@ -1591,8 +1596,10 @@ mod tests {
         assert!(names.contains("browser")); // used tool, added back
     }
 
+    /// Old behavior hid tools from local models. New behavior: all registered
+    /// tools are visible regardless of message content or used_tools.
     #[test]
-    fn test_local_defs_minimal_core() {
+    fn test_local_defs_all_registered_visible() {
         let mut registry = ToolRegistry::new();
         for name in &[
             "read_file",
@@ -1608,6 +1615,7 @@ mod tests {
             registry.register(Box::new(MockTool::new(name)));
         }
 
+        // Bland message, empty used_tools — everything still shows.
         let messages = vec![serde_json::json!({"role": "user", "content": "fix the bug"})];
         let used = HashSet::new();
 
@@ -1617,82 +1625,11 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
 
-        // Local core: read_file, write_file, list_dir, exec
-        assert!(names.contains("read_file"));
-        assert!(names.contains("list_dir"));
-        assert!(names.contains("exec"));
-        // Excluded from local core:
-        assert!(!names.contains("edit_file"));
-        assert!(!names.contains("spawn"));
-        assert!(!names.contains("web_search"));
-        assert!(!names.contains("message"));
-    }
-
-    #[test]
-    fn test_local_defs_keyword_expansion() {
-        let mut registry = ToolRegistry::new();
-        for name in &["read_file", "list_dir", "exec", "web_search"] {
-            registry.register(Box::new(MockTool::new(name)));
+        assert_eq!(names.len(), 9, "All 9 registered tools must be visible: {:?}", names);
+        for tool in &["read_file", "write_file", "edit_file", "list_dir", "exec",
+                       "spawn", "web_search", "browser", "message"] {
+            assert!(names.contains(*tool), "Missing '{}' in {:?}", tool, names);
         }
-
-        // "search" triggers web_search
-        let messages = vec![serde_json::json!({"role": "user", "content": "search for rust docs"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(names.contains("web_search")); // keyword-triggered
-        assert!(names.contains("read_file")); // local core
-    }
-
-    #[test]
-    fn test_local_defs_news_triggers_web_search() {
-        let mut registry = ToolRegistry::new();
-        for name in &["read_file", "list_dir", "exec", "web_search"] {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        // "news" should trigger web_search — previously missed keyword
-        let messages =
-            vec![serde_json::json!({"role": "user", "content": "tell me the latest news on Iran"})];
-        let used = HashSet::new();
-
-        let defs = registry.get_local_definitions(&messages, &used);
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(
-            names.contains("web_search"),
-            "\"news\" should trigger web_search, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn test_local_defs_used_tools_preserved() {
-        let mut registry = ToolRegistry::new();
-        for name in &["read_file", "list_dir", "exec", "spawn", "message"] {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        let messages = vec![serde_json::json!({"role": "user", "content": "continue"})];
-        let mut used = HashSet::new();
-        used.insert("spawn".to_string());
-
-        let defs = registry.get_local_definitions(&messages, &used);
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(names.contains("spawn")); // used tool preserved
-        assert!(!names.contains("message")); // not used, not in local core
     }
 
     // -----------------------------------------------------------------------
@@ -2151,5 +2088,130 @@ mod tests {
         let names = vec!["alpha".to_string(), "nonexistent".to_string()];
         let defs = registry.definitions_for(&names);
         assert_eq!(defs.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Local tool selection: all registered tools visible
+    // -----------------------------------------------------------------------
+
+    /// Local models must see ALL registered+available tools — not a hardcoded
+    /// subset. Registration is the source of truth; `is_available()` gates
+    /// visibility; keyword triggers are irrelevant for local (everything shows).
+    #[test]
+    fn test_local_defs_include_all_registered_tools() {
+        let mut registry = ToolRegistry::new();
+        let all_tools = [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "web_search",
+            "web_fetch",
+            "recall",
+            "remember",
+            "read_skill",
+            "browser",
+            "spawn",
+        ];
+        for name in &all_tools {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        // Bland message — no keywords that would trigger anything.
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // Every registered tool must be present — no keyword gating.
+        for tool in &all_tools {
+            assert!(
+                names.contains(*tool),
+                "Local model must see '{}' — got: {:?}",
+                tool,
+                names,
+            );
+        }
+    }
+
+    /// Unavailable tools must still be excluded from local definitions.
+    #[test]
+    fn test_local_defs_exclude_unavailable() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(MockTool::new("web_search")));
+        registry.register(Box::new(UnavailableTool)); // unavailable_test
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let names: HashSet<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(names.contains("read_file"));
+        assert!(names.contains("web_search"));
+        assert!(
+            !names.contains("unavailable_test"),
+            "Unavailable tools must be excluded from local definitions"
+        );
+    }
+
+    /// Local definitions must have condensed (first-sentence) descriptions
+    /// to save tokens without hiding tools.
+    #[test]
+    fn test_local_defs_are_condensed() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        assert_eq!(defs.len(), 1);
+
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+        // MockTool description is "A mock tool for testing" (no period, no
+        // second sentence) — condense_description returns it unchanged.
+        // The important thing: condense IS applied (verified by the multi-
+        // sentence test below).
+        assert_eq!(desc, "A mock tool for testing");
+    }
+
+    /// Verify condensation actually truncates multi-sentence descriptions.
+    #[test]
+    fn test_local_defs_condense_truncates_multi_sentence() {
+        // Use a real tool that has a multi-sentence description.
+        // WebSearchTool: "Search the web. Returns titles, URLs, and snippets. ..."
+        let tool = super::WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let full_desc = tool.description().to_string();
+        assert!(
+            full_desc.contains(". "),
+            "WebSearchTool should have multi-sentence description"
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(tool));
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let used = HashSet::new();
+
+        let defs = registry.get_local_definitions(&messages, &used);
+        let condensed_desc = defs[0]["function"]["description"].as_str().unwrap();
+
+        // Should be truncated to first sentence.
+        assert!(
+            !condensed_desc.contains(". "),
+            "Local definition should be condensed to first sentence, got: {}",
+            condensed_desc,
+        );
+        assert!(condensed_desc.ends_with('.'));
     }
 }

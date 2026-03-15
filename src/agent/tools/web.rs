@@ -11,7 +11,6 @@ use url::Url;
 
 use super::base::{Tool, ToolExecutionContext};
 use crate::agent::audit::ToolEvent;
-use crate::config::schema::JinaReaderConfig;
 
 /// Shared user-agent string.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36";
@@ -384,12 +383,11 @@ impl WebSearchTool {
 pub struct WebFetchTool {
     max_chars: usize,
     client: Client,
-    jina_config: Option<JinaReaderConfig>,
 }
 
 impl WebFetchTool {
     /// Create a new web fetch tool.
-    pub fn new(max_chars: usize, jina_config: Option<JinaReaderConfig>) -> Self {
+    pub fn new(max_chars: usize) -> Self {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .user_agent(USER_AGENT)
@@ -397,41 +395,7 @@ impl WebFetchTool {
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Self {
-            max_chars,
-            client,
-            jina_config,
-        }
-    }
-
-    /// Fetch content via Jina Reader and return (markdown_body, jina_url).
-    async fn fetch_via_jina(
-        &self,
-        url: &str,
-        config: &JinaReaderConfig,
-    ) -> Result<(String, String), String> {
-        let jina_url = format!("{}/{}", config.url.trim_end_matches('/'), url);
-        let mut req = self
-            .client
-            .get(&jina_url)
-            .header("Accept", "text/markdown")
-            .header("X-No-Cache", "true");
-        if let Some(key) = &config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Jina request failed: {}", e))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("Jina returned {}", status));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("Jina body read failed: {}", e))?;
-        Ok((body, jina_url))
+        Self { max_chars, client }
     }
 }
 
@@ -491,44 +455,6 @@ impl Tool for WebFetchTool {
                 "url": url
             })
             .to_string();
-        }
-
-        // Try Jina Reader first if configured and enabled.
-        if let Some(jina_cfg) = &self.jina_config {
-            if jina_cfg.enabled {
-                match self.fetch_via_jina(url, jina_cfg).await {
-                    Ok((body, jina_url)) => {
-                        let text = normalize_whitespace(&body);
-                        let truncated = text.len() > max_chars;
-                        let final_text = if truncated {
-                            let mut end = max_chars;
-                            while !text.is_char_boundary(end) && end > 0 {
-                                end -= 1;
-                            }
-                            text[..end].to_string()
-                        } else {
-                            text
-                        };
-                        return serde_json::json!({
-                            "url": url,
-                            "finalUrl": jina_url,
-                            "status": 200,
-                            "extractor": "jina-reader",
-                            "truncated": truncated,
-                            "length": final_text.len(),
-                            "text": final_text
-                        })
-                        .to_string();
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Jina Reader failed for {}: {}. Falling back to direct fetch.",
-                            url,
-                            e
-                        );
-                    }
-                }
-            }
         }
 
         match self.client.get(url).send().await {
@@ -1050,13 +976,13 @@ mod tests {
 
     #[test]
     fn test_web_fetch_tool_name() {
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
         assert_eq!(tool.name(), "web_fetch");
     }
 
     #[test]
     fn test_web_fetch_tool_parameters() {
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["url"].is_object());
@@ -1143,7 +1069,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_invalid_url() {
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
         let mut params = HashMap::new();
         params.insert(
             "url".to_string(),
@@ -1155,61 +1081,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_missing_url() {
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
         let params = HashMap::new();
         let result = tool.execute(params).await;
         assert!(result.contains("url parameter is required"));
     }
 
-    // -----------------------------------------------------------------------
-    // Jina Reader tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_jina_reader_url_construction() {
-        let config = JinaReaderConfig {
-            enabled: true,
-            url: "https://r.jina.ai".to_string(),
-            api_key: None,
-        };
-        let jina_url = format!(
-            "{}/{}",
-            config.url.trim_end_matches('/'),
-            "https://www.bbc.com/news"
-        );
-        assert_eq!(jina_url, "https://r.jina.ai/https://www.bbc.com/news");
-    }
-
-    #[test]
-    fn test_jina_reader_url_construction_trailing_slash() {
-        let config = JinaReaderConfig {
-            enabled: true,
-            url: "https://r.jina.ai/".to_string(),
-            api_key: None,
-        };
-        let jina_url = format!(
-            "{}/{}",
-            config.url.trim_end_matches('/'),
-            "https://example.com"
-        );
-        assert_eq!(jina_url, "https://r.jina.ai/https://example.com");
-    }
-
-    #[test]
-    fn test_jina_config_defaults() {
-        let json = r#"{}"#;
-        let config: JinaReaderConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.enabled); // Default is now false (disabled)
-        assert_eq!(config.url, "https://r.jina.ai");
-        assert!(config.api_key.is_none());
-    }
-
-    #[test]
-    fn test_web_fetch_without_jina() {
-        // WebFetchTool with None jina_config should work (backward compat)
-        let tool = WebFetchTool::new(10000, None);
-        assert_eq!(tool.name(), "web_fetch");
-    }
 
     // -----------------------------------------------------------------------
     // Pipeline tests: what the main model sees after processing
@@ -1376,7 +1253,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
 
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
@@ -1420,7 +1297,7 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         use crate::agent::audit::ToolEvent;
         use crate::agent::tools::base::ToolExecutionContext;
 
-        let tool = WebFetchTool::new(50000, None);
+        let tool = WebFetchTool::new(50000);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ToolEvent>();
         let token = tokio_util::sync::CancellationToken::new();
@@ -1457,5 +1334,19 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
             has_extracting,
             "Expected 'Extracting content...' progress event"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Jina removal: WebFetchTool must not accept or reference Jina config
+    // -----------------------------------------------------------------------
+
+    /// WebFetchTool::new must take only max_chars — no jina_config parameter.
+    #[test]
+    fn test_web_fetch_no_jina_parameter() {
+        // This is a compile-time test: if WebFetchTool::new still takes a
+        // second parameter, this won't compile.
+        // TEMPORARILY: use current signature so registry tests can run RED.
+        let tool = WebFetchTool::new(10000);
+        assert_eq!(tool.name(), "web_fetch");
     }
 }

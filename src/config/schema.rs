@@ -680,35 +680,6 @@ impl Default for GatewayConfig {
 // Tools configs
 // ---------------------------------------------------------------------------
 
-/// Jina Reader configuration for AI-powered web content extraction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JinaReaderConfig {
-    /// Enable Jina Reader for web_fetch tool. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Jina Reader URL. Default: "https://r.jina.ai".
-    #[serde(default = "default_jina_url")]
-    pub url: String,
-    /// Optional API key for Jina Reader.
-    #[serde(default)]
-    pub api_key: Option<String>,
-}
-
-fn default_jina_url() -> String {
-    "https://r.jina.ai".to_string()
-}
-
-impl Default for JinaReaderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: default_jina_url(),
-            api_key: None,
-        }
-    }
-}
-
 /// Web search tool configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -768,8 +739,6 @@ impl Default for WebSearchConfig {
 pub struct WebToolsConfig {
     #[serde(default)]
     pub search: WebSearchConfig,
-    #[serde(default)]
-    pub jina_reader: Option<JinaReaderConfig>,
 }
 
 /// Shell exec tool configuration.

@@ -279,7 +279,7 @@ impl SubagentManager {
         self
     }
 
-    /// Set search configuration fields (provider, SearXNG URL, max results, Jina key).
+    /// Set search configuration fields (provider, SearXNG URL, max results).
     pub fn with_search_config(
         mut self,
         provider: String,
