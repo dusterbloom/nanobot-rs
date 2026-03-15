@@ -584,15 +584,10 @@ fn core_config_from(
     }
 }
 
-/// Resolve MLX context cap: full config value when mlx-lm server handles
-/// inference, capped to 4K for in-process (GDN recurrence is slow).
+/// Resolve MLX context size from config.
 #[cfg(feature = "mlx")]
 fn mlx_max_context(config: &Config) -> usize {
-    if config.agents.defaults.mlx_lm_url.is_some() {
-        config.agents.defaults.local_max_context_tokens
-    } else {
-        config.agents.defaults.local_max_context_tokens.min(4096)
-    }
+    config.agents.defaults.local_max_context_tokens
 }
 
 pub(crate) fn build_core_handle(

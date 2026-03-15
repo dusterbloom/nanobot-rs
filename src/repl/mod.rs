@@ -202,8 +202,10 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
     // Query already-loaded models so we can skip redundant loads
     let models_url = format!("{}/api/v1/models", native);
     let client = reqwest::Client::new();
+    let api_key = &config.agents.defaults.local_api_key;
     let loaded_map: std::collections::HashMap<String, Option<usize>> = match client
         .get(&models_url)
+        .header("Authorization", format!("Bearer {}", api_key))
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -272,9 +274,15 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
 ///
 /// `native_base` must be the root URL without a trailing slash and without `/v1`
 /// (e.g. `http://host:1234`). Returns an empty vec on any error.
-async fn fetch_lms_loaded_models(native_base: &str) -> Vec<String> {
+async fn fetch_lms_loaded_models(native_base: &str, api_key: &str) -> Vec<String> {
     let list_url = format!("{}/api/v1/models", native_base);
-    let resp = match reqwest::get(&list_url).await {
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&list_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };
