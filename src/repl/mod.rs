@@ -1988,6 +1988,12 @@ pub(crate) fn cmd_agent(
 
             ctx.srv.shutdown();
 
+            // Shut down auxiliary mlx-lm server if we spawned one.
+            #[cfg(feature = "mlx")]
+            if let Some(ref aux) = ctx.core_handle.counters.auxiliary_server {
+                aux.shutdown();
+            }
+
             // Run skill cleanup commands (e.g. stop background audio).
             {
                 let ws = ctx.config.workspace_path();

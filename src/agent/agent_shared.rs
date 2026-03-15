@@ -526,7 +526,11 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Continue => {
-                    ctx.restore_thinking_budget();
+                    // Do NOT restore thinking budget here. When restore_thinking_budget
+                    // is Some, the previous iteration temporarily disabled thinking for
+                    // an empty-response retry. Restoring before the retry runs defeats
+                    // the purpose. Restoration happens in the Finished arm instead.
+
                     // Successful tool execution — reset both counters.
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
@@ -1146,6 +1150,14 @@ impl AgentLoopShared {
                         let bg_turn_count = ctx.turn_count;
                         in_flight.store(true, Ordering::SeqCst);
 
+                        // Lazily start auxiliary server before compaction uses its endpoint.
+                        #[cfg(feature = "mlx")]
+                        if bg_lcm_compactor.is_some() {
+                            if let Some(ref aux) = self.core_handle.counters.auxiliary_server {
+                                aux.ensure_ready();
+                            }
+                        }
+
                         if action == CompactionAction::Async {
                             // Mark async pending so we don't re-trigger.
                             let mut engine = lcm_engine.lock().await;
@@ -1693,6 +1705,14 @@ impl AgentLoopShared {
                 "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
                 pressure * 100.0,
             );
+        }
+
+        // Lazily start auxiliary server if delegation targets a local endpoint.
+        #[cfg(feature = "mlx")]
+        if ctx.core.tool_delegation_config.enabled {
+            if let Some(ref aux) = counters.auxiliary_server {
+                aux.ensure_ready();
+            }
         }
 
         // Check if we should delegate to the tool runner.

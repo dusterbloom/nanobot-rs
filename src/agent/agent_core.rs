@@ -218,6 +218,10 @@ pub struct RuntimeCounters {
     pub training_loss_x10k: AtomicU64,
     /// Set to true to request the training loop to stop early (e.g. on shutdown).
     pub training_cancel: AtomicBool,
+    /// Lazy auxiliary mlx-lm server for delegation/compaction/memory.
+    /// Spawned on first use, killed on drop.
+    #[cfg(feature = "mlx")]
+    pub auxiliary_server: Option<Arc<crate::agent::mlx_lm::LazyAuxiliaryServer>>,
 }
 
 impl RuntimeCounters {
@@ -255,6 +259,8 @@ impl RuntimeCounters {
             training_total_steps: AtomicU64::new(0),
             training_loss_x10k: AtomicU64::new(0),
             training_cancel: AtomicBool::new(false),
+            #[cfg(feature = "mlx")]
+            auxiliary_server: None,
         }
     }
 }

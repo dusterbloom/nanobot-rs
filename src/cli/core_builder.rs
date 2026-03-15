@@ -520,6 +520,100 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Lazy auxiliary MLX server
+// ---------------------------------------------------------------------------
+
+/// Extract port from a localhost URL (127.0.0.1 or localhost).
+///
+/// Returns `Some(port)` if the URL targets localhost, `None` otherwise.
+fn parse_local_port(url: &str) -> Option<u16> {
+    let url_lower = url.to_lowercase();
+    let host_port = if let Some(rest) = url_lower.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = url_lower.strip_prefix("https://") {
+        rest
+    } else {
+        &url_lower
+    };
+    let is_local = host_port.starts_with("127.0.0.1:") || host_port.starts_with("localhost:");
+    if !is_local {
+        return None;
+    }
+    let after_colon = host_port.split(':').nth(1)?;
+    let port_str = after_colon.split('/').next()?;
+    port_str.parse::<u16>().ok()
+}
+
+/// Check if a TCP port is responding (500ms timeout).
+fn is_port_responding(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let addr = format!("127.0.0.1:{port}");
+    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(500)).is_ok()
+}
+
+/// Build a `LazyAuxiliaryServer` from config if any auxiliary role
+/// targets a local endpoint. Returns `None` if no local auxiliary is configured.
+#[cfg(feature = "mlx")]
+fn lazy_auxiliary_from_config(
+    config: &Config,
+) -> Option<Arc<crate::agent::mlx_lm::LazyAuxiliaryServer>> {
+    let mut local_port: Option<u16> = None;
+    let mut model_name: Option<String> = None;
+
+    // 1. Tool delegation provider
+    if let Some(ref prov) = config.tool_delegation.provider {
+        if let Some(ref base) = prov.api_base {
+            if let Some(p) = parse_local_port(base) {
+                local_port = Some(p);
+                if !config.tool_delegation.model.is_empty() {
+                    model_name = Some(config.tool_delegation.model.clone());
+                }
+            }
+        }
+    }
+
+    // 2. LCM compaction endpoint
+    if local_port.is_none() {
+        if let Some(ref ep) = config.lcm.compaction_endpoint {
+            if let Some(p) = parse_local_port(&ep.url) {
+                local_port = Some(p);
+                model_name = Some(ep.model.clone());
+            }
+        }
+    }
+
+    // 3. Memory provider
+    if local_port.is_none() {
+        if let Some(ref prov) = config.memory.provider {
+            if let Some(ref base) = prov.api_base {
+                if let Some(p) = parse_local_port(base) {
+                    local_port = Some(p);
+                    if !config.memory.model.is_empty() {
+                        model_name = Some(config.memory.model.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let port = local_port?;
+    let model_name = model_name.filter(|s| !s.is_empty())?;
+
+    // Edge case: main mlx-lm server uses "auto" on the same port.
+    if let Some(ref mlx_url) = config.agents.defaults.mlx_lm_url {
+        if mlx_url == "auto" && port == 8090 {
+            tracing::debug!("auxiliary server: skipping — main mlx-lm (auto) owns port 8090");
+            return None;
+        }
+    }
+
+    Some(Arc::new(crate::agent::mlx_lm::LazyAuxiliaryServer::new(
+        port, model_name,
+    )))
+}
+
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
 ///
 /// Centralises the 25-field struct construction that was previously copy-pasted
@@ -634,10 +728,10 @@ pub(crate) fn build_core_handle(
         dp,
         sp,
     ));
-    let counters = Arc::new(RuntimeCounters::new_with_config(
+    let mut counters = RuntimeCounters::new_with_config(
         max_context_tokens,
         &config.trio.circuit_breaker,
-    ));
+    );
     // When main_no_think is enabled, also suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
     if config.trio.main_no_think {
@@ -645,7 +739,12 @@ pub(crate) fn build_core_handle(
             .suppress_thinking_in_tts
             .store(true, Ordering::Relaxed);
     }
-    AgentHandle::new(core, counters)
+    // Attach lazy auxiliary server (spawns on first delegation/compaction/memory use).
+    #[cfg(feature = "mlx")]
+    {
+        counters.auxiliary_server = lazy_auxiliary_from_config(config);
+    }
+    AgentHandle::new(core, Arc::new(counters))
 }
 
 /// Build a core handle using the in-process MLX provider as the main LLM.
@@ -672,11 +771,12 @@ pub(crate) fn build_core_handle_mlx(config: &Config, mlx: &MlxHandle) -> SharedC
         None,
         None,
     ));
-    let counters = Arc::new(RuntimeCounters::new_with_config(
+    let mut counters = RuntimeCounters::new_with_config(
         max_context_tokens,
         &config.trio.circuit_breaker,
-    ));
-    AgentHandle::new(core, counters)
+    );
+    counters.auxiliary_server = lazy_auxiliary_from_config(config);
+    AgentHandle::new(core, Arc::new(counters))
 }
 
 /// Rebuild the shared core for MLX mode (e.g. `/ctx` or `/model` changes).
@@ -1081,5 +1181,44 @@ mod matching_tests {
     fn test_match_empty_model_name() {
         let dirs = fake_dirs(&["Qwen3.5-2B-MLX-8bit"]);
         assert!(best_matching_dir("", &dirs).is_none());
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_server_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_local_port_standard() {
+        assert_eq!(parse_local_port("http://127.0.0.1:8090/v1"), Some(8090));
+        assert_eq!(parse_local_port("http://localhost:8090/v1"), Some(8090));
+        assert_eq!(parse_local_port("http://127.0.0.1:1234/v1"), Some(1234));
+    }
+
+    #[test]
+    fn test_parse_local_port_no_path() {
+        assert_eq!(parse_local_port("http://127.0.0.1:8090"), Some(8090));
+    }
+
+    #[test]
+    fn test_parse_local_port_https() {
+        assert_eq!(parse_local_port("https://127.0.0.1:8090/v1"), Some(8090));
+    }
+
+    #[test]
+    fn test_parse_local_port_remote_returns_none() {
+        assert_eq!(parse_local_port("http://192.168.1.22:1234/v1"), None);
+        assert_eq!(parse_local_port("https://api.openai.com/v1"), None);
+    }
+
+    #[test]
+    fn test_parse_local_port_empty() {
+        assert_eq!(parse_local_port(""), None);
+    }
+
+    #[test]
+    fn test_is_port_responding_closed_port() {
+        // Port 1 is almost certainly not listening.
+        assert!(!is_port_responding(1));
     }
 }

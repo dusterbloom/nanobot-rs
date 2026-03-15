@@ -453,6 +453,191 @@ pub fn is_mlx_model_dir(dir: &Path) -> bool {
     !has_gguf
 }
 
+// ---------------------------------------------------------------------------
+// Lazy auxiliary server guard
+// ---------------------------------------------------------------------------
+
+/// Lazy auxiliary mlx-lm server for delegation, compaction, and memory.
+///
+/// The server is spawned on the first call to `ensure_ready()` and killed on
+/// `Drop`. This avoids startup cost when auxiliary roles are never triggered.
+pub struct LazyAuxiliaryServer {
+    port: u16,
+    model_name: String,
+    server: parking_lot::Mutex<Option<MlxLmServer>>,
+    /// Once a spawn attempt fails, don't retry every call.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl LazyAuxiliaryServer {
+    /// Create a new lazy server guard with the given port and model name.
+    ///
+    /// Does NOT start the server — call `ensure_ready()` when you need it.
+    pub fn new(port: u16, model_name: String) -> Self {
+        Self {
+            port,
+            model_name,
+            server: parking_lot::Mutex::new(None),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Ensure the auxiliary server is running. Spawns it on first call.
+    ///
+    /// Returns `true` if the server is (now) available, `false` if spawn
+    /// failed or was skipped. Cheap after the first successful call.
+    pub fn ensure_ready(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        // Fast path: already failed.
+        if self.failed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut guard = self.server.lock();
+        if guard.is_some() {
+            return true;
+        }
+
+        // Check if something is already listening (external server).
+        if Self::is_port_responding(self.port) {
+            tracing::debug!(port = self.port, "auxiliary server: port already responding");
+            return true;
+        }
+
+        // Resolve model directory via LM Studio cache scan.
+        let base = match dirs::home_dir() {
+            Some(h) => h.join(".cache/lm-studio/models"),
+            None => {
+                tracing::warn!("auxiliary server: no home dir, skipping");
+                self.failed.store(true, Ordering::Relaxed);
+                return false;
+            }
+        };
+        let model_dir = Self::find_model_dir(&base, &self.model_name);
+        let Some(model_dir) = model_dir else {
+            tracing::warn!(
+                model = %self.model_name,
+                "auxiliary server: MLX model dir not found, skipping"
+            );
+            self.failed.store(true, Ordering::Relaxed);
+            return false;
+        };
+
+        tracing::info!(
+            port = self.port,
+            model = %self.model_name,
+            model_dir = %model_dir.display(),
+            "starting managed auxiliary inference server (lazy)"
+        );
+
+        match MlxLmServer::start(
+            model_dir,
+            None,
+            self.port,
+            InferenceBackend::MlxLm,
+            MlxLmServerOptions::default(),
+            VllmMlxOptions::default(),
+        ) {
+            Ok(srv) => {
+                *guard = Some(srv);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("auxiliary server: failed to start on port {}: {e}", self.port);
+                self.failed.store(true, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Shut down the server immediately.
+    pub fn shutdown(&self) {
+        let mut guard = self.server.lock();
+        if let Some(mut srv) = guard.take() {
+            tracing::info!(port = srv.port, "shutting down auxiliary inference server");
+            srv.kill();
+        }
+    }
+
+    fn is_port_responding(port: u16) -> bool {
+        use std::net::TcpStream;
+        std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::from_millis(500),
+        )
+        .is_ok()
+    }
+
+    /// Search for an MLX model directory matching `model_name`.
+    fn find_model_dir(base: &Path, model_name: &str) -> Option<PathBuf> {
+        if !base.is_dir() {
+            return None;
+        }
+        let mut all_mlx_dirs = Vec::new();
+        Self::collect_mlx_dirs(base, &mut all_mlx_dirs);
+
+        let needle = model_name.to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+
+        // Exact dir-name match.
+        for d in &all_mlx_dirs {
+            if let Some(name) = d.file_name() {
+                if name.to_string_lossy().to_lowercase() == needle {
+                    return Some(d.clone());
+                }
+            }
+        }
+
+        // Substring match — shortest (most specific) wins.
+        let mut matches: Vec<_> = all_mlx_dirs
+            .iter()
+            .filter(|d| {
+                d.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if !matches.is_empty() {
+            matches.sort_by_key(|d| d.file_name().map(|n| n.len()).unwrap_or(usize::MAX));
+            return Some(matches.remove(0));
+        }
+        None
+    }
+
+    fn collect_mlx_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut subdirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort();
+        for path in &subdirs {
+            if is_mlx_model_dir(path) {
+                out.push(path.clone());
+            }
+        }
+        for sub in subdirs {
+            Self::collect_mlx_dirs(&sub, out);
+        }
+    }
+}
+
+impl Drop for LazyAuxiliaryServer {
+    fn drop(&mut self) {
+        // MlxLmServer::drop already kills the child process.
+        if self.server.get_mut().is_some() {
+            tracing::debug!("LazyAuxiliaryServer dropped — server process will be killed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
