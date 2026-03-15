@@ -570,11 +570,10 @@ impl AgentLoopShared {
         {
             ctx.flow.retries.rescue_attempted = true;
             let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
-            let mut rescue_messages = ctx.messages.clone();
-            rescue_messages.push(json!({
-                "role": "user",
-                "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
-            }));
+            let rescue_messages = prepare_rescue_messages(
+                &ctx.messages,
+                &*ctx.protocol,
+            );
             counters.inference_active.store(true, Ordering::Relaxed);
             let rescue_result = ctx
                 .core
@@ -682,6 +681,25 @@ impl AgentLoopShared {
             validation_result: None,
         });
     }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Render raw messages through the conversation protocol, then append
+/// the rescue prompt. This ensures local servers never receive invalid
+/// roles like "tool" or "developer" in the rescue call.
+fn prepare_rescue_messages(
+    raw_messages: &[Value],
+    protocol: &dyn crate::agent::protocol::ConversationProtocol,
+) -> Vec<Value> {
+    let mut rendered = super::render_via_protocol(protocol, raw_messages);
+    rendered.push(json!({
+        "role": "user",
+        "content": "Return the final answer now. No reasoning. No tool calls. Max 6 lines."
+    }));
+    rendered
 }
 
 // ============================================================================
@@ -863,6 +881,45 @@ mod tests {
         assert!(
             !matches!(kind, ResponseKind::ToolCalls { .. }),
             "Empty <tool_call></tool_call> must NOT be classified as tool calls"
+        );
+    }
+
+    /// Rescue messages must go through protocol rendering so local servers
+    /// don't receive invalid roles like "tool" or "developer".
+    #[test]
+    fn test_prepare_rescue_messages_renders_via_local_protocol() {
+        use crate::agent::protocol::LocalProtocol;
+
+        // Raw messages with roles that local templates reject.
+        let raw = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tc_1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "tc_1", "name": "exec", "content": "done"}),
+        ];
+
+        let protocol = LocalProtocol::native();
+        let rendered = super::prepare_rescue_messages(&raw, &protocol);
+
+        // No message should have role "tool" or "developer" after rendering.
+        for msg in &rendered {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            assert!(
+                role == "system" || role == "user" || role == "assistant",
+                "rescue messages contain invalid role '{}' that local templates reject",
+                role,
+            );
+        }
+        // Must end with user (the rescue prompt).
+        let last_role = rendered.last().unwrap()["role"].as_str().unwrap();
+        assert_eq!(last_role, "user", "rescue messages must end with user role");
+        // The rescue prompt must be present.
+        let last_content = rendered.last().unwrap()["content"].as_str().unwrap();
+        assert!(
+            last_content.contains("final answer"),
+            "rescue prompt missing from rendered messages"
         );
     }
 

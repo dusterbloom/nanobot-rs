@@ -282,7 +282,7 @@ fn apply_local_reasoning_controls(
     body: &mut serde_json::Value,
     api_base: &str,
     thinking_budget: Option<u32>,
-    _supports_thinking: bool,
+    supports_thinking: bool,
 ) {
     if !is_local_api_base(api_base) {
         return;
@@ -294,10 +294,16 @@ fn apply_local_reasoning_controls(
         });
         body["reasoning_budget"] = serde_json::json!(budget);
         body["reasoning_format"] = serde_json::json!("deepseek");
+    } else if supports_thinking {
+        // Models like Qwen3.5 think by default (template-level). Without
+        // explicit `enable_thinking: false` they burn all output tokens on
+        // `<think>` blocks and produce no visible response.
+        // The assistant-prefill approach (`<think>\n</think>`) doesn't work
+        // on servers like oMLX that reject assistant message prefill.
+        body["chat_template_kwargs"] = serde_json::json!({
+            "enable_thinking": false
+        });
     }
-    // When thinking_budget is None: send nothing.
-    // Prefill already suppresses reasoning for thinking-capable models;
-    // sending reasoning params causes LM Studio HTTP 400 for some models.
 }
 
 /// Check if a model uses template-level thinking that requires the native LMS
@@ -563,6 +569,17 @@ fn apply_local_thinking_prefill(
     if !supports_thinking {
         return;
     }
+    // Skip prefill when chat_template_kwargs already disables thinking.
+    // The prefill hack (`<think>\n</think>`) is an LM Studio workaround;
+    // servers like oMLX reject assistant message prefill entirely.
+    if body
+        .get("chat_template_kwargs")
+        .and_then(|v| v.get("enable_thinking"))
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        return;
+    }
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
         messages.push(serde_json::json!({
             "role": "assistant",
@@ -761,6 +778,19 @@ impl LLMProvider for OpenAICompatProvider {
         };
 
         // Build request body.
+        // Log message roles for debugging chat template errors from local servers.
+        if is_local_api_base(&self.api_base) {
+            let roles: Vec<&str> = cached_msgs
+                .iter()
+                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+                .collect();
+            tracing::debug!(
+                model = model,
+                message_count = cached_msgs.len(),
+                roles = ?roles,
+                "local_llm_request_roles"
+            );
+        }
         let mut body = serde_json::json!({
             "model": model,
             "messages": cached_msgs,
@@ -853,6 +883,24 @@ impl LLMProvider for OpenAICompatProvider {
                 if !status.is_success() {
                     let status_code = status.as_u16();
                     let body_snippet: String = response_text.chars().take(500).collect();
+                    // On 400 errors from local servers, log the message roles
+                    // to help diagnose chat template issues.
+                    if status_code == 400 && is_local_api_base(&api_base) {
+                        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+                            let roles: Vec<&str> = msgs
+                                .iter()
+                                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+                                .collect();
+                            tracing::error!(
+                                model = %model_str,
+                                status = status_code,
+                                body = %body_snippet,
+                                roles = ?roles,
+                                message_count = msgs.len(),
+                                "local_llm_400_message_roles"
+                            );
+                        }
+                    }
                     warn!(
                         model = %model_str,
                         api_base = %api_base,
@@ -995,6 +1043,19 @@ impl LLMProvider for OpenAICompatProvider {
             (messages.to_vec(), tools.map(|t| t.to_vec()))
         };
 
+        // Log message roles for debugging chat template errors from local servers.
+        if is_local_api_base(&self.api_base) {
+            let roles: Vec<&str> = cached_msgs
+                .iter()
+                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+                .collect();
+            tracing::debug!(
+                model = model,
+                message_count = cached_msgs.len(),
+                roles = ?roles,
+                "local_llm_stream_request_roles"
+            );
+        }
         let mut body = serde_json::json!({
             "model": model,
             "messages": cached_msgs,
@@ -1082,6 +1143,23 @@ impl LLMProvider for OpenAICompatProvider {
                 if !status.is_success() {
                     let error_text = response.text().await.unwrap_or_default();
                     let status_code = status.as_u16();
+                    // On 400 from local server, log roles to diagnose template errors.
+                    if status_code == 400 && is_local_api_base(&api_base) {
+                        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+                            let roles: Vec<&str> = msgs
+                                .iter()
+                                .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
+                                .collect();
+                            tracing::error!(
+                                model = %model_str,
+                                status = status_code,
+                                error = %error_text,
+                                roles = ?roles,
+                                message_count = msgs.len(),
+                                "local_llm_stream_400_message_roles"
+                            );
+                        }
+                    }
                     warn!(
                         model = %model_str,
                         api_base = %api_base,

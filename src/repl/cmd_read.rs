@@ -1058,18 +1058,24 @@ impl ReplContext {
             crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx)
         };
 
-        // Spawn a watcher to mark experiences exported when training completes.
-        tokio::task::spawn_blocking(move || {
-            let ok = handle.join().unwrap_or(false);
-            tc.training_active.store(false, Ordering::Relaxed);
-            if ok {
-                tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
-                if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
-                    let _ = eb.mark_exported(&ids);
+        // Spawn a plain thread (NOT tokio::spawn_blocking) to watch for
+        // training completion. Using spawn_blocking would block tokio runtime
+        // shutdown if training is still in-flight (the ANE hardware dispatch
+        // can't be interrupted), causing the process to hang on exit.
+        std::thread::Builder::new()
+            .name("ane-train-watcher".into())
+            .spawn(move || {
+                let ok = handle.join().unwrap_or(false);
+                tc.training_active.store(false, Ordering::Relaxed);
+                if ok {
+                    tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
+                        let _ = eb.mark_exported(&ids);
+                    }
+                    crate::agent::learn_loop::omlx_try_reload_from_config();
                 }
-                crate::agent::learn_loop::omlx_try_reload_from_config();
-            }
-        });
+            })
+            .ok();
 
         println!(
             "\n  Training started: {} samples ({} newly unexported)\n  Model: {}\n  Use /train to check progress.\n",

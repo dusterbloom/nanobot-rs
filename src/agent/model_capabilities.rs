@@ -155,6 +155,30 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             parser: None,
         };
     }
+    // Qwen3.5 family: thinking enabled by default (template-level, not /think markers).
+    // Must explicitly send `enable_thinking: false` to suppress reasoning.
+    if lower.contains("qwen3.5") {
+        let size = if has_size_marker(lower, "0.8b") || has_size_marker(lower, "2b") {
+            ModelSizeClass::Small
+        } else {
+            ModelSizeClass::Medium
+        };
+        return ModelCapabilities {
+            size_class: size,
+            tool_calling: true,
+            thinking: true,
+            needs_native_lms_api: false,
+            strict_alternation: true,
+            max_reliable_output: 4096,
+            scratch_pad_rounds: 8,
+            reader_tier: if size == ModelSizeClass::Small {
+                ReaderTier::Minimal
+            } else {
+                ReaderTier::Standard
+            },
+            parser: None,
+        };
+    }
     if lower.contains("ministral-3") {
         return ModelCapabilities {
             size_class: ModelSizeClass::Small,

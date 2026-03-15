@@ -435,9 +435,12 @@ impl LearnLoop for DefaultLearnLoop {
                             info!(
                             "perplexity_gate: ANE split-silicon training spawned ({n_exps} experiences)"
                         );
-                            // Wait for the ANE thread to finish on the blocking pool,
-                            // then clear training_active and mark experiences exported.
-                            let _ = tokio::task::spawn_blocking(move || {
+                            // Use a plain thread (NOT spawn_blocking) so tokio
+                            // runtime shutdown isn't blocked by in-flight ANE
+                            // training stuck in hardware dispatch.
+                            std::thread::Builder::new()
+                                .name("ane-train-watcher".into())
+                                .spawn(move || {
                             let ok = handle.join().unwrap_or(false);
                             if let Some(ref tc) = tc_for_done {
                                 tc.training_active.store(false, Ordering::Relaxed);
@@ -461,7 +464,7 @@ impl LearnLoop for DefaultLearnLoop {
                                     "perplexity_gate: ANE training failed, experiences NOT marked exported"
                                 );
                             }
-                        }).await;
+                        }).ok();
                             return;
                         }
                     }
