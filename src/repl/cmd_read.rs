@@ -1002,26 +1002,31 @@ impl ReplContext {
             }
         };
 
-        // Collect ALL successful experiences for training (not just unexported).
-        // LoRA warm-starts from previous checkpoint, so we need the full dataset
-        // to prevent drift. Track unexported IDs for mark_exported after training.
-        let unexported_ids: Vec<i64> = match eb.top_unexported(200) {
-            Ok(e) => e.iter().map(|e| e.id).collect(),
-            Err(_) => vec![],
-        };
-        let exps = match eb.all_for_training(200) {
+        // Train primarily on unexported (new) experiences, with a small replay
+        // buffer of top-quality exported experiences to prevent LoRA drift.
+        // Replay size = min(n_new, 15) — so 1 new → 2 steps, not 200.
+        let new_exps = match eb.top_unexported(200) {
             Ok(e) => e,
             Err(e) => {
                 println!("\n  Failed to read experiences: {e}\n");
                 return;
             }
         };
-        if exps.is_empty() {
-            println!("\n  No experiences found.\n");
+        if new_exps.is_empty() {
+            println!("\n  No unexported experiences to train on.\n");
             return;
         }
-
-        let ids = unexported_ids;
+        let ids: Vec<i64> = new_exps.iter().map(|e| e.id).collect();
+        let n_new = new_exps.len();
+        let replay_cap = n_new.min(15);
+        let replay_exps = match eb.top_exported_for_replay(replay_cap) {
+            Ok(e) => e,
+            Err(_) => vec![],
+        };
+        let n_replay = replay_exps.len();
+        // Merge: new experiences first, then replay
+        let mut exps = new_exps;
+        exps.extend(replay_exps);
         let mut samples = Vec::new();
         for exp in &exps {
             let messages = vec![
@@ -1073,7 +1078,6 @@ impl ReplContext {
             .store(now_ms, Ordering::Relaxed);
 
         let n_samples = samples.len();
-        let n_exps = ids.len();
 
         // Scale epochs inversely with sample count: many samples need fewer
         // passes. Target ≤120 optimizer steps to keep wall-clock under ~10 min.
@@ -1117,8 +1121,10 @@ impl ReplContext {
             .ok();
 
         println!(
-            "\n  Training started: {} samples × {} epochs = {} steps ({} newly unexported)\n  Model: {}\n  Use /train to check progress.\n",
-            n_samples, epochs_used, total_steps, n_exps, model_dir.display()
+            "\n  Training started: {} new + {} replay = {} samples × {} epoch{} = {} steps\n  Model: {}\n  Use /train to check progress.\n",
+            n_new, n_replay, n_samples, epochs_used,
+            if epochs_used == 1 { "" } else { "s" },
+            total_steps, model_dir.display()
         );
     }
 

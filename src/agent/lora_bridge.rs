@@ -151,6 +151,32 @@ impl ExperienceBuffer {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Get top N already-exported experiences by quality, for replay during training.
+    /// Prevents LoRA drift when training primarily on new (unexported) data.
+    pub fn top_exported_for_replay(&self, limit: usize) -> Result<Vec<Experience>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, prompt, tool_trace, response, success, quality, model, surprise, exported, created_at
+             FROM experiences WHERE exported = 1 AND success = 1
+             ORDER BY quality DESC, surprise DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(Experience {
+                id: row.get(0)?,
+                prompt: row.get(1)?,
+                tool_trace: row.get(2)?,
+                response: row.get(3)?,
+                success: row.get::<_, i32>(4)? != 0,
+                quality: row.get(5)?,
+                model: row.get(6)?,
+                surprise: row.get(7)?,
+                exported: row.get::<_, i32>(8)? != 0,
+                created_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Mark experiences as exported.
     pub fn mark_exported(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() {

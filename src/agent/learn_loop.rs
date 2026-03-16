@@ -299,27 +299,28 @@ impl LearnLoop for DefaultLearnLoop {
             let epochs = pg_config.train_epochs;
             let min_exp = pg_config.min_experiences.max(1); // 0 would LIMIT 0 → empty
 
-            // Collect top experiences for training, not just unexported.
-            // LoRA warm-starts from the previous checkpoint, so training only on
-            // new samples causes drift from what earlier data taught. The unexported
-            // IDs are tracked separately so we can mark them exported after training.
-            // Cap at 30 for auto-triggered runs (~10min on 35B). /train run has no cap.
-            const AUTO_BATCH_CAP: usize = 30;
+            // Train primarily on unexported (new) experiences, plus a small
+            // replay buffer of top-quality exported ones to prevent LoRA drift.
+            // Replay = min(n_new, 10). So 5 new → 10 steps, not 30.
+            const AUTO_NEW_CAP: usize = 30;
             let (exps_data, ids) = {
                 let eb = eb_mutex.lock();
-                // IDs of unexported experiences — for mark_exported after training.
-                let unexported_ids: Vec<i64> = match eb.top_unexported(AUTO_BATCH_CAP) {
-                    Ok(e) => e.iter().map(|e| e.id).collect(),
-                    Err(_) => return,
-                };
-                // Top experiences by quality for training data.
-                let all = match eb.all_for_training(AUTO_BATCH_CAP) {
+                let new_exps = match eb.top_unexported(AUTO_NEW_CAP) {
                     Ok(e) => e,
                     Err(_) => return,
                 };
-                if all.is_empty() {
+                if new_exps.is_empty() {
                     return;
                 }
+                let unexported_ids: Vec<i64> = new_exps.iter().map(|e| e.id).collect();
+                let n_new = new_exps.len();
+                let replay_cap = n_new.min(10);
+                let replay = match eb.top_exported_for_replay(replay_cap) {
+                    Ok(e) => e,
+                    Err(_) => vec![],
+                };
+                let mut all = new_exps;
+                all.extend(replay);
                 let data: Vec<(String, String, String, f64)> = all
                     .iter()
                     .map(|e| {
@@ -332,9 +333,10 @@ impl LearnLoop for DefaultLearnLoop {
                     })
                     .collect();
                 info!(
-                    "perplexity_gate: training on {} experiences ({} newly unexported)",
+                    "perplexity_gate: training on {} experiences ({} new + {} replay)",
                     data.len(),
-                    unexported_ids.len()
+                    n_new,
+                    data.len() - n_new
                 );
                 (data, unexported_ids)
             };
