@@ -598,27 +598,68 @@ struct AppState {
 // Helper: tokenize message pairs for training
 // ---------------------------------------------------------------------------
 
+/// IGNORE_LABEL: target value that `cross_entropy_loss` skips (> vocab size).
+/// Used to mask prompt tokens so loss is only computed on the assistant response.
+pub const IGNORE_LABEL: i32 = i32::MAX;
+
 pub fn tokenize_conversation(
     tokenizer: &MlxTokenizer,
     messages: &[ChatMessage],
 ) -> Result<(Vec<i32>, Vec<i32>), String> {
-    let mut text = String::new();
+    // Build full text and find where the last assistant response starts.
+    // We mask all tokens before the assistant response in the loss targets.
+    let mut prefix_text = String::new();
+    let mut full_text = String::new();
+    let mut found_assistant = false;
+
     for msg in messages {
-        text.push_str(IM_START);
-        text.push_str(&msg.role);
-        text.push('\n');
-        text.push_str(&msg.content);
-        text.push_str(IM_END);
-        text.push('\n');
+        let block_start = full_text.len();
+        full_text.push_str(IM_START);
+        full_text.push_str(&msg.role);
+        full_text.push('\n');
+        full_text.push_str(&msg.content);
+        full_text.push_str(IM_END);
+        full_text.push('\n');
+
+        if msg.role != "assistant" {
+            // Everything before the assistant response is prefix (masked).
+            prefix_text.push_str(&full_text[block_start..]);
+        } else if !found_assistant {
+            // Include the "<|im_start|>assistant\n" header in the prefix
+            // since the model shouldn't be penalized for predicting it.
+            prefix_text.push_str(IM_START);
+            prefix_text.push_str("assistant\n");
+            found_assistant = true;
+        }
     }
+
     let tokens = tokenizer
-        .encode(&text)
+        .encode(&full_text)
         .map_err(|e| format!("tokenize: {e}"))?;
     if tokens.len() < 2 {
         return Err("conversation too short".into());
     }
+
+    // Find the number of prefix tokens to mask.
+    let mask_len = if found_assistant {
+        let prefix_tokens = tokenizer
+            .encode(&prefix_text)
+            .map_err(|e| format!("tokenize prefix: {e}"))?;
+        // In the shifted target array, position i predicts token i+1.
+        // Mask positions 0..prefix_len-1 (they predict prompt tokens).
+        prefix_tokens.len().saturating_sub(1)
+    } else {
+        0
+    };
+
     let input = tokens[..tokens.len() - 1].to_vec();
-    let target = tokens[1..].to_vec();
+    let mut target = tokens[1..].to_vec();
+
+    // Mask prompt positions with IGNORE_LABEL so cross_entropy_loss skips them.
+    for t in target.iter_mut().take(mask_len) {
+        *t = IGNORE_LABEL;
+    }
+
     Ok((input, target))
 }
 
@@ -704,8 +745,43 @@ pub fn tokenize_rich_conversation(
     if tokens.len() < 2 {
         return Err("conversation too short".into());
     }
+
+    // Find the last assistant message start to mask prompt tokens.
+    // Build prefix text = everything up to and including "<|im_start|>assistant\n".
+    let mut prefix_text = String::new();
+    let mut found_assistant = false;
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        if role == "assistant" && !found_assistant {
+            // Include the header but not the content in the prefix.
+            prefix_text.push_str(IM_START);
+            prefix_text.push_str("assistant\n");
+            found_assistant = true;
+            break;
+        }
+        // Reconstruct this message's ChatML text for prefix measurement.
+        prefix_text.push_str(IM_START);
+        prefix_text.push_str(role);
+        prefix_text.push('\n');
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        prefix_text.push_str(content);
+        prefix_text.push_str(IM_END);
+        prefix_text.push('\n');
+    }
+
     let input = tokens[..tokens.len() - 1].to_vec();
-    let target = tokens[1..].to_vec();
+    let mut target = tokens[1..].to_vec();
+
+    if found_assistant {
+        let prefix_tokens = tokenizer
+            .encode(&prefix_text)
+            .map_err(|e| format!("tokenize prefix: {e}"))?;
+        let mask_len = prefix_tokens.len().saturating_sub(1);
+        for t in target.iter_mut().take(mask_len) {
+            *t = IGNORE_LABEL;
+        }
+    }
+
     Ok((input, target))
 }
 
@@ -1138,6 +1214,53 @@ pub async fn serve(config: MlxServerConfig) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify IGNORE_LABEL masks prompt tokens in cross_entropy_loss.
+    #[test]
+    fn test_ignore_label_masks_loss() {
+        use crate::agent::ane_forward::cross_entropy_loss;
+        let vocab = 10usize;
+        let seq = 4usize;
+
+        // Uniform logits: each position gets loss = ln(vocab) ≈ 2.302
+        let logits = vec![0.0f32; vocab * seq];
+
+        // All-valid targets
+        let targets_full: Vec<u32> = vec![0, 1, 2, 3];
+        let (loss_full, _) = cross_entropy_loss(&logits, &targets_full, vocab, seq);
+        let expected = (vocab as f32).ln(); // ln(10) ≈ 2.302
+        assert!(
+            (loss_full - expected).abs() < 0.01,
+            "full loss should be ~ln(vocab)={expected:.3}, got {loss_full:.3}"
+        );
+
+        // Mask first 2 positions (prompt), keep last 2 (response)
+        let targets_masked: Vec<u32> = vec![u32::MAX, u32::MAX, 2, 3];
+        let (loss_masked, _) = cross_entropy_loss(&logits, &targets_masked, vocab, seq);
+        // Same expected since all positions contribute equally with uniform logits
+        assert!(
+            (loss_masked - expected).abs() < 0.01,
+            "masked loss should still be ~ln(vocab) for valid positions, got {loss_masked:.3}"
+        );
+
+        // Mask ALL positions — loss should be 0 (or NaN, handled by max(1))
+        let targets_all_masked: Vec<u32> = vec![u32::MAX; seq];
+        let (loss_none, _) = cross_entropy_loss(&logits, &targets_all_masked, vocab, seq);
+        assert!(
+            loss_none.abs() < 1e-6,
+            "fully masked loss should be 0, got {loss_none:.3}"
+        );
+    }
+
+    /// Verify IGNORE_LABEL (i32::MAX) cast to u32 is above any real vocab size.
+    #[test]
+    fn test_ignore_label_exceeds_vocab() {
+        let as_u32 = IGNORE_LABEL as u32;
+        assert!(
+            as_u32 > 300_000,
+            "IGNORE_LABEL as u32 must exceed max vocab (248320), got {as_u32}"
+        );
+    }
 
     #[test]
     fn test_chat_template() {
