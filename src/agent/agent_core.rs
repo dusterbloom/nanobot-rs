@@ -60,6 +60,7 @@ pub struct SwappableCore {
     pub memory_model: String,
     pub reflection_threshold: usize,
     pub is_local: bool,
+    pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
     /// Whether the current main provider is a cluster peer (feature-gated).
     #[cfg(feature = "cluster")]
@@ -356,6 +357,7 @@ pub struct SwappableCoreConfig {
     pub restrict_to_workspace: bool,
     pub memory_config: MemoryConfig,
     pub is_local: bool,
+    pub local_tool_mode: crate::config::schema::LocalToolMode,
     pub lane: Lane,
     pub compaction_provider: Option<Arc<dyn LLMProvider>>,
     pub tool_delegation: ToolDelegationConfig,
@@ -400,6 +402,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         restrict_to_workspace,
         memory_config,
         is_local,
+        local_tool_mode,
         lane,
         compaction_provider,
         tool_delegation,
@@ -612,6 +615,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_model,
         reflection_threshold: memory_config.reflection_threshold,
         is_local,
+        local_tool_mode,
         lane,
         #[cfg(feature = "cluster")]
         is_cluster_peer: false,

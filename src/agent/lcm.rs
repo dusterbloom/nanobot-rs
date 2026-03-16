@@ -481,6 +481,19 @@ impl LcmEngine {
         }
 
         let block_tokens = TokenBudget::estimate_tokens(&block_messages);
+
+        // Skip compaction when the block is too small to be worth an LLM call.
+        // An LLM summarization of <200 tokens wastes more GPU time than it saves.
+        const MIN_COMPACTION_TOKENS: usize = 200;
+        if block_tokens < MIN_COMPACTION_TOKENS {
+            debug!(
+                "LCM: skipping compaction — block too small ({} tokens < {})",
+                block_tokens, MIN_COMPACTION_TOKENS
+            );
+            self.async_compaction_pending = false;
+            return None;
+        }
+
         info!(
             "LCM: compacting {} messages ({} tokens) from positions {}..{}",
             block_messages.len(),

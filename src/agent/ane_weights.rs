@@ -103,9 +103,12 @@ struct MlxCheckpointMeta {
 }
 
 impl MlxCheckpointMeta {
-    /// Number of quantized values packed per u32 word (8 for 4-bit, 4 for 8-bit).
-    fn elems_per_u32(&self) -> usize {
-        32 / self.bits
+    /// Logical columns from packed u32 columns: `packed_cols * 32 / bits`.
+    ///
+    /// For power-of-2 bits this equals `packed_cols * (32/bits)`, but for
+    /// non-power-of-2 (e.g. 3-bit) the multiply-first order avoids truncation.
+    fn unpack_cols(&self, packed_cols: usize) -> usize {
+        packed_cols * 32 / self.bits
     }
 }
 
@@ -965,9 +968,8 @@ impl ModelWeights {
             {
                 let (_, shape) = store.meta(&w_key).unwrap();
                 let rows = shape[0];
-                let packed_cols = shape[1];
-                let elems_per_u32 = 32 / bits;
-                let cols = packed_cols * elems_per_u32;
+                // Correct for non-power-of-2 bits (3, 5, 6): multiply before dividing.
+                let cols = shape[1] * 32 / bits;
                 let sc = bf16_to_f32(s);
                 let bi = bf16_to_f32(b);
                 Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
@@ -1027,11 +1029,21 @@ impl ModelWeights {
 
         // Embedding (quantized or bf16)
         let embed_raw = get_weight("model.embed_tokens", group_size, bits)?;
-        // embed_raw is [vocab, dim] row-major → we need [dim, vocab] col-major (our format: embed[d * vocab + v])
-        // Actually our format: embed[v * dim + d] for embed_lookup which does: out[d * seq + t] = embed[token * dim + d]
-        // So we need [vocab, dim] row-major — that's what we already have.
-        // Wait, our embed_lookup: out[d*seq+t] = embed[tok*dim + d]. So embed is [vocab, dim] where embed[tok*dim+d].
-        // The safetensors gives us [vocab, dim] row-major. That matches!
+        // embed_raw is [vocab, dim] row-major. embed_lookup: out[d*seq+t] = embed[tok*dim+d].
+        let expected_embed = vocab_size * dim;
+        if embed_raw.len() != expected_embed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "embed size mismatch: got {} f32 values, expected {} (vocab={} × dim={}). \
+                     Possible {bits}-bit dequantization error.",
+                    embed_raw.len(),
+                    expected_embed,
+                    vocab_size,
+                    dim,
+                ),
+            ));
+        }
 
         // Expand KV: replicate each KV head hpg times to get [dim, dim] from [kv_dim, dim]
         let expand_kv = |kv: &[f32], kv_dim: usize, dim: usize, hpg: usize| -> Vec<f32> {
@@ -1202,9 +1214,8 @@ impl QuantizedModelWeights {
                 {
                     let (_, shape) = store.meta(&w_key).unwrap();
                     let rows = shape[0];
-                    let packed_cols = shape[1];
-                    let elems_per_u32 = 32 / bits;
-                    let cols = packed_cols * elems_per_u32;
+                    // Correct for non-power-of-2 bits (3, 5, 6): multiply before dividing.
+                    let cols = shape[1] * 32 / bits;
 
                     Ok(QuantizedTensor {
                         data: w.to_vec(),
@@ -1249,8 +1260,9 @@ impl QuantizedModelWeights {
             {
                 let (_, shape) = store.meta(&w_key).unwrap();
                 let rows = shape[0];
-                let elems_per_u32 = 32 / bits;
-                let cols = shape[1] * elems_per_u32;
+                // Correct for non-power-of-2 bits: multiply before dividing.
+                // e.g. 3-bit: packed_cols=192, 192*32/3 = 2048 (not 192*(32/3)=1920).
+                let cols = shape[1] * 32 / bits;
                 let sc = bf16_to_f32(s);
                 let bi = bf16_to_f32(b);
                 Ok(dequant_nbit(w, &sc, &bi, rows, cols, group_size, bits))
@@ -1277,7 +1289,22 @@ impl QuantizedModelWeights {
         let hpg = cfg.heads_per_group();
 
         // Embedding — must be f32 (accessed every step, random access pattern)
+        tracing::debug!(bits, group_size, vocab_size, dim = cfg.dim, "loading {bits}-bit embed table");
         let embed_raw = get_weight_f32("model.embed_tokens", group_size, bits)?;
+        let expected_embed = vocab_size * cfg.dim;
+        if embed_raw.len() != expected_embed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "embed size mismatch: got {} f32 values, expected {} (vocab={} × dim={}). \
+                     Possible {bits}-bit dequantization error.",
+                    embed_raw.len(),
+                    expected_embed,
+                    vocab_size,
+                    cfg.dim,
+                ),
+            ));
+        }
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -1419,24 +1446,60 @@ fn dequant_nbit(
     bits: usize,
 ) -> Vec<f32> {
     let n_groups = cols / group_size;
-    let elems_per_u32 = 32 / bits;
     let mask = (1u32 << bits) - 1;
-    let packed_cols = cols / elems_per_u32; // u32 words per row
+    // Packed u32 words per row: cols * bits / 32 (exact for MLX quantization).
+    let packed_cols = (cols * bits + 31) / 32;
     let mut out = vec![0.0f32; rows * cols];
+
+    // For power-of-2 bit widths (4, 8), values never span u32 boundaries.
+    // For non-power-of-2 (3, 5, 6), MLX packs bits contiguously across words.
+    let spans_words = (32 % bits) != 0;
 
     for r in 0..rows {
         let row_byte_offset = r * packed_cols * 4; // 4 bytes per u32
         for c in 0..cols {
-            let word_idx = c / elems_per_u32;
-            let elem_idx = c % elems_per_u32;
-            let byte_off = row_byte_offset + word_idx * 4;
-            let u32_val = u32::from_le_bytes([
-                weight[byte_off],
-                weight[byte_off + 1],
-                weight[byte_off + 2],
-                weight[byte_off + 3],
-            ]);
-            let qval = ((u32_val >> (elem_idx * bits)) & mask) as f32;
+            let qval = if spans_words {
+                // Contiguous bit packing: value c starts at absolute bit c*bits
+                let bit_offset = c * bits;
+                let word_idx = bit_offset / 32;
+                let bit_within_word = bit_offset % 32;
+                let byte_off = row_byte_offset + word_idx * 4;
+                let lo_word = u32::from_le_bytes([
+                    weight[byte_off],
+                    weight[byte_off + 1],
+                    weight[byte_off + 2],
+                    weight[byte_off + 3],
+                ]);
+                if bit_within_word + bits <= 32 {
+                    ((lo_word >> bit_within_word) & mask) as f32
+                } else {
+                    // Value spans two u32 words
+                    let lo_bits = 32 - bit_within_word;
+                    let hi_byte_off = byte_off + 4;
+                    let hi_word = u32::from_le_bytes([
+                        weight[hi_byte_off],
+                        weight[hi_byte_off + 1],
+                        weight[hi_byte_off + 2],
+                        weight[hi_byte_off + 3],
+                    ]);
+                    let lo = lo_word >> bit_within_word;
+                    let hi = hi_word & ((1u32 << (bits - lo_bits)) - 1);
+                    (lo | (hi << lo_bits)) as f32
+                }
+            } else {
+                // Non-spanning: each u32 holds exactly 32/bits values
+                let elems_per_u32 = 32 / bits;
+                let word_idx = c / elems_per_u32;
+                let elem_idx = c % elems_per_u32;
+                let byte_off = row_byte_offset + word_idx * 4;
+                let u32_val = u32::from_le_bytes([
+                    weight[byte_off],
+                    weight[byte_off + 1],
+                    weight[byte_off + 2],
+                    weight[byte_off + 3],
+                ]);
+                ((u32_val >> (elem_idx * bits)) & mask) as f32
+            };
             let g = c / group_size;
             let s = scales[r * n_groups + g];
             let b = biases[r * n_groups + g];
@@ -1455,7 +1518,7 @@ pub struct QuantizedTensor {
     pub rows: usize,
     pub cols: usize, // Logical (unpacked) columns
     pub group_size: usize,
-    pub bits: usize, // Quantization bits (4 or 8)
+    pub bits: usize, // Quantization bits (3, 4, or 8)
 }
 
 impl QuantizedTensor {
@@ -1482,8 +1545,7 @@ impl QuantizedTensor {
     /// Used for fused `gate_up_proj` [2*hidden_dim, dim] → gate [hidden_dim, dim] + up [hidden_dim, dim].
     pub fn split_rows_half(&self) -> (QuantizedTensor, QuantizedTensor) {
         let half_rows = self.rows / 2;
-        let elems_per_u32 = 32 / self.bits;
-        let packed_cols = self.cols / elems_per_u32;
+        let packed_cols = (self.cols * self.bits + 31) / 32;
         let bytes_per_row = packed_cols * 4; // 4 bytes per u32
         let data_mid = half_rows * bytes_per_row;
 
@@ -1876,6 +1938,202 @@ impl WeightSource for DenseCachedModel {
     }
     fn actual_hidden_dim(&self) -> usize {
         self.quantized.actual_hidden_dim()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-packed weight cache (Orion-style delta patching)
+// ---------------------------------------------------------------------------
+
+/// Per-layer pre-packed weight buffers for ANE IOSurface layout.
+///
+/// Weights are static across training steps, so we pre-transpose and pre-pack
+/// them once into the IOSurface layout. Per step, only the activation slice
+/// (the first `seq` columns per channel) is patched in — eliminating redundant
+/// transpose + alloc + copy for the weight portion.
+///
+/// Saves ~2.9 GB of memory bandwidth per step on the 35B model (40 layers × fwd+bwd).
+pub struct PrePackedLayerWeights {
+    /// Forward fused FFN: f32 buffer [dim × (seq + 3*hidden)] with W1_t, W3_t, W2 pre-placed.
+    /// Activation `xnorm` is patched into columns [0..seq] per channel.
+    pub fwd_fused_ffn: Option<Vec<f32>>,
+
+    /// Backward W2^T: f32 buffer [dim × (seq + hidden)] with W2 pre-placed.
+    /// `dffn` activation is patched into columns [0..seq] per channel.
+    pub bwd_w2t: Option<Vec<f32>>,
+
+    /// Backward W1^T + W3^T: f32 buffer [hidden × (2*seq + 2*dim)] with W1, W3 pre-placed.
+    /// `dh1`, `dh3` are patched into columns [0..seq] and [seq..2*seq] per channel.
+    pub bwd_w13t: Option<Vec<f32>>,
+}
+
+/// Complete set of pre-packed weights for all layers.
+pub struct PrePackedWeights {
+    pub layers: Vec<PrePackedLayerWeights>,
+    pub seq_len: usize,
+}
+
+impl PrePackedWeights {
+    /// Build pre-packed weight cache from a DenseCachedModel.
+    ///
+    /// `seq_len` determines the activation slot size. This must match the
+    /// bucket kernel's seq_len — build one PrePackedWeights per bucket.
+    pub fn build(model: &DenseCachedModel, seq_len: usize, fused_ffn: bool) -> Self {
+        let cfg = model.cfg();
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let n_layers = model.n_layers();
+        let mut layers = Vec::with_capacity(n_layers);
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            let fwd_fused = if fused_ffn {
+                // Pre-transpose W1, W3 and pack weights into fused FFN layout.
+                // Layout: [dim, seq + 3*hidden] per channel d:
+                //   [0..seq] = activation (patched per step)
+                //   [seq..seq+hidden] = W1_t row d
+                //   [seq+hidden..seq+2*hidden] = W3_t row d
+                //   [seq+2*hidden..seq+3*hidden] = W2 row d
+                let sp = seq_len + 3 * hidden;
+                let mut buf = vec![0.0f32; dim * sp];
+                for d in 0..dim {
+                    let row = d * sp;
+                    // W1_t: transpose from [hidden, dim] to [dim, hidden] inline
+                    for h in 0..hidden {
+                        buf[row + seq_len + h] = lw.w1[h * dim + d];
+                    }
+                    // W3_t: transpose from [hidden, dim] to [dim, hidden] inline
+                    for h in 0..hidden {
+                        buf[row + seq_len + hidden + h] = lw.w3[h * dim + d];
+                    }
+                    // W2: [dim, hidden] — direct copy (transposed inside kernel)
+                    buf[row + seq_len + 2 * hidden..row + seq_len + 3 * hidden]
+                        .copy_from_slice(&lw.w2[d * hidden..(d + 1) * hidden]);
+                }
+                Some(buf)
+            } else {
+                None
+            };
+
+            // Backward W2^T: layout [dim, seq + hidden]
+            // W2 is [dim, hidden] — pack as weight columns
+            let bwd_w2t = {
+                let sp = seq_len + hidden;
+                let mut buf = vec![0.0f32; dim * sp];
+                for d in 0..dim {
+                    let row = d * sp;
+                    // W2 row d: [dim, hidden] direct
+                    buf[row + seq_len..row + seq_len + hidden]
+                        .copy_from_slice(&lw.w2[d * hidden..(d + 1) * hidden]);
+                }
+                Some(buf)
+            };
+
+            // Backward W1^T + W3^T: layout [hidden, 2*seq + 2*dim]
+            // W1 is [hidden, dim], W3 is [hidden, dim] — these ARE the transposed forms
+            let bwd_w13t = {
+                let sp = 2 * seq_len + 2 * dim;
+                let mut buf = vec![0.0f32; hidden * sp];
+                for d in 0..hidden {
+                    let row = d * sp;
+                    // W1 row d = W1^T column d: [hidden, dim] direct
+                    buf[row + 2 * seq_len..row + 2 * seq_len + dim]
+                        .copy_from_slice(&lw.w1[d * dim..(d + 1) * dim]);
+                    // W3 row d = W3^T column d
+                    buf[row + 2 * seq_len + dim..row + 2 * seq_len + 2 * dim]
+                        .copy_from_slice(&lw.w3[d * dim..(d + 1) * dim]);
+                }
+                Some(buf)
+            };
+
+            layers.push(PrePackedLayerWeights {
+                fwd_fused_ffn: fwd_fused,
+                bwd_w2t,
+                bwd_w13t,
+            });
+        }
+
+        tracing::info!(
+            "pre-packed weights: {} layers, seq_len={}, fused_ffn={}",
+            n_layers,
+            seq_len,
+            fused_ffn,
+        );
+
+        Self { layers, seq_len }
+    }
+
+    /// Patch activation into a pre-packed fused FFN buffer and return bytes for kernel input.
+    ///
+    /// Only writes the activation slice (columns 0..seq per channel), leaving
+    /// pre-packed weights untouched. Returns the buffer as bytes for `write_input`.
+    #[inline]
+    pub fn patch_fwd_fused_ffn(&mut self, layer: usize, xnorm: &[f32], dim: usize) -> &[u8] {
+        let buf = self.layers[layer]
+            .fwd_fused_ffn
+            .as_mut()
+            .expect("fwd_fused_ffn not pre-packed");
+        let seq = self.seq_len;
+        let sp = buf.len() / dim;
+        for d in 0..dim {
+            buf[d * sp..d * sp + seq].copy_from_slice(&xnorm[d * seq..d * seq + seq]);
+        }
+        // Safety: f32 slice → u8 slice (same backing memory, no alloc)
+        unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
+        }
+    }
+
+    /// Patch activation into a pre-packed backward W2^T buffer.
+    #[inline]
+    pub fn patch_bwd_w2t(&mut self, layer: usize, dffn: &[f32], dim: usize) -> &[u8] {
+        let buf = self.layers[layer]
+            .bwd_w2t
+            .as_mut()
+            .expect("bwd_w2t not pre-packed");
+        let seq = self.seq_len;
+        let sp = buf.len() / dim;
+        for d in 0..dim {
+            buf[d * sp..d * sp + seq].copy_from_slice(&dffn[d * seq..d * seq + seq]);
+        }
+        unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
+        }
+    }
+
+    /// Patch activations into a pre-packed backward W13^T buffer.
+    #[inline]
+    pub fn patch_bwd_w13t(
+        &mut self,
+        layer: usize,
+        dh1: &[f32],
+        dh3: &[f32],
+        hidden: usize,
+    ) -> &[u8] {
+        let buf = self.layers[layer]
+            .bwd_w13t
+            .as_mut()
+            .expect("bwd_w13t not pre-packed");
+        let seq = self.seq_len;
+        let sp = buf.len() / hidden;
+        for d in 0..hidden {
+            buf[d * sp..d * sp + seq].copy_from_slice(&dh1[d * seq..d * seq + seq]);
+            buf[d * sp + seq..d * sp + 2 * seq].copy_from_slice(&dh3[d * seq..d * seq + seq]);
+        }
+        unsafe {
+            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
+        }
+    }
+
+    /// Memory usage in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.layers.iter().map(|l| {
+            l.fwd_fused_ffn.as_ref().map_or(0, |b| b.len() * 4)
+                + l.bwd_w2t.as_ref().map_or(0, |b| b.len() * 4)
+                + l.bwd_w13t.as_ref().map_or(0, |b| b.len() * 4)
+        }).sum()
     }
 }
 
@@ -3043,5 +3301,96 @@ mod tests {
         assert!(cfg2.attn_dim() > cfg2.dim);
         assert_eq!(cfg2.kv_dim(), 4 * 256);
         assert_eq!(cfg2.heads_per_group(), 4);
+    }
+
+    #[test]
+    fn test_dequant_3bit_contiguous_packing() {
+        // Simulate MLX 3-bit quantization with contiguous bit packing.
+        // 16 logical values packed into ceil(16*3/32) = 2 u32 words.
+        let bits: usize = 3;
+        let group_size: usize = 8;
+        let cols: usize = 16;
+        let rows: usize = 2;
+        let packed_cols = (cols * bits + 31) / 32; // 2 u32 words per row
+        assert_eq!(packed_cols, 2);
+
+        // Pack values 0..15 (mod 8 to fit in 3 bits) contiguously into u32 words.
+        // Value i occupies bits [i*3 .. i*3+3).
+        let mut words = vec![0u32; rows * packed_cols];
+        let vals: Vec<u32> = (0..cols as u32).map(|v| v % 8).collect();
+        for r in 0..rows {
+            for c in 0..cols {
+                let bit_offset = c * bits;
+                let word_idx = bit_offset / 32;
+                let bit_within_word = bit_offset % 32;
+                words[r * packed_cols + word_idx] |= vals[c] << bit_within_word;
+                // Handle spanning: value 10 starts at bit 30, needs 2 bits in next word
+                if bit_within_word + bits > 32 {
+                    let overflow_bits = bit_within_word + bits - 32;
+                    words[r * packed_cols + word_idx + 1] |= vals[c] >> (bits - overflow_bits);
+                }
+            }
+        }
+
+        // Convert words to bytes (LE)
+        let mut weight_bytes = vec![0u8; words.len() * 4];
+        for (i, w) in words.iter().enumerate() {
+            weight_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        // Scales = 1.0, biases = 0.0 (identity transform)
+        let n_groups = cols / group_size; // 2
+        let scales = vec![1.0f32; rows * n_groups];
+        let biases = vec![0.0f32; rows * n_groups];
+
+        let out = super::dequant_nbit(&weight_bytes, &scales, &biases, rows, cols, group_size, bits);
+        assert_eq!(out.len(), rows * cols);
+
+        // Check that all values match
+        for r in 0..rows {
+            for c in 0..cols {
+                let expected = (c % 8) as f32;
+                let got = out[r * cols + c];
+                assert_eq!(
+                    got, expected,
+                    "row={r} col={c}: expected {expected}, got {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dequant_4bit_non_spanning() {
+        // 4-bit: 8 values per u32, no spanning.
+        let bits: usize = 4;
+        let group_size: usize = 8;
+        let cols: usize = 16;
+        let rows: usize = 1;
+        let packed_cols = (cols * bits + 31) / 32; // 2
+        assert_eq!(packed_cols, 2);
+
+        let vals: Vec<u32> = (0..16).map(|v| v % 16).collect();
+        let mut words = vec![0u32; rows * packed_cols];
+        for c in 0..cols {
+            let elems_per_u32 = 32 / bits;
+            let word_idx = c / elems_per_u32;
+            let elem_idx = c % elems_per_u32;
+            words[word_idx] |= vals[c] << (elem_idx * bits);
+        }
+
+        let mut weight_bytes = vec![0u8; words.len() * 4];
+        for (i, w) in words.iter().enumerate() {
+            weight_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let n_groups = cols / group_size;
+        let scales = vec![1.0f32; rows * n_groups];
+        let biases = vec![0.0f32; rows * n_groups];
+
+        let out = super::dequant_nbit(&weight_bytes, &scales, &biases, rows, cols, group_size, bits);
+        assert_eq!(out.len(), rows * cols);
+        for c in 0..cols {
+            assert_eq!(out[c], (c % 16) as f32, "col={c}");
+        }
     }
 }

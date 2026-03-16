@@ -284,6 +284,57 @@ impl FfnBwdKernels {
         }
     }
 
+    /// Execute backward W2^T using pre-packed weight buffers (Orion delta patching).
+    ///
+    /// Only patches `dffn` activation into the pre-packed buffer — no weight copy.
+    pub fn eval_w2t_prepacked(
+        &self,
+        dffn: &[f32],
+        prepacked: &mut super::ane_weights::PrePackedWeights,
+        layer: usize,
+        cfg: &MilConfig,
+    ) -> Result<Vec<f32>, String> {
+        let FfnBwdKernels::Fused { w2t, .. } = self else {
+            return Err("eval_w2t_prepacked requires Fused kernels".into());
+        };
+        let input_bytes = prepacked.patch_bwd_w2t(layer, dffn, cfg.dim);
+        let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
+        w2t.write_input(0, input_bytes);
+        w2t.eval()?;
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        w2t.read_output(0, &mut out_buf);
+        Ok(out_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// Execute backward W1^T + W3^T using pre-packed weight buffers (Orion delta patching).
+    ///
+    /// Only patches `dh1`, `dh3` activations — no weight transpose or copy.
+    pub fn eval_w13t_prepacked(
+        &self,
+        dh1: &[f32],
+        dh3: &[f32],
+        prepacked: &mut super::ane_weights::PrePackedWeights,
+        layer: usize,
+        cfg: &MilConfig,
+    ) -> Result<Vec<f32>, String> {
+        let FfnBwdKernels::Fused { w13t, .. } = self else {
+            return Err("eval_w13t_prepacked requires Fused kernels".into());
+        };
+        let input_bytes = prepacked.patch_bwd_w13t(layer, dh1, dh3, cfg.hidden_dim);
+        let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
+        w13t.write_input(0, input_bytes);
+        w13t.eval()?;
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        w13t.read_output(0, &mut out_buf);
+        Ok(out_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
     /// Execute backward W1^T + W3^T: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (output is [dim, seq]).
     ///
     /// `w1t`, `w3t` are pre-transposed to [hidden, dim] layout.
@@ -2065,6 +2116,33 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
     residual_scale: f32,
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
 ) -> BackwardResultWithLora {
+    backward_lora_ane_impl(bwd_kernels, model, fwd, lora, loss_scale, residual_scale, lora_kernels, None)
+}
+
+/// Backward with optional pre-packed weight buffers (Orion delta patching).
+pub fn backward_lora_ane_prepacked<W: ane_weights::WeightSource>(
+    bwd_kernels: &BackwardKernels,
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    loss_scale: f32,
+    residual_scale: f32,
+    lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
+    prepacked: &mut ane_weights::PrePackedWeights,
+) -> BackwardResultWithLora {
+    backward_lora_ane_impl(bwd_kernels, model, fwd, lora, loss_scale, residual_scale, lora_kernels, Some(prepacked))
+}
+
+fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
+    bwd_kernels: &BackwardKernels,
+    model: &W,
+    fwd: &ane_forward::ForwardResultWithLora,
+    lora: &super::ane_lora::LoraModel,
+    loss_scale: f32,
+    residual_scale: f32,
+    lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
+    mut prepacked: Option<&mut ane_weights::PrePackedWeights>,
+) -> BackwardResultWithLora {
     use super::ane_lora;
 
     let cfg = model.cfg();
@@ -2130,8 +2208,12 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
 
         // --- PARALLEL: ANE ffn_bwd_w2t || LoRA W2 grad + W1/W3 pre-transpose ---
         // ANE kernel is !Send, stays on calling thread. CPU work on a scoped thread.
+        //
+        // When prepacked weights are available, the W1/W3 clone on the CPU thread
+        // is skipped (eval_w13t_prepacked doesn't need them).
+        let has_prepacked = prepacked.is_some();
         let (dsilu, w2_grads, w1t, w3t) = std::thread::scope(|s| {
-            // Spawn CPU work: LoRA W2 backward + pre-transpose W1/W3
+            // Spawn CPU work: LoRA W2 backward + (if not prepacked) W1/W3 clone
             let cpu_handle = s.spawn(|| {
                 let w2_grads = if use_ane_w2_grads {
                     None
@@ -2146,21 +2228,35 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
                 } else {
                     None
                 };
-                // W1/W3 are [hidden, dim] — pass directly to backward packing
-                let w1_ref = lw.w1.clone();
-                let w3_ref = lw.w3.clone();
-                (w2_grads, w1_ref, w3_ref)
+                // Skip W1/W3 clone when prepacked (eval_w13t_prepacked uses pre-packed buffers)
+                if has_prepacked {
+                    (w2_grads, Vec::new(), Vec::new())
+                } else {
+                    let w1_ref = lw.w1.clone();
+                    let w3_ref = lw.w3.clone();
+                    (w2_grads, w1_ref, w3_ref)
+                }
             });
 
             // Main thread: ANE ffn_bwd_w2t (dsilu = dffn @ W2^T) — fused or tiled
-            // W2 is [dim, hidden] — pass directly to backward packing
-            let dsilu = bwd_kernels
-                .ffn_bwd
-                .eval_w2t(&dffn, &lw.w2, cfg)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
-                    vec![0.0f32; hidden * seq]
-                });
+            let dsilu = if let Some(ref mut pp) = prepacked {
+                // Orion delta patching: weights pre-packed, only patch activation
+                bwd_kernels
+                    .ffn_bwd
+                    .eval_w2t_prepacked(&dffn, pp, l, cfg)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ANE ffn_bwd_w2t_prepacked failed: {e}");
+                        vec![0.0f32; hidden * seq]
+                    })
+            } else {
+                bwd_kernels
+                    .ffn_bwd
+                    .eval_w2t(&dffn, &lw.w2, cfg)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
+                        vec![0.0f32; hidden * seq]
+                    })
+            };
 
             let (w2_grads, w1t, w3t) = cpu_handle.join().unwrap();
             (dsilu, w2_grads, w1t, w3t)
@@ -2215,14 +2311,25 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
         silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
 
         // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (fused or tiled) ---
-        // w1t, w3t already pre-transposed by the parallel CPU thread
-        let mut dx_ffn = bwd_kernels
-            .ffn_bwd
-            .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
-            .unwrap_or_else(|e| {
-                tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
-                vec![0.0f32; dim * seq]
-            });
+        let mut dx_ffn = if let Some(ref mut pp) = prepacked {
+            // Orion delta patching: weights pre-packed, only patch gradient activations
+            bwd_kernels
+                .ffn_bwd
+                .eval_w13t_prepacked(&dh1, &dh3, pp, l, cfg)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("ANE ffn_bwd_w13t_prepacked failed: {e}");
+                    vec![0.0f32; dim * seq]
+                })
+        } else {
+            // w1t, w3t already pre-transposed by the parallel CPU thread
+            bwd_kernels
+                .ffn_bwd
+                .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
+                    vec![0.0f32; dim * seq]
+                })
+        };
         ane_forward::clamp_fp16(&mut dx_ffn);
 
         // RMSNorm backward (FFN, CPU)

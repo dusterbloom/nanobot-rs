@@ -351,7 +351,15 @@ impl LearnLoop for DefaultLearnLoop {
                 };
                 if let Some(ref model_dir) = model_dir_opt {
                     if let Some(mut ane_cfg) = build_ane_training_config(Some(model_dir)) {
-                        ane_cfg.epochs = epochs.max(1);
+                        // Scale epochs: target ≤90 optimizer steps to keep
+                        // wall-clock manageable on large models (~7 min on 35B).
+                        let n_data = exps_data.len();
+                        let mut e = epochs.max(1);
+                        let max_steps = 90usize;
+                        if n_data > 0 && n_data * e > max_steps {
+                            e = (max_steps / n_data).max(1);
+                        }
+                        ane_cfg.epochs = e;
                         if let Some(optimizer) = ane_optimizer_override {
                             ane_cfg.optimizer = optimizer;
                         }

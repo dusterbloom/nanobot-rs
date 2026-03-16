@@ -883,18 +883,7 @@ pub(crate) async fn router_preflight(
         tracing::Span::current().record("routing_decision", "passthrough_circuit_open");
         return PreflightResult::Passthrough;
     }
-    let tool_list = if ctx.core.is_local {
-        ctx.tools.get_local_definitions()
-            .iter()
-            .filter_map(|d| {
-                d.pointer("/function/name")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .collect()
-    } else {
-        ctx.tools.tool_names()
-    };
+    let tool_list: Vec<String> = ctx.tools.tool_names();
     let conv_tail = build_conversation_tail(
         &ctx.messages,
         ROUTER_TAIL_MAX_PAIRS,

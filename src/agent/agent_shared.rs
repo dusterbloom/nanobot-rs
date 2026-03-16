@@ -941,7 +941,11 @@ impl AgentLoopShared {
         // Local models get a minimal set to conserve context tokens.
         let current_phase = self.system_state.load_full().task_phase;
         let mut tool_defs = if ctx.core.is_local {
-            ctx.tools.get_local_definitions()
+            match ctx.core.local_tool_mode {
+                crate::config::schema::LocalToolMode::Proxy => ctx.tools.get_proxy_definition(),
+                crate::config::schema::LocalToolMode::Slim => ctx.tools.get_slim_definitions(),
+                crate::config::schema::LocalToolMode::Full => ctx.tools.get_local_definitions(),
+            }
         } else if self.proprioception_config.enabled
             && self.proprioception_config.dynamic_tool_scoping
         {
@@ -1145,16 +1149,23 @@ impl AgentLoopShared {
                         let bg_session_key = ctx.session_key.clone();
                         let bg_session_id = ctx.session_id.clone();
                         let bg_lcm = lcm_engine.clone();
-                        let bg_lcm_compactor = self.lcm_compactor.clone();
+                        let mut bg_lcm_compactor = self.lcm_compactor.clone();
                         let watermark = ctx.messages.len();
                         let bg_turn_count = ctx.turn_count;
                         in_flight.store(true, Ordering::SeqCst);
 
                         // Lazily start auxiliary server before compaction uses its endpoint.
+                        // If aux fails, clear the dedicated compactor so we fall back to
+                        // the main provider's compactor (bg_core.compactor).
                         #[cfg(feature = "mlx")]
                         if bg_lcm_compactor.is_some() {
                             if let Some(ref aux) = self.core_handle.counters.auxiliary_server {
-                                aux.ensure_ready();
+                                if !aux.ensure_ready() {
+                                    tracing::warn!(
+                                        "auxiliary server unavailable — compaction will use main provider"
+                                    );
+                                    bg_lcm_compactor = None;
+                                }
                             }
                         }
 

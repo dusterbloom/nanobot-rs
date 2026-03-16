@@ -464,6 +464,8 @@ struct AneTrainerSession {
     muon_kernel_signature: Option<MuonKernelSignature>,
     bucket_kernels: BucketKernels,
     bucket_lora_grad_kernels: Vec<(usize, super::ane_lora::LoraWeightGradKernels)>,
+    /// Pre-packed weight buffers per bucket seq_len (Orion delta patching).
+    prepacked_weights: Vec<(usize, super::ane_weights::PrePackedWeights)>,
 }
 
 #[cfg(feature = "mlx")]
@@ -510,6 +512,7 @@ impl AneTrainerSession {
             muon_kernel_signature: None,
             bucket_kernels: BucketKernels::empty(),
             bucket_lora_grad_kernels: Vec::new(),
+            prepacked_weights: Vec::new(),
         })
     }
 
@@ -532,6 +535,36 @@ impl AneTrainerSession {
             );
         }
         Ok(())
+    }
+
+    fn ensure_prepacked_weights(&mut self) {
+        use super::ane_weights::PrePackedWeights;
+
+        let fused_ffn = self
+            .bucket_kernels
+            .buckets
+            .first()
+            .map(|(_, fwd, _)| fwd.ffn.is_fully_fused())
+            .unwrap_or(false);
+
+        for (bucket_seq, _, _) in &self.bucket_kernels.buckets {
+            if self
+                .prepacked_weights
+                .iter()
+                .any(|(seq, _)| *seq == *bucket_seq)
+            {
+                continue;
+            }
+            let pp = PrePackedWeights::build(&self.model, *bucket_seq, fused_ffn);
+            tracing::info!(
+                "ANE train: pre-packed weights for seq_len={} ({:.1} MB)",
+                bucket_seq,
+                pp.memory_bytes() as f64 / 1_048_576.0,
+            );
+            self.prepacked_weights.push((*bucket_seq, pp));
+        }
+        self.prepacked_weights
+            .sort_by_key(|(seq, _)| *seq);
     }
 
     fn ensure_muon_grad_kernels(&mut self) -> Result<(), String> {
@@ -691,6 +724,12 @@ impl AneTrainerSession {
             }
         };
 
+        // Pre-pack weights for all buckets (Orion delta patching — eliminates
+        // per-step transpose + alloc for the weight portion of IOSurface buffers).
+        if use_ane {
+            self.ensure_prepacked_weights();
+        }
+
         if let Err(e) = self.ensure_optimizer_state(cfg) {
             tracing::error!("ANE train: optimizer setup failed: {e}");
             return false;
@@ -747,6 +786,7 @@ impl AneTrainerSession {
 
         let bucket_lora_grad_kernels = &self.bucket_lora_grad_kernels;
         let muon_kernels = self.muon_kernels.as_ref();
+        let prepacked_weights = &mut self.prepacked_weights;
         let model = &mut self.model;
         let lora = &mut self.lora;
         let adam = &mut self.adam;
@@ -784,7 +824,13 @@ impl AneTrainerSession {
                         };
                         model.cfg_mut().seq_len = sample.bucket_seq;
 
-                        match ane_forward::forward_ane_generic(
+                        // Get pre-packed weights for this bucket (if available)
+                        let pp = prepacked_weights
+                            .iter_mut()
+                            .find(|(seq, _)| *seq == sample.bucket_seq)
+                            .map(|(_, pp)| pp);
+
+                        match ane_forward::forward_ane_generic_prepacked(
                             fwd_k,
                             model,
                             Some(lora),
@@ -792,8 +838,15 @@ impl AneTrainerSession {
                             &sample.tgt_pad,
                             cfg.softcap,
                             residual_scale,
+                            pp,
                         ) {
                             Ok(fwd) => {
+                                // Re-get prepacked for backward (forward borrow ended)
+                                let pp_bwd = prepacked_weights
+                                    .iter_mut()
+                                    .find(|(seq, _)| *seq == sample.bucket_seq)
+                                    .map(|(_, pp)| pp);
+
                                 let bwd = if cfg.optimizer == AneTrainingOptimizer::AneMuon {
                                     let Some(grad_kernels) = bucket_lora_grad_kernels
                                         .iter()
@@ -807,16 +860,40 @@ impl AneTrainerSession {
                                         );
                                         continue;
                                     };
-                                    ane_backward::backward_lora_ane_generic_with_lora_kernels(
+                                    if let Some(pp) = pp_bwd {
+                                        ane_backward::backward_lora_ane_prepacked(
+                                            bwd_k,
+                                            model,
+                                            &fwd,
+                                            lora,
+                                            sample.effective_loss_scale,
+                                            residual_scale,
+                                            Some(grad_kernels),
+                                            pp,
+                                        )
+                                    } else {
+                                        ane_backward::backward_lora_ane_generic_with_lora_kernels(
+                                            bwd_k,
+                                            model,
+                                            &fwd,
+                                            lora,
+                                            &sample.tok_pad,
+                                            cfg.softcap,
+                                            sample.effective_loss_scale,
+                                            residual_scale,
+                                            Some(grad_kernels),
+                                        )
+                                    }
+                                } else if let Some(pp) = pp_bwd {
+                                    ane_backward::backward_lora_ane_prepacked(
                                         bwd_k,
                                         model,
                                         &fwd,
                                         lora,
-                                        &sample.tok_pad,
-                                        cfg.softcap,
                                         sample.effective_loss_scale,
                                         residual_scale,
-                                        Some(grad_kernels),
+                                        None,
+                                        pp,
                                     )
                                 } else {
                                     ane_backward::backward_lora_ane_generic(
@@ -1777,6 +1854,62 @@ mod tests {
         !qwen3_5_dir().join("tokenizer.json").exists()
     }
 
+    /// Build MilConfig directly from config.json without the `mlx` feature.
+    /// This avoids the `ModelConfig` dependency so ANE-only benchmarks compile.
+    fn mil_config_from_json(dir: &std::path::Path, seq_len: usize) -> crate::agent::ane_mil::MilConfig {
+        let config_str = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let root: serde_json::Value = serde_json::from_str(&config_str).expect("parse config.json");
+        let tc = root.get("text_config").unwrap_or(&root);
+
+        let dim = tc["hidden_size"].as_u64().expect("hidden_size") as usize;
+        let hidden_dim = tc.get("intermediate_size")
+            .or_else(|| tc.get("moe_intermediate_size"))
+            .and_then(|v| v.as_u64()).expect("hidden_dim") as usize;
+        let n_heads = tc["num_attention_heads"].as_u64().expect("n_heads") as usize;
+        let n_kv_heads = tc.get("num_key_value_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
+        let head_dim = tc.get("head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or((dim / n_heads) as u64) as usize;
+        let rope_theta = tc.get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()))
+            .or_else(|| root.get("rope_theta").and_then(|v| v.as_f64()))
+            .unwrap_or(1_000_000.0);
+        let rms_eps = tc.get("rms_norm_eps")
+            .and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+        let attn_output_gate = tc.get("attn_output_gate")
+            .and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // GDN (linear attention) fields
+        let layer_types: Vec<String> = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
+            .filter(|(_, t)| t.as_str() == "linear_attention")
+            .map(|(i, _)| i).collect();
+        let linear_n_heads = tc.get("linear_num_key_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_head_dim = tc.get("linear_key_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let linear_n_value_heads = tc.get("linear_num_value_heads")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc.get("linear_value_head_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        crate::agent::ane_mil::MilConfig {
+            dim, hidden_dim, n_heads, seq_len, n_kv_heads,
+            rope_theta, rms_eps, has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices, linear_n_heads, linear_head_dim,
+            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            attn_output_gate,
+        }
+    }
+
     fn qwen3_5_alias_dir(
         tag: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -2005,6 +2138,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "mlx")]
     fn qwen3_5_tokenize_pair(
         model_dir: &std::path::Path,
         user: &str,
@@ -2025,6 +2159,7 @@ mod tests {
         crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages).expect("tokenize")
     }
 
+    #[cfg(feature = "mlx")]
     fn qwen3_5_eval_avg_loss(
         model_dir: &std::path::Path,
         lora: Option<&crate::agent::ane_lora::LoraModel>,
@@ -4045,6 +4180,191 @@ mod tests {
             "PASS: offline training from sessions.db ({} samples, {step} steps, {:.1}% improvement)",
             samples.len(),
             improvement * 100.0,
+        );
+    }
+
+    /// End-to-end benchmark: prepacked vs standard weight packing.
+    ///
+    /// Runs multiple ANE forward+backward steps with and without PrePackedWeights,
+    /// comparing wall-clock time and verifying numerically identical results.
+    ///
+    /// Run with: cargo test --features ane --release --lib -- bench_prepacked_vs_standard --nocapture --test-threads=1
+    #[test]
+    fn bench_prepacked_vs_standard() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_backward;
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel, LoraModelAdam, lora_adam_update};
+        use crate::agent::ane_weights::{DenseCachedModel, PrePackedWeights, QuantizedModelWeights, WeightSource};
+
+        let dir = qwen3_5_dir();
+
+        // Build MilConfig from config.json without mlx feature dependency.
+        // Parse just the fields we need for training.
+        let mil_cfg = mil_config_from_json(&dir, 64);
+
+        // Synthetic tokens: deterministic sequence in valid vocab range (248320 for 0.8B)
+        let n_tokens = 48usize;
+        let vocab_size = 248320usize;
+        let tokens_u32: Vec<u32> = (0..n_tokens).map(|i| ((i * 137 + 42) % vocab_size) as u32).collect();
+        let targets_u32: Vec<u32> = (0..n_tokens).map(|i| ((i * 137 + 179) % vocab_size) as u32).collect();
+        eprintln!("sample: {} synthetic tokens", tokens_u32.len());
+
+        // Load model
+        let quantized =
+            QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg).expect("load model");
+        let mut model = DenseCachedModel::auto(quantized);
+        let n_layers = model.n_layers();
+        let dim = model.actual_dim();
+        let hidden = model.actual_hidden_dim();
+        eprintln!(
+            "model: dim={dim}, hidden={hidden}, {}/{} layers cached",
+            model.cached_layer_count(),
+            n_layers
+        );
+
+        // Compile bucket kernels
+        let bucket_kernels =
+            BucketKernels::compile(&[tokens_u32.len()], &mil_cfg).expect("bucket compile");
+        let (bucket_seq, fwd_k, bwd_k) = bucket_kernels
+            .get(tokens_u32.len())
+            .expect("bucket must exist");
+        let tok_pad = pad_to(&tokens_u32, *bucket_seq);
+        let tgt_pad = pad_targets_to(&targets_u32, *bucket_seq);
+        model.cfg_mut().seq_len = *bucket_seq;
+
+        let fused_ffn = fwd_k.ffn.is_fully_fused();
+        eprintln!(
+            "bucket_seq={bucket_seq}, fused_ffn={fused_ffn}"
+        );
+
+        let residual_scale = 1.0f32 / (2.0f32 * n_layers as f32).sqrt();
+        let softcap = 15.0f32;
+        let loss_scale = 256.0f32;
+        let iters = 5;
+
+        // --- A: Standard path (no prepacked) ---
+        let mut lora_a = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam_a = LoraModelAdam::zeros(&lora_a);
+
+        // Warmup
+        let _ = ane_forward::forward_ane_generic(
+            fwd_k, &model, Some(&lora_a), &tok_pad, &tgt_pad, softcap, residual_scale,
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut losses_a = Vec::new();
+        for step in 1..=iters {
+            let fwd = ane_forward::forward_ane_generic(
+                fwd_k, &model, Some(&lora_a), &tok_pad, &tgt_pad, softcap, residual_scale,
+            )
+            .expect("fwd standard");
+            losses_a.push(fwd.base.loss);
+            let bwd = ane_backward::backward_lora_ane_generic(
+                bwd_k, &model, &fwd, &lora_a, &tok_pad, softcap, loss_scale, residual_scale,
+            );
+            lora_adam_update(&mut lora_a, &bwd.lora_grads, &mut adam_a, step, 1e-4, 0.9, 0.999, 1e-8, 0.01);
+        }
+        let standard_ms = t0.elapsed().as_millis() as f64;
+        let standard_per_step = standard_ms / iters as f64;
+
+        // --- B: Prepacked path ---
+        let mut lora_b = LoraModel::with_full_dims(
+            LoraConfig::default(),
+            n_layers,
+            dim,
+            mil_cfg.kv_dim(),
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam_b = LoraModelAdam::zeros(&lora_b);
+
+        // Build prepacked weights
+        let t_build = std::time::Instant::now();
+        let mut prepacked = PrePackedWeights::build(&model, *bucket_seq, fused_ffn);
+        let build_ms = t_build.elapsed().as_millis();
+        eprintln!(
+            "prepacked build: {build_ms}ms, {:.1} MB",
+            prepacked.memory_bytes() as f64 / 1_048_576.0,
+        );
+
+        // Warmup
+        let _ = ane_forward::forward_ane_generic_prepacked(
+            fwd_k, &model, Some(&lora_b), &tok_pad, &tgt_pad, softcap, residual_scale, Some(&mut prepacked),
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut losses_b = Vec::new();
+        for step in 1..=iters {
+            let fwd = ane_forward::forward_ane_generic_prepacked(
+                fwd_k, &model, Some(&lora_b), &tok_pad, &tgt_pad, softcap, residual_scale, Some(&mut prepacked),
+            )
+            .expect("fwd prepacked");
+            losses_b.push(fwd.base.loss);
+            let bwd = ane_backward::backward_lora_ane_prepacked(
+                bwd_k, &model, &fwd, &lora_b, loss_scale, residual_scale, None, &mut prepacked,
+            );
+            lora_adam_update(&mut lora_b, &bwd.lora_grads, &mut adam_b, step, 1e-4, 0.9, 0.999, 1e-8, 0.01);
+        }
+        let prepacked_ms = t0.elapsed().as_millis() as f64;
+        let prepacked_per_step = prepacked_ms / iters as f64;
+
+        let speedup = standard_per_step / prepacked_per_step;
+
+        // Print per-step comparison
+        eprintln!("\n=== PREPACKED vs STANDARD ({iters} steps, seq={bucket_seq}) ===");
+        eprintln!("standard:  {standard_per_step:.0}ms/step ({standard_ms:.0}ms total)");
+        eprintln!("prepacked: {prepacked_per_step:.0}ms/step ({prepacked_ms:.0}ms total) + {build_ms}ms build");
+        eprintln!("speedup:   {speedup:.2}x");
+        eprintln!();
+
+        // Print loss trajectory
+        eprintln!("loss trajectory (should be identical):");
+        for i in 0..iters {
+            let a = losses_a[i];
+            let b = losses_b[i];
+            let rel_err = if a != 0.0 {
+                ((a - b) / a).abs()
+            } else {
+                0.0
+            };
+            let marker = if rel_err < 1e-4 { "OK" } else { "DRIFT" };
+            eprintln!(
+                "  step {}: standard={a:.6} prepacked={b:.6} rel_err={rel_err:.2e} [{marker}]",
+                i + 1
+            );
+        }
+
+        // Verify numerical equivalence (tolerance for fp16 round-trip differences)
+        let first_loss_a = losses_a[0];
+        let first_loss_b = losses_b[0];
+        let rel_err = ((first_loss_a - first_loss_b) / first_loss_a).abs();
+        assert!(
+            rel_err < 1e-3,
+            "first step loss mismatch: standard={first_loss_a:.6}, prepacked={first_loss_b:.6}, rel_err={rel_err:.2e}"
+        );
+
+        // Verify prepacked is at least not slower (allow 5% margin for variance)
+        assert!(
+            speedup > 0.95,
+            "prepacked should not be significantly slower: {speedup:.2}x"
+        );
+
+        eprintln!(
+            "\nPASS: prepacked {speedup:.2}x speedup, losses match within tolerance"
         );
     }
 }

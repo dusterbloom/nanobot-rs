@@ -12,3 +12,4 @@ bridge/whatsapp/node_modules/
 experiments/**/.venv/
 .planning/
 src/.janitor/
+.gitnexus

@@ -814,6 +814,29 @@ impl FfnKernels {
         Ok(ane_weights::unpack_fused_ffn(&out_buf, cfg))
     }
 
+    /// Execute fully-fused FFN using pre-packed weight buffers (Orion delta patching).
+    ///
+    /// The weight portions of the IOSurface are already packed in `prepacked`.
+    /// Only the activation `xnorm` is patched in per call — no transpose, no full pack.
+    pub fn eval_full_prepacked(
+        &self,
+        xnorm: &[f32],
+        prepacked: &mut super::ane_weights::PrePackedWeights,
+        layer: usize,
+        cfg: &MilConfig,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String> {
+        let FfnKernels::FullyFused { kernel } = self else {
+            return Err("eval_full_prepacked called on non-FullyFused kernel".into());
+        };
+        let input_bytes = prepacked.patch_fwd_fused_ffn(layer, xnorm, cfg.dim);
+        let spec = KernelSpec::for_kernel(cfg, KernelType::FusedFfn);
+        kernel.write_input(0, input_bytes);
+        kernel.eval()?;
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        Ok(ane_weights::unpack_fused_ffn(&out_buf, cfg))
+    }
+
     /// Execute FFN W1+W3: xnorm → (h1, h3, gate).
     ///
     /// `w1`, `w3` are in standard `[out_features, in_features]` = `[hidden, dim]` layout.
@@ -1627,26 +1650,55 @@ fn dequantize_row_block(
     debug_assert_eq!(out.len(), row_count * w.cols);
 
     let n_groups = w.cols / w.group_size;
-    let elems_per_u32 = 32 / w.bits;
     let mask = (1u32 << w.bits) - 1;
-    let packed_cols = w.cols / elems_per_u32; // u32 words per row
+    let packed_cols = (w.cols * w.bits + 31) / 32; // u32 words per row
     let row_bytes = packed_cols * 4; // bytes per row
+    let spans_words = (32 % w.bits) != 0;
 
     for local_row in 0..row_count {
         let row = row_start + local_row;
         let row_byte_offset = row * row_bytes;
         let out_row = &mut out[local_row * w.cols..(local_row + 1) * w.cols];
         for col in 0..w.cols {
-            let word_idx = col / elems_per_u32;
-            let elem_idx = col % elems_per_u32;
-            let byte_off = row_byte_offset + word_idx * 4;
-            let u32_val = u32::from_le_bytes([
-                w.data[byte_off],
-                w.data[byte_off + 1],
-                w.data[byte_off + 2],
-                w.data[byte_off + 3],
-            ]);
-            let qval = ((u32_val >> (elem_idx * w.bits)) & mask) as f32;
+            let qval = if spans_words {
+                let bit_offset = col * w.bits;
+                let word_idx = bit_offset / 32;
+                let bit_within_word = bit_offset % 32;
+                let byte_off = row_byte_offset + word_idx * 4;
+                let lo_word = u32::from_le_bytes([
+                    w.data[byte_off],
+                    w.data[byte_off + 1],
+                    w.data[byte_off + 2],
+                    w.data[byte_off + 3],
+                ]);
+                if bit_within_word + w.bits <= 32 {
+                    ((lo_word >> bit_within_word) & mask) as f32
+                } else {
+                    let lo_bits = 32 - bit_within_word;
+                    let hi_byte_off = byte_off + 4;
+                    let hi_word = u32::from_le_bytes([
+                        w.data[hi_byte_off],
+                        w.data[hi_byte_off + 1],
+                        w.data[hi_byte_off + 2],
+                        w.data[hi_byte_off + 3],
+                    ]);
+                    let lo = lo_word >> bit_within_word;
+                    let hi = hi_word & ((1u32 << (w.bits - lo_bits)) - 1);
+                    (lo | (hi << lo_bits)) as f32
+                }
+            } else {
+                let elems_per_u32 = 32 / w.bits;
+                let word_idx = col / elems_per_u32;
+                let elem_idx = col % elems_per_u32;
+                let byte_off = row_byte_offset + word_idx * 4;
+                let u32_val = u32::from_le_bytes([
+                    w.data[byte_off],
+                    w.data[byte_off + 1],
+                    w.data[byte_off + 2],
+                    w.data[byte_off + 3],
+                ]);
+                ((u32_val >> (elem_idx * w.bits)) & mask) as f32
+            };
             let group = col / w.group_size;
             let scale = w.scales[row * n_groups + group];
             let bias = w.biases[row * n_groups + group];
@@ -2957,6 +3009,24 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
     softcap: f32,
     residual_scale: f32,
 ) -> Result<ForwardResultWithLora, String> {
+    forward_ane_generic_prepacked(kernels, model, lora, tokens, targets, softcap, residual_scale, None)
+}
+
+/// ANE-accelerated forward with optional pre-packed weight buffers.
+///
+/// When `prepacked` is `Some`, FFN evaluations use pre-packed IOSurface buffers
+/// (Orion delta patching) — only the activation slice is patched per call,
+/// eliminating per-step weight transpose and packing.
+pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
+    kernels: &CompiledKernels,
+    model: &W,
+    lora: Option<&super::ane_lora::LoraModel>,
+    tokens: &[T],
+    targets: &[T],
+    softcap: f32,
+    residual_scale: f32,
+    mut prepacked: Option<&mut ane_weights::PrePackedWeights>,
+) -> Result<ForwardResultWithLora, String> {
     use super::ane_lora::LoraLayerActivations;
 
     let cfg = model.cfg();
@@ -3147,10 +3217,18 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
         // --- FFN on ANE ---
         let (mut h1, mut h3, mut gate, mut ffn_out) = if kernels.ffn.is_fully_fused() {
             // Single-dispatch: W1+W3+SiLU+gate+W2
-            let (h1, h3, gate, ffn_out) = kernels
-                .ffn
-                .eval_full(&x2norm, &lw.w1, &lw.w3, &lw.w2, cfg)
-                .map_err(|e| format!("layer {l} FFN fused ANE forward failed: {e}"))?;
+            let (h1, h3, gate, ffn_out) = if let Some(ref mut pp) = prepacked {
+                // Orion delta patching: weights pre-packed, only patch activation
+                kernels
+                    .ffn
+                    .eval_full_prepacked(&x2norm, pp, l, cfg)
+                    .map_err(|e| format!("layer {l} FFN fused ANE forward (prepacked) failed: {e}"))?
+            } else {
+                kernels
+                    .ffn
+                    .eval_full(&x2norm, &lw.w1, &lw.w3, &lw.w2, cfg)
+                    .map_err(|e| format!("layer {l} FFN fused ANE forward failed: {e}"))?
+            };
             (h1, h3, gate, ffn_out)
         } else {
             // Two dispatches: W1+W3 then W2

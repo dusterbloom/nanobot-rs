@@ -785,6 +785,8 @@ pub(crate) async fn run_gateway_async(
     let health_registry = Arc::new(crate::heartbeat::health::build_registry(&config));
 
     let mut lcm_config = config.lcm.clone();
+    // Inject the local API key so the LCM compactor can authenticate with oMLX.
+    lcm_config.api_key = config.agents.defaults.local_api_key.clone();
     if core_handle.swappable().is_local && !lcm_config.enabled {
         tracing::info!("Auto-enabling LCM for local mode");
         lcm_config.enabled = true;

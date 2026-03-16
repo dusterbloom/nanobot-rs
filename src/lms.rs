@@ -354,11 +354,13 @@ pub(crate) async fn unload_model_at(base_url: &str, model: &str) -> Result<(), S
             .and_then(|m| m.instance_id.clone())
     };
 
-    let body = if let Some(ref iid) = instance_id {
-        serde_json::json!({ "identifier": model, "instance_id": iid })
-    } else {
-        serde_json::json!({ "identifier": model })
+    let Some(ref iid) = instance_id else {
+        return Err(format!(
+            "lms unload '{}' failed: model not loaded or instance_id not found in /api/v1/models",
+            model
+        ));
     };
+    let body = serde_json::json!({ "instance_id": iid });
 
     let client = reqwest::Client::new();
     let resp = client
@@ -404,6 +406,33 @@ pub(crate) struct ModelInfo {
     pub instance_id: Option<String>,
 }
 
+/// Parse a single model JSON object from the LM Studio `/api/v1/models` response.
+fn parse_model_entry(m: &serde_json::Value) -> Option<ModelInfo> {
+    let key = m.get("key")?.as_str()?.to_string();
+    let model_type = m.get("type")?.as_str()?.to_string();
+    let instances = m.get("loaded_instances").and_then(|v| v.as_array());
+    let loaded = instances.map(|a| !a.is_empty()).unwrap_or(false);
+    let first_instance = instances.and_then(|arr| arr.first());
+    let loaded_context = first_instance
+        .and_then(|inst| inst.get("config"))
+        .and_then(|c| c.get("context_length"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    // LM Studio v1 API uses "id" in loaded_instances; fall back to
+    // "instance_id" for forward-compatibility.
+    let instance_id = first_instance
+        .and_then(|inst| inst.get("id").or_else(|| inst.get("instance_id")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(ModelInfo {
+        key,
+        model_type,
+        loaded,
+        loaded_context,
+        instance_id,
+    })
+}
+
 /// List all models via `GET /api/v1/models`, returning full info.
 async fn list_models_full(host: &str, port: u16) -> Vec<ModelInfo> {
     list_models_full_at(&rest_base(host, port)).await
@@ -426,32 +455,7 @@ async fn list_models_full_at(base_url: &str) -> Vec<ModelInfo> {
         None => return Vec::new(),
     };
 
-    models
-        .iter()
-        .filter_map(|m| {
-            let key = m.get("key")?.as_str()?.to_string();
-            let model_type = m.get("type")?.as_str()?.to_string();
-            let instances = m.get("loaded_instances").and_then(|v| v.as_array());
-            let loaded = instances.map(|a| !a.is_empty()).unwrap_or(false);
-            let first_instance = instances.and_then(|arr| arr.first());
-            let loaded_context = first_instance
-                .and_then(|inst| inst.get("config"))
-                .and_then(|c| c.get("context_length"))
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let instance_id = first_instance
-                .and_then(|inst| inst.get("instance_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            Some(ModelInfo {
-                key,
-                model_type,
-                loaded,
-                loaded_context,
-                instance_id,
-            })
-        })
-        .collect()
+    models.iter().filter_map(parse_model_entry).collect()
 }
 
 /// List currently loaded model identifiers via the HTTP API.
@@ -1015,5 +1019,49 @@ mod tests {
         if let Some(orig_ctx) = original {
             let _ = reload_model_with_context("", port, &model, orig_ctx, 120, 30).await;
         }
+    }
+
+    /// Real LM Studio v1 API shape: loaded_instances entries use `"id"`, not
+    /// `"instance_id"`.  parse_model_entry must extract it so unload_model_at
+    /// can build the correct request body.
+    #[test]
+    fn test_parse_model_entry_extracts_instance_id_from_v1_response() {
+        let v1_response = serde_json::json!({
+            "models": [{
+                "key": "qwen/qwen3.5-35b-a3b-4bit",
+                "type": "llm",
+                "loaded_instances": [{
+                    "id": "qwen/qwen3.5-35b-a3b-4bit",
+                    "config": { "context_length": 8192 }
+                }]
+            }, {
+                "key": "meta/llama-3-8b",
+                "type": "llm",
+                "loaded_instances": []
+            }]
+        });
+
+        let models: Vec<ModelInfo> = v1_response["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_model_entry)
+            .collect();
+
+        assert_eq!(models.len(), 2);
+
+        // Loaded model must have instance_id extracted from "id" field
+        let loaded = &models[0];
+        assert!(loaded.loaded);
+        assert_eq!(loaded.loaded_context, Some(8192));
+        assert_eq!(
+            loaded.instance_id.as_deref(),
+            Some("qwen/qwen3.5-35b-a3b-4bit"),
+        );
+
+        // Unloaded model has no instance_id
+        let unloaded = &models[1];
+        assert!(!unloaded.loaded);
+        assert!(unloaded.instance_id.is_none());
     }
 }

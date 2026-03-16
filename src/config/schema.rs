@@ -810,6 +810,23 @@ impl Default for CodeExecutionConfig {
     }
 }
 
+/// How tool schemas are presented to local models.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalToolMode {
+    /// Single proxy schema (~90 tokens) with inspect/execute modes.
+    /// Requires a model smart enough to use indirect `tool(name, args)` calls.
+    Proxy,
+    /// Individual tool schemas with condensed descriptions and stripped parameter
+    /// descriptions (~120 tokens for 12 tools). Keeps real tool names so models
+    /// call them directly. Default.
+    #[default]
+    Slim,
+    /// All schemas sent individually with condensed descriptions but full
+    /// parameter detail (~350 tokens).
+    Full,
+}
+
 /// Tools configuration.
 ///
 /// Note: the `exec` field from Python is renamed to `exec_` in Rust to avoid
@@ -827,6 +844,9 @@ pub struct ToolsConfig {
     /// Code execution (Python RPC) tool settings.
     #[serde(default)]
     pub code_execution: CodeExecutionConfig,
+    /// How tool schemas are presented to local models (default: proxy).
+    #[serde(default)]
+    pub local_tool_mode: LocalToolMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,6 +1850,10 @@ pub struct LcmSchemaConfig {
     /// Only used when `compaction_endpoint` is set.
     #[serde(default = "default_lcm_compaction_context_size")]
     pub compaction_context_size: usize,
+    /// API key for the compaction endpoint (injected at runtime from
+    /// `agents.defaults.localApiKey`, not serialized in JSON).
+    #[serde(skip)]
+    pub api_key: String,
 }
 
 impl Default for LcmSchemaConfig {
@@ -1841,6 +1865,7 @@ impl Default for LcmSchemaConfig {
             deterministic_target: default_lcm_deterministic_target(),
             compaction_endpoint: None,
             compaction_context_size: default_lcm_compaction_context_size(),
+            api_key: String::new(),
         }
     }
 }

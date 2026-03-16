@@ -662,6 +662,7 @@ fn core_config_from(
         restrict_to_workspace: config.tools.exec_.restrict_to_workspace,
         memory_config: config.memory.clone(),
         is_local,
+        local_tool_mode: config.tools.local_tool_mode.clone(),
         lane,
         compaction_provider: compaction,
         tool_delegation: config.tool_delegation.clone(),
@@ -926,6 +927,8 @@ fn create_agent_loop_inner(
     let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
 
     let mut lcm_config = config.lcm.clone();
+    // Inject the local API key so the LCM compactor can authenticate with oMLX.
+    lcm_config.api_key = config.agents.defaults.local_api_key.clone();
     if core_handle.swappable().is_local && !lcm_config.enabled {
         tracing::info!("Auto-enabling LCM for local mode");
         lcm_config.enabled = true;

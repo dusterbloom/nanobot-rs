@@ -245,9 +245,11 @@ pub fn resolve_model_alias(alias: &str) -> String {
 /// regardless of whether the session is local or cloud.
 pub fn resolve_model_for_env(alias: &str, is_local: bool, local_model: &str) -> String {
     if is_local {
+        // Only lowercase the alias for keyword matching — preserve original case
+        // for model names that oMLX/servers expect verbatim.
         match alias.to_lowercase().as_str() {
             "haiku" | "sonnet" | "opus" | "local" => local_model.to_string(),
-            other => other.to_string(),
+            _ => alias.to_string(),
         }
     } else {
         resolve_model_alias(alias)

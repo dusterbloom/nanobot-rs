@@ -120,9 +120,19 @@ impl AgentLoop {
             subagent_mgr = subagent_mgr.with_providers_config(pc);
         }
         // Wire up the cheap default model for subagents from config.
-        subagent_mgr = subagent_mgr.with_default_subagent_model(
-            core.tool_delegation_config.default_subagent_model.clone(),
-        );
+        // Resolve "local" to the delegation model name so it's a real model
+        // name that oMLX/servers recognise, not a literal "local" string.
+        let subagent_model = {
+            let raw = &core.tool_delegation_config.default_subagent_model;
+            if raw.eq_ignore_ascii_case("local") {
+                core.tool_runner_model
+                    .clone()
+                    .unwrap_or_else(|| core.model.clone())
+            } else {
+                raw.clone()
+            }
+        };
+        subagent_mgr = subagent_mgr.with_default_subagent_model(subagent_model);
         // Wire up subagent tuning from config.
         subagent_mgr =
             subagent_mgr.with_subagent_tuning(core.tool_delegation_config.subagent.clone());
@@ -157,10 +167,16 @@ impl AgentLoop {
 
         // Build dedicated LCM compactor when compaction_endpoint is configured.
         let lcm_compactor = lcm_config.compaction_endpoint.as_ref().map(|ep| {
+            // Use the local API key so authenticated endpoints (oMLX) work.
+            let api_key = if lcm_config.api_key.is_empty() {
+                "lcm-compactor".to_string()
+            } else {
+                lcm_config.api_key.clone()
+            };
             let provider: Arc<dyn crate::providers::base::LLMProvider> =
                 crate::providers::factory::create_openai_compat(
                     crate::providers::factory::ProviderSpec {
-                        api_key: "lcm-compactor".to_string(),
+                        api_key,
                         api_base: Some(ep.url.clone()),
                         model: Some(ep.model.clone()),
                         jit_gate: None,

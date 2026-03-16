@@ -10,6 +10,32 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Resolve the best `python3` binary: prefer a `.venv` in the workspace root
+/// (so `mlx_lm` is importable), fall back to bare `python3`.
+fn resolve_python3() -> PathBuf {
+    // 1. VIRTUAL_ENV environment variable (set by `source .venv/bin/activate`).
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let p = PathBuf::from(&venv).join("bin/python3");
+        if p.exists() {
+            return p;
+        }
+    }
+    // 2. .venv in the crate / project root (compile-time CARGO_MANIFEST_DIR).
+    let manifest_venv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/python3");
+    if manifest_venv.exists() {
+        return manifest_venv;
+    }
+    // 3. .venv relative to current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_venv = cwd.join(".venv/bin/python3");
+        if cwd_venv.exists() {
+            return cwd_venv;
+        }
+    }
+    // 4. Fall back to PATH-resolved python3.
+    PathBuf::from("python3")
+}
+
 /// Which inference server backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InferenceBackend {
@@ -173,7 +199,7 @@ impl MlxLmServer {
 
     /// Build the `python3 -m mlx_lm.server` command.
     fn build_mlx_lm_command(&self) -> Command {
-        let mut cmd = Command::new("python3");
+        let mut cmd = Command::new(resolve_python3());
         cmd.args(["-m", "mlx_lm.server"])
             .arg("--model")
             .arg(&self.model_dir)

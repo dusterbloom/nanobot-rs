@@ -413,6 +413,20 @@ impl ToolRegistry {
         name: &str,
         params: HashMap<String, serde_json::Value>,
     ) -> ToolExecutionResult {
+        // Proxy intercept: "tool" is the meta-tool, not a registered tool.
+        if name == "tool" {
+            return self.execute_proxy(params).await;
+        }
+        self.execute_inner(name, params).await
+    }
+
+    /// Core execute logic (no proxy intercept). Called by both `execute()`
+    /// and `execute_proxy()` dispatch mode.
+    async fn execute_inner(
+        &self,
+        name: &str,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
         let (name, params) = match Self::normalize_tool_request(name, params) {
             Ok(v) => v,
             Err(e) => return ToolExecutionResult::failure(e),
@@ -439,6 +453,20 @@ impl ToolRegistry {
     ///
     /// Same as [`execute`] but passes the context through to the tool.
     pub async fn execute_with_context(
+        &self,
+        name: &str,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolExecutionResult {
+        // Proxy intercept: "tool" is the meta-tool, not a registered tool.
+        if name == "tool" {
+            return self.execute_proxy_with_context(params, ctx).await;
+        }
+        self.execute_inner_with_context(name, params, ctx).await
+    }
+
+    /// Core execute-with-context logic (no proxy intercept).
+    async fn execute_inner_with_context(
         &self,
         name: &str,
         params: HashMap<String, serde_json::Value>,
@@ -603,6 +631,224 @@ impl ToolRegistry {
             .collect();
         Self::condense_definitions(&mut defs);
         defs
+    }
+
+    /// Returns individual tool schemas with condensed descriptions AND stripped
+    /// parameter descriptions. Keeps property names, types, and required list
+    /// but removes per-parameter `"description"` fields that consume most tokens.
+    pub fn get_slim_definitions(&self) -> Vec<serde_json::Value> {
+        let mut defs = self.get_local_definitions();
+        for def in &mut defs {
+            if let Some(params) = def.pointer_mut("/function/parameters/properties") {
+                if let Some(props) = params.as_object_mut() {
+                    for (_key, prop) in props.iter_mut() {
+                        if let Some(obj) = prop.as_object_mut() {
+                            obj.remove("description");
+                        }
+                    }
+                }
+            }
+        }
+        defs
+    }
+
+    // -------------------------------------------------------------------
+    // Tool proxy: single compact schema for local models
+    // -------------------------------------------------------------------
+
+    /// Sorted list of available tool names. Used by proxy error messages.
+    fn available_tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tools
+            .values()
+            .filter(|t| t.is_available())
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Extract the first required parameter name from a tool's JSON Schema.
+    fn primary_arg_hint(tool: &dyn Tool) -> Option<String> {
+        let params = tool.parameters();
+        let required = params.get("required")?.as_array()?;
+        required.first()?.as_str().map(String::from)
+    }
+
+    /// Build arg hints for all required params: `"name(path,content)"`.
+    fn tool_hint(tool: &dyn Tool) -> String {
+        let params = tool.parameters();
+        let hints: Vec<&str> = params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<&str>>()
+            })
+            .unwrap_or_default();
+        if hints.is_empty() {
+            tool.name().to_string()
+        } else {
+            format!("{}({})", tool.name(), hints.join(","))
+        }
+    }
+
+    /// Build a single compact proxy schema that lists all available tools.
+    ///
+    /// Returns one tool definition called `"tool"` whose description embeds
+    /// the full catalog with arg hints. The model calls `tool(name: "X")`
+    /// to inspect a tool's schema, or `tool(name: "X", args: {...})` to execute.
+    ///
+    /// Token cost: ~90 tokens vs ~2045 for 15 individual schemas.
+    pub fn get_proxy_definition(&self) -> Vec<serde_json::Value> {
+        let mut hints: Vec<String> = self
+            .tools
+            .values()
+            .filter(|t| t.is_available())
+            .map(|t| Self::tool_hint(t.as_ref()))
+            .collect();
+        hints.sort();
+
+        let description = format!(
+            "Use any tool. Available: {}. \
+             Pass name only to see full parameters, or name+args to execute.",
+            hints.join(", ")
+        );
+
+        vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "tool",
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Tool name" },
+                        "args": { "type": "object", "description": "Tool arguments (omit to see schema)" }
+                    },
+                    "required": ["name"]
+                }
+            }
+        })]
+    }
+
+    /// Handle a proxy call: inspect (no args) or dispatch (with args).
+    pub async fn execute_proxy(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+    ) -> ToolExecutionResult {
+        let tool_name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                let names = self.available_tool_names();
+                return ToolExecutionResult::failure(format!(
+                    "Missing 'name'. Available tools: {}",
+                    names.join(", ")
+                ));
+            }
+        };
+
+        match params.get("args") {
+            None | Some(serde_json::Value::Null) => {
+                // Inspect mode: return tool's full schema
+                match self.tools.get(&tool_name) {
+                    Some(tool) if tool.is_available() => {
+                        let schema = serde_json::json!({
+                            "name": tool.name(),
+                            "description": tool.description(),
+                            "parameters": tool.parameters(),
+                        });
+                        ToolExecutionResult::success(
+                            serde_json::to_string_pretty(&schema)
+                                .unwrap_or_else(|_| "{}".into()),
+                        )
+                    }
+                    _ => {
+                        let names = self.available_tool_names();
+                        ToolExecutionResult::failure(format!(
+                            "Tool '{}' not found. Available: {}",
+                            tool_name,
+                            names.join(", ")
+                        ))
+                    }
+                }
+            }
+            Some(args_val) => {
+                // Dispatch mode: extract args and call the real tool.
+                // Call execute_inner directly to avoid recursion through execute().
+                let inner_params: HashMap<String, serde_json::Value> = match args_val {
+                    serde_json::Value::Object(map) => {
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    _ => {
+                        return ToolExecutionResult::failure(
+                            "'args' must be a JSON object".to_string(),
+                        );
+                    }
+                };
+                self.execute_inner(&tool_name, inner_params).await
+            }
+        }
+    }
+
+    /// Handle a proxy call with execution context passthrough.
+    pub async fn execute_proxy_with_context(
+        &self,
+        params: HashMap<String, serde_json::Value>,
+        ctx: &ToolExecutionContext,
+    ) -> ToolExecutionResult {
+        let tool_name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                let names = self.available_tool_names();
+                return ToolExecutionResult::failure(format!(
+                    "Missing 'name'. Available tools: {}",
+                    names.join(", ")
+                ));
+            }
+        };
+
+        match params.get("args") {
+            None | Some(serde_json::Value::Null) => {
+                // Inspect mode (same as non-context version)
+                match self.tools.get(&tool_name) {
+                    Some(tool) if tool.is_available() => {
+                        let schema = serde_json::json!({
+                            "name": tool.name(),
+                            "description": tool.description(),
+                            "parameters": tool.parameters(),
+                        });
+                        ToolExecutionResult::success(
+                            serde_json::to_string_pretty(&schema)
+                                .unwrap_or_else(|_| "{}".into()),
+                        )
+                    }
+                    _ => {
+                        let names = self.available_tool_names();
+                        ToolExecutionResult::failure(format!(
+                            "Tool '{}' not found. Available: {}",
+                            tool_name,
+                            names.join(", ")
+                        ))
+                    }
+                }
+            }
+            Some(args_val) => {
+                let inner_params: HashMap<String, serde_json::Value> = match args_val {
+                    serde_json::Value::Object(map) => {
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    _ => {
+                        return ToolExecutionResult::failure(
+                            "'args' must be a JSON object".to_string(),
+                        );
+                    }
+                };
+                self.execute_inner_with_context(&tool_name, inner_params, ctx)
+                    .await
+            }
+        }
     }
 
     /// Extract text content from the last N messages for keyword scanning.
@@ -1733,5 +1979,247 @@ mod tests {
             "Two-sentence condensation should have 1 internal break, got {}: {}",
             condensed_breaks, condensed_desc,
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Tool proxy tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_definition_single_schema() {
+        let mut registry = ToolRegistry::new();
+        for name in &["read_file", "list_dir", "exec"] {
+            registry.register(Box::new(MockTool::new(name)));
+        }
+
+        let defs = registry.get_proxy_definition();
+        assert_eq!(defs.len(), 1, "Proxy must return exactly 1 tool schema");
+        assert_eq!(
+            defs[0]["function"]["name"].as_str().unwrap(),
+            "tool",
+            "Proxy tool must be named 'tool'"
+        );
+
+        let props = &defs[0]["function"]["parameters"]["properties"];
+        assert!(props.get("name").is_some(), "Must have 'name' param");
+        assert!(props.get("args").is_some(), "Must have 'args' param");
+    }
+
+    #[test]
+    fn test_proxy_definition_has_arg_hints() {
+        let mut registry = ToolRegistry::new();
+        // MockTool has required: ["value"]
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let defs = registry.get_proxy_definition();
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+
+        assert!(
+            desc.contains("read_file(value)"),
+            "Description should contain arg hint 'read_file(value)', got: {}",
+            desc
+        );
+    }
+
+    #[test]
+    fn test_proxy_definition_excludes_unavailable() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+        registry.register(Box::new(UnavailableTool));
+
+        let defs = registry.get_proxy_definition();
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+
+        assert!(desc.contains("read_file"), "Available tool must be listed");
+        assert!(
+            !desc.contains("unavailable_test"),
+            "Unavailable tool must NOT be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_inspect_returns_schema() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("read_file"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(result.ok, "Inspect should succeed: {:?}", result.error);
+        assert!(
+            result.data.contains("parameters"),
+            "Inspect result should contain parameters schema: {}",
+            result.data
+        );
+        assert!(
+            result.data.contains("value"),
+            "Schema should mention required param 'value': {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_inspect_unknown_lists_available() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("nonexistent"));
+
+        let result = registry.execute("tool", params).await;
+        assert!(!result.ok, "Unknown tool inspect should fail");
+        assert!(
+            result.data.contains("read_file"),
+            "Error should list available tools: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_dispatch_executes_real_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("mock_tool"));
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({"value": "hello"}),
+        );
+
+        let result = registry.execute("tool", params).await;
+        assert!(result.ok, "Proxy dispatch should succeed: {:?}", result.error);
+        assert!(
+            result.data.contains("hello"),
+            "Should contain dispatched tool output: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_dispatch_runs_normalization() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParamEchoTool::new("read_file")));
+
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("read_file"));
+        // Use alias "file_path" which normalize_tool_request converts to "path"
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({"file_path": "/foo", "path": "/foo"}),
+        );
+
+        let result = registry.execute("tool", params).await;
+        assert!(result.ok, "Dispatch with alias should succeed: {:?}", result.error);
+        assert!(
+            result.data.contains("path"),
+            "Normalization should convert file_path to path: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_missing_name_returns_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        let result = registry.execute("tool", HashMap::new()).await;
+        assert!(!result.ok, "Missing name should fail");
+        assert!(
+            result.data.contains("Missing 'name'"),
+            "Error should mention missing name: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_intercept_via_execute() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("list_dir")));
+
+        // Call through the main execute() path with "tool" as the tool name
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), serde_json::json!("list_dir"));
+        params.insert(
+            "args".to_string(),
+            serde_json::json!({"value": "test"}),
+        );
+
+        let result = registry.execute("tool", params).await;
+        assert!(result.ok, "Proxy intercept via execute() should work: {:?}", result.error);
+        assert!(
+            result.data.contains("test"),
+            "Should dispatch to real tool: {}",
+            result.data
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_call_bypasses_proxy() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("mock_tool")));
+
+        // Call mock_tool directly, not through proxy
+        let mut params = HashMap::new();
+        params.insert("value".to_string(), serde_json::json!("direct"));
+
+        let result = registry.execute("mock_tool", params).await;
+        assert!(result.ok, "Direct call should still work: {:?}", result.error);
+        assert!(
+            result.data.contains("direct"),
+            "Should get direct tool output: {}",
+            result.data
+        );
+    }
+
+    /// A mock tool with param descriptions for testing slim stripping.
+    struct DescribedTool;
+    #[async_trait]
+    impl Tool for DescribedTool {
+        fn name(&self) -> &str { "described_tool" }
+        fn description(&self) -> &str { "A tool with described params." }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The file path" },
+                    "content": { "type": "string", "description": "The content to write" }
+                },
+                "required": ["path", "content"]
+            })
+        }
+        async fn execute(&self, _params: HashMap<String, serde_json::Value>) -> String {
+            "ok".into()
+        }
+    }
+
+    #[test]
+    fn test_slim_definitions_strip_param_descriptions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DescribedTool));
+
+        let slim = registry.get_slim_definitions();
+        let full = registry.get_local_definitions();
+
+        assert_eq!(slim.len(), 1);
+        assert_eq!(full.len(), 1);
+
+        // Slim defs should have no "description" keys in parameter properties
+        let slim_props = slim[0].pointer("/function/parameters/properties").unwrap();
+        for (key, prop) in slim_props.as_object().unwrap() {
+            assert!(
+                prop.get("description").is_none(),
+                "Slim def should strip description from param '{}': {:?}",
+                key, prop
+            );
+            // But type should still be present
+            assert!(prop.get("type").is_some(), "Slim def should keep type for param '{}'", key);
+        }
+
+        // Full defs should retain descriptions
+        let full_props = full[0].pointer("/function/parameters/properties").unwrap();
+        let has_desc = full_props.as_object().unwrap().values().any(|v| v.get("description").is_some());
+        assert!(has_desc, "Full defs should retain param descriptions");
     }
 }

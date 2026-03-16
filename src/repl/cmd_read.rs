@@ -772,7 +772,7 @@ impl ReplContext {
     pub(super) fn cmd_train_status(&self) {
         let counters = &self.core_handle.counters;
         let active = counters.training_active.load(Ordering::Relaxed);
-        let total = counters.training_steps_total.load(Ordering::Relaxed);
+        let runs_completed = counters.training_steps_total.load(Ordering::Relaxed);
         let started_ms = counters.training_started_ms.load(Ordering::Relaxed);
 
         println!("\n  Training Status:");
@@ -786,14 +786,37 @@ impl ReplContext {
             } else {
                 0
             };
-            println!(
-                "    State:  \x1b[33mactive\x1b[0m (running for {}s)",
-                elapsed_s
-            );
+            let cur_step = counters.training_current_step.load(Ordering::Relaxed);
+            let total_steps = counters.training_total_steps.load(Ordering::Relaxed);
+            let loss_x10k = counters.training_loss_x10k.load(Ordering::Relaxed);
+            let loss = loss_x10k as f64 / 10000.0;
+
+            if total_steps > 0 {
+                let pct = (cur_step as f64 / total_steps as f64 * 100.0).min(100.0);
+                let s_per_step = if cur_step > 0 {
+                    elapsed_s as f64 / cur_step as f64
+                } else {
+                    0.0
+                };
+                let eta_s = if cur_step > 0 {
+                    ((total_steps - cur_step) as f64 * s_per_step) as u64
+                } else {
+                    0
+                };
+                println!(
+                    "    State:  \x1b[33mactive\x1b[0m step {}/{} ({:.0}%) — {:.1}s/step, loss={:.4}, ETA {}s",
+                    cur_step, total_steps, pct, s_per_step, loss, eta_s,
+                );
+            } else {
+                println!(
+                    "    State:  \x1b[33mactive\x1b[0m (initializing, {}s elapsed)",
+                    elapsed_s
+                );
+            }
         } else {
             println!("    State:  \x1b[32midle\x1b[0m");
         }
-        println!("    Steps completed: {}", total);
+        println!("    Runs completed: {}", runs_completed);
 
         // Show experience buffer stats if available.
         if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
@@ -1051,9 +1074,25 @@ impl ReplContext {
 
         let n_samples = samples.len();
         let n_exps = ids.len();
+
+        // Scale epochs inversely with sample count: many samples need fewer
+        // passes. Target ≤120 optimizer steps to keep wall-clock under ~10 min.
+        let mut ane_cfg = ane_cfg;
+        let max_steps_target = 120usize;
+        if n_samples > 0 && n_samples * ane_cfg.epochs > max_steps_target {
+            ane_cfg.epochs = (max_steps_target / n_samples).max(1);
+        }
+        let epochs_used = ane_cfg.epochs;
+        let total_steps = n_samples * epochs_used;
+
         let tc = counters.clone();
         let handle = if let Some(trainer) = self.agent_loop.ane_trainer() {
-            trainer.spawn_training(ane_cfg, samples, mlx_tx)
+            trainer.spawn_training_with_progress(
+                ane_cfg,
+                samples,
+                mlx_tx,
+                Some(counters.clone()),
+            )
         } else {
             crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx)
         };
@@ -1078,8 +1117,8 @@ impl ReplContext {
             .ok();
 
         println!(
-            "\n  Training started: {} samples ({} newly unexported)\n  Model: {}\n  Use /train to check progress.\n",
-            n_samples, n_exps, model_dir.display()
+            "\n  Training started: {} samples × {} epochs = {} steps ({} newly unexported)\n  Model: {}\n  Use /train to check progress.\n",
+            n_samples, epochs_used, total_steps, n_exps, model_dir.display()
         );
     }
 

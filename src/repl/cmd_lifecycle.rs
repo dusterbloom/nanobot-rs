@@ -456,13 +456,15 @@ impl ReplContext {
                     Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
-                // Persist
+                // Persist — switch backend away from "mlx" to LM Studio HTTP.
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
+                self.config.agents.defaults.local_backend = "lmstudio".to_string();
                 self.current_model_path = PathBuf::from(&selected.id);
                 let mut disk_cfg = load_config(None);
                 disk_cfg.agents.defaults.local_model = selected.id.clone();
                 disk_cfg.agents.defaults.lms_main_model = selected.id;
+                disk_cfg.agents.defaults.local_backend = "lmstudio".to_string();
                 save_config(&disk_cfg, None);
                 self.apply_and_rebuild();
             }
@@ -513,10 +515,13 @@ impl ReplContext {
                         }
                     }
                 }
-                // Set endpoint + model (same as /cl use logic)
+                // Set endpoint + model (same as /cl use logic).
+                // Switch backend away from "mlx" (in-process) so rebuild uses
+                // the HTTP provider for this remote/oMLX endpoint.
                 self.config.agents.defaults.local_api_base = endpoint.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
+                self.config.agents.defaults.local_backend = "omlx".to_string();
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
@@ -604,9 +609,11 @@ impl ReplContext {
             }
             ModelSource::Omlx { ref endpoint } => {
                 // oMLX uses LRU auto-eviction — just update config, no load/unload.
+                // Switch backend away from "mlx" (in-process) so rebuild uses HTTP.
                 self.config.agents.defaults.local_api_base = endpoint.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
+                self.config.agents.defaults.local_backend = "omlx".to_string();
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
@@ -1076,9 +1083,11 @@ impl ReplContext {
 
     pub(super) fn persist_local_config(&self) {
         let mut disk_cfg = load_config(None);
-        // Persist local mode settings
+        // Persist local mode settings (including backend so /m switches survive restart)
         disk_cfg.agents.defaults.local_api_base =
             self.config.agents.defaults.local_api_base.clone();
+        disk_cfg.agents.defaults.local_backend =
+            self.config.agents.defaults.local_backend.clone();
         disk_cfg.agents.defaults.skip_jit_gate = self.config.agents.defaults.skip_jit_gate;
         disk_cfg.agents.defaults.lms_port = self.config.agents.defaults.lms_port;
         disk_cfg.agents.defaults.lms_main_model =
