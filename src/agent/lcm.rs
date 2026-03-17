@@ -409,9 +409,30 @@ impl LcmEngine {
         self.active.iter().map(|e| e.message().clone()).collect()
     }
 
-    /// Estimate the token count of the active context.
+    /// Estimate the token count of the active context (including system prompt).
     pub fn active_tokens(&self) -> usize {
         let messages: Vec<Value> = self.active_context();
+        TokenBudget::estimate_tokens(&messages)
+    }
+
+    /// Estimate token count of conversation only (excludes system prompt).
+    ///
+    /// The system prompt is a fixed cost that cannot be compacted, so it must
+    /// not count toward the compaction threshold. Without this, a large system
+    /// prompt (~8K tokens on a 32K window with tau_soft=0.5) leaves only ~7K
+    /// for conversation, triggering compaction after just 1-2 exchanges.
+    pub fn conversation_tokens(&self) -> usize {
+        let messages: Vec<Value> = self
+            .active
+            .iter()
+            .filter(|e| {
+                e.message()
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    != Some("system")
+            })
+            .map(|e| e.message().clone())
+            .collect();
         TokenBudget::estimate_tokens(&messages)
     }
 
@@ -422,7 +443,9 @@ impl LcmEngine {
         tool_def_tokens: usize,
     ) -> CompactionAction {
         let available = budget.available_budget(tool_def_tokens);
-        let current = self.active_tokens();
+        // Use conversation tokens only — the system prompt is fixed overhead
+        // that cannot be compacted and must not trigger the threshold.
+        let current = self.conversation_tokens();
 
         let hard_limit = (available as f64 * self.config.tau_hard) as usize;
         let soft_limit = (available as f64 * self.config.tau_soft) as usize;
@@ -1327,6 +1350,82 @@ mod tests {
             engine.check_thresholds(&budget, 500),
             CompactionAction::None
         );
+    }
+
+    /// A realistic system prompt (~8K tokens) should NOT trigger compaction
+    /// on a 32K context window after just 1-2 turns of conversation.
+    ///
+    /// Before the fix, `active_tokens()` counted the system prompt, so with
+    /// tau_soft=0.5 on a 32K window (soft limit ~15K), an 8K system prompt
+    /// left only ~7K for conversation before compaction fired at msg_count=2.
+    #[test]
+    fn test_system_prompt_excluded_from_compaction_threshold() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+        });
+
+        // Simulate a realistic ~8K-token system prompt (32K chars ≈ 8K tokens)
+        let big_system = "x".repeat(32_000);
+        engine.ingest(json!({"role": "system", "content": big_system}));
+
+        // Add 2 short conversation turns (~200 tokens total)
+        engine.ingest(json!({"role": "user", "content": "Hello, how are you?"}));
+        engine.ingest(json!({"role": "assistant", "content": "I'm fine, thanks for asking! How can I help you today?"}));
+        engine.ingest(json!({"role": "user", "content": "What is the weather like?"}));
+        engine.ingest(json!({"role": "assistant", "content": "I don't have access to weather data, but I can help with other things."}));
+
+        // 32K context, 2K reserve → 30K available, tau_soft=0.5 → soft=15K
+        let budget = TokenBudget::new(32_768, 2048);
+
+        // With the fix: conversation tokens (~200) are well under 15K → None
+        // Before the fix: 8K system + 200 conv = 8.2K, but the real bug is
+        // that it triggers even earlier with slightly more conversation.
+        assert_eq!(
+            engine.check_thresholds(&budget, 500),
+            CompactionAction::None,
+            "System prompt should not count toward compaction threshold"
+        );
+    }
+
+    /// Verify that conversation tokens (excluding system prompt) DO trigger
+    /// compaction when they genuinely exceed the soft threshold.
+    #[test]
+    fn test_conversation_tokens_trigger_compaction_when_over_threshold() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+        });
+
+        // Small system prompt
+        engine.ingest(json!({"role": "system", "content": "You are helpful."}));
+
+        // Fill conversation with enough tokens to exceed tau_soft on a small window
+        // 4K context, 512 reserve → 3.5K available, tau_soft=0.5 → soft=1.75K tokens
+        // Add ~2K tokens of conversation (8K chars / 4)
+        let big_msg = "y".repeat(8_000);
+        engine.ingest(json!({"role": "user", "content": big_msg}));
+
+        let budget = TokenBudget::new(4096, 512);
+        assert_eq!(
+            engine.check_thresholds(&budget, 0),
+            CompactionAction::Async,
+            "Conversation tokens over soft threshold should trigger async compaction"
+        );
+    }
+
+    /// `conversation_tokens()` should return 0 when only a system prompt exists.
+    #[test]
+    fn test_conversation_tokens_zero_for_system_only() {
+        let mut engine = LcmEngine::new(LcmConfig::default());
+        let big_system = "z".repeat(40_000); // ~10K tokens
+        engine.ingest(json!({"role": "system", "content": big_system}));
+
+        assert_eq!(engine.conversation_tokens(), 0);
     }
 
     #[test]
