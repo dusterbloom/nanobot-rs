@@ -4,6 +4,7 @@
 //! `SessionDb`. All functions are pure — no I/O.
 
 use serde_json::Value;
+use tracing::warn;
 
 /// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
 fn estimate_msg_tokens(m: &Value) -> usize {
@@ -18,6 +19,25 @@ fn estimate_msg_tokens(m: &Value) -> usize {
         .unwrap_or(0);
     // ~4 chars per token is a conservative estimate (tiktoken cl100k_base).
     (content_len + tc_len + 20) / 4 // +20 for role/JSON overhead
+}
+
+/// Advance an index past leading `role: "tool"` messages whose parent
+/// `assistant+tool_calls` is outside the window. Sending a lone tool result
+/// to the LLM is a protocol error.
+fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
+    let mut i = start;
+    while i < messages.len() {
+        if messages[i]
+            .get("role")
+            .and_then(|r| r.as_str())
+            == Some("tool")
+        {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
 }
 
 /// Filter messages: respect clear markers, skip orphaned tool results,
@@ -37,7 +57,8 @@ fn estimate_msg_tokens(m: &Value) -> usize {
 ///    (prevents context bombs when sessions accumulate large tool results)
 pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize) -> Vec<Value> {
     // Stage 1: max_messages window — start index into `messages`.
-    let start = if messages.len() > max_messages {
+    // max_messages=0 means "no limit".
+    let start = if max_messages > 0 && messages.len() > max_messages {
         messages.len() - max_messages
     } else {
         0
@@ -53,21 +74,7 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         .unwrap_or(0);
 
     // Stage 3: advance past orphaned tool results at the window boundary.
-    // A tool result is orphaned when its matching assistant+tool_calls message
-    // was before the window start and got dropped. Sending a lone tool result
-    // to the LLM is a protocol error, so we skip it.
-    let mut safe_start = start.max(clear_start);
-    while safe_start < messages.len() {
-        let role = messages[safe_start]
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        if role == "tool" {
-            safe_start += 1;
-        } else {
-            break;
-        }
-    }
+    let mut safe_start = skip_leading_orphan_tools(messages, start.max(clear_start));
 
     // Stage 4: turn-based limit. Scan backward from the end counting user
     // messages as turn boundaries. If more than `max_turns` user messages are
@@ -132,14 +139,17 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // calculates "30% of context / 150 tokens per message", we use
     // max_messages * 150 as the token ceiling. This gives history at most
     // 30% of the context window in tokens, not just in message count.
-    let token_budget = max_messages * 150;
+    let token_budget = max_messages.saturating_mul(150);
+    if token_budget == 0 {
+        // max_messages=0 means "no limit" in Stage 1; honour that here too.
+        return mapped;
+    }
     let total_tokens: usize = mapped.iter().map(|m| estimate_msg_tokens(m)).sum();
     if total_tokens <= token_budget {
         return mapped;
     }
 
-    // Over budget. Drop from the front (oldest), but skip orphaned tool
-    // results at the new boundary.
+    // Over budget. Drop from the front (oldest), skip orphaned tool results.
     let mut cumulative = 0;
     let mut keep_from = mapped.len();
     for i in (0..mapped.len()).rev() {
@@ -150,17 +160,16 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         cumulative += msg_tokens;
         keep_from = i;
     }
-    // Advance past orphaned tool results at the new boundary.
-    while keep_from < mapped.len() {
-        if mapped[keep_from]
-            .get("role")
-            .and_then(|r| r.as_str())
-            == Some("tool")
-        {
-            keep_from += 1;
-        } else {
-            break;
-        }
+    let keep_from = skip_leading_orphan_tools(&mapped, keep_from);
+    let dropped = mapped.len() - (mapped.len() - keep_from);
+    if dropped > 0 {
+        warn!(
+            dropped_messages = dropped,
+            budget_tokens = token_budget,
+            total_tokens = total_tokens,
+            kept_messages = mapped.len() - keep_from,
+            "token_budget_trim: dropped oldest messages from session history"
+        );
     }
     mapped[keep_from..].to_vec()
 }
@@ -627,6 +636,20 @@ mod tests {
     }
 
     #[test]
+    fn test_token_budget_zero_max_messages_preserves_all() {
+        // max_messages=0 means "no limit" in Stage 1. Stage 6 must honour
+        // that contract and not drop everything (H1 regression guard).
+        let messages = vec![
+            user("hello"),
+            assistant("world"),
+            user("follow up"),
+            assistant("reply"),
+        ];
+        let result = filter_history(&messages, 0, 0);
+        assert_eq!(result.len(), 4, "max_messages=0 must preserve all history");
+    }
+
+    #[test]
     fn test_token_budget_preserves_small_history() {
         // Small messages well under budget → all preserved.
         let messages = vec![
@@ -641,34 +664,47 @@ mod tests {
 
     #[test]
     fn test_token_budget_skips_orphaned_tool_results_at_boundary() {
-        // When token budget drops messages, the new boundary might start
-        // with orphaned tool results. These must be skipped.
-        let big = "x".repeat(2000);
+        // When token budget drops messages, the new boundary might land on
+        // a tool result whose parent assistant+tool_calls was dropped.
+        // The orphan-skip must advance past it.
+        //
+        // Layout: [assistant+tc (big), tool_result (big), user, assistant]
+        // max_messages=2 → budget = 300 tokens.
+        // The big messages (~500 tokens each) blow the budget; backward walk
+        // keeps user + assistant (~13 tokens), then can't fit tool_result.
+        // keep_from lands at index 2 (user) — no orphan at boundary.
+        //
+        // To force the orphan case: budget must fit the tool_result but NOT
+        // its parent. Use max_messages=5 → budget=750. Backward walk keeps
+        // assistant(6) + user(6) + tool_result(~505) = 517 < 750, then tries
+        // assistant+tc (~45) = 562 < 750 — fits. So we need the tool result
+        // to be the tipping point.
+        //
+        // Simplest: make the assistant+tool_calls message large so it busts
+        // the budget, leaving tool_result as first kept message (orphaned).
+        let big_args = "y".repeat(3000); // ~750 tokens in tool_calls JSON
         let messages = vec![
-            tool_call_assistant("c1"),  // parent of tool result below
-            json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": &big}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "exec", "arguments": &big_args}}]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "ok"}),
             user("question"),
             assistant("answer"),
         ];
         // max_messages=4 → budget = 600 tokens.
-        // Total is ~500 (tool) + overhead. If the tool result is at the
-        // boundary, it should be skipped as orphaned.
+        // assistant+tc is ~770 tokens (big_args alone). Total > 600.
+        // Backward walk: answer(7) + question(7) + tool(8) = 22 < 600.
+        // Adding assistant+tc (770) = 792 > 600 → stop. keep_from = 1 (tool).
+        // Orphan skip advances past the tool result → keep_from = 2.
         let result = filter_history(&messages, 4, 0);
-        // The tool result's parent (tool_call_assistant) might be dropped,
-        // making the tool result orphaned at the new boundary.
-        for m in &result {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "tool" {
-                // If a tool message survived, its parent must also be present.
-                let tc_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-                let has_parent = result.iter().any(|p| {
-                    p.get("tool_calls")
-                        .and_then(|tc| tc.as_array())
-                        .map(|arr| arr.iter().any(|t| t.get("id").and_then(|i| i.as_str()) == Some(tc_id)))
-                        .unwrap_or(false)
-                });
-                assert!(has_parent, "orphaned tool result should have been dropped");
-            }
-        }
+        assert!(
+            result.iter().all(|m| role_of(m) != "tool"),
+            "orphaned tool result at token-budget boundary must be skipped"
+        );
+        assert_eq!(result.len(), 2, "only user + assistant should remain");
+        assert_eq!(result[0]["content"], "question");
+        assert_eq!(result[1]["content"], "answer");
     }
 }
