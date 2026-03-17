@@ -16,6 +16,9 @@ use crate::agent::budget_calibrator::BudgetCalibrator;
 use crate::agent::lora_bridge::ExperienceBuffer;
 use crate::config::schema::PerplexityGateConfig;
 
+const DEFAULT_LEARN_IDLE_MS: u64 = 30_000;
+const MAX_LEARN_IDLE_MS: u64 = 10 * 60 * 1000;
+
 /// Flat struct capturing all observer-needed data from a completed turn.
 ///
 /// All fields are owned (no references/lifetimes) so `TurnOutcome` can be
@@ -102,6 +105,151 @@ impl DefaultLearnLoop {
         } else {
             "tool_use"
         }
+    }
+}
+
+#[derive(Clone)]
+struct LearnTelemetryContext {
+    model: String,
+    session_key: String,
+    turn_count: u64,
+    experience_count: u32,
+    new_experience_count: u32,
+    replay_experience_count: u32,
+    idle_target_ms: u64,
+    idle_wait_ms: u64,
+}
+
+fn emit_learn_metric(
+    telemetry: &LearnTelemetryContext,
+    event: &str,
+    backend: &str,
+    status: &str,
+    train_elapsed_ms: Option<u64>,
+    reload_wait_ms: Option<u64>,
+) {
+    crate::agent::metrics::emit_learn(&crate::agent::metrics::LearnMetrics {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        role: "learn".into(),
+        event: event.into(),
+        backend: backend.into(),
+        status: status.into(),
+        model: telemetry.model.clone(),
+        session_key: telemetry.session_key.clone(),
+        turn_count: telemetry.turn_count,
+        experience_count: telemetry.experience_count,
+        new_experience_count: telemetry.new_experience_count,
+        replay_experience_count: telemetry.replay_experience_count,
+        idle_target_ms: Some(telemetry.idle_target_ms),
+        idle_wait_ms: Some(telemetry.idle_wait_ms),
+        train_elapsed_ms,
+        reload_wait_ms,
+    });
+}
+
+fn learn_idle_wait_ms() -> u64 {
+    std::env::var("NANOBOT_LEARN_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.min(MAX_LEARN_IDLE_MS))
+        .unwrap_or(DEFAULT_LEARN_IDLE_MS)
+}
+
+fn reserve_training_slot(
+    train_counters: Option<&Arc<crate::agent::agent_core::RuntimeCounters>>,
+) -> bool {
+    train_counters
+        .map(|tc| {
+            tc.training_active
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        })
+        .unwrap_or(true)
+}
+
+fn mark_training_started(train_counters: Option<&Arc<crate::agent::agent_core::RuntimeCounters>>) {
+    if let Some(tc) = train_counters {
+        tc.training_active.store(true, Ordering::Relaxed);
+        tc.training_started_ms.store(
+            crate::agent::agent_core::RuntimeCounters::now_epoch_ms(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn clear_training_state(train_counters: Option<&Arc<crate::agent::agent_core::RuntimeCounters>>) {
+    if let Some(tc) = train_counters {
+        tc.training_active.store(false, Ordering::Relaxed);
+        tc.training_started_ms.store(0, Ordering::Relaxed);
+        tc.training_current_step.store(0, Ordering::Relaxed);
+        tc.training_total_steps.store(0, Ordering::Relaxed);
+        tc.training_loss_x10k.store(0, Ordering::Relaxed);
+    }
+}
+
+async fn wait_for_idle_window_async(
+    train_counters: Option<&Arc<crate::agent::agent_core::RuntimeCounters>>,
+    idle_ms: u64,
+) -> bool {
+    let Some(tc) = train_counters else {
+        return true;
+    };
+    if idle_ms == 0 {
+        return true;
+    }
+    loop {
+        if tc.training_cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if tc.inference_active.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        }
+        let now_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+        let last_done_ms = tc.last_inference_finished_ms.load(Ordering::Relaxed);
+        let quiet_ms = now_ms.saturating_sub(last_done_ms);
+        if last_done_ms != 0 && quiet_ms >= idle_ms {
+            return true;
+        }
+        let sleep_ms = if last_done_ms == 0 {
+            idle_ms.min(1_000)
+        } else {
+            idle_ms.saturating_sub(quiet_ms).min(1_000)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms.max(100))).await;
+    }
+}
+
+fn wait_for_idle_window_blocking(
+    train_counters: Option<&Arc<crate::agent::agent_core::RuntimeCounters>>,
+    idle_ms: u64,
+) -> bool {
+    let Some(tc) = train_counters else {
+        return true;
+    };
+    if idle_ms == 0 {
+        return true;
+    }
+    loop {
+        if tc.training_cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if tc.inference_active.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            continue;
+        }
+        let now_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+        let last_done_ms = tc.last_inference_finished_ms.load(Ordering::Relaxed);
+        let quiet_ms = now_ms.saturating_sub(last_done_ms);
+        if last_done_ms != 0 && quiet_ms >= idle_ms {
+            return true;
+        }
+        let sleep_ms = if last_done_ms == 0 {
+            idle_ms.min(1_000)
+        } else {
+            idle_ms.saturating_sub(quiet_ms).min(1_000)
+        };
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms.max(100)));
     }
 }
 
@@ -303,7 +451,7 @@ impl LearnLoop for DefaultLearnLoop {
             // replay buffer of top-quality exported ones to prevent LoRA drift.
             // Replay = min(n_new, 10). So 5 new → 10 steps, not 30.
             const AUTO_NEW_CAP: usize = 30;
-            let (exps_data, ids) = {
+            let (exps_data, ids, n_new, replay_count) = {
                 let eb = eb_mutex.lock();
                 let new_exps = match eb.top_unexported(AUTO_NEW_CAP) {
                     Ok(e) => e,
@@ -338,7 +486,36 @@ impl LearnLoop for DefaultLearnLoop {
                     n_new,
                     data.len() - n_new
                 );
-                (data, unexported_ids)
+                let replay_count = data.len() - n_new;
+                (data, unexported_ids, n_new, replay_count)
+            };
+            let idle_wait_ms = learn_idle_wait_ms();
+            if !reserve_training_slot(train_counters.as_ref()) {
+                debug!("perplexity_gate: skipping — training already in progress");
+                return;
+            }
+            let queue_started_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+            if idle_wait_ms > 0 {
+                debug!(
+                    idle_wait_ms,
+                    "perplexity_gate: waiting for idle window before training"
+                );
+                if !wait_for_idle_window_async(train_counters.as_ref(), idle_wait_ms).await {
+                    clear_training_state(train_counters.as_ref());
+                    return;
+                }
+            }
+            let waited_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                .saturating_sub(queue_started_ms);
+            let telemetry = LearnTelemetryContext {
+                model: outcome.model.clone(),
+                session_key: outcome.session_key.clone(),
+                turn_count: outcome.turn_count,
+                experience_count: exps_data.len() as u32,
+                new_experience_count: n_new as u32,
+                replay_experience_count: replay_count as u32,
+                idle_target_ms: idle_wait_ms,
+                idle_wait_ms: waited_ms,
             };
 
             // ANE split-silicon training: train on CPU/ANE thread,
@@ -385,6 +562,7 @@ impl LearnLoop for DefaultLearnLoop {
                                     epochs,
                                     &pg_config.mlx_server_url,
                                     &train_counters,
+                                    Some(telemetry.clone()),
                                 )
                                 .await;
                                 return;
@@ -423,18 +601,26 @@ impl LearnLoop for DefaultLearnLoop {
                         }
                         if !samples.is_empty() {
                             let mlx_tx = mlx_provider.as_ref().map(|mlx| mlx.model_tx());
-                            // Signal training start.
-                            if let Some(ref tc) = train_counters {
-                                tc.training_active.store(true, Ordering::Relaxed);
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-                                tc.training_started_ms.store(now_ms, Ordering::Relaxed);
-                            }
+                            emit_learn_metric(
+                                &telemetry,
+                                "train_start",
+                                "ane",
+                                "started",
+                                None,
+                                None,
+                            );
+                            mark_training_started(train_counters.as_ref());
+                            let training_started_ms =
+                                crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
                             let tc_for_done = train_counters.clone();
+                            let telemetry_for_done = telemetry.clone();
                             let handle = if let Some(ref trainer) = ane_trainer {
-                                trainer.spawn_training_with_progress(ane_cfg, samples, mlx_tx, train_counters.clone())
+                                trainer.spawn_training_with_progress(
+                                    ane_cfg,
+                                    samples,
+                                    mlx_tx,
+                                    train_counters.clone(),
+                                )
                             } else {
                                 crate::agent::ane_mlx_bridge::spawn_ane_training(
                                     ane_cfg, samples, mlx_tx,
@@ -452,28 +638,53 @@ impl LearnLoop for DefaultLearnLoop {
                                 .name("ane-train-watcher".into())
                                 .spawn(move || {
                             let ok = handle.join().unwrap_or(false);
-                            if let Some(ref tc) = tc_for_done {
-                                tc.training_active.store(false, Ordering::Relaxed);
-                                tc.training_current_step.store(0, Ordering::Relaxed);
-                                tc.training_total_steps.store(0, Ordering::Relaxed);
-                                tc.training_loss_x10k.store(0, Ordering::Relaxed);
-                                if ok {
-                                    tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
+                            let train_elapsed_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                                .saturating_sub(training_started_ms);
                             if ok {
                                 let eb = eb_for_done.lock();
                                 let _ = eb.mark_exported(&ids);
                                 info!(
                                     "perplexity_gate: ANE training completed ({n_exps} experiences)"
                                 );
-                                // Trigger oMLX/LM Studio model reload so it picks up new adapters.
-                                omlx_try_reload_from_config();
+                                if let Some(ref tc) = tc_for_done {
+                                    tc.training_steps_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                                // Delay oMLX/LM Studio reload until the system is
+                                // idle so the next foreground turn does not pay the
+                                // unload/reload cost immediately after training.
+                                let reload_wait_started_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+                                let reloaded = wait_for_idle_window_blocking(tc_for_done.as_ref(), idle_wait_ms);
+                                let reload_wait_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                                    .saturating_sub(reload_wait_started_ms);
+                                if reloaded {
+                                    omlx_try_reload_from_config();
+                                }
+                                emit_learn_metric(
+                                    &telemetry_for_done,
+                                    "train_end",
+                                    "ane",
+                                    if reloaded {
+                                        "finished"
+                                    } else {
+                                        "finished_reload_skipped"
+                                    },
+                                    Some(train_elapsed_ms),
+                                    Some(reload_wait_ms),
+                                );
                             } else {
                                 warn!(
                                     "perplexity_gate: ANE training failed, experiences NOT marked exported"
                                 );
+                                emit_learn_metric(
+                                    &telemetry_for_done,
+                                    "train_end",
+                                    "ane",
+                                    "failed",
+                                    Some(train_elapsed_ms),
+                                    None,
+                                );
                             }
+                            clear_training_state(tc_for_done.as_ref());
                         }).ok();
                             return;
                         }
@@ -495,6 +706,7 @@ impl LearnLoop for DefaultLearnLoop {
                 epochs,
                 &pg_config.mlx_server_url,
                 &train_counters,
+                Some(telemetry),
             )
             .await;
         });
@@ -605,7 +817,10 @@ pub(crate) fn omlx_try_reload_from_config() {
     if defaults.local_api_base.is_empty() || defaults.local_model.is_empty() {
         return;
     }
-    let base = defaults.local_api_base.trim_end_matches("/v1").trim_end_matches('/');
+    let base = defaults
+        .local_api_base
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
     let model_id = &defaults.local_model;
     let url = format!("{base}/v1/models/{model_id}/unload");
     let client = match reqwest::blocking::Client::builder()
@@ -622,7 +837,9 @@ pub(crate) fn omlx_try_reload_from_config() {
     }
     match req.send() {
         Ok(resp) if resp.status().is_success() => {
-            info!("oMLX: unloaded {model_id} for adapter reload (next request reloads with adapters)");
+            info!(
+                "oMLX: unloaded {model_id} for adapter reload (next request reloads with adapters)"
+            );
         }
         Ok(resp) => {
             debug!("oMLX: unload {model_id} returned {}", resp.status());
@@ -645,16 +862,14 @@ async fn try_http_train(
     epochs: usize,
     server_url: &str,
     train_counters: &Option<Arc<crate::agent::agent_core::RuntimeCounters>>,
+    telemetry: Option<LearnTelemetryContext>,
 ) {
     // Signal training start.
-    if let Some(ref tc) = train_counters {
-        tc.training_active.store(true, Ordering::Relaxed);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        tc.training_started_ms.store(now_ms, Ordering::Relaxed);
+    mark_training_started(train_counters.as_ref());
+    if let Some(ref telemetry) = telemetry {
+        emit_learn_metric(telemetry, "train_start", "http", "started", None, None);
     }
+    let train_started_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
 
     let conversations: Vec<serde_json::Value> = exps_data
         .iter()
@@ -674,9 +889,20 @@ async fn try_http_train(
         Ok(c) => c,
         Err(_) => {
             // Signal training done (failed to build client).
-            if let Some(ref tc) = train_counters {
-                tc.training_active.store(false, Ordering::Relaxed);
+            if let Some(ref telemetry) = telemetry {
+                emit_learn_metric(
+                    telemetry,
+                    "train_end",
+                    "http",
+                    "failed_client_build",
+                    Some(
+                        crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                            .saturating_sub(train_started_ms),
+                    ),
+                    None,
+                );
             }
+            clear_training_state(train_counters.as_ref());
             return;
         }
     };
@@ -691,14 +917,55 @@ async fn try_http_train(
                 "perplexity_gate: triggered HTTP training with {} experiences",
                 ids.len()
             );
+            if let Some(ref telemetry) = telemetry {
+                emit_learn_metric(
+                    telemetry,
+                    "train_end",
+                    "http",
+                    "finished",
+                    Some(
+                        crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                            .saturating_sub(train_started_ms),
+                    ),
+                    None,
+                );
+            }
         }
-        Ok(resp) => debug!("perplexity_gate: /train returned {}", resp.status()),
-        Err(e) => debug!("perplexity_gate: HTTP training failed: {e}"),
+        Ok(resp) => {
+            debug!("perplexity_gate: /train returned {}", resp.status());
+            if let Some(ref telemetry) = telemetry {
+                emit_learn_metric(
+                    telemetry,
+                    "train_end",
+                    "http",
+                    "failed_http_status",
+                    Some(
+                        crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                            .saturating_sub(train_started_ms),
+                    ),
+                    None,
+                );
+            }
+        }
+        Err(e) => {
+            debug!("perplexity_gate: HTTP training failed: {e}");
+            if let Some(ref telemetry) = telemetry {
+                emit_learn_metric(
+                    telemetry,
+                    "train_end",
+                    "http",
+                    "failed_http_error",
+                    Some(
+                        crate::agent::agent_core::RuntimeCounters::now_epoch_ms()
+                            .saturating_sub(train_started_ms),
+                    ),
+                    None,
+                );
+            }
+        }
     }
     // Signal training done.
-    if let Some(ref tc) = train_counters {
-        tc.training_active.store(false, Ordering::Relaxed);
-    }
+    clear_training_state(train_counters.as_ref());
 }
 
 #[cfg(test)]

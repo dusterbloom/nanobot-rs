@@ -514,7 +514,7 @@ impl AgentLoopShared {
                 break;
             }
 
-            counters.inference_active.store(true, Ordering::Relaxed);
+            counters.mark_inference_started();
             let cont_result = ctx
                 .core
                 .provider
@@ -528,7 +528,7 @@ impl AgentLoopShared {
                     None,
                 )
                 .await;
-            counters.inference_active.store(false, Ordering::Relaxed);
+            counters.mark_inference_finished();
 
             match cont_result {
                 Ok(cont_response) => {
@@ -566,11 +566,8 @@ impl AgentLoopShared {
         {
             ctx.flow.retries.rescue_attempted = true;
             let rescue_tokens = ctx.core.max_tokens.min(384).max(128);
-            let rescue_messages = prepare_rescue_messages(
-                &ctx.messages,
-                &*ctx.protocol,
-            );
-            counters.inference_active.store(true, Ordering::Relaxed);
+            let rescue_messages = prepare_rescue_messages(&ctx.messages, &*ctx.protocol);
+            counters.mark_inference_started();
             let rescue_result = ctx
                 .core
                 .provider
@@ -584,7 +581,7 @@ impl AgentLoopShared {
                     None,
                 )
                 .await;
-            counters.inference_active.store(false, Ordering::Relaxed);
+            counters.mark_inference_finished();
 
             match rescue_result {
                 Ok(r) => {

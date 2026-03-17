@@ -196,6 +196,8 @@ pub struct RuntimeCounters {
     /// Wrapped in Arc so the watchdog can hold a cheap clone without needing
     /// the full RuntimeCounters.
     pub inference_active: Arc<AtomicBool>,
+    /// Timestamp (epoch ms) when the most recent inference finished.
+    pub last_inference_finished_ms: AtomicU64,
     /// Trio routing observability.
     pub trio_metrics: TrioMetrics,
     /// Circuit breaker for trio routing providers.
@@ -247,6 +249,7 @@ impl RuntimeCounters {
             last_estimated_prompt_tokens: AtomicU64::new(0),
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
+            last_inference_finished_ms: AtomicU64::new(0),
             trio_metrics: TrioMetrics::default(),
             trio_circuit_breaker: parking_lot::Mutex::new(CircuitBreaker::new(cb_config)),
             trio_state: AtomicU8::new(TrioState::Standalone as u8),
@@ -267,6 +270,23 @@ impl RuntimeCounters {
 }
 
 impl RuntimeCounters {
+    pub(crate) fn now_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn mark_inference_started(&self) {
+        self.inference_active.store(true, Ordering::Relaxed);
+    }
+
+    pub fn mark_inference_finished(&self) {
+        self.inference_active.store(false, Ordering::Relaxed);
+        self.last_inference_finished_ms
+            .store(Self::now_epoch_ms(), Ordering::Relaxed);
+    }
+
     /// Update trio state, logging only on transitions.
     pub fn set_trio_state(&self, new_state: TrioState) {
         let old = self

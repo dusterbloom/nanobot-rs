@@ -786,7 +786,6 @@ impl AgentLoopShared {
         msg_count = ctx.messages.len(),
     ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
-
         // Response boundary: suppress exec/write_file tools to force text output.
         let boundary_active = ctx.flow.force_response
             && ctx.core.provenance_config.enabled
@@ -813,8 +812,7 @@ impl AgentLoopShared {
         }
 
         // Select and filter tool definitions for this turn.
-        let (mut tool_defs, saved_tool_defs) =
-            self.select_tool_definitions(ctx, boundary_active);
+        let (mut tool_defs, saved_tool_defs) = self.select_tool_definitions(ctx, boundary_active);
         let tool_defs_opt: Option<&[Value]> = if tool_defs.is_empty() {
             None
         } else {
@@ -1414,7 +1412,7 @@ impl AgentLoopShared {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             return StepResult::Done(IterationOutcome::Continue);
         }
-        counters.inference_active.store(false, Ordering::Relaxed);
+        counters.mark_inference_finished();
         error!(model = %ctx.core.model, error = %e, "{label}_failed");
         StepResult::Done(IterationOutcome::Error(format!(
             "I encountered an error: {}",
@@ -1464,7 +1462,7 @@ impl AgentLoopShared {
             }
         };
         // Signal watchdog: LLM inference is active — skip health checks.
-        counters.inference_active.store(true, Ordering::Relaxed);
+        counters.mark_inference_started();
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
 
         // Use the protocol-rendered wire format for the provider call.
@@ -1561,7 +1559,7 @@ impl AgentLoopShared {
             match streamed_response {
                 Some(r) => r,
                 None => {
-                    counters.inference_active.store(false, Ordering::Relaxed);
+                    counters.mark_inference_finished();
                     // Stream ended without Done — either cancelled or genuine error.
                     if ctx.is_cancelled() {
                         // Cancelled mid-stream — exit cleanly.
@@ -1597,7 +1595,7 @@ impl AgentLoopShared {
         };
 
         // Inference complete — allow watchdog health checks again.
-        counters.inference_active.store(false, Ordering::Relaxed);
+        counters.mark_inference_finished();
 
         StepResult::Next(IterationPhase::Processing { response })
     }
@@ -1622,11 +1620,7 @@ impl AgentLoopShared {
         delegation_enabled = ctx.core.tool_delegation_config.enabled,
         n_tool_calls = response.tool_calls.len(),
     ))]
-    async fn step_execute_tools(
-        &self,
-        ctx: &mut TurnContext,
-        response: LLMResponse,
-    ) -> StepResult {
+    async fn step_execute_tools(&self, ctx: &mut TurnContext, response: LLMResponse) -> StepResult {
         let counters = &self.core_handle.counters;
 
         let routed_tool_calls = match crate::agent::router::route_tool_calls(
