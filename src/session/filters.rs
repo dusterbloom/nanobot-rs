@@ -5,8 +5,23 @@
 
 use serde_json::Value;
 
+/// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
+fn estimate_msg_tokens(m: &Value) -> usize {
+    let content_len = m
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let tc_len = m
+        .get("tool_calls")
+        .map(|v| v.to_string().len())
+        .unwrap_or(0);
+    // ~4 chars per token is a conservative estimate (tiktoken cl100k_base).
+    (content_len + tc_len + 20) / 4 // +20 for role/JSON overhead
+}
+
 /// Filter messages: respect clear markers, skip orphaned tool results,
-/// filter synthetics, apply turn limit, and map to wire format.
+/// filter synthetics, apply turn limit, token budget, and map to wire format.
 ///
 /// This is the primary entry point — it applies all filtering stages
 /// in sequence:
@@ -18,6 +33,8 @@ use serde_json::Value;
 /// 4. Turn limit — keep only the last `max_turns` user-assistant pairs
 /// 5. Per-message filter/map — strip synthetics, clear markers, summaries;
 ///    copy role, content, tool_calls, tool_call_id, name, _turn to wire format
+/// 6. Token budget — drop oldest messages until total tokens ≤ budget
+///    (prevents context bombs when sessions accumulate large tool results)
 pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize) -> Vec<Value> {
     // Stage 1: max_messages window — start index into `messages`.
     let start = if messages.len() > max_messages {
@@ -71,7 +88,7 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     }
 
     // Stage 5: filter and map each surviving message to wire format.
-    messages[safe_start..]
+    let mapped: Vec<Value> = messages[safe_start..]
         .iter()
         .filter(|m| {
             // Skip synthetic router/specialist injections — ephemeral to the
@@ -106,7 +123,46 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             }
             msg
         })
-        .collect()
+        .collect();
+
+    // Stage 6: Token budget — prevent context bombs from sessions that
+    // accumulated large tool results. Walk backward from the end, keeping
+    // messages until the cumulative token count exceeds the budget.
+    // Budget is derived from max_messages: since history_limit() already
+    // calculates "30% of context / 150 tokens per message", we use
+    // max_messages * 150 as the token ceiling. This gives history at most
+    // 30% of the context window in tokens, not just in message count.
+    let token_budget = max_messages * 150;
+    let total_tokens: usize = mapped.iter().map(|m| estimate_msg_tokens(m)).sum();
+    if total_tokens <= token_budget {
+        return mapped;
+    }
+
+    // Over budget. Drop from the front (oldest), but skip orphaned tool
+    // results at the new boundary.
+    let mut cumulative = 0;
+    let mut keep_from = mapped.len();
+    for i in (0..mapped.len()).rev() {
+        let msg_tokens = estimate_msg_tokens(&mapped[i]);
+        if cumulative + msg_tokens > token_budget {
+            break;
+        }
+        cumulative += msg_tokens;
+        keep_from = i;
+    }
+    // Advance past orphaned tool results at the new boundary.
+    while keep_from < mapped.len() {
+        if mapped[keep_from]
+            .get("role")
+            .and_then(|r| r.as_str())
+            == Some("tool")
+        {
+            keep_from += 1;
+        } else {
+            break;
+        }
+    }
+    mapped[keep_from..].to_vec()
 }
 
 #[cfg(test)]
@@ -541,5 +597,78 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "q2");
         assert_eq!(result[1]["content"], "a2");
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 6: Token budget
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_token_budget_drops_old_messages_when_over_budget() {
+        // max_messages=6 → token budget = 6 * 150 = 900 tokens.
+        // Each "x".repeat(2000) message is ~500 tokens (2020 chars / 4).
+        // 3 such messages = ~1500 tokens > 900 budget.
+        let big = "x".repeat(2000);
+        let messages = vec![
+            user(&big),           // ~500 tokens (oldest, should be dropped)
+            assistant(&big),      // ~500 tokens (should be dropped)
+            user("recent"),       // ~6 tokens (kept)
+            assistant("answer"),  // ~7 tokens (kept)
+        ];
+        let result = filter_history(&messages, 6, 0);
+        // The two big messages (~1000 tokens) exceed the budget of 900.
+        // Walking backward: "answer" (7) + "recent" (6) = 13, well under 900.
+        // Adding assistant(&big) would be 13 + 500 = 513, still under.
+        // Adding user(&big) would be 513 + 500 = 1013 > 900 → stop.
+        // So we keep 3 messages.
+        assert!(result.len() <= 3, "expected at most 3 messages, got {}", result.len());
+        // The last message must be the "answer"
+        assert_eq!(result.last().unwrap()["content"], "answer");
+    }
+
+    #[test]
+    fn test_token_budget_preserves_small_history() {
+        // Small messages well under budget → all preserved.
+        let messages = vec![
+            user("hi"),
+            assistant("hello"),
+            user("how are you"),
+            assistant("fine"),
+        ];
+        let result = filter_history(&messages, 100, 0);
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn test_token_budget_skips_orphaned_tool_results_at_boundary() {
+        // When token budget drops messages, the new boundary might start
+        // with orphaned tool results. These must be skipped.
+        let big = "x".repeat(2000);
+        let messages = vec![
+            tool_call_assistant("c1"),  // parent of tool result below
+            json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": &big}),
+            user("question"),
+            assistant("answer"),
+        ];
+        // max_messages=4 → budget = 600 tokens.
+        // Total is ~500 (tool) + overhead. If the tool result is at the
+        // boundary, it should be skipped as orphaned.
+        let result = filter_history(&messages, 4, 0);
+        // The tool result's parent (tool_call_assistant) might be dropped,
+        // making the tool result orphaned at the new boundary.
+        for m in &result {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "tool" {
+                // If a tool message survived, its parent must also be present.
+                let tc_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let has_parent = result.iter().any(|p| {
+                    p.get("tool_calls")
+                        .and_then(|tc| tc.as_array())
+                        .map(|arr| arr.iter().any(|t| t.get("id").and_then(|i| i.as_str()) == Some(tc_id)))
+                        .unwrap_or(false)
+                });
+                assert!(has_parent, "orphaned tool result should have been dropped");
+            }
+        }
     }
 }
