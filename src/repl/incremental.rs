@@ -74,7 +74,7 @@ impl IncrementalRenderer {
 
     /// Feed a text delta. May print zero or more completed lines to stdout.
     pub fn push(&mut self, delta: &str) {
-        // Detect thinking start: agent_loop sends "\x1b[90m🧠 \x1b[2m"
+        // Detect thinking start: agent_loop sends "\x1b[90m\x1b[2m"
         if delta.starts_with("\x1b[90m") {
             if !matches!(self.state, StreamState::Thinking { .. }) {
                 self.clear_partial_internal();
@@ -282,7 +282,7 @@ impl IncrementalRenderer {
                 }
                 if !*marker_printed {
                     *marker_printed = true;
-                    println!("\r\x1b[2m\u{1f9e0} {}\x1b[0m", line);
+                    println!("\r\x1b[2m{}\x1b[0m", line);
                 } else {
                     println!("\r  \x1b[2m{}\x1b[0m", line);
                 }

@@ -360,7 +360,7 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 /// Build the REPL prompt string based on current mode.
 pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
     let think_prefix = if thinking_on {
-        "\x1b[2m\u{1f9e0}\x1b[0m"
+        "\x1b[2mT\x1b[0m"
     } else {
         ""
     };
@@ -2187,7 +2187,7 @@ mod tests {
     #[test]
     fn test_build_prompt_thinking() {
         let p = build_prompt(false, false, true);
-        assert!(p.contains("\u{1f9e0}"));
+        assert!(p.contains("T"));
         assert!(p.contains(">"));
     }
 

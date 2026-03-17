@@ -47,7 +47,7 @@ impl ReplContext {
         let thinking = counters.thinking_budget.load(Ordering::Relaxed);
         if thinking > 0 {
             println!(
-                "  {}THINKING{}  {}\u{1f9e0}{} enabled (budget: {} tokens)",
+                "  {}THINKING{}  {}enabled{} (budget: {} tokens)",
                 tui::BOLD,
                 tui::RESET,
                 tui::GREY,

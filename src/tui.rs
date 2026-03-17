@@ -297,7 +297,7 @@ pub(crate) fn terminal_height() -> usize {
 /// Layout (at terminal bottom):
 /// ```text
 /// ──────────────────────────────────────────────
-///   ~/Dev/nanobot · opus-4-6 · 🧠 thinking
+///   ~/Dev/nanobot · opus-4-6 · thinking
 ///   ⏵⏵ /t think · /l local · /v voice · ctx 12K/1M
 /// ```
 ///
@@ -343,7 +343,7 @@ pub(crate) fn render_input_bar(
     };
 
     let think_str = if thinking_on {
-        format!(" · {GREY}\u{1f9e0} thinking{RESET}")
+        format!(" · {GREY}thinking{RESET}")
     } else {
         String::new()
     };
@@ -522,7 +522,7 @@ pub(crate) fn print_status_bar(
 
     // Thinking mode indicator
     if core_handle.counters.thinking_budget.load(Ordering::Relaxed) > 0 {
-        parts.push(format!("{GREY}\u{1f9e0}{RESET}"));
+        parts.push(format!("{GREY}T{RESET}"));
     }
 
     // Training status indicator
