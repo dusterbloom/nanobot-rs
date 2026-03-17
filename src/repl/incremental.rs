@@ -78,7 +78,9 @@ impl IncrementalRenderer {
         if delta.starts_with("\x1b[90m") {
             if !matches!(self.state, StreamState::Thinking { .. }) {
                 self.clear_partial_internal();
-                self.state = StreamState::Thinking { marker_printed: false };
+                self.state = StreamState::Thinking {
+                    marker_printed: false,
+                };
             }
             // The prefix is display-only ANSI — don't buffer.
             return;
@@ -110,8 +112,7 @@ impl IncrementalRenderer {
 
                 // Process remaining content after reset + trailing newlines.
                 let after_reset = &delta[reset_pos + "\x1b[0m".len()..];
-                let remaining =
-                    after_reset.trim_start_matches(|c: char| c == '\n' || c == '\r');
+                let remaining = after_reset.trim_start_matches(|c: char| c == '\n' || c == '\r');
                 if !remaining.is_empty() {
                     self.push(remaining);
                 }

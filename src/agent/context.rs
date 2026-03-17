@@ -1887,7 +1887,11 @@ mod tests {
             cb.build_messages(&history, "what's up?", None, None, None, None, false, None);
 
         // Should have: system, developer (timestamp+context), history entry, current user message.
-        assert!(messages.len() >= 3, "expected at least system + history + user, got {}", messages.len());
+        assert!(
+            messages.len() >= 3,
+            "expected at least system + history + user, got {}",
+            messages.len()
+        );
         assert_eq!(messages[0]["role"], "system");
         // Last message is always the current user message.
         let last = messages.last().unwrap();
@@ -1928,7 +1932,11 @@ mod tests {
         let (_tmp, cb) = make_context();
         let messages = cb.build_messages(&[], "test", None, None, None, None, false, None);
         // system + optional developer (timestamp) + current user message
-        assert!(messages.len() >= 2, "expected at least system + user, got {}", messages.len());
+        assert!(
+            messages.len() >= 2,
+            "expected at least system + user, got {}",
+            messages.len()
+        );
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages.last().unwrap()["role"], "user");
     }
@@ -2359,9 +2367,13 @@ mod tests {
         // Must still have a system message.
         assert!(messages.iter().any(|m| m["role"] == "system"));
         // Developer message exists and contains the timestamp.
-        let dev: Vec<_> = messages.iter().filter(|m| m["role"] == "developer").collect();
+        let dev: Vec<_> = messages
+            .iter()
+            .filter(|m| m["role"] == "developer")
+            .collect();
         assert!(
-            dev.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Current time")),
+            dev.iter()
+                .any(|m| m["content"].as_str().unwrap_or("").contains("Current time")),
             "developer message should contain timestamp"
         );
     }

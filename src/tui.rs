@@ -549,9 +549,18 @@ pub(crate) fn print_status_bar(
         .training_steps_total
         .load(Ordering::Relaxed);
     if core_handle.counters.training_active.load(Ordering::Relaxed) {
-        let cur = core_handle.counters.training_current_step.load(Ordering::Relaxed);
-        let total = core_handle.counters.training_total_steps.load(Ordering::Relaxed);
-        let loss_x10k = core_handle.counters.training_loss_x10k.load(Ordering::Relaxed);
+        let cur = core_handle
+            .counters
+            .training_current_step
+            .load(Ordering::Relaxed);
+        let total = core_handle
+            .counters
+            .training_total_steps
+            .load(Ordering::Relaxed);
+        let loss_x10k = core_handle
+            .counters
+            .training_loss_x10k
+            .load(Ordering::Relaxed);
         let loss = loss_x10k as f64 / 10000.0;
         if total > 0 {
             let pct = (cur * 100).checked_div(total).unwrap_or(0);

@@ -954,7 +954,9 @@ pub(crate) async fn run_gateway_async(
     }
 
     // Signal training to stop so it doesn't block shutdown.
-    shutdown_counters.training_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown_counters
+        .training_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     agent_loop.stop();
     heartbeat.stop().await;

@@ -1289,7 +1289,13 @@ impl QuantizedModelWeights {
         let hpg = cfg.heads_per_group();
 
         // Embedding — must be f32 (accessed every step, random access pattern)
-        tracing::debug!(bits, group_size, vocab_size, dim = cfg.dim, "loading {bits}-bit embed table");
+        tracing::debug!(
+            bits,
+            group_size,
+            vocab_size,
+            dim = cfg.dim,
+            "loading {bits}-bit embed table"
+        );
         let embed_raw = get_weight_f32("model.embed_tokens", group_size, bits)?;
         let expected_embed = vocab_size * cfg.dim;
         if embed_raw.len() != expected_embed {
@@ -2081,9 +2087,7 @@ impl PrePackedWeights {
             buf[d * sp..d * sp + seq].copy_from_slice(&xnorm[d * seq..d * seq + seq]);
         }
         // Safety: f32 slice → u8 slice (same backing memory, no alloc)
-        unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
-        }
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) }
     }
 
     /// Patch activation into a pre-packed backward W2^T buffer.
@@ -2098,9 +2102,7 @@ impl PrePackedWeights {
         for d in 0..dim {
             buf[d * sp..d * sp + seq].copy_from_slice(&dffn[d * seq..d * seq + seq]);
         }
-        unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
-        }
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) }
     }
 
     /// Patch activations into a pre-packed backward W13^T buffer.
@@ -2122,18 +2124,19 @@ impl PrePackedWeights {
             buf[d * sp..d * sp + seq].copy_from_slice(&dh1[d * seq..d * seq + seq]);
             buf[d * sp + seq..d * sp + 2 * seq].copy_from_slice(&dh3[d * seq..d * seq + seq]);
         }
-        unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
-        }
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) }
     }
 
     /// Memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
-        self.layers.iter().map(|l| {
-            l.fwd_fused_ffn.as_ref().map_or(0, |b| b.len() * 4)
-                + l.bwd_w2t.as_ref().map_or(0, |b| b.len() * 4)
-                + l.bwd_w13t.as_ref().map_or(0, |b| b.len() * 4)
-        }).sum()
+        self.layers
+            .iter()
+            .map(|l| {
+                l.fwd_fused_ffn.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.bwd_w2t.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.bwd_w13t.as_ref().map_or(0, |b| b.len() * 4)
+            })
+            .sum()
     }
 }
 
@@ -3343,7 +3346,15 @@ mod tests {
         let scales = vec![1.0f32; rows * n_groups];
         let biases = vec![0.0f32; rows * n_groups];
 
-        let out = super::dequant_nbit(&weight_bytes, &scales, &biases, rows, cols, group_size, bits);
+        let out = super::dequant_nbit(
+            &weight_bytes,
+            &scales,
+            &biases,
+            rows,
+            cols,
+            group_size,
+            bits,
+        );
         assert_eq!(out.len(), rows * cols);
 
         // Check that all values match
@@ -3387,7 +3398,15 @@ mod tests {
         let scales = vec![1.0f32; rows * n_groups];
         let biases = vec![0.0f32; rows * n_groups];
 
-        let out = super::dequant_nbit(&weight_bytes, &scales, &biases, rows, cols, group_size, bits);
+        let out = super::dequant_nbit(
+            &weight_bytes,
+            &scales,
+            &biases,
+            rows,
+            cols,
+            group_size,
+            bits,
+        );
         assert_eq!(out.len(), rows * cols);
         for c in 0..cols {
             assert_eq!(out[c], (c % 16) as f32, "col={c}");

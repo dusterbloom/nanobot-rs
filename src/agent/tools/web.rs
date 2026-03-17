@@ -1087,7 +1087,6 @@ mod tests {
         assert!(result.contains("url parameter is required"));
     }
 
-
     // -----------------------------------------------------------------------
     // Pipeline tests: what the main model sees after processing
     // -----------------------------------------------------------------------

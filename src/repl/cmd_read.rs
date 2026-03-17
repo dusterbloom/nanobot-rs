@@ -1091,12 +1091,7 @@ impl ReplContext {
 
         let tc = counters.clone();
         let handle = if let Some(trainer) = self.agent_loop.ane_trainer() {
-            trainer.spawn_training_with_progress(
-                ane_cfg,
-                samples,
-                mlx_tx,
-                Some(counters.clone()),
-            )
+            trainer.spawn_training_with_progress(ane_cfg, samples, mlx_tx, Some(counters.clone()))
         } else {
             crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx)
         };

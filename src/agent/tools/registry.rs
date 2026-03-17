@@ -279,9 +279,7 @@ impl ToolRegistry {
             )));
         }
         if should_include("web_fetch") {
-            self.register(Box::new(WebFetchTool::new(
-                config.max_tool_result_chars,
-            )));
+            self.register(Box::new(WebFetchTool::new(config.max_tool_result_chars)));
         }
         if should_include("browser") {
             self.register(Box::new(BrowserTool::new(config.max_tool_result_chars)));
@@ -681,11 +679,7 @@ impl ToolRegistry {
         let hints: Vec<&str> = params
             .get("required")
             .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<&str>>()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<&str>>())
             .unwrap_or_default();
         if hints.is_empty() {
             tool.name().to_string()
@@ -760,8 +754,7 @@ impl ToolRegistry {
                             "parameters": tool.parameters(),
                         });
                         ToolExecutionResult::success(
-                            serde_json::to_string_pretty(&schema)
-                                .unwrap_or_else(|_| "{}".into()),
+                            serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".into()),
                         )
                     }
                     _ => {
@@ -820,8 +813,7 @@ impl ToolRegistry {
                             "parameters": tool.parameters(),
                         });
                         ToolExecutionResult::success(
-                            serde_json::to_string_pretty(&schema)
-                                .unwrap_or_else(|_| "{}".into()),
+                            serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".into()),
                         )
                     }
                     _ => {
@@ -1610,9 +1602,23 @@ mod tests {
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
             .collect();
 
-        assert_eq!(names.len(), 9, "All 9 registered tools must be visible: {:?}", names);
-        for tool in &["read_file", "write_file", "edit_file", "list_dir", "exec",
-                       "spawn", "web_search", "browser", "message"] {
+        assert_eq!(
+            names.len(),
+            9,
+            "All 9 registered tools must be visible: {:?}",
+            names
+        );
+        for tool in &[
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "exec",
+            "spawn",
+            "web_search",
+            "browser",
+            "message",
+        ] {
             assert!(names.contains(*tool), "Missing '{}' in {:?}", tool, names);
         }
     }
@@ -1949,14 +1955,20 @@ mod tests {
     fn test_local_defs_condense_truncates_multi_sentence() {
         // Use a real tool that has a 3-sentence description.
         // WebSearchTool: "Search the web. Returns titles, URLs, and snippets. Use web_fetch..."
-        let tool = super::WebSearchTool::new(None, 5, "searxng".to_string(), "http://localhost:8888".to_string());
+        let tool = super::WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://localhost:8888".to_string(),
+        );
         let full_desc = tool.description().to_string();
         // Count sentences in full description (periods followed by space).
         let sentence_breaks = full_desc.matches(". ").count();
         assert!(
             sentence_breaks >= 2,
             "WebSearchTool should have 3+ sentences, got {} breaks in: {}",
-            sentence_breaks, full_desc,
+            sentence_breaks,
+            full_desc,
         );
 
         let mut registry = ToolRegistry::new();
@@ -1970,7 +1982,8 @@ mod tests {
         assert!(
             condensed_desc.len() < full_desc.len(),
             "Condensed should be shorter than full: {} vs {}",
-            condensed_desc.len(), full_desc.len(),
+            condensed_desc.len(),
+            full_desc.len(),
         );
         // Two sentences means exactly one ". " break in the condensed output.
         let condensed_breaks = condensed_desc.matches(". ").count();
@@ -2083,13 +2096,14 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("mock_tool"));
-        params.insert(
-            "args".to_string(),
-            serde_json::json!({"value": "hello"}),
-        );
+        params.insert("args".to_string(), serde_json::json!({"value": "hello"}));
 
         let result = registry.execute("tool", params).await;
-        assert!(result.ok, "Proxy dispatch should succeed: {:?}", result.error);
+        assert!(
+            result.ok,
+            "Proxy dispatch should succeed: {:?}",
+            result.error
+        );
         assert!(
             result.data.contains("hello"),
             "Should contain dispatched tool output: {}",
@@ -2111,7 +2125,11 @@ mod tests {
         );
 
         let result = registry.execute("tool", params).await;
-        assert!(result.ok, "Dispatch with alias should succeed: {:?}", result.error);
+        assert!(
+            result.ok,
+            "Dispatch with alias should succeed: {:?}",
+            result.error
+        );
         assert!(
             result.data.contains("path"),
             "Normalization should convert file_path to path: {}",
@@ -2141,13 +2159,14 @@ mod tests {
         // Call through the main execute() path with "tool" as the tool name
         let mut params = HashMap::new();
         params.insert("name".to_string(), serde_json::json!("list_dir"));
-        params.insert(
-            "args".to_string(),
-            serde_json::json!({"value": "test"}),
-        );
+        params.insert("args".to_string(), serde_json::json!({"value": "test"}));
 
         let result = registry.execute("tool", params).await;
-        assert!(result.ok, "Proxy intercept via execute() should work: {:?}", result.error);
+        assert!(
+            result.ok,
+            "Proxy intercept via execute() should work: {:?}",
+            result.error
+        );
         assert!(
             result.data.contains("test"),
             "Should dispatch to real tool: {}",
@@ -2165,7 +2184,11 @@ mod tests {
         params.insert("value".to_string(), serde_json::json!("direct"));
 
         let result = registry.execute("mock_tool", params).await;
-        assert!(result.ok, "Direct call should still work: {:?}", result.error);
+        assert!(
+            result.ok,
+            "Direct call should still work: {:?}",
+            result.error
+        );
         assert!(
             result.data.contains("direct"),
             "Should get direct tool output: {}",
@@ -2177,8 +2200,12 @@ mod tests {
     struct DescribedTool;
     #[async_trait]
     impl Tool for DescribedTool {
-        fn name(&self) -> &str { "described_tool" }
-        fn description(&self) -> &str { "A tool with described params." }
+        fn name(&self) -> &str {
+            "described_tool"
+        }
+        fn description(&self) -> &str {
+            "A tool with described params."
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({
                 "type": "object",
@@ -2211,15 +2238,24 @@ mod tests {
             assert!(
                 prop.get("description").is_none(),
                 "Slim def should strip description from param '{}': {:?}",
-                key, prop
+                key,
+                prop
             );
             // But type should still be present
-            assert!(prop.get("type").is_some(), "Slim def should keep type for param '{}'", key);
+            assert!(
+                prop.get("type").is_some(),
+                "Slim def should keep type for param '{}'",
+                key
+            );
         }
 
         // Full defs should retain descriptions
         let full_props = full[0].pointer("/function/parameters/properties").unwrap();
-        let has_desc = full_props.as_object().unwrap().values().any(|v| v.get("description").is_some());
+        let has_desc = full_props
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v.get("description").is_some());
         assert!(has_desc, "Full defs should retain param descriptions");
     }
 }

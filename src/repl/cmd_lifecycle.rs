@@ -1086,8 +1086,7 @@ impl ReplContext {
         // Persist local mode settings (including backend so /m switches survive restart)
         disk_cfg.agents.defaults.local_api_base =
             self.config.agents.defaults.local_api_base.clone();
-        disk_cfg.agents.defaults.local_backend =
-            self.config.agents.defaults.local_backend.clone();
+        disk_cfg.agents.defaults.local_backend = self.config.agents.defaults.local_backend.clone();
         disk_cfg.agents.defaults.skip_jit_gate = self.config.agents.defaults.skip_jit_gate;
         disk_cfg.agents.defaults.lms_port = self.config.agents.defaults.lms_port;
         disk_cfg.agents.defaults.lms_main_model =

@@ -992,7 +992,9 @@ fn cpu_sdpa_backward(
 
         // 1. Recompute probs = softmax(scale * Q_h^T @ K_h, causal)
         let mut probs = vec![0.0f32; seq * seq];
-        ane_forward::cpu_gemm(&mut probs, q_h, true, k_h, false, seq, seq, head_dim, scale, 0.0);
+        ane_forward::cpu_gemm(
+            &mut probs, q_h, true, k_h, false, seq, seq, head_dim, scale, 0.0,
+        );
         for s1 in 0..seq {
             for s2 in (s1 + 1)..seq {
                 probs[s1 * seq + s2] = f32::NEG_INFINITY;
@@ -1014,12 +1016,16 @@ fn cpu_sdpa_backward(
 
         // 2. dV = dO_h @ probs → [head_dim, seq]
         // dV_h[d, s2] = sum_s1 dO_h[d, s1] * probs[s1, s2]
-        ane_forward::cpu_gemm(dv_h, do_h, false, &probs, false, head_dim, seq, seq, 1.0, 0.0);
+        ane_forward::cpu_gemm(
+            dv_h, do_h, false, &probs, false, head_dim, seq, seq, 1.0, 0.0,
+        );
 
         // 3. dP = dO_h^T @ V_h → [seq, seq]
         // dP[s1, s2] = sum_d dO_h[d, s1] * V_h[d, s2]
         let mut dp = vec![0.0f32; seq * seq];
-        ane_forward::cpu_gemm(&mut dp, do_h, true, v_h, false, seq, seq, head_dim, 1.0, 0.0);
+        ane_forward::cpu_gemm(
+            &mut dp, do_h, true, v_h, false, seq, seq, head_dim, 1.0, 0.0,
+        );
 
         // 4. Softmax backward: dS = probs * (dP - row_sum(probs .* dP))
         let mut ds = vec![0.0f32; seq * seq];
@@ -2116,7 +2122,16 @@ pub fn backward_lora_ane_generic_with_lora_kernels<
     residual_scale: f32,
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
 ) -> BackwardResultWithLora {
-    backward_lora_ane_impl(bwd_kernels, model, fwd, lora, loss_scale, residual_scale, lora_kernels, None)
+    backward_lora_ane_impl(
+        bwd_kernels,
+        model,
+        fwd,
+        lora,
+        loss_scale,
+        residual_scale,
+        lora_kernels,
+        None,
+    )
 }
 
 /// Backward with optional pre-packed weight buffers (Orion delta patching).
@@ -2130,7 +2145,16 @@ pub fn backward_lora_ane_prepacked<W: ane_weights::WeightSource>(
     lora_kernels: Option<&super::ane_lora::LoraWeightGradKernels>,
     prepacked: &mut ane_weights::PrePackedWeights,
 ) -> BackwardResultWithLora {
-    backward_lora_ane_impl(bwd_kernels, model, fwd, lora, loss_scale, residual_scale, lora_kernels, Some(prepacked))
+    backward_lora_ane_impl(
+        bwd_kernels,
+        model,
+        fwd,
+        lora,
+        loss_scale,
+        residual_scale,
+        lora_kernels,
+        Some(prepacked),
+    )
 }
 
 fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
@@ -3433,7 +3457,14 @@ mod tests {
         let mut x_cur = last_act.x2.clone();
         ane_forward::vec_add_inplace(&mut x_cur, &last_act.ffn_out);
         let mut x_final = vec![0.0f32; dim * seq];
-        ane_forward::rmsnorm(&mut x_final, &x_cur, &model.rms_final, dim, seq, cfg.rms_eps);
+        ane_forward::rmsnorm(
+            &mut x_final,
+            &x_cur,
+            &model.rms_final,
+            dim,
+            seq,
+            cfg.rms_eps,
+        );
 
         // Unfused path: classifier_forward → cross_entropy_loss → classifier_bwd
         let lm_head = model.lm_head.as_ref().unwrap();
@@ -3444,7 +3475,16 @@ mod tests {
 
         let mut dy = vec![0.0f32; dim * seq];
         let mut dlm_head = vec![0.0f32; vocab * dim];
-        classifier_bwd(&mut dy, &mut dlm_head, &dlogits, lm_head, &x_final, vocab, dim, seq);
+        classifier_bwd(
+            &mut dy,
+            &mut dlm_head,
+            &dlogits,
+            lm_head,
+            &x_final,
+            vocab,
+            dim,
+            seq,
+        );
 
         // dlm_head should have nonzero gradients
         assert_eq!(dlm_head.len(), vocab * dim);

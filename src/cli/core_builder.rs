@@ -729,10 +729,8 @@ pub(crate) fn build_core_handle(
         dp,
         sp,
     ));
-    let mut counters = RuntimeCounters::new_with_config(
-        max_context_tokens,
-        &config.trio.circuit_breaker,
-    );
+    let mut counters =
+        RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
     // When main_no_think is enabled, also suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
     if config.trio.main_no_think {
@@ -772,10 +770,8 @@ pub(crate) fn build_core_handle_mlx(config: &Config, mlx: &MlxHandle) -> SharedC
         None,
         None,
     ));
-    let mut counters = RuntimeCounters::new_with_config(
-        max_context_tokens,
-        &config.trio.circuit_breaker,
-    );
+    let mut counters =
+        RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
     counters.auxiliary_server = lazy_auxiliary_from_config(config);
     AgentHandle::new(core, Arc::new(counters))
 }

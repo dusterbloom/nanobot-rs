@@ -380,17 +380,16 @@ impl LoraModelGrads {
     /// Element-wise add gradients from `other` into `self`.
     pub fn add_from(&mut self, other: &LoraModelGrads) {
         for (lg, og) in self.layers.iter_mut().zip(other.layers.iter()) {
-            let add_opt =
-                |dst: &mut Option<LoraAdapterGrads>, src: &Option<LoraAdapterGrads>| {
-                    if let (Some(d), Some(s)) = (dst.as_mut(), src.as_ref()) {
-                        for (dv, sv) in d.da.iter_mut().zip(s.da.iter()) {
-                            *dv += sv;
-                        }
-                        for (dv, sv) in d.db.iter_mut().zip(s.db.iter()) {
-                            *dv += sv;
-                        }
+            let add_opt = |dst: &mut Option<LoraAdapterGrads>, src: &Option<LoraAdapterGrads>| {
+                if let (Some(d), Some(s)) = (dst.as_mut(), src.as_ref()) {
+                    for (dv, sv) in d.da.iter_mut().zip(s.da.iter()) {
+                        *dv += sv;
                     }
-                };
+                    for (dv, sv) in d.db.iter_mut().zip(s.db.iter()) {
+                        *dv += sv;
+                    }
+                }
+            };
             add_opt(&mut lg.wq, &og.wq);
             add_opt(&mut lg.wv, &og.wv);
             add_opt(&mut lg.wo, &og.wo);
@@ -1355,10 +1354,7 @@ impl MuonMatrixKernel {
         self.param_kernel.eval()?;
         let mut param_out = vec![0u8; self.tensor_bytes];
         self.param_kernel.read_output(0, &mut param_out);
-        Ok((
-            ane_weights::bytes_to_f32_vec(&param_out),
-            m_new,
-        ))
+        Ok((ane_weights::bytes_to_f32_vec(&param_out), m_new))
     }
 }
 
@@ -1382,17 +1378,18 @@ impl LoraMuonKernels {
         momentum: f32,
         wd: f32,
     ) -> Result<Self, String> {
-        let compile_adapter =
-            |adapter: Option<&LoraAdapter>, lr: f32| -> Result<Option<AdapterMuonKernels>, String> {
-                if let Some(adapter) = adapter {
-                    Ok(Some(AdapterMuonKernels {
-                        a: MuonMatrixKernel::compile(adapter.rank, adapter.d_in, momentum, lr, wd)?,
-                        b: MuonMatrixKernel::compile(adapter.d_out, adapter.rank, momentum, lr, wd)?,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            };
+        let compile_adapter = |adapter: Option<&LoraAdapter>,
+                               lr: f32|
+         -> Result<Option<AdapterMuonKernels>, String> {
+            if let Some(adapter) = adapter {
+                Ok(Some(AdapterMuonKernels {
+                    a: MuonMatrixKernel::compile(adapter.rank, adapter.d_in, momentum, lr, wd)?,
+                    b: MuonMatrixKernel::compile(adapter.d_out, adapter.rank, momentum, lr, wd)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        };
         let first_wq = lora.layers.iter().find_map(|layer| layer.wq.as_ref());
         let first_wv = lora.layers.iter().find_map(|layer| layer.wv.as_ref());
         let first_wo = lora.layers.iter().find_map(|layer| layer.wo.as_ref());
@@ -2596,13 +2593,7 @@ mod tests {
             .zip(wrong_order_delta.iter())
             .map(|(a, b)| a * b)
             .sum::<f32>()
-            / (cpu_norm
-                * wrong_order_delta
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f32>()
-                    .sqrt())
-                .max(1e-8);
+            / (cpu_norm * wrong_order_delta.iter().map(|v| v * v).sum::<f32>().sqrt()).max(1e-8);
 
         eprintln!(
             "ANE Muon debug: cosine={cosine:.4} max_param_err={max_param_err:.4} max_mom_err={max_mom_err:.4} wrong_order_cosine={wrong_order_cosine:.4}"
@@ -2612,7 +2603,10 @@ mod tests {
             cosine > 0.9,
             "ANE Muon update direction drifted too far: cosine={cosine:.4}"
         );
-        assert!(max_mom_err < 0.1, "ANE Muon momentum max error: {max_mom_err}");
+        assert!(
+            max_mom_err < 0.1,
+            "ANE Muon momentum max error: {max_mom_err}"
+        );
     }
 
     #[test]
@@ -2627,8 +2621,12 @@ mod tests {
             mil,
             "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> x) {{"
         );
-        mil.push_str("        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n");
-        mil.push_str("        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n");
+        mil.push_str(
+            "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n",
+        );
+        mil.push_str(
+            "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n",
+        );
         let _ = writeln!(
             mil,
             "        fp16 eps = const()[name=string(\"eps\"), val=fp16({})];",
@@ -2712,8 +2710,12 @@ mod tests {
             mil,
             "    func main<ios18>(tensor<fp32, [1, {rows}, 1, {cols}]> x) {{"
         );
-        mil.push_str("        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n");
-        mil.push_str("        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n");
+        mil.push_str(
+            "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];\n",
+        );
+        mil.push_str(
+            "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];\n",
+        );
         let _ = writeln!(
             mil,
             "        fp16 a = const()[name=string(\"a\"), val=fp16({a_coeff})];"
@@ -2803,7 +2805,13 @@ mod tests {
         let x_raw: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 * 0.009).sin() + (i as f32 * 0.004).cos() * 0.25)
             .collect();
-        let norm = x_raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(MUON_EPS) * MUON_NORM_PAD;
+        let norm = x_raw
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            .max(MUON_EPS)
+            * MUON_NORM_PAD;
         let x: Vec<f32> = x_raw.iter().map(|v| *v / norm).collect();
 
         kernel.write_input(0, &ane_weights::f32_slice_to_bytes(&x));
@@ -2815,7 +2823,13 @@ mod tests {
         kernel.read_output(0, &mut out);
         let y = ane_weights::bytes_to_f32_vec(&out);
 
-        let a = ane_forward::cpu_matmul(&x, &ane_weights::transpose_weight(&x, rows, cols), rows, cols, rows);
+        let a = ane_forward::cpu_matmul(
+            &x,
+            &ane_weights::transpose_weight(&x, rows, cols),
+            rows,
+            cols,
+            rows,
+        );
         let a2 = ane_forward::cpu_matmul(&a, &a, rows, rows, rows);
         let mut bb = vec![0.0f32; rows * rows];
         for i in 0..bb.len() {

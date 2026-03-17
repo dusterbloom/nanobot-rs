@@ -27,11 +27,7 @@ fn estimate_msg_tokens(m: &Value) -> usize {
 fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
     let mut i = start;
     while i < messages.len() {
-        if messages[i]
-            .get("role")
-            .and_then(|r| r.as_str())
-            == Some("tool")
-        {
+        if messages[i].get("role").and_then(|r| r.as_str()) == Some("tool") {
             i += 1;
         } else {
             break;
@@ -619,10 +615,10 @@ mod tests {
         // 3 such messages = ~1500 tokens > 900 budget.
         let big = "x".repeat(2000);
         let messages = vec![
-            user(&big),           // ~500 tokens (oldest, should be dropped)
-            assistant(&big),      // ~500 tokens (should be dropped)
-            user("recent"),       // ~6 tokens (kept)
-            assistant("answer"),  // ~7 tokens (kept)
+            user(&big),          // ~500 tokens (oldest, should be dropped)
+            assistant(&big),     // ~500 tokens (should be dropped)
+            user("recent"),      // ~6 tokens (kept)
+            assistant("answer"), // ~7 tokens (kept)
         ];
         let result = filter_history(&messages, 6, 0);
         // The two big messages (~1000 tokens) exceed the budget of 900.
@@ -630,7 +626,11 @@ mod tests {
         // Adding assistant(&big) would be 13 + 500 = 513, still under.
         // Adding user(&big) would be 513 + 500 = 1013 > 900 → stop.
         // So we keep 3 messages.
-        assert!(result.len() <= 3, "expected at most 3 messages, got {}", result.len());
+        assert!(
+            result.len() <= 3,
+            "expected at most 3 messages, got {}",
+            result.len()
+        );
         // The last message must be the "answer"
         assert_eq!(result.last().unwrap()["content"], "answer");
     }

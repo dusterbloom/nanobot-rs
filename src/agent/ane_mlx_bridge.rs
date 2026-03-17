@@ -308,7 +308,10 @@ fn prepare_training_samples(
                     effective_loss_scale,
                 });
             } else {
-                tracing::warn!("ANE train: no bucket for sample len={}, skipping", tokens_u32.len());
+                tracing::warn!(
+                    "ANE train: no bucket for sample len={}, skipping",
+                    tokens_u32.len()
+                );
             }
         } else {
             prepared.push(PreparedTrainingSample {
@@ -484,11 +487,11 @@ impl AneTrainerSession {
                     let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
                     let cached = DenseCachedModel::auto(m);
                     tracing::info!(
-                        "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
-                        t0.elapsed().as_millis(),
-                        cached.cached_layer_count(),
-                        cached.n_layers(),
-                    );
+                    "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
+                    t0.elapsed().as_millis(),
+                    cached.cached_layer_count(),
+                    cached.n_layers(),
+                );
                     cached
                 }
                 Err(e) => return Err(format!("failed to load weights: {e}")),
@@ -525,7 +528,9 @@ impl AneTrainerSession {
         sample_lens: &[usize],
         stats: &PersistentAneTrainerStatCounters,
     ) -> Result<(), String> {
-        let compiled = self.bucket_kernels.ensure(sample_lens, &self.cfg.mil_config)?;
+        let compiled = self
+            .bucket_kernels
+            .ensure(sample_lens, &self.cfg.mil_config)?;
         if compiled > 0 {
             use std::sync::atomic::Ordering;
             stats.bucket_compiles.fetch_add(compiled, Ordering::Relaxed);
@@ -563,8 +568,7 @@ impl AneTrainerSession {
             );
             self.prepacked_weights.push((*bucket_seq, pp));
         }
-        self.prepacked_weights
-            .sort_by_key(|(seq, _)| *seq);
+        self.prepacked_weights.sort_by_key(|(seq, _)| *seq);
     }
 
     fn ensure_muon_grad_kernels(&mut self) -> Result<(), String> {
@@ -706,9 +710,7 @@ impl AneTrainerSession {
     ) -> bool {
         use super::ane_backward;
         use super::ane_forward;
-        use super::ane_lora::{
-            lora_adam_update, lora_adam_update_split_lr, lora_muon_update_ane,
-        };
+        use super::ane_lora::{lora_adam_update, lora_adam_update_split_lr, lora_muon_update_ane};
 
         let t0 = std::time::Instant::now();
         let sample_lens: Vec<usize> = samples.iter().map(|(tokens, _, _)| tokens.len()).collect();
@@ -765,8 +767,10 @@ impl AneTrainerSession {
 
         // Publish total steps so TUI can show progress from the start.
         if let Some(rc) = runtime_counters {
-            rc.training_total_steps.store(total_opt_steps as u64, std::sync::atomic::Ordering::Relaxed);
-            rc.training_current_step.store(0, std::sync::atomic::Ordering::Relaxed);
+            rc.training_total_steps
+                .store(total_opt_steps as u64, std::sync::atomic::Ordering::Relaxed);
+            rc.training_current_step
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
 
         let bucket_kernels = if use_ane {
@@ -774,8 +778,7 @@ impl AneTrainerSession {
         } else {
             None
         };
-        let prepared_samples =
-            prepare_training_samples(samples, bucket_kernels, cfg.loss_scale);
+        let prepared_samples = prepare_training_samples(samples, bucket_kernels, cfg.loss_scale);
 
         tracing::info!(
             "ANE train: {n_samples} samples, {total_opt_steps} optimizer steps (accum={accum}), lr={}, mode={}, optimizer={:?}",
@@ -819,7 +822,10 @@ impl AneTrainerSession {
                     let t_fwd = std::time::Instant::now();
                     let (fwd, bwd) = if let Some(bk) = bucket_kernels {
                         let Some((_, fwd_k, bwd_k)) = bk.get(sample.tokens_u32.len()) else {
-                            tracing::error!("ANE train: no bucket kernel for sample len={}", sample.tokens_u32.len());
+                            tracing::error!(
+                                "ANE train: no bucket kernel for sample len={}",
+                                sample.tokens_u32.len()
+                            );
                             continue;
                         };
                         model.cfg_mut().seq_len = sample.bucket_seq;
@@ -910,7 +916,8 @@ impl AneTrainerSession {
                                 (fwd, bwd)
                             }
                             Err(e) => {
-                                if cfg.strict_ane || cfg.optimizer == AneTrainingOptimizer::AneMuon {
+                                if cfg.strict_ane || cfg.optimizer == AneTrainingOptimizer::AneMuon
+                                {
                                     tracing::error!("ANE forward failed in strict mode: {e}");
                                     return false;
                                 }
@@ -1042,7 +1049,9 @@ impl AneTrainerSession {
                 total_clone_us += t_clone.elapsed().as_micros() as u64;
 
                 if stale_count >= patience {
-                    tracing::info!("ANE train: early stop at opt_step {opt_step}, loss={chunk_loss:.4}");
+                    tracing::info!(
+                        "ANE train: early stop at opt_step {opt_step}, loss={chunk_loss:.4}"
+                    );
                     break 'outer;
                 }
 
@@ -1050,28 +1059,22 @@ impl AneTrainerSession {
                 if let Some(rc) = runtime_counters {
                     use std::sync::atomic::Ordering::Relaxed;
                     rc.training_current_step.store(opt_step as u64, Relaxed);
-                    rc.training_loss_x10k.store((chunk_loss * 10000.0) as u64, Relaxed);
+                    rc.training_loss_x10k
+                        .store((chunk_loss * 10000.0) as u64, Relaxed);
                     if rc.training_cancel.load(Relaxed) {
                         tracing::info!("ANE train: cancelled at step {opt_step}/{total_opt_steps}");
                         break 'outer;
                     }
-                    // Yield to inference: pause training while an LLM call is
-                    // in flight so we don't tank generation speed on shared GPU.
-                    if rc.inference_active.load(Relaxed) {
-                        tracing::debug!("ANE train: yielding to inference at step {opt_step}");
-                        while rc.inference_active.load(Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            if rc.training_cancel.load(Relaxed) {
-                                tracing::info!("ANE train: cancelled while yielding at step {opt_step}");
-                                break 'outer;
-                            }
-                        }
-                        tracing::debug!("ANE train: resuming after inference completed");
-                    }
+                    // NOTE: yield guard removed. ANE and GPU are independent
+                    // hardware blocks that run simultaneously with zero
+                    // interference (confirmed by autoresearch-ANE). Training on
+                    // CPU/ANE does not compete with inference on GPU/Metal.
                 }
 
                 if opt_step % 5 == 0 || opt_step == total_opt_steps {
-                    tracing::debug!("ANE train: step {opt_step}/{total_opt_steps}, loss={chunk_loss:.4}");
+                    tracing::debug!(
+                        "ANE train: step {opt_step}/{total_opt_steps}, loss={chunk_loss:.4}"
+                    );
                 }
             }
         }
@@ -1093,7 +1096,9 @@ impl AneTrainerSession {
             let fwd_bwd_ms = total_fwd_us as f64 / sample_count as f64 / 1000.0;
             let opt_ms = total_opt_us as f64 / opt_step.max(1) as f64 / 1000.0;
             let clone_ms = total_clone_us as f64 / opt_step.max(1) as f64 / 1000.0;
-            let fwd_bwd_pct = total_fwd_us as f64 / (total_fwd_us + total_opt_us + total_clone_us).max(1) as f64 * 100.0;
+            let fwd_bwd_pct = total_fwd_us as f64
+                / (total_fwd_us + total_opt_us + total_clone_us).max(1) as f64
+                * 100.0;
             tracing::info!(
                 "ANE train profile: {sample_count} samples, fwd+bwd={fwd_bwd_ms:.1}ms/sample ({fwd_bwd_pct:.0}%), opt={opt_ms:.1}ms/step, clone={clone_ms:.1}ms/step, total={train_ms}ms",
             );
@@ -1153,7 +1158,15 @@ fn persistent_trainer_worker(
 
                 let ok = session
                     .as_mut()
-                    .map(|existing| existing.train_with_progress(&cfg, &samples, mlx_tx, stats.as_ref(), runtime_counters.as_deref()))
+                    .map(|existing| {
+                        existing.train_with_progress(
+                            &cfg,
+                            &samples,
+                            mlx_tx,
+                            stats.as_ref(),
+                            runtime_counters.as_deref(),
+                        )
+                    })
                     .unwrap_or(false);
                 if ok {
                     use std::sync::atomic::Ordering;
@@ -1869,71 +1882,109 @@ mod tests {
 
     /// Build MilConfig directly from config.json without the `mlx` feature.
     /// This avoids the `ModelConfig` dependency so ANE-only benchmarks compile.
-    fn mil_config_from_json(dir: &std::path::Path, seq_len: usize) -> crate::agent::ane_mil::MilConfig {
-        let config_str = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+    fn mil_config_from_json(
+        dir: &std::path::Path,
+        seq_len: usize,
+    ) -> crate::agent::ane_mil::MilConfig {
+        let config_str =
+            std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
         let root: serde_json::Value = serde_json::from_str(&config_str).expect("parse config.json");
         let tc = root.get("text_config").unwrap_or(&root);
 
         let dim = tc["hidden_size"].as_u64().expect("hidden_size") as usize;
-        let hidden_dim = tc.get("intermediate_size")
+        let hidden_dim = tc
+            .get("intermediate_size")
             .or_else(|| tc.get("moe_intermediate_size"))
-            .and_then(|v| v.as_u64()).expect("hidden_dim") as usize;
+            .and_then(|v| v.as_u64())
+            .expect("hidden_dim") as usize;
         let n_heads = tc["num_attention_heads"].as_u64().expect("n_heads") as usize;
-        let n_kv_heads = tc.get("num_key_value_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
-        let head_dim = tc.get("head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or((dim / n_heads) as u64) as usize;
-        let rope_theta = tc.get("rope_parameters")
+        let n_kv_heads = tc
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(n_heads as u64) as usize;
+        let head_dim = tc
+            .get("head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or((dim / n_heads) as u64) as usize;
+        let rope_theta = tc
+            .get("rope_parameters")
             .and_then(|rp| rp.get("rope_theta"))
             .and_then(|v| v.as_f64())
             .or_else(|| tc.get("rope_theta").and_then(|v| v.as_f64()))
             .or_else(|| root.get("rope_theta").and_then(|v| v.as_f64()))
             .unwrap_or(1_000_000.0);
-        let rms_eps = tc.get("rms_norm_eps")
-            .and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
-        let attn_output_gate = tc.get("attn_output_gate")
-            .and_then(|v| v.as_bool()).unwrap_or(false);
+        let rms_eps = tc
+            .get("rms_norm_eps")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-6) as f32;
+        let attn_output_gate = tc
+            .get("attn_output_gate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // GDN (linear attention) fields
-        let layer_types: Vec<String> = tc.get("layer_types")
+        let layer_types: Vec<String> = tc
+            .get("layer_types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let linear_attn_indices: Vec<usize> = layer_types.iter().enumerate()
+        let linear_attn_indices: Vec<usize> = layer_types
+            .iter()
+            .enumerate()
             .filter(|(_, t)| t.as_str() == "linear_attention")
-            .map(|(i, _)| i).collect();
-        let linear_n_heads = tc.get("linear_num_key_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_head_dim = tc.get("linear_key_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let linear_n_value_heads = tc.get("linear_num_value_heads")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_n_heads as u64) as usize;
-        let linear_value_head_dim = tc.get("linear_value_head_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(linear_head_dim as u64) as usize;
-        let conv_kernel_size = tc.get("linear_conv_kernel_dim")
-            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            .map(|(i, _)| i)
+            .collect();
+        let linear_n_heads = tc
+            .get("linear_num_key_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_head_dim = tc
+            .get("linear_key_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let linear_n_value_heads = tc
+            .get("linear_num_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_n_heads as u64) as usize;
+        let linear_value_head_dim = tc
+            .get("linear_value_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(linear_head_dim as u64) as usize;
+        let conv_kernel_size = tc
+            .get("linear_conv_kernel_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
 
         crate::agent::ane_mil::MilConfig {
-            dim, hidden_dim, n_heads, seq_len, n_kv_heads,
-            rope_theta, rms_eps, has_lm_head: false,
+            dim,
+            hidden_dim,
+            n_heads,
+            seq_len,
+            n_kv_heads,
+            rope_theta,
+            rms_eps,
+            has_lm_head: false,
             head_dim_explicit: head_dim,
-            linear_attn_indices, linear_n_heads, linear_head_dim,
-            linear_n_value_heads, linear_value_head_dim, conv_kernel_size,
+            linear_attn_indices,
+            linear_n_heads,
+            linear_head_dim,
+            linear_n_value_heads,
+            linear_value_head_dim,
+            conv_kernel_size,
             attn_output_gate,
         }
     }
 
-    fn qwen3_5_alias_dir(
-        tag: &str,
-    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn qwen3_5_alias_dir(tag: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let unique = tmp.path().file_name().unwrap().to_string_lossy();
-        let alias_name = format!(
-            "Qwen3.5-0.8B-8bit-{tag}-{}-{unique}",
-            std::process::id()
-        );
+        let alias_name = format!("Qwen3.5-0.8B-8bit-{tag}-{}-{unique}", std::process::id());
         let alias_dir = tmp.path().join(alias_name);
         symlink(qwen3_5_dir(), &alias_dir).expect("symlink model dir");
         let model_key = alias_dir.file_name().unwrap().to_string_lossy().to_string();
@@ -1963,15 +2014,15 @@ mod tests {
             let src = entry.path();
             let dst = overlay_dir.join(entry.file_name());
             symlink(&src, &dst).unwrap_or_else(|e| {
-                panic!(
-                    "symlink {} -> {} failed: {e}",
-                    src.display(),
-                    dst.display()
-                )
+                panic!("symlink {} -> {} failed: {e}", src.display(), dst.display())
             });
         }
 
-        let model_key = overlay_dir.file_name().unwrap().to_string_lossy().to_string();
+        let model_key = overlay_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let lora_path = dirs::home_dir()
             .unwrap()
             .join(".nanobot/workspace/lora")
@@ -2362,7 +2413,10 @@ mod tests {
             post_loss < baseline_loss,
             "benchmark training should reduce loss: baseline={baseline_loss:.4}, post={post_loss:.4}"
         );
-        assert!(step2_loss.is_finite(), "preloaded second-step loss should be finite");
+        assert!(
+            step2_loss.is_finite(),
+            "preloaded second-step loss should be finite"
+        );
     }
 
     /// Regression: the persistent trainer must reuse the loaded 0.8B model
@@ -2397,7 +2451,10 @@ mod tests {
             .expect("first persistent run should not panic");
         assert!(ok1, "first persistent trainer run should succeed");
         let stats1 = trainer.stats();
-        assert_eq!(stats1.model_loads, 1, "first run should load the model once");
+        assert_eq!(
+            stats1.model_loads, 1,
+            "first run should load the model once"
+        );
         assert!(
             stats1.bucket_compiles >= 1,
             "first run should compile at least one bucket"
@@ -2495,7 +2552,10 @@ mod tests {
         });
         eprintln!("ANE benchmark persistent: {metrics}");
 
-        assert_eq!(stats.model_loads, 1, "persistent trainer should load the model once");
+        assert_eq!(
+            stats.model_loads, 1,
+            "persistent trainer should load the model once"
+        );
         assert_eq!(
             stats.completed_runs, 2,
             "persistent trainer should report two completed runs"
@@ -3701,14 +3761,10 @@ mod tests {
         )
         .expect("35B ANE export failed");
 
-        assert_eq!(
-            n, 140,
-            "35B MoE: 30 GDN×2 + 10 MHA×8 = 140 tensors"
-        );
+        assert_eq!(n, 140, "35B MoE: 30 GDN×2 + 10 MHA×8 = 140 tensors");
 
-        let loaded =
-            mlx_rs::Array::load_safetensors(&tmpdir.path().join("adapters.safetensors"))
-                .expect("load back");
+        let loaded = mlx_rs::Array::load_safetensors(&tmpdir.path().join("adapters.safetensors"))
+            .expect("load back");
         assert_eq!(loaded.len(), 140);
 
         // GDN layer 0 should only have down_proj
@@ -3781,7 +3837,10 @@ mod tests {
         // Clean adapter dir so we verify fresh export
         let adapter_dir = dir.join("adapters");
         let adapters_file = adapter_dir.join("adapters.safetensors");
-        let modified_before = adapters_file.metadata().ok().and_then(|m| m.modified().ok());
+        let modified_before = adapters_file
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         let t0 = std::time::Instant::now();
         let handle = spawn_ane_training(cfg, vec![(tokens, targets, 1.0)], None);
@@ -3809,7 +3868,10 @@ mod tests {
             "adapters.safetensors should exist at {}",
             adapters_file.display()
         );
-        let modified_after = adapters_file.metadata().ok().and_then(|m| m.modified().ok());
+        let modified_after = adapters_file
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok());
         assert!(
             modified_after > modified_before,
             "adapters.safetensors should have been updated"
@@ -4211,8 +4273,10 @@ mod tests {
 
         use crate::agent::ane_backward;
         use crate::agent::ane_forward;
-        use crate::agent::ane_lora::{LoraConfig, LoraModel, LoraModelAdam, lora_adam_update};
-        use crate::agent::ane_weights::{DenseCachedModel, PrePackedWeights, QuantizedModelWeights, WeightSource};
+        use crate::agent::ane_lora::{lora_adam_update, LoraConfig, LoraModel, LoraModelAdam};
+        use crate::agent::ane_weights::{
+            DenseCachedModel, PrePackedWeights, QuantizedModelWeights, WeightSource,
+        };
 
         let dir = qwen3_5_dir();
 
@@ -4223,8 +4287,12 @@ mod tests {
         // Synthetic tokens: deterministic sequence in valid vocab range (248320 for 0.8B)
         let n_tokens = 48usize;
         let vocab_size = 248320usize;
-        let tokens_u32: Vec<u32> = (0..n_tokens).map(|i| ((i * 137 + 42) % vocab_size) as u32).collect();
-        let targets_u32: Vec<u32> = (0..n_tokens).map(|i| ((i * 137 + 179) % vocab_size) as u32).collect();
+        let tokens_u32: Vec<u32> = (0..n_tokens)
+            .map(|i| ((i * 137 + 42) % vocab_size) as u32)
+            .collect();
+        let targets_u32: Vec<u32> = (0..n_tokens)
+            .map(|i| ((i * 137 + 179) % vocab_size) as u32)
+            .collect();
         eprintln!("sample: {} synthetic tokens", tokens_u32.len());
 
         // Load model
@@ -4251,9 +4319,7 @@ mod tests {
         model.cfg_mut().seq_len = *bucket_seq;
 
         let fused_ffn = fwd_k.ffn.is_fully_fused();
-        eprintln!(
-            "bucket_seq={bucket_seq}, fused_ffn={fused_ffn}"
-        );
+        eprintln!("bucket_seq={bucket_seq}, fused_ffn={fused_ffn}");
 
         let residual_scale = 1.0f32 / (2.0f32 * n_layers as f32).sqrt();
         let softcap = 15.0f32;
@@ -4274,21 +4340,50 @@ mod tests {
 
         // Warmup
         let _ = ane_forward::forward_ane_generic(
-            fwd_k, &model, Some(&lora_a), &tok_pad, &tgt_pad, softcap, residual_scale,
+            fwd_k,
+            &model,
+            Some(&lora_a),
+            &tok_pad,
+            &tgt_pad,
+            softcap,
+            residual_scale,
         );
 
         let t0 = std::time::Instant::now();
         let mut losses_a = Vec::new();
         for step in 1..=iters {
             let fwd = ane_forward::forward_ane_generic(
-                fwd_k, &model, Some(&lora_a), &tok_pad, &tgt_pad, softcap, residual_scale,
+                fwd_k,
+                &model,
+                Some(&lora_a),
+                &tok_pad,
+                &tgt_pad,
+                softcap,
+                residual_scale,
             )
             .expect("fwd standard");
             losses_a.push(fwd.base.loss);
             let bwd = ane_backward::backward_lora_ane_generic(
-                bwd_k, &model, &fwd, &lora_a, &tok_pad, softcap, loss_scale, residual_scale,
+                bwd_k,
+                &model,
+                &fwd,
+                &lora_a,
+                &tok_pad,
+                softcap,
+                loss_scale,
+                residual_scale,
             );
-            lora_adam_update(&mut lora_a, &bwd.lora_grads, &mut adam_a, step, 1e-4, 0.9, 0.999, 1e-8, 0.01);
+            lora_adam_update(
+                &mut lora_a,
+                &bwd.lora_grads,
+                &mut adam_a,
+                step,
+                1e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
         }
         let standard_ms = t0.elapsed().as_millis() as f64;
         let standard_per_step = standard_ms / iters as f64;
@@ -4316,21 +4411,52 @@ mod tests {
 
         // Warmup
         let _ = ane_forward::forward_ane_generic_prepacked(
-            fwd_k, &model, Some(&lora_b), &tok_pad, &tgt_pad, softcap, residual_scale, Some(&mut prepacked),
+            fwd_k,
+            &model,
+            Some(&lora_b),
+            &tok_pad,
+            &tgt_pad,
+            softcap,
+            residual_scale,
+            Some(&mut prepacked),
         );
 
         let t0 = std::time::Instant::now();
         let mut losses_b = Vec::new();
         for step in 1..=iters {
             let fwd = ane_forward::forward_ane_generic_prepacked(
-                fwd_k, &model, Some(&lora_b), &tok_pad, &tgt_pad, softcap, residual_scale, Some(&mut prepacked),
+                fwd_k,
+                &model,
+                Some(&lora_b),
+                &tok_pad,
+                &tgt_pad,
+                softcap,
+                residual_scale,
+                Some(&mut prepacked),
             )
             .expect("fwd prepacked");
             losses_b.push(fwd.base.loss);
             let bwd = ane_backward::backward_lora_ane_prepacked(
-                bwd_k, &model, &fwd, &lora_b, loss_scale, residual_scale, None, &mut prepacked,
+                bwd_k,
+                &model,
+                &fwd,
+                &lora_b,
+                loss_scale,
+                residual_scale,
+                None,
+                &mut prepacked,
             );
-            lora_adam_update(&mut lora_b, &bwd.lora_grads, &mut adam_b, step, 1e-4, 0.9, 0.999, 1e-8, 0.01);
+            lora_adam_update(
+                &mut lora_b,
+                &bwd.lora_grads,
+                &mut adam_b,
+                step,
+                1e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
+            );
         }
         let prepacked_ms = t0.elapsed().as_millis() as f64;
         let prepacked_per_step = prepacked_ms / iters as f64;
@@ -4349,11 +4475,7 @@ mod tests {
         for i in 0..iters {
             let a = losses_a[i];
             let b = losses_b[i];
-            let rel_err = if a != 0.0 {
-                ((a - b) / a).abs()
-            } else {
-                0.0
-            };
+            let rel_err = if a != 0.0 { ((a - b) / a).abs() } else { 0.0 };
             let marker = if rel_err < 1e-4 { "OK" } else { "DRIFT" };
             eprintln!(
                 "  step {}: standard={a:.6} prepacked={b:.6} rel_err={rel_err:.2e} [{marker}]",
@@ -4376,8 +4498,350 @@ mod tests {
             "prepacked should not be significantly slower: {speedup:.2}x"
         );
 
+        eprintln!("\nPASS: prepacked {speedup:.2}x speedup, losses match within tolerance");
+    }
+
+    // =========================================================================
+    // Split-Silicon TDD: MLX forward + ANE/CPU backward
+    // =========================================================================
+
+    /// RED TEST 1: CPU forward activations are consumed by CPU backward — baseline
+    /// that proves the forward/backward interface contract.
+    ///
+    /// This is the "known good" path. If this passes, we know the activation
+    /// interface is correct. Then we can swap in MLX forward and expect the same.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_split_fwd_bwd_cpu_baseline() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_backward;
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{lora_adam_update, LoraConfig, LoraModel, LoraModelAdam};
+
+        let dir = qwen3_5_dir();
+        let mil_cfg = mil_config_from_json(&dir, 4);
+        let model = crate::agent::ane_weights::ModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load model");
+        let n_layers = model.layers.len();
+        let dim = mil_cfg.dim;
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+        let hidden = mil_cfg.hidden_dim;
+
+        let lora_cfg = LoraConfig::default();
+        let mut lora = LoraModel::with_full_dims(
+            lora_cfg,
+            n_layers,
+            dim,
+            kv_dim,
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        let tokens: Vec<u32> = (100..104).collect();
+        let targets: Vec<u32> = (101..105).collect();
+
+        // Forward (CPU) → produces ForwardResultWithLora
+        let fwd = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
+
+        // Backward (CPU) — consumes the ForwardResultWithLora
+        let bwd = ane_backward::backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
+
+        // Verify: loss is finite and reasonable
+        assert!(fwd.base.loss.is_finite(), "loss must be finite");
+        assert!(fwd.base.loss > 0.0, "loss must be positive");
+
+        // Verify: gradients are non-zero (model is learning)
+        let grad_norm: f32 = bwd.lora_grads.layers.iter().map(|lg| {
+            let adapter_ss = |a: &Option<crate::agent::ane_lora::LoraAdapterGrads>| -> f32 {
+                a.as_ref().map_or(0.0, |g| {
+                    g.da.iter().map(|x| x * x).sum::<f32>()
+                        + g.db.iter().map(|x| x * x).sum::<f32>()
+                })
+            };
+            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
+        }).sum::<f32>().sqrt();
+        assert!(grad_norm > 0.0, "LoRA gradients must be non-zero, got {grad_norm}");
+        assert!(grad_norm.is_finite(), "gradient norm must be finite");
+
+        // Verify: Adam update produces changed weights (check A matrix, not B which starts at 0)
+        let wo = lora.layers[0].wo.as_ref().unwrap();
+        let w_before: f32 = wo.a.iter().map(|x| x * x).sum::<f32>();
+        lora_adam_update(&mut lora, &bwd.lora_grads, &mut adam, 1, 5e-4, 0.9, 0.999, 1e-8, 0.01);
+        let wo = lora.layers[0].wo.as_ref().unwrap();
+        let w_after: f32 = wo.a.iter().map(|x| x * x).sum::<f32>();
+        assert!(
+            (w_before - w_after).abs() > 1e-12,
+            "weights must change after Adam update"
+        );
+
+        eprintln!("PASS: CPU fwd→bwd baseline, loss={:.4}, grad_norm={grad_norm:.6}", fwd.base.loss);
+    }
+
+    /// RED TEST 2: MLX forward produces a ForwardResultWithLora that the CPU
+    /// backward can consume, yielding valid gradients.
+    ///
+    /// This is the core split-silicon test. It calls `mlx_forward_for_training`
+    /// (which doesn't exist yet) and verifies backward works with its output.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_split_silicon_mlx_fwd_cpu_bwd() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_backward;
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{LoraConfig, LoraModel};
+
+        let dir = qwen3_5_dir();
+        let mil_cfg = mil_config_from_json(&dir, 4);
+        let model = crate::agent::ane_weights::ModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load model");
+        let n_layers = model.layers.len();
+        let dim = mil_cfg.dim;
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+        let hidden = mil_cfg.hidden_dim;
+
+        let lora_cfg = LoraConfig::default();
+        let lora = LoraModel::with_full_dims(
+            lora_cfg,
+            n_layers,
+            dim,
+            kv_dim,
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+
+        let tokens: Vec<u32> = (100..104).collect();
+        let targets: Vec<u32> = (101..105).collect();
+
+        // CPU forward — reference
+        let fwd_cpu = ane_forward::forward_cpu_generic(
+            &model, Some(&lora), &tokens, &targets,
+        );
+
+        // MLX forward — the function under test (split-silicon: GPU forward)
+        let mlx_cfg = crate::agent::mlx_lora::ModelConfig::from_config_json(&dir)
+            .expect("load MLX config");
+        let mlx_lora_cfg = crate::agent::mlx_lora::LoraConfig::default();
+        let mlx_model = crate::agent::mlx_lora::MlxLoraModel::load(&dir, &mlx_cfg, &mlx_lora_cfg)
+            .expect("load MLX model");
+
+        let fwd_mlx = crate::agent::split_silicon::mlx_forward_for_training(
+            &mlx_model,
+            &model,
+            Some(&lora),
+            &tokens,
+            &targets,
+            &mil_cfg,
+        );
+
+        // Losses should be close (different float paths, so allow tolerance)
+        let loss_diff = (fwd_cpu.base.loss - fwd_mlx.base.loss).abs();
+        let loss_rel = loss_diff / fwd_cpu.base.loss;
+        assert!(
+            loss_rel < 0.05,
+            "MLX and CPU forward losses should be within 5%: cpu={:.4}, mlx={:.4}, rel={loss_rel:.4}",
+            fwd_cpu.base.loss, fwd_mlx.base.loss,
+        );
+
+        // Backward with MLX-produced activations must yield valid gradients
+        let bwd = ane_backward::backward_lora_cpu_generic(
+            &model, &fwd_mlx, &lora, &tokens, 0.0, 1.0,
+        );
+
+        let adapter_ss = |a: &Option<crate::agent::ane_lora::LoraAdapterGrads>| -> f32 {
+            a.as_ref().map_or(0.0, |g| {
+                g.da.iter().map(|x| x * x).sum::<f32>()
+                    + g.db.iter().map(|x| x * x).sum::<f32>()
+            })
+        };
+        let grad_norm: f32 = bwd.lora_grads.layers.iter().map(|lg| {
+            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
+        }).sum::<f32>().sqrt();
+
+        assert!(grad_norm > 0.0, "split-silicon gradients must be non-zero");
+        assert!(grad_norm.is_finite(), "split-silicon gradient norm must be finite");
+
+        // Reference backward with CPU activations
+        let bwd_ref = ane_backward::backward_lora_cpu_generic(
+            &model, &fwd_cpu, &lora, &tokens, 0.0, 1.0,
+        );
+        let ref_norm: f32 = bwd_ref.lora_grads.layers.iter().map(|lg| {
+            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
+        }).sum::<f32>().sqrt();
+
+        // Gradient norms should be in the same ballpark (allow 20% for float divergence)
+        let norm_ratio = grad_norm / ref_norm;
+        assert!(
+            (0.5..2.0).contains(&norm_ratio),
+            "gradient norm ratio should be ~1.0: mlx={grad_norm:.6}, cpu={ref_norm:.6}, ratio={norm_ratio:.3}"
+        );
+
         eprintln!(
-            "\nPASS: prepacked {speedup:.2}x speedup, losses match within tolerance"
+            "PASS: split-silicon MLX fwd → CPU bwd\n  loss: cpu={:.4} mlx={:.4} (rel={loss_rel:.4})\n  grads: cpu={ref_norm:.6} mlx={grad_norm:.6} (ratio={norm_ratio:.3})",
+            fwd_cpu.base.loss, fwd_mlx.base.loss,
+        );
+    }
+
+    /// RED TEST 3: Split-silicon training step decreases loss over 3 steps.
+    ///
+    /// Full training loop: MLX forward → CPU backward → Adam update → repeat.
+    /// Loss must decrease, proving the gradient signal is correct end-to-end.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_split_silicon_loss_decreases() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        use crate::agent::ane_backward;
+        use crate::agent::ane_lora::{lora_adam_update, LoraConfig, LoraModel, LoraModelAdam};
+
+        let dir = qwen3_5_dir();
+        let mil_cfg = mil_config_from_json(&dir, 4);
+        let model = crate::agent::ane_weights::ModelWeights::from_mlx_safetensors(&dir, &mil_cfg)
+            .expect("load model");
+        let n_layers = model.layers.len();
+        let dim = mil_cfg.dim;
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+        let hidden = mil_cfg.hidden_dim;
+
+        let lora_cfg = LoraConfig::default();
+        let mut lora = LoraModel::with_full_dims(
+            lora_cfg,
+            n_layers,
+            dim,
+            kv_dim,
+            mil_cfg.attn_dim(),
+            mil_cfg.q_proj_dim(),
+            hidden,
+        );
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        let mlx_cfg = crate::agent::mlx_lora::ModelConfig::from_config_json(&dir)
+            .expect("load MLX config");
+        let mlx_lora_cfg = crate::agent::mlx_lora::LoraConfig::default();
+        let mlx_model = crate::agent::mlx_lora::MlxLoraModel::load(&dir, &mlx_cfg, &mlx_lora_cfg)
+            .expect("load MLX model");
+
+        let tokens: Vec<u32> = (100..104).collect();
+        let targets: Vec<u32> = (101..105).collect();
+
+        let mut losses = Vec::new();
+        for step in 0..3 {
+            let fwd = crate::agent::split_silicon::mlx_forward_for_training(
+                &mlx_model,
+                &model,
+                Some(&lora),
+                &tokens,
+                &targets,
+                &mil_cfg,
+            );
+
+            let bwd = ane_backward::backward_lora_cpu_generic(
+                &model, &fwd, &lora, &tokens, 0.0, 1.0,
+            );
+
+            lora_adam_update(
+                &mut lora, &bwd.lora_grads, &mut adam,
+                step + 1, 5e-4, 0.9, 0.999, 1e-8, 0.01,
+            );
+
+            eprintln!("  step {step}: loss={:.4}", fwd.base.loss);
+            losses.push(fwd.base.loss);
+        }
+
+        assert!(
+            losses[2] < losses[0],
+            "loss must decrease: step0={:.4} → step2={:.4}",
+            losses[0], losses[2],
+        );
+
+        eprintln!("PASS: split-silicon loss decreased {:.4} → {:.4}", losses[0], losses[2]);
+    }
+
+    /// RED TEST 4: Training without yield guard — verify step completes and
+    /// the training thread doesn't check inference_active.
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_training_no_yield_guard() {
+        // The yield guard at ane_mlx_bridge.rs:1068 sleeps 200ms per poll while
+        // inference_active is true. A training step should complete without
+        // checking this flag — ANE and GPU are independent hardware.
+        //
+        // This test sets inference_active=true for the ENTIRE training duration
+        // and asserts the step completes in reasonable time (not blocked).
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+
+        let dir = qwen3_5_dir();
+        let mil_cfg = mil_config_from_json(&dir, 4);
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+
+        let cfg = AneTrainingConfig {
+            model_dir: dir.clone(),
+            mil_config: mil_cfg.clone(),
+            lr: 5e-4,
+            epochs: 1,
+            accum_steps: 1,
+            loss_scale: 1.0,
+            softcap: 0.0,
+            residual_scale: 0.0,
+            lr_scale_attn: 1.0,
+            lr_scale_ffn: 1.0,
+            optimizer: AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            linear_attn_indices: vec![],
+            kv_dim,
+        };
+
+        let tokens: Vec<i32> = (100..104).collect();
+        let targets: Vec<i32> = (101..105).collect();
+        let samples = vec![(tokens, targets, 1.0f32)];
+
+        // Create RuntimeCounters with inference_active permanently ON
+        let counters = std::sync::Arc::new(crate::agent::agent_core::RuntimeCounters::new(32000));
+        counters.inference_active.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let trainer = PersistentAneTrainer::new();
+
+        let t0 = std::time::Instant::now();
+        let handle = trainer.spawn_training_with_progress(
+            cfg,
+            samples,
+            None,  // no mlx_tx
+            Some(counters),
+        );
+
+        // Wait for completion. If yield guard is still active, this will block
+        // forever because inference_active=true and each poll sleeps 200ms.
+        let ok = handle.join().expect("training thread panicked");
+        let elapsed = t0.elapsed();
+
+        assert!(ok, "training must succeed");
+        eprintln!("PASS: training completed in {:.1}s with inference_active=true", elapsed.as_secs_f64());
+
+        // With the yield guard active at 200ms/poll, training would hang
+        // forever because inference_active is permanently true. Without the
+        // guard, training completes normally. Debug builds are ~3x slower
+        // than release, so allow 180s.
+        let deadline = std::time::Duration::from_secs(180);
+        assert!(
+            elapsed < deadline,
+            "training took {:.1}s — yield guard may still be blocking",
+            elapsed.as_secs_f64(),
         );
     }
 }

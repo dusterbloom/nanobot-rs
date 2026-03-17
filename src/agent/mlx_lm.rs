@@ -526,7 +526,10 @@ impl LazyAuxiliaryServer {
 
         // Check if something is already listening (external server).
         if Self::is_port_responding(self.port) {
-            tracing::debug!(port = self.port, "auxiliary server: port already responding");
+            tracing::debug!(
+                port = self.port,
+                "auxiliary server: port already responding"
+            );
             return true;
         }
 
@@ -569,7 +572,10 @@ impl LazyAuxiliaryServer {
                 true
             }
             Err(e) => {
-                tracing::warn!("auxiliary server: failed to start on port {}: {e}", self.port);
+                tracing::warn!(
+                    "auxiliary server: failed to start on port {}: {e}",
+                    self.port
+                );
                 self.failed.store(true, Ordering::Relaxed);
                 false
             }

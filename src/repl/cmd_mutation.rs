@@ -43,7 +43,10 @@ impl ReplContext {
                 Ok(budget) => {
                     let clamped = budget.clamp(1024, 128000);
                     counters.thinking_budget.store(clamped, Ordering::Relaxed);
-                    println!("\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", clamped);
+                    println!(
+                        "\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
+                        clamped
+                    );
                 }
                 Err(_) => {
                     println!(
@@ -61,7 +64,10 @@ impl ReplContext {
                 counters
                     .thinking_budget
                     .store(default_budget, Ordering::Relaxed);
-                println!("\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n", default_budget);
+                println!(
+                    "\n  Thinking \x1b[32menabled\x1b[0m — budget: {} tokens\n",
+                    default_budget
+                );
             }
         }
     }

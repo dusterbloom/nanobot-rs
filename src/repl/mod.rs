@@ -359,11 +359,7 @@ pub(crate) fn short_channel_name(name: &str) -> &str {
 
 /// Build the REPL prompt string based on current mode.
 pub(crate) fn build_prompt(is_local: bool, voice_on: bool, thinking_on: bool) -> String {
-    let think_prefix = if thinking_on {
-        "\x1b[2mT\x1b[0m"
-    } else {
-        ""
-    };
+    let think_prefix = if thinking_on { "\x1b[2mT\x1b[0m" } else { "" };
     if voice_on {
         format!(
             "{}{}{}~>{} ",

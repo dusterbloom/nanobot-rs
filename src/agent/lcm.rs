@@ -438,12 +438,7 @@ impl LcmEngine {
         let messages: Vec<Value> = self
             .active
             .iter()
-            .filter(|e| {
-                e.message()
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    != Some("system")
-            })
+            .filter(|e| e.message().get("role").and_then(|r| r.as_str()) != Some("system"))
             .map(|e| e.message().clone())
             .collect();
         TokenBudget::estimate_tokens(&messages)
@@ -556,7 +551,8 @@ impl LcmEngine {
                 block_messages.len(),
                 MAX_COMPACTION_BLOCK_MESSAGES
             );
-            let truncated = deterministic_truncate(&block_messages, self.config.deterministic_target);
+            let truncated =
+                deterministic_truncate(&block_messages, self.config.deterministic_target);
             (truncated, 3)
         } else {
             // Three-level escalation (Algorithm 3).
@@ -1511,9 +1507,15 @@ mod tests {
         // compact() should succeed via deterministic truncation (level 3),
         // never calling the LLM.
         let result = engine.compact(&compactor, &budget, 0).await;
-        assert!(result.is_some(), "Should produce a summary via deterministic truncation");
+        assert!(
+            result.is_some(),
+            "Should produce a summary via deterministic truncation"
+        );
         if let Some(Turn::Summary { level, .. }) = &result {
-            assert_eq!(*level, 3, "Should use level 3 (deterministic), not LLM levels 1-2");
+            assert_eq!(
+                *level, 3,
+                "Should use level 3 (deterministic), not LLM levels 1-2"
+            );
         }
     }
 
