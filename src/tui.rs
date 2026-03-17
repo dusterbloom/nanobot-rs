@@ -363,6 +363,24 @@ pub(crate) fn render_input_bar(
         hints.push(format!("{CYAN}{}{RESET}", channel_names.join(" ")));
     }
 
+    // Training progress (persistent — always visible while training runs)
+    if counters.training_active.load(Ordering::Relaxed) {
+        let cur = counters.training_current_step.load(Ordering::Relaxed);
+        let total = counters.training_total_steps.load(Ordering::Relaxed);
+        let loss_x10k = counters.training_loss_x10k.load(Ordering::Relaxed);
+        let loss = loss_x10k as f64 / 10000.0;
+        let runs = counters.training_steps_total.load(Ordering::Relaxed);
+        if total > 0 {
+            let pct = (cur * 100).checked_div(total).unwrap_or(0);
+            hints.push(format!(
+                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} {cur}/{total} L={loss:.2} #{}{RESET}",
+                runs + 1,
+            ));
+        } else {
+            hints.push(format!("{YELLOW}train:starting{RESET}"));
+        }
+    }
+
     if max > 0 {
         let pct = (used * 100) / max;
         let ctx_color = match pct {
