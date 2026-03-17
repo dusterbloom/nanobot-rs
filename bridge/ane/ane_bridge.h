@@ -50,9 +50,26 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
 // Returns true on success
 bool ane_bridge_eval(ANEKernelHandle *kernel);
 
-// Write data to kernel input tensor
+// Write data to kernel input tensor (full buffer)
 void ane_bridge_write_input(ANEKernelHandle *kernel, int idx,
                              const void *data, size_t bytes);
+
+// Write data to a region of kernel input tensor (partial update).
+// Only the bytes at [offset..offset+bytes) are modified; the rest of
+// the IOSurface is left untouched. Use this to patch activations into
+// a pre-populated weight buffer without re-copying static weights.
+void ane_bridge_write_input_region(ANEKernelHandle *kernel, int idx,
+                                    size_t offset, const void *data,
+                                    size_t bytes);
+
+// Write scattered chunks to kernel input tensor under a single IOSurface lock.
+// Copies n_chunks blocks of chunk_bytes from src (at src_stride intervals)
+// to input[idx] starting at dst_offset (at dst_stride intervals).
+// Use this to patch interleaved activation rows without touching static weights.
+void ane_bridge_write_input_strided(ANEKernelHandle *kernel, int idx,
+                                     size_t dst_offset, size_t dst_stride,
+                                     const void *src, size_t src_stride,
+                                     size_t chunk_bytes, int n_chunks);
 
 // Read data from kernel output tensor
 void ane_bridge_read_output(ANEKernelHandle *kernel, int idx,

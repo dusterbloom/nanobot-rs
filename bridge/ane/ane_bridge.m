@@ -60,6 +60,7 @@ int ane_bridge_init(void) {
     return 0;
 }
 
+// Default (cached) IOSurface — used for outputs where CPU reads need cache coherency.
 static IOSurfaceRef create_surface(size_t bytes) {
     return IOSurfaceCreate((__bridge CFDictionaryRef)@{
         (id)kIOSurfaceWidth: @(bytes),
@@ -68,6 +69,22 @@ static IOSurfaceRef create_surface(size_t bytes) {
         (id)kIOSurfaceBytesPerRow: @(bytes),
         (id)kIOSurfaceAllocSize: @(bytes),
         (id)kIOSurfacePixelFormat: @0
+    });
+}
+
+// Write-combining IOSurface — used for inputs where CPU only writes.
+// Bypasses the LLC so training's IOSurface writes don't evict GPU inference data.
+// ANE reads via DMA from DRAM directly, so write-combining is transparent to it.
+// kIOMapWriteCombineCache = 0x0400 (IOKit/IOTypes.h)
+static IOSurfaceRef create_surface_wc(size_t bytes) {
+    return IOSurfaceCreate((__bridge CFDictionaryRef)@{
+        (id)kIOSurfaceWidth: @(bytes),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfaceBytesPerRow: @(bytes),
+        (id)kIOSurfaceAllocSize: @(bytes),
+        (id)kIOSurfacePixelFormat: @0,
+        (id)kIOSurfaceCacheMode: @(0x0400)
     });
 }
 
@@ -173,10 +190,13 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
         memcpy(k->outputBytes, output_sizes, n_outputs * sizeof(size_t));
 
         // Create IOSurfaces
+        // Inputs use write-combining: CPU only writes, ANE reads via DMA.
+        // This prevents training's weight copies from polluting the LLC
+        // (which would evict GPU inference working set on unified memory).
         k->ioInputs = (IOSurfaceRef *)malloc(n_inputs * sizeof(IOSurfaceRef));
         k->ioOutputs = (IOSurfaceRef *)malloc(n_outputs * sizeof(IOSurfaceRef));
         for (int i = 0; i < n_inputs; i++)
-            k->ioInputs[i] = create_surface(input_sizes[i]);
+            k->ioInputs[i] = create_surface_wc(input_sizes[i]);
         for (int i = 0; i < n_outputs; i++)
             k->ioOutputs[i] = create_surface(output_sizes[i]);
 
@@ -239,6 +259,35 @@ void ane_bridge_write_input(ANEKernelHandle *kernel, int idx,
     if (!kernel || idx < 0 || idx >= kernel->nInputs) return;
     IOSurfaceLock(kernel->ioInputs[idx], 0, NULL);
     memcpy(IOSurfaceGetBaseAddress(kernel->ioInputs[idx]), data, bytes);
+    IOSurfaceUnlock(kernel->ioInputs[idx], 0, NULL);
+}
+
+void ane_bridge_write_input_region(ANEKernelHandle *kernel, int idx,
+                                    size_t offset, const void *data,
+                                    size_t bytes) {
+    if (!kernel || idx < 0 || idx >= kernel->nInputs) return;
+    if (offset + bytes > kernel->inputBytes[idx]) return;
+    IOSurfaceLock(kernel->ioInputs[idx], 0, NULL);
+    void *base = IOSurfaceGetBaseAddress(kernel->ioInputs[idx]);
+    memcpy((uint8_t *)base + offset, data, bytes);
+    IOSurfaceUnlock(kernel->ioInputs[idx], 0, NULL);
+}
+
+void ane_bridge_write_input_strided(ANEKernelHandle *kernel, int idx,
+                                     size_t dst_offset, size_t dst_stride,
+                                     const void *src, size_t src_stride,
+                                     size_t chunk_bytes, int n_chunks) {
+    if (!kernel || idx < 0 || idx >= kernel->nInputs) return;
+    size_t max_dst = dst_offset + (n_chunks > 0 ? (n_chunks - 1) : 0) * dst_stride + chunk_bytes;
+    if (max_dst > kernel->inputBytes[idx]) return;
+    IOSurfaceLock(kernel->ioInputs[idx], 0, NULL);
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(kernel->ioInputs[idx]);
+    const uint8_t *s = (const uint8_t *)src;
+    for (int i = 0; i < n_chunks; i++) {
+        memcpy(base + dst_offset + (size_t)i * dst_stride,
+               s + (size_t)i * src_stride,
+               chunk_bytes);
+    }
     IOSurfaceUnlock(kernel->ioInputs[idx], 0, NULL);
 }
 

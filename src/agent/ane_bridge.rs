@@ -54,6 +54,25 @@ extern "C" {
         bytes: usize,
     );
 
+    fn ane_bridge_write_input_region(
+        kernel: *mut ANEKernelHandle,
+        idx: c_int,
+        offset: usize,
+        data: *const c_void,
+        bytes: usize,
+    );
+
+    fn ane_bridge_write_input_strided(
+        kernel: *mut ANEKernelHandle,
+        idx: c_int,
+        dst_offset: usize,
+        dst_stride: usize,
+        src: *const c_void,
+        src_stride: usize,
+        chunk_bytes: usize,
+        n_chunks: c_int,
+    );
+
     fn ane_bridge_read_output(
         kernel: *mut ANEKernelHandle,
         idx: c_int,
@@ -237,7 +256,7 @@ impl AneKernel {
         }
     }
 
-    /// Write data to input tensor at `idx`.
+    /// Write data to input tensor at `idx` (full buffer).
     pub fn write_input(&self, idx: usize, data: &[u8]) {
         unsafe {
             ane_bridge_write_input(
@@ -245,6 +264,56 @@ impl AneKernel {
                 idx as c_int,
                 data.as_ptr() as *const c_void,
                 data.len(),
+            );
+        }
+    }
+
+    /// Write data to a region of input tensor at `idx`.
+    ///
+    /// Only bytes `[offset..offset+data.len())` in the IOSurface are modified.
+    /// Use this to patch activations into a pre-populated weight buffer without
+    /// re-copying static weights — reduces CPU memory bandwidth from ~13MB to
+    /// ~512KB per layer dispatch.
+    pub fn write_input_region(&self, idx: usize, offset: usize, data: &[u8]) {
+        unsafe {
+            ane_bridge_write_input_region(
+                self.handle,
+                idx as c_int,
+                offset,
+                data.as_ptr() as *const c_void,
+                data.len(),
+            );
+        }
+    }
+
+    /// Write scattered chunks from `src` into input tensor at `idx`.
+    ///
+    /// Copies `n_chunks` blocks of `chunk_bytes` from `src` (at `src_stride`
+    /// intervals) into the IOSurface starting at `dst_offset` (at `dst_stride`
+    /// intervals). All writes happen under a single IOSurface lock.
+    ///
+    /// Use this to patch interleaved activation rows (e.g. dim rows of seq×4
+    /// bytes each) without re-copying the static weight columns.
+    pub fn write_input_strided(
+        &self,
+        idx: usize,
+        dst_offset: usize,
+        dst_stride: usize,
+        src: &[u8],
+        src_stride: usize,
+        chunk_bytes: usize,
+        n_chunks: usize,
+    ) {
+        unsafe {
+            ane_bridge_write_input_strided(
+                self.handle,
+                idx as c_int,
+                dst_offset,
+                dst_stride,
+                src.as_ptr() as *const c_void,
+                src_stride,
+                chunk_bytes,
+                n_chunks as c_int,
             );
         }
     }
@@ -342,5 +411,88 @@ mod tests {
         assert!(compile_count() >= 1, "compile count should be >= 1");
 
         // 7. Drop is implicit — verifies cleanup doesn't crash
+    }
+
+    /// Test write_input_region: partial write then eval should preserve the patched region.
+    #[test]
+    fn smoke_write_input_region() {
+        ane_init().expect("ane_init failed");
+        let tensor_bytes = N * 4;
+        let kernel = AneKernel::compile(CAST_IDENTITY_MIL, None, &[tensor_bytes], &[tensor_bytes])
+            .expect("compile failed");
+
+        // Write zeros to the full input first
+        let zeros = vec![0u8; tensor_bytes];
+        kernel.write_input(0, &zeros);
+
+        // Patch the first 64 elements (one row of the [1,64,1,64] tensor)
+        let patch: Vec<f32> = (0..64).map(|i| (i + 1) as f32).collect();
+        let patch_bytes: Vec<u8> = patch.iter().flat_map(|f| f.to_le_bytes()).collect();
+        kernel.write_input_region(0, 0, &patch_bytes);
+
+        kernel.eval().expect("eval failed");
+
+        let mut out = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut out);
+        let out_f32: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // First 64 elements should be our patch (1..=64), rest should be 0
+        for i in 0..64 {
+            assert_eq!(out_f32[i], (i + 1) as f32, "patched element {i}");
+        }
+        for i in 64..N {
+            assert_eq!(out_f32[i], 0.0, "unpatched element {i}");
+        }
+    }
+
+    /// Test write_input_strided: scattered writes under single lock.
+    #[test]
+    fn smoke_write_input_strided() {
+        ane_init().expect("ane_init failed");
+        let tensor_bytes = N * 4; // 64*64*4 = 16384 bytes
+        let kernel = AneKernel::compile(CAST_IDENTITY_MIL, None, &[tensor_bytes], &[tensor_bytes])
+            .expect("compile failed");
+
+        // Write zeros first
+        kernel.write_input(0, &vec![0u8; tensor_bytes]);
+
+        // Use strided write to set the first 4 bytes of each 64-element row.
+        // Tensor is [1, 64, 1, 64] = 64 rows of 64 floats each.
+        // Write one f32 per row: chunk_bytes=4, n_chunks=64,
+        // dst_stride=64*4=256, src_stride=4 (contiguous source)
+        let src: Vec<f32> = (0..64).map(|i| (i + 10) as f32).collect();
+        let src_bytes: Vec<u8> = src.iter().flat_map(|f| f.to_le_bytes()).collect();
+        kernel.write_input_strided(
+            0,      // idx
+            0,      // dst_offset
+            256,    // dst_stride (64 floats * 4 bytes)
+            &src_bytes,
+            4,      // src_stride (contiguous f32s)
+            4,      // chunk_bytes (one f32)
+            64,     // n_chunks (64 rows)
+        );
+
+        kernel.eval().expect("eval failed");
+
+        let mut out = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut out);
+        let out_f32: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // First element of each row should be our value, rest should be 0
+        for row in 0..64 {
+            assert_eq!(
+                out_f32[row * 64], (row + 10) as f32,
+                "row {row} first element"
+            );
+            for col in 1..64 {
+                assert_eq!(out_f32[row * 64 + col], 0.0, "row {row} col {col}");
+            }
+        }
     }
 }
