@@ -480,16 +480,7 @@ fn fused_ce_pass2_grad<T: TokenId>(
         // Recompute tile logits
         let embed_tile = &embed[v_start * dim..(v_start + tile_rows) * dim];
         cpu_gemm(
-            tile_slice,
-            embed_tile,
-            false,
-            x_final,
-            false,
-            tile_rows,
-            seq,
-            dim,
-            1.0,
-            0.0,
+            tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0,
         );
 
         if has_softcap {
@@ -1200,6 +1191,9 @@ impl GdnProjForwardKernels {
 pub struct CompiledKernels {
     /// SDPA forward kernel (None at 4B where IOSurface exceeds ANE SRAM).
     pub sdpa_fwd: Option<AneKernel>,
+    /// SDPA core kernel for GQA/gated attention: just Q@K^T → softmax → @V.
+    /// Used when `sdpa_fwd` is None (gated attention, over-parameterized Q).
+    pub sdpa_core_gqa: Option<AneKernel>,
     pub mha_proj_fwd: Option<MhaProjForwardKernels>,
     pub gdn_proj_fwd: Option<GdnProjForwardKernels>,
     /// FFN kernels — fused (small models) or tiled (large models).
@@ -1244,6 +1238,26 @@ impl CompiledKernels {
                 cfg.dim,
                 cfg.attn_output_gate
             );
+            None
+        };
+
+        // SDPA core kernel for GQA/gated attention: pure Q@K^T → softmax → @V.
+        // This handles Qwen3.5 where sdpa_fwd is None due to attn_output_gate.
+        let sdpa_core_gqa = if sdpa_fwd.is_none() && cfg.n_heads > 0 {
+            let spec = KernelSpec::for_kernel(cfg, KernelType::SdpaCoreGqa);
+            AneKernel::compile_multi_weights(
+                &spec.mil_text,
+                &["@model_path/weights/mask.bin"],
+                &[&mask_blob],
+                &[spec.input_bytes],
+                &[spec.output_bytes],
+            )
+            .map_err(|e| {
+                tracing::debug!("ANE SDPA core GQA: failed to compile: {e}");
+                e
+            })
+            .ok()
+        } else {
             None
         };
 
@@ -1360,6 +1374,7 @@ impl CompiledKernels {
 
         Ok(Self {
             sdpa_fwd,
+            sdpa_core_gqa,
             mha_proj_fwd,
             gdn_proj_fwd,
             ffn,
@@ -1528,7 +1543,9 @@ pub fn forward_with_lora<T: TokenId>(
 
         // FFN (fully-fused or two-kernel)
         let (h1, h3, gate, mut ffn_out) = if kernels.ffn.is_fully_fused() {
-            kernels.ffn.eval_full(&x2norm, &lw.w1, &lw.w3, &lw.w2, cfg)?
+            kernels
+                .ffn
+                .eval_full(&x2norm, &lw.w1, &lw.w3, &lw.w2, cfg)?
         } else {
             let (h1, h3, gate) = kernels.ffn.eval_w13(&x2norm, &lw.w1, &lw.w3, cfg)?;
             let ffn_out = kernels.ffn.eval_w2(&gate, &lw.w2, cfg)?;
@@ -1596,7 +1613,17 @@ pub fn forward_with_lora<T: TokenId>(
     let vocab = model.vocab_size;
     let cls_w = model.lm_head.as_ref().unwrap_or(&model.embed);
     let mut classifier_dy = vec![0.0f32; dim * seq];
-    let loss = fused_classifier_ce(&mut classifier_dy, cls_w, &x_final, targets, vocab, dim, seq, 0.0, 1.0);
+    let loss = fused_classifier_ce(
+        &mut classifier_dy,
+        cls_w,
+        &x_final,
+        targets,
+        vocab,
+        dim,
+        seq,
+        0.0,
+        1.0,
+    );
 
     Ok(ForwardResultWithLora {
         base: ForwardResult {
@@ -2001,7 +2028,18 @@ fn cpu_sdpa(
 
         // 1. Scores = scale * Q_h^T @ K_h → [seq, seq]
         let mut scores = vec![0.0f32; seq * seq];
-        cpu_gemm(&mut scores, q_h, true, k_h, false, seq, seq, head_dim, scale, 0.0);
+        cpu_gemm(
+            &mut scores,
+            q_h,
+            true,
+            k_h,
+            false,
+            seq,
+            seq,
+            head_dim,
+            scale,
+            0.0,
+        );
 
         // 2. Causal mask: set upper triangle to -inf
         for s1 in 0..seq {
@@ -2027,9 +2065,53 @@ fn cpu_sdpa(
 
         // 4. Output = V_h @ probs^T → [head_dim, seq]
         // out_h[d, s1] = sum_s2 probs[s1, s2] * V_h[d, s2]
-        cpu_gemm(out_h, v_h, false, &scores, true, head_dim, seq, seq, 1.0, 0.0);
+        cpu_gemm(
+            out_h, v_h, false, &scores, true, head_dim, seq, seq, 1.0, 0.0,
+        );
     }
     out
+}
+
+/// Evaluate the ANE SDPA core GQA kernel.
+///
+/// Packs pre-processed Q, K, V (all GQA-expanded, post-norm, post-RoPE) into
+/// a single buffer, runs the ANE kernel, and returns the attention output.
+///
+/// Q, K, V are all `[attn_dim, seq]`.
+/// Returns: `[attn_dim, seq]`.
+fn eval_sdpa_core_gqa(
+    kernel: &AneKernel,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attn_dim: usize,
+    seq: usize,
+) -> Result<Vec<f32>, String> {
+    let in_ch = 3 * attn_dim;
+    let in_bytes = in_ch * seq * 4; // fp32
+    let out_bytes = attn_dim * seq * 4; // fp32
+
+    // Pack: concat(Q, K, V) into [1, 3*attn_dim, 1, seq] IOSurface layout
+    let mut input = vec![0u8; in_bytes];
+    let f32_slice = unsafe {
+        std::slice::from_raw_parts_mut(input.as_mut_ptr() as *mut f32, in_ch * seq)
+    };
+    // IOSurface channel-first layout: channel c, spatial s → offset c * seq + s
+    f32_slice[..attn_dim * seq].copy_from_slice(q);
+    f32_slice[attn_dim * seq..2 * attn_dim * seq].copy_from_slice(k);
+    f32_slice[2 * attn_dim * seq..3 * attn_dim * seq].copy_from_slice(v);
+
+    kernel.write_input(0, &input);
+    kernel.eval()?;
+
+    let mut output = vec![0u8; out_bytes];
+    kernel.read_output(0, &mut output);
+    let out_f32 = unsafe {
+        std::slice::from_raw_parts(output.as_ptr() as *const f32, attn_dim * seq)
+    };
+    let mut result = out_f32.to_vec();
+    clamp_fp16(&mut result);
+    Ok(result)
 }
 
 /// CPU SiLU activation: silu(x) = x * sigmoid(x).
@@ -2946,7 +3028,17 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
     let vocab = model.vocab_size();
     let cls_w = model.lm_head().unwrap_or(model.embed());
     let mut classifier_dy = vec![0.0f32; dim * seq];
-    let loss = fused_classifier_ce(&mut classifier_dy, cls_w, &x_final, targets, vocab, dim, seq, 0.0, 1.0);
+    let loss = fused_classifier_ce(
+        &mut classifier_dy,
+        cls_w,
+        &x_final,
+        targets,
+        vocab,
+        dim,
+        seq,
+        0.0,
+        1.0,
+    );
 
     ForwardResultWithLora {
         base: ForwardResult {
@@ -3009,7 +3101,16 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
     softcap: f32,
     residual_scale: f32,
 ) -> Result<ForwardResultWithLora, String> {
-    forward_ane_generic_prepacked(kernels, model, lora, tokens, targets, softcap, residual_scale, None)
+    forward_ane_generic_prepacked(
+        kernels,
+        model,
+        lora,
+        tokens,
+        targets,
+        softcap,
+        residual_scale,
+        None,
+    )
 }
 
 /// ANE-accelerated forward with optional pre-packed weight buffers.
@@ -3153,7 +3254,17 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
             };
 
             cpu_rope(&mut q, &mut k, n_heads, head_dim, seq, cfg.rope_theta);
-            let mut attn_out = cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+            // ANE SDPA wins at seq>=192 (quadratic attention outweighs dispatch overhead).
+            // Below that threshold, CPU cblas_sgemm is faster due to lower dispatch latency.
+            let mut attn_out = if seq >= 192 {
+                if let Some(sdpa_k) = kernels.sdpa_core_gqa.as_ref() {
+                    eval_sdpa_core_gqa(sdpa_k, &q, &k, &v, ad, seq)?
+                } else {
+                    cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq)
+                }
+            } else {
+                cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq)
+            };
 
             let (attn_pre_gate_saved, attn_gate_saved) = if cfg.attn_output_gate {
                 let pre_gate = attn_out.clone();
@@ -3222,7 +3333,9 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                 kernels
                     .ffn
                     .eval_full_prepacked(&x2norm, pp, l, cfg)
-                    .map_err(|e| format!("layer {l} FFN fused ANE forward (prepacked) failed: {e}"))?
+                    .map_err(|e| {
+                        format!("layer {l} FFN fused ANE forward (prepacked) failed: {e}")
+                    })?
             } else {
                 kernels
                     .ffn
@@ -3311,10 +3424,25 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
     let vocab = model.vocab_size();
     let cls_w = model.lm_head().unwrap_or(model.embed());
     let mut classifier_dy = vec![0.0f32; dim * seq];
-    let loss = fused_classifier_ce(&mut classifier_dy, cls_w, &x_final, targets, vocab, dim, seq, softcap, 1.0);
+    let loss = fused_classifier_ce(
+        &mut classifier_dy,
+        cls_w,
+        &x_final,
+        targets,
+        vocab,
+        dim,
+        seq,
+        softcap,
+        1.0,
+    );
 
     let _prof_cls_us = _t_cls.elapsed().as_micros() as u64;
-    let _prof_total = _prof_dequant_us + _prof_rmsnorm_us + _prof_attn_us + _prof_ffn_us + _prof_residual_us + _prof_cls_us;
+    let _prof_total = _prof_dequant_us
+        + _prof_rmsnorm_us
+        + _prof_attn_us
+        + _prof_ffn_us
+        + _prof_residual_us
+        + _prof_cls_us;
     if std::env::var("NANOBOT_PROFILE_FWD").is_ok() {
         eprintln!(
             "FWD profile ({n_layers}L seq={seq}): dequant={:.1}ms rmsnorm={:.1}ms attn={:.1}ms ffn={:.1}ms residual={:.1}ms classifier={:.1}ms total={:.1}ms",
@@ -3697,12 +3825,29 @@ mod tests {
         let (ref_loss, dlogits) = cross_entropy_loss(&logits, &targets, vocab, seq);
         let mut ref_dy = vec![0.0f32; dim * seq];
         let mut _dcls = vec![0.0f32; vocab * dim];
-        classifier_bwd(&mut ref_dy, &mut _dcls, &dlogits, &embed, &x_final, vocab, dim, seq);
+        classifier_bwd(
+            &mut ref_dy,
+            &mut _dcls,
+            &dlogits,
+            &embed,
+            &x_final,
+            vocab,
+            dim,
+            seq,
+        );
 
         // Fused
         let mut fused_dy = vec![0.0f32; dim * seq];
         let fused_loss = fused_classifier_ce(
-            &mut fused_dy, &embed, &x_final, &targets, vocab, dim, seq, 0.0, 1.0,
+            &mut fused_dy,
+            &embed,
+            &x_final,
+            &targets,
+            vocab,
+            dim,
+            seq,
+            0.0,
+            1.0,
         );
 
         let loss_err = (ref_loss - fused_loss).abs();
@@ -3710,8 +3855,11 @@ mod tests {
             loss_err < 1e-4,
             "loss mismatch without softcap: ref={ref_loss:.6} fused={fused_loss:.6} err={loss_err:.2e}"
         );
-        let max_err = ref_dy.iter().zip(fused_dy.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_err = ref_dy
+            .iter()
+            .zip(fused_dy.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         assert!(max_err < 1e-4, "dy mismatch without softcap: {max_err:.2e}");
     }
 
@@ -3722,7 +3870,9 @@ mod tests {
         let dim = 8;
         let seq = 2;
 
-        let embed: Vec<f32> = (0..vocab * dim).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+        let embed: Vec<f32> = (0..vocab * dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+            .collect();
         let x_final: Vec<f32> = (0..dim * seq).map(|i| i as f32 * 0.05).collect();
         let targets: Vec<u32> = vec![0, vocab as u32 - 1]; // first and last vocab
 
@@ -3732,10 +3882,21 @@ mod tests {
 
         let mut fused_dy = vec![0.0f32; dim * seq];
         let fused_loss = fused_classifier_ce(
-            &mut fused_dy, &embed, &x_final, &targets, vocab, dim, seq, 0.0, 1.0,
+            &mut fused_dy,
+            &embed,
+            &x_final,
+            &targets,
+            vocab,
+            dim,
+            seq,
+            0.0,
+            1.0,
         );
 
-        assert!((ref_loss - fused_loss).abs() < 1e-4, "loss mismatch at partial tile boundary");
+        assert!(
+            (ref_loss - fused_loss).abs() < 1e-4,
+            "loss mismatch at partial tile boundary"
+        );
     }
 
     #[test]
@@ -3857,7 +4018,12 @@ mod tests {
         let dense_fwd = forward_cpu_generic(&dense, None, &tokens, &targets);
 
         assert!((quantized_fwd.base.loss - dense_fwd.base.loss).abs() < 1e-4);
-        assert!(max_abs_diff(&quantized_fwd.base.classifier_dy, &dense_fwd.base.classifier_dy) < 1e-4);
+        assert!(
+            max_abs_diff(
+                &quantized_fwd.base.classifier_dy,
+                &dense_fwd.base.classifier_dy
+            ) < 1e-4
+        );
 
         let q_act = &quantized_fwd.base.layer_acts[0];
         let d_act = &dense_fwd.base.layer_acts[0];
@@ -3996,7 +4162,12 @@ mod tests {
         let dense_fwd = forward_cpu_generic(&dense, None, &tokens, &targets);
 
         assert!((quantized_fwd.base.loss - dense_fwd.base.loss).abs() < 1e-4);
-        assert!(max_abs_diff(&quantized_fwd.base.classifier_dy, &dense_fwd.base.classifier_dy) < 1e-4);
+        assert!(
+            max_abs_diff(
+                &quantized_fwd.base.classifier_dy,
+                &dense_fwd.base.classifier_dy
+            ) < 1e-4
+        );
 
         let q_act = &quantized_fwd.base.layer_acts[0];
         let d_act = &dense_fwd.base.layer_acts[0];
@@ -4113,8 +4284,13 @@ mod tests {
         );
         let fwd = fwd.unwrap();
         eprintln!(
-            "35B-A3B forward kernels: sdpa_fwd={}",
-            fwd.sdpa_fwd.is_some()
+            "35B-A3B forward kernels: sdpa_fwd={} sdpa_core_gqa={}",
+            fwd.sdpa_fwd.is_some(),
+            fwd.sdpa_core_gqa.is_some()
+        );
+        assert!(
+            fwd.sdpa_core_gqa.is_some(),
+            "sdpa_core_gqa should compile for Qwen3.5-35B-A3B"
         );
 
         let bwd = BackwardKernels::compile_backward(&cfg, &fwd.mask_blob);
@@ -5535,7 +5711,10 @@ mod tests {
         );
 
         // Compare classifier_dy (fp16 ANE intermediates cause drift, generous tolerance)
-        let dy_err = max_abs_diff(&cpu_result.base.classifier_dy, &ane_result.base.classifier_dy);
+        let dy_err = max_abs_diff(
+            &cpu_result.base.classifier_dy,
+            &ane_result.base.classifier_dy,
+        );
         eprintln!("classifier_dy max_abs_diff={dy_err:.6}");
         assert!(
             dy_err < 1.0,
@@ -6311,8 +6490,8 @@ mod tests {
     /// Run: cargo test --features ane --release --lib -- "test_fused_mil_op_support" --nocapture --test-threads=1
     #[test]
     fn test_fused_mil_op_support() {
-        use super::AneKernel;
         use super::super::ane_mil::MIL_HDR;
+        use super::AneKernel;
 
         if super::super::ane_bridge::ane_init().is_err() {
             eprintln!("SKIP: ANE init failed");
@@ -6335,17 +6514,21 @@ mod tests {
         let hdr = format!("{MIL_HDR}    func main<ios18>");
 
         // 1. reduce_sum
-        let mil = format!("{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
             int32 ax = const()[name=string(\"ax\"), val=int32(1)];\n\
             bool kd = const()[name=string(\"kd\"), val=bool(true)];\n\
             tensor<fp16, [1,1,1,8]> y = reduce_sum(x=x,axes=ax,keep_dims=kd)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("reduce_sum", &mil, 4 * 8 * 2, 1 * 8 * 2);
 
         // 2. rsqrt
-        let mil = format!("{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
             tensor<fp16, [1,1,1,8]> y = rsqrt(x=x)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("rsqrt", &mil, 8 * 2, 8 * 2);
 
         // 3. reduce_mean
@@ -6357,23 +6540,29 @@ mod tests {
         try_compile("reduce_mean", &mil, 4 * 8 * 2, 1 * 8 * 2);
 
         // 4. real_div
-        let mil = format!("{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
             fp16 c = const()[name=string(\"c\"), val=fp16(2.0)];\n\
             tensor<fp16, [1,1,1,8]> y = real_div(x=x,y=c)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("real_div", &mil, 8 * 2, 8 * 2);
 
         // 5. sqrt
-        let mil = format!("{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
             tensor<fp16, [1,1,1,8]> y = sqrt(x=x)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("sqrt", &mil, 8 * 2, 8 * 2);
 
         // 6. pow
-        let mil = format!("{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,1,1,8]> x) {{\n\
             fp16 e = const()[name=string(\"e\"), val=fp16(-0.5)];\n\
             tensor<fp16, [1,1,1,8]> y = pow(x=x,y=e)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("pow", &mil, 8 * 2, 8 * 2);
 
         // 7. concat (on last axis, like RoPE)
@@ -6385,23 +6574,29 @@ mod tests {
         try_compile("concat", &mil, 2 * 4 * 2, 8 * 2);
 
         // 8. cast fp32->fp16
-        let mil = format!("{hdr}(tensor<fp32, [1,4,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp32, [1,4,1,8]> x) {{\n\
             string dt = const()[name=string(\"dt\"), val=string(\"fp16\")];\n\
             tensor<fp16, [1,4,1,8]> y = cast(dtype=dt,x=x)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("cast_fp32_to_fp16", &mil, 4 * 8 * 4, 4 * 8 * 2);
 
         // 9. cast fp16->fp32
-        let mil = format!("{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
             string dt = const()[name=string(\"dt\"), val=string(\"fp32\")];\n\
             tensor<fp32, [1,4,1,8]> y = cast(dtype=dt,x=x)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("cast_fp16_to_fp32", &mil, 4 * 8 * 2, 4 * 8 * 4);
 
         // 10. sub
-        let mil = format!("{hdr}(tensor<fp16, [1,4,1,8]> a, tensor<fp16, [1,4,1,8]> b) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,4,1,8]> a, tensor<fp16, [1,4,1,8]> b) {{\n\
             tensor<fp16, [1,4,1,8]> y = sub(x=a,y=b)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("sub", &mil, 2 * 4 * 8 * 2, 4 * 8 * 2);
 
         // 11. slice_by_size (known working)
@@ -6413,9 +6608,11 @@ mod tests {
         try_compile("slice_by_size", &mil, 4 * 8 * 2, 2 * 8 * 2);
 
         // 12. mul+add (known working baseline)
-        let mil = format!("{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
+        let mil = format!(
+            "{hdr}(tensor<fp16, [1,4,1,8]> x) {{\n\
             tensor<fp16, [1,4,1,8]> y = mul(x=x,y=x)[name=string(\"y\")];\n\
-        }} -> (y);\n}}");
+        }} -> (y);\n}}"
+        );
         try_compile("mul_baseline", &mil, 4 * 8 * 2, 4 * 8 * 2);
     }
 
@@ -6429,9 +6626,7 @@ mod tests {
     #[test]
     fn test_fused_layer_compile_and_correctness() {
         use super::super::ane_mil::{build_causal_mask_blob, gen_fused_layer_fwd, MilConfig};
-        use super::super::ane_weights::{
-            build_fp16_blob, generate_rope_blobs, transpose_weight,
-        };
+        use super::super::ane_weights::{build_fp16_blob, generate_rope_blobs, transpose_weight};
         use super::AneKernel;
 
         if super::super::ane_bridge::ane_init().is_err() {
@@ -6463,8 +6658,12 @@ mod tests {
         let w1 = make_weight(hidden * dim, 500);
         let w3 = make_weight(hidden * dim, 600);
         let w2 = make_weight(dim * hidden, 700);
-        let rms_att: Vec<f32> = (0..dim).map(|i| 0.8 + 0.4 * (i as f32 / dim as f32)).collect();
-        let rms_ffn: Vec<f32> = (0..dim).map(|i| 0.9 + 0.2 * (i as f32 / dim as f32)).collect();
+        let rms_att: Vec<f32> = (0..dim)
+            .map(|i| 0.8 + 0.4 * (i as f32 / dim as f32))
+            .collect();
+        let rms_ffn: Vec<f32> = (0..dim)
+            .map(|i| 0.9 + 0.2 * (i as f32 / dim as f32))
+            .collect();
 
         // --- Build the 12 BLOBFILE weight blobs ---
         // MIL gen_fused_layer_fwd expects weights in [in, out] layout (transposed).
@@ -6478,8 +6677,7 @@ mod tests {
         let w1_blob = build_fp16_blob(&transpose_weight(&w1, hidden, dim));
         let w3_blob = build_fp16_blob(&transpose_weight(&w3, hidden, dim));
         let w2_blob = build_fp16_blob(&transpose_weight(&w2, dim, hidden));
-        let (rope_cos_blob, rope_sin_blob) =
-            generate_rope_blobs(seq, head_dim, cfg.rope_theta);
+        let (rope_cos_blob, rope_sin_blob) = generate_rope_blobs(seq, head_dim, cfg.rope_theta);
         let mask_blob = build_causal_mask_blob(seq);
 
         // --- Generate fused MIL ---
@@ -6522,7 +6720,9 @@ mod tests {
             }
             Err(e) => {
                 eprintln!("FUSED LAYER COMPILE FAILED: {e}");
-                eprintln!("This is the critical D.1 question answered: ANE cannot compile this MIL.");
+                eprintln!(
+                    "This is the critical D.1 question answered: ANE cannot compile this MIL."
+                );
                 // Dump first 2000 chars of MIL for debugging
                 eprintln!(
                     "MIL (first 2000 chars):\n{}",
@@ -6670,8 +6870,8 @@ mod tests {
 
         // --- Model geometries to test ---
         let configs: Vec<(&str, usize, usize, usize)> = vec![
-            ("tiny", 64, 128, 16),   // dim=64, hidden=128, seq=16
-            ("small", 256, 512, 32), // dim=256, hidden=512, seq=32
+            ("tiny", 64, 128, 16),     // dim=64, hidden=128, seq=16
+            ("small", 256, 512, 32),   // dim=256, hidden=512, seq=32
             ("0.8B", 1024, 2816, 128), // Qwen3.5-0.8B dims
         ];
 
@@ -6703,13 +6903,19 @@ mod tests {
                 &[spec.output_bytes],
             ) {
                 Ok(k) => {
-                    eprintln!("  Fused FFN compiled OK (in={}KB, out={}KB)",
-                        spec.input_bytes / 1024, spec.output_bytes / 1024);
+                    eprintln!(
+                        "  Fused FFN compiled OK (in={}KB, out={}KB)",
+                        spec.input_bytes / 1024,
+                        spec.output_bytes / 1024
+                    );
                     k
                 }
                 Err(e) => {
                     eprintln!("  FUSED FFN COMPILE FAILED: {e}");
-                    eprintln!("  MIL (first 1000 chars):\n{}", &spec.mil_text[..spec.mil_text.len().min(1000)]);
+                    eprintln!(
+                        "  MIL (first 1000 chars):\n{}",
+                        &spec.mil_text[..spec.mil_text.len().min(1000)]
+                    );
                     panic!("Fused FFN kernel must compile for {label}");
                 }
             };
@@ -6808,8 +7014,8 @@ mod tests {
         }
 
         // Read model config
-        let config_str = std::fs::read_to_string(model_dir.join("config.json"))
-            .expect("read config.json");
+        let config_str =
+            std::fs::read_to_string(model_dir.join("config.json")).expect("read config.json");
         let root: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let tc = root.get("text_config").unwrap_or(&root);
         let dim = tc["hidden_size"].as_u64().unwrap() as usize;
@@ -6824,7 +7030,11 @@ mod tests {
         let layer_types: Vec<String> = tc
             .get("layer_types")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let linear_attn_indices: Vec<usize> = layer_types
             .iter()
@@ -6849,7 +7059,10 @@ mod tests {
             linear_n_value_heads: 0,
             linear_value_head_dim: 0,
             conv_kernel_size: 0,
-            attn_output_gate: tc.get("attn_output_gate").and_then(|v| v.as_bool()).unwrap_or(false),
+            attn_output_gate: tc
+                .get("attn_output_gate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         };
         eprintln!("Model: dim={dim}, hidden={hidden}, heads={n_heads}, kv={n_kv_heads}, hd={head_dim}, layers={n_layers}, seq={seq}");
 
@@ -6862,7 +7075,11 @@ mod tests {
             &[spec.output_bytes],
         )
         .expect("Fused FFN must compile for 0.8B dims");
-        eprintln!("Fused FFN compiled (in={}KB, out={}KB)", spec.input_bytes / 1024, spec.output_bytes / 1024);
+        eprintln!(
+            "Fused FFN compiled (in={}KB, out={}KB)",
+            spec.input_bytes / 1024,
+            spec.output_bytes / 1024
+        );
 
         // Load quantized weights
         let model = QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg)
@@ -6889,7 +7106,10 @@ mod tests {
         let mut x_cur = vec![0.0f32; dim * seq];
         super::embed_lookup(&mut x_cur, embed, &tokens, dim, seq);
 
-        eprintln!("\n{:>3} {:>12} {:>12} {:>12} {:>12}", "L", "h1_err", "h3_err", "gate_err", "ffn_err");
+        eprintln!(
+            "\n{:>3} {:>12} {:>12} {:>12} {:>12}",
+            "L", "h1_err", "h3_err", "gate_err", "ffn_err"
+        );
         eprintln!("{}", "-".repeat(60));
 
         let mut max_ffn_err = 0.0f64;
@@ -6954,10 +7174,16 @@ mod tests {
         let w13_spec = KernelSpec::for_kernel(&cfg, KernelType::FfnW13);
         let w2_spec = KernelSpec::for_kernel(&cfg, KernelType::FfnW2);
         let w13_kernel = AneKernel::compile(
-            &w13_spec.mil_text, None, &[w13_spec.input_bytes], &[w13_spec.output_bytes],
+            &w13_spec.mil_text,
+            None,
+            &[w13_spec.input_bytes],
+            &[w13_spec.output_bytes],
         );
         let w2_kernel = AneKernel::compile(
-            &w2_spec.mil_text, None, &[w2_spec.input_bytes], &[w2_spec.output_bytes],
+            &w2_spec.mil_text,
+            None,
+            &[w2_spec.input_bytes],
+            &[w2_spec.output_bytes],
         );
 
         if let (Ok(w13_k), Ok(w2_k)) = (w13_kernel, w2_kernel) {
@@ -7069,13 +7295,19 @@ mod tests {
         eprintln!("FFN kernel type: {ffn_type}");
         eprintln!("Config: dim={dim}, hidden={hidden}, seq={seq}");
 
-        let quantized = QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg)
-            .expect("load model");
+        let quantized =
+            QuantizedModelWeights::from_mlx_safetensors(&model_dir, &cfg).expect("load model");
         let model = super::super::ane_weights::DenseCachedModel::auto(quantized);
-        eprintln!("Loaded {} layers (dense cached: {})", model.n_layers(), model.cached_layer_count());
+        eprintln!(
+            "Loaded {} layers (dense cached: {})",
+            model.n_layers(),
+            model.cached_layer_count()
+        );
 
         let tokens: Vec<u32> = (0..seq).map(|i| (i * 17 % vocab_size) as u32).collect();
-        let targets: Vec<u32> = (0..seq).map(|i| ((i * 17 + 1) % vocab_size) as u32).collect();
+        let targets: Vec<u32> = (0..seq)
+            .map(|i| ((i * 17 + 1) % vocab_size) as u32)
+            .collect();
 
         let cpu_fwd = forward_cpu_generic(&model, None, &tokens, &targets);
         eprintln!("CPU loss: {:.6}", cpu_fwd.base.loss);
@@ -7091,19 +7323,34 @@ mod tests {
         // Per-layer FFN diagnostics
         let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
         let l2_diff = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).powi(2))
+                .sum::<f32>()
+                .sqrt()
         };
 
         eprintln!("\n{:>3} {:>12} {:>12}", "L", "ffn_out_rel", "gate_rel");
         eprintln!("{}", "-".repeat(32));
-        for (l, (ca, aa)) in cpu_fwd.base.layer_acts.iter()
+        for (l, (ca, aa)) in cpu_fwd
+            .base
+            .layer_acts
+            .iter()
             .zip(ane_fwd.base.layer_acts.iter())
             .enumerate()
         {
             let ffn_cn = l2(&ca.ffn_out);
-            let ffn_re = if ffn_cn > 1e-12 { l2_diff(&ca.ffn_out, &aa.ffn_out) / ffn_cn } else { 0.0 };
+            let ffn_re = if ffn_cn > 1e-12 {
+                l2_diff(&ca.ffn_out, &aa.ffn_out) / ffn_cn
+            } else {
+                0.0
+            };
             let gate_cn = l2(&ca.gate);
-            let gate_re = if gate_cn > 1e-12 { l2_diff(&ca.gate, &aa.gate) / gate_cn } else { 0.0 };
+            let gate_re = if gate_cn > 1e-12 {
+                l2_diff(&ca.gate, &aa.gate) / gate_cn
+            } else {
+                0.0
+            };
             eprintln!("{l:>3} {ffn_re:>12.6} {gate_re:>12.6}");
         }
 
@@ -7112,5 +7359,272 @@ mod tests {
             loss_rel < 0.10,
             "ANE vs CPU loss diverges too much: {loss_rel:.4} (expected <0.10)"
         );
+    }
+
+    /// Micro-benchmark: ANE SDPA core GQA kernel vs CPU cblas SDPA.
+    /// Isolates just the attention computation at real Qwen3.5-0.8B dimensions.
+    ///
+    /// cargo test --features ane --release --lib -- bench_sdpa_ane_vs_cpu --nocapture --test-threads=1
+    #[test]
+    fn bench_sdpa_ane_vs_cpu() {
+        use super::ane_bridge;
+        use super::ane_mil::{KernelSpec, KernelType, MilConfig};
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        // Qwen3.5-0.8B dimensions
+        let cfg = MilConfig {
+            dim: 1024,
+            hidden_dim: 3584,
+            n_heads: 8,
+            n_kv_heads: 2,
+            head_dim_explicit: 256,
+            has_lm_head: false,
+            seq_len: 128,
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let n_heads = cfg.n_heads;
+        let head_dim = cfg.head_dim();
+        let ad = cfg.attn_dim(); // 8 * 256 = 2048
+        let seq = cfg.seq_len;
+
+        // Generate causal mask blob
+        let mask_blob = super::ane_mil::build_causal_mask_blob(seq);
+
+        // Compile the ANE SDPA kernel
+        let spec = KernelSpec::for_kernel(&cfg, KernelType::SdpaCoreGqa);
+        let kernel = AneKernel::compile_multi_weights(
+            &spec.mil_text,
+            &["@model_path/weights/mask.bin"],
+            &[&mask_blob],
+            &[spec.input_bytes],
+            &[spec.output_bytes],
+        );
+        let kernel = match kernel {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("SKIP: ANE kernel failed to compile: {e}");
+                return;
+            }
+        };
+
+        // Random Q, K, V at [attn_dim, seq] = [2048, 128]
+        let mut rng_state = 42u64;
+        let mut rand_f32 = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let q: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+        let k: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+        let v: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+
+        let iters = 50;
+
+        // Warmup
+        let _ = super::eval_sdpa_core_gqa(&kernel, &q, &k, &v, ad, seq);
+        let _ = super::cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+        // Benchmark ANE
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = super::eval_sdpa_core_gqa(&kernel, &q, &k, &v, ad, seq).unwrap();
+        }
+        let ane_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        // Benchmark CPU
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = super::cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+        }
+        let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let speedup = cpu_us / ane_us;
+        eprintln!("\n=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq={seq}) ===");
+        eprintln!("  attn_dim={ad} ({} elements per QKV)", ad * seq);
+        eprintln!("  ANE:  {ane_us:.0}us/call ({iters} iters)");
+        eprintln!("  CPU:  {cpu_us:.0}us/call ({iters} iters)");
+        eprintln!("  speedup: {speedup:.2}x");
+        eprintln!();
+
+        // Also test at seq=256
+        let cfg256 = MilConfig { seq_len: 256, ..cfg.clone() };
+        let mask256 = super::ane_mil::build_causal_mask_blob(256);
+        let spec256 = KernelSpec::for_kernel(&cfg256, KernelType::SdpaCoreGqa);
+        if let Ok(kern256) = AneKernel::compile_multi_weights(
+            &spec256.mil_text,
+            &["@model_path/weights/mask.bin"],
+            &[&mask256],
+            &[spec256.input_bytes],
+            &[spec256.output_bytes],
+        ) {
+            let q256: Vec<f32> = (0..ad * 256).map(|_| rand_f32() * 0.1).collect();
+            let k256: Vec<f32> = (0..ad * 256).map(|_| rand_f32() * 0.1).collect();
+            let v256: Vec<f32> = (0..ad * 256).map(|_| rand_f32() * 0.1).collect();
+
+            // Warmup
+            let _ = super::eval_sdpa_core_gqa(&kern256, &q256, &k256, &v256, ad, 256);
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = super::eval_sdpa_core_gqa(&kern256, &q256, &k256, &v256, ad, 256).unwrap();
+            }
+            let ane256_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = super::cpu_sdpa(&q256, &k256, &v256, n_heads, head_dim, 256);
+            }
+            let cpu256_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            eprintln!("=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=256) ===");
+            eprintln!("  ANE:  {ane256_us:.0}us/call");
+            eprintln!("  CPU:  {cpu256_us:.0}us/call");
+            eprintln!("  speedup: {:.2}x", cpu256_us / ane256_us);
+        }
+
+        // seq=512
+        let cfg512 = MilConfig { seq_len: 512, ..cfg };
+        let mask512 = super::ane_mil::build_causal_mask_blob(512);
+        let spec512 = KernelSpec::for_kernel(&cfg512, KernelType::SdpaCoreGqa);
+        if let Ok(kern512) = AneKernel::compile_multi_weights(
+            &spec512.mil_text,
+            &["@model_path/weights/mask.bin"],
+            &[&mask512],
+            &[spec512.input_bytes],
+            &[spec512.output_bytes],
+        ) {
+            let q512: Vec<f32> = (0..ad * 512).map(|_| rand_f32() * 0.1).collect();
+            let k512: Vec<f32> = (0..ad * 512).map(|_| rand_f32() * 0.1).collect();
+            let v512: Vec<f32> = (0..ad * 512).map(|_| rand_f32() * 0.1).collect();
+
+            let _ = super::eval_sdpa_core_gqa(&kern512, &q512, &k512, &v512, ad, 512);
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = super::eval_sdpa_core_gqa(&kern512, &q512, &k512, &v512, ad, 512).unwrap();
+            }
+            let ane512_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _ = super::cpu_sdpa(&q512, &k512, &v512, n_heads, head_dim, 512);
+            }
+            let cpu512_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            eprintln!("=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=512) ===");
+            eprintln!("  ANE:  {ane512_us:.0}us/call");
+            eprintln!("  CPU:  {cpu512_us:.0}us/call");
+            eprintln!("  speedup: {:.2}x", cpu512_us / ane512_us);
+        } else {
+            eprintln!("SKIP: seq=512 kernel failed to compile (may exceed ANE SRAM)");
+        }
+    }
+
+    /// Sweep ANE SDPA vs CPU at Qwen3.5-35B-A3B dimensions across seq lengths.
+    /// attn_dim=4096 (16 heads × 256 head_dim), n_kv_heads=2.
+    ///
+    /// cargo test --features ane --release --lib -- bench_sdpa_35b_sweep --nocapture --test-threads=1
+    #[test]
+    fn bench_sdpa_35b_sweep() {
+        use super::ane_bridge;
+        use super::ane_mil::{KernelSpec, KernelType, MilConfig};
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        // Qwen3.5-35B-A3B dimensions
+        let base_cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 5120,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim_explicit: 256,
+            has_lm_head: false,
+            seq_len: 64, // placeholder, overridden per sweep
+            rope_theta: 1_000_000.0,
+            rms_eps: 1e-6,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let n_heads = base_cfg.n_heads;
+        let head_dim = base_cfg.head_dim();
+        let ad = base_cfg.attn_dim(); // 16 * 256 = 4096
+
+        eprintln!("\n=== SDPA sweep: Qwen3.5-35B-A3B (n_heads={n_heads}, head_dim={head_dim}, attn_dim={ad}) ===");
+        eprintln!("{:>6} {:>10} {:>10} {:>8}", "seq", "ANE(us)", "CPU(us)", "speedup");
+        eprintln!("{}", "-".repeat(40));
+
+        let iters = 30;
+
+        // RNG
+        let mut rng_state = 42u64;
+        let mut rand_f32 = || -> f32 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng_state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+
+        for &seq in &[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768] {
+            let cfg = MilConfig { seq_len: seq, ..base_cfg.clone() };
+            let mask = super::ane_mil::build_causal_mask_blob(seq);
+            let spec = KernelSpec::for_kernel(&cfg, KernelType::SdpaCoreGqa);
+
+            let kern = match AneKernel::compile_multi_weights(
+                &spec.mil_text,
+                &["@model_path/weights/mask.bin"],
+                &[&mask],
+                &[spec.input_bytes],
+                &[spec.output_bytes],
+            ) {
+                Ok(k) => k,
+                Err(_) => {
+                    eprintln!("{seq:>6} {:>10} {:>10} {:>8}", "FAIL", "-", "-");
+                    continue;
+                }
+            };
+
+            let q: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+            let k: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+            let v: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
+
+            // Scale iters down for large seq to keep total runtime sane
+            let n = if seq >= 16384 { 1 } else if seq >= 8192 { 2 } else if seq >= 4096 { 3 } else if seq >= 2048 { 5 } else if seq >= 1024 { 10 } else { iters };
+
+            // Warmup
+            let _ = super::eval_sdpa_core_gqa(&kern, &q, &k, &v, ad, seq);
+            let _ = super::cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = super::eval_sdpa_core_gqa(&kern, &q, &k, &v, ad, seq).unwrap();
+            }
+            let ane_us = t0.elapsed().as_micros() as f64 / n as f64;
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = super::cpu_sdpa(&q, &k, &v, n_heads, head_dim, seq);
+            }
+            let cpu_us = t0.elapsed().as_micros() as f64 / n as f64;
+
+            let speedup = cpu_us / ane_us;
+            eprintln!("{seq:>6} {ane_us:>10.0} {cpu_us:>10.0} {speedup:>7.2}x");
+        }
     }
 }

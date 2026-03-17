@@ -81,6 +81,8 @@ pub mod role_policy;
 pub mod router;
 pub mod router_fallback;
 pub mod sanitize;
+#[cfg(feature = "mlx")]
+pub mod split_silicon;
 pub mod session_indexer;
 pub mod skills;
 pub mod step_voter;

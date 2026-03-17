@@ -119,7 +119,10 @@ impl MilConfig {
 /// Kernel type for spec computation.
 #[derive(Debug, Clone, Copy)]
 pub enum KernelType {
-    DynMatmul { ic: usize, oc: usize },
+    DynMatmul {
+        ic: usize,
+        oc: usize,
+    },
     SdpaFwd,
     FfnW13,
     FfnW2,
@@ -127,6 +130,9 @@ pub enum KernelType {
     FfnBwdW2t,
     FfnBwdW13t,
     Qkvb,
+    /// Pure SDPA core for GQA: Q@K^T → scale → mask → softmax → @V.
+    /// Accepts pre-projected, pre-normed, pre-RoPE'd, GQA-expanded Q/K/V.
+    SdpaCoreGqa,
     SdpaBwd1,
     SdpaBwd2,
     /// Fully-fused FFN: W1+W3+SiLU+gate+W2 in a single ANE dispatch.
@@ -232,6 +238,19 @@ impl KernelSpec {
                     qpd,
                     sp_in,
                     cfg.dim,
+                    cfg.seq_len,
+                    false,
+                    false,
+                )
+            }
+            KernelType::SdpaCoreGqa => {
+                let ad = cfg.attn_dim();
+                let in_ch = 3 * ad;
+                (
+                    gen_sdpa_core_gqa(cfg),
+                    in_ch,
+                    cfg.seq_len,
+                    ad,
                     cfg.seq_len,
                     false,
                     false,
@@ -682,6 +701,102 @@ pub fn gen_sdpa_fwd(cfg: &MilConfig) -> String {
     m
 }
 
+/// SDPA core for GQA: Q @ K^T → scale → mask → softmax → @V.
+///
+/// Unlike `gen_sdpa_fwd` which fuses projections+RoPE+SDPA+O_proj, this is
+/// JUST the attention core. Projections, QK-norm, RoPE, and gating are handled
+/// on CPU (cheap element-wise ops). The matmuls (Q@K^T and scores@V) are the
+/// expensive part that benefits from ANE.
+///
+/// Input: `[1, 2*attn_dim + kv_dim, 1, seq]` fp32 = concat(Q, K, V_unexpanded).
+///   - Q: `[attn_dim, seq]` — post-QK-norm, post-RoPE
+///   - K: `[attn_dim, seq]` — expanded for GQA, post-QK-norm, post-RoPE
+///   - V: `[kv_dim, seq]` — NOT expanded (expanded inside kernel via tile)
+///
+/// Wait — actually K needs to be expanded BEFORE the kernel because Q@K^T
+/// requires matching head counts. Let's accept expanded K.
+///
+/// Input: `[1, 3*attn_dim, 1, seq]` fp32 = concat(Q, K_expanded, V_expanded).
+/// Output: `[1, attn_dim, 1, seq]` fp32 = attention output.
+///
+/// The causal mask is baked in as a BLOBFILE constant.
+pub fn gen_sdpa_core_gqa(cfg: &MilConfig) -> String {
+    let ad = cfg.attn_dim();
+    let seq = cfg.seq_len;
+    let heads = cfg.n_heads;
+    let hd = cfg.head_dim();
+    let sc = 1.0 / (hd as f64).sqrt();
+    let in_ch = 3 * ad;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> x) {{"
+    );
+
+    // Cast to fp16 for ANE
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+
+    // Slice Q, K, V
+    let _ = writeln!(m, "        tensor<int32, [4]> bq = const()[name=string(\"bq\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> sq = const()[name=string(\"sq\"), val=tensor<int32, [4]>([1,{ad},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ad},1,{seq}]> qf = slice_by_size(x=xh,begin=bq,size=sq)[name=string(\"qf\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> bk = const()[name=string(\"bk\"), val=tensor<int32, [4]>([0,{ad},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ad},1,{seq}]> kf = slice_by_size(x=xh,begin=bk,size=sq)[name=string(\"kf\")];");
+
+    let off_v = 2 * ad;
+    let _ = writeln!(m, "        tensor<int32, [4]> bv = const()[name=string(\"bv\"), val=tensor<int32, [4]>([0,{off_v},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ad},1,{seq}]> vf = slice_by_size(x=xh,begin=bv,size=sq)[name=string(\"vf\")];");
+
+    // Reshape to [1, heads, hd, seq] → transpose to [1, heads, seq, hd]
+    let _ = writeln!(m, "        tensor<int32, [4]> rsh = const()[name=string(\"rsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=rsh,x=qf)[name=string(\"rq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = transpose(perm=pm,x=q4)[name=string(\"tq\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> k4 = reshape(shape=rsh,x=kf)[name=string(\"rk\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> k = transpose(perm=pm,x=k4)[name=string(\"tk\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> v4 = reshape(shape=rsh,x=vf)[name=string(\"rv\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> v = transpose(perm=pm,x=v4)[name=string(\"tv\")];");
+
+    // Q @ K^T → [1, heads, seq, seq]
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string(\"mm1\")];");
+
+    // Scale
+    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];");
+
+    // Causal mask (const BLOBFILE)
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];");
+
+    // Softmax
+    let _ = writeln!(m, "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];");
+
+    // scores @ V → [1, heads, seq, hd]
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> a4 = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=v)[name=string(\"mm2\")];");
+
+    // Reshape back to [1, attn_dim, 1, seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{ad},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ad},1,{seq}]> af = reshape(shape=os,x=at)[name=string(\"ra\")];");
+
+    // Cast back to fp32
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{ad},1,{seq}]> out = cast(dtype=to32,x=af)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+    m
+}
+
 /// FFN forward part 1: xnorm @ W1 → SiLU, xnorm @ W3 → gate, gate*silu.
 ///
 /// Input: `[1, dim, 1, seq + 2*hidden]` fp32.
@@ -860,13 +975,25 @@ pub fn gen_fused_ffn_fwd(cfg: &MilConfig) -> String {
 
     let mut m = String::with_capacity(8192);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {sp_in}]> x) {{"
+    );
 
     // --- Constants ---
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
     let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
 
     // Cast input to fp16
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{sp_in}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
@@ -915,9 +1042,18 @@ pub fn gen_fused_ffn_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h3 = reshape(shape=rh,x=h3t)[name=string(\"h3\")];");
 
     // --- SiLU + gate ---
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];"
+    );
 
     // --- W2 matmul: gate @ W2_t ---
     // W2_orig [1,dim,1,hidden] → reshape [1,1,dim,hidden] → transpose → [1,1,hidden,dim] = W2_t
@@ -938,8 +1074,14 @@ pub fn gen_fused_ffn_fwd(cfg: &MilConfig) -> String {
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> ffn = reshape(shape=ro,x=ft)[name=string(\"ffn\")];");
 
     // --- Output: concat(h1, h3, gate, ffn_out) ---
-    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
-    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool cid = const()[name=string(\"cid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> out = concat(axis=cax,interleave=cid,values=(h1,h3,gate,ffn))[name=string(\"cat\")];");
     let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out32 = cast(dtype=to32,x=out)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (out32);");
@@ -1367,29 +1509,74 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
 
     let mut m = String::with_capacity(32768);
     m.push_str(MIL_HDR);
-    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+    let _ = writeln!(
+        m,
+        "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{"
+    );
 
     // --- Shared constants ---
-    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
-    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
-    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
-    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(
+        m,
+        "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool bT = const()[name=string(\"bT\"), val=bool(true)];"
+    );
     let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
-    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
-    let _ = writeln!(m, "        int32 ch_ax = const()[name=string(\"chax\"), val=int32(1)];");
-    let _ = writeln!(m, "        fp16 inv_d = const()[name=string(\"invd\"), val=fp16({inv_dim})];");
-    let _ = writeln!(m, "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];");
+    let _ = writeln!(
+        m,
+        "        bool kd = const()[name=string(\"kd\"), val=bool(true)];"
+    );
+    let _ = writeln!(
+        m,
+        "        int32 ch_ax = const()[name=string(\"chax\"), val=int32(1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 inv_d = const()[name=string(\"invd\"), val=fp16({inv_dim})];"
+    );
+    let _ = writeln!(
+        m,
+        "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];"
+    );
 
     // Cast input to fp16
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];"
+    );
 
     // === RMSNorm (attention) ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> rn1_sq = mul(x=xh,y=xh)[name=string(\"rn1sq\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> rn1_sq = mul(x=xh,y=xh)[name=string(\"rn1sq\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn1_ss = reduce_sum(x=rn1_sq,axes=ch_ax,keep_dims=kd)[name=string(\"rn1ss\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn1_m = mul(x=rn1_ss,y=inv_d)[name=string(\"rn1m\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn1_e = add(x=rn1_m,y=eps_v)[name=string(\"rn1e\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn1_r = rsqrt(x=rn1_e)[name=string(\"rn1r\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> rn1_n = mul(x=xh,y=rn1_r)[name=string(\"rn1n\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn1_m = mul(x=rn1_ss,y=inv_d)[name=string(\"rn1m\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn1_e = add(x=rn1_m,y=eps_v)[name=string(\"rn1e\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn1_r = rsqrt(x=rn1_e)[name=string(\"rn1r\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> rn1_n = mul(x=xh,y=rn1_r)[name=string(\"rn1n\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,1]> rn1_w = const()[name=string(\"rn1w\"), val=tensor<fp16, [1,{dim},1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_att.bin\"), offset=uint64(64)))];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xnorm = mul(x=rn1_n,y=rn1_w)[name=string(\"xnorm\")];");
 
@@ -1415,9 +1602,18 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> vt = transpose(perm=pm,x=vm)[name=string(\"vt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> qf = reshape(shape=os,x=qt)[name=string(\"qf\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> kf = reshape(shape=os,x=kt)[name=string(\"kf\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> vf = reshape(shape=os,x=vt)[name=string(\"vf\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> qf = reshape(shape=os,x=qt)[name=string(\"qf\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> kf = reshape(shape=os,x=kt)[name=string(\"kf\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> vf = reshape(shape=os,x=vt)[name=string(\"vf\")];"
+    );
 
     // === RoPE ===
     let _ = writeln!(m, "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
@@ -1444,8 +1640,14 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q1s = mul(x=q1,y=rope_sin)[name=string(\"q1s\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> q2c = mul(x=q2,y=rope_cos)[name=string(\"q2c\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{half_hd}]> qr2 = add(x=q1s,y=q2c)[name=string(\"qr2\")];");
-    let _ = writeln!(m, "        int32 rpax = const()[name=string(\"rpax\"), val=int32(-1)];");
-    let _ = writeln!(m, "        bool rpid = const()[name=string(\"rpid\"), val=bool(false)];");
+    let _ = writeln!(
+        m,
+        "        int32 rpax = const()[name=string(\"rpax\"), val=int32(-1)];"
+    );
+    let _ = writeln!(
+        m,
+        "        bool rpid = const()[name=string(\"rpid\"), val=bool(false)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q_rot = concat(axis=rpax,interleave=rpid,values=(qr1,qr2))[name=string(\"qrot\")];");
 
     // Same RoPE for K
@@ -1461,35 +1663,68 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
 
     // === SDPA ===
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q_rot,y=k_rot)[name=string(\"mm1\")];");
-    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
+    let _ = writeln!(
+        m,
+        "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"scl\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];");
-    let _ = writeln!(m, "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"msk\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"sm\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> a4 = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=v)[name=string(\"mm2\")];");
 
     // Reshape back to [1,D,1,S]
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> af = reshape(shape=os,x=at)[name=string(\"ra\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> af = reshape(shape=os,x=at)[name=string(\"ra\")];"
+    );
 
     // === Wo projection ===
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> af2 = reshape(shape=r2d,x=af)[name=string(\"af2\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> aft = transpose(perm=pm,x=af2)[name=string(\"aft\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> om = matmul(transpose_x=bF,transpose_y=bF,x=aft,y=Wo)[name=string(\"om\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ot = transpose(perm=pm,x=om)[name=string(\"ot\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> oo = reshape(shape=os,x=ot)[name=string(\"oo\")];"
+    );
 
     // === Residual 1 ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2 = add(x=xh,y=oo)[name=string(\"x2\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> x2 = add(x=xh,y=oo)[name=string(\"x2\")];"
+    );
 
     // === RMSNorm (FFN) ===
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> rn2_sq = mul(x=x2,y=x2)[name=string(\"rn2sq\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> rn2_sq = mul(x=x2,y=x2)[name=string(\"rn2sq\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn2_ss = reduce_sum(x=rn2_sq,axes=ch_ax,keep_dims=kd)[name=string(\"rn2ss\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn2_m = mul(x=rn2_ss,y=inv_d)[name=string(\"rn2m\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn2_e = add(x=rn2_m,y=eps_v)[name=string(\"rn2e\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rn2_r = rsqrt(x=rn2_e)[name=string(\"rn2r\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> rn2_n = mul(x=x2,y=rn2_r)[name=string(\"rn2n\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn2_m = mul(x=rn2_ss,y=inv_d)[name=string(\"rn2m\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn2_e = add(x=rn2_m,y=eps_v)[name=string(\"rn2e\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,1,1,{seq}]> rn2_r = rsqrt(x=rn2_e)[name=string(\"rn2r\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{dim},1,{seq}]> rn2_n = mul(x=x2,y=rn2_r)[name=string(\"rn2n\")];"
+    );
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,1]> rn2_w = const()[name=string(\"rn2w\"), val=tensor<fp16, [1,{dim},1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_ffn.bin\"), offset=uint64(64)))];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2norm = mul(x=rn2_n,y=rn2_w)[name=string(\"x2norm\")];");
 
@@ -1513,9 +1748,18 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
     let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h3 = reshape(shape=rh,x=h3t)[name=string(\"h3\")];");
 
     // SiLU + gate
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];");
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];"
+    );
+    let _ = writeln!(
+        m,
+        "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];"
+    );
 
     // === FFN W2 projection ===
     let _ = writeln!(m, "        tensor<int32, [4]> rh2 = const()[name=string(\"rh2\"), val=tensor<int32, [4]>([1,1,{hidden},{seq}])];");
