@@ -9,11 +9,9 @@
 
 A personal AI assistant that runs on your terms. Cloud or local. Text or voice. Your machine, your models, your data.
 
-Rust port of [nanobot](https://github.com/HKUDS/nanobot) by HKUDS -- rebuilt from scratch for speed, portability, and offline-first operation.
-
 ## Why
 
-Most AI assistants are cloud-locked SaaS products. nanobot is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a GGUF running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
+Most AI assistants are cloud-locked SaaS products. nanobot is a single binary that talks to whatever LLM you point it at -- Claude, GPT, Gemini, Groq, or a model running on your own hardware. Add voice and it becomes a conversational assistant you can interrupt mid-sentence. Add channels and it lives in your Telegram, WhatsApp, or Feishu.
 
 No containers. No Python. No dependencies beyond what `cargo build` pulls in.
 
@@ -138,6 +136,33 @@ nanobot mlx-serve --port 8766
 ```
 
 Exposes `/v1/chat/completions` (OpenAI) + Ex0bit protocol (`/chat` SSE, `/train`, `/status`, `/reset`).
+
+### On-device training (Apple Silicon)
+
+nanobot can train LoRA adapters directly on Apple Silicon using a split-silicon architecture that keeps all three hardware blocks busy simultaneously:
+
+```bash
+cargo build --release --features ane
+```
+
+```
+GPU  (Metal)  -->  inference (uninterrupted)
+ANE  (Neural) -->  training forward pass (projections, FFN, SDPA)
+CPU  (NEON)   -->  backward pass, sequential ops (GDN recurrence)
+```
+
+**ANE SDPA kernel**: For models with gated attention (Qwen3.5), a custom MIL kernel runs the O(n^2) scaled dot-product attention on the Neural Engine. At longer context lengths the ANE advantage compounds -- the kernel scales sub-quadratically while CPU scales quadratically:
+
+| Context length | ANE | CPU | Speedup |
+|---|---|---|---|
+| 512 | 5.6ms | 10.1ms | 1.8x |
+| 1024 | 11.9ms | 39.2ms | 3.3x |
+| 4096 | 127ms | 705ms | 5.5x |
+| 8192 | 517ms | 2917ms | 5.7x |
+
+*Measured on Qwen3.5-35B-A3B dimensions (16 heads, 256 head_dim, 4096 attn_dim).*
+
+Training runs in the background during normal use. Inference on GPU is never blocked by training on ANE -- they are independent hardware blocks with zero interference.
 
 ### Tools
 
@@ -265,6 +290,12 @@ cargo build --release --features voice
 # With MLX in-process inference (Apple Silicon only)
 cargo build --release --features mlx
 
+# With ANE on-device training (Apple Silicon only)
+cargo build --release --features ane
+
+# All Apple Silicon features
+cargo build --release --features mlx,ane
+
 # Debug with logging
 RUST_LOG=debug cargo run -- agent -m "Hello"
 ```
@@ -305,9 +336,9 @@ Single-binary. No microservices. The agent loop is the core -- it takes a messag
 
 On startup, the TUI clears the terminal, shows an ASCII splash with mode info, and renders LLM responses as styled markdown (headers, code blocks, bold/italic) via termimad. Input uses rustyline with arrow-key history.
 
-## Attribution
+## Origin
 
-Rust port of [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS). Original Python implementation licensed under MIT.
+Originally inspired by [nanobot](https://github.com/HKUDS/nanobot) by [HKUDS](https://github.com/HKUDS) (Python, MIT). Rebuilt from scratch in Rust with a different architecture, feature set, and direction.
 
 ## License
 
