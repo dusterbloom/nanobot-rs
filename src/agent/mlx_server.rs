@@ -606,31 +606,15 @@ pub fn tokenize_conversation(
     tokenizer: &MlxTokenizer,
     messages: &[ChatMessage],
 ) -> Result<(Vec<i32>, Vec<i32>), String> {
-    // Build full text and find where the last assistant response starts.
-    // We mask all tokens before the assistant response in the loss targets.
-    let mut prefix_text = String::new();
+    // Build full ChatML text.
     let mut full_text = String::new();
-    let mut found_assistant = false;
-
     for msg in messages {
-        let block_start = full_text.len();
         full_text.push_str(IM_START);
         full_text.push_str(&msg.role);
         full_text.push('\n');
         full_text.push_str(&msg.content);
         full_text.push_str(IM_END);
         full_text.push('\n');
-
-        if msg.role != "assistant" {
-            // Everything before the assistant response is prefix (masked).
-            prefix_text.push_str(&full_text[block_start..]);
-        } else if !found_assistant {
-            // Include the "<|im_start|>assistant\n" header in the prefix
-            // since the model shouldn't be penalized for predicting it.
-            prefix_text.push_str(IM_START);
-            prefix_text.push_str("assistant\n");
-            found_assistant = true;
-        }
     }
 
     let tokens = tokenizer
@@ -640,24 +624,21 @@ pub fn tokenize_conversation(
         return Err("conversation too short".into());
     }
 
-    // Find the number of prefix tokens to mask.
-    let mask_len = if found_assistant {
-        let prefix_tokens = tokenizer
-            .encode(&prefix_text)
-            .map_err(|e| format!("tokenize prefix: {e}"))?;
-        // In the shifted target array, position i predicts token i+1.
-        // Mask positions 0..prefix_len-1 (they predict prompt tokens).
-        prefix_tokens.len().saturating_sub(1)
-    } else {
-        0
-    };
-
     let input = tokens[..tokens.len() - 1].to_vec();
     let mut target = tokens[1..].to_vec();
 
-    // Mask prompt positions with IGNORE_LABEL so cross_entropy_loss skips them.
-    for t in target.iter_mut().take(mask_len) {
-        *t = IGNORE_LABEL;
+    // Mask everything before the first assistant response content.
+    // Use a substring of the full text so BPE token alignment is exact.
+    let assistant_header = format!("{IM_START}assistant\n");
+    if let Some(pos) = full_text.find(&assistant_header) {
+        let prefix = &full_text[..pos + assistant_header.len()];
+        let prefix_tokens = tokenizer
+            .encode(prefix)
+            .map_err(|e| format!("tokenize prefix: {e}"))?;
+        let mask_len = prefix_tokens.len().saturating_sub(1);
+        for t in target.iter_mut().take(mask_len) {
+            *t = IGNORE_LABEL;
+        }
     }
 
     Ok((input, target))
@@ -746,35 +727,18 @@ pub fn tokenize_rich_conversation(
         return Err("conversation too short".into());
     }
 
-    // Find the last assistant message start to mask prompt tokens.
-    // Build prefix text = everything up to and including "<|im_start|>assistant\n".
-    let mut prefix_text = String::new();
-    let mut found_assistant = false;
-    for msg in messages {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        if role == "assistant" && !found_assistant {
-            // Include the header but not the content in the prefix.
-            prefix_text.push_str(IM_START);
-            prefix_text.push_str("assistant\n");
-            found_assistant = true;
-            break;
-        }
-        // Reconstruct this message's ChatML text for prefix measurement.
-        prefix_text.push_str(IM_START);
-        prefix_text.push_str(role);
-        prefix_text.push('\n');
-        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        prefix_text.push_str(content);
-        prefix_text.push_str(IM_END);
-        prefix_text.push('\n');
-    }
-
     let input = tokens[..tokens.len() - 1].to_vec();
     let mut target = tokens[1..].to_vec();
 
-    if found_assistant {
+    // Mask everything before the first assistant response content.
+    // Use a substring of the actual formatted text so token alignment is exact
+    // (the old manual reconstruction diverged from format_rich_chatml for tool
+    // messages, causing the mask to cover the entire sequence → loss=0).
+    let assistant_header = format!("{IM_START}assistant\n");
+    if let Some(pos) = text.find(&assistant_header) {
+        let prefix = &text[..pos + assistant_header.len()];
         let prefix_tokens = tokenizer
-            .encode(&prefix_text)
+            .encode(prefix)
             .map_err(|e| format!("tokenize prefix: {e}"))?;
         let mask_len = prefix_tokens.len().saturating_sub(1);
         for t in target.iter_mut().take(mask_len) {
