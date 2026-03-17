@@ -177,12 +177,30 @@ impl SessionDb {
 
     /// Return the most recent session for `key`, or create a new one.
     ///
-    /// This is the primary entry point for gateway and default CLI usage.
-    /// Unlike the old JSONL manager, there is no date-based rotation — a
-    /// session for `key` lives until it is explicitly deleted or until
-    /// `create_session()` is called explicitly.
+    /// Resume the most recent session for `key`, or create a new one.
+    ///
+    /// If `max_idle_secs > 0` and the latest session hasn't been updated in
+    /// that many seconds, a fresh session is created instead of resuming the
+    /// stale one. Pass `0` to always resume (the old behaviour).
     pub async fn get_or_resume(&self, key: &str) -> SessionMeta {
+        self.get_or_resume_with_idle(key, 0).await
+    }
+
+    /// Like [`get_or_resume`] but with an explicit idle timeout.
+    pub async fn get_or_resume_with_idle(&self, key: &str, max_idle_secs: u64) -> SessionMeta {
         if let Some(meta) = self.get_latest_session(key).await {
+            if max_idle_secs > 0 {
+                let idle = chrono::Utc::now() - meta.updated_at;
+                if idle.num_seconds() > max_idle_secs as i64 {
+                    tracing::info!(
+                        session_key = %key,
+                        idle_secs = idle.num_seconds(),
+                        max_idle_secs,
+                        "session_expired: creating fresh session"
+                    );
+                    return self.create_session(key).await;
+                }
+            }
             return meta;
         }
         self.create_session(key).await
@@ -847,6 +865,59 @@ mod tests {
 
         assert_eq!(meta.session_key, "new:channel");
         assert!(!meta.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_resume_with_idle_creates_fresh_when_stale() {
+        let (db, _dir) = make_db();
+
+        // Create a session and add a message so it looks real.
+        let original = db.create_session("telegram:42").await;
+        db.add_messages(
+            &original.id,
+            &[serde_json::json!({"role": "user", "content": "old message"})],
+        )
+        .await;
+
+        // Backdate updated_at to 2 hours ago.
+        {
+            let old_time = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![old_time, original.id],
+            )
+            .unwrap();
+        }
+
+        // With max_idle_secs=3600 (1 hour), the 2-hour-old session is stale.
+        let fresh = db.get_or_resume_with_idle("telegram:42", 3600).await;
+        assert_ne!(
+            fresh.id, original.id,
+            "stale session should not be resumed; a new one should be created"
+        );
+        assert_eq!(fresh.message_count, 0);
+
+        // Without idle timeout, the old session is still resumed.
+        // (get_latest_session returns the newest by updated_at, which is the
+        // fresh one we just created — so this confirms both exist.)
+        let sessions = db.list_sessions(Some("telegram:42"), 10).await;
+        assert_eq!(sessions.len(), 2, "both old and new sessions should exist");
+    }
+
+    #[tokio::test]
+    async fn test_get_or_resume_with_idle_resumes_when_recent() {
+        let (db, _dir) = make_db();
+
+        let original = db.create_session("telegram:99").await;
+
+        // Session was just created (updated_at is now). With 3600s idle timeout
+        // it should be resumed, not replaced.
+        let resumed = db.get_or_resume_with_idle("telegram:99", 3600).await;
+        assert_eq!(
+            resumed.id, original.id,
+            "recent session must be resumed, not replaced"
+        );
     }
 
     #[tokio::test]

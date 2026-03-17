@@ -332,7 +332,10 @@ impl AgentLoopShared {
                     let config = LcmConfig::from(&self.lcm_config);
 
                     // Try to restore DAG from SQLite summary_nodes table.
-                    let session_meta_tmp = core.sessions.get_or_resume(&session_key).await;
+                    let session_meta_tmp = core
+                        .sessions
+                        .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
+                        .await;
                     let db_nodes = core.sessions.load_summary_nodes(&session_meta_tmp.id).await;
 
                     let engine = if !db_nodes.is_empty() {
@@ -382,7 +385,12 @@ impl AgentLoopShared {
         }
 
         // Resolve or create session for this key.
-        let session_meta = core.sessions.get_or_resume(&session_key).await;
+        // If the session has been idle longer than session_complete_after_secs,
+        // start fresh instead of loading stale history into the context.
+        let session_meta = core
+            .sessions
+            .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
+            .await;
         let session_id = session_meta.id.clone();
 
         // Get session history. Track count so we know where new messages start.
