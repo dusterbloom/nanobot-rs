@@ -1134,6 +1134,11 @@ impl LLMProvider for OpenAICompatProvider {
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
+                    // Override the client's 120s total timeout for streaming.
+                    // Streaming responses can legitimately run for minutes
+                    // (e.g. long generation under GPU contention from training).
+                    // The SSE chunk reader has its own idle detection.
+                    .timeout(std::time::Duration::from_secs(600))
                     .json(&body)
                     .send()
                     .await
@@ -1327,13 +1332,26 @@ fn parse_response(data: &serde_json::Value) -> Result<LLMResponse> {
             inline_reasoning.push_str(&tail_reasoning);
             if !inline_reasoning.is_empty() {
                 debug!(
-                    "Model returned inline think tags ({} chars), discarding from output",
+                    "Model returned inline think tags ({} chars visible, {} chars reasoning)",
+                    visible.len(),
                     inline_reasoning.len()
                 );
             }
             let cleaned = visible.trim().to_string();
             if cleaned.is_empty() {
-                None
+                // Model put everything in <think> blocks with no visible output.
+                // This happens when servers (e.g. oMLX) ignore enable_thinking:false
+                // and Qwen3.5 thinks by default. Use inline reasoning as fallback
+                // so the caller doesn't get an empty response.
+                if !inline_reasoning.is_empty() {
+                    debug!(
+                        "content empty after think-strip, using inline reasoning ({} chars) as fallback",
+                        inline_reasoning.len()
+                    );
+                    Some(inline_reasoning.trim().to_string()).filter(|s| !s.is_empty())
+                } else {
+                    None
+                }
             } else {
                 Some(cleaned)
             }
@@ -1445,7 +1463,7 @@ async fn parse_sse_stream(
     let mut line_buffer = String::new();
     let mut full_content = String::new();
     let mut full_reasoning = String::new(); // API reasoning_content field only
-    let mut full_inline_thinking = String::new(); // inline <think> tags — never used as fallback
+    let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = String::from("stop");
     let mut got_done = false;
@@ -1512,13 +1530,15 @@ async fn parse_sse_stream(
                         full_reasoning.len()
                     );
                     Some(full_reasoning.clone())
+                } else if !full_inline_thinking.is_empty() {
+                    // Model put everything in <think> blocks with no visible
+                    // content — happens when oMLX ignores enable_thinking:false.
+                    debug!(
+                        "Streaming: content empty, using inline <think> ({} chars) as fallback",
+                        full_inline_thinking.len()
+                    );
+                    Some(full_inline_thinking.clone())
                 } else {
-                    if !full_inline_thinking.is_empty() {
-                        debug!(
-                            "Streaming: discarding inline <think> blocks ({} chars), not using as content fallback",
-                            full_inline_thinking.len()
-                        );
-                    }
                     None
                 };
 
@@ -1663,7 +1683,7 @@ async fn parse_sse_stream(
         tool_calls = tool_calls_acc.len(),
         "sse_stream_ended_without_done"
     );
-    // Fallback: only use API reasoning_content, never inline <think> blocks.
+    // Fallback chain: API reasoning_content first, then inline <think> blocks.
     let content = if !full_content.is_empty() {
         if !full_reasoning.is_empty() {
             debug!(
@@ -1678,13 +1698,13 @@ async fn parse_sse_stream(
             full_reasoning.len()
         );
         Some(full_reasoning)
+    } else if !full_inline_thinking.is_empty() {
+        debug!(
+            "Streaming (no DONE): content empty, using inline <think> ({} chars) as fallback",
+            full_inline_thinking.len()
+        );
+        Some(full_inline_thinking)
     } else {
-        if !full_inline_thinking.is_empty() {
-            debug!(
-                "Streaming (no DONE): discarding inline <think> blocks ({} chars), not using as fallback",
-                full_inline_thinking.len()
-            );
-        }
         None
     };
 
@@ -1970,6 +1990,43 @@ mod tests {
 
         let resp = parse_response(&data).expect("parse should succeed");
         assert_eq!(resp.content.as_deref(), Some("Answer: 42"));
+    }
+
+    #[test]
+    fn test_parse_response_think_only_content_falls_back_to_reasoning() {
+        // oMLX ignores enable_thinking:false — model puts everything in <think>.
+        // The inline reasoning should be used as fallback content.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "<think>The user wants to know about the codebase structure. Let me analyze it and provide a summary of key components.</think>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("The user wants to know about the codebase structure. Let me analyze it and provide a summary of key components."),
+            "think-only content should use inline reasoning as fallback"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_think_with_visible_content_strips_think() {
+        // When there IS visible content after stripping, only visible should remain.
+        let data = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "<think>reasoning</think>The answer is 42."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let resp = parse_response(&data).expect("parse should succeed");
+        assert_eq!(resp.content.as_deref(), Some("The answer is 42."));
     }
 
     #[test]
