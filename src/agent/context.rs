@@ -637,6 +637,21 @@ impl ContextBuilder {
             });
         }
 
+        // Timestamp goes LAST so the stable prefix (identity + bootstrap +
+        // skills + tools) hashes identically across turns.  oMLX prefix cache
+        // uses 1024-token block hashing â€” putting the timestamp at token ~15
+        // would poison the entire hash chain and cause 0% cache hits.
+        let now = Local::now();
+        sections.push(SectionEntry {
+            section: PromptSection::MemoryBriefing, // highest section â†’ rendered last
+            block: PromptBlock::new("Session", &format!("Current time: {now}")),
+            allocated_tokens: 0,
+            actual_tokens: 0,
+            source: SectionSource::Runtime("timestamp".to_string()),
+            included: true,
+            shrinkable: false,
+        });
+
         sections
     }
 
@@ -833,6 +848,19 @@ impl ContextBuilder {
                 });
             }
         }
+
+        // Timestamp goes LAST so the stable prefix (identity + bootstrap +
+        // skills) hashes identically across turns for prefix-cache reuse.
+        let now = Local::now();
+        sections.push(SectionEntry {
+            section: PromptSection::MemoryBriefing,
+            block: PromptBlock::new("Session", &format!("Current time: {now}")),
+            allocated_tokens: 0,
+            actual_tokens: 0,
+            source: SectionSource::Runtime("timestamp".to_string()),
+            included: true,
+            shrinkable: false,
+        });
 
         sections
     }
@@ -1093,7 +1121,6 @@ impl ContextBuilder {
 
     /// Core identity section including current time, time awareness, and workspace info.
     fn _get_identity(&self) -> String {
-        let now = Local::now();
         let workspace_path = Self::display_path(
             &self
                 .workspace
@@ -1146,8 +1173,7 @@ impl ContextBuilder {
 
 You are nanobot, a helpful AI assistant with tools for file I/O, shell, web, messaging, and subagents.
 
-## Context
-Time: {now}{model_section}
+## Context{model_section}
 Home: {home_dir}
 Working directory: {cwd}
 Workspace: {workspace_path}
@@ -1172,7 +1198,6 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
     }
 
     fn _get_local_identity(&self) -> String {
-        let now = Local::now();
         let workspace_path = Self::display_path(
             &self
                 .workspace
@@ -1197,11 +1222,15 @@ If you see a [PRIORITY USER MESSAGE], acknowledge it and adjust your approach â€
             ""
         };
 
+        // NOTE: Timestamp is intentionally omitted from the identity prefix.
+        // It is appended as the LAST section in the system prompt so the stable
+        // prefix (identity + bootstrap + skills + tools) hashes identically
+        // across turns, enabling oMLX/vLLM prefix-cache hits on the first
+        // 1024-token block(s). See `_collect_local_sections` for the injection.
         format!(
             r#"# nanobot
 
 You are nanobot, a local tool-using assistant.
-Time: {now}
 {model_line}
 
 ## IMPORTANT: Directories
@@ -1857,13 +1886,17 @@ mod tests {
         let messages =
             cb.build_messages(&history, "what's up?", None, None, None, None, false, None);
 
-        // Should have: system, history entry, current user message.
-        assert_eq!(messages.len(), 3);
+        // Should have: system, developer (timestamp+context), history entry, current user message.
+        assert!(messages.len() >= 3, "expected at least system + history + user, got {}", messages.len());
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "hello");
-        assert_eq!(messages[2]["role"], "user");
-        assert_eq!(messages[2]["content"], "what's up?");
+        // Last message is always the current user message.
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"], "what's up?");
+        // History entry is second-to-last.
+        let prev = &messages[messages.len() - 2];
+        assert_eq!(prev["role"], "user");
+        assert_eq!(prev["content"], "hello");
     }
 
     #[test]
@@ -1894,10 +1927,10 @@ mod tests {
     fn test_build_messages_without_history() {
         let (_tmp, cb) = make_context();
         let messages = cb.build_messages(&[], "test", None, None, None, None, false, None);
-        // system + current user message
-        assert_eq!(messages.len(), 2);
+        // system + optional developer (timestamp) + current user message
+        assert!(messages.len() >= 2, "expected at least system + user, got {}", messages.len());
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages.last().unwrap()["role"], "user");
     }
 
     // ----- add_tool_result -----
@@ -2314,19 +2347,23 @@ mod tests {
 
     #[test]
     fn test_developer_role_no_context_no_extra_message() {
-        // When there is nothing to inject (no memory, no skills, no profiles),
-        // no `developer` message should be emitted even for cloud models.
+        // Even when there is no memory, no skills, no profiles, there is still
+        // a timestamp injected as a runtime section.  On cloud models the
+        // assembler puts non-Identity sections into the developer message, so
+        // we always get at least one developer message containing the time.
         let (_tmp, mut cb) = make_context();
         cb.model_name = "claude-opus-4-6".to_string();
 
         let messages = cb.build_messages(&[], "hello", None, None, None, None, false, None);
 
-        assert!(
-            messages.iter().all(|m| m["role"] != "developer"),
-            "no developer message when context is empty"
-        );
         // Must still have a system message.
         assert!(messages.iter().any(|m| m["role"] == "system"));
+        // Developer message exists and contains the timestamp.
+        let dev: Vec<_> = messages.iter().filter(|m| m["role"] == "developer").collect();
+        assert!(
+            dev.iter().any(|m| m["content"].as_str().unwrap_or("").contains("Current time")),
+            "developer message should contain timestamp"
+        );
     }
 
     // --- Integration tests: instruction profiles injected into developer context ---
