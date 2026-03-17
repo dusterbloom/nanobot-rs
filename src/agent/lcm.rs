@@ -525,14 +525,29 @@ impl LcmEngine {
             block_end
         );
 
-        // Three-level escalation (Algorithm 3).
-        let (summary_text, level) = escalated_summary(
-            &block_messages,
-            target,
-            compactor,
-            self.config.deterministic_target,
-        )
-        .await;
+        // Guard: if the block is enormous, skip LLM summarization entirely.
+        // A 0.8B model summarizing 100+ messages produces 60-75+ sequential
+        // LLM calls (chunk + merge rounds), each competing for GPU time with
+        // the main model. Deterministic truncation is instant and sufficient.
+        const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
+        let (summary_text, level) = if block_messages.len() > MAX_COMPACTION_BLOCK_MESSAGES {
+            info!(
+                "LCM: block too large ({} msgs > {}), using deterministic truncation",
+                block_messages.len(),
+                MAX_COMPACTION_BLOCK_MESSAGES
+            );
+            let truncated = deterministic_truncate(&block_messages, self.config.deterministic_target);
+            (truncated, 3)
+        } else {
+            // Three-level escalation (Algorithm 3).
+            escalated_summary(
+                &block_messages,
+                target,
+                compactor,
+                self.config.deterministic_target,
+            )
+            .await
+        };
 
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
 
@@ -1280,6 +1295,29 @@ mod tests {
         }
     }
 
+    /// Mock LLM that panics if called — proves the LLM was never invoked.
+    struct PanickingMock;
+
+    #[async_trait]
+    impl LLMProvider for PanickingMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            panic!("LLM should not be called for huge compaction blocks")
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-panicking"
+        }
+    }
+
     #[test]
     fn test_summary_dag_create_and_retrieve() {
         let mut dag = SummaryDag::new();
@@ -1416,6 +1454,47 @@ mod tests {
             CompactionAction::Async,
             "Conversation tokens over soft threshold should trigger async compaction"
         );
+    }
+
+    /// When a block has more messages than MAX_COMPACTION_BLOCK_MESSAGES,
+    /// compact() should skip LLM summarization and use deterministic
+    /// truncation directly. This prevents a 0.8B model from making 75+
+    /// sequential LLM calls to summarize a massive block.
+    #[tokio::test]
+    async fn test_huge_block_skips_llm_uses_deterministic() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            enabled: true,
+            tau_soft: 0.1,
+            tau_hard: 0.3,
+            deterministic_target: 64,
+        });
+
+        engine.ingest(json!({"role": "system", "content": "System"}));
+        // Add 200 messages — way more than any sane compaction block
+        for i in 0..100 {
+            engine.ingest(
+                json!({"role": "user", "content": format!("Question {} about topic {}", i, i * 7)}),
+            );
+            engine.ingest(
+                json!({"role": "assistant", "content": format!("Answer {} with details about {}", i, i * 3)}),
+            );
+        }
+
+        // Use a mock that PANICS if called — proving LLM was never invoked.
+        let compactor = ContextCompactor::new(
+            Arc::new(PanickingMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let budget = TokenBudget::new(32_768, 2048);
+
+        // compact() should succeed via deterministic truncation (level 3),
+        // never calling the LLM.
+        let result = engine.compact(&compactor, &budget, 0).await;
+        assert!(result.is_some(), "Should produce a summary via deterministic truncation");
+        if let Some(Turn::Summary { level, .. }) = &result {
+            assert_eq!(*level, 3, "Should use level 3 (deterministic), not LLM levels 1-2");
+        }
     }
 
     /// `conversation_tokens()` should return 0 when only a system prompt exists.

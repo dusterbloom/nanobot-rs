@@ -1052,45 +1052,20 @@ impl AgentLoopShared {
     async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
         if self.lcm_config.enabled {
             // LCM path: get or create per-session engine, check thresholds.
-            // On first creation, restore DAG from DB summary_nodes table,
-            // falling back to legacy Turn::Summary entries in messages.
+            //
+            // The engine starts EMPTY and ingests only the filtered messages
+            // from ctx.messages (assembled by prepare_context/filter_history).
+            // Previous versions loaded ALL session messages from the DB here,
+            // which could be 1000+ messages / 150K+ tokens — immediately
+            // triggering a massive compaction that made 75+ sequential LLM
+            // calls to the 0.8B summarizer while competing for GPU time with
+            // the main model. The session DB is the durable store; the LCM
+            // engine only needs the current context window.
             let lcm_engine = {
                 let mut engines = self.lcm_engines.lock().await;
                 if !engines.contains_key(&ctx.session_key) {
                     let config = LcmConfig::from(&self.lcm_config);
-
-                    // Try DB-persisted DAG first (preferred).
-                    let db_nodes = ctx.core.sessions.load_summary_nodes(&ctx.session_id).await;
-
-                    let engine = if !db_nodes.is_empty() {
-                        let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
-                        debug!(
-                            session = %ctx.session_key,
-                            node_count = db_nodes.len(),
-                            "LCM: rebuilding engine from DB summary nodes"
-                        );
-                        LcmEngine::rebuild_from_db_nodes(&all_msgs, &db_nodes, config)
-                    } else {
-                        // Fallback: check for legacy Turn::Summary entries.
-                        let all_msgs = ctx.core.sessions.get_all_messages(&ctx.session_id).await;
-                        let turns: Vec<crate::agent::turn::Turn> = all_msgs
-                            .iter()
-                            .filter_map(|v| crate::agent::turn::turn_from_legacy(v))
-                            .collect();
-                        let has_summaries = turns.iter().any(|t| t.is_summary());
-
-                        if has_summaries {
-                            debug!(
-                                session = %ctx.session_key,
-                                summary_count = turns.iter().filter(|t| t.is_summary()).count(),
-                                "LCM: rebuilding engine from legacy Turn::Summary entries"
-                            );
-                            LcmEngine::rebuild_from_turns(&turns, config, ctx.protocol.as_ref(), "")
-                        } else {
-                            LcmEngine::new(config)
-                        }
-                    };
-
+                    let engine = LcmEngine::new(config);
                     engines.insert(
                         ctx.session_key.clone(),
                         Arc::new(tokio::sync::Mutex::new(engine)),
