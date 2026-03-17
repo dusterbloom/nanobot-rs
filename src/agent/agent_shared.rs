@@ -1074,20 +1074,21 @@ impl AgentLoopShared {
                 engines.get(&ctx.session_key).cloned().unwrap()
             };
 
-            // Feed messages into the LCM engine's store (idempotent by index).
-            // Bug 5 fix: after a compaction swap ctx.messages shrinks but
-            // store_len still reflects the pre-compaction count, causing the
-            // loop to skip everything. Use lcm_synced_to (set to 0 after swap)
-            // as the skip offset when it is present.
+            // Feed messages into the LCM engine's store.
             {
                 let mut engine = lcm_engine.lock().await;
-                let store_len = engine.store_len();
-                let skip = ctx.lcm_synced_to.unwrap_or(store_len);
-                // After using the override, reset it so future iterations use
-                // the normal store_len path.
-                ctx.lcm_synced_to = None;
-                for msg in ctx.messages.iter().skip(skip) {
-                    engine.ingest(msg.clone());
+                if ctx.lcm_synced_to == Some(0) {
+                    // Post-compaction: ctx.messages was rebuilt from the engine's
+                    // active_context(). Re-ingesting via ingest() would APPEND
+                    // duplicates. Reset the engine from the compacted messages.
+                    engine.reset_from_messages(&ctx.messages);
+                    ctx.lcm_synced_to = None;
+                } else {
+                    // Normal path: append only new messages (idempotent by index).
+                    let store_len = engine.store_len();
+                    for msg in ctx.messages.iter().skip(store_len) {
+                        engine.ingest(msg.clone());
+                    }
                 }
             }
 
@@ -1101,9 +1102,14 @@ impl AgentLoopShared {
                 debug!("LCM compaction skipped: endpoint degraded");
             }
             if lcm_healthy && !ctx.compaction.in_flight.load(Ordering::Relaxed) {
-                let action = {
+                let (action, conv_tokens, available, hard_limit, soft_limit) = {
                     let engine = lcm_engine.lock().await;
-                    engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens)
+                    let action = engine.check_thresholds(&ctx.core.token_budget, tool_def_tokens);
+                    let available = ctx.core.token_budget.available_budget(tool_def_tokens);
+                    let conv = engine.conversation_tokens();
+                    let hard = (available as f64 * engine.tau_hard()) as usize;
+                    let soft = (available as f64 * engine.tau_soft()) as usize;
+                    (action, conv, available, hard, soft)
                 };
 
                 match action {
@@ -1115,6 +1121,10 @@ impl AgentLoopShared {
                                 "lcm_blocking"
                             },
                             msg_count = ctx.messages.len(),
+                            conv_tokens = conv_tokens,
+                            available = available,
+                            hard_limit = hard_limit,
+                            soft_limit = soft_limit,
                             "lcm_compaction_triggered"
                         );
                         let slot = ctx.compaction.slot.clone();
@@ -1518,7 +1528,7 @@ impl AgentLoopShared {
                                 // Render thinking tokens as dimmed text
                                 if !in_thinking {
                                     in_thinking = true;
-                                    let _ = delta_tx.send("\x1b[90m\u{1f9e0} \x1b[2m".to_string());
+                                    let _ = delta_tx.send("\x1b[90m\x1b[2m".to_string());
                                 }
                                 let _ = delta_tx.send(delta);
                             }

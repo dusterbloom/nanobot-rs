@@ -1046,7 +1046,7 @@ impl AneTrainerSession {
                     break 'outer;
                 }
 
-                // Update TUI progress counters and check for cancellation.
+                // Update TUI progress counters, yield to inference, check cancellation.
                 if let Some(rc) = runtime_counters {
                     use std::sync::atomic::Ordering::Relaxed;
                     rc.training_current_step.store(opt_step as u64, Relaxed);
@@ -1054,6 +1054,19 @@ impl AneTrainerSession {
                     if rc.training_cancel.load(Relaxed) {
                         tracing::info!("ANE train: cancelled at step {opt_step}/{total_opt_steps}");
                         break 'outer;
+                    }
+                    // Yield to inference: pause training while an LLM call is
+                    // in flight so we don't tank generation speed on shared GPU.
+                    if rc.inference_active.load(Relaxed) {
+                        tracing::debug!("ANE train: yielding to inference at step {opt_step}");
+                        while rc.inference_active.load(Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            if rc.training_cancel.load(Relaxed) {
+                                tracing::info!("ANE train: cancelled while yielding at step {opt_step}");
+                                break 'outer;
+                            }
+                        }
+                        tracing::debug!("ANE train: resuming after inference completed");
                     }
                 }
 

@@ -209,6 +209,19 @@ impl LcmEngine {
         }
     }
 
+    /// Replace the engine's store and active context from a new message array.
+    ///
+    /// Used after compaction swap: ctx.messages was rebuilt from the engine's
+    /// own active_context(), so re-ingesting via `ingest()` would duplicate
+    /// everything. This method replaces instead of appending.
+    pub fn reset_from_messages(&mut self, messages: &[serde_json::Value]) {
+        self.store.clear();
+        self.active.clear();
+        for msg in messages {
+            self.ingest(msg.clone());
+        }
+    }
+
     /// Rebuild the LCM engine from persisted turns (including summaries).
     ///
     /// This is called when loading a session that has `Turn::Summary` entries.
@@ -434,6 +447,13 @@ impl LcmEngine {
             .map(|e| e.message().clone())
             .collect();
         TokenBudget::estimate_tokens(&messages)
+    }
+
+    pub fn tau_soft(&self) -> f64 {
+        self.config.tau_soft
+    }
+    pub fn tau_hard(&self) -> f64 {
+        self.config.tau_hard
     }
 
     /// Check thresholds and return what action is needed.
