@@ -826,6 +826,29 @@ impl AneTrainerSession {
                 }
             }
 
+            // Prime per-layer fused FFN backward kernels (W2T+SiLU+W13T).
+            {
+                let ffn_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                match pp.prime_fused_ffn_bwd_kernels(&ffn_cfg, &self.model) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ANE train: fused FFN bwd kernels primed for seq_len={}",
+                            bucket_seq,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ANE train: fused FFN bwd priming failed for seq_len={}: {}",
+                            bucket_seq, e,
+                        );
+                    }
+                }
+            }
+
             self.prepacked_weights.push((*bucket_seq, pp));
         }
         self.prepacked_weights.sort_by_key(|(seq, _)| *seq);

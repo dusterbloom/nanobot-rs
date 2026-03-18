@@ -2241,6 +2241,8 @@ pub struct PrePackedWeights {
     rmsnorm_bwd_att_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer RMSNorm backward (FFN) kernels — dx only, no dw.
     rmsnorm_bwd_ffn_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer fused FFN backward kernels: W2^T + SiLU bwd + W13^T in 1 dispatch.
+    fused_ffn_bwd_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
 }
 
 impl PrePackedWeights {
@@ -2267,6 +2269,7 @@ impl PrePackedWeights {
             rmsnorm_ffn_kernels: None,
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
+            fused_ffn_bwd_kernels: None,
         }
     }
 
@@ -2370,6 +2373,7 @@ impl PrePackedWeights {
             rmsnorm_ffn_kernels: None,
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
+            fused_ffn_bwd_kernels: None,
         }
     }
 
@@ -2462,6 +2466,7 @@ impl PrePackedWeights {
         self.rmsnorm_ffn_kernels = None;
         self.rmsnorm_bwd_att_kernels = None;
         self.rmsnorm_bwd_ffn_kernels = None;
+        self.fused_ffn_bwd_kernels = None;
     }
 
     /// Prime per-layer kernel clones with IOSurface-resident weights.
@@ -3060,6 +3065,107 @@ impl PrePackedWeights {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Some(Ok(out))
+    }
+
+    /// Prime per-layer fused FFN backward kernels (W2^T + SiLU bwd + W13^T).
+    pub fn prime_fused_ffn_bwd_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let result = super::ane_mil::gen_fused_ffn_bwd(cfg);
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            // W2 is stored [dim, hidden] row-major. MIL kernel expects W2^T = [hidden, dim].
+            let w2t = transpose_weight(&lw.w2, dim, hidden);
+            let w2t_blob = build_fp16_blob(&w2t);
+            // W1 is [hidden, dim]. MIL expects W1^T = [dim, hidden].
+            let w1t = transpose_weight(&lw.w1, hidden, dim);
+            let w1t_blob = build_fp16_blob(&w1t);
+            // W3 is [hidden, dim]. MIL expects W3^T = [dim, hidden].
+            let w3t = transpose_weight(&lw.w3, hidden, dim);
+            let w3t_blob = build_fp16_blob(&w3t);
+
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = vec![&w2t_blob, &w1t_blob, &w3t_blob];
+
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} fused_ffn_bwd compile: {e}"))?;
+
+            kernels.push(k);
+        }
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed {} per-layer fused FFN backward kernels in {:.1}ms ({:.1}ms/layer)",
+            n_layers,
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / n_layers.max(1) as f64,
+        );
+        self.fused_ffn_bwd_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate fused FFN backward on per-layer kernel.
+    ///
+    /// Input: dx_ffn[dim*seq], h1[hidden*seq], h3[hidden*seq]
+    /// Output: (dx[dim*seq], dsilu[hidden*seq]) — dx for backward chain, dsilu for LoRA W2 grads.
+    /// Returns None if not primed.
+    pub fn eval_fused_ffn_bwd(
+        &self,
+        layer: usize,
+        dx_ffn: &[f32],
+        h1: &[f32],
+        h3: &[f32],
+        dim: usize,
+        hidden: usize,
+        seq: usize,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
+        let kernels = self.fused_ffn_bwd_kernels.as_ref()?;
+        let kernel = &kernels[layer];
+
+        // Pack input: dx_ffn | h1 | h3
+        let mut input = Vec::with_capacity(dx_ffn.len() + h1.len() + h3.len());
+        input.extend_from_slice(dx_ffn);
+        input.extend_from_slice(h1);
+        input.extend_from_slice(h3);
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!(
+                "fused_ffn_bwd eval layer {layer}: {e}"
+            )));
+        }
+
+        let out_ch = dim + hidden;
+        let mut buf = vec![0u8; out_ch * seq * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let dx = out[..dim * seq].to_vec();
+        let dsilu = out[dim * seq..].to_vec();
+        Some(Ok((dx, dsilu)))
     }
 
     /// Evaluate forward fused FFN on per-layer kernel (IOSurface-resident weights).

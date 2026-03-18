@@ -2704,14 +2704,19 @@ pub fn gen_fused_ffn_bwd(cfg: &MilConfig) -> FusedLayerMil {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dx3m = matmul(transpose_x=bF,transpose_y=bF,x=W3m,y=dh3m)[name=string(\"dx3m\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx3 = reshape(shape=rdout,x=dx3m)[name=string(\"dx3\")];");
 
-    // Sum
+    // Sum dx1 + dx3
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dxs = add(x=dx1,y=dx3)[name=string(\"dxs\")];");
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> out = cast(dtype=to32,x=dxs)[name=string(\"cout\")];");
+
+    // Output: dx | dsilu concatenated on channel axis (caller can split to get both)
+    let out_ch = dim + hidden;
+    let _ = writeln!(m, "        tensor<int32, [1]> cax = const()[name=string(\"cax\"), val=int32(1)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(dxs,dsilu),axis=cax,interleave=bF)[name=string(\"cat\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out = cast(dtype=to32,x=cat)[name=string(\"cout\")];");
     let _ = writeln!(m, "    }} -> (out);");
     m.push_str("}\n");
 
     let input_bytes = in_ch * seq * 4;
-    let output_bytes = dim * seq * 4;
+    let output_bytes = out_ch * seq * 4;
 
     FusedLayerMil {
         mil_text: m,

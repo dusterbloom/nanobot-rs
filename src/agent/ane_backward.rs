@@ -2575,7 +2575,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         // When prepacked weights are available, the W1/W3 clone on the CPU thread
         // is skipped (eval_w13t_prepacked doesn't need them).
         let has_prepacked = prepacked.is_some();
-        let (dsilu, w2_grads, w1t, w3t) = std::thread::scope(|s| {
+        let (dsilu, fused_dx_ffn, w2_grads, w1t, w3t) = std::thread::scope(|s| {
             // Spawn CPU work: LoRA W2 backward + (if not prepacked) W1/W3 clone
             let cpu_handle = s.spawn(|| {
                 let w2_grads = if use_ane_w2_grads {
@@ -2601,28 +2601,38 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                 }
             });
 
-            // Main thread: ANE ffn_bwd_w2t (dsilu = dffn @ W2^T) — fused or tiled
-            let dsilu = if let Some(ref mut pp) = prepacked {
-                // Orion delta patching: weights pre-packed, only patch activation
-                bwd_kernels
-                    .ffn_bwd
-                    .eval_w2t_prepacked(&dffn, pp, l, cfg)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("ANE ffn_bwd_w2t_prepacked failed: {e}");
-                        vec![0.0f32; hidden * seq]
-                    })
-            } else {
-                bwd_kernels
-                    .ffn_bwd
-                    .eval_w2t(&dffn, &lw.w2, cfg)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
-                        vec![0.0f32; hidden * seq]
-                    })
+            // Main thread: try fused FFN backward (1 dispatch) → fallback to W2^T (2 dispatches)
+            // Try fused first (immutable borrow)
+            let fused_result = prepacked.as_ref().and_then(|pp| {
+                pp.eval_fused_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq)
+            });
+            let (dsilu, fused_dx_ffn) = match fused_result {
+                Some(Ok((dx, ds))) => (ds, Some(dx)),
+                _ => {
+                    // Fallback: separate W2^T dispatch
+                    let ds = if let Some(ref mut pp) = prepacked {
+                        bwd_kernels
+                            .ffn_bwd
+                            .eval_w2t_prepacked(&dffn, pp, l, cfg)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("ANE ffn_bwd_w2t_prepacked failed: {e}");
+                                vec![0.0f32; hidden * seq]
+                            })
+                    } else {
+                        bwd_kernels
+                            .ffn_bwd
+                            .eval_w2t(&dffn, &lw.w2, cfg)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("ANE ffn_bwd_w2t failed: {e}");
+                                vec![0.0f32; hidden * seq]
+                            })
+                    };
+                    (ds, None)
+                }
             };
 
             let (w2_grads, w1t, w3t) = cpu_handle.join().unwrap();
-            (dsilu, w2_grads, w1t, w3t)
+            (dsilu, fused_dx_ffn, w2_grads, w1t, w3t)
         });
 
         // Clamp ANE backward outputs to prevent fp16 overflow propagation
@@ -2668,30 +2678,33 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             }
         }
 
-        // SiLU backward (CPU)
-        let mut dh1 = vec![0.0f32; hidden * seq];
-        let mut dh3 = vec![0.0f32; hidden * seq];
-        silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
-
-        // --- FFN backward on ANE: dx_ffn = dh1 @ W1^T + dh3 @ W3^T (fused or tiled) ---
-        let mut dx_ffn = if let Some(ref mut pp) = prepacked {
-            // Orion delta patching: weights pre-packed, only patch gradient activations
-            bwd_kernels
-                .ffn_bwd
-                .eval_w13t_prepacked(&dh1, &dh3, pp, l, cfg)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("ANE ffn_bwd_w13t_prepacked failed: {e}");
-                    vec![0.0f32; dim * seq]
-                })
+        // FFN backward dx_ffn: use fused result if available, else SiLU + W13^T
+        let mut dx_ffn = if let Some(dx) = fused_dx_ffn {
+            dx
         } else {
-            // w1t, w3t already pre-transposed by the parallel CPU thread
-            bwd_kernels
-                .ffn_bwd
-                .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
-                    vec![0.0f32; dim * seq]
-                })
+            // SiLU backward (CPU)
+            let mut dh1 = vec![0.0f32; hidden * seq];
+            let mut dh3 = vec![0.0f32; hidden * seq];
+            silu_bwd(&mut dh1, &mut dh3, &dsilu, &ac.h1, &ac.h3, hidden * seq);
+
+            // W13^T dispatch
+            if let Some(ref mut pp) = prepacked {
+                bwd_kernels
+                    .ffn_bwd
+                    .eval_w13t_prepacked(&dh1, &dh3, pp, l, cfg)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ANE ffn_bwd_w13t_prepacked failed: {e}");
+                        vec![0.0f32; dim * seq]
+                    })
+            } else {
+                bwd_kernels
+                    .ffn_bwd
+                    .eval_w13t(&dh1, &dh3, &w1t, &w3t, cfg)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ANE ffn_bwd_w13t failed: {e}");
+                        vec![0.0f32; dim * seq]
+                    })
+            }
         };
         ane_forward::clamp_fp16(&mut dx_ffn);
 
