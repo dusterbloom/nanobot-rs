@@ -147,6 +147,16 @@ Other:                140ms   6%  (residual, RMSNorm, overhead)
 - QK-norm via `reduce_mean(axis=-1)` in `[1,H,S,hd]` layout (no batch reshape)
 - `fused_classifier_ce()` — two-pass tiled CE loss, no `[vocab, seq]` materialization
 
+## Late-Session Discovery: The 119 Load Limit
+
+The ANE has a limit of ~119 simultaneously loaded programs per process. We assumed this was a compile limit — it's actually a **load** limit. Even cached kernels (zero compile cost) consume a load slot.
+
+Our delta compilation cache works perfectly: 63 kernel loads but only 6 fresh `compileWithQoS` calls. The cache eliminates compilation time but NOT the slot constraint.
+
+Budget allocation for 35B-A3B: 30 GDN proj + 10 MHA attn + 23 templates = 63 slots. This leaves 56 slots, enough for FFN backward. But the fused FFN backward kernel (3 matmuls + SiLU in one graph) **doesn't compile at 35B dimensions** — the ANE compiler rejects graphs this deep at production tensor sizes, independent of the load budget.
+
+We built a `reload_weights()` hotswap infrastructure (1 loaded program slot shared across 40 layers via weight patching), but it can't help when the kernel doesn't compile at all. The fix is to split the 3-matmul kernel into two shallower kernels.
+
 ## Commits
 
 ```
@@ -157,4 +167,6 @@ Other:                140ms   6%  (residual, RMSNorm, overhead)
 69a4b19  feat(ane): fused GDN projection kernel (4 matmuls in 1 dispatch)
 cb7104c  feat(ane): wire fused GDN projections — 2.4x training speedup
 92e8bb4  feat(ane): ANE classifier tile kernel + fused CE integration
+ce3e112  docs: ANE training journey
+e93215a  feat(ane): weight hotswap infrastructure + compile budget analysis
 ```
