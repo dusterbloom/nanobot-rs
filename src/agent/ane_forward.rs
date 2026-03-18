@@ -3316,7 +3316,35 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
             attn_gate_saved,
             attn_pre_gate_saved,
         ) = if let Some(gdn_w) = &lw.gdn {
-            let gdn_out = if let Some(gdn_proj) = kernels.gdn_proj_fwd.as_ref() {
+            // Try prepacked GDN projections first (1 dispatch vs 4+1 DynMatmul)
+            let gdn_out = if let Some(Ok((qkv, a, b, z))) = prepacked
+                .as_ref()
+                .and_then(|pp| pp.eval_gdn_proj(l, &xnorm, cfg))
+            {
+                let mut qkv = qkv;
+                let mut a = a;
+                let mut b = b;
+                let mut z = z;
+                clamp_fp16(&mut qkv);
+                clamp_fp16(&mut a);
+                clamp_fp16(&mut b);
+                clamp_fp16(&mut z);
+                cpu_gdn_forward_post_proj(
+                    &qkv, &a, &b, &z,
+                    &gdn_w.a_log, &gdn_w.dt_bias, &gdn_w.norm_weight,
+                    &gdn_w.conv_weight, &gdn_w.conv_bias, cfg,
+                    |gated| {
+                        if let Some(Ok(out)) = prepacked
+                            .as_ref()
+                            .and_then(|pp| pp.eval_gdn_o_proj(l, gated, dim, seq))
+                        {
+                            out
+                        } else {
+                            cpu_matmul(&gdn_w.o_proj, gated, dim, gdn_w.o_proj.len() / dim, seq)
+                        }
+                    },
+                )
+            } else if let Some(gdn_proj) = kernels.gdn_proj_fwd.as_ref() {
                 gdn_proj
                     .eval_layer(gdn_w, &xnorm, cfg)
                     .map_err(|e| format!("layer {l} GDN ANE forward failed: {e}"))?

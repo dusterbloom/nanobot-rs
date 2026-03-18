@@ -2243,6 +2243,10 @@ pub struct PrePackedWeights {
     rmsnorm_bwd_ffn_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer fused FFN backward kernels: W2^T + SiLU bwd + W13^T in 1 dispatch.
     fused_ffn_bwd_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer fused GDN projection kernels: QKV+A+B+Z in 1 dispatch.
+    fused_gdn_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer GDN O projection kernels with baked weights.
+    gdn_o_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
 }
 
 impl PrePackedWeights {
@@ -2270,6 +2274,8 @@ impl PrePackedWeights {
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
             fused_ffn_bwd_kernels: None,
+            fused_gdn_proj_kernels: None,
+            gdn_o_proj_kernels: None,
         }
     }
 
@@ -2374,6 +2380,8 @@ impl PrePackedWeights {
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
             fused_ffn_bwd_kernels: None,
+            fused_gdn_proj_kernels: None,
+            gdn_o_proj_kernels: None,
         }
     }
 
@@ -2467,6 +2475,8 @@ impl PrePackedWeights {
         self.rmsnorm_bwd_att_kernels = None;
         self.rmsnorm_bwd_ffn_kernels = None;
         self.fused_ffn_bwd_kernels = None;
+        self.fused_gdn_proj_kernels = None;
+        self.gdn_o_proj_kernels = None;
     }
 
     /// Prime per-layer kernel clones with IOSurface-resident weights.
@@ -3172,6 +3182,164 @@ impl PrePackedWeights {
         let dx = out[..dim * seq].to_vec();
         let dsilu = out[dim * seq..].to_vec();
         Some(Ok((dx, dsilu)))
+    }
+
+    /// Prime per-layer fused GDN projection kernels (QKV+A+B+Z) and O projection.
+    pub fn prime_gdn_proj_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+
+        let proj_result = super::ane_mil::gen_fused_gdn_proj(cfg);
+        let o_result = super::ane_mil::gen_blobfile_matmul(value_dim, dim, cfg.seq_len);
+
+        let mut proj_kernels = Vec::with_capacity(n_layers);
+        let mut o_kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            if lw.gdn.is_none() {
+                proj_kernels.push(None);
+                o_kernels.push(None);
+                continue;
+            }
+            let gdn = lw.gdn.as_ref().unwrap();
+
+            // Transpose weights to [in, out] for BLOBFILE matmul layout
+            let wqkv_t = transpose_weight(&gdn.qkv_proj, qkv_dim, dim);
+            let wa_t = transpose_weight(&gdn.a_proj, h_v, dim);
+            let wb_t = transpose_weight(&gdn.b_proj, h_v, dim);
+            let wz_t = transpose_weight(&gdn.z_proj, value_dim, dim);
+            let wo_t = transpose_weight(&gdn.o_proj, dim, value_dim);
+
+            let wqkv_blob = build_fp16_blob(&wqkv_t);
+            let wa_blob = build_fp16_blob(&wa_t);
+            let wb_blob = build_fp16_blob(&wb_t);
+            let wz_blob = build_fp16_blob(&wz_t);
+
+            let names: Vec<&str> = proj_result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = vec![&wqkv_blob, &wa_blob, &wb_blob, &wz_blob];
+            match super::ane_bridge::AneKernel::compile_multi_weights(
+                &proj_result.mil_text, &names, &datas,
+                &[proj_result.input_bytes], &[proj_result.output_bytes],
+            ) {
+                Ok(k) => proj_kernels.push(Some(k)),
+                Err(_) => {
+                    proj_kernels.push(None);
+                    o_kernels.push(None);
+                    continue; // skip O proj too
+                }
+            }
+
+            // O projection
+            let wo_blob = build_fp16_blob(&wo_t);
+            let o_names: Vec<&str> = o_result.weight_names.iter().copied().collect();
+            match super::ane_bridge::AneKernel::compile_multi_weights(
+                &o_result.mil_text, &o_names, &[&wo_blob],
+                &[o_result.input_bytes], &[o_result.output_bytes],
+            ) {
+                Ok(k) => o_kernels.push(Some(k)),
+                Err(_) => {
+                    // Hit ANE compile limit — push None, caller falls back to DynMatmul
+                    o_kernels.push(None);
+                }
+            }
+        }
+
+        let gdn_count = proj_kernels.iter().filter(|k| k.is_some()).count();
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "primed {gdn_count}/{n_layers} GDN projection kernels in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        self.fused_gdn_proj_kernels = Some(proj_kernels);
+        self.gdn_o_proj_kernels = Some(o_kernels);
+        Ok(())
+    }
+
+    /// Evaluate fused GDN projections on per-layer kernel.
+    /// Returns (qkv_raw, a_raw, b_raw, z) or None if not primed.
+    pub fn eval_gdn_proj(
+        &self,
+        layer: usize,
+        xnorm: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String>> {
+        let kernels = self.fused_gdn_proj_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("fused_gdn_proj eval layer {layer}: {e}")));
+        }
+
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let seq = cfg.seq_len;
+
+        let out_ch = qkv_dim + 2 * h_v + value_dim;
+        let mut buf = vec![0u8; out_ch * seq * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let qkv = out[..qkv_dim * seq].to_vec();
+        let a = out[qkv_dim * seq..(qkv_dim + h_v) * seq].to_vec();
+        let b = out[(qkv_dim + h_v) * seq..(qkv_dim + 2 * h_v) * seq].to_vec();
+        let z = out[(qkv_dim + 2 * h_v) * seq..].to_vec();
+        Some(Ok((qkv, a, b, z)))
+    }
+
+    /// Evaluate GDN O projection on per-layer kernel.
+    /// `out_dim` is the model dim (output size of O projection).
+    pub fn eval_gdn_o_proj(
+        &self,
+        layer: usize,
+        gated: &[f32],
+        out_dim: usize,
+        seq: usize,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.gdn_o_proj_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(gated.as_ptr() as *const u8, gated.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("gdn_o_proj eval layer {layer}: {e}")));
+        }
+
+        let mut buf = vec![0u8; out_dim * seq * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some(Ok(out))
     }
 
     /// Evaluate forward fused FFN on per-layer kernel (IOSurface-resident weights).

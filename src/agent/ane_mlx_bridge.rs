@@ -849,6 +849,29 @@ impl AneTrainerSession {
                 }
             }
 
+            // Prime per-layer fused GDN projection kernels (QKV+A+B+Z + O).
+            if !self.model.cfg().linear_attn_indices.is_empty() {
+                let gdn_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                match pp.prime_gdn_proj_kernels(&gdn_cfg, &self.model) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ANE train: GDN proj kernels primed for seq_len={}",
+                            bucket_seq,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ANE train: GDN proj priming failed for seq_len={}: {}",
+                            bucket_seq, e,
+                        );
+                    }
+                }
+            }
+
             self.prepacked_weights.push((*bucket_seq, pp));
         }
         self.prepacked_weights.sort_by_key(|(seq, _)| *seq);
@@ -4151,19 +4174,19 @@ mod tests {
             let _ = pp.prime_kernels(fwd_tmpl, bwd_w2t, bwd_w13t);
         }
         let pp_cfg = { let mut c = model.cfg().clone(); c.seq_len = *bucket_seq; c };
+        // GDN projections first (biggest win: 86ms→5ms per layer × 30 layers)
+        if !pp_cfg.linear_attn_indices.is_empty() {
+            match pp.prime_gdn_proj_kernels(&pp_cfg, &model) {
+                Ok(()) => eprintln!("35B bench: GDN proj primed OK"),
+                Err(e) => eprintln!("35B bench: GDN proj priming FAILED: {e}"),
+            }
+        }
+        // MHA attention kernels (10 layers × 2 = 20 compiles)
         if bucket_fwd_k.fused_attn_gqa.is_some() {
             let _ = pp.prime_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob);
-            if bucket_bwd_k.fused_attn_gqa_bwd.is_some() {
-                let _ = pp.prime_bwd_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob);
-            }
         }
-        if bucket_fwd_k.rmsnorm_fwd.is_some() {
-            let _ = pp.prime_rmsnorm_kernels(&pp_cfg, &model);
-            if bucket_bwd_k.rmsnorm_bwd.is_some() {
-                let _ = pp.prime_rmsnorm_bwd_kernels(&pp_cfg, &model);
-            }
-        }
-        let _ = pp.prime_fused_ffn_bwd_kernels(&pp_cfg, &model);
+        // Skip rmsnorm/ffn_bwd/bwd_attn priming to stay under compile limit
+        // These fall back to CPU or shared kernels automatically
 
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
         eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);

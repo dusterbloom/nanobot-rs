@@ -2700,6 +2700,41 @@ pub fn gen_fused_gdn_proj(cfg: &MilConfig) -> FusedLayerMil {
     }
 }
 
+/// Generate a single BLOBFILE matmul kernel: out = x @ W.
+///
+/// Input: `[1, in_dim, 1, seq]` fp32.
+/// Weight: `w.bin` `[1, 1, in_dim, out_dim]` fp16.
+/// Output: `[1, out_dim, 1, seq]` fp32.
+pub fn gen_blobfile_matmul(in_dim: usize, out_dim: usize, seq: usize) -> FusedLayerMil {
+    let mut m = String::with_capacity(2048);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_dim}, 1, {seq}]> x) {{");
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{in_dim},{out_dim}]> W = const()[name=string(\"W\"), val=tensor<fp16, [1,1,{in_dim},{out_dim}]>(BLOBFILE(path=string(\"@model_path/weights/w.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_dim},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{in_dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{in_dim},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{in_dim}]> xmt = transpose(perm=pm,x=xm)[name=string(\"xmt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{out_dim}]> ym = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=W)[name=string(\"ym\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{out_dim},{seq}]> yt = transpose(perm=pm,x=ym)[name=string(\"yt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{out_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_dim},1,{seq}]> yr = reshape(shape=ro,x=yt)[name=string(\"yr\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{out_dim},1,{seq}]> out = cast(dtype=to32,x=yr)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec!["@model_path/weights/w.bin"],
+        input_bytes: in_dim * seq * 4,
+        output_bytes: out_dim * seq * 4,
+    }
+}
+
 /// Generate fused FFN backward kernel: W2^T + SiLU backward + W13^T in one dispatch.
 ///
 /// Uses BLOBFILE weights (per-layer, baked into compiled model via delta cache).
