@@ -1174,7 +1174,12 @@ impl GdnProjForwardKernels {
         xnorm: &[f32],
         cfg: &MilConfig,
     ) -> Result<Vec<f32>, String> {
+        let _t0 = std::time::Instant::now();
         let (qkv_raw, a_raw, b_raw, z) = self.eval_inputs(xnorm, gdn)?;
+        let _proj_us = _t0.elapsed().as_micros();
+        if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
+            eprintln!("  GDN projections (4x ANE): {:.2}ms", _proj_us as f64 / 1000.0);
+        }
         let mut o_err = None;
         let out = cpu_gdn_forward_post_proj(
             &qkv_raw,
@@ -2580,12 +2585,17 @@ fn cpu_gdn_forward_post_proj(
 
     // 7. Gated delta recurrence (NEON-optimized on aarch64)
     //    state: [Hv, Dv, Dk] — per-head outer product accumulator
+    let _t_rec = std::time::Instant::now();
     let mut state = vec![0.0f32; h_v * d_v * d_k];
     let mut y = vec![0.0f32; value_dim * seq]; // [Hv*Dv, seq]
 
     gdn_recurrence(
         &mut state, &mut y, &q_exp, &k_exp, v_raw, &g, &beta, h_v, d_k, d_v, seq,
     );
+    let _rec_us = _t_rec.elapsed().as_micros();
+    if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
+        eprintln!("  GDN recurrence: {:.2}ms (h_v={h_v}, d_k={d_k}, d_v={d_v}, seq={seq})", _rec_us as f64 / 1000.0);
+    }
 
     // 8. Output gating: silu(z) * rmsnorm(y), then out_proj
     // RMSNorm on y (per-head across d_v dimension) using norm_weight

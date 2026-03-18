@@ -2612,6 +2612,96 @@ pub fn gen_rmsnorm_bwd(dim: usize, seq: usize, eps: f32) -> FusedLayerMil {
 /// Generate fused FFN backward kernel: W2^T + SiLU backward + W13^T in one dispatch.
 ///
 /// Replaces 2 ANE dispatches (W2^T, W13^T) + 1 CPU op (SiLU backward) with 1 dispatch.
+/// Generate fused GDN projections: QKV + A + B + Z in 1 dispatch with BLOBFILE weights.
+///
+/// Eliminates 86ms/layer of DynMatmul weight-packing overhead (was 4 dispatches × ~22ms each).
+///
+/// Input: `[1, dim, 1, seq]` fp32 — xnorm
+/// Weights: wqkv.bin [dim,qkv_dim], wa.bin [dim,h_v], wb.bin [dim,h_v], wz.bin [dim,value_dim] (fp16)
+/// Output: `[1, out_ch, 1, seq]` fp32 — qkv|a|b|z concatenated on channel axis
+pub fn gen_fused_gdn_proj(cfg: &MilConfig) -> FusedLayerMil {
+    let dim = cfg.dim;
+    let seq = cfg.seq_len;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let out_ch = qkv_dim + 2 * h_v + value_dim;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+
+    // Constants
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+
+    // BLOBFILE weights
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{qkv_dim}]> Wqkv = const()[name=string(\"Wqkv\"), val=tensor<fp16, [1,1,{dim},{qkv_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wqkv.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{h_v}]> Wa = const()[name=string(\"Wa\"), val=tensor<fp16, [1,1,{dim},{h_v}]>(BLOBFILE(path=string(\"@model_path/weights/wa.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{h_v}]> Wb = const()[name=string(\"Wb\"), val=tensor<fp16, [1,1,{dim},{h_v}]>(BLOBFILE(path=string(\"@model_path/weights/wb.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{value_dim}]> Wz = const()[name=string(\"Wz\"), val=tensor<fp16, [1,1,{dim},{value_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wz.bin\"), offset=uint64(64)))];");
+
+    // Cast + reshape input for matmul
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+    // Transpose for matmul: [1,1,dim,seq] → [1,1,seq,dim]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> xmt = transpose(perm=pm,x=xm)[name=string(\"xmt\")];");
+
+    // 4 matmuls: xmt[1,1,seq,dim] @ W[1,1,dim,out] → [1,1,seq,out]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{qkv_dim}]> qkvm = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=Wqkv)[name=string(\"qkvm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{h_v}]> am = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=Wa)[name=string(\"am\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{h_v}]> bm = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=Wb)[name=string(\"bm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{value_dim}]> zm = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=Wz)[name=string(\"zm\")];");
+
+    // Transpose back to channel-first: [1,1,seq,out] → pm → [1,1,out,seq] → reshape [1,out,1,seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{qkv_dim},{seq}]> qkvt = transpose(perm=pm,x=qkvm)[name=string(\"qkvt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rqkv = const()[name=string(\"rqkv\"), val=tensor<int32, [4]>([1,{qkv_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> qkv = reshape(shape=rqkv,x=qkvt)[name=string(\"qkv\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{h_v},{seq}]> at = transpose(perm=pm,x=am)[name=string(\"at\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,{h_v},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> a = reshape(shape=ra,x=at)[name=string(\"a\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{h_v},{seq}]> bt = transpose(perm=pm,x=bm)[name=string(\"bt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> b = reshape(shape=ra,x=bt)[name=string(\"b\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{value_dim},{seq}]> zt = transpose(perm=pm,x=zm)[name=string(\"zt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rz = const()[name=string(\"rz\"), val=tensor<int32, [4]>([1,{value_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{value_dim},1,{seq}]> z = reshape(shape=rz,x=zt)[name=string(\"z\")];");
+
+    // Concatenate on channel axis: qkv|a|b|z
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(qkv,a,b,z),axis=cax,interleave=bF)[name=string(\"cat\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out = cast(dtype=to32,x=cat)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = dim * seq * 4;
+    let output_bytes = out_ch * seq * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/wqkv.bin",
+            "@model_path/weights/wa.bin",
+            "@model_path/weights/wb.bin",
+            "@model_path/weights/wz.bin",
+        ],
+        input_bytes,
+        output_bytes,
+    }
+}
+
+/// Generate fused FFN backward kernel: W2^T + SiLU backward + W13^T in one dispatch.
+///
 /// Uses BLOBFILE weights (per-layer, baked into compiled model via delta cache).
 ///
 /// Input: `[1, dim + 2*hidden, 1, seq]` fp32 — dx_ffn | h1 | h3
@@ -4098,6 +4188,66 @@ mod tests {
             Err(e) => {
                 eprintln!("SDPA+RoPE+QKV^T BWD: COMPILE FAILED: {e}");
                 // Don't panic — this is experimental
+            }
+        }
+    }
+
+    // ---- Round 10.4: gen_fused_gdn_proj (QKV+A+B+Z in 1 dispatch) ----
+
+    #[test]
+    fn test_fused_gdn_proj_compile() {
+        use crate::agent::ane_weights::build_fp16_blob;
+        init_ane();
+
+        // 35B GDN dimensions
+        let cfg = MilConfig {
+            dim: 2048, hidden_dim: 512, n_heads: 16, seq_len: 128, n_kv_heads: 2,
+            rope_theta: 1e6, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 256,
+            linear_attn_indices: (0..30).collect(), linear_n_heads: 16, linear_head_dim: 128,
+            linear_n_value_heads: 32, linear_value_head_dim: 128, conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let result = gen_fused_gdn_proj(&cfg);
+        eprintln!("Fused GDN proj: {} bytes, {} weights, in={}B, out={}B",
+            result.mil_text.len(), result.weight_names.len(), result.input_bytes, result.output_bytes);
+
+        let dim = cfg.dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+
+        let make = |n: usize, s: usize| build_fp16_blob(&(0..n).map(|i| ((i+s) as f32*0.001).sin()*0.1).collect::<Vec<_>>());
+        let wqkv = make(dim * qkv_dim, 1);
+        let wa = make(dim * h_v, 2);
+        let wb = make(dim * h_v, 3);
+        let wz = make(dim * value_dim, 4);
+
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let datas: Vec<&[u8]> = vec![&wqkv, &wa, &wb, &wz];
+
+        match AneKernel::compile_multi_weights(
+            &result.mil_text, &names, &datas, &[result.input_bytes], &[result.output_bytes],
+        ) {
+            Ok(k) => {
+                eprintln!("Fused GDN proj: COMPILED OK on ANE!");
+                let input: Vec<f32> = (0..dim*128).map(|i| ((i+42) as f32*0.001).sin()*0.5).collect();
+                k.write_input(0, &f32_to_bytes(&input));
+                k.eval().expect("eval");
+                let mut out = vec![0u8; result.output_bytes];
+                k.read_output(0, &mut out);
+                let vals = bytes_to_f32(&out);
+                let nz = vals.iter().filter(|v| v.abs() > 1e-10).count();
+                eprintln!("Fused GDN proj: {nz}/{} non-zero", vals.len());
+                assert!(nz > 0);
+            }
+            Err(e) => {
+                eprintln!("Fused GDN proj: COMPILE FAILED: {e}");
+                panic!("Fused GDN proj kernel does not compile");
             }
         }
     }
