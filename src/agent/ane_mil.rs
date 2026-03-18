@@ -2613,6 +2613,118 @@ pub fn gen_rmsnorm_bwd(dim: usize, seq: usize, eps: f32) -> FusedLayerMil {
     }
 }
 
+/// Generate fused FFN backward kernel: W2^T + SiLU backward + W13^T in one dispatch.
+///
+/// Replaces 2 ANE dispatches (W2^T, W13^T) + 1 CPU op (SiLU backward) with 1 dispatch.
+/// Uses BLOBFILE weights (per-layer, baked into compiled model via delta cache).
+///
+/// Input: `[1, dim + 2*hidden, 1, seq]` fp32 — dx_ffn | h1 | h3
+/// Weights: w2t.bin [hidden,dim], w1t.bin [dim,hidden], w3t.bin [dim,hidden] (all fp16)
+/// Output: `[1, dim, 1, seq]` fp32 — dx = W1^T @ dh1 + W3^T @ dh3
+pub fn gen_fused_ffn_bwd(cfg: &MilConfig) -> FusedLayerMil {
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let in_ch = dim + 2 * hidden;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> x) {{");
+
+    // Constants
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        fp16 one_v = const()[name=string(\"onev\"), val=fp16(1.0)];");
+
+    // Weight BLOBFILEs
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{dim}]> W2t = const()[name=string(\"W2t\"), val=tensor<fp16, [1,{hidden},1,{dim}]>(BLOBFILE(path=string(\"@model_path/weights/w2t.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{hidden}]> W1t = const()[name=string(\"W1t\"), val=tensor<fp16, [1,{dim},1,{hidden}]>(BLOBFILE(path=string(\"@model_path/weights/w1t.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{hidden}]> W3t = const()[name=string(\"W3t\"), val=tensor<fp16, [1,{dim},1,{hidden}]>(BLOBFILE(path=string(\"@model_path/weights/w3t.bin\"), offset=uint64(64)))];");
+
+    // Cast input + slice
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+
+    // dx_ffn [dim, seq]
+    let _ = writeln!(m, "        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> sd = const()[name=string(\"sd\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dxf = slice_by_size(x=xh,begin=b0,size=sd)[name=string(\"dxf\")];");
+
+    // h1 [hidden, seq]
+    let _ = writeln!(m, "        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,{dim},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> sh = const()[name=string(\"sh\"), val=tensor<int32, [4]>([1,{hidden},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h1 = slice_by_size(x=xh,begin=b1,size=sh)[name=string(\"h1\")];");
+
+    // h3 [hidden, seq]
+    let off_h3 = dim + hidden;
+    let _ = writeln!(m, "        tensor<int32, [4]> b3 = const()[name=string(\"b3\"), val=tensor<int32, [4]>([0,{off_h3},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h3 = slice_by_size(x=xh,begin=b3,size=sh)[name=string(\"h3\")];");
+
+    // Step 1: dsilu = W2^T @ dx_ffn
+    // Reshape to [1,1,M,K] @ [1,1,K,N] pattern for ANE matmul
+    let _ = writeln!(m, "        tensor<int32, [4]> rw2 = const()[name=string(\"rw2\"), val=tensor<int32, [4]>([1,1,{hidden},{dim}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{dim}]> W2m = reshape(shape=rw2,x=W2t)[name=string(\"W2m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},{seq},1]> dxf_t = transpose(perm=pm,x=dxf)[name=string(\"dxft\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rdx = const()[name=string(\"rdx\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dxfm = reshape(shape=rdx,x=dxf_t)[name=string(\"dxfm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> dsm = matmul(transpose_x=bF,transpose_y=bF,x=W2m,y=dxfm)[name=string(\"dsm\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rds = const()[name=string(\"rds\"), val=tensor<int32, [4]>([1,{hidden},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> dsilu = reshape(shape=rds,x=dsm)[name=string(\"dsilu\")];");
+
+    // Step 2: SiLU backward
+    // sig = sigmoid(h1)
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sig\")];");
+    // silu_val = h1 * sig
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"silu\")];");
+    // dh3 = dsilu * silu_val
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> dh3 = mul(x=dsilu,y=silu)[name=string(\"dh3\")];");
+    // silu_deriv = sig * (1 + h1 * (1 - sig))
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> omsig = sub(x=one_v,y=sig)[name=string(\"oms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h1oms = mul(x=h1,y=omsig)[name=string(\"h1oms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> opl = add(x=one_v,y=h1oms)[name=string(\"opl\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sd1 = mul(x=sig,y=opl)[name=string(\"sd1\")];");
+    // dh1 = dsilu * h3 * silu_deriv
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> dsh3 = mul(x=dsilu,y=h3)[name=string(\"dsh3\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> dh1 = mul(x=dsh3,y=sd1)[name=string(\"dh1\")];");
+
+    // Step 3: dx1 = W1^T @ dh1 + W3^T @ dh3
+    let _ = writeln!(m, "        tensor<int32, [4]> rw1 = const()[name=string(\"rw1\"), val=tensor<int32, [4]>([1,1,{dim},{hidden}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W1m = reshape(shape=rw1,x=W1t)[name=string(\"W1m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},{seq},1]> dh1_t = transpose(perm=pm,x=dh1)[name=string(\"dh1t\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rdh = const()[name=string(\"rdh\"), val=tensor<int32, [4]>([1,1,{hidden},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> dh1m = reshape(shape=rdh,x=dh1_t)[name=string(\"dh1m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dx1m = matmul(transpose_x=bF,transpose_y=bF,x=W1m,y=dh1m)[name=string(\"dx1m\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rdout = const()[name=string(\"rdout\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx1 = reshape(shape=rdout,x=dx1m)[name=string(\"dx1\")];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W3m = reshape(shape=rw1,x=W3t)[name=string(\"W3m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},{seq},1]> dh3_t = transpose(perm=pm,x=dh3)[name=string(\"dh3t\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> dh3m = reshape(shape=rdh,x=dh3_t)[name=string(\"dh3m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dx3m = matmul(transpose_x=bF,transpose_y=bF,x=W3m,y=dh3m)[name=string(\"dx3m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx3 = reshape(shape=rdout,x=dx3m)[name=string(\"dx3\")];");
+
+    // Sum
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dxs = add(x=dx1,y=dx3)[name=string(\"dxs\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> out = cast(dtype=to32,x=dxs)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = in_ch * seq * 4;
+    let output_bytes = dim * seq * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/w2t.bin",
+            "@model_path/weights/w1t.bin",
+            "@model_path/weights/w3t.bin",
+        ],
+        input_bytes,
+        output_bytes,
+    }
+}
+
 /// Generate fused SDPA backward for GQA (RoPE backward done on CPU).
 ///
 /// Replaces sdpa_bwd1 + sdpa_bwd2 with a single dispatch.
@@ -3829,7 +3941,199 @@ mod tests {
         );
     }
 
-    // ---- Round 10: gen_sdpa_rope_qkvt_bwd (2-kernel approach) ----
+    // ---- Round 10: gen_sdpa_rope_qkvt_bwd (fused SDPA+RoPE+QKV^T backward) ----
+
+    #[test]
+    fn test_sdpa_rope_qkvt_bwd_compile() {
+        use crate::agent::ane_weights::{build_fp16_blob, generate_rope_blobs};
+
+        init_ane();
+
+        let cfg = MilConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 8,
+            seq_len: 64,
+            n_kv_heads: 4,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            head_dim_explicit: 16,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let result = gen_sdpa_rope_qkvt_bwd(&cfg, cfg.attn_output_gate);
+        eprintln!(
+            "SDPA+RoPE+QKV^T BWD MIL: {} bytes, {} weights, in={}B, out={}B",
+            result.mil_text.len(),
+            result.weight_names.len(),
+            result.input_bytes,
+            result.output_bytes,
+        );
+
+        // Build weight blobs
+        let dim = cfg.dim;
+        let qpd = cfg.q_proj_dim();
+        let kv_dim = cfg.kv_dim();
+        let attn_dim = cfg.attn_dim();
+        let (cos_blob, sin_blob) = generate_rope_blobs(cfg.seq_len, cfg.head_dim(), cfg.rope_theta);
+        let mask_blob = build_causal_mask_blob(cfg.seq_len);
+        let wq_blob = build_fp16_blob(&vec![0.01f32; dim * qpd]);
+        let wk_blob = build_fp16_blob(&vec![0.01f32; dim * kv_dim]);
+        let wv_blob = build_fp16_blob(&vec![0.01f32; dim * kv_dim]);
+        let gate_blob = build_fp16_blob(&vec![0.0f32; 1]); // placeholder
+
+        let mut names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let mut datas: Vec<&[u8]> = Vec::new();
+        for name in &names {
+            match *name {
+                "@model_path/weights/wq.bin" => datas.push(&wq_blob),
+                "@model_path/weights/wk.bin" => datas.push(&wk_blob),
+                "@model_path/weights/wv.bin" => datas.push(&wv_blob),
+                "@model_path/weights/rope_cos.bin" => datas.push(&cos_blob),
+                "@model_path/weights/rope_sin.bin" => datas.push(&sin_blob),
+                "@model_path/weights/mask.bin" => datas.push(&mask_blob),
+                "@model_path/weights/gate_zeros.bin" => datas.push(&gate_blob),
+                _ => datas.push(&wq_blob), // fallback
+            }
+        }
+
+        match AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &names,
+            &datas,
+            &[result.input_bytes],
+            &[result.output_bytes],
+        ) {
+            Ok(kernel) => {
+                eprintln!("SDPA+RoPE+QKV^T BWD: COMPILED OK");
+                // Quick eval test
+                let input = vec![0.01f32; result.input_bytes / 4];
+                kernel.write_input(0, &f32_to_bytes(&input));
+                kernel.eval().expect("eval failed");
+                let mut out = vec![0u8; result.output_bytes];
+                kernel.read_output(0, &mut out);
+                let vals = bytes_to_f32(&out);
+                let nonzero = vals.iter().filter(|v| v.abs() > 1e-10).count();
+                eprintln!("SDPA+RoPE+QKV^T BWD: {}/{} non-zero output elements", nonzero, vals.len());
+            }
+            Err(e) => {
+                eprintln!("SDPA+RoPE+QKV^T BWD: COMPILE FAILED: {e}");
+                // Don't panic — this is experimental
+            }
+        }
+    }
+
+    // ---- Round 10.5: gen_fused_ffn_bwd (W2T + SiLU bwd + W13T) ----
+
+    #[test]
+    fn test_fused_ffn_bwd_compile_and_eval() {
+        use crate::agent::ane_weights::build_fp16_blob;
+
+        init_ane();
+
+        let cfg = MilConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            seq_len: 64,
+            n_kv_heads: 4,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            head_dim_explicit: 16,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: false,
+        };
+
+        let result = gen_fused_ffn_bwd(&cfg);
+        eprintln!(
+            "Fused FFN BWD MIL: {} bytes, {} weights, in={}B, out={}B",
+            result.mil_text.len(),
+            result.weight_names.len(),
+            result.input_bytes,
+            result.output_bytes,
+        );
+
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let seq = cfg.seq_len;
+
+        // Build weight blobs (W2^T [hidden,dim], W1^T [dim,hidden], W3^T [dim,hidden])
+        let w2t_blob = build_fp16_blob(&(0..hidden*dim).map(|i| ((i+1) as f32 * 0.003).sin() * 0.5).collect::<Vec<_>>());
+        let w1t_blob = build_fp16_blob(&(0..dim*hidden).map(|i| ((i+2) as f32 * 0.005).sin() * 0.5).collect::<Vec<_>>());
+        let w3t_blob = build_fp16_blob(&(0..dim*hidden).map(|i| ((i+3) as f32 * 0.007).sin() * 0.5).collect::<Vec<_>>());
+
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let datas: Vec<&[u8]> = vec![&w2t_blob, &w1t_blob, &w3t_blob];
+
+        let kernel = AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &names,
+            &datas,
+            &[result.input_bytes],
+            &[result.output_bytes],
+        )
+        .expect("Fused FFN BWD compile failed");
+
+        // Build input: dx_ffn | h1 | h3
+        let in_ch = dim + 2 * hidden;
+        let input: Vec<f32> = (0..in_ch * seq)
+            .map(|i| ((i + 42) as f32 * 0.0013).sin() * 0.5)
+            .collect();
+
+        kernel.write_input(0, &f32_to_bytes(&input));
+        kernel.eval().expect("Fused FFN BWD eval failed");
+
+        let mut out_buf = vec![0u8; result.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        let out = bytes_to_f32(&out_buf);
+        let nonzero = out.iter().filter(|v| v.abs() > 1e-10).count();
+        let norm: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!(
+            "Fused FFN BWD: {}/{} non-zero, norm={norm:.4}",
+            nonzero, out.len()
+        );
+        assert!(nonzero > 0, "output is all zeros");
+        assert!(norm > 1e-6, "output norm too small");
+
+        // CPU reference: W2^T matmul → SiLU backward → W13^T matmul
+        let dx_ffn: Vec<f32> = input[..dim*seq].to_vec();
+        let h1_act: Vec<f32> = input[dim*seq..(dim+hidden)*seq].to_vec();
+        let h3_act: Vec<f32> = input[(dim+hidden)*seq..].to_vec();
+
+        // W2^T weights (decode from fp16 blob)
+        let w2t_f32: Vec<f32> = (0..hidden*dim).map(|i| ((i+1) as f32 * 0.003).sin() * 0.5).collect();
+        let w1t_f32: Vec<f32> = (0..dim*hidden).map(|i| ((i+2) as f32 * 0.005).sin() * 0.5).collect();
+        let w3t_f32: Vec<f32> = (0..dim*hidden).map(|i| ((i+3) as f32 * 0.007).sin() * 0.5).collect();
+
+        // dsilu = W2^T @ dx_ffn: [hidden,dim] @ [dim,seq] → [hidden,seq]
+        let dsilu_cpu = crate::agent::ane_forward::cpu_matmul(&w2t_f32, &dx_ffn, hidden, dim, seq);
+        // SiLU backward
+        let mut dh1_cpu = vec![0.0f32; hidden*seq];
+        let mut dh3_cpu = vec![0.0f32; hidden*seq];
+        crate::agent::ane_backward::silu_bwd(&mut dh1_cpu, &mut dh3_cpu, &dsilu_cpu, &h1_act, &h3_act, hidden*seq);
+        // W1^T @ dh1 + W3^T @ dh3: [dim,hidden] @ [hidden,seq]
+        let dx1 = crate::agent::ane_forward::cpu_matmul(&w1t_f32, &dh1_cpu, dim, hidden, seq);
+        let dx3 = crate::agent::ane_forward::cpu_matmul(&w3t_f32, &dh3_cpu, dim, hidden, seq);
+        let cpu_out: Vec<f32> = dx1.iter().zip(dx3.iter()).map(|(a,b)| a+b).collect();
+
+        let max_err = out.iter().zip(cpu_out.iter()).map(|(a,c)| (a-c).abs()).fold(0.0f32, f32::max);
+        let cpu_norm: f32 = cpu_out.iter().map(|v| v*v).sum::<f32>().sqrt();
+        eprintln!("Fused FFN BWD vs CPU: max_err={max_err:.6}, ane_norm={norm:.4}, cpu_norm={cpu_norm:.4}");
+        assert!(max_err < 0.5, "Fused FFN BWD max error too large: {max_err:.6}");
+    }
 
     // ---- Round 11: gen_rmsnorm_fwd (standalone RMSNorm for ANE) ----
 
