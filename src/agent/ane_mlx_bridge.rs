@@ -209,6 +209,10 @@ impl BucketKernels {
     }
 
     /// Compile only buckets that are not already cached.
+    ///
+    /// Uses the delta compilation cache: if net.plist exists from a previous
+    /// process run (same MIL text → same hexId → same tmpDir), the ANE
+    /// compiler is bypassed entirely. Only `loadWithQoS:` is called.
     pub fn ensure(
         &mut self,
         sample_lens: &[usize],
@@ -228,16 +232,50 @@ impl BucketKernels {
         needed.sort();
 
         let mut compiled = 0usize;
-        for bucket_seq in needed {
+        let ensure_start = std::time::Instant::now();
+        let compile_count_before = super::ane_bridge::compile_count();
+
+        for bucket_seq in &needed {
+            let bucket_start = std::time::Instant::now();
+            let cc_before = super::ane_bridge::compile_count();
+
             let mut cfg = base_cfg.clone();
-            cfg.seq_len = bucket_seq;
+            cfg.seq_len = *bucket_seq;
             let fwd = super::ane_forward::CompiledKernels::compile_forward(&cfg)?;
-            let bwd = super::ane_backward::BackwardKernels::compile_backward(&cfg, &fwd.mask_blob)?;
-            tracing::info!("ANE train: compiled kernels for seq_len={bucket_seq}");
-            self.buckets.push((bucket_seq, fwd, bwd));
+            let bwd =
+                super::ane_backward::BackwardKernels::compile_backward(&cfg, &fwd.mask_blob)?;
+
+            let cc_delta = super::ane_bridge::compile_count() - cc_before;
+            let elapsed = bucket_start.elapsed();
+            if cc_delta == 0 {
+                tracing::info!(
+                    "ANE train: loaded seq_len={bucket_seq} from cache in {:.0}ms (0 compiles)",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            } else {
+                tracing::info!(
+                    "ANE train: compiled seq_len={bucket_seq} in {:.0}ms ({cc_delta} compiles)",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            self.buckets.push((*bucket_seq, fwd, bwd));
             compiled += 1;
         }
         self.buckets.sort_by_key(|(bucket_seq, _, _)| *bucket_seq);
+
+        let total_compiles = super::ane_bridge::compile_count() - compile_count_before;
+        let total_elapsed = ensure_start.elapsed();
+        if !needed.is_empty() {
+            let label = if total_compiles == 0 {
+                "all cached"
+            } else {
+                "fresh"
+            };
+            tracing::info!(
+                "ANE train: {compiled} bucket(s) ready in {:.1}s ({total_compiles} compiles — {label})",
+                total_elapsed.as_secs_f64(),
+            );
+        }
 
         Ok(compiled)
     }
@@ -455,6 +493,92 @@ impl MuonKernelSignature {
 }
 
 #[cfg(feature = "mlx")]
+fn live_apply_idle_wait_ms() -> u64 {
+    const DEFAULT_IDLE_MS: u64 = 30_000;
+    const MAX_IDLE_MS: u64 = 10 * 60 * 1_000;
+
+    std::env::var("NANOBOT_LEARN_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.min(MAX_IDLE_MS))
+        .unwrap_or(DEFAULT_IDLE_MS)
+}
+
+#[cfg(feature = "mlx")]
+fn wait_for_live_apply_window(
+    runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+    idle_ms: u64,
+) -> bool {
+    let Some(rc) = runtime_counters else {
+        return true;
+    };
+    if idle_ms == 0 {
+        return true;
+    }
+
+    loop {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if rc.training_cancel.load(Relaxed) {
+            return false;
+        }
+        if rc.inference_active.load(Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        let now_ms = super::agent_core::RuntimeCounters::now_epoch_ms();
+        let last_done_ms = rc.last_inference_finished_ms.load(Relaxed);
+        let quiet_ms = now_ms.saturating_sub(last_done_ms);
+        if last_done_ms != 0 && quiet_ms >= idle_ms {
+            return true;
+        }
+        let sleep_ms = if last_done_ms == 0 {
+            idle_ms.min(1_000)
+        } else {
+            idle_ms.saturating_sub(quiet_ms).min(1_000)
+        };
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms.max(100)));
+    }
+}
+
+#[cfg(feature = "mlx")]
+fn publish_deltas_when_idle(
+    tx: &std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>,
+    deltas: LoraDeltas,
+    runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+) -> bool {
+    publish_deltas_when_idle_with_idle_ms(tx, deltas, runtime_counters, live_apply_idle_wait_ms())
+}
+
+#[cfg(feature = "mlx")]
+fn publish_deltas_when_idle_with_idle_ms(
+    tx: &std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>,
+    deltas: LoraDeltas,
+    runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+    idle_ms: u64,
+) -> bool {
+    if !wait_for_live_apply_window(runtime_counters, idle_ms) {
+        tracing::warn!("ANE train: skipping live MLX LoRA apply due to cancellation");
+        return false;
+    }
+
+    let n_deltas = deltas.layers.len();
+    match tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
+        deltas,
+        reply: None,
+    }) {
+        Ok(()) => {
+            tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("ANE train: failed to send deltas to MLX worker: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(feature = "mlx")]
 struct AneTrainerSession {
     cfg: AneTrainingConfig,
     model: super::ane_weights::DenseCachedModel,
@@ -481,21 +605,31 @@ impl AneTrainerSession {
         use super::ane_weights::{DenseCachedModel, QuantizedModelWeights};
 
         let t0 = std::time::Instant::now();
-        let model =
-            match QuantizedModelWeights::from_mlx_safetensors(&cfg.model_dir, &cfg.mil_config) {
-                Ok(m) => {
-                    let q_mb = m.quantized_memory_bytes() as f64 / 1_048_576.0;
-                    let cached = DenseCachedModel::auto(m);
-                    tracing::info!(
-                    "ANE train: loaded model in {}ms (quantized {q_mb:.1} MB, {}/{} layers cached)",
-                    t0.elapsed().as_millis(),
-                    cached.cached_layer_count(),
-                    cached.n_layers(),
-                );
-                    cached
-                }
-                Err(e) => return Err(format!("failed to load weights: {e}")),
-            };
+        let model = match QuantizedModelWeights::from_mlx_safetensors(
+            &cfg.model_dir,
+            &cfg.mil_config,
+        ) {
+            Ok(m) => {
+                let cached = DenseCachedModel::auto(m);
+                let cache_budget = cached.cache_budget();
+                tracing::info!(
+                        "ANE train memory budget: phys={:.1} GB, quantized={:.1} MB, reserve={:.1} MB (inference {:.1} MB + headroom {:.1} MB), dense_cache={:.1}/{:.1} MB, dense_total={:.1} MB, layers={}/{}",
+                        cache_budget.physical_mem_bytes as f64 / 1_073_741_824.0,
+                        cache_budget.quantized_bytes as f64 / 1_048_576.0,
+                        cache_budget.reserved_bytes as f64 / 1_048_576.0,
+                        cache_budget.inference_reserve_bytes as f64 / 1_048_576.0,
+                        cache_budget.fixed_headroom_bytes as f64 / 1_048_576.0,
+                        cached.cached_bytes() as f64 / 1_048_576.0,
+                        cache_budget.dense_cache_budget_bytes as f64 / 1_048_576.0,
+                        cache_budget.total_dense_layer_bytes as f64 / 1_048_576.0,
+                        cached.cached_layer_count(),
+                        cached.n_layers(),
+                    );
+                tracing::info!("ANE train: loaded model in {}ms", t0.elapsed().as_millis());
+                cached
+            }
+            Err(e) => return Err(format!("failed to load weights: {e}")),
+        };
         use std::sync::atomic::Ordering;
         stats.model_loads.fetch_add(1, Ordering::Relaxed);
 
@@ -528,9 +662,19 @@ impl AneTrainerSession {
         sample_lens: &[usize],
         stats: &PersistentAneTrainerStatCounters,
     ) -> Result<(), String> {
-        let compiled = self
-            .bucket_kernels
-            .ensure(sample_lens, &self.cfg.mil_config)?;
+        // Single-bucket mode: compile only the largest needed bucket.
+        // All samples get padded up to this size. Saves ~2/3 of prepacked +
+        // IOSurface memory when samples span multiple bucket sizes — critical
+        // for 35B models where 3 buckets consume ~5 GB of IOSurface/heap.
+        let max_len = sample_lens.iter().copied().max().unwrap_or(128);
+        let single_bucket = BUCKET_SIZES
+            .iter()
+            .copied()
+            .find(|&b| b >= max_len)
+            .unwrap_or(*BUCKET_SIZES.last().unwrap());
+        let single = [single_bucket];
+
+        let compiled = self.bucket_kernels.ensure(&single, &self.cfg.mil_config)?;
         if compiled > 0 {
             use std::sync::atomic::Ordering;
             stats.bucket_compiles.fetch_add(compiled, Ordering::Relaxed);
@@ -552,7 +696,7 @@ impl AneTrainerSession {
             .map(|(_, fwd, _)| fwd.ffn.is_fully_fused())
             .unwrap_or(false);
 
-        for (bucket_seq, _, _) in &self.bucket_kernels.buckets {
+        for (bucket_seq, fwd_k, bwd_k) in &self.bucket_kernels.buckets {
             if self
                 .prepacked_weights
                 .iter()
@@ -560,15 +704,60 @@ impl AneTrainerSession {
             {
                 continue;
             }
-            let pp = PrePackedWeights::build(&self.model, *bucket_seq, fused_ffn);
+            let mut pp = PrePackedWeights::build(&self.model, *bucket_seq, fused_ffn);
             tracing::info!(
-                "ANE train: pre-packed weights for seq_len={} ({:.1} MB)",
+                "ANE train: pre-packed weights for seq_len={} ({:.1} MB heap)",
                 bucket_seq,
                 pp.memory_bytes() as f64 / 1_048_576.0,
             );
+
+            // Prime per-layer kernel clones: weights baked into IOSurface.
+            // After priming, only activation data traverses CPU caches per step.
+            let fwd_tmpl = fwd_k.ffn.fused_kernel();
+            let (bwd_w2t_tmpl, bwd_w13t_tmpl) = bwd_k
+                .ffn_bwd
+                .fused_kernels()
+                .map(|(a, b)| (Some(a), Some(b)))
+                .unwrap_or((None, None));
+            match pp.prime_kernels(fwd_tmpl, bwd_w2t_tmpl, bwd_w13t_tmpl) {
+                Ok(()) => {
+                    tracing::info!(
+                        "ANE train: per-layer kernels primed for seq_len={} (IOSurface-resident)",
+                        bucket_seq,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ANE train: per-layer kernel priming failed for seq_len={}: {} (falling back to shared kernels)",
+                        bucket_seq, e,
+                    );
+                }
+            }
+
             self.prepacked_weights.push((*bucket_seq, pp));
         }
         self.prepacked_weights.sort_by_key(|(seq, _)| *seq);
+
+        let total_heap_bytes: usize = self
+            .prepacked_weights
+            .iter()
+            .map(|(_, pp)| pp.memory_bytes())
+            .sum();
+        let total_iosurface_bytes: usize = self
+            .prepacked_weights
+            .iter()
+            .filter(|(_, pp)| pp.has_per_layer_kernels())
+            .map(|(_, pp)| pp.memory_bytes())
+            .sum();
+        if total_heap_bytes > 0 {
+            tracing::info!(
+                "ANE train prepacked residency: heap={:.1} MB, iosurface_inputs={:.1} MB, total={:.1} MB across {} bucket(s)",
+                total_heap_bytes as f64 / 1_048_576.0,
+                total_iosurface_bytes as f64 / 1_048_576.0,
+                (total_heap_bytes + total_iosurface_bytes) as f64 / 1_048_576.0,
+                self.prepacked_weights.len(),
+            );
+        }
     }
 
     fn ensure_muon_grad_kernels(&mut self) -> Result<(), String> {
@@ -625,6 +814,7 @@ impl AneTrainerSession {
         &self,
         cfg: &AneTrainingConfig,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
+        runtime_counters: Option<&super::agent_core::RuntimeCounters>,
     ) -> bool {
         use super::ane_lora::save_lora_bin;
 
@@ -679,12 +869,7 @@ impl AneTrainerSession {
                     Some(&cfg.linear_attn_indices)
                 },
             );
-            let n_deltas = deltas.layers.len();
-            let _ = tx.send(super::mlx_server::ModelRequest::ApplyLoraDeltas {
-                deltas,
-                reply: None,
-            });
-            tracing::info!("ANE train: sent {n_deltas} deltas to MLX worker");
+            publish_deltas_when_idle(tx, deltas, runtime_counters);
         }
 
         saved
@@ -1055,7 +1240,7 @@ impl AneTrainerSession {
                     break 'outer;
                 }
 
-                // Update TUI progress counters, yield to inference, check cancellation.
+                // Update TUI progress counters, evict memory for inference, check cancellation.
                 if let Some(rc) = runtime_counters {
                     use std::sync::atomic::Ordering::Relaxed;
                     rc.training_current_step.store(opt_step as u64, Relaxed);
@@ -1065,10 +1250,17 @@ impl AneTrainerSession {
                         tracing::info!("ANE train: cancelled at step {opt_step}/{total_opt_steps}");
                         break 'outer;
                     }
-                    // NOTE: yield guard removed. ANE and GPU are independent
-                    // hardware blocks that run simultaneously with zero
-                    // interference (confirmed by autoresearch-ANE). Training on
-                    // CPU/ANE does not compete with inference on GPU/Metal.
+
+                    // Yield guard REMOVED (2026-03-18).
+                    //
+                    // Benchmark proof (bench_concurrent_35b_omlx_real_traces):
+                    //   Without guard: inference degrades 10% (24→27ms/tok)
+                    //   WITH guard:    inference degrades 3,461% (24→858ms/tok)
+                    //
+                    // The evict→sleep→reprime cycle destroys inference 35x worse
+                    // than just letting training run. ANE utilization is ~1.7% —
+                    // the bottleneck is CPU cores, not memory bandwidth.
+                    // IOSurface buffers (~0.6GB) are negligible vs 32GB unified.
                 }
 
                 if opt_step % 5 == 0 || opt_step == total_opt_steps {
@@ -1105,7 +1297,7 @@ impl AneTrainerSession {
         }
         tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
 
-        self.save_and_publish(cfg, mlx_tx)
+        self.save_and_publish(cfg, mlx_tx, runtime_counters)
     }
 }
 
@@ -1717,6 +1909,60 @@ mod tests {
             }
             _ => panic!("expected ApplyLoraDeltas, got different ModelRequest"),
         }
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_publish_deltas_waits_for_inference_idle() {
+        use crate::agent::agent_core::RuntimeCounters;
+        use crate::agent::mlx_server::ModelRequest;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let counters = std::sync::Arc::new(RuntimeCounters::new(32_000));
+        counters.inference_active.store(true, Ordering::Relaxed);
+        counters.training_cancel.store(false, Ordering::Relaxed);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ModelRequest>(1);
+        let counters_for_worker = counters.clone();
+        let handle = std::thread::spawn(move || {
+            publish_deltas_when_idle_with_idle_ms(
+                &tx,
+                LoraDeltas {
+                    layers: Vec::new(),
+                    scale: 1.0,
+                },
+                Some(counters_for_worker.as_ref()),
+                150,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            rx.try_recv().is_err(),
+            "delta publish should wait while inference is active"
+        );
+
+        counters.inference_active.store(false, Ordering::Relaxed);
+        counters
+            .last_inference_finished_ms
+            .store(RuntimeCounters::now_epoch_ms(), Ordering::Relaxed);
+
+        let msg = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("delta publish should resume after inference becomes idle");
+        match msg {
+            ModelRequest::ApplyLoraDeltas { deltas, reply } => {
+                assert!(deltas.layers.is_empty());
+                assert!(reply.is_none());
+            }
+            _ => panic!("expected ApplyLoraDeltas after idle window"),
+        }
+
+        assert!(
+            handle.join().expect("publish thread panicked"),
+            "delta publish should succeed once inference is idle"
+        );
     }
 
     /// Verify no contention: MLX inference completes normally while ANE trains.
@@ -4557,22 +4803,41 @@ mod tests {
         assert!(fwd.base.loss > 0.0, "loss must be positive");
 
         // Verify: gradients are non-zero (model is learning)
-        let grad_norm: f32 = bwd.lora_grads.layers.iter().map(|lg| {
-            let adapter_ss = |a: &Option<crate::agent::ane_lora::LoraAdapterGrads>| -> f32 {
-                a.as_ref().map_or(0.0, |g| {
-                    g.da.iter().map(|x| x * x).sum::<f32>()
-                        + g.db.iter().map(|x| x * x).sum::<f32>()
-                })
-            };
-            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
-        }).sum::<f32>().sqrt();
-        assert!(grad_norm > 0.0, "LoRA gradients must be non-zero, got {grad_norm}");
+        let grad_norm: f32 = bwd
+            .lora_grads
+            .layers
+            .iter()
+            .map(|lg| {
+                let adapter_ss = |a: &Option<crate::agent::ane_lora::LoraAdapterGrads>| -> f32 {
+                    a.as_ref().map_or(0.0, |g| {
+                        g.da.iter().map(|x| x * x).sum::<f32>()
+                            + g.db.iter().map(|x| x * x).sum::<f32>()
+                    })
+                };
+                adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
+            })
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            grad_norm > 0.0,
+            "LoRA gradients must be non-zero, got {grad_norm}"
+        );
         assert!(grad_norm.is_finite(), "gradient norm must be finite");
 
         // Verify: Adam update produces changed weights (check A matrix, not B which starts at 0)
         let wo = lora.layers[0].wo.as_ref().unwrap();
         let w_before: f32 = wo.a.iter().map(|x| x * x).sum::<f32>();
-        lora_adam_update(&mut lora, &bwd.lora_grads, &mut adam, 1, 5e-4, 0.9, 0.999, 1e-8, 0.01);
+        lora_adam_update(
+            &mut lora,
+            &bwd.lora_grads,
+            &mut adam,
+            1,
+            5e-4,
+            0.9,
+            0.999,
+            1e-8,
+            0.01,
+        );
         let wo = lora.layers[0].wo.as_ref().unwrap();
         let w_after: f32 = wo.a.iter().map(|x| x * x).sum::<f32>();
         assert!(
@@ -4580,7 +4845,10 @@ mod tests {
             "weights must change after Adam update"
         );
 
-        eprintln!("PASS: CPU fwd→bwd baseline, loss={:.4}, grad_norm={grad_norm:.6}", fwd.base.loss);
+        eprintln!(
+            "PASS: CPU fwd→bwd baseline, loss={:.4}, grad_norm={grad_norm:.6}",
+            fwd.base.loss
+        );
     }
 
     /// RED TEST 2: MLX forward produces a ForwardResultWithLora that the CPU
@@ -4624,13 +4892,11 @@ mod tests {
         let targets: Vec<u32> = (101..105).collect();
 
         // CPU forward — reference
-        let fwd_cpu = ane_forward::forward_cpu_generic(
-            &model, Some(&lora), &tokens, &targets,
-        );
+        let fwd_cpu = ane_forward::forward_cpu_generic(&model, Some(&lora), &tokens, &targets);
 
         // MLX forward — the function under test (split-silicon: GPU forward)
-        let mlx_cfg = crate::agent::mlx_lora::ModelConfig::from_config_json(&dir)
-            .expect("load MLX config");
+        let mlx_cfg =
+            crate::agent::mlx_lora::ModelConfig::from_config_json(&dir).expect("load MLX config");
         let mlx_lora_cfg = crate::agent::mlx_lora::LoraConfig::default();
         let mlx_model = crate::agent::mlx_lora::MlxLoraModel::load(&dir, &mlx_cfg, &mlx_lora_cfg)
             .expect("load MLX model");
@@ -4654,30 +4920,38 @@ mod tests {
         );
 
         // Backward with MLX-produced activations must yield valid gradients
-        let bwd = ane_backward::backward_lora_cpu_generic(
-            &model, &fwd_mlx, &lora, &tokens, 0.0, 1.0,
-        );
+        let bwd =
+            ane_backward::backward_lora_cpu_generic(&model, &fwd_mlx, &lora, &tokens, 0.0, 1.0);
 
         let adapter_ss = |a: &Option<crate::agent::ane_lora::LoraAdapterGrads>| -> f32 {
             a.as_ref().map_or(0.0, |g| {
-                g.da.iter().map(|x| x * x).sum::<f32>()
-                    + g.db.iter().map(|x| x * x).sum::<f32>()
+                g.da.iter().map(|x| x * x).sum::<f32>() + g.db.iter().map(|x| x * x).sum::<f32>()
             })
         };
-        let grad_norm: f32 = bwd.lora_grads.layers.iter().map(|lg| {
-            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
-        }).sum::<f32>().sqrt();
+        let grad_norm: f32 = bwd
+            .lora_grads
+            .layers
+            .iter()
+            .map(|lg| adapter_ss(&lg.wo) + adapter_ss(&lg.w2))
+            .sum::<f32>()
+            .sqrt();
 
         assert!(grad_norm > 0.0, "split-silicon gradients must be non-zero");
-        assert!(grad_norm.is_finite(), "split-silicon gradient norm must be finite");
+        assert!(
+            grad_norm.is_finite(),
+            "split-silicon gradient norm must be finite"
+        );
 
         // Reference backward with CPU activations
-        let bwd_ref = ane_backward::backward_lora_cpu_generic(
-            &model, &fwd_cpu, &lora, &tokens, 0.0, 1.0,
-        );
-        let ref_norm: f32 = bwd_ref.lora_grads.layers.iter().map(|lg| {
-            adapter_ss(&lg.wo) + adapter_ss(&lg.w2)
-        }).sum::<f32>().sqrt();
+        let bwd_ref =
+            ane_backward::backward_lora_cpu_generic(&model, &fwd_cpu, &lora, &tokens, 0.0, 1.0);
+        let ref_norm: f32 = bwd_ref
+            .lora_grads
+            .layers
+            .iter()
+            .map(|lg| adapter_ss(&lg.wo) + adapter_ss(&lg.w2))
+            .sum::<f32>()
+            .sqrt();
 
         // Gradient norms should be in the same ballpark (allow 20% for float divergence)
         let norm_ratio = grad_norm / ref_norm;
@@ -4728,8 +5002,8 @@ mod tests {
         );
         let mut adam = LoraModelAdam::zeros(&lora);
 
-        let mlx_cfg = crate::agent::mlx_lora::ModelConfig::from_config_json(&dir)
-            .expect("load MLX config");
+        let mlx_cfg =
+            crate::agent::mlx_lora::ModelConfig::from_config_json(&dir).expect("load MLX config");
         let mlx_lora_cfg = crate::agent::mlx_lora::LoraConfig::default();
         let mlx_model = crate::agent::mlx_lora::MlxLoraModel::load(&dir, &mlx_cfg, &mlx_lora_cfg)
             .expect("load MLX model");
@@ -4748,13 +5022,19 @@ mod tests {
                 &mil_cfg,
             );
 
-            let bwd = ane_backward::backward_lora_cpu_generic(
-                &model, &fwd, &lora, &tokens, 0.0, 1.0,
-            );
+            let bwd =
+                ane_backward::backward_lora_cpu_generic(&model, &fwd, &lora, &tokens, 0.0, 1.0);
 
             lora_adam_update(
-                &mut lora, &bwd.lora_grads, &mut adam,
-                step + 1, 5e-4, 0.9, 0.999, 1e-8, 0.01,
+                &mut lora,
+                &bwd.lora_grads,
+                &mut adam,
+                step + 1,
+                5e-4,
+                0.9,
+                0.999,
+                1e-8,
+                0.01,
             );
 
             eprintln!("  step {step}: loss={:.4}", fwd.base.loss);
@@ -4764,10 +5044,596 @@ mod tests {
         assert!(
             losses[2] < losses[0],
             "loss must decrease: step0={:.4} → step2={:.4}",
-            losses[0], losses[2],
+            losses[0],
+            losses[2],
         );
 
-        eprintln!("PASS: split-silicon loss decreased {:.4} → {:.4}", losses[0], losses[2]);
+        eprintln!(
+            "PASS: split-silicon loss decreased {:.4} → {:.4}",
+            losses[0], losses[2]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent ANE training + MLX inference benchmark
+    // -----------------------------------------------------------------------
+
+    /// Run concurrent ANE training and MLX inference, measuring throughput
+    /// degradation vs solo baselines.
+    ///
+    /// Returns JSON metrics: solo/concurrent training ms, solo/concurrent
+    /// inference ms/tok, degradation percentages.
+    #[cfg(feature = "mlx")]
+    fn bench_concurrent_ane_mlx(
+        model_dir: &std::path::Path,
+        label: &str,
+        train_epochs: usize,
+        inference_tokens: usize,
+    ) -> serde_json::Value {
+        use crate::agent::mlx_lora::{LoraConfig as MlxLoraConfig, ModelConfig};
+        use crate::agent::mlx_server::{
+            apply_chat_template_nothink, ChatMessage, ModelRequest, TrainState,
+        };
+
+        let mc = ModelConfig::from_config_json(model_dir).expect("model config");
+        let is_moe = mc.is_moe;
+
+        // -- Tokenize a training sample --
+        let tokenizer =
+            crate::agent::mlx_lora::MlxTokenizer::load(model_dir).expect("tokenizer");
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "What is the capital of France?".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "The capital of France is Paris.".into(),
+            },
+        ];
+        let prompt_text = apply_chat_template_nothink(&messages);
+        let all_tokens: Vec<i32> = tokenizer.encode(&prompt_text).expect("encode");
+        let n = all_tokens.len();
+        let tokens = all_tokens[..n - 1].to_vec();
+        let targets = all_tokens[1..].to_vec();
+
+        // -- Build ANE training config --
+        let mil_cfg = mil_config_from_json(model_dir, 4);
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+        let cfg = AneTrainingConfig {
+            model_dir: model_dir.to_path_buf(),
+            mil_config: mil_cfg,
+            lr: 5e-4,
+            epochs: train_epochs,
+            accum_steps: 1,
+            loss_scale: 1.0,
+            softcap: 0.0,
+            residual_scale: 0.0,
+            lr_scale_attn: 1.0,
+            lr_scale_ffn: 1.0,
+            optimizer: AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            linear_attn_indices: vec![],
+            kv_dim,
+        };
+        let train_samples = vec![
+            (tokens.clone(), targets.clone(), 1.0),
+            (tokens.clone(), targets.clone(), 1.0),
+        ];
+
+        // -- Build MLX inference worker --
+        let lora_cfg = MlxLoraConfig::default();
+        let train_state = std::sync::Arc::new(TrainState::new());
+        let (mlx_tx, mlx_rx) = std::sync::mpsc::sync_channel::<ModelRequest>(4);
+
+        let worker_dir = model_dir.to_path_buf();
+        let worker_cfg = mc.clone();
+        let worker_lora = lora_cfg.clone();
+        let worker_ts = train_state.clone();
+        let _mlx_thread = std::thread::Builder::new()
+            .name("mlx-bench-worker".into())
+            .spawn(move || {
+                crate::agent::mlx_server::run_model_worker(
+                    worker_dir,
+                    worker_cfg,
+                    worker_lora,
+                    worker_ts,
+                    mlx_rx,
+                    None,
+                );
+            })
+            .expect("spawn mlx worker");
+
+        // Inference helper: send Chat request, measure round-trip
+        let do_inference = |tx: &std::sync::mpsc::SyncSender<ModelRequest>,
+                            max_tokens: usize|
+         -> Result<(f64, usize, usize), String> {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let inference_prompt = apply_chat_template_nothink(&[ChatMessage {
+                role: "user".into(),
+                content: "Explain quantum computing in simple terms.".into(),
+            }]);
+            let t = std::time::Instant::now();
+            tx.send(ModelRequest::Chat {
+                prompt: inference_prompt,
+                max_tokens,
+                temperature: 0.0,
+                reply: reply_tx,
+            })
+            .map_err(|e| format!("send: {e}"))?;
+            let result = reply_rx
+                .blocking_recv()
+                .map_err(|e| format!("recv: {e}"))?;
+            let elapsed_ms = t.elapsed().as_millis() as f64;
+            let (_text, prompt_len, gen_len) = result?;
+            Ok((elapsed_ms, prompt_len, gen_len))
+        };
+
+        // ===== PHASE 1: Solo training baseline =====
+        eprintln!("[{label}] Phase 1: solo ANE training ({train_epochs} epochs)...");
+        let t0 = std::time::Instant::now();
+        let ok = spawn_ane_training(cfg.clone(), train_samples.clone(), None)
+            .join()
+            .expect("solo training should not panic");
+        let solo_train_ms = t0.elapsed().as_millis() as f64;
+        assert!(ok, "[{label}] solo training must succeed");
+        eprintln!("[{label}]   solo training: {solo_train_ms:.0}ms");
+
+        // ===== PHASE 2: Solo inference baseline =====
+        let (solo_inf_ms, solo_prompt_len, solo_gen_len) = if is_moe {
+            eprintln!("[{label}] Phase 2: SKIP solo inference (MoE — in-process model not loaded)");
+            (0.0, 0, 0)
+        } else {
+            eprintln!(
+                "[{label}] Phase 2: solo MLX inference ({inference_tokens} tokens)..."
+            );
+            match do_inference(&mlx_tx, inference_tokens) {
+                Ok(r) => {
+                    eprintln!(
+                        "[{label}]   solo inference: {:.0}ms ({} prompt, {} gen, {:.1}ms/tok)",
+                        r.0,
+                        r.1,
+                        r.2,
+                        r.0 / r.2.max(1) as f64
+                    );
+                    r
+                }
+                Err(e) => {
+                    eprintln!("[{label}]   solo inference failed: {e}");
+                    (0.0, 0, 0)
+                }
+            }
+        };
+
+        // ===== PHASE 3: Concurrent training + inference =====
+        eprintln!("[{label}] Phase 3: concurrent ANE training + MLX inference...");
+        let train_tx = mlx_tx.clone();
+        let concurrent_train_cfg = cfg.clone();
+        let concurrent_samples = train_samples.clone();
+
+        // Start training in background (no runtime_counters → no yield guard)
+        let t_concurrent = std::time::Instant::now();
+        let train_handle =
+            spawn_ane_training(concurrent_train_cfg, concurrent_samples, None);
+
+        // Run inference while training is running
+        let concurrent_inf = if is_moe {
+            eprintln!("[{label}]   SKIP concurrent inference (MoE)");
+            Ok((0.0, 0usize, 0usize))
+        } else {
+            do_inference(&mlx_tx, inference_tokens)
+        };
+
+        // Wait for training to finish
+        let train_ok = train_handle.join().expect("concurrent training should not panic");
+        let concurrent_total_ms = t_concurrent.elapsed().as_millis() as f64;
+        assert!(train_ok, "[{label}] concurrent training must succeed");
+
+        let (concurrent_inf_ms, _conc_prompt, concurrent_gen_len) =
+            concurrent_inf.unwrap_or_else(|e| {
+                eprintln!("[{label}]   concurrent inference failed: {e}");
+                (0.0, 0, 0)
+            });
+
+        // ===== PHASE 4: Second solo training (warm cache) =====
+        eprintln!("[{label}] Phase 4: warm solo ANE training...");
+        let t1 = std::time::Instant::now();
+        let ok2 = spawn_ane_training(cfg, train_samples, None)
+            .join()
+            .expect("warm training should not panic");
+        let warm_train_ms = t1.elapsed().as_millis() as f64;
+        assert!(ok2, "[{label}] warm training must succeed");
+        eprintln!("[{label}]   warm training: {warm_train_ms:.0}ms");
+
+        // ===== Results =====
+        let solo_ms_per_tok = if solo_gen_len > 0 {
+            solo_inf_ms / solo_gen_len as f64
+        } else {
+            0.0
+        };
+        let concurrent_ms_per_tok = if concurrent_gen_len > 0 {
+            concurrent_inf_ms / concurrent_gen_len as f64
+        } else {
+            0.0
+        };
+        let inf_degradation_pct = if solo_ms_per_tok > 0.0 {
+            ((concurrent_ms_per_tok - solo_ms_per_tok) / solo_ms_per_tok) * 100.0
+        } else {
+            0.0
+        };
+        // Compare concurrent training time against warm (fair comparison —
+        // both have cached kernels after the first run).
+        let train_degradation_pct = if warm_train_ms > 0.0 {
+            ((concurrent_total_ms - warm_train_ms) / warm_train_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        let metrics = serde_json::json!({
+            "model": label,
+            "is_moe": is_moe,
+            "solo_train_cold_ms": solo_train_ms,
+            "solo_train_warm_ms": warm_train_ms,
+            "solo_inference_ms": solo_inf_ms,
+            "solo_inference_tokens": solo_gen_len,
+            "solo_ms_per_tok": format!("{solo_ms_per_tok:.1}"),
+            "concurrent_train_ms": concurrent_total_ms,
+            "concurrent_inference_ms": concurrent_inf_ms,
+            "concurrent_inference_tokens": concurrent_gen_len,
+            "concurrent_ms_per_tok": format!("{concurrent_ms_per_tok:.1}"),
+            "inference_degradation_pct": format!("{inf_degradation_pct:+.1}"),
+            "training_degradation_pct": format!("{train_degradation_pct:+.1}"),
+        });
+        eprintln!("\n[{label}] RESULTS: {}\n", serde_json::to_string_pretty(&metrics).unwrap());
+
+        // Drop mlx_tx to shut down worker
+        drop(mlx_tx);
+
+        metrics
+    }
+
+    /// Concurrent ANE training + MLX inference: Qwen3.5-0.8B
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "hardware benchmark; run with --features ane,mlx --release"]
+    fn bench_concurrent_0_8b() {
+        if skip_if_no_qwen3_5() {
+            eprintln!("SKIP: Qwen3.5-0.8B not found");
+            return;
+        }
+        let metrics = bench_concurrent_ane_mlx(&qwen3_5_dir(), "0.8B", 5, 32);
+        let inf_deg: f64 = metrics["inference_degradation_pct"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            inf_deg < 50.0,
+            "inference degradation {inf_deg:.1}% exceeds 50% threshold"
+        );
+    }
+
+    /// Concurrent ANE training + MLX inference: Qwen3.5-2B
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "hardware benchmark; run with --features ane,mlx --release"]
+    fn bench_concurrent_2b() {
+        let dir = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-2B not found");
+            return;
+        }
+        let metrics = bench_concurrent_ane_mlx(&dir, "2B", 3, 32);
+        let inf_deg: f64 = metrics["inference_degradation_pct"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            inf_deg < 80.0,
+            "inference degradation {inf_deg:.1}% exceeds 80% threshold"
+        );
+    }
+
+    /// Concurrent ANE training + oMLX inference: Qwen3.5-35B-A3B-3bit
+    ///
+    /// Uses REAL training data from experience.db and oMLX HTTP inference.
+    /// Runs four phases:
+    ///   A) Solo ANE training (no yield guard)
+    ///   B) Solo oMLX inference (HTTP /v1/chat/completions)
+    ///   C) Concurrent — no yield guard (hypothesis: both run at full speed)
+    ///   D) Concurrent — WITH yield guard (control: training blocks during inference)
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "hardware benchmark; requires oMLX + 35B model + experience.db"]
+    fn bench_concurrent_35b_omlx_real_traces() {
+        let dir = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-3bit not found");
+            return;
+        }
+
+        // -- Check oMLX is online --
+        let omlx_base = "http://127.0.0.1:8080/v1";
+        let omlx_key = "omlx";
+        let omlx_model = "Qwen3.5-35B-A3B-3bit";
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("http client");
+        let models_resp = client
+            .get(format!("{omlx_base}/models"))
+            .bearer_auth(omlx_key)
+            .send();
+        if models_resp.is_err() {
+            eprintln!("SKIP: oMLX not responding at {omlx_base}");
+            return;
+        }
+        let models_body: serde_json::Value =
+            models_resp.unwrap().json().unwrap_or_default();
+        let has_model = models_body["data"]
+            .as_array()
+            .map_or(false, |arr| {
+                arr.iter().any(|m| {
+                    m["id"].as_str().map_or(false, |id| id.contains("35B-A3B-3bit"))
+                })
+            });
+        if !has_model {
+            eprintln!("SKIP: oMLX does not have {omlx_model} loaded");
+            return;
+        }
+        eprintln!("[35B-3bit] oMLX online, model available");
+
+        // -- Load REAL training data from experience.db --
+        let db_path = dirs::home_dir()
+            .unwrap()
+            .join(".nanobot/experience.db");
+        if !db_path.exists() {
+            eprintln!("SKIP: experience.db not found");
+            return;
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open experience.db");
+        let mut stmt = conn
+            .prepare(
+                "SELECT prompt, tool_trace, response, quality \
+                 FROM experiences WHERE success = 1 AND quality > 0.4 \
+                 ORDER BY quality DESC, surprise DESC LIMIT 6",
+            )
+            .expect("prepare query");
+        let exps: Vec<(String, String, String, f64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        if exps.is_empty() {
+            eprintln!("SKIP: no suitable experiences in experience.db");
+            return;
+        }
+        eprintln!("[35B-3bit] loaded {} real experiences from experience.db", exps.len());
+
+        // -- Tokenize real experiences into training samples --
+        let tokenizer =
+            crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let mut samples: Vec<(Vec<i32>, Vec<i32>, f32)> = Vec::new();
+        for (prompt, trace, response, quality) in &exps {
+            use crate::agent::mlx_server::ChatMessage;
+            let rich = serde_json::from_str::<Vec<serde_json::Value>>(trace)
+                .ok()
+                .filter(|msgs| msgs.first().map_or(false, |m| m.get("role").is_some()));
+            let pair = if let Some(messages) = rich {
+                crate::agent::mlx_server::tokenize_rich_conversation(&tokenizer, &messages)
+            } else {
+                let messages = vec![
+                    ChatMessage { role: "user".into(), content: prompt.clone() },
+                    ChatMessage { role: "assistant".into(), content: response.clone() },
+                ];
+                crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages)
+            };
+            if let Ok(pair) = pair {
+                samples.push((pair.0, pair.1, *quality as f32));
+            }
+        }
+        eprintln!(
+            "[35B-3bit] tokenized {} samples, token lengths: {:?}",
+            samples.len(),
+            samples.iter().map(|(t, _, _)| t.len()).collect::<Vec<_>>()
+        );
+
+        // -- Build ANE training config --
+        let mil_cfg = mil_config_from_json(&dir, 4);
+        let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
+        let train_cfg = AneTrainingConfig {
+            model_dir: dir.to_path_buf(),
+            mil_config: mil_cfg,
+            lr: 5e-4,
+            epochs: 2,
+            accum_steps: 1,
+            loss_scale: 1.0,
+            softcap: 0.0,
+            residual_scale: 0.0,
+            lr_scale_attn: 1.0,
+            lr_scale_ffn: 1.0,
+            optimizer: AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            linear_attn_indices: vec![],
+            kv_dim,
+        };
+
+        // -- oMLX inference helper --
+        let do_omlx_inference = |label: &str| -> (f64, usize) {
+            let body = serde_json::json!({
+                "model": omlx_model,
+                "messages": [
+                    {"role": "user", "content": "Explain in 2 sentences what a transformer model is and why attention matters."}
+                ],
+                "max_tokens": 64,
+                "temperature": 0.0,
+            });
+            let t = std::time::Instant::now();
+            let resp = client
+                .post(format!("{omlx_base}/chat/completions"))
+                .bearer_auth(omlx_key)
+                .json(&body)
+                .send();
+            let elapsed_ms = t.elapsed().as_millis() as f64;
+            match resp {
+                Ok(r) => {
+                    let json: serde_json::Value = r.json().unwrap_or_default();
+                    let gen_tokens = json["usage"]["completion_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as usize;
+                    let content = json["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("");
+                    eprintln!(
+                        "[35B-3bit]   {label}: {elapsed_ms:.0}ms, {gen_tokens} tokens, \
+                         {:.1}ms/tok, preview: {:?}",
+                        elapsed_ms / gen_tokens.max(1) as f64,
+                        &content[..content.len().min(80)]
+                    );
+                    (elapsed_ms, gen_tokens)
+                }
+                Err(e) => {
+                    eprintln!("[35B-3bit]   {label}: FAILED: {e}");
+                    (0.0, 0)
+                }
+            }
+        };
+
+        // ===== PHASE A: Solo ANE training (no yield guard) =====
+        eprintln!("\n[35B-3bit] PHASE A: Solo ANE training (real traces, no yield guard)...");
+        let t0 = std::time::Instant::now();
+        let ok_a = spawn_ane_training(train_cfg.clone(), samples.clone(), None)
+            .join()
+            .expect("Phase A: training panicked");
+        let solo_train_ms = t0.elapsed().as_millis() as f64;
+        assert!(ok_a, "Phase A: training must succeed");
+        eprintln!("[35B-3bit]   solo training: {solo_train_ms:.0}ms");
+
+        // ===== PHASE B: Solo oMLX inference =====
+        eprintln!("\n[35B-3bit] PHASE B: Solo oMLX inference (warmup + measured)...");
+        let _ = do_omlx_inference("warmup");
+        let (solo_inf_ms, solo_gen_tokens) = do_omlx_inference("solo");
+
+        // ===== PHASE C: Concurrent — NO yield guard =====
+        eprintln!("\n[35B-3bit] PHASE C: Concurrent (no yield guard)...");
+        let concurrent_samples = samples.clone();
+        let concurrent_cfg = train_cfg.clone();
+        let t_c = std::time::Instant::now();
+        let train_handle_c =
+            spawn_ane_training(concurrent_cfg, concurrent_samples, None);
+        // Inference while training runs
+        let (conc_inf_ms, conc_gen_tokens) = do_omlx_inference("concurrent-no-guard");
+        let train_ok_c = train_handle_c.join().expect("Phase C: training panicked");
+        let conc_train_ms = t_c.elapsed().as_millis() as f64;
+        assert!(train_ok_c, "Phase C: concurrent training must succeed");
+        eprintln!("[35B-3bit]   concurrent training: {conc_train_ms:.0}ms");
+
+        // ===== PHASE D: Concurrent — WITH yield guard =====
+        eprintln!("\n[35B-3bit] PHASE D: Concurrent (WITH yield guard)...");
+        let trainer = PersistentAneTrainer::new();
+        let counters = std::sync::Arc::new(
+            crate::agent::agent_core::RuntimeCounters::new(32_000),
+        );
+        // Mark inference as active BEFORE starting training
+        counters
+            .inference_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let t_d = std::time::Instant::now();
+        let guarded_samples = samples.clone();
+        let guarded_cfg = train_cfg.clone();
+        let guarded_counters = Some(counters.clone());
+        let train_handle_d = trainer.spawn_training_with_progress(
+            guarded_cfg,
+            guarded_samples,
+            None,
+            guarded_counters,
+        );
+        // Inference while training is blocked by yield guard
+        let (guard_inf_ms, guard_gen_tokens) = do_omlx_inference("concurrent-with-guard");
+        // Release the yield guard so training can complete
+        counters
+            .inference_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let train_ok_d = train_handle_d.join().expect("Phase D: training panicked");
+        let guard_train_ms = t_d.elapsed().as_millis() as f64;
+        assert!(train_ok_d, "Phase D: guarded training must succeed");
+        eprintln!("[35B-3bit]   guarded training: {guard_train_ms:.0}ms");
+
+        // ===== RESULTS =====
+        let solo_ms_tok = if solo_gen_tokens > 0 {
+            solo_inf_ms / solo_gen_tokens as f64
+        } else { 0.0 };
+        let conc_ms_tok = if conc_gen_tokens > 0 {
+            conc_inf_ms / conc_gen_tokens as f64
+        } else { 0.0 };
+        let guard_ms_tok = if guard_gen_tokens > 0 {
+            guard_inf_ms / guard_gen_tokens as f64
+        } else { 0.0 };
+        let inf_deg_no_guard = if solo_ms_tok > 0.0 {
+            ((conc_ms_tok - solo_ms_tok) / solo_ms_tok) * 100.0
+        } else { 0.0 };
+        let inf_deg_with_guard = if solo_ms_tok > 0.0 {
+            ((guard_ms_tok - solo_ms_tok) / solo_ms_tok) * 100.0
+        } else { 0.0 };
+        let train_deg_no_guard = if solo_train_ms > 0.0 {
+            ((conc_train_ms - solo_train_ms) / solo_train_ms) * 100.0
+        } else { 0.0 };
+        // Guarded training includes the blocked time waiting for inference
+        let train_overhead_guard_ms = guard_train_ms - solo_train_ms;
+
+        let metrics = serde_json::json!({
+            "model": "Qwen3.5-35B-A3B-3bit",
+            "real_experiences": exps.len(),
+            "training_samples": samples.len(),
+            "phase_a_solo_train_ms": solo_train_ms,
+            "phase_b_solo_inference_ms": solo_inf_ms,
+            "phase_b_solo_ms_per_tok": format!("{solo_ms_tok:.1}"),
+            "phase_b_solo_tokens": solo_gen_tokens,
+            "phase_c_no_guard_train_ms": conc_train_ms,
+            "phase_c_no_guard_inference_ms": conc_inf_ms,
+            "phase_c_no_guard_ms_per_tok": format!("{conc_ms_tok:.1}"),
+            "phase_c_no_guard_tokens": conc_gen_tokens,
+            "phase_c_inference_degradation_pct": format!("{inf_deg_no_guard:+.1}"),
+            "phase_c_training_degradation_pct": format!("{train_deg_no_guard:+.1}"),
+            "phase_d_with_guard_train_ms": guard_train_ms,
+            "phase_d_with_guard_inference_ms": guard_inf_ms,
+            "phase_d_with_guard_ms_per_tok": format!("{guard_ms_tok:.1}"),
+            "phase_d_with_guard_tokens": guard_gen_tokens,
+            "phase_d_inference_degradation_pct": format!("{inf_deg_with_guard:+.1}"),
+            "phase_d_training_overhead_ms": train_overhead_guard_ms,
+            "verdict": if inf_deg_no_guard.abs() < 20.0 && train_deg_no_guard.abs() < 20.0 {
+                "CONCURRENT OK — yield guard is unnecessary"
+            } else {
+                "CONCURRENT DEGRADES — yield guard may be warranted"
+            },
+        });
+        eprintln!(
+            "\n[35B-3bit] FINAL RESULTS:\n{}",
+            serde_json::to_string_pretty(&metrics).unwrap()
+        );
+
+        // The key assertion: no-guard inference should not degrade more than 30%
+        assert!(
+            inf_deg_no_guard < 30.0,
+            "inference degradation without guard ({inf_deg_no_guard:+.1}%) exceeds 30%"
+        );
     }
 
     /// RED TEST 4: Training without yield guard — verify step completes and
@@ -4813,7 +5679,9 @@ mod tests {
 
         // Create RuntimeCounters with inference_active permanently ON
         let counters = std::sync::Arc::new(crate::agent::agent_core::RuntimeCounters::new(32000));
-        counters.inference_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .inference_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let trainer = PersistentAneTrainer::new();
 
@@ -4821,7 +5689,7 @@ mod tests {
         let handle = trainer.spawn_training_with_progress(
             cfg,
             samples,
-            None,  // no mlx_tx
+            None, // no mlx_tx
             Some(counters),
         );
 
@@ -4831,7 +5699,10 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert!(ok, "training must succeed");
-        eprintln!("PASS: training completed in {:.1}s with inference_active=true", elapsed.as_secs_f64());
+        eprintln!(
+            "PASS: training completed in {:.1}s with inference_active=true",
+            elapsed.as_secs_f64()
+        );
 
         // With the yield guard active at 200ms/poll, training would hang
         // forever because inference_active is permanently true. Without the
