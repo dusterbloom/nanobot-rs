@@ -2243,6 +2243,11 @@ pub struct PrePackedWeights {
     rmsnorm_bwd_ffn_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer fused FFN backward kernels: W2^T + SiLU bwd + W13^T in 1 dispatch.
     fused_ffn_bwd_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Shared fused FFN backward kernel with per-layer weight hotswap.
+    /// Uses 1 ANE program slot for all layers (vs 40 slots for per-layer).
+    fused_ffn_bwd_shared: Option<super::ane_bridge::AneKernel>,
+    /// Pre-built weight blobs for FFN backward hotswap (per-layer, fp16).
+    fused_ffn_bwd_weight_blobs: Option<Vec<[Vec<u8>; 3]>>,
     /// Per-layer fused GDN projection kernels: QKV+A+B+Z in 1 dispatch.
     fused_gdn_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer GDN O projection kernels with baked weights.
@@ -2274,6 +2279,8 @@ impl PrePackedWeights {
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
             fused_ffn_bwd_kernels: None,
+            fused_ffn_bwd_shared: None,
+            fused_ffn_bwd_weight_blobs: None,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2380,6 +2387,8 @@ impl PrePackedWeights {
             rmsnorm_bwd_att_kernels: None,
             rmsnorm_bwd_ffn_kernels: None,
             fused_ffn_bwd_kernels: None,
+            fused_ffn_bwd_shared: None,
+            fused_ffn_bwd_weight_blobs: None,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2475,6 +2484,8 @@ impl PrePackedWeights {
         self.rmsnorm_bwd_att_kernels = None;
         self.rmsnorm_bwd_ffn_kernels = None;
         self.fused_ffn_bwd_kernels = None;
+        self.fused_ffn_bwd_shared = None;
+        self.fused_ffn_bwd_weight_blobs = None;
         self.fused_gdn_proj_kernels = None;
         self.gdn_o_proj_kernels = None;
     }
@@ -3137,6 +3148,106 @@ impl PrePackedWeights {
         Ok(())
     }
 
+    /// Prime shared fused FFN backward kernel (1 ANE program slot for all layers).
+    /// Uses `reload_weights()` to hotswap per-layer weights before each eval.
+    /// Only uses 1 ANE program slot instead of N (critical for 119-slot budget).
+    pub fn prime_fused_ffn_bwd_shared<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let result = super::ane_mil::gen_fused_ffn_bwd(cfg);
+        let t0 = std::time::Instant::now();
+
+        // Pre-build weight blobs for all layers
+        let mut all_blobs = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            let w2t = transpose_weight(&lw.w2, dim, hidden);
+            let w1t = transpose_weight(&lw.w1, hidden, dim);
+            let w3t = transpose_weight(&lw.w3, hidden, dim);
+            all_blobs.push([
+                build_fp16_blob(&w2t),
+                build_fp16_blob(&w1t),
+                build_fp16_blob(&w3t),
+            ]);
+        }
+
+        // Compile ONE kernel with layer 0's weights
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let datas: Vec<&[u8]> = vec![&all_blobs[0][0], &all_blobs[0][1], &all_blobs[0][2]];
+        let kernel = super::ane_bridge::AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &names,
+            &datas,
+            &[result.input_bytes],
+            &[result.output_bytes],
+        )
+        .map_err(|e| format!("fused_ffn_bwd shared compile: {e}"))?;
+
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "primed shared FFN bwd kernel (1 slot, {} layers hotswap) in {:.1}ms",
+            n_layers,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        self.fused_ffn_bwd_shared = Some(kernel);
+        self.fused_ffn_bwd_weight_blobs = Some(all_blobs);
+        Ok(())
+    }
+
+    /// Evaluate fused FFN backward using shared kernel with weight hotswap.
+    pub fn eval_fused_ffn_bwd_hotswap(
+        &self,
+        layer: usize,
+        dx_ffn: &[f32],
+        h1: &[f32],
+        h3: &[f32],
+        dim: usize,
+        hidden: usize,
+        seq: usize,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
+        let kernel = self.fused_ffn_bwd_shared.as_ref()?;
+        let blobs = self.fused_ffn_bwd_weight_blobs.as_ref()?;
+        let layer_blobs = &blobs[layer];
+
+        // Hotswap weights for this layer
+        let weight_datas: Vec<&[u8]> = vec![&layer_blobs[0], &layer_blobs[1], &layer_blobs[2]];
+        if let Err(e) = kernel.reload_weights(&weight_datas) {
+            return Some(Err(format!("fused_ffn_bwd hotswap layer {layer}: {e}")));
+        }
+
+        // Pack input: dx_ffn | h1 | h3
+        let mut input = Vec::with_capacity(dx_ffn.len() + h1.len() + h3.len());
+        input.extend_from_slice(dx_ffn);
+        input.extend_from_slice(h1);
+        input.extend_from_slice(h3);
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("fused_ffn_bwd hotswap eval layer {layer}: {e}")));
+        }
+
+        let out_ch = dim + hidden;
+        let mut buf = vec![0u8; out_ch * seq * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let dx = out[..dim * seq].to_vec();
+        let dsilu = out[dim * seq..].to_vec();
+        Some(Ok((dx, dsilu)))
+    }
+
     /// Evaluate fused FFN backward on per-layer kernel.
     ///
     /// Input: dx_ffn[dim*seq], h1[hidden*seq], h3[hidden*seq]
@@ -3244,19 +3355,10 @@ impl PrePackedWeights {
                 }
             }
 
-            // O projection
-            let wo_blob = build_fp16_blob(&wo_t);
-            let o_names: Vec<&str> = o_result.weight_names.iter().copied().collect();
-            match super::ane_bridge::AneKernel::compile_multi_weights(
-                &o_result.mil_text, &o_names, &[&wo_blob],
-                &[o_result.input_bytes], &[o_result.output_bytes],
-            ) {
-                Ok(k) => o_kernels.push(Some(k)),
-                Err(_) => {
-                    // Hit ANE compile limit — push None, caller falls back to DynMatmul
-                    o_kernels.push(None);
-                }
-            }
+            // Skip per-layer O projection to save 30 compile/load slots.
+            // The existing DynMatmul O projection path is only ~5ms/layer.
+            // Saving 30 slots for FFN bwd is more valuable (saves ~200ms total).
+            o_kernels.push(None);
         }
 
         let gdn_count = proj_kernels.iter().filter(|k| k.is_some()).count();

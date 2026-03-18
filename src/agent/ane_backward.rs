@@ -2602,9 +2602,10 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             });
 
             // Main thread: try fused FFN backward (1 dispatch) → fallback to W2^T (2 dispatches)
-            // Try fused first (immutable borrow)
+            // Try per-layer BLOBFILE first, then shared hotswap, then DynMatmul
             let fused_result = prepacked.as_ref().and_then(|pp| {
                 pp.eval_fused_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq)
+                    .or_else(|| pp.eval_fused_ffn_bwd_hotswap(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq))
             });
             let (dsilu, fused_dx_ffn) = match fused_result {
                 Some(Ok((dx, ds))) => (ds, Some(dx)),

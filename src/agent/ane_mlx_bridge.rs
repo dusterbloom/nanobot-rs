@@ -836,15 +836,26 @@ impl AneTrainerSession {
                 match pp.prime_fused_ffn_bwd_kernels(&ffn_cfg, &self.model) {
                     Ok(()) => {
                         tracing::info!(
-                            "ANE train: fused FFN bwd kernels primed for seq_len={}",
+                            "ANE train: fused FFN bwd per-layer primed for seq_len={}",
                             bucket_seq,
                         );
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "ANE train: fused FFN bwd priming failed for seq_len={}: {}",
-                            bucket_seq, e,
-                        );
+                    Err(_) => {
+                        // Fall back to shared hotswap (1 program slot)
+                        match pp.prime_fused_ffn_bwd_shared(&ffn_cfg, &self.model) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "ANE train: fused FFN bwd shared hotswap for seq_len={}",
+                                    bucket_seq,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "ANE train: fused FFN bwd priming failed for seq_len={}: {}",
+                                    bucket_seq, e,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -4181,12 +4192,30 @@ mod tests {
                 Err(e) => eprintln!("35B bench: GDN proj priming FAILED: {e}"),
             }
         }
-        // MHA attention kernels (10 layers × 2 = 20 compiles)
-        if bucket_fwd_k.fused_attn_gqa.is_some() {
-            let _ = pp.prime_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob);
+        // Budget: ~119 kernel loads per process. Allocate by ms saved per slot:
+        //   GDN proj: 60 slots → saves 2400ms (40ms/slot) — already primed above
+        //   FFN bwd:  40 slots → saves ~200ms (5ms/slot)
+        //   MHA fwd:  10 slots → saves ~400ms (40ms/slot)
+        // Total: 60+40+10+23 templates = 133. Over budget — some will fail gracefully.
+        eprintln!("35B bench: compile count after GDN+MHA = {}", crate::agent::ane_bridge::compile_count());
+        // FFN bwd: try per-layer first, fall back to shared hotswap (1 program slot)
+        match pp.prime_fused_ffn_bwd_kernels(&pp_cfg, &model) {
+            Ok(()) => eprintln!("35B bench: FFN bwd per-layer primed OK"),
+            Err(_) => {
+                match pp.prime_fused_ffn_bwd_shared(&pp_cfg, &model) {
+                    Ok(()) => eprintln!("35B bench: FFN bwd shared hotswap primed OK"),
+                    Err(e) => eprintln!("35B bench: FFN bwd FAILED: {e}"),
+                }
+            }
         }
-        // Skip rmsnorm/ffn_bwd/bwd_attn priming to stay under compile limit
-        // These fall back to CPU or shared kernels automatically
+        if bucket_fwd_k.fused_attn_gqa.is_some() {
+            match pp.prime_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob) {
+                Ok(()) => eprintln!("35B bench: MHA fwd attn primed OK"),
+                Err(e) => eprintln!("35B bench: MHA fwd attn FAILED: {e}"),
+            }
+        }
+        // RMSNorm fwd/bwd: 0.25ms per kernel — not worth compile slots
+        // They fall back to CPU (2ms total for 40 layers, negligible)
 
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
         eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);
