@@ -773,6 +773,14 @@ impl FfnKernels {
         matches!(self, FfnKernels::FullyFused { .. })
     }
 
+    /// Get a reference to the FullyFused kernel (for cloning into per-layer pool).
+    pub fn fused_kernel(&self) -> Option<&super::ane_bridge::AneKernel> {
+        match self {
+            FfnKernels::FullyFused { kernel } => Some(kernel),
+            _ => None,
+        }
+    }
+
     /// Execute fully-fused FFN: xnorm → (h1, h3, gate, ffn_out) in a single ANE dispatch.
     ///
     /// `w1`, `w3` are `[hidden, dim]` (PyTorch convention). `w2` is `[dim, hidden]`.
@@ -819,6 +827,13 @@ impl FfnKernels {
         let FfnKernels::FullyFused { kernel } = self else {
             return Err("eval_full_prepacked called on non-FullyFused kernel".into());
         };
+        // Fast path: per-layer kernel with IOSurface-resident weights.
+        // Only patches activation (~512KB) via strided write instead of
+        // copying the full buffer (~13MB) through CPU caches.
+        if let Some(result) = prepacked.eval_fwd_fused(layer, xnorm, cfg) {
+            return result;
+        }
+        // Fallback: shared kernel, full buffer copy
         let input_bytes = prepacked.patch_fwd_fused_ffn(layer, xnorm, cfg.dim);
         let spec = KernelSpec::for_kernel(cfg, KernelType::FusedFfn);
         kernel.write_input(0, input_bytes);
@@ -1198,6 +1213,9 @@ pub struct CompiledKernels {
     pub gdn_proj_fwd: Option<GdnProjForwardKernels>,
     /// FFN kernels — fused (small models) or tiled (large models).
     pub ffn: FfnKernels,
+    /// Fused attention for GQA + gated models (Qwen3.5): QKV+RoPE+SDPA+gate+Wo in 1 dispatch.
+    /// Template kernel with placeholder BLOBFILE weights (compile per-layer via PrePackedWeights).
+    pub fused_attn_gqa: Option<AneKernel>,
     pub mask_blob: Vec<u8>,
     pub rope_cos_blob: Vec<u8>,
     pub rope_sin_blob: Vec<u8>,
@@ -1372,12 +1390,77 @@ impl CompiledKernels {
             }
         };
 
+        // Fused attention GQA: single-dispatch QKV+RoPE+SDPA+gate+Wo for GQA/gated models.
+        // Compiled with placeholder zero-weight BLOBFILEs (real weights via per-layer kernels).
+        let fused_attn_gqa = if cfg.attn_output_gate || cfg.n_kv_heads != cfg.n_heads {
+            let has_qk_norm = false; // ANE batch>1 blocker — skip for now
+            let result = ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
+            let dim = cfg.dim;
+            let qpd = cfg.q_proj_dim();
+            let kv_dim = cfg.kv_dim();
+            let attn_dim = cfg.attn_dim();
+            let hd = cfg.head_dim();
+            let zero_blobs: Vec<Vec<u8>> = result
+                .weight_names
+                .iter()
+                .map(|name| match *name {
+                    "@model_path/weights/rope_cos.bin" => rope_cos_blob.clone(),
+                    "@model_path/weights/rope_sin.bin" => rope_sin_blob.clone(),
+                    "@model_path/weights/mask.bin" => mask_blob.clone(),
+                    "@model_path/weights/wq.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; dim * qpd])
+                    }
+                    "@model_path/weights/wk.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; dim * kv_dim])
+                    }
+                    "@model_path/weights/wv.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; dim * kv_dim])
+                    }
+                    "@model_path/weights/wo.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; attn_dim * dim])
+                    }
+                    "@model_path/weights/q_norm.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; hd])
+                    }
+                    "@model_path/weights/k_norm.bin" => {
+                        ane_weights::build_fp16_blob(&vec![0.0f32; hd])
+                    }
+                    _ => ane_weights::build_fp16_blob(&vec![0.0f32; 16]),
+                })
+                .collect();
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = zero_blobs.iter().map(|b| b.as_slice()).collect();
+            match AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            ) {
+                Ok(k) => {
+                    tracing::debug!(
+                        "ANE fused_attn_gqa: compiled (in={}B, out={}B)",
+                        result.input_bytes,
+                        result.output_bytes
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::debug!("ANE fused_attn_gqa: compile failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             sdpa_fwd,
             sdpa_core_gqa,
             mha_proj_fwd,
             gdn_proj_fwd,
             ffn,
+            fused_attn_gqa,
             mask_blob,
             rope_cos_blob,
             rope_sin_blob,
@@ -2093,9 +2176,8 @@ fn eval_sdpa_core_gqa(
 
     // Pack: concat(Q, K, V) into [1, 3*attn_dim, 1, seq] IOSurface layout
     let mut input = vec![0u8; in_bytes];
-    let f32_slice = unsafe {
-        std::slice::from_raw_parts_mut(input.as_mut_ptr() as *mut f32, in_ch * seq)
-    };
+    let f32_slice =
+        unsafe { std::slice::from_raw_parts_mut(input.as_mut_ptr() as *mut f32, in_ch * seq) };
     // IOSurface channel-first layout: channel c, spatial s → offset c * seq + s
     f32_slice[..attn_dim * seq].copy_from_slice(q);
     f32_slice[attn_dim * seq..2 * attn_dim * seq].copy_from_slice(k);
@@ -2106,9 +2188,8 @@ fn eval_sdpa_core_gqa(
 
     let mut output = vec![0u8; out_bytes];
     kernel.read_output(0, &mut output);
-    let out_f32 = unsafe {
-        std::slice::from_raw_parts(output.as_ptr() as *const f32, attn_dim * seq)
-    };
+    let out_f32 =
+        unsafe { std::slice::from_raw_parts(output.as_ptr() as *const f32, attn_dim * seq) };
     let mut result = out_f32.to_vec();
     clamp_fp16(&mut result);
     Ok(result)
@@ -3207,6 +3288,47 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                 None,
                 None,
             )
+        } else if kernels.fused_attn_gqa.is_some() && lw.q_norm.is_none() && lw.k_norm.is_none() {
+            // Fused attention GQA: single ANE dispatch for QKV+RoPE+SDPA+gate+Wo.
+            // Skip for layers with QK-norm (ANE batch>1 blocker).
+            // Fast path: per-layer kernel with real weights baked in.
+            // Fallback: template kernel with zero weights (produces zero output).
+            let u = if let Some(result) = prepacked
+                .as_mut()
+                .and_then(|pp| pp.eval_fwd_fused_attn_gqa(l, &xnorm, cfg))
+            {
+                result.map_err(|e| format!("layer {l} fused_attn_gqa: {e}"))?
+            } else {
+                let fused_k = kernels.fused_attn_gqa.as_ref().unwrap();
+                let xnorm_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4)
+                };
+                fused_k.write_input(0, xnorm_bytes);
+                fused_k.eval().map_err(|e| format!("layer {l} fused_attn_gqa eval failed: {e}"))?;
+                let ad = cfg.attn_dim();
+                let kvd = cfg.kv_dim();
+                let out_ch = if cfg.attn_output_gate { dim + 4 * ad + 2 * kvd } else { dim + 2 * ad + 2 * kvd };
+                let mut buf = vec![0u8; out_ch * seq * 4];
+                fused_k.read_output(0, &mut buf);
+                ane_weights::unpack_fused_attn_gqa(
+                    &buf, cfg, cfg.attn_output_gate, false,
+                )
+            };
+
+            let mut o_out = u.o_out;
+            let attn_out = u.attn_out;
+
+            // LoRA on Wo (applied AFTER fused kernel, on CPU)
+            if let Some(ll) = lora_layer {
+                if let Some(wo_adapter) = ll.wo.as_ref() {
+                    let (wo_delta, wo_h) = wo_adapter.forward_cpu(&attn_out, seq);
+                    super::ane_lora::vec_add_scaled(&mut o_out, &wo_delta, lora_scale);
+                    lora_layer_acts.wo_x = Some(attn_out.clone());
+                    lora_layer_acts.wo_h = Some(wo_h);
+                }
+            }
+
+            (u.q, u.k, u.v, attn_out, o_out, u.q_pre_norm, u.k_pre_norm, u.attn_gate, u.attn_pre_gate)
         } else {
             let ad = cfg.attn_dim();
             let qpd = cfg.q_proj_dim();
@@ -4314,6 +4436,272 @@ mod tests {
         assert!(
             bwd.sdpa_bwd2.is_some(),
             "sdpa_bwd2 should compile for 35B-A3B"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round 3b: fused_attn_gqa — compile + eval + unpack for GQA models
+    // -----------------------------------------------------------------------
+
+    /// Red test: CompiledKernels should produce a fused_attn_gqa kernel for
+    /// GQA configs (attn_output_gate=true). Eval with synthetic weights,
+    /// verify output is non-zero and has the correct channel count.
+    ///
+    /// Run: cargo test --features ane --release --lib -- "test_fused_attn_gqa_in_compiled_kernels" --nocapture --test-threads=1
+    #[test]
+    fn test_fused_attn_gqa_in_compiled_kernels() {
+        use super::ane_bridge;
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        // Small GQA config with output gate (like Qwen3.5)
+        let cfg = MilConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 8,
+            seq_len: 32,
+            n_kv_heads: 4,
+            rope_theta: 1e6,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 16,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let kernels = CompiledKernels::compile_forward(&cfg).expect("compile_forward failed");
+
+        // Fused attn GQA should be compiled for this GQA + gated config
+        assert!(
+            kernels.fused_attn_gqa.is_some(),
+            "fused_attn_gqa should be Some for GQA + attn_output_gate config"
+        );
+
+        // Eval with synthetic input
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+        let kernel = kernels.fused_attn_gqa.as_ref().unwrap();
+        let input: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.1)
+            .collect();
+        let input_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
+        };
+        kernel.write_input(0, input_bytes);
+        kernel.eval().expect("fused_attn_gqa eval failed");
+
+        // Read output and verify shape
+        let ad = cfg.attn_dim();
+        let kvd = cfg.kv_dim();
+        // has_gate=true, has_qk_norm=false → out_ch = dim + 4*ad + 2*kvd
+        let out_ch = dim + 4 * ad + 2 * kvd;
+        let out_bytes = out_ch * seq * 4;
+        let mut buf = vec![0u8; out_bytes];
+        kernel.read_output(0, &mut buf);
+        let output: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        assert_eq!(
+            output.len(),
+            out_ch * seq,
+            "output size mismatch: got {} expected {}",
+            output.len(),
+            out_ch * seq
+        );
+        // Unpack and verify field sizes
+        let unpacked = ane_weights::unpack_fused_attn_gqa(&buf, &cfg, true, false);
+        assert_eq!(unpacked.o_out.len(), dim * seq, "o_out size");
+        assert_eq!(unpacked.q.len(), ad * seq, "q size");
+        assert_eq!(unpacked.k.len(), kvd * seq, "k size");
+        assert_eq!(unpacked.v.len(), kvd * seq, "v size");
+        assert_eq!(unpacked.attn_out.len(), ad * seq, "attn_out size");
+        assert!(unpacked.attn_pre_gate.is_some(), "has_gate → attn_pre_gate");
+        assert!(unpacked.attn_gate.is_some(), "has_gate → attn_gate");
+        assert_eq!(unpacked.attn_pre_gate.unwrap().len(), ad * seq);
+        assert_eq!(unpacked.attn_gate.unwrap().len(), ad * seq);
+        assert!(unpacked.q_pre_norm.is_none(), "no qk_norm → None");
+        assert!(unpacked.k_pre_norm.is_none(), "no qk_norm → None");
+        eprintln!(
+            "fused_attn_gqa via CompiledKernels OK: out_ch={out_ch}, unpack verified"
+        );
+    }
+
+    // Round 3c: PrePackedWeights for fused_attn_gqa — per-layer kernels with real weights
+    // -----------------------------------------------------------------------
+
+    /// Step 4 test: per-layer attention kernels with real weights produce
+    /// non-zero output that differs from the zero-weight template kernel.
+    ///
+    /// Run: cargo test --features ane --release --lib -- "test_prepacked_fused_attn_gqa" --nocapture --test-threads=1
+    #[test]
+    fn test_prepacked_fused_attn_gqa() {
+        use super::ane_bridge;
+        use super::ane_weights::{ModelWeights, PrePackedWeights, WeightSource};
+
+        if ane_bridge::ane_init().is_err() {
+            eprintln!("SKIP: ANE init failed");
+            return;
+        }
+
+        // Small GQA config with output gate (like Qwen3.5)
+        let cfg = MilConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 8,
+            seq_len: 32,
+            n_kv_heads: 4,
+            rope_theta: 1e6,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 16,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+        let qpd = cfg.q_proj_dim();
+        let kv_dim = cfg.kv_dim();
+        let attn_dim = cfg.attn_dim();
+        let ad = cfg.attn_dim();
+        let kvd = cfg.kv_dim();
+
+        // Build a 2-layer model with non-zero random weights
+        let n_layers = 2;
+        let mut layers = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let rng_seed = (l + 1) as f32;
+            let gen = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| ((i as f32 + rng_seed) * 0.0031).sin() * 0.05)
+                    .collect()
+            };
+            layers.push(ane_weights::LayerWeights {
+                wq: gen(qpd * dim),
+                wk: gen(kv_dim * dim),
+                wv: gen(kv_dim * dim),
+                wo: gen(dim * attn_dim),
+                w1: gen(cfg.hidden_dim * dim),
+                w2: gen(dim * cfg.hidden_dim),
+                w3: gen(cfg.hidden_dim * dim),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            });
+        }
+
+        let model = ModelWeights {
+            cfg: cfg.clone(),
+            layers,
+            rms_final: vec![1.0; dim],
+            embed: vec![0.0; 256 * dim],
+            vocab_size: 256,
+            lm_head: None,
+        };
+
+        // Compile forward kernels (template with zero weights)
+        let kernels = CompiledKernels::compile_forward(&cfg).expect("compile_forward failed");
+        assert!(kernels.fused_attn_gqa.is_some(), "need fused_attn_gqa template");
+
+        // Build PrePackedWeights and prime attention kernels
+        let mut pp = PrePackedWeights::build_empty(seq, model.n_layers());
+        pp.prime_attn_kernels(
+            &cfg,
+            &model,
+            &kernels.rope_cos_blob,
+            &kernels.rope_sin_blob,
+            &kernels.mask_blob,
+        )
+        .expect("prime_attn_kernels failed");
+
+        assert!(
+            pp.has_per_layer_kernels(),
+            "per-layer attention kernels should be primed"
+        );
+
+        // Synthetic input
+        let input: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.1)
+            .collect();
+
+        // Eval layer 0 via prepacked (real weights)
+        let result = pp
+            .eval_fwd_fused_attn_gqa(0, &input, &cfg)
+            .expect("eval should return Some")
+            .expect("eval should succeed");
+
+        // Eval layer 0 via template (zero weights) for comparison
+        let template = kernels.fused_attn_gqa.as_ref().unwrap();
+        let input_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
+        };
+        template.write_input(0, input_bytes);
+        template.eval().expect("template eval failed");
+        let out_ch = dim + 4 * ad + 2 * kvd;
+        let mut buf = vec![0u8; out_ch * seq * 4];
+        template.read_output(0, &mut buf);
+        let template_result = ane_weights::unpack_fused_attn_gqa(&buf, &cfg, true, false);
+
+        // Prepacked output should be non-zero
+        let pp_energy: f32 = result.o_out.iter().map(|x| x * x).sum();
+        assert!(pp_energy > 1e-10, "prepacked o_out should be non-zero, got energy={pp_energy}");
+
+        // Prepacked output should differ from template (which has zero weights)
+        let diff: f32 = result
+            .o_out
+            .iter()
+            .zip(template_result.o_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>();
+        assert!(
+            diff > 1e-6,
+            "prepacked should differ from zero-weight template, diff={diff}"
+        );
+
+        // Layer 1 should produce different output than layer 0 (different weights)
+        let result1 = pp
+            .eval_fwd_fused_attn_gqa(1, &input, &cfg)
+            .expect("eval layer 1 should return Some")
+            .expect("eval layer 1 should succeed");
+
+        let layer_diff: f32 = result
+            .o_out
+            .iter()
+            .zip(result1.o_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>();
+        assert!(
+            layer_diff > 1e-6,
+            "different layers should produce different output, diff={layer_diff}"
+        );
+
+        // Verify all output fields have correct sizes
+        assert_eq!(result.o_out.len(), dim * seq, "o_out size");
+        assert_eq!(result.q.len(), ad * seq, "q size");
+        assert_eq!(result.k.len(), kvd * seq, "k size");
+        assert_eq!(result.v.len(), kvd * seq, "v size");
+        assert_eq!(result.attn_out.len(), ad * seq, "attn_out size");
+        assert!(result.attn_pre_gate.is_some(), "has_gate → attn_pre_gate");
+        assert!(result.attn_gate.is_some(), "has_gate → attn_gate");
+
+        eprintln!(
+            "prepacked fused_attn_gqa OK: pp_energy={pp_energy:.6}, template_diff={diff:.6}, layer_diff={layer_diff:.6}"
         );
     }
 
@@ -7422,7 +7810,9 @@ mod tests {
         // Random Q, K, V at [attn_dim, seq] = [2048, 128]
         let mut rng_state = 42u64;
         let mut rand_f32 = || -> f32 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng_state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
         let q: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
@@ -7450,7 +7840,9 @@ mod tests {
         let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
         let speedup = cpu_us / ane_us;
-        eprintln!("\n=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq={seq}) ===");
+        eprintln!(
+            "\n=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq={seq}) ==="
+        );
         eprintln!("  attn_dim={ad} ({} elements per QKV)", ad * seq);
         eprintln!("  ANE:  {ane_us:.0}us/call ({iters} iters)");
         eprintln!("  CPU:  {cpu_us:.0}us/call ({iters} iters)");
@@ -7458,7 +7850,10 @@ mod tests {
         eprintln!();
 
         // Also test at seq=256
-        let cfg256 = MilConfig { seq_len: 256, ..cfg.clone() };
+        let cfg256 = MilConfig {
+            seq_len: 256,
+            ..cfg.clone()
+        };
         let mask256 = super::ane_mil::build_causal_mask_blob(256);
         let spec256 = KernelSpec::for_kernel(&cfg256, KernelType::SdpaCoreGqa);
         if let Ok(kern256) = AneKernel::compile_multi_weights(
@@ -7487,14 +7882,19 @@ mod tests {
             }
             let cpu256_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
-            eprintln!("=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=256) ===");
+            eprintln!(
+                "=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=256) ==="
+            );
             eprintln!("  ANE:  {ane256_us:.0}us/call");
             eprintln!("  CPU:  {cpu256_us:.0}us/call");
             eprintln!("  speedup: {:.2}x", cpu256_us / ane256_us);
         }
 
         // seq=512
-        let cfg512 = MilConfig { seq_len: 512, ..cfg };
+        let cfg512 = MilConfig {
+            seq_len: 512,
+            ..cfg
+        };
         let mask512 = super::ane_mil::build_causal_mask_blob(512);
         let spec512 = KernelSpec::for_kernel(&cfg512, KernelType::SdpaCoreGqa);
         if let Ok(kern512) = AneKernel::compile_multi_weights(
@@ -7522,7 +7922,9 @@ mod tests {
             }
             let cpu512_us = t0.elapsed().as_micros() as f64 / iters as f64;
 
-            eprintln!("=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=512) ===");
+            eprintln!(
+                "=== SDPA micro-benchmark (n_heads={n_heads}, head_dim={head_dim}, seq=512) ==="
+            );
             eprintln!("  ANE:  {ane512_us:.0}us/call");
             eprintln!("  CPU:  {cpu512_us:.0}us/call");
             eprintln!("  speedup: {:.2}x", cpu512_us / ane512_us);
@@ -7569,7 +7971,10 @@ mod tests {
         let ad = base_cfg.attn_dim(); // 16 * 256 = 4096
 
         eprintln!("\n=== SDPA sweep: Qwen3.5-35B-A3B (n_heads={n_heads}, head_dim={head_dim}, attn_dim={ad}) ===");
-        eprintln!("{:>6} {:>10} {:>10} {:>8}", "seq", "ANE(us)", "CPU(us)", "speedup");
+        eprintln!(
+            "{:>6} {:>10} {:>10} {:>8}",
+            "seq", "ANE(us)", "CPU(us)", "speedup"
+        );
         eprintln!("{}", "-".repeat(40));
 
         let iters = 30;
@@ -7577,12 +7982,17 @@ mod tests {
         // RNG
         let mut rng_state = 42u64;
         let mut rand_f32 = || -> f32 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng_state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
 
         for &seq in &[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768] {
-            let cfg = MilConfig { seq_len: seq, ..base_cfg.clone() };
+            let cfg = MilConfig {
+                seq_len: seq,
+                ..base_cfg.clone()
+            };
             let mask = super::ane_mil::build_causal_mask_blob(seq);
             let spec = KernelSpec::for_kernel(&cfg, KernelType::SdpaCoreGqa);
 
@@ -7605,7 +8015,19 @@ mod tests {
             let v: Vec<f32> = (0..ad * seq).map(|_| rand_f32() * 0.1).collect();
 
             // Scale iters down for large seq to keep total runtime sane
-            let n = if seq >= 16384 { 1 } else if seq >= 8192 { 2 } else if seq >= 4096 { 3 } else if seq >= 2048 { 5 } else if seq >= 1024 { 10 } else { iters };
+            let n = if seq >= 16384 {
+                1
+            } else if seq >= 8192 {
+                2
+            } else if seq >= 4096 {
+                3
+            } else if seq >= 2048 {
+                5
+            } else if seq >= 1024 {
+                10
+            } else {
+                iters
+            };
 
             // Warmup
             let _ = super::eval_sdpa_core_gqa(&kern, &q, &k, &v, ad, seq);

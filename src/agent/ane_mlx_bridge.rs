@@ -734,6 +734,35 @@ impl AneTrainerSession {
                 }
             }
 
+            // Prime per-layer fused attention GQA kernels (real weights via delta cache).
+            if fwd_k.fused_attn_gqa.is_some() {
+                let attn_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                match pp.prime_attn_kernels(
+                    &attn_cfg,
+                    &self.model,
+                    &fwd_k.rope_cos_blob,
+                    &fwd_k.rope_sin_blob,
+                    &fwd_k.mask_blob,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ANE train: fused attention GQA kernels primed for seq_len={}",
+                            bucket_seq,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ANE train: fused attention GQA priming failed for seq_len={}: {}",
+                            bucket_seq, e,
+                        );
+                    }
+                }
+            }
+
             self.prepacked_weights.push((*bucket_seq, pp));
         }
         self.prepacked_weights.sort_by_key(|(seq, _)| *seq);

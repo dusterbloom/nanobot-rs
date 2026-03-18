@@ -558,6 +558,84 @@ pub fn unpack_fused_ffn(
     (h1, h3, gate, ffn_out)
 }
 
+/// Unpacked output from fused attention GQA kernel.
+pub struct FusedAttnGqaOutput {
+    pub o_out: Vec<f32>,            // [dim, seq]
+    pub q: Vec<f32>,                // [attn_dim, seq] post-RoPE
+    pub k: Vec<f32>,                // [kv_dim, seq] post-RoPE
+    pub v: Vec<f32>,                // [kv_dim, seq]
+    pub attn_out: Vec<f32>,         // [attn_dim, seq] post-gate
+    pub attn_pre_gate: Option<Vec<f32>>, // [attn_dim, seq] (if has_gate)
+    pub attn_gate: Option<Vec<f32>>,     // [attn_dim, seq] raw gate (if has_gate)
+    pub q_pre_norm: Option<Vec<f32>>,    // [attn_dim, seq] (if has_qk_norm)
+    pub k_pre_norm: Option<Vec<f32>>,    // [kv_dim, seq] (if has_qk_norm)
+}
+
+/// Unpack the concatenated output of `gen_fused_attn_gqa_fwd`.
+///
+/// Channel layout: oo | qr_f | kr_f | v_f | ao_f [| pg_f | gr_f] [| qp_f | kp_f]
+pub fn unpack_fused_attn_gqa(
+    output: &[u8],
+    cfg: &super::ane_mil::MilConfig,
+    has_gate: bool,
+    has_qk_norm: bool,
+) -> FusedAttnGqaOutput {
+    let dim = cfg.dim;
+    let ad = cfg.attn_dim();
+    let kvd = cfg.kv_dim();
+    let seq = cfg.seq_len;
+    let floats = bytes_to_f32_vec(output);
+
+    let mut off = 0;
+    let slice = |start: usize, ch: usize| -> Vec<f32> {
+        floats[start..start + ch * seq].to_vec()
+    };
+
+    let o_out = slice(off, dim);
+    off += dim * seq;
+    let q = slice(off, ad);
+    off += ad * seq;
+    let k = slice(off, kvd);
+    off += kvd * seq;
+    let v = slice(off, kvd);
+    off += kvd * seq;
+    let attn_out = slice(off, ad);
+    off += ad * seq;
+
+    let (attn_pre_gate, attn_gate) = if has_gate {
+        let pg = slice(off, ad);
+        off += ad * seq;
+        let gr = slice(off, ad);
+        off += ad * seq;
+        (Some(pg), Some(gr))
+    } else {
+        (None, None)
+    };
+
+    let (q_pre_norm, k_pre_norm) = if has_qk_norm {
+        let qp = slice(off, ad);
+        off += ad * seq;
+        let kp = slice(off, kvd);
+        off += kvd * seq;
+        (Some(qp), Some(kp))
+    } else {
+        (None, None)
+    };
+
+    let _ = off; // suppress unused warning
+    FusedAttnGqaOutput {
+        o_out,
+        q,
+        k,
+        v,
+        attn_out,
+        attn_pre_gate,
+        attn_gate,
+        q_pre_norm,
+        k_pre_norm,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backward packing
 // ---------------------------------------------------------------------------
@@ -1809,6 +1887,12 @@ impl QuantizedModelWeights {
             * 4;
         attn + ffn + gdn + norms
     }
+
+    pub fn total_dense_layer_bytes(&self) -> usize {
+        (0..self.layers.len())
+            .map(|l| self.dense_layer_bytes(l))
+            .sum()
+    }
 }
 
 /// Dense layer cache wrapping a quantized model for fast training.
@@ -1819,32 +1903,167 @@ impl QuantizedModelWeights {
 ///
 /// For small models (0.8B): caches all layers → ~4× speedup, ~2.9 GB.
 /// For large models (35B MoE): caches what fits within the budget.
+const MIB_BYTES: usize = 1024 * 1024;
+const GIB_BYTES: usize = 1024 * MIB_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DenseCacheBudgetPolicy {
+    pub fixed_headroom_bytes: usize,
+    pub inference_reserve_bytes: usize,
+    pub cache_fraction: f64,
+    pub explicit_budget_bytes: Option<usize>,
+}
+
+impl DenseCacheBudgetPolicy {
+    pub fn split_silicon_default(quantized_bytes: usize) -> Self {
+        let fixed_headroom_bytes =
+            parse_env_mebibytes("NANOBOT_ANE_FIXED_HEADROOM_MB").unwrap_or(2 * GIB_BYTES);
+        let inference_reserve_bytes = parse_env_mebibytes("NANOBOT_ANE_INFERENCE_RESERVE_MB")
+            // Reserve enough unified memory for the foreground MLX model plus
+            // some decode/KV headroom while ANE training runs in the background.
+            .unwrap_or(quantized_bytes.saturating_add(GIB_BYTES));
+        let cache_fraction = parse_env_fraction("NANOBOT_ANE_DENSE_CACHE_FRACTION")
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let explicit_budget_bytes = parse_env_mebibytes("NANOBOT_ANE_DENSE_CACHE_BUDGET_MB");
+
+        Self {
+            fixed_headroom_bytes,
+            inference_reserve_bytes,
+            cache_fraction,
+            explicit_budget_bytes,
+        }
+    }
+
+    pub fn explicit(dense_cache_budget_bytes: usize) -> Self {
+        Self {
+            fixed_headroom_bytes: 0,
+            inference_reserve_bytes: 0,
+            cache_fraction: 1.0,
+            explicit_budget_bytes: Some(dense_cache_budget_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DenseCacheBudgetPlan {
+    pub physical_mem_bytes: usize,
+    pub quantized_bytes: usize,
+    pub fixed_headroom_bytes: usize,
+    pub inference_reserve_bytes: usize,
+    pub reserved_bytes: usize,
+    pub available_after_reserve_bytes: usize,
+    pub total_dense_layer_bytes: usize,
+    pub dense_cache_budget_bytes: usize,
+    pub cache_fraction: f64,
+}
+
+impl DenseCacheBudgetPlan {
+    pub fn split_silicon_default(
+        physical_mem_bytes: usize,
+        quantized_bytes: usize,
+        total_dense_layer_bytes: usize,
+    ) -> Self {
+        let policy = DenseCacheBudgetPolicy::split_silicon_default(quantized_bytes);
+        Self::from_policy(
+            physical_mem_bytes,
+            quantized_bytes,
+            total_dense_layer_bytes,
+            policy,
+        )
+    }
+
+    pub fn explicit(
+        physical_mem_bytes: usize,
+        quantized_bytes: usize,
+        total_dense_layer_bytes: usize,
+        dense_cache_budget_bytes: usize,
+    ) -> Self {
+        Self::from_policy(
+            physical_mem_bytes,
+            quantized_bytes,
+            total_dense_layer_bytes,
+            DenseCacheBudgetPolicy::explicit(dense_cache_budget_bytes),
+        )
+    }
+
+    fn from_policy(
+        physical_mem_bytes: usize,
+        quantized_bytes: usize,
+        total_dense_layer_bytes: usize,
+        policy: DenseCacheBudgetPolicy,
+    ) -> Self {
+        let reserved_bytes = quantized_bytes
+            .saturating_add(policy.fixed_headroom_bytes)
+            .saturating_add(policy.inference_reserve_bytes);
+        let available_after_reserve_bytes = physical_mem_bytes.saturating_sub(reserved_bytes);
+        let fraction_budget_bytes =
+            ((available_after_reserve_bytes as f64) * policy.cache_fraction).round() as usize;
+        let dense_cache_budget_bytes = policy
+            .explicit_budget_bytes
+            .unwrap_or(fraction_budget_bytes)
+            .min(total_dense_layer_bytes);
+
+        Self {
+            physical_mem_bytes,
+            quantized_bytes,
+            fixed_headroom_bytes: policy.fixed_headroom_bytes,
+            inference_reserve_bytes: policy.inference_reserve_bytes,
+            reserved_bytes,
+            available_after_reserve_bytes,
+            total_dense_layer_bytes,
+            dense_cache_budget_bytes,
+            cache_fraction: policy.cache_fraction,
+        }
+    }
+}
+
 pub struct DenseCachedModel {
     quantized: QuantizedModelWeights,
     cache: Vec<Option<LayerWeights>>,
     cached_count: usize,
+    cached_bytes: usize,
+    cache_budget: DenseCacheBudgetPlan,
 }
 
 impl DenseCachedModel {
     /// Create a dense cache with automatic memory budgeting.
     ///
-    /// Uses 50% of physical RAM (minus current quantized model) as the budget,
-    /// capping at the full dense size. Layers are cached in order (0..N-1)
-    /// until the budget is exhausted.
+    /// Uses an explicit unified-memory budget plan:
+    /// - reserve the quantized training weights
+    /// - reserve foreground inference memory
+    /// - reserve fixed system headroom
+    /// - spend only a fraction of what remains on dense layer caching
     pub fn auto(quantized: QuantizedModelWeights) -> Self {
         let phys_mem = Self::physical_memory_bytes();
-        // Reserve memory for quantized model + embed + LoRA/Adam + activations + headroom
-        let reserved = quantized.quantized_memory_bytes() + 2 * 1024 * 1024 * 1024; // +2 GB headroom
-        let budget = if phys_mem > reserved {
-            (phys_mem - reserved) / 2 // Use half of remaining
-        } else {
-            0
-        };
-        Self::with_budget(quantized, budget)
+        let quantized_bytes = quantized.quantized_memory_bytes();
+        let total_dense_layer_bytes = quantized.total_dense_layer_bytes();
+        let budget = DenseCacheBudgetPlan::split_silicon_default(
+            phys_mem,
+            quantized_bytes,
+            total_dense_layer_bytes,
+        );
+        Self::with_budget_plan(quantized, budget)
     }
 
     /// Create a dense cache with an explicit byte budget for layer storage.
     pub fn with_budget(quantized: QuantizedModelWeights, budget: usize) -> Self {
+        let phys_mem = Self::physical_memory_bytes();
+        let quantized_bytes = quantized.quantized_memory_bytes();
+        let total_dense_layer_bytes = quantized.total_dense_layer_bytes();
+        let budget = DenseCacheBudgetPlan::explicit(
+            phys_mem,
+            quantized_bytes,
+            total_dense_layer_bytes,
+            budget,
+        );
+        Self::with_budget_plan(quantized, budget)
+    }
+
+    pub fn with_budget_plan(
+        quantized: QuantizedModelWeights,
+        cache_budget: DenseCacheBudgetPlan,
+    ) -> Self {
         let n = quantized.layers.len();
         let mut cache: Vec<Option<LayerWeights>> = (0..n).map(|_| None).collect();
         let mut used = 0usize;
@@ -1852,7 +2071,7 @@ impl DenseCachedModel {
 
         for l in 0..n {
             let layer_bytes = quantized.dense_layer_bytes(l);
-            if used + layer_bytes > budget {
+            if used + layer_bytes > cache_budget.dense_cache_budget_bytes {
                 break;
             }
             cache[l] = Some(quantized.dequantize_layer(l));
@@ -1861,21 +2080,34 @@ impl DenseCachedModel {
         }
 
         tracing::info!(
-            "dense cache: {cached_count}/{n} layers cached ({:.1} MB / {:.1} MB budget)",
+            "dense cache: {cached_count}/{n} layers cached ({:.1} MB / {:.1} MB budget, reserves {:.1} MB incl. inference {:.1} MB + headroom {:.1} MB)",
             used as f64 / 1_048_576.0,
-            budget as f64 / 1_048_576.0,
+            cache_budget.dense_cache_budget_bytes as f64 / 1_048_576.0,
+            cache_budget.reserved_bytes as f64 / 1_048_576.0,
+            cache_budget.inference_reserve_bytes as f64 / 1_048_576.0,
+            cache_budget.fixed_headroom_bytes as f64 / 1_048_576.0,
         );
 
         Self {
             quantized,
             cache,
             cached_count,
+            cached_bytes: used,
+            cache_budget,
         }
     }
 
     /// Number of layers currently cached in dense form.
     pub fn cached_layer_count(&self) -> usize {
         self.cached_count
+    }
+
+    pub fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    pub fn cache_budget(&self) -> DenseCacheBudgetPlan {
+        self.cache_budget
     }
 
     #[cfg(target_os = "macos")]
@@ -1900,6 +2132,17 @@ impl DenseCachedModel {
         // Fallback: assume 16 GB
         16 * 1024 * 1024 * 1024
     }
+}
+
+fn parse_env_mebibytes(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(MIB_BYTES))
+}
+
+fn parse_env_fraction(name: &str) -> Option<f64> {
+    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
 }
 
 impl WeightSource for DenseCachedModel {
@@ -1977,9 +2220,40 @@ pub struct PrePackedLayerWeights {
 pub struct PrePackedWeights {
     pub layers: Vec<PrePackedLayerWeights>,
     pub seq_len: usize,
+    /// Per-layer kernel clones with weights baked into IOSurface.
+    /// When present, forward/backward evals use these instead of the shared
+    /// bucket kernel — only activation data is patched per step via strided write,
+    /// eliminating ~12MB/layer of weight copies through CPU caches.
+    fwd_fused_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    bwd_w2t_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    bwd_w13t_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer fused attention GQA kernels with real weights baked in.
+    /// Created via `compile_multi_weights` with delta cache hits (same MIL, different weights).
+    fwd_fused_attn_gqa_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
 }
 
 impl PrePackedWeights {
+    /// Create an empty PrePackedWeights (no FFN buffers, just attention kernel slots).
+    ///
+    /// Use when only attention priming is needed (e.g. tests, inference-only paths).
+    pub fn build_empty(seq_len: usize, n_layers: usize) -> Self {
+        let layers = (0..n_layers)
+            .map(|_| PrePackedLayerWeights {
+                fwd_fused_ffn: None,
+                bwd_w2t: None,
+                bwd_w13t: None,
+            })
+            .collect();
+        Self {
+            layers,
+            seq_len,
+            fwd_fused_kernels: None,
+            bwd_w2t_kernels: None,
+            bwd_w13t_kernels: None,
+            fwd_fused_attn_gqa_kernels: None,
+        }
+    }
+
     /// Build pre-packed weight cache from a DenseCachedModel.
     ///
     /// `seq_len` determines the activation slot size. This must match the
@@ -2068,7 +2342,14 @@ impl PrePackedWeights {
             fused_ffn,
         );
 
-        Self { layers, seq_len }
+        Self {
+            layers,
+            seq_len,
+            fwd_fused_kernels: None,
+            bwd_w2t_kernels: None,
+            bwd_w13t_kernels: None,
+            fwd_fused_attn_gqa_kernels: None,
+        }
     }
 
     /// Patch activation into a pre-packed fused FFN buffer and return bytes for kernel input.
@@ -2137,6 +2418,349 @@ impl PrePackedWeights {
                     + l.bwd_w13t.as_ref().map_or(0, |b| b.len() * 4)
             })
             .sum()
+    }
+
+    /// Returns true if per-layer kernels have been primed.
+    pub fn has_per_layer_kernels(&self) -> bool {
+        self.fwd_fused_kernels.is_some() || self.fwd_fused_attn_gqa_kernels.is_some()
+    }
+
+    /// Drop per-layer IOSurface kernels to free memory bandwidth for inference.
+    /// The heap-resident pre-packed layer buffers (`fwd_fused_ffn`, `bwd_w2t`,
+    /// `bwd_w13t`) are retained — they are cheap to keep and avoid re-transposing
+    /// weights from the dense cache. Call `prime_kernels()` again to rebuild.
+    pub fn evict_kernels(&mut self) {
+        self.fwd_fused_kernels = None;
+        self.bwd_w2t_kernels = None;
+        self.bwd_w13t_kernels = None;
+        self.fwd_fused_attn_gqa_kernels = None;
+    }
+
+    /// Prime per-layer kernel clones with IOSurface-resident weights.
+    ///
+    /// Clones the template kernels once per layer and writes each layer's
+    /// pre-packed weights into the clone's IOSurface. After priming, only
+    /// activation data needs to be patched per step via strided write.
+    ///
+    /// `fwd_template`: the FullyFused FFN kernel (or None if not fused)
+    /// `bwd_w2t_template`: backward W2^T kernel (or None)
+    /// `bwd_w13t_template`: backward W1^T+W3^T kernel (or None)
+    pub fn prime_kernels(
+        &mut self,
+        fwd_template: Option<&super::ane_bridge::AneKernel>,
+        bwd_w2t_template: Option<&super::ane_bridge::AneKernel>,
+        bwd_w13t_template: Option<&super::ane_bridge::AneKernel>,
+    ) -> Result<(), String> {
+        let n_layers = self.layers.len();
+
+        if let Some(tmpl) = fwd_template {
+            let mut kernels = Vec::with_capacity(n_layers);
+            for (l, lw) in self.layers.iter().enumerate() {
+                let Some(ref buf) = lw.fwd_fused_ffn else {
+                    return Err(format!("layer {l}: fwd_fused_ffn not pre-packed"));
+                };
+                let k = tmpl
+                    .clone_kernel()
+                    .map_err(|e| format!("layer {l} fwd clone: {e}"))?;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
+                k.write_input(0, bytes);
+                kernels.push(k);
+            }
+            tracing::info!(
+                "primed {} per-layer fwd fused FFN kernels ({:.1} MB IOSurface)",
+                n_layers,
+                self.layers
+                    .iter()
+                    .filter_map(|l| l.fwd_fused_ffn.as_ref())
+                    .map(|b| b.len() * 4)
+                    .sum::<usize>() as f64
+                    / 1_048_576.0,
+            );
+            self.fwd_fused_kernels = Some(kernels);
+        }
+
+        if let Some(tmpl) = bwd_w2t_template {
+            let mut kernels = Vec::with_capacity(n_layers);
+            for (l, lw) in self.layers.iter().enumerate() {
+                let Some(ref buf) = lw.bwd_w2t else {
+                    return Err(format!("layer {l}: bwd_w2t not pre-packed"));
+                };
+                let k = tmpl
+                    .clone_kernel()
+                    .map_err(|e| format!("layer {l} bwd_w2t clone: {e}"))?;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
+                k.write_input(0, bytes);
+                kernels.push(k);
+            }
+            tracing::info!("primed {} per-layer bwd W2^T kernels", n_layers);
+            self.bwd_w2t_kernels = Some(kernels);
+        }
+
+        if let Some(tmpl) = bwd_w13t_template {
+            let mut kernels = Vec::with_capacity(n_layers);
+            for (l, lw) in self.layers.iter().enumerate() {
+                let Some(ref buf) = lw.bwd_w13t else {
+                    return Err(format!("layer {l}: bwd_w13t not pre-packed"));
+                };
+                let k = tmpl
+                    .clone_kernel()
+                    .map_err(|e| format!("layer {l} bwd_w13t clone: {e}"))?;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
+                k.write_input(0, bytes);
+                kernels.push(k);
+            }
+            tracing::info!("primed {} per-layer bwd W1^T+W3^T kernels", n_layers);
+            self.bwd_w13t_kernels = Some(kernels);
+        }
+
+        Ok(())
+    }
+
+    /// Prime per-layer fused attention GQA kernels with real weights.
+    ///
+    /// Unlike FFN (weights packed into input IOSurface), the fused attention kernel
+    /// stores weights as BLOBFILE constants compiled into the model. Per-layer kernels
+    /// are created via `compile_multi_weights` — each call hits the delta compilation
+    /// cache (same MIL text → same hexId → cached net.plist), so only loadWithQoS
+    /// happens. Cost: ~17ms × N layers one-time.
+    pub fn prime_attn_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+        rope_cos_blob: &[u8],
+        rope_sin_blob: &[u8],
+        mask_blob: &[u8],
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let has_qk_norm = false; // ANE batch>1 blocker — matches compile_forward
+        let result = super::ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
+        let dim = cfg.dim;
+        let qpd = cfg.q_proj_dim();
+        let kv_dim = cfg.kv_dim();
+        let attn_dim = cfg.attn_dim();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            // Build per-layer weight blobs: transpose to MIL layout then fp16
+            let blobs: Vec<Vec<u8>> = result
+                .weight_names
+                .iter()
+                .map(|name| match *name {
+                    "@model_path/weights/rope_cos.bin" => rope_cos_blob.to_vec(),
+                    "@model_path/weights/rope_sin.bin" => rope_sin_blob.to_vec(),
+                    "@model_path/weights/mask.bin" => mask_blob.to_vec(),
+                    "@model_path/weights/wq.bin" => {
+                        // wq stored as [qpd, dim], MIL needs [dim, qpd]
+                        let wq_t = transpose_weight(&lw.wq, qpd, dim);
+                        build_fp16_blob(&wq_t)
+                    }
+                    "@model_path/weights/wk.bin" => {
+                        // wk stored as [kv_dim, dim], MIL needs [dim, kv_dim]
+                        let wk_t = transpose_weight(&lw.wk, kv_dim, dim);
+                        build_fp16_blob(&wk_t)
+                    }
+                    "@model_path/weights/wv.bin" => {
+                        // wv stored as [kv_dim, dim], MIL needs [dim, kv_dim]
+                        let wv_t = transpose_weight(&lw.wv, kv_dim, dim);
+                        build_fp16_blob(&wv_t)
+                    }
+                    "@model_path/weights/wo.bin" => {
+                        // wo stored as [dim, attn_dim], MIL needs [attn_dim, dim]
+                        let wo_t = transpose_weight(&lw.wo, dim, attn_dim);
+                        build_fp16_blob(&wo_t)
+                    }
+                    _ => build_fp16_blob(&vec![0.0f32; 16]),
+                })
+                .collect();
+
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} fused_attn_gqa compile: {e}"))?;
+
+            kernels.push(k);
+        }
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed {} per-layer fused attention GQA kernels in {:.1}ms ({:.1}ms/layer)",
+            n_layers,
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / n_layers as f64,
+        );
+        self.fwd_fused_attn_gqa_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate fused attention GQA on per-layer kernel (weights baked into compiled model).
+    ///
+    /// Only writes the input activation `xnorm` [dim, seq]. Returns None if
+    /// per-layer attention kernels aren't primed.
+    pub fn eval_fwd_fused_attn_gqa(
+        &self,
+        layer: usize,
+        xnorm: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<FusedAttnGqaOutput, String>> {
+        let kernels = self.fwd_fused_attn_gqa_kernels.as_ref()?;
+        let kernel = &kernels[layer];
+
+        let xnorm_bytes =
+            unsafe { std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4) };
+        kernel.write_input(0, xnorm_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!(
+                "per-layer fused_attn_gqa eval layer {layer}: {e}"
+            )));
+        }
+
+        let ad = cfg.attn_dim();
+        let kvd = cfg.kv_dim();
+        let has_gate = cfg.attn_output_gate;
+        let out_ch = if has_gate {
+            cfg.dim + 4 * ad + 2 * kvd
+        } else {
+            cfg.dim + 2 * ad + 2 * kvd
+        };
+        let mut buf = vec![0u8; out_ch * cfg.seq_len * 4];
+        kernel.read_output(0, &mut buf);
+        Some(Ok(unpack_fused_attn_gqa(
+            &buf, cfg, has_gate, false,
+        )))
+    }
+
+    /// Evaluate forward fused FFN on per-layer kernel (IOSurface-resident weights).
+    ///
+    /// Only patches the activation slice via strided write (~512KB for seq=128),
+    /// instead of copying the full 13MB buffer. Returns None if per-layer kernels
+    /// aren't primed (caller should fall back to shared kernel path).
+    pub fn eval_fwd_fused(
+        &self,
+        layer: usize,
+        xnorm: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), String>> {
+        let kernels = self.fwd_fused_kernels.as_ref()?;
+        let kernel = &kernels[layer];
+        let dim = cfg.dim;
+        let seq = self.seq_len;
+        let hidden = cfg.hidden_dim;
+        let sp = seq + 3 * hidden;
+
+        // Strided write: patch xnorm rows into IOSurface activation columns.
+        // Each of dim rows has seq floats at the start, then 3*hidden weight floats.
+        // xnorm is [dim, seq] contiguous. IOSurface stride is sp*4, source stride is seq*4.
+        let xnorm_bytes =
+            unsafe { std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4) };
+        kernel.write_input_strided(
+            0,      // input idx
+            0,      // dst_offset (activation starts at beginning of each row)
+            sp * 4, // dst_stride (bytes per row in IOSurface)
+            xnorm_bytes,
+            seq * 4, // src_stride (bytes per row in xnorm)
+            seq * 4, // chunk_bytes (one row of activation)
+            dim,     // n_chunks (number of rows)
+        );
+
+        let spec =
+            super::ane_mil::KernelSpec::for_kernel(cfg, super::ane_mil::KernelType::FusedFfn);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("per-layer fwd fused eval layer {layer}: {e}")));
+        }
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        Some(Ok(unpack_fused_ffn(&out_buf, cfg)))
+    }
+
+    /// Evaluate backward W2^T on per-layer kernel (IOSurface-resident weights).
+    pub fn eval_bwd_w2t(
+        &self,
+        layer: usize,
+        dffn: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_w2t_kernels.as_ref()?;
+        let kernel = &kernels[layer];
+        let dim = cfg.dim;
+        let seq = self.seq_len;
+        let hidden = cfg.hidden_dim;
+        let sp = seq + hidden;
+
+        let dffn_bytes =
+            unsafe { std::slice::from_raw_parts(dffn.as_ptr() as *const u8, dffn.len() * 4) };
+        kernel.write_input_strided(0, 0, sp * 4, dffn_bytes, seq * 4, seq * 4, dim);
+
+        let spec =
+            super::ane_mil::KernelSpec::for_kernel(cfg, super::ane_mil::KernelType::FfnBwdW2t);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("per-layer bwd w2t eval layer {layer}: {e}")));
+        }
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        Some(Ok(out_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()))
+    }
+
+    /// Evaluate backward W1^T+W3^T on per-layer kernel (IOSurface-resident weights).
+    pub fn eval_bwd_w13t(
+        &self,
+        layer: usize,
+        dh1: &[f32],
+        dh3: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_w13t_kernels.as_ref()?;
+        let kernel = &kernels[layer];
+        let hidden = cfg.hidden_dim;
+        let seq = self.seq_len;
+        let dim = cfg.dim;
+        let sp = 2 * seq + 2 * dim;
+
+        // dh1 goes to columns [0..seq], dh3 to columns [seq..2*seq]
+        let dh1_bytes =
+            unsafe { std::slice::from_raw_parts(dh1.as_ptr() as *const u8, dh1.len() * 4) };
+        let dh3_bytes =
+            unsafe { std::slice::from_raw_parts(dh3.as_ptr() as *const u8, dh3.len() * 4) };
+        kernel.write_input_strided(0, 0, sp * 4, dh1_bytes, seq * 4, seq * 4, hidden);
+        kernel.write_input_strided(
+            0,
+            seq * 4, // dh3 starts after dh1 in each row
+            sp * 4,
+            dh3_bytes,
+            seq * 4,
+            seq * 4,
+            hidden,
+        );
+
+        let spec =
+            super::ane_mil::KernelSpec::for_kernel(cfg, super::ane_mil::KernelType::FfnBwdW13t);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("per-layer bwd w13t eval layer {layer}: {e}")));
+        }
+        let mut out_buf = vec![0u8; spec.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        Some(Ok(out_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()))
     }
 }
 
@@ -3411,5 +4035,45 @@ mod tests {
         for c in 0..cols {
             assert_eq!(out[c], (c % 16) as f32, "col={c}");
         }
+    }
+
+    #[test]
+    fn test_dense_cache_budget_plan_reserves_inference_memory() {
+        let plan = super::DenseCacheBudgetPlan::from_policy(
+            16 * super::GIB_BYTES,
+            2 * super::GIB_BYTES,
+            12 * super::GIB_BYTES,
+            super::DenseCacheBudgetPolicy {
+                fixed_headroom_bytes: 2 * super::GIB_BYTES,
+                inference_reserve_bytes: 3 * super::GIB_BYTES,
+                cache_fraction: 0.5,
+                explicit_budget_bytes: None,
+            },
+        );
+
+        assert_eq!(plan.reserved_bytes, 7 * super::GIB_BYTES);
+        assert_eq!(plan.available_after_reserve_bytes, 9 * super::GIB_BYTES);
+        assert_eq!(
+            plan.dense_cache_budget_bytes,
+            4 * super::GIB_BYTES + 512 * super::MIB_BYTES
+        );
+    }
+
+    #[test]
+    fn test_dense_cache_budget_plan_explicit_override_clamps_to_dense_total() {
+        let plan = super::DenseCacheBudgetPlan::from_policy(
+            32 * super::GIB_BYTES,
+            super::GIB_BYTES,
+            3 * super::GIB_BYTES,
+            super::DenseCacheBudgetPolicy {
+                fixed_headroom_bytes: 0,
+                inference_reserve_bytes: 0,
+                cache_fraction: 1.0,
+                explicit_budget_bytes: Some(10 * super::GIB_BYTES),
+            },
+        );
+
+        assert_eq!(plan.dense_cache_budget_bytes, 3 * super::GIB_BYTES);
+        assert_eq!(plan.total_dense_layer_bytes, 3 * super::GIB_BYTES);
     }
 }
