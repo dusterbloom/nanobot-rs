@@ -319,6 +319,7 @@ pub fn fused_classifier_ce<T: TokenId>(
     seq: usize,
     softcap: f32,
     loss_scale: f32,
+    ane_tile: Option<&OcDynMatmulKernel>,
 ) -> f32 {
     debug_assert_eq!(dy.len(), dim * seq);
     debug_assert_eq!(embed.len(), vocab * dim);
@@ -357,13 +358,13 @@ pub fn fused_classifier_ce<T: TokenId>(
         has_softcap,
         softcap,
         inv_cap,
+        ane_tile,
     );
 
     // Finalize log-sum-exp: lse[t] = max[t] + ln(sum[t])
     for t in 0..seq {
         lse_max[t] += lse_sum[t].ln();
     }
-    // lse_max now holds the final log-sum-exp per position — reuse the vec
     let lse = lse_max;
 
     // Pass 2: recompute tile logits, compute dlogits, accumulate dy + loss
@@ -385,6 +386,7 @@ pub fn fused_classifier_ce<T: TokenId>(
         inv_cap,
         inv_n,
         loss_scale,
+        ane_tile,
     );
 
     loss * inv_n
@@ -404,6 +406,7 @@ fn fused_ce_pass1_logsumexp(
     has_softcap: bool,
     softcap: f32,
     inv_cap: f32,
+    ane_tile: Option<&OcDynMatmulKernel>,
 ) {
     for tile in 0..n_tiles {
         let v_start = tile * CE_TILE;
@@ -411,18 +414,36 @@ fn fused_ce_pass1_logsumexp(
         let tile_slice = &mut tile_buf[..tile_rows * seq];
 
         // tile_logits[tile_rows, seq] = embed_tile[tile_rows, dim] @ x_final[dim, seq]
-        cpu_gemm(
-            tile_slice,
-            &embed[v_start * dim..(v_start + tile_rows) * dim],
-            false,
-            x_final,
-            false,
-            tile_rows,
-            seq,
-            dim,
-            1.0,
-            0.0,
-        );
+        // ANE fast path: use OcDynMatmul when tile is full-sized
+        let used_ane = if tile_rows == CE_TILE {
+            if let Some(k) = ane_tile {
+                match k.eval_row_major(x_final, &embed[v_start * dim..(v_start + tile_rows) * dim]) {
+                    Ok(result) => {
+                        tile_slice.copy_from_slice(&result);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !used_ane {
+            cpu_gemm(
+                tile_slice,
+                &embed[v_start * dim..(v_start + tile_rows) * dim],
+                false,
+                x_final,
+                false,
+                tile_rows,
+                seq,
+                dim,
+                1.0,
+                0.0,
+            );
+        }
 
         if has_softcap {
             for v in tile_slice.iter_mut() {
@@ -468,6 +489,7 @@ fn fused_ce_pass2_grad<T: TokenId>(
     inv_cap: f32,
     inv_seq: f32,
     loss_scale: f32,
+    ane_tile: Option<&OcDynMatmulKernel>,
 ) -> f32 {
     let scale = inv_seq * loss_scale;
     let mut total_loss = 0.0f32;
@@ -477,11 +499,19 @@ fn fused_ce_pass2_grad<T: TokenId>(
         let tile_rows = CE_TILE.min(vocab - v_start);
         let tile_slice = &mut tile_buf[..tile_rows * seq];
 
-        // Recompute tile logits
+        // Recompute tile logits (ANE fast path for full tiles)
         let embed_tile = &embed[v_start * dim..(v_start + tile_rows) * dim];
-        cpu_gemm(
-            tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0,
-        );
+        let used_ane = if tile_rows == CE_TILE {
+            if let Some(k) = ane_tile {
+                match k.eval_row_major(x_final, embed_tile) {
+                    Ok(result) => { tile_slice.copy_from_slice(&result); true }
+                    Err(_) => false,
+                }
+            } else { false }
+        } else { false };
+        if !used_ane {
+            cpu_gemm(tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0);
+        }
 
         if has_softcap {
             for v in tile_slice.iter_mut() {
@@ -1224,6 +1254,10 @@ pub struct CompiledKernels {
     /// Standalone RMSNorm kernel — template with placeholder weight BLOBFILE.
     /// Per-layer kernels with baked weights live in PrePackedWeights.
     pub rmsnorm_fwd: Option<AneKernel>,
+    /// Classifier tile DynMatmul for fused CE: [CE_TILE, dim] @ [dim, seq] → [CE_TILE, seq].
+    pub cls_tile_fwd: Option<OcDynMatmulKernel>,
+    /// Classifier backward tile: [dim, CE_TILE] @ [CE_TILE, seq] → [dim, seq].
+    pub cls_tile_bwd: Option<OcDynMatmulKernel>,
     pub mask_blob: Vec<u8>,
     pub rope_cos_blob: Vec<u8>,
     pub rope_sin_blob: Vec<u8>,
@@ -1487,6 +1521,13 @@ impl CompiledKernels {
             }
         };
 
+        // Classifier tile kernels for fused CE (forward + backward tile GEMMs)
+        let cls_tile_fwd = OcDynMatmulKernel::compile(cfg, cfg.dim, CE_TILE).ok();
+        let cls_tile_bwd = OcDynMatmulKernel::compile(cfg, CE_TILE, cfg.dim).ok();
+        if cls_tile_fwd.is_some() {
+            tracing::debug!("ANE classifier tile fwd compiled (CE_TILE={CE_TILE})");
+        }
+
         Ok(Self {
             sdpa_fwd,
             sdpa_core_gqa,
@@ -1495,6 +1536,8 @@ impl CompiledKernels {
             ffn,
             fused_attn_gqa,
             rmsnorm_fwd,
+            cls_tile_fwd,
+            cls_tile_bwd,
             mask_blob,
             rope_cos_blob,
             rope_sin_blob,
@@ -1740,6 +1783,7 @@ pub fn forward_with_lora<T: TokenId>(
         seq,
         0.0,
         1.0,
+        None,
     );
 
     Ok(ForwardResultWithLora {
@@ -3158,6 +3202,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
         seq,
         0.0,
         1.0,
+        None,
     );
 
     ForwardResultWithLora {
@@ -3629,6 +3674,7 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
     let vocab = model.vocab_size();
     let cls_w = model.lm_head().unwrap_or(model.embed());
     let mut classifier_dy = vec![0.0f32; dim * seq];
+    let _t_ce = std::time::Instant::now();
     let loss = fused_classifier_ce(
         &mut classifier_dy,
         cls_w,
@@ -3639,6 +3685,7 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
         seq,
         softcap,
         1.0,
+        None, // CPU BLAS is faster than ANE DynMatmul for classifier tiles
     );
 
     let _prof_cls_us = _t_cls.elapsed().as_micros() as u64;
@@ -3991,6 +4038,7 @@ mod tests {
             seq,
             softcap,
             loss_scale,
+            None,
         );
 
         // Compare
@@ -4053,6 +4101,7 @@ mod tests {
             seq,
             0.0,
             1.0,
+            None,
         );
 
         let loss_err = (ref_loss - fused_loss).abs();
@@ -4096,6 +4145,7 @@ mod tests {
             seq,
             0.0,
             1.0,
+            None,
         );
 
         assert!(
