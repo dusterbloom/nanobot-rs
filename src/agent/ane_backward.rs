@@ -219,6 +219,16 @@ pub enum FfnBwdKernels {
 }
 
 impl FfnBwdKernels {
+    /// Get references to the Fused backward kernels (for cloning into per-layer pool).
+    pub fn fused_kernels(
+        &self,
+    ) -> Option<(&super::ane_bridge::AneKernel, &super::ane_bridge::AneKernel)> {
+        match self {
+            FfnBwdKernels::Fused { w2t, w13t } => Some((w2t, w13t)),
+            _ => None,
+        }
+    }
+
     /// Execute backward W2^T: dsilu = dffn @ W2^T (output is [hidden, seq]).
     ///
     /// `w2_transposed` is W2 pre-transposed to [dim, hidden] layout.
@@ -297,6 +307,11 @@ impl FfnBwdKernels {
         let FfnBwdKernels::Fused { w2t, .. } = self else {
             return Err("eval_w2t_prepacked requires Fused kernels".into());
         };
+        // Fast path: per-layer kernel with IOSurface-resident weights
+        if let Some(result) = prepacked.eval_bwd_w2t(layer, dffn, cfg) {
+            return result;
+        }
+        // Fallback: shared kernel, full buffer copy
         let input_bytes = prepacked.patch_bwd_w2t(layer, dffn, cfg.dim);
         let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW2t);
         w2t.write_input(0, input_bytes);
@@ -323,6 +338,11 @@ impl FfnBwdKernels {
         let FfnBwdKernels::Fused { w13t, .. } = self else {
             return Err("eval_w13t_prepacked requires Fused kernels".into());
         };
+        // Fast path: per-layer kernel with IOSurface-resident weights
+        if let Some(result) = prepacked.eval_bwd_w13t(layer, dh1, dh3, cfg) {
+            return result;
+        }
+        // Fallback: shared kernel, full buffer copy
         let input_bytes = prepacked.patch_bwd_w13t(layer, dh1, dh3, cfg.hidden_dim);
         let spec = KernelSpec::for_kernel(cfg, KernelType::FfnBwdW13t);
         w13t.write_input(0, input_bytes);
@@ -426,6 +446,12 @@ pub struct BackwardKernels {
     pub sdpa_bwd2: Option<AneKernel>,
     /// QKV backward (None at 4B where attention is CPU-only).
     pub qkv_bwd: Option<AneKernel>,
+    /// Fused backward attention GQA: single dispatch replacing wot+sdpa1+sdpa2+qkv.
+    /// Template kernel (zero weights) — per-layer kernels live in PrePackedWeights.
+    pub fused_attn_gqa_bwd: Option<AneKernel>,
+    /// RMSNorm backward (dx only, no dw — LoRA freezes base weights).
+    /// Template kernel with placeholder weights — per-layer kernels in PrePackedWeights.
+    pub rmsnorm_bwd: Option<AneKernel>,
 }
 
 impl BackwardKernels {
@@ -561,12 +587,62 @@ impl BackwardKernels {
             .ok()
         };
 
+        // Fused SDPA backward: replaces sdpa_bwd1 + sdpa_bwd2 with 1 dispatch.
+        // Uses [1,H,S,*] form with K/V pre-expanded. Only needs mask BLOBFILE.
+        let fused_attn_gqa_bwd = {
+            let has_gate = cfg.attn_output_gate;
+            let result = ane_mil::gen_sdpa_rope_bwd(cfg, has_gate);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = vec![mask_blob];
+            match AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            ) {
+                Ok(k) => {
+                    tracing::debug!("ANE fused SDPA backward compiled (replaces sdpa_bwd1+bwd2)");
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::debug!("ANE fused SDPA backward compile failed: {e}");
+                    None
+                }
+            }
+        };
+
+        // RMSNorm backward: dx-only kernel (dw not needed for LoRA).
+        let rmsnorm_bwd = {
+            let result = ane_mil::gen_rmsnorm_bwd(cfg.dim, cfg.seq_len, cfg.rms_eps);
+            let placeholder_w = ane_weights::build_fp16_blob(&vec![1.0f32; cfg.dim]);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            match AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &[&placeholder_w],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            ) {
+                Ok(k) => {
+                    tracing::debug!("ANE RMSNorm backward compiled");
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::debug!("ANE RMSNorm backward compile failed: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             ffn_bwd,
             wot_bwd,
             sdpa_bwd1,
             sdpa_bwd2,
             qkv_bwd,
+            fused_attn_gqa_bwd,
+            rmsnorm_bwd,
         })
     }
 }
@@ -1255,6 +1331,269 @@ fn mha_backward_ane_dx_attn(
     };
 
     let qkv_input = ane_weights::pack_qkvb(&dq_for_wq, &dk, &dv, &lw.wq, &lw.wk, &lw.wv, cfg);
+    let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
+    let qkv_kernel = kernels
+        .qkv_bwd
+        .as_ref()
+        .ok_or_else(|| "qkv_bwd kernel missing".to_string())?;
+    qkv_kernel.write_input(0, &qkv_input);
+    qkv_kernel
+        .eval()
+        .map_err(|e| format!("qkv_bwd eval: {e}"))?;
+    let mut qkv_out = vec![0u8; qkv_spec.output_bytes];
+    qkv_kernel.read_output(0, &mut qkv_out);
+    Ok(qkv_out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Backward attention using fused SDPA kernel (replaces sdpa_bwd1 + sdpa_bwd2).
+///
+/// Flow: wot_bwd(1) → CPU gate → fused_sdpa(1) → CPU RoPE → qkv_bwd(1) = 3 dispatches.
+fn mha_backward_fused_sdpa_dx_attn(
+    kernels: &BackwardKernels,
+    lw: &ane_weights::LayerWeights,
+    ac: &ane_forward::LayerActivations,
+    dx2: &[f32],
+    cfg: &MilConfig,
+) -> Result<Vec<f32>, String> {
+    let dim = cfg.dim;
+    let seq = cfg.seq_len;
+    let ad = cfg.attn_dim();
+    let hd = cfg.head_dim();
+    let heads = cfg.n_heads;
+    let kv_heads = cfg.n_kv_heads;
+    let hpg = cfg.heads_per_group();
+
+    // Step 1: Wo^T projection (same as 4-kernel path)
+    let wot_input = ane_weights::pack_dyn_matmul(dx2, &lw.wo, dim, ad, seq);
+    let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
+    let wot_kernel = kernels
+        .wot_bwd
+        .as_ref()
+        .ok_or_else(|| "wot_bwd kernel missing".to_string())?;
+    wot_kernel.write_input(0, &wot_input);
+    wot_kernel
+        .eval()
+        .map_err(|e| format!("wot_bwd eval: {e}"))?;
+    let mut wot_out = vec![0u8; wot_spec.output_bytes];
+    wot_kernel.read_output(0, &mut wot_out);
+    let da_raw: Vec<f32> = wot_out
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Step 2: Gate backward (CPU)
+    let (da, d_gate) = if cfg.attn_output_gate {
+        let gate_raw = ac.attn_gate.as_ref().unwrap();
+        let pre_gate = ac.attn_pre_gate.as_ref().unwrap();
+        let (d_attn, dg) = sigmoid_gate_backward(&da_raw, gate_raw, pre_gate);
+        (d_attn, Some(dg))
+    } else {
+        (da_raw, None)
+    };
+
+    // Step 3: Fused SDPA backward (1 dispatch replaces sdpa_bwd1 + sdpa_bwd2)
+    // Expand K/V from kv_heads to full heads (repeat each KV head hpg times)
+    let kvd = cfg.kv_dim();
+    let q_rot = &ac.q[..ad * seq];
+    let k_rot = &ac.k[..kvd * seq]; // [kvd, seq]
+    let v = &ac.v[..kvd * seq]; // [kvd, seq]
+
+    // Expand K: [kvd, seq] → [ad, seq] by repeating each KV head hpg times
+    let mut k_expanded = vec![0.0f32; ad * seq];
+    for kv_h in 0..kv_heads {
+        for rep in 0..hpg {
+            let dst_h = kv_h * hpg + rep;
+            let src_off = kv_h * hd * seq;
+            let dst_off = dst_h * hd * seq;
+            k_expanded[dst_off..dst_off + hd * seq]
+                .copy_from_slice(&k_rot[src_off..src_off + hd * seq]);
+        }
+    }
+    let mut v_expanded = vec![0.0f32; ad * seq];
+    for kv_h in 0..kv_heads {
+        for rep in 0..hpg {
+            let dst_h = kv_h * hpg + rep;
+            let src_off = kv_h * hd * seq;
+            let dst_off = dst_h * hd * seq;
+            v_expanded[dst_off..dst_off + hd * seq]
+                .copy_from_slice(&v[src_off..src_off + hd * seq]);
+        }
+    }
+
+    // Pack input: da[ad,seq] | Q_rot[ad,seq] | K_expanded[ad,seq] | V_expanded[ad,seq]
+    let in_ch = 4 * ad;
+    let mut input = Vec::with_capacity(in_ch * seq);
+    input.extend_from_slice(&da);
+    input.extend_from_slice(q_rot);
+    input.extend_from_slice(&k_expanded);
+    input.extend_from_slice(&v_expanded);
+
+    let fused_kernel = kernels
+        .fused_attn_gqa_bwd
+        .as_ref()
+        .ok_or_else(|| "fused_sdpa_bwd kernel missing".to_string())?;
+    let input_bytes =
+        unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+    fused_kernel.write_input(0, input_bytes);
+    fused_kernel
+        .eval()
+        .map_err(|e| format!("fused_sdpa_bwd eval: {e}"))?;
+
+    // Output: [1, 3*H, S, hd] fp32 — dQ_scaled | dK_scaled | dV stacked on head axis
+    let out_elems = 3 * heads * seq * hd;
+    let mut out_buf = vec![0u8; out_elems * 4];
+    fused_kernel.read_output(0, &mut out_buf);
+    let output: Vec<f32> = out_buf
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Unpack: slice head axis into dQ[H,S,hd], dK[H,S,hd], dV[H,S,hd]
+    let head_stride = seq * hd;
+    let dq_start = 0;
+    let dk_start = heads * head_stride;
+    let dv_start = 2 * heads * head_stride;
+
+    let dq_scaled: Vec<f32> = output[dq_start..dk_start].to_vec();
+    let dk_all: Vec<f32> = output[dk_start..dv_start].to_vec();
+    let dv_all: Vec<f32> = output[dv_start..].to_vec();
+
+    // Transpose dQ from [H,S,hd] → [ad, seq] channel form
+    let mut dq = vec![0.0f32; ad * seq];
+    for h in 0..heads {
+        for t in 0..seq {
+            for d in 0..hd {
+                dq[(h * hd + d) * seq + t] = dq_scaled[h * head_stride + t * hd + d];
+            }
+        }
+    }
+    // Transpose dK/dV at full [H,S,hd] → [ad, seq] (NOT GQA-reduced yet — need full
+    // dimension for RoPE backward and QK-norm backward which work at attn_dim)
+    let mut dk = vec![0.0f32; ad * seq];
+    for h in 0..heads {
+        for t in 0..seq {
+            for d in 0..hd {
+                dk[(h * hd + d) * seq + t] = dk_all[h * head_stride + t * hd + d];
+            }
+        }
+    }
+
+    // RoPE backward on Q and K at full attn_dim
+    ane_forward::rope_backward(&mut dq, &mut dk, heads, hd, seq, cfg.rope_theta);
+
+    // QK-norm backward (if applicable) — both at full attn_dim
+    if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
+        ane_forward::qk_rmsnorm_bwd(
+            &mut dq,
+            &mut vec![0.0f32; cfg.head_dim()],
+            q_pre,
+            q_nw,
+            cfg.n_heads,
+            cfg.head_dim(),
+            seq,
+            cfg.rms_eps,
+        );
+    }
+    if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
+        ane_forward::qk_rmsnorm_bwd(
+            &mut dk,
+            &mut vec![0.0f32; cfg.head_dim()],
+            k_pre,
+            k_nw,
+            cfg.n_heads, // dk still at full attn_dim here
+            cfg.head_dim(),
+            seq,
+            cfg.rms_eps,
+        );
+    }
+
+    // NOW GQA-reduce dK → [kv_dim, seq], dV → [kv_dim, seq]
+    let mut dk_reduced = vec![0.0f32; kvd * seq];
+    let inv_hpg = 1.0 / hpg as f32;
+    for kv_h in 0..kv_heads {
+        for rep in 0..hpg {
+            let src_h = kv_h * hpg + rep;
+            for c in 0..hd {
+                let dst_row = kv_h * hd + c;
+                let src_row = src_h * hd + c;
+                for t in 0..seq {
+                    dk_reduced[dst_row * seq + t] += dk[src_row * seq + t] * inv_hpg;
+                }
+            }
+        }
+    }
+    let dk = dk_reduced;
+
+    // GQA-reduce dV: transpose from [H,S,hd] then reduce
+    let mut dv = vec![0.0f32; kvd * seq];
+    for kv_h in 0..kv_heads {
+        for rep in 0..hpg {
+            let src_h = kv_h * hpg + rep;
+            for t in 0..seq {
+                for d in 0..hd {
+                    let dst_row = kv_h * hd + d;
+                    dv[dst_row * seq + t] +=
+                        dv_all[src_h * head_stride + t * hd + d] * inv_hpg;
+                }
+            }
+        }
+    }
+
+    // Step 5: QKV^T projection (same as 4-kernel path)
+    let dq_for_wq = if let Some(dg) = &d_gate {
+        ane_forward::merge_q_gate(&dq, dg, cfg.n_heads, cfg.head_dim(), seq)
+    } else {
+        dq
+    };
+
+    // Re-expand dk/dv to [attn_dim, seq] for QKV^T kernel (weights are stored expanded)
+    let dk_expanded = if hpg > 1 {
+        let mut exp = vec![0.0f32; ad * seq];
+        for kv_h in 0..kv_heads {
+            for rep in 0..hpg {
+                let dst_h = kv_h * hpg + rep;
+                for c in 0..hd {
+                    let src_row = kv_h * hd + c;
+                    let dst_row = dst_h * hd + c;
+                    exp[dst_row * seq..(dst_row + 1) * seq]
+                        .copy_from_slice(&dk[src_row * seq..(src_row + 1) * seq]);
+                }
+            }
+        }
+        exp
+    } else {
+        dk
+    };
+    let dv_expanded = if hpg > 1 {
+        let mut exp = vec![0.0f32; ad * seq];
+        for kv_h in 0..kv_heads {
+            for rep in 0..hpg {
+                let dst_h = kv_h * hpg + rep;
+                for c in 0..hd {
+                    let src_row = kv_h * hd + c;
+                    let dst_row = dst_h * hd + c;
+                    exp[dst_row * seq..(dst_row + 1) * seq]
+                        .copy_from_slice(&dv[src_row * seq..(src_row + 1) * seq]);
+                }
+            }
+        }
+        exp
+    } else {
+        dv
+    };
+
+    let qkv_input = ane_weights::pack_qkvb(
+        &dq_for_wq,
+        &dk_expanded,
+        &dv_expanded,
+        &lw.wq,
+        &lw.wk,
+        &lw.wv,
+        cfg,
+    );
     let qkv_spec = KernelSpec::for_kernel(cfg, KernelType::Qkvb);
     let qkv_kernel = kernels
         .qkv_bwd
@@ -2356,18 +2695,17 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         };
         ane_forward::clamp_fp16(&mut dx_ffn);
 
-        // RMSNorm backward (FFN, CPU)
-        let mut dx2 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(
-            &mut dx2,
-            &mut vec![0.0f32; dim],
-            &dx_ffn,
-            &ac.x2,
-            &lw.rms_ffn,
-            dim,
-            seq,
-            cfg.rms_eps,
-        );
+        // RMSNorm backward (FFN): ANE per-layer kernel → CPU fallback
+        let mut dx2 = if let Some(Ok(result)) = prepacked
+            .as_ref()
+            .and_then(|pp| pp.eval_rmsnorm_bwd(l, &dx_ffn, &ac.x2, true))
+        {
+            result
+        } else {
+            let mut dx = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(&mut dx, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+            dx
+        };
         ane_forward::vec_add_inplace(&mut dx2, &dz_ffn);
 
         // Apply residual_scale for attention residual backward
@@ -2418,35 +2756,65 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             continue;
         }
 
-        let dx_attn = if bwd_kernels.wot_bwd.is_some()
-            && bwd_kernels.sdpa_bwd1.is_some()
-            && bwd_kernels.sdpa_bwd2.is_some()
-            && bwd_kernels.qkv_bwd.is_some()
-        {
-            match mha_backward_ane_dx_attn(bwd_kernels, lw, ac, &dx2, cfg) {
-                Ok(dx_attn) => dx_attn,
-                Err(e) => {
-                    tracing::warn!("ANE MHA backward fell back to CPU: {e}");
-                    mha_backward_cpu_dx_attn(lw, ac, &dx2, cfg)
+        // Fused-first backward attention: 1 dispatch vs 4 separate + CPU interleaving.
+        let dx_attn = 'attn_bwd: {
+            // 1. Try fused per-layer kernel (real weights, delta-cached)
+            if let Some(ref mut pp) = prepacked {
+                if lw.q_norm.is_none() && lw.k_norm.is_none() {
+                    if let Some(result) = pp.eval_bwd_fused_attn_gqa(l, &dx2, ac, cfg) {
+                        match result {
+                            Ok(dx) => {
+                                let mut dx = dx;
+                                ane_forward::clamp_fp16(&mut dx);
+                                break 'attn_bwd dx;
+                            }
+                            Err(e) => {
+                                tracing::warn!("fused_attn_gqa_bwd layer {l}: {e}");
+                            }
+                        }
+                    }
                 }
             }
-        } else {
+            // 2. Try fused SDPA path (3 dispatches: wot + fused_sdpa + qkv)
+            if bwd_kernels.fused_attn_gqa_bwd.is_some()
+                && bwd_kernels.wot_bwd.is_some()
+                && bwd_kernels.qkv_bwd.is_some()
+            {
+                match mha_backward_fused_sdpa_dx_attn(bwd_kernels, lw, ac, &dx2, cfg) {
+                    Ok(dx_attn) => break 'attn_bwd dx_attn,
+                    Err(e) => {
+                        tracing::warn!("ANE fused SDPA backward fell back: {e}");
+                    }
+                }
+            }
+            // 3. Fall back to 4-kernel path
+            if bwd_kernels.wot_bwd.is_some()
+                && bwd_kernels.sdpa_bwd1.is_some()
+                && bwd_kernels.sdpa_bwd2.is_some()
+                && bwd_kernels.qkv_bwd.is_some()
+            {
+                match mha_backward_ane_dx_attn(bwd_kernels, lw, ac, &dx2, cfg) {
+                    Ok(dx_attn) => break 'attn_bwd dx_attn,
+                    Err(e) => {
+                        tracing::warn!("ANE MHA backward fell back to CPU: {e}");
+                    }
+                }
+            }
+            // 3. CPU fallback
             mha_backward_cpu_dx_attn(lw, ac, &dx2, cfg)
         };
 
-        // RMSNorm backward (attention)
-        let mut dx_rms1 = vec![0.0f32; dim * seq];
-        rmsnorm_bwd(
-            &mut dx_rms1,
-            &mut vec![0.0f32; dim],
-            &dx_attn,
-            &ac.layer_in,
-            &lw.rms_att,
-            dim,
-            seq,
-            cfg.rms_eps,
-        );
-        dy = dx_rms1;
+        // RMSNorm backward (attention): ANE per-layer kernel → CPU fallback
+        dy = if let Some(Ok(result)) = prepacked
+            .as_ref()
+            .and_then(|pp| pp.eval_rmsnorm_bwd(l, &dx_attn, &ac.layer_in, false))
+        {
+            result
+        } else {
+            let mut dx = vec![0.0f32; dim * seq];
+            rmsnorm_bwd(&mut dx, &mut vec![0.0f32; dim], &dx_attn, &ac.layer_in, &lw.rms_att, dim, seq, cfg.rms_eps);
+            dx
+        };
         ane_forward::vec_add_inplace(&mut dy, &dx2);
     }
 
@@ -4148,5 +4516,118 @@ mod tests {
             "Qwen3.5-0.8B LoRA training: {} steps, losses={:.4?}",
             n_steps, losses
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused SDPA backward vs CPU reference (gen_sdpa_rope_bwd correctness)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fused_sdpa_bwd_matches_cpu_reference() {
+        let dim = 64;
+        let hidden = 128;
+        let n_heads: usize = 4;
+        let n_kv_heads: usize = 4; // MHA (forward_cpu doesn't support GQA K/V dims)
+        let head_dim: usize = 16;
+        let seq = 64;
+        let vocab = 32;
+        let ad = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let qpd = 2 * ad; // attn_output_gate
+
+        let cfg = MilConfig {
+            dim,
+            hidden_dim: hidden,
+            n_heads,
+            seq_len: seq,
+            n_kv_heads,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            has_lm_head: false,
+            head_dim_explicit: head_dim,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let fwd_kernels = match ane_forward::CompiledKernels::compile_forward(&cfg) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping fused SDPA backward test (ANE unavailable): {e}");
+                return;
+            }
+        };
+
+        let bwd_kernels =
+            BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
+                .expect("compile_backward failed");
+
+        if bwd_kernels.fused_attn_gqa_bwd.is_none() {
+            eprintln!("Skipping: fused_attn_gqa_bwd kernel did not compile");
+            return;
+        }
+
+        let make = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0013).sin() * 0.05)
+                .collect()
+        };
+
+        let model = ane_weights::ModelWeights {
+            cfg: cfg.clone(),
+            layers: vec![ane_weights::LayerWeights {
+                wq: make(qpd * dim, 0),
+                wk: make(kv_dim * dim, 1000),
+                wv: make(kv_dim * dim, 2000),
+                wo: make(dim * ad, 3000),
+                w1: make(hidden * dim, 4000),
+                w2: make(dim * hidden, 5000),
+                w3: make(hidden * dim, 6000),
+                rms_att: vec![1.0; dim],
+                rms_ffn: vec![1.0; dim],
+                q_norm: None,
+                k_norm: None,
+                gdn: None,
+            }],
+            rms_final: vec![1.0; dim],
+            embed: make(vocab * dim, 7000),
+            vocab_size: vocab,
+            lm_head: None,
+        };
+
+        let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
+        let targets: Vec<u16> = (0..seq).map(|i| ((i + 1) % vocab) as u16).collect();
+
+        let fwd = ane_forward::forward_cpu(&model, None, &tokens, &targets);
+        assert!(fwd.base.loss.is_finite(), "forward loss: {}", fwd.base.loss);
+
+        let ac = &fwd.base.layer_acts[0];
+        let lw = &model.layers[0];
+        let dx2 = make(dim * seq, 8000);
+
+        let cpu_dx = mha_backward_cpu_dx_attn(lw, ac, &dx2, &cfg);
+        let fused_dx = mha_backward_fused_sdpa_dx_attn(&bwd_kernels, lw, ac, &dx2, &cfg)
+            .expect("fused SDPA backward failed");
+
+        assert_eq!(cpu_dx.len(), fused_dx.len());
+
+        let max_err = max_abs_diff(&cpu_dx, &fused_dx);
+        let cpu_norm: f32 = cpu_dx.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let fused_norm: f32 = fused_dx.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        eprintln!(
+            "fused SDPA bwd: max_err={max_err:.6}, cpu_norm={cpu_norm:.6}, fused_norm={fused_norm:.6}"
+        );
+
+        assert!(
+            max_err < 0.05,
+            "fused SDPA backward max error too large: {max_err:.6}"
+        );
+        assert!(cpu_norm > 1e-8, "CPU dx_attn is zero: norm={cpu_norm}");
+        assert!(fused_norm > 1e-8, "Fused dx_attn is zero: norm={fused_norm}");
     }
 }

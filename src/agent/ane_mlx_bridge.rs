@@ -761,6 +761,69 @@ impl AneTrainerSession {
                         );
                     }
                 }
+
+                // Prime per-layer fused BACKWARD attention GQA kernels (same delta cache).
+                if bwd_k.fused_attn_gqa_bwd.is_some() {
+                    match pp.prime_bwd_attn_kernels(
+                        &attn_cfg,
+                        &self.model,
+                        &fwd_k.rope_cos_blob,
+                        &fwd_k.rope_sin_blob,
+                        &fwd_k.mask_blob,
+                    ) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "ANE train: fused backward attention GQA kernels primed for seq_len={}",
+                                bucket_seq,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "ANE train: fused backward attention GQA priming failed for seq_len={}: {}",
+                                bucket_seq, e,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Prime per-layer RMSNorm kernels (forward + backward, attention + FFN).
+            if fwd_k.rmsnorm_fwd.is_some() {
+                let rms_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                match pp.prime_rmsnorm_kernels(&rms_cfg, &self.model) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ANE train: RMSNorm fwd kernels primed for seq_len={}",
+                            bucket_seq,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ANE train: RMSNorm fwd priming failed for seq_len={}: {}",
+                            bucket_seq, e,
+                        );
+                    }
+                }
+                if bwd_k.rmsnorm_bwd.is_some() {
+                    match pp.prime_rmsnorm_bwd_kernels(&rms_cfg, &self.model) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "ANE train: RMSNorm bwd kernels primed for seq_len={}",
+                                bucket_seq,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "ANE train: RMSNorm bwd priming failed for seq_len={}: {}",
+                                bucket_seq, e,
+                            );
+                        }
+                    }
+                }
             }
 
             self.prepacked_weights.push((*bucket_seq, pp));

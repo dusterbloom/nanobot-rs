@@ -2229,7 +2229,18 @@ pub struct PrePackedWeights {
     bwd_w13t_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer fused attention GQA kernels with real weights baked in.
     /// Created via `compile_multi_weights` with delta cache hits (same MIL, different weights).
-    fwd_fused_attn_gqa_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    fwd_fused_attn_gqa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer fused backward attention GQA kernels with real weights baked in.
+    /// Same delta-cache pattern as forward: same MIL text → cached net.plist → load-only.
+    bwd_fused_attn_gqa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer RMSNorm (attention) kernels with baked weights.
+    rmsnorm_att_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer RMSNorm (FFN) kernels with baked weights.
+    rmsnorm_ffn_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer RMSNorm backward (attention) kernels — dx only, no dw.
+    rmsnorm_bwd_att_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Per-layer RMSNorm backward (FFN) kernels — dx only, no dw.
+    rmsnorm_bwd_ffn_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
 }
 
 impl PrePackedWeights {
@@ -2251,6 +2262,11 @@ impl PrePackedWeights {
             bwd_w2t_kernels: None,
             bwd_w13t_kernels: None,
             fwd_fused_attn_gqa_kernels: None,
+            bwd_fused_attn_gqa_kernels: None,
+            rmsnorm_att_kernels: None,
+            rmsnorm_ffn_kernels: None,
+            rmsnorm_bwd_att_kernels: None,
+            rmsnorm_bwd_ffn_kernels: None,
         }
     }
 
@@ -2349,6 +2365,11 @@ impl PrePackedWeights {
             bwd_w2t_kernels: None,
             bwd_w13t_kernels: None,
             fwd_fused_attn_gqa_kernels: None,
+            bwd_fused_attn_gqa_kernels: None,
+            rmsnorm_att_kernels: None,
+            rmsnorm_ffn_kernels: None,
+            rmsnorm_bwd_att_kernels: None,
+            rmsnorm_bwd_ffn_kernels: None,
         }
     }
 
@@ -2422,7 +2443,9 @@ impl PrePackedWeights {
 
     /// Returns true if per-layer kernels have been primed.
     pub fn has_per_layer_kernels(&self) -> bool {
-        self.fwd_fused_kernels.is_some() || self.fwd_fused_attn_gqa_kernels.is_some()
+        self.fwd_fused_kernels.is_some()
+            || self.fwd_fused_attn_gqa_kernels.is_some()
+            || self.bwd_fused_attn_gqa_kernels.is_some()
     }
 
     /// Drop per-layer IOSurface kernels to free memory bandwidth for inference.
@@ -2434,6 +2457,11 @@ impl PrePackedWeights {
         self.bwd_w2t_kernels = None;
         self.bwd_w13t_kernels = None;
         self.fwd_fused_attn_gqa_kernels = None;
+        self.bwd_fused_attn_gqa_kernels = None;
+        self.rmsnorm_att_kernels = None;
+        self.rmsnorm_ffn_kernels = None;
+        self.rmsnorm_bwd_att_kernels = None;
+        self.rmsnorm_bwd_ffn_kernels = None;
     }
 
     /// Prime per-layer kernel clones with IOSurface-resident weights.
@@ -2549,6 +2577,32 @@ impl PrePackedWeights {
             let lw_cow = model.layer(l);
             let lw = &*lw_cow;
 
+            // GDN (linear attention) layers have no Q/K/V/O — skip
+            if lw.gdn.is_some() || lw.wq.is_empty() {
+                kernels.push(None);
+                continue;
+            }
+
+            // Un-expand GQA: wk/wv are stored expanded [attn_dim, dim] but MIL
+            // wants compact [kv_dim, dim]. Extract head 0 from each group.
+            let hd = cfg.head_dim();
+            let hpg = cfg.heads_per_group();
+            let unexpand_kv = |expanded: &[f32]| -> Vec<f32> {
+                if hpg <= 1 {
+                    return expanded.to_vec();
+                }
+                let n_kv = cfg.n_kv_heads;
+                let mut compact = Vec::with_capacity(kv_dim * dim);
+                for kv_h in 0..n_kv {
+                    let src_h = kv_h * hpg; // first head in group
+                    for d in 0..hd {
+                        let row = src_h * hd + d;
+                        compact.extend_from_slice(&expanded[row * dim..(row + 1) * dim]);
+                    }
+                }
+                compact
+            };
+
             // Build per-layer weight blobs: transpose to MIL layout then fp16
             let blobs: Vec<Vec<u8>> = result
                 .weight_names
@@ -2563,13 +2617,15 @@ impl PrePackedWeights {
                         build_fp16_blob(&wq_t)
                     }
                     "@model_path/weights/wk.bin" => {
-                        // wk stored as [kv_dim, dim], MIL needs [dim, kv_dim]
-                        let wk_t = transpose_weight(&lw.wk, kv_dim, dim);
+                        // wk stored expanded [attn_dim, dim], un-expand → [kv_dim, dim], transpose → [dim, kv_dim]
+                        let wk_compact = unexpand_kv(&lw.wk);
+                        let wk_t = transpose_weight(&wk_compact, kv_dim, dim);
                         build_fp16_blob(&wk_t)
                     }
                     "@model_path/weights/wv.bin" => {
-                        // wv stored as [kv_dim, dim], MIL needs [dim, kv_dim]
-                        let wv_t = transpose_weight(&lw.wv, kv_dim, dim);
+                        // wv stored expanded [attn_dim, dim], un-expand → [kv_dim, dim], transpose → [dim, kv_dim]
+                        let wv_compact = unexpand_kv(&lw.wv);
+                        let wv_t = transpose_weight(&wv_compact, kv_dim, dim);
                         build_fp16_blob(&wv_t)
                     }
                     "@model_path/weights/wo.bin" => {
@@ -2593,15 +2649,15 @@ impl PrePackedWeights {
             )
             .map_err(|e| format!("layer {l} fused_attn_gqa compile: {e}"))?;
 
-            kernels.push(k);
+            kernels.push(Some(k));
         }
 
         let elapsed = t0.elapsed();
+        let attn_layers = kernels.iter().filter(|k| k.is_some()).count();
         tracing::info!(
-            "primed {} per-layer fused attention GQA kernels in {:.1}ms ({:.1}ms/layer)",
-            n_layers,
+            "primed {attn_layers}/{n_layers} per-layer fused attention GQA kernels in {:.1}ms ({:.1}ms/layer)",
             elapsed.as_secs_f64() * 1000.0,
-            elapsed.as_secs_f64() * 1000.0 / n_layers as f64,
+            if attn_layers > 0 { elapsed.as_secs_f64() * 1000.0 / attn_layers as f64 } else { 0.0 },
         );
         self.fwd_fused_attn_gqa_kernels = Some(kernels);
         Ok(())
@@ -2618,7 +2674,7 @@ impl PrePackedWeights {
         cfg: &super::ane_mil::MilConfig,
     ) -> Option<Result<FusedAttnGqaOutput, String>> {
         let kernels = self.fwd_fused_attn_gqa_kernels.as_ref()?;
-        let kernel = &kernels[layer];
+        let kernel = kernels[layer].as_ref()?;
 
         let xnorm_bytes =
             unsafe { std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4) };
@@ -2643,6 +2699,367 @@ impl PrePackedWeights {
         Some(Ok(unpack_fused_attn_gqa(
             &buf, cfg, has_gate, false,
         )))
+    }
+
+    /// Prime per-layer fused backward attention GQA kernels with real weights.
+    ///
+    /// Same pattern as `prime_attn_kernels()`: per-layer weight blobs compiled via
+    /// `compile_multi_weights` hitting delta cache. Cost: ~17ms × N layers one-time.
+    pub fn prime_bwd_attn_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+        rope_cos_blob: &[u8],
+        rope_sin_blob: &[u8],
+        mask_blob: &[u8],
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let has_qk_norm = false; // ANE batch>1 blocker
+        let result = super::ane_mil::gen_fused_attn_gqa_bwd(cfg, has_qk_norm);
+        let dim = cfg.dim;
+        let qpd = cfg.q_proj_dim();
+        let kv_dim = cfg.kv_dim();
+        let attn_dim = cfg.attn_dim();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            // GDN (linear attention) layers have no Q/K/V/O — skip
+            if lw.gdn.is_some() || lw.wq.is_empty() {
+                kernels.push(None);
+                continue;
+            }
+
+            // Un-expand GQA K/V (same logic as forward prime)
+            let hd = cfg.head_dim();
+            let hpg = cfg.heads_per_group();
+            let unexpand_kv = |expanded: &[f32]| -> Vec<f32> {
+                if hpg <= 1 {
+                    return expanded.to_vec();
+                }
+                let n_kv = cfg.n_kv_heads;
+                let mut compact = Vec::with_capacity(kv_dim * dim);
+                for kv_h in 0..n_kv {
+                    let src_h = kv_h * hpg;
+                    for d in 0..hd {
+                        let row = src_h * hd + d;
+                        compact.extend_from_slice(&expanded[row * dim..(row + 1) * dim]);
+                    }
+                }
+                compact
+            };
+
+            // Build per-layer weight blobs — same transposes as forward
+            let blobs: Vec<Vec<u8>> = result
+                .weight_names
+                .iter()
+                .map(|name| match *name {
+                    "@model_path/weights/rope_cos.bin" => rope_cos_blob.to_vec(),
+                    "@model_path/weights/rope_sin.bin" => rope_sin_blob.to_vec(),
+                    "@model_path/weights/mask.bin" => mask_blob.to_vec(),
+                    "@model_path/weights/wq.bin" => {
+                        let wq_t = transpose_weight(&lw.wq, qpd, dim);
+                        build_fp16_blob(&wq_t)
+                    }
+                    "@model_path/weights/wk.bin" => {
+                        let wk_compact = unexpand_kv(&lw.wk);
+                        let wk_t = transpose_weight(&wk_compact, kv_dim, dim);
+                        build_fp16_blob(&wk_t)
+                    }
+                    "@model_path/weights/wv.bin" => {
+                        let wv_compact = unexpand_kv(&lw.wv);
+                        let wv_t = transpose_weight(&wv_compact, kv_dim, dim);
+                        build_fp16_blob(&wv_t)
+                    }
+                    "@model_path/weights/wo.bin" => {
+                        let wo_t = transpose_weight(&lw.wo, dim, attn_dim);
+                        build_fp16_blob(&wo_t)
+                    }
+                    _ => build_fp16_blob(&vec![0.0f32; 16]),
+                })
+                .collect();
+
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} fused_attn_gqa_bwd compile: {e}"))?;
+
+            kernels.push(Some(k));
+        }
+
+        let elapsed = t0.elapsed();
+        let attn_layers = kernels.iter().filter(|k| k.is_some()).count();
+        tracing::info!(
+            "primed {attn_layers}/{n_layers} per-layer fused backward attention GQA kernels in {:.1}ms ({:.1}ms/layer)",
+            elapsed.as_secs_f64() * 1000.0,
+            if attn_layers > 0 { elapsed.as_secs_f64() * 1000.0 / attn_layers as f64 } else { 0.0 },
+        );
+        self.bwd_fused_attn_gqa_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate fused backward attention GQA on per-layer kernel.
+    ///
+    /// Packs dx2, Q_rot, K_rot, V, [pre_gate, gate_raw] into the input buffer,
+    /// evals, and returns dx_attn [dim, seq] fp32. Returns None if not primed.
+    pub fn eval_bwd_fused_attn_gqa(
+        &self,
+        layer: usize,
+        dx2: &[f32],
+        ac: &super::ane_forward::LayerActivations,
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_fused_attn_gqa_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+
+        let dim = cfg.dim;
+        let ad = cfg.attn_dim();
+        let kvd = cfg.kv_dim();
+        let seq = cfg.seq_len;
+        let has_gate = cfg.attn_output_gate;
+
+        // Pack input: dx2[dim,seq] | Q_rot[ad,seq] | K_rot[kvd,seq] | V[kvd,seq]
+        //             [| pre_gate[ad,seq] | gate_raw[ad,seq]]
+        let in_ch = if has_gate {
+            dim + 3 * ad + 2 * kvd
+        } else {
+            dim + ad + 2 * kvd
+        };
+        let mut input = Vec::with_capacity(in_ch * seq);
+        input.extend_from_slice(dx2);
+        input.extend_from_slice(&ac.q[..ad * seq]);
+        input.extend_from_slice(&ac.k[..kvd * seq]);
+        input.extend_from_slice(&ac.v[..kvd * seq]);
+        if has_gate {
+            if let (Some(pg), Some(gr)) = (ac.attn_pre_gate.as_ref(), ac.attn_gate.as_ref()) {
+                input.extend_from_slice(pg);
+                input.extend_from_slice(gr);
+            } else {
+                return Some(Err("gate activations missing for fused bwd attn".into()));
+            }
+        }
+
+        let input_bytes = unsafe {
+            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
+        };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!(
+                "per-layer fused_attn_gqa_bwd eval layer {layer}: {e}"
+            )));
+        }
+
+        let mut buf = vec![0u8; dim * seq * 4];
+        kernel.read_output(0, &mut buf);
+        let dx_attn: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some(Ok(dx_attn))
+    }
+
+    /// Prime per-layer RMSNorm kernels (attention + FFN) with baked weights.
+    ///
+    /// Each layer's RMSNorm weight vector is compiled into a per-layer kernel via
+    /// `compile_multi_weights` hitting the delta cache (same MIL, different weights).
+    pub fn prime_rmsnorm_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+        let result = super::ane_mil::gen_rmsnorm_fwd(dim, seq, cfg.rms_eps);
+
+        let mut att_kernels = Vec::with_capacity(n_layers);
+        let mut ffn_kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            // Attention RMSNorm weight
+            let att_blob = build_fp16_blob(&lw.rms_att);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &[&att_blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} rmsnorm_att compile: {e}"))?;
+            att_kernels.push(k);
+
+            // FFN RMSNorm weight
+            let ffn_blob = build_fp16_blob(&lw.rms_ffn);
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &[&ffn_blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} rmsnorm_ffn compile: {e}"))?;
+            ffn_kernels.push(k);
+        }
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed {} per-layer RMSNorm kernels (att+ffn) in {:.1}ms ({:.1}ms/layer)",
+            n_layers * 2,
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / n_layers as f64,
+        );
+        self.rmsnorm_att_kernels = Some(att_kernels);
+        self.rmsnorm_ffn_kernels = Some(ffn_kernels);
+        Ok(())
+    }
+
+    /// Prime per-layer RMSNorm backward kernels (dx only, no dw).
+    pub fn prime_rmsnorm_bwd_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+        let result = super::ane_mil::gen_rmsnorm_bwd(dim, seq, cfg.rms_eps);
+
+        let mut att_kernels = Vec::with_capacity(n_layers);
+        let mut ffn_kernels = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+
+            let att_blob = build_fp16_blob(&lw.rms_att);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &[&att_blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} rmsnorm_bwd_att compile: {e}"))?;
+            att_kernels.push(k);
+
+            let ffn_blob = build_fp16_blob(&lw.rms_ffn);
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &[&ffn_blob],
+                &[result.input_bytes],
+                &[result.output_bytes],
+            )
+            .map_err(|e| format!("layer {l} rmsnorm_bwd_ffn compile: {e}"))?;
+            ffn_kernels.push(k);
+        }
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed {} per-layer RMSNorm backward kernels (att+ffn) in {:.1}ms",
+            n_layers * 2,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        self.rmsnorm_bwd_att_kernels = Some(att_kernels);
+        self.rmsnorm_bwd_ffn_kernels = Some(ffn_kernels);
+        Ok(())
+    }
+
+    /// Evaluate RMSNorm backward on ANE per-layer kernel.
+    ///
+    /// Input: dy[dim,seq] and x[dim,seq] (the forward input).
+    /// Returns dx[dim,seq] or None if not primed.
+    pub fn eval_rmsnorm_bwd(
+        &self,
+        layer: usize,
+        dy: &[f32],
+        x: &[f32],
+        which_ffn: bool,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = if which_ffn {
+            self.rmsnorm_bwd_ffn_kernels.as_ref()?
+        } else {
+            self.rmsnorm_bwd_att_kernels.as_ref()?
+        };
+        let kernel = &kernels[layer];
+
+        // Pack input: dy | x concatenated on channel axis
+        let n = dy.len();
+        let mut input = Vec::with_capacity(2 * n);
+        input.extend_from_slice(dy);
+        input.extend_from_slice(x);
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!(
+                "rmsnorm_bwd eval layer {layer} (ffn={which_ffn}): {e}"
+            )));
+        }
+
+        let mut buf = vec![0u8; n * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some(Ok(out))
+    }
+
+    /// Evaluate RMSNorm on per-layer kernel. Returns None if not primed.
+    ///
+    /// `which`: `false` for attention RMSNorm, `true` for FFN RMSNorm.
+    pub fn eval_rmsnorm(
+        &self,
+        layer: usize,
+        x: &[f32],
+        which_ffn: bool,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = if which_ffn {
+            self.rmsnorm_ffn_kernels.as_ref()?
+        } else {
+            self.rmsnorm_att_kernels.as_ref()?
+        };
+        let kernel = &kernels[layer];
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!(
+                "rmsnorm eval layer {layer} (ffn={which_ffn}): {e}"
+            )));
+        }
+
+        let mut buf = vec![0u8; x.len() * 4];
+        kernel.read_output(0, &mut buf);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Some(Ok(out))
     }
 
     /// Evaluate forward fused FFN on per-layer kernel (IOSurface-resident weights).
