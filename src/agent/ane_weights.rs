@@ -2568,7 +2568,7 @@ impl PrePackedWeights {
         mask_blob: &[u8],
     ) -> Result<(), String> {
         let n_layers = model.n_layers();
-        let has_qk_norm = false; // ANE batch>1 blocker — matches compile_forward
+        let has_qk_norm = true; // QK-norm via reduce_mean(axis=-1) in [1,H,S,hd]
         let result = super::ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
         let dim = cfg.dim;
         let qpd = cfg.q_proj_dim();
@@ -2637,6 +2637,12 @@ impl PrePackedWeights {
                         // wo stored as [dim, attn_dim], MIL needs [attn_dim, dim]
                         let wo_t = transpose_weight(&lw.wo, dim, attn_dim);
                         build_fp16_blob(&wo_t)
+                    }
+                    "@model_path/weights/q_norm.bin" => {
+                        build_fp16_blob(lw.q_norm.as_deref().unwrap_or(&vec![1.0f32; hd]))
+                    }
+                    "@model_path/weights/k_norm.bin" => {
+                        build_fp16_blob(lw.k_norm.as_deref().unwrap_or(&vec![1.0f32; hd]))
                     }
                     _ => build_fp16_blob(&vec![0.0f32; 16]),
                 })
@@ -2719,7 +2725,7 @@ impl PrePackedWeights {
         mask_blob: &[u8],
     ) -> Result<(), String> {
         let n_layers = model.n_layers();
-        let has_qk_norm = false; // ANE batch>1 blocker
+        let has_qk_norm = false; // backward QK-norm not yet ported to axis=-1 approach
         let result = super::ane_mil::gen_fused_attn_gqa_bwd(cfg, has_qk_norm);
         let dim = cfg.dim;
         let qpd = cfg.q_proj_dim();

@@ -1882,14 +1882,12 @@ pub fn gen_fused_attn_gqa_fwd(cfg: &MilConfig, has_qk_norm: bool) -> FusedLayerM
 
     // --- QK-norm constants: [1,H,hd,S] → [H,hd,1,S], reduce_mean axis 1 per-head ---
     if has_qk_norm {
-        let _ = writeln!(m, "        int32 ch_ax = const()[name=string(\"chax\"), val=int32(1)];");
+        // QK-norm uses reduce_mean on axis -1 (hd dim) in [1,H,S,hd] layout
+        // No batch dim reshape needed — stays [1,*,*,*] throughout
+        let _ = writeln!(m, "        tensor<int32, [1]> rax_last = const()[name=string(\"raxl\"), val=tensor<int32, [1]>([-1])];");
         let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
         let _ = writeln!(m, "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];");
         let _ = writeln!(m, "        fp16 nhalf = const()[name=string(\"nh\"), val=fp16(-0.5)];");
-        let _ = writeln!(m, "        tensor<int32, [4]> rqnf = const()[name=string(\"rqnf\"), val=tensor<int32, [4]>([{heads},{hd},1,{seq}])];");
-        let _ = writeln!(m, "        tensor<int32, [4]> rqnb = const()[name=string(\"rqnb\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
-        let _ = writeln!(m, "        tensor<int32, [4]> rknf = const()[name=string(\"rknf\"), val=tensor<int32, [4]>([{kv_heads},{hd},1,{seq}])];");
-        let _ = writeln!(m, "        tensor<int32, [4]> rknb = const()[name=string(\"rknb\"), val=tensor<int32, [4]>([1,{kv_heads},{hd},{seq}])];");
     }
 
     // --- Cast input to fp16 ---
@@ -1940,18 +1938,18 @@ pub fn gen_fused_attn_gqa_fwd(cfg: &MilConfig, has_qk_norm: bool) -> FusedLayerM
         let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = transpose(perm=pm,x=q4)[name=string(\"q\")];");
     }
 
-    // --- Q QK-norm: [1,H,S,hd]→pm→[1,H,hd,S]→reshape [H,hd,1,S], reduce axis 1, back ---
+    // --- Q QK-norm: stay in [1,H,S,hd], reduce axis=3 (no batch dim change) ---
     if has_qk_norm {
-        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> qn_t = transpose(perm=pm,x=q)[name=string(\"qnt\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},{hd},1,{seq}]> qn_f = reshape(shape=rqnf,x=qn_t)[name=string(\"qnf\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},{hd},1,{seq}]> qn_sq = mul(x=qn_f,y=qn_f)[name=string(\"qnsq\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},1,1,{seq}]> qn_ms = reduce_mean(x=qn_sq,axes=ch_ax,keep_dims=kd)[name=string(\"qnms\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},1,1,{seq}]> qn_me = add(x=qn_ms,y=eps_v)[name=string(\"qnme\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},1,1,{seq}]> qn_ri = pow(x=qn_me,y=nhalf)[name=string(\"qnri\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},{hd},1,{seq}]> qn_nm = mul(x=qn_f,y=qn_ri)[name=string(\"qnnm\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{heads},{hd},1,{seq}]> qn_sc = mul(x=qn_nm,y=qnw)[name=string(\"qnsc\")];");
-        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> qn_b = reshape(shape=rqnb,x=qn_sc)[name=string(\"qnb\")];");
-        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q_n = transpose(perm=pm,x=qn_b)[name=string(\"qn\")];");
+        // sq = q^2, ms = reduce_mean(sq, axis=-1), rr = pow(ms+eps, -0.5), q_n = q*rr*w
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> qn_sq = mul(x=q,y=q)[name=string(\"qnsq\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> qn_ms = reduce_mean(x=qn_sq,axes=rax_last,keep_dims=kd)[name=string(\"qnms\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> qn_me = add(x=qn_ms,y=eps_v)[name=string(\"qnme\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> qn_ri = pow(x=qn_me,y=nhalf)[name=string(\"qnri\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> qn_nm = mul(x=q,y=qn_ri)[name=string(\"qnnm\")];");
+        // qnw is [1,hd,1,1] but we need [1,1,1,hd] for broadcast in [1,H,S,hd]
+        let _ = writeln!(m, "        tensor<int32, [4]> rqnw = const()[name=string(\"rqnw\"), val=tensor<int32, [4]>([1,1,1,{hd}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,1,{hd}]> qnw_b = reshape(shape=rqnw,x=qnw)[name=string(\"qnwb\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q_n = mul(x=qn_nm,y=qnw_b)[name=string(\"qn\")];");
     }
 
     // --- K: [1,1,S,kvd] → transpose → reshape → transpose → [1,kvH,S,hd] ---
@@ -1960,18 +1958,16 @@ pub fn gen_fused_attn_gqa_fwd(cfg: &MilConfig, has_qk_norm: bool) -> FusedLayerM
     let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> k4 = reshape(shape=rkv,x=kt2)[name=string(\"rk\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k = transpose(perm=pm,x=k4)[name=string(\"tk\")];");
 
-    // --- K QK-norm: same pattern as Q, but [1,kvH,S,hd] ---
+    // --- K QK-norm: stay in [1,kvH,S,hd], reduce axis=3 (no batch dim change) ---
     if has_qk_norm {
-        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> kn_t = transpose(perm=pm,x=k)[name=string(\"knt\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},{hd},1,{seq}]> kn_f = reshape(shape=rknf,x=kn_t)[name=string(\"knf\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},{hd},1,{seq}]> kn_sq = mul(x=kn_f,y=kn_f)[name=string(\"knsq\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},1,1,{seq}]> kn_ms = reduce_mean(x=kn_sq,axes=ch_ax,keep_dims=kd)[name=string(\"knms\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},1,1,{seq}]> kn_me = add(x=kn_ms,y=eps_v)[name=string(\"knme\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},1,1,{seq}]> kn_ri = pow(x=kn_me,y=nhalf)[name=string(\"knri\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},{hd},1,{seq}]> kn_nm = mul(x=kn_f,y=kn_ri)[name=string(\"knnm\")];");
-        let _ = writeln!(m, "        tensor<fp16, [{kv_heads},{hd},1,{seq}]> kn_sc = mul(x=kn_nm,y=knw)[name=string(\"knsc\")];");
-        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{hd},{seq}]> kn_b = reshape(shape=rknb,x=kn_sc)[name=string(\"knb\")];");
-        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_n = transpose(perm=pm,x=kn_b)[name=string(\"kn\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn_sq = mul(x=k,y=k)[name=string(\"knsq\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_ms = reduce_mean(x=kn_sq,axes=rax_last,keep_dims=kd)[name=string(\"knms\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_me = add(x=kn_ms,y=eps_v)[name=string(\"knme\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},1]> kn_ri = pow(x=kn_me,y=nhalf)[name=string(\"knri\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> kn_nm = mul(x=k,y=kn_ri)[name=string(\"knnm\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> rknw = const()[name=string(\"rknw\"), val=tensor<int32, [4]>([1,1,1,{hd}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,1,1,{hd}]> knw_b = reshape(shape=rknw,x=knw)[name=string(\"knwb\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{kv_heads},{seq},{hd}]> k_n = mul(x=kn_nm,y=knw_b)[name=string(\"kn\")];");
     }
 
     // --- V: same path ---
@@ -3809,6 +3805,77 @@ mod tests {
             "Fused attn GQA OK: {} output values, max_abs={max_abs:.4}, nonzero={nonzero}",
             output.len()
         );
+    }
+
+    #[test]
+    fn test_fused_attn_gqa_fwd_with_qknorm() {
+        use crate::agent::ane_weights::{build_fp16_blob, generate_rope_blobs, transpose_weight};
+        init_ane();
+
+        let cfg = MilConfig {
+            dim: 64, hidden_dim: 128, n_heads: 8, seq_len: 32, n_kv_heads: 4,
+            rope_theta: 1e6, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 16,
+            linear_attn_indices: vec![], linear_n_heads: 0, linear_head_dim: 0,
+            linear_n_value_heads: 0, linear_value_head_dim: 0, conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let hd = cfg.head_dim();
+        let kv_dim = cfg.kv_dim();
+        let qpd = cfg.q_proj_dim();
+        let dim = cfg.dim;
+        let attn_dim = cfg.attn_dim();
+        let seq = cfg.seq_len;
+
+        let make = |n: usize, s: usize| -> Vec<f32> { (0..n).map(|i| ((i+s) as f32 * 0.003).sin() * 0.1).collect() };
+        let wq_blob = build_fp16_blob(&transpose_weight(&make(qpd*dim, 1), qpd, dim));
+        let wk_blob = build_fp16_blob(&transpose_weight(&make(kv_dim*dim, 2), kv_dim, dim));
+        let wv_blob = build_fp16_blob(&transpose_weight(&make(kv_dim*dim, 3), kv_dim, dim));
+        let wo_blob = build_fp16_blob(&transpose_weight(&make(dim*attn_dim, 4), dim, attn_dim));
+        let (rc, rs) = generate_rope_blobs(seq, hd, cfg.rope_theta);
+        let mask = build_causal_mask_blob(seq);
+        let qn_blob = build_fp16_blob(&make(hd, 5));
+        let kn_blob = build_fp16_blob(&make(hd, 6));
+
+        let result = gen_fused_attn_gqa_fwd(&cfg, true); // QK-NORM ENABLED
+        eprintln!("Fused attn GQA FWD (qk_norm=true): {} bytes, {} weights", result.mil_text.len(), result.weight_names.len());
+
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let mut datas: Vec<&[u8]> = Vec::new();
+        for n in &names {
+            match *n {
+                "@model_path/weights/wq.bin" => datas.push(&wq_blob),
+                "@model_path/weights/wk.bin" => datas.push(&wk_blob),
+                "@model_path/weights/wv.bin" => datas.push(&wv_blob),
+                "@model_path/weights/wo.bin" => datas.push(&wo_blob),
+                "@model_path/weights/rope_cos.bin" => datas.push(&rc),
+                "@model_path/weights/rope_sin.bin" => datas.push(&rs),
+                "@model_path/weights/mask.bin" => datas.push(&mask),
+                "@model_path/weights/q_norm.bin" => datas.push(&qn_blob),
+                "@model_path/weights/k_norm.bin" => datas.push(&kn_blob),
+                _ => datas.push(&wq_blob),
+            }
+        }
+
+        match AneKernel::compile_multi_weights(
+            &result.mil_text, &names, &datas, &[result.input_bytes], &[result.output_bytes],
+        ) {
+            Ok(k) => {
+                eprintln!("QK-NORM FORWARD: COMPILED OK on ANE!");
+                let input: Vec<f32> = (0..dim*seq).map(|i| ((i+42) as f32*0.001).sin()*0.5).collect();
+                k.write_input(0, &f32_to_bytes(&input));
+                k.eval().expect("eval");
+                let mut out = vec![0u8; result.output_bytes];
+                k.read_output(0, &mut out);
+                let vals = bytes_to_f32(&out);
+                let nonzero = vals.iter().filter(|v| v.abs() > 1e-10).count();
+                eprintln!("QK-NORM FORWARD: {}/{} non-zero", nonzero, vals.len());
+                assert!(nonzero > 0, "output is all zeros");
+            }
+            Err(e) => {
+                eprintln!("QK-NORM FORWARD: COMPILE FAILED: {e}");
+                panic!("QK-norm forward kernel does not compile on ANE");
+            }
+        }
     }
 
     // ---- Round 9: gen_fused_attn_gqa_bwd ----

@@ -4076,6 +4076,162 @@ mod tests {
         );
     }
 
+    /// Benchmark: per-step timing for 35B ANE training (excludes load/compile).
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "local benchmark; requires Qwen3.5-35B-A3B-4bit"]
+    fn bench_35b_ane_per_step_timing() {
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-4bit not found");
+            return;
+        }
+
+        use crate::agent::ane_backward;
+        use crate::agent::ane_forward;
+        use crate::agent::ane_lora::{lora_adam_update_split_lr, LoraConfig, LoraModel, LoraModelAdam};
+        use crate::agent::ane_weights::{self, DenseCachedModel, QuantizedModelWeights, WeightSource};
+
+        let train_cfg =
+            crate::agent::learn_loop::build_ane_training_config(Some(&dir)).expect("build config");
+        let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
+        let messages = vec![
+            crate::agent::mlx_server::ChatMessage { role: "user".into(), content: "Explain why addition is commutative, then solve 27 + 15.".into() },
+            crate::agent::mlx_server::ChatMessage { role: "assistant".into(), content: "Addition is commutative because swapping the order of two quantities does not change the total. 27 + 15 = 42.".into() },
+        ];
+        let (tokens, targets) = crate::agent::mlx_server::tokenize_conversation(&tokenizer, &messages).expect("tokenize");
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
+
+        // --- Load + compile (timed separately) ---
+        let t_load = std::time::Instant::now();
+        let bucket_kernels = BucketKernels::compile(&[tokens_u32.len()], &train_cfg.mil_config)
+            .expect("bucket compile");
+        let compile_ms = t_load.elapsed().as_millis();
+
+        let (bucket_seq, bucket_fwd_k, bucket_bwd_k) = bucket_kernels
+            .get(tokens_u32.len())
+            .expect("bucket must exist");
+
+        let t_model = std::time::Instant::now();
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config)
+            .expect("load 35B");
+        let mut model = DenseCachedModel::auto(quantized);
+        model.cfg_mut().seq_len = *bucket_seq;
+        let load_ms = t_model.elapsed().as_millis();
+
+        let n_layers = model.n_layers();
+        let dim = model.actual_dim();
+        let hidden = model.actual_hidden_dim();
+        let residual_scale = if train_cfg.residual_scale > 0.0 {
+            train_cfg.residual_scale
+        } else {
+            1.0 / (2.0 * n_layers as f32).sqrt()
+        };
+
+        let tok_pad = pad_to(&tokens_u32, *bucket_seq);
+        let tgt_pad = pad_targets_to(&targets_u32, *bucket_seq);
+
+        let mut lora = LoraModel::with_full_dims(
+            LoraConfig::default(), n_layers, dim,
+            train_cfg.mil_config.kv_dim(), train_cfg.mil_config.attn_dim(),
+            train_cfg.mil_config.q_proj_dim(), hidden,
+        );
+        let mut adam = LoraModelAdam::zeros(&lora);
+
+        // Create prepacked weights (like real training path)
+        let fused_ffn = bucket_fwd_k.ffn.is_fully_fused();
+        let mut pp = ane_weights::PrePackedWeights::build(&model, *bucket_seq, fused_ffn);
+        {
+            let fwd_tmpl = bucket_fwd_k.ffn.fused_kernel();
+            let (bwd_w2t, bwd_w13t) = bucket_bwd_k.ffn_bwd.fused_kernels()
+                .map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None));
+            let _ = pp.prime_kernels(fwd_tmpl, bwd_w2t, bwd_w13t);
+        }
+        let pp_cfg = { let mut c = model.cfg().clone(); c.seq_len = *bucket_seq; c };
+        if bucket_fwd_k.fused_attn_gqa.is_some() {
+            let _ = pp.prime_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob);
+            if bucket_bwd_k.fused_attn_gqa_bwd.is_some() {
+                let _ = pp.prime_bwd_attn_kernels(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob);
+            }
+        }
+        if bucket_fwd_k.rmsnorm_fwd.is_some() {
+            let _ = pp.prime_rmsnorm_kernels(&pp_cfg, &model);
+            if bucket_bwd_k.rmsnorm_bwd.is_some() {
+                let _ = pp.prime_rmsnorm_bwd_kernels(&pp_cfg, &model);
+            }
+        }
+        let _ = pp.prime_fused_ffn_bwd_kernels(&pp_cfg, &model);
+
+        eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
+        eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);
+
+        let n_steps = 5;
+        let mut fwd_times = Vec::new();
+        let mut bwd_times = Vec::new();
+        let mut update_times = Vec::new();
+        let mut losses = Vec::new();
+
+        for step in 0..n_steps {
+            let t0 = std::time::Instant::now();
+            let fwd = ane_forward::forward_ane_generic_prepacked(
+                bucket_fwd_k, &model, Some(&lora), &tok_pad, &tgt_pad,
+                train_cfg.softcap, residual_scale, Some(&mut pp),
+            ).expect("fwd");
+            let fwd_us = t0.elapsed().as_micros();
+            fwd_times.push(fwd_us);
+
+            let t1 = std::time::Instant::now();
+            let bwd = ane_backward::backward_lora_ane_prepacked(
+                bucket_bwd_k, &model, &fwd, &lora,
+                train_cfg.loss_scale, residual_scale,
+                None, &mut pp,
+            );
+            let bwd_us = t1.elapsed().as_micros();
+            bwd_times.push(bwd_us);
+
+            let t2 = std::time::Instant::now();
+            lora_adam_update_split_lr(
+                &mut lora, &bwd.lora_grads, &mut adam, step + 1,
+                train_cfg.lr, train_cfg.lr_scale_attn, train_cfg.lr_scale_ffn,
+                0.9, 0.999, 1e-8, 0.01,
+            );
+            let upd_us = t2.elapsed().as_micros();
+            update_times.push(upd_us);
+
+            losses.push(fwd.base.loss);
+            let total_ms = (fwd_us + bwd_us + upd_us) as f64 / 1000.0;
+            eprintln!(
+                "  step {step}: fwd={:.1}ms bwd={:.1}ms upd={:.1}ms total={:.1}ms loss={:.4}",
+                fwd_us as f64 / 1000.0, bwd_us as f64 / 1000.0, upd_us as f64 / 1000.0,
+                total_ms, fwd.base.loss,
+            );
+        }
+
+        let avg_fwd = fwd_times[1..].iter().sum::<u128>() as f64 / (n_steps - 1) as f64 / 1000.0;
+        let avg_bwd = bwd_times[1..].iter().sum::<u128>() as f64 / (n_steps - 1) as f64 / 1000.0;
+        let avg_upd = update_times[1..].iter().sum::<u128>() as f64 / (n_steps - 1) as f64 / 1000.0;
+        let avg_total = avg_fwd + avg_bwd + avg_upd;
+        let tok_per_sec = (*bucket_seq as f64) / (avg_total / 1000.0);
+
+        let attn_layers = train_cfg.mil_config.linear_attn_indices.len();
+        let mha_layers = n_layers - attn_layers;
+        let dispatches_per_step = mha_layers * 12 + attn_layers * 4; // rough estimate
+
+        eprintln!("\n=== 35B-A3B Per-Step Summary (warm, excl. step 0) ===");
+        eprintln!("  avg fwd:    {avg_fwd:.1}ms");
+        eprintln!("  avg bwd:    {avg_bwd:.1}ms");
+        eprintln!("  avg update: {avg_upd:.1}ms");
+        eprintln!("  avg total:  {avg_total:.1}ms/step");
+        eprintln!("  tok/sec:    {tok_per_sec:.0}");
+        eprintln!("  seq_len:    {bucket_seq}");
+        eprintln!("  layers:     {n_layers} ({mha_layers} MHA + {attn_layers} GDN)");
+        eprintln!("  ~dispatches: {dispatches_per_step}/step");
+        eprintln!("  losses:     {losses:.4?}");
+    }
+
     /// Test: adapter export produces correct tensor count for 35B MoE layout.
     ///
     /// 35B: 40 layers, 30 GDN + 10 MHA.

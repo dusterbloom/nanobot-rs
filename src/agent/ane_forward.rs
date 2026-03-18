@@ -1216,6 +1216,9 @@ pub struct CompiledKernels {
     /// Fused attention for GQA + gated models (Qwen3.5): QKV+RoPE+SDPA+gate+Wo in 1 dispatch.
     /// Template kernel with placeholder BLOBFILE weights (compile per-layer via PrePackedWeights).
     pub fused_attn_gqa: Option<AneKernel>,
+    /// Standalone RMSNorm kernel — template with placeholder weight BLOBFILE.
+    /// Per-layer kernels with baked weights live in PrePackedWeights.
+    pub rmsnorm_fwd: Option<AneKernel>,
     pub mask_blob: Vec<u8>,
     pub rope_cos_blob: Vec<u8>,
     pub rope_sin_blob: Vec<u8>,
@@ -1393,7 +1396,7 @@ impl CompiledKernels {
         // Fused attention GQA: single-dispatch QKV+RoPE+SDPA+gate+Wo for GQA/gated models.
         // Compiled with placeholder zero-weight BLOBFILEs (real weights via per-layer kernels).
         let fused_attn_gqa = if cfg.attn_output_gate || cfg.n_kv_heads != cfg.n_heads {
-            let has_qk_norm = false; // ANE batch>1 blocker — skip for now
+            let has_qk_norm = true; // QK-norm via reduce_mean(axis=-1) in [1,H,S,hd]
             let result = ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
             let dim = cfg.dim;
             let qpd = cfg.q_proj_dim();
@@ -1454,6 +1457,31 @@ impl CompiledKernels {
             None
         };
 
+        // RMSNorm forward kernel (best-effort, None if compile fails)
+        let rmsnorm_fwd = {
+            let result = ane_mil::gen_rmsnorm_fwd(cfg.dim, cfg.seq_len, cfg.rms_eps);
+            // Build a placeholder weight blob for the template kernel
+            let placeholder_w = ane_weights::build_fp16_blob(&vec![1.0f32; cfg.dim]);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let datas: Vec<&[u8]> = vec![&placeholder_w];
+            match AneKernel::compile_multi_weights(
+                &result.mil_text,
+                &names,
+                &datas,
+                &[result.input_bytes],
+                &[result.output_bytes],
+            ) {
+                Ok(k) => {
+                    tracing::debug!("ANE RMSNorm forward compiled");
+                    Some(k)
+                }
+                Err(e) => {
+                    tracing::debug!("ANE RMSNorm forward compile failed: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             sdpa_fwd,
             sdpa_core_gqa,
@@ -1461,6 +1489,7 @@ impl CompiledKernels {
             gdn_proj_fwd,
             ffn,
             fused_attn_gqa,
+            rmsnorm_fwd,
             mask_blob,
             rope_cos_blob,
             rope_sin_blob,
@@ -3250,10 +3279,18 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
         // Clamp before RMSNorm to prevent fp16 overflow (Orion fix)
         clamp_fp16(&mut x_cur);
 
-        // RMSNorm before attention (CPU)
+        // RMSNorm before attention (ANE per-layer kernel → CPU fallback)
         let _t_rms = std::time::Instant::now();
-        let mut xnorm = vec![0.0f32; dim * seq];
-        rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+        let xnorm = if let Some(Ok(result)) = prepacked
+            .as_ref()
+            .and_then(|pp| pp.eval_rmsnorm(l, &x_cur, false))
+        {
+            result
+        } else {
+            let mut xn = vec![0.0f32; dim * seq];
+            rmsnorm(&mut xn, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+            xn
+        };
         _prof_rmsnorm_us += _t_rms.elapsed().as_micros() as u64;
 
         // --- Attention (CPU — handles GDN, GQA, QK-norm, attn_output_gate) ---
@@ -3288,9 +3325,9 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                 None,
                 None,
             )
-        } else if kernels.fused_attn_gqa.is_some() && lw.q_norm.is_none() && lw.k_norm.is_none() {
+        } else if kernels.fused_attn_gqa.is_some() {
             // Fused attention GQA: single ANE dispatch for QKV+RoPE+SDPA+gate+Wo.
-            // Skip for layers with QK-norm (ANE batch>1 blocker).
+            // QK-norm is now handled inside the MIL kernel (reduce_mean axis=-1).
             // Fast path: per-layer kernel with real weights baked in.
             // Fallback: template kernel with zero weights (produces zero output).
             let u = if let Some(result) = prepacked
@@ -3442,10 +3479,18 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
         // Clamp before RMSNorm to prevent fp16 overflow (Orion fix)
         clamp_fp16(&mut x2);
 
-        // RMSNorm before FFN (CPU)
+        // RMSNorm before FFN (ANE per-layer kernel → CPU fallback)
         let _t_ffn = std::time::Instant::now();
-        let mut x2norm = vec![0.0f32; dim * seq];
-        rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+        let x2norm = if let Some(Ok(result)) = prepacked
+            .as_ref()
+            .and_then(|pp| pp.eval_rmsnorm(l, &x2, true))
+        {
+            result
+        } else {
+            let mut xn = vec![0.0f32; dim * seq];
+            rmsnorm(&mut xn, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+            xn
+        };
 
         // --- FFN on ANE ---
         let (mut h1, mut h3, mut gate, mut ffn_out) = if kernels.ffn.is_fully_fused() {
