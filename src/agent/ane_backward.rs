@@ -2551,10 +2551,18 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     );
     dy = dx_rms;
 
-    // Per-layer backward (reverse)
+    // Per-layer backward (reverse) with optional phase profiling
+    let mut _prof_ffn_us = 0u64;
+    let mut _prof_attn_us = 0u64;
+    let mut _prof_rmsnorm_us = 0u64;
+    let mut _prof_lora_us = 0u64;
+    let mut _prof_misc_us = 0u64;
+
     for l in (0..n_layers).rev() {
         let ac = &fwd.base.layer_acts[l];
         let la = &fwd.lora_acts[l];
+
+        let _t_layer = std::time::Instant::now();
 
         // Apply residual_scale to dy for FFN residual backward
         let dz_ffn = if apply_res_scale {
@@ -2601,16 +2609,19 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                 }
             });
 
-            // Main thread: try fused FFN backward (1 dispatch) → fallback to W2^T (2 dispatches)
-            // Try per-layer BLOBFILE first, then shared hotswap, then DynMatmul
+            // Main thread: try fused FFN backward (1 dispatch) → split (2 dispatches) → DynMatmul
+            // Fused: 3 matmuls in 1 kernel (fails at 35B dims)
+            // Split: W2T+SiLU then W13T (2 shallower kernels, compiles at any dim)
+            // DynMatmul: weight packed into input (slowest, always works)
             let fused_result = prepacked.as_ref().and_then(|pp| {
                 pp.eval_fused_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq)
                     .or_else(|| pp.eval_fused_ffn_bwd_hotswap(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq))
+                    .or_else(|| pp.eval_split_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq))
             });
             let (dsilu, fused_dx_ffn) = match fused_result {
                 Some(Ok((dx, ds))) => (ds, Some(dx)),
                 _ => {
-                    // Fallback: separate W2^T dispatch
+                    // Fallback: separate W2^T dispatch (DynMatmul)
                     let ds = if let Some(ref mut pp) = prepacked {
                         bwd_kernels
                             .ffn_bwd
@@ -2709,7 +2720,10 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
         };
         ane_forward::clamp_fp16(&mut dx_ffn);
 
+        _prof_ffn_us += _t_layer.elapsed().as_micros() as u64;
+
         // RMSNorm backward (FFN): ANE per-layer kernel → CPU fallback
+        let _t_rmsnorm = std::time::Instant::now();
         let mut dx2 = if let Some(Ok(result)) = prepacked
             .as_ref()
             .and_then(|pp| pp.eval_rmsnorm_bwd(l, &dx_ffn, &ac.x2, true))
@@ -2729,7 +2743,10 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             }
         }
 
+        _prof_rmsnorm_us += _t_rmsnorm.elapsed().as_micros() as u64;
+
         // --- LoRA Wo backward (CPU) ---
+        let _t_lora = std::time::Instant::now();
         if let (Some(wo_adapter), Some(wo_x), Some(wo_h), Some(lg)) = (
             lora.layers[l].wo.as_ref(),
             la.wo_x.as_ref(),
@@ -2762,7 +2779,10 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             }
         }
 
+        _prof_lora_us += _t_lora.elapsed().as_micros() as u64;
+
         // --- Attention backward (CPU — handles GQA, GDN, QK-norm, attn_output_gate) ---
+        let _t_attn = std::time::Instant::now();
         if lw.gdn.is_some() {
             // GDN layers: skip attention backward, gradient flows through residual only.
             // x2 = layer_in + gdn_out, so d_layer_in = dx2 (residual) + d_gdn (skipped=0).
@@ -2830,6 +2850,25 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             dx
         };
         ane_forward::vec_add_inplace(&mut dy, &dx2);
+
+        _prof_attn_us += _t_attn.elapsed().as_micros() as u64;
+    }
+
+    // Log backward phase profile (prepacked path)
+    if _prof_ffn_us + _prof_attn_us > 0 {
+        let total = (_prof_ffn_us + _prof_rmsnorm_us + _prof_lora_us + _prof_attn_us).max(1);
+        tracing::info!(
+            "backward profile: ffn={:.1}ms ({:.0}%) attn={:.1}ms ({:.0}%) rmsnorm={:.1}ms ({:.0}%) lora={:.1}ms ({:.0}%) total={:.1}ms",
+            _prof_ffn_us as f64 / 1000.0,
+            _prof_ffn_us as f64 / total as f64 * 100.0,
+            _prof_attn_us as f64 / 1000.0,
+            _prof_attn_us as f64 / total as f64 * 100.0,
+            _prof_rmsnorm_us as f64 / 1000.0,
+            _prof_rmsnorm_us as f64 / total as f64 * 100.0,
+            _prof_lora_us as f64 / 1000.0,
+            _prof_lora_us as f64 / total as f64 * 100.0,
+            total as f64 / 1000.0,
+        );
     }
 
     // Divide LoRA gradients by loss_scale to compensate for scaled dlogits

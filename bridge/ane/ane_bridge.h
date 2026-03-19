@@ -46,6 +46,17 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
     int n_inputs, const size_t *input_sizes,
     int n_outputs, const size_t *output_sizes);
 
+// Compile via _ANEClient direct path (supports conv, full MIL op set).
+// Same API as ane_bridge_compile_multi_weights but uses a different
+// compilation pipeline that supports conv1x1 and other ops blocked
+// by _ANEInMemoryModel.compileWithQoS.
+ANEKernelHandle *ane_bridge_compile_direct(
+    const char *mil_text, size_t mil_len,
+    const char **weight_names, const uint8_t **weight_datas,
+    const size_t *weight_lens, int n_weights,
+    int n_inputs, const size_t *input_sizes,
+    int n_outputs, const size_t *output_sizes);
+
 // Evaluate (run) a compiled kernel on ANE
 // Returns true on success
 bool ane_bridge_eval(ANEKernelHandle *kernel);
@@ -75,6 +86,12 @@ void ane_bridge_write_input_strided(ANEKernelHandle *kernel, int idx,
 void ane_bridge_read_output(ANEKernelHandle *kernel, int idx,
                               void *data, size_t bytes);
 
+// Clone a kernel: shares the compiled model but creates fresh IOSurfaces.
+// Use this to create per-layer kernel instances where each layer's weights
+// live permanently in its own IOSurface. The clone is ref-counted with the
+// source — the model is unloaded only when all clones + source are freed.
+ANEKernelHandle *ane_bridge_clone_kernel(ANEKernelHandle *source);
+
 // Free a compiled kernel and all associated resources
 void ane_bridge_free(ANEKernelHandle *kernel);
 
@@ -83,6 +100,42 @@ int ane_bridge_get_compile_count(void);
 
 // Reset compile count
 void ane_bridge_reset_compile_count(void);
+
+// Clear the persistent compilation cache (~/.nanobot/ane_cache/).
+// Use in tests to ensure a cold-start compilation.
+void ane_bridge_clear_cache(void);
+
+// Returns true if this kernel was loaded from the compilation cache
+// (no compileWithQoS: happened — delta compilation fast path).
+bool ane_bridge_was_cached(ANEKernelHandle *kernel);
+
+// --- Delta compilation (Orion-style weight reload without recompile) ---
+
+// Reload weights for an already-compiled kernel.
+// Unloads the model from ANE, writes new weight files to disk, and reloads.
+// The compiled microcode (net.plist) is reused — no recompilation.
+// weight_datas/weight_lens must match the weight count from the original compile.
+// Does NOT increment the compile count.
+// Returns true on success.
+bool ane_bridge_reload_weights(ANEKernelHandle *kernel,
+                                const uint8_t **weight_datas,
+                                const size_t *weight_lens,
+                                int n_weights);
+
+// Create a new kernel by patching weights from a donor's compiled program.
+// The donor's net.plist (compiled microcode) is copied to the new model's
+// temp directory. Only loadWithQoS: is called — no compileWithQoS:.
+// Use this when the MIL structure is the same but tensor shapes may differ
+// (e.g. different seq_len buckets with identical layer topology).
+// Does NOT increment the compile count.
+// Returns kernel handle or NULL on failure.
+ANEKernelHandle *ane_bridge_patch_from_donor(
+    ANEKernelHandle *donor,
+    const char *mil_text, size_t mil_len,
+    const char **weight_names, const uint8_t **weight_datas,
+    const size_t *weight_lens, int n_weights,
+    int n_inputs, const size_t *input_sizes,
+    int n_outputs, const size_t *output_sizes);
 
 // Build a weight blob in ANE format (128-byte header + fp16 data)
 // src: float32 weights [rows x cols]

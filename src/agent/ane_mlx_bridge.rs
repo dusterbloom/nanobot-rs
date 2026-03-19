@@ -593,6 +593,8 @@ struct AneTrainerSession {
     bucket_lora_grad_kernels: Vec<(usize, super::ane_lora::LoraWeightGradKernels)>,
     /// Pre-packed weight buffers per bucket seq_len (Orion delta patching).
     prepacked_weights: Vec<(usize, super::ane_weights::PrePackedWeights)>,
+    /// BLOBFILE classifier kernel for fused CE (1 ANE slot, per-tile hotswap).
+    cls_blob: Option<super::ane_forward::ClassifierBlobKernel>,
 }
 
 #[cfg(feature = "mlx")]
@@ -650,6 +652,7 @@ impl AneTrainerSession {
             bucket_kernels: BucketKernels::empty(),
             bucket_lora_grad_kernels: Vec::new(),
             prepacked_weights: Vec::new(),
+            cls_blob: None,
         })
     }
 
@@ -849,11 +852,22 @@ impl AneTrainerSession {
                                     bucket_seq,
                                 );
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "ANE train: fused FFN bwd priming failed for seq_len={}: {}",
-                                    bucket_seq, e,
-                                );
+                            Err(_) => {
+                                // Monolithic fused rejected — try split (2 shallower kernels)
+                                match pp.prime_split_ffn_bwd(&ffn_cfg, &self.model) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "ANE train: split FFN bwd primed (2 slots) for seq_len={}",
+                                            bucket_seq,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "ANE train: FFN bwd priming failed for seq_len={}: {}",
+                                            bucket_seq, e,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -886,6 +900,31 @@ impl AneTrainerSession {
             self.prepacked_weights.push((*bucket_seq, pp));
         }
         self.prepacked_weights.sort_by_key(|(seq, _)| *seq);
+
+        // Build classifier BLOBFILE kernel (1 ANE slot, per-tile hotswap)
+        if self.cls_blob.is_none() {
+            let cls_w = self.model.lm_head().unwrap_or(self.model.embed());
+            let vocab = self.model.vocab_size();
+            let dim = self.model.cfg().dim;
+            // Use the smallest bucket seq_len for the classifier kernel
+            let cls_seq = self
+                .prepacked_weights
+                .first()
+                .map(|(s, _)| *s)
+                .unwrap_or(128);
+            match super::ane_forward::ClassifierBlobKernel::build(cls_w, vocab, dim, cls_seq) {
+                Ok(blob) => {
+                    tracing::info!(
+                        "ANE train: classifier BLOBFILE primed ({} tiles, vocab={}, dim={}, seq={})",
+                        blob.n_tiles, vocab, dim, cls_seq,
+                    );
+                    self.cls_blob = Some(blob);
+                }
+                Err(e) => {
+                    tracing::warn!("ANE train: classifier BLOBFILE failed: {e}");
+                }
+            }
+        }
 
         let total_heap_bytes: usize = self
             .prepacked_weights
@@ -1124,6 +1163,7 @@ impl AneTrainerSession {
         let bucket_lora_grad_kernels = &self.bucket_lora_grad_kernels;
         let muon_kernels = self.muon_kernels.as_ref();
         let prepacked_weights = &mut self.prepacked_weights;
+        let cls_blob = &self.cls_blob;
         let model = &mut self.model;
         let lora = &mut self.lora;
         let adam = &mut self.adam;
@@ -1170,6 +1210,9 @@ impl AneTrainerSession {
                             .find(|(seq, _)| *seq == sample.bucket_seq)
                             .map(|(_, pp)| pp);
 
+                        // Use classifier BLOBFILE if seq_len matches
+                        let cls_ref = cls_blob.as_ref().filter(|b| b.seq == sample.bucket_seq);
+
                         match ane_forward::forward_ane_generic_prepacked(
                             fwd_k,
                             model,
@@ -1179,6 +1222,7 @@ impl AneTrainerSession {
                             cfg.softcap,
                             residual_scale,
                             pp,
+                            cls_ref,
                         ) {
                             Ok(fwd) => {
                                 // Re-get prepacked for backward (forward borrow ended)
@@ -4198,13 +4242,18 @@ mod tests {
         //   MHA fwd:  10 slots → saves ~400ms (40ms/slot)
         // Total: 60+40+10+23 templates = 133. Over budget — some will fail gracefully.
         eprintln!("35B bench: compile count after GDN+MHA = {}", crate::agent::ane_bridge::compile_count());
-        // FFN bwd: try per-layer first, fall back to shared hotswap (1 program slot)
+        // FFN bwd: try fused (1 slot) → split (2 slots) → DynMatmul fallback
         match pp.prime_fused_ffn_bwd_kernels(&pp_cfg, &model) {
             Ok(()) => eprintln!("35B bench: FFN bwd per-layer primed OK"),
             Err(_) => {
                 match pp.prime_fused_ffn_bwd_shared(&pp_cfg, &model) {
                     Ok(()) => eprintln!("35B bench: FFN bwd shared hotswap primed OK"),
-                    Err(e) => eprintln!("35B bench: FFN bwd FAILED: {e}"),
+                    Err(_) => {
+                        match pp.prime_split_ffn_bwd(&pp_cfg, &model) {
+                            Ok(()) => eprintln!("35B bench: FFN bwd split (2 slots) primed OK"),
+                            Err(e) => eprintln!("35B bench: FFN bwd FAILED: {e}"),
+                        }
+                    }
                 }
             }
         }
@@ -4220,17 +4269,39 @@ mod tests {
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
         eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);
 
+        // Build classifier BLOBFILE kernel
+        let cls_w = model.lm_head().unwrap_or(model.embed());
+        let cls_blob = match ane_forward::ClassifierBlobKernel::build(cls_w, model.vocab_size(), dim, *bucket_seq) {
+            Ok(blob) => {
+                eprintln!("35B bench: classifier BLOBFILE primed ({} tiles)", blob.n_tiles);
+                Some(blob)
+            }
+            Err(e) => {
+                eprintln!("35B bench: classifier BLOBFILE failed: {e}");
+                None
+            }
+        };
+
         let n_steps = 5;
         let mut fwd_times = Vec::new();
         let mut bwd_times = Vec::new();
         let mut update_times = Vec::new();
         let mut losses = Vec::new();
 
+        // Warmup pass with cls_blob (pre-compile all tile hexIds)
+        if cls_blob.is_some() {
+            let _ = ane_forward::forward_ane_generic_prepacked(
+                bucket_fwd_k, &model, Some(&lora), &tok_pad, &tgt_pad,
+                train_cfg.softcap, residual_scale, Some(&mut pp), cls_blob.as_ref(),
+            );
+            eprintln!("35B bench: classifier warmup done (tile hexIds compiled)");
+        }
+
         for step in 0..n_steps {
             let t0 = std::time::Instant::now();
             let fwd = ane_forward::forward_ane_generic_prepacked(
                 bucket_fwd_k, &model, Some(&lora), &tok_pad, &tgt_pad,
-                train_cfg.softcap, residual_scale, Some(&mut pp),
+                train_cfg.softcap, residual_scale, Some(&mut pp), cls_blob.as_ref(),
             ).expect("fwd");
             let fwd_us = t0.elapsed().as_micros();
             fwd_times.push(fwd_us);
@@ -4988,6 +5059,7 @@ mod tests {
             softcap,
             residual_scale,
             Some(&mut prepacked),
+            None,
         );
 
         let t0 = std::time::Instant::now();
@@ -5002,6 +5074,7 @@ mod tests {
                 softcap,
                 residual_scale,
                 Some(&mut prepacked),
+                None,
             )
             .expect("fwd prepacked");
             losses_b.push(fwd.base.loss);

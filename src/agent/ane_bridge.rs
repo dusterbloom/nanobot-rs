@@ -45,6 +45,19 @@ extern "C" {
         output_sizes: *const usize,
     ) -> *mut ANEKernelHandle;
 
+    fn ane_bridge_compile_direct(
+        mil_text: *const c_char,
+        mil_len: usize,
+        weight_names: *const *const c_char,
+        weight_datas: *const *const u8,
+        weight_lens: *const usize,
+        n_weights: c_int,
+        n_inputs: c_int,
+        input_sizes: *const usize,
+        n_outputs: c_int,
+        output_sizes: *const usize,
+    ) -> *mut ANEKernelHandle;
+
     fn ane_bridge_eval(kernel: *mut ANEKernelHandle) -> bool;
 
     fn ane_bridge_write_input(
@@ -80,10 +93,14 @@ extern "C" {
         bytes: usize,
     );
 
+    fn ane_bridge_clone_kernel(source: *mut ANEKernelHandle) -> *mut ANEKernelHandle;
+
     fn ane_bridge_free(kernel: *mut ANEKernelHandle);
 
     fn ane_bridge_get_compile_count() -> c_int;
     fn ane_bridge_reset_compile_count();
+    fn ane_bridge_clear_cache();
+    fn ane_bridge_was_cached(kernel: *mut ANEKernelHandle) -> bool;
 
     fn ane_bridge_build_weight_blob(
         src: *const f32,
@@ -100,6 +117,28 @@ extern "C" {
     ) -> *mut u8;
 
     fn ane_bridge_free_blob(ptr: *mut c_void);
+
+    // Delta compilation (Orion-style)
+    fn ane_bridge_reload_weights(
+        kernel: *mut ANEKernelHandle,
+        weight_datas: *const *const u8,
+        weight_lens: *const usize,
+        n_weights: c_int,
+    ) -> bool;
+
+    fn ane_bridge_patch_from_donor(
+        donor: *mut ANEKernelHandle,
+        mil_text: *const c_char,
+        mil_len: usize,
+        weight_names: *const *const c_char,
+        weight_datas: *const *const u8,
+        weight_lens: *const usize,
+        n_weights: c_int,
+        n_inputs: c_int,
+        input_sizes: *const usize,
+        n_outputs: c_int,
+        output_sizes: *const usize,
+    ) -> *mut ANEKernelHandle;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +163,11 @@ pub fn compile_count() -> i32 {
 /// Reset the global compile counter.
 pub fn reset_compile_count() {
     unsafe { ane_bridge_reset_compile_count() }
+}
+
+/// Clear the persistent compilation cache (~/.nanobot/ane_cache/).
+pub fn clear_cache() {
+    unsafe { ane_bridge_clear_cache() }
 }
 
 /// Convert f32 weights into ANE blob format (128-byte header + fp16 data).
@@ -246,6 +290,72 @@ impl AneKernel {
         })
     }
 
+    /// Compile via _ANEClient direct path (supports conv, full MIL op set).
+    ///
+    /// Same API as `compile_multi_weights` but uses `_ANEClient.compileModel`
+    /// which calls ANECCompile with full conv/matmul/etc support.
+    pub fn compile_direct(
+        mil_text: &str,
+        weight_names: &[&str],
+        weight_datas: &[&[u8]],
+        input_sizes: &[usize],
+        output_sizes: &[usize],
+    ) -> Result<Self, String> {
+        assert_eq!(weight_names.len(), weight_datas.len());
+        let c_names: Vec<CString> = weight_names
+            .iter()
+            .map(|n| CString::new(*n).expect("weight name contains null byte"))
+            .collect();
+        let name_ptrs: Vec<*const c_char> = c_names.iter().map(|c| c.as_ptr()).collect();
+        let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
+        let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
+
+        let handle = unsafe {
+            ane_bridge_compile_direct(
+                mil_text.as_ptr() as *const c_char,
+                mil_text.len(),
+                name_ptrs.as_ptr(),
+                data_ptrs.as_ptr(),
+                data_lens.as_ptr(),
+                weight_names.len() as c_int,
+                input_sizes.len() as c_int,
+                input_sizes.as_ptr(),
+                output_sizes.len() as c_int,
+                output_sizes.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err("ANE direct compilation failed".into());
+        }
+        Ok(Self {
+            handle,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Clone this kernel: shares the compiled ANE program but creates fresh
+    /// IOSurfaces. Use this to create per-layer instances where each layer's
+    /// weights live permanently in its own IOSurface.
+    ///
+    /// The compiled model is ref-counted — it is unloaded only when all
+    /// clones and the original are dropped.
+    pub fn clone_kernel(&self) -> Result<Self, String> {
+        let handle = unsafe { ane_bridge_clone_kernel(self.handle) };
+        if handle.is_null() {
+            return Err("ANE kernel clone failed".into());
+        }
+        Ok(Self {
+            handle,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Returns true if this kernel was loaded from the compilation cache
+    /// (delta compilation fast path — no compileWithQoS: happened).
+    pub fn was_cached(&self) -> bool {
+        unsafe { ane_bridge_was_cached(self.handle) }
+    }
+
     /// Execute the kernel on ANE hardware.
     pub fn eval(&self) -> Result<(), String> {
         let ok = unsafe { ane_bridge_eval(self.handle) };
@@ -329,6 +439,79 @@ impl AneKernel {
             );
         }
     }
+
+    /// Reload weights without recompiling (Orion-style delta compilation).
+    ///
+    /// Unloads the model from ANE, writes new weight BLOBFILEs to disk,
+    /// and reloads. The compiled microcode is reused — 8.5× faster than
+    /// a full compile cycle. Does not increment the compile count.
+    ///
+    /// `weight_datas` must have the same number of entries as the original
+    /// compile call's weight arrays.
+    pub fn reload_weights(&self, weight_datas: &[&[u8]]) -> Result<(), String> {
+        let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
+        let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
+        let ok = unsafe {
+            ane_bridge_reload_weights(
+                self.handle,
+                data_ptrs.as_ptr(),
+                data_lens.as_ptr(),
+                weight_datas.len() as c_int,
+            )
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err("ANE delta reload failed".into())
+        }
+    }
+
+    /// Create a new kernel by patching weights from this kernel's compiled
+    /// program (Orion-style zero-compile clone).
+    ///
+    /// Copies this kernel's compiled microcode (net.plist) to the new model's
+    /// temp directory and calls loadWithQoS only — no compileWithQoS.
+    /// Does not increment the compile count.
+    pub fn patch_from_donor(
+        &self,
+        mil_text: &str,
+        weight_names: &[&str],
+        weight_datas: &[&[u8]],
+        input_sizes: &[usize],
+        output_sizes: &[usize],
+    ) -> Result<Self, String> {
+        assert_eq!(weight_names.len(), weight_datas.len());
+        let c_names: Vec<CString> = weight_names
+            .iter()
+            .map(|n| CString::new(*n).expect("weight name contains null byte"))
+            .collect();
+        let name_ptrs: Vec<*const c_char> = c_names.iter().map(|c| c.as_ptr()).collect();
+        let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
+        let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
+
+        let handle = unsafe {
+            ane_bridge_patch_from_donor(
+                self.handle,
+                mil_text.as_ptr() as *const c_char,
+                mil_text.len(),
+                name_ptrs.as_ptr(),
+                data_ptrs.as_ptr(),
+                data_lens.as_ptr(),
+                weight_names.len() as c_int,
+                input_sizes.len() as c_int,
+                input_sizes.as_ptr(),
+                output_sizes.len() as c_int,
+                output_sizes.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err("ANE patch_from_donor failed".into());
+        }
+        Ok(Self {
+            handle,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
 }
 
 impl Drop for AneKernel {
@@ -407,8 +590,7 @@ mod tests {
             "Cast identity kernel should preserve values through fp32→fp16→fp32"
         );
 
-        // 6. Verify compile count incremented
-        assert!(compile_count() >= 1, "compile count should be >= 1");
+        // 6. Verify kernel works (compile count may be 0 if cached from previous run)
 
         // 7. Drop is implicit — verifies cleanup doesn't crash
     }
@@ -466,13 +648,12 @@ mod tests {
         let src: Vec<f32> = (0..64).map(|i| (i + 10) as f32).collect();
         let src_bytes: Vec<u8> = src.iter().flat_map(|f| f.to_le_bytes()).collect();
         kernel.write_input_strided(
-            0,      // idx
-            0,      // dst_offset
-            256,    // dst_stride (64 floats * 4 bytes)
-            &src_bytes,
-            4,      // src_stride (contiguous f32s)
-            4,      // chunk_bytes (one f32)
-            64,     // n_chunks (64 rows)
+            0,   // idx
+            0,   // dst_offset
+            256, // dst_stride (64 floats * 4 bytes)
+            &src_bytes, 4,  // src_stride (contiguous f32s)
+            4,  // chunk_bytes (one f32)
+            64, // n_chunks (64 rows)
         );
 
         kernel.eval().expect("eval failed");
@@ -487,12 +668,264 @@ mod tests {
         // First element of each row should be our value, rest should be 0
         for row in 0..64 {
             assert_eq!(
-                out_f32[row * 64], (row + 10) as f32,
+                out_f32[row * 64],
+                (row + 10) as f32,
                 "row {row} first element"
             );
             for col in 1..64 {
                 assert_eq!(out_f32[row * 64 + col], 0.0, "row {row} col {col}");
             }
         }
+    }
+
+    /// Test reload_weights: update weight blob without recompiling.
+    #[test]
+    fn smoke_reload_weights() {
+        ane_init().expect("ane_init failed");
+        clear_cache(); // ensure cold compile
+
+        let tensor_bytes = N * 4;
+        let weight_name = "@model_path/weights/weight.bin";
+        let dummy_weight = vec![0u8; 128 + 64 * 2]; // minimal ANE blob
+
+        let compile_count_before = compile_count();
+        let kernel = AneKernel::compile_multi_weights(
+            CAST_IDENTITY_MIL,
+            &[weight_name],
+            &[&dummy_weight],
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )
+        .expect("compile failed");
+        assert_eq!(
+            compile_count(),
+            compile_count_before + 1,
+            "compile should increment count"
+        );
+
+        // Verify kernel works before reload
+        let input_f32: Vec<f32> = (0..N).map(|i| (i % 50) as f32).collect();
+        let input_bytes: Vec<u8> = input_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().expect("eval before reload failed");
+
+        // Reload with different weight data — should NOT increment compile count
+        let new_weight = vec![0xFFu8; 128 + 64 * 2];
+        let reload_count_before = compile_count();
+        kernel
+            .reload_weights(&[&new_weight])
+            .expect("reload_weights failed");
+        assert_eq!(
+            compile_count(),
+            reload_count_before,
+            "reload should NOT increment compile count"
+        );
+
+        // Verify kernel still works after reload
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().expect("eval after reload failed");
+
+        let mut output_bytes = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut output_bytes);
+        let output_f32: Vec<f32> = output_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            input_f32, output_f32,
+            "cast identity should still work after weight reload"
+        );
+    }
+
+    /// Test patch_from_donor: create kernel from donor's compiled microcode.
+    #[test]
+    fn smoke_patch_from_donor() {
+        ane_init().expect("ane_init failed");
+        let tensor_bytes = N * 4;
+        let weight_name = "@model_path/weights/weight.bin";
+        let dummy_weight = vec![0u8; 128 + 64 * 2];
+
+        // Compile the donor
+        let donor = AneKernel::compile_multi_weights(
+            CAST_IDENTITY_MIL,
+            &[weight_name],
+            &[&dummy_weight],
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )
+        .expect("donor compile failed");
+
+        // Patch from donor — same MIL text, different weight values
+        let patch_count_before = compile_count();
+        let patched_weight = vec![0xAAu8; 128 + 64 * 2];
+        let patched = donor
+            .patch_from_donor(
+                CAST_IDENTITY_MIL,
+                &[weight_name],
+                &[&patched_weight],
+                &[tensor_bytes],
+                &[tensor_bytes],
+            )
+            .expect("patch_from_donor failed");
+        assert_eq!(
+            compile_count(),
+            patch_count_before,
+            "patch should NOT increment compile count"
+        );
+
+        // Verify patched kernel works
+        let input_f32: Vec<f32> = (0..N).map(|i| (i % 80) as f32).collect();
+        let input_bytes: Vec<u8> = input_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        patched.write_input(0, &input_bytes);
+        patched.eval().expect("patched eval failed");
+
+        let mut output_bytes = vec![0u8; tensor_bytes];
+        patched.read_output(0, &mut output_bytes);
+        let output_f32: Vec<f32> = output_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            input_f32, output_f32,
+            "patched kernel should work correctly"
+        );
+
+        // Both donor and patched should still be independently usable
+        donor.write_input(0, &input_bytes);
+        donor.eval().expect("donor eval after patch failed");
+    }
+
+    /// Test clone_kernel: original and clone share the program but have independent IOSurfaces.
+    #[test]
+    fn smoke_clone_kernel() {
+        ane_init().expect("ane_init failed");
+        let tensor_bytes = N * 4;
+        let original =
+            AneKernel::compile(CAST_IDENTITY_MIL, None, &[tensor_bytes], &[tensor_bytes])
+                .expect("compile failed");
+        let clone = original.clone_kernel().expect("clone failed");
+
+        // Write different data to original and clone (values < 2048 for fp16 exactness)
+        let data_a: Vec<f32> = (0..N).map(|i| (i % 100) as f32).collect();
+        let data_b: Vec<f32> = (0..N).map(|i| ((i % 100) + 500) as f32).collect();
+        let bytes_a: Vec<u8> = data_a.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes_b: Vec<u8> = data_b.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        original.write_input(0, &bytes_a);
+        clone.write_input(0, &bytes_b);
+
+        // Eval both — they should produce independent results
+        original.eval().expect("original eval failed");
+        clone.eval().expect("clone eval failed");
+
+        let mut out_a = vec![0u8; tensor_bytes];
+        let mut out_b = vec![0u8; tensor_bytes];
+        original.read_output(0, &mut out_a);
+        clone.read_output(0, &mut out_b);
+
+        let out_a_f32: Vec<f32> = out_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let out_b_f32: Vec<f32> = out_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Verify independence: original got data_a round-tripped, clone got data_b
+        assert_eq!(out_a_f32, data_a, "original should have data_a");
+        assert_eq!(out_b_f32, data_b, "clone should have data_b");
+
+        // Drop clone first, then original — tests refcount cleanup
+        drop(clone);
+        // Original should still work after clone is dropped
+        original.write_input(0, &bytes_a);
+        original.eval().expect("original eval after clone drop");
+    }
+
+    /// Benchmark: compile → drop → re-compile the same kernel.
+    /// Second compile should hit the delta cache (net.plist saved to ~/.nanobot/ane_cache/).
+    #[test]
+    fn bench_delta_compilation_cache() {
+        ane_init().expect("ane_init failed");
+        clear_cache(); // ensure cold start
+        let tensor_bytes = N * 4;
+        let weight_name = "@model_path/weights/weight.bin";
+        let dummy_weight = vec![0u8; 128 + 64 * 2];
+
+        // --- First compile: cold (full compileWithQoS) ---
+        reset_compile_count();
+        let t0 = std::time::Instant::now();
+        let kernel = AneKernel::compile_multi_weights(
+            CAST_IDENTITY_MIL,
+            &[weight_name],
+            &[&dummy_weight],
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )
+        .expect("first compile failed");
+        let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let cold_compiles = compile_count();
+        assert!(!kernel.was_cached(), "first compile should NOT be cached");
+        assert_eq!(cold_compiles, 1, "first compile should increment count");
+
+        // Verify correctness
+        let input_f32: Vec<f32> = (0..N).map(|i| (i % 50) as f32).collect();
+        let input_bytes: Vec<u8> = input_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().expect("cold eval failed");
+        let mut out = vec![0u8; tensor_bytes];
+        kernel.read_output(0, &mut out);
+        let out_f32: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(input_f32, out_f32, "cold compile should produce correct output");
+
+        // Drop kernel — tmpDir with net.plist persists on disk
+        drop(kernel);
+
+        // --- Second compile: warm (delta cache — load only, no compile) ---
+        reset_compile_count();
+        let t1 = std::time::Instant::now();
+        let cached = AneKernel::compile_multi_weights(
+            CAST_IDENTITY_MIL,
+            &[weight_name],
+            &[&dummy_weight],
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )
+        .expect("cached compile failed");
+        let warm_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let warm_compiles = compile_count();
+        assert!(cached.was_cached(), "second compile SHOULD be cached");
+        assert_eq!(warm_compiles, 0, "cached load should NOT increment count");
+
+        // Verify correctness after cached load
+        cached.write_input(0, &input_bytes);
+        cached.eval().expect("cached eval failed");
+        let mut out2 = vec![0u8; tensor_bytes];
+        cached.read_output(0, &mut out2);
+        let out2_f32: Vec<f32> = out2
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            input_f32, out2_f32,
+            "cached kernel should produce identical output"
+        );
+
+        eprintln!(
+            "\n  Delta compilation cache benchmark:\n    Cold compile: {cold_ms:.1}ms ({cold_compiles} compile)\n    Warm cached:  {warm_ms:.1}ms ({warm_compiles} compiles)\n    Speedup:      {:.1}×\n",
+            cold_ms / warm_ms.max(0.01)
+        );
+
+        // Warm should be faster (or at worst equal for tiny kernels)
+        // For real transformer kernels, Orion reports 8.5× speedup.
+        // For this minimal cast kernel, expect at least some improvement.
+        assert!(
+            warm_ms <= cold_ms * 1.1,
+            "cached should not be slower than cold: {warm_ms:.1}ms > {cold_ms:.1}ms"
+        );
     }
 }

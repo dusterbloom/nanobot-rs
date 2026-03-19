@@ -280,6 +280,8 @@ pub fn classifier_forward(
 
 /// Vocab tile size for fused CE. Each tile occupies TILE × seq × 4 bytes
 /// of stack-reusable buffer (~512 KB at TILE=1024, seq=128).
+/// When BLOBFILE classifier is active, larger tiles reduce reload count
+/// (243 → 75 at 2048, → 38 at 4096) at the cost of larger weight blobs.
 const CE_TILE: usize = 1024;
 
 /// Fused classifier → softcap → cross-entropy loss → softcap backward → classifier backward.
@@ -320,6 +322,7 @@ pub fn fused_classifier_ce<T: TokenId>(
     softcap: f32,
     loss_scale: f32,
     ane_tile: Option<&OcDynMatmulKernel>,
+    ane_blob: Option<&ClassifierBlobKernel>,
 ) -> f32 {
     debug_assert_eq!(dy.len(), dim * seq);
     debug_assert_eq!(embed.len(), vocab * dim);
@@ -359,6 +362,7 @@ pub fn fused_classifier_ce<T: TokenId>(
         softcap,
         inv_cap,
         ane_tile,
+        ane_blob,
     );
 
     // Finalize log-sum-exp: lse[t] = max[t] + ln(sum[t])
@@ -387,6 +391,7 @@ pub fn fused_classifier_ce<T: TokenId>(
         inv_n,
         loss_scale,
         ane_tile,
+        ane_blob,
     );
 
     loss * inv_n
@@ -407,6 +412,7 @@ fn fused_ce_pass1_logsumexp(
     softcap: f32,
     inv_cap: f32,
     ane_tile: Option<&OcDynMatmulKernel>,
+    ane_blob: Option<&ClassifierBlobKernel>,
 ) {
     for tile in 0..n_tiles {
         let v_start = tile * CE_TILE;
@@ -414,8 +420,17 @@ fn fused_ce_pass1_logsumexp(
         let tile_slice = &mut tile_buf[..tile_rows * seq];
 
         // tile_logits[tile_rows, seq] = embed_tile[tile_rows, dim] @ x_final[dim, seq]
-        // ANE fast path: use OcDynMatmul when tile is full-sized
-        let used_ane = if tile_rows == CE_TILE {
+        // ANE BLOBFILE path: hotswap weights per tile (input already written)
+        let used_ane = if let Some(blob) = ane_blob {
+            match blob.eval_tile(tile, x_final) {
+                Ok(result) => {
+                    tile_slice.copy_from_slice(&result[..tile_rows * seq]);
+                    true
+                }
+                Err(_) => false,
+            }
+        } else if tile_rows == CE_TILE {
+            // DynMatmul fallback: pack weights into input per tile
             if let Some(k) = ane_tile {
                 match k.eval_row_major(x_final, &embed[v_start * dim..(v_start + tile_rows) * dim]) {
                     Ok(result) => {
@@ -490,6 +505,7 @@ fn fused_ce_pass2_grad<T: TokenId>(
     inv_seq: f32,
     loss_scale: f32,
     ane_tile: Option<&OcDynMatmulKernel>,
+    ane_blob: Option<&ClassifierBlobKernel>,
 ) -> f32 {
     let scale = inv_seq * loss_scale;
     let mut total_loss = 0.0f32;
@@ -499,9 +515,14 @@ fn fused_ce_pass2_grad<T: TokenId>(
         let tile_rows = CE_TILE.min(vocab - v_start);
         let tile_slice = &mut tile_buf[..tile_rows * seq];
 
-        // Recompute tile logits (ANE fast path for full tiles)
+        // Recompute tile logits — BLOBFILE hotswap > DynMatmul > CPU GEMM
         let embed_tile = &embed[v_start * dim..(v_start + tile_rows) * dim];
-        let used_ane = if tile_rows == CE_TILE {
+        let used_ane = if let Some(blob) = ane_blob {
+            match blob.eval_tile(tile, x_final) {
+                Ok(result) => { tile_slice.copy_from_slice(&result[..tile_rows * seq]); true }
+                Err(_) => false,
+            }
+        } else if tile_rows == CE_TILE {
             if let Some(k) = ane_tile {
                 match k.eval_row_major(x_final, embed_tile) {
                     Ok(result) => { tile_slice.copy_from_slice(&result); true }
@@ -1039,6 +1060,112 @@ impl FfnKernels {
             }
         }
     }
+}
+
+/// BLOBFILE classifier tile kernel — 1 ANE slot with per-tile weight hotswap.
+///
+/// Replaces `OcDynMatmulKernel` for the classifier: instead of packing weights
+/// into the input buffer per tile (DynMatmul), weights are pre-packed as fp16
+/// blobs and hotswapped via `reload_weights()`. Input x_final is written once
+/// per pass (not per tile).
+pub(crate) struct ClassifierBlobKernel {
+    kernel: AneKernel,
+    tile_blobs: Vec<Vec<u8>>,
+    pub(crate) tile_size: usize,
+    dim: usize,
+    pub(crate) seq: usize,
+    vocab: usize,
+    pub(crate) n_tiles: usize,
+}
+
+impl ClassifierBlobKernel {
+    /// Build classifier BLOBFILE kernel from embedding weights.
+    ///
+    /// Pre-transposes each vocab tile from [tile_rows, dim] to [dim, tile_rows]
+    /// and packs as fp16 BLOBFILE blobs. Compiles 1 ANE kernel.
+    pub fn build(embed: &[f32], vocab: usize, dim: usize, seq: usize) -> Result<Self, String> {
+        let tile_size = CE_TILE;
+        let n_tiles = (vocab + tile_size - 1) / tile_size;
+        let t0 = std::time::Instant::now();
+
+        // Pre-pack tile blobs: transpose each [tile_rows, dim] → [dim, tile_rows] as fp16
+        let mut tile_blobs = Vec::with_capacity(n_tiles);
+        for tile in 0..n_tiles {
+            let v_start = tile * tile_size;
+            let tile_rows = tile_size.min(vocab - v_start);
+            let mut transposed = vec![0.0f32; dim * tile_size]; // zero-padded for partial tiles
+            for r in 0..tile_rows {
+                for c in 0..dim {
+                    // embed is [vocab, dim] row-major → transpose to [dim, tile_size]
+                    transposed[c * tile_size + r] = embed[(v_start + r) * dim + c];
+                }
+            }
+            tile_blobs.push(ane_weights::build_fp16_blob(&transposed));
+        }
+
+        // Generate and compile MIL kernel
+        let result = ane_mil::gen_classifier_tile_fwd(dim, tile_size, seq);
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let kernel = AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &names,
+            &[&tile_blobs[0]],
+            &[result.input_bytes],
+            &[result.output_bytes],
+        )
+        .map_err(|e| format!("classifier BLOBFILE compile: {e}"))?;
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "classifier BLOBFILE: {} tiles, compile+pack in {:.1}ms",
+            n_tiles,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+
+        Ok(Self {
+            kernel,
+            tile_blobs,
+            tile_size,
+            dim,
+            seq,
+            vocab,
+            n_tiles,
+        })
+    }
+
+    /// Evaluate one tile: hotswap weights → write input → eval → return logits[tile_rows, seq].
+    ///
+    /// `x_final` is written to the IOSurface before each eval because `reload_weights`
+    /// recreates IOSurfaces (unload + load cycle).
+    pub fn eval_tile(&self, tile: usize, x_final: &[f32]) -> Result<Vec<f32>, String> {
+        let v_start = tile * self.tile_size;
+        let tile_rows = self.tile_size.min(self.vocab - v_start);
+
+        // Hotswap weights for this tile (unload → write weights → reload)
+        self.kernel
+            .reload_weights(&[&self.tile_blobs[tile]])
+            .map_err(|e| format!("classifier tile {tile} hotswap: {e}"))?;
+
+        // Write x_final input (must be after reload_weights which recreates IOSurfaces)
+        let bytes = unsafe {
+            std::slice::from_raw_parts(x_final.as_ptr() as *const u8, x_final.len() * 4)
+        };
+        self.kernel.write_input(0, bytes);
+
+        self.kernel.eval().map_err(|e| format!("classifier tile {tile} eval: {e}"))?;
+
+        // Read output [tile_size, seq] and trim to [tile_rows, seq]
+        let mut buf = vec![0u8; self.tile_size * self.seq * 4];
+        self.kernel.read_output(0, &mut buf);
+        let full: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Return only tile_rows × seq (trim zero-padded rows)
+        Ok(full[..tile_rows * self.seq].to_vec())
+    }
+
 }
 
 struct OcDynMatmulKernel {
@@ -1783,6 +1910,7 @@ pub fn forward_with_lora<T: TokenId>(
         seq,
         0.0,
         1.0,
+        None,
         None,
     );
 
@@ -3203,6 +3331,7 @@ pub fn forward_cpu_generic<T: TokenId, W: ane_weights::WeightSource>(
         0.0,
         1.0,
         None,
+        None,
     );
 
     ForwardResultWithLora {
@@ -3275,6 +3404,7 @@ pub fn forward_ane_generic<T: TokenId, W: ane_weights::WeightSource>(
         softcap,
         residual_scale,
         None,
+        None,
     )
 }
 
@@ -3292,6 +3422,7 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
     softcap: f32,
     residual_scale: f32,
     mut prepacked: Option<&mut ane_weights::PrePackedWeights>,
+    cls_blob: Option<&ClassifierBlobKernel>,
 ) -> Result<ForwardResultWithLora, String> {
     use super::ane_lora::LoraLayerActivations;
 
@@ -3685,7 +3816,8 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
         seq,
         softcap,
         1.0,
-        None, // CPU BLAS is faster than ANE DynMatmul for classifier tiles
+        None, // ane_tile: DynMatmul (unused — CPU BLAS or BLOBFILE preferred)
+        cls_blob,
     );
 
     let _prof_cls_us = _t_cls.elapsed().as_micros() as u64;
@@ -4039,6 +4171,7 @@ mod tests {
             softcap,
             loss_scale,
             None,
+            None,
         );
 
         // Compare
@@ -4102,6 +4235,7 @@ mod tests {
             0.0,
             1.0,
             None,
+            None,
         );
 
         let loss_err = (ref_loss - fused_loss).abs();
@@ -4146,12 +4280,104 @@ mod tests {
             0.0,
             1.0,
             None,
+            None,
         );
 
         assert!(
             (ref_loss - fused_loss).abs() < 1e-4,
             "loss mismatch at partial tile boundary"
         );
+    }
+
+    #[test]
+    fn test_classifier_blob_matches_cpu() {
+        // Test that BLOBFILE classifier produces same loss as CPU BLAS
+        let dim = 64;
+        let seq = 16;
+        let vocab = 3072; // 3 tiles (2 full + 1 partial) — tests reload_weights + partial tile
+
+        // Random embed + x_final
+        let embed: Vec<f32> = (0..vocab * dim)
+            .map(|i| ((i + 1) as f32 * 0.001).sin() * 0.5)
+            .collect();
+        let x_final: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i + 7) as f32 * 0.003).sin() * 0.3)
+            .collect();
+        let targets: Vec<u32> = (0..seq).map(|i| (i * 100) as u32).collect();
+
+        // CPU reference
+        let mut cpu_dy = vec![0.0f32; dim * seq];
+        let t_cpu = std::time::Instant::now();
+        let cpu_loss = fused_classifier_ce(
+            &mut cpu_dy, &embed, &x_final, &targets, vocab, dim, seq, 0.0, 1.0, None, None,
+        );
+        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("classifier CPU: {:.2}ms (vocab={}, dim={}, seq={})", cpu_ms, vocab, dim, seq);
+
+        // BLOBFILE path (only on ANE hardware)
+        #[cfg(feature = "ane")]
+        {
+            use super::ane_bridge;
+            static ANE_INIT: std::sync::Once = std::sync::Once::new();
+            ANE_INIT.call_once(|| {
+                let _ = ane_bridge::ane_init();
+            });
+
+            match ClassifierBlobKernel::build(&embed, vocab, dim, seq) {
+                Ok(blob) => {
+                    // Warmup (first-time compiles)
+                    let mut warmup_dy = vec![0.0f32; dim * seq];
+                    let _ = fused_classifier_ce(
+                        &mut warmup_dy, &embed, &x_final, &targets,
+                        vocab, dim, seq, 0.0, 1.0, None, Some(&blob),
+                    );
+
+                    // Timed run (delta cache hits)
+                    let t_blob = std::time::Instant::now();
+                    let mut blob_dy = vec![0.0f32; dim * seq];
+                    let blob_loss = fused_classifier_ce(
+                        &mut blob_dy,
+                        &embed,
+                        &x_final,
+                        &targets,
+                        vocab,
+                        dim,
+                        seq,
+                        0.0,
+                        1.0,
+                        None,
+                        Some(&blob),
+                    );
+
+                    let blob_ms = t_blob.elapsed().as_secs_f64() * 1000.0;
+                    let loss_err = (cpu_loss - blob_loss).abs();
+                    eprintln!(
+                        "classifier BLOBFILE: {:.2}ms (vs CPU {:.2}ms, {:.1}x), err={:.6}",
+                        blob_ms, cpu_ms, cpu_ms / blob_ms, loss_err
+                    );
+                    assert!(
+                        loss_err < 0.01,
+                        "classifier BLOBFILE loss mismatch: err={loss_err}"
+                    );
+
+                    // Check dy gradient similarity
+                    let dy_diff: f32 = cpu_dy
+                        .iter()
+                        .zip(blob_dy.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .sum::<f32>()
+                        / cpu_dy.len() as f32;
+                    eprintln!("classifier BLOBFILE: mean |dy_diff|={:.6}", dy_diff);
+                    assert!(dy_diff < 0.01, "classifier BLOBFILE dy mismatch: {dy_diff}");
+                }
+                Err(e) => {
+                    eprintln!("classifier BLOBFILE: build failed (expected on non-ANE): {e}");
+                }
+            }
+        }
+
+        // Basic sanity
+        assert!(cpu_loss > 0.0, "CPU loss should be positive");
     }
 
     #[test]

@@ -2248,6 +2248,14 @@ pub struct PrePackedWeights {
     fused_ffn_bwd_shared: Option<super::ane_bridge::AneKernel>,
     /// Pre-built weight blobs for FFN backward hotswap (per-layer, fp16).
     fused_ffn_bwd_weight_blobs: Option<Vec<[Vec<u8>; 3]>>,
+    /// Shared split FFN backward kernel A: W2^T + SiLU bwd (1 slot, hotswap).
+    split_ffn_bwd_a_shared: Option<super::ane_bridge::AneKernel>,
+    /// Shared split FFN backward kernel B: W1^T + W3^T → dx (1 slot, hotswap).
+    split_ffn_bwd_b_shared: Option<super::ane_bridge::AneKernel>,
+    /// Pre-built weight blobs for split FFN backward A (per-layer, 1 blob: W2^T).
+    split_ffn_bwd_a_blobs: Option<Vec<Vec<u8>>>,
+    /// Pre-built weight blobs for split FFN backward B (per-layer, 2 blobs: W1^T, W3^T).
+    split_ffn_bwd_b_blobs: Option<Vec<[Vec<u8>; 2]>>,
     /// Per-layer fused GDN projection kernels: QKV+A+B+Z in 1 dispatch.
     fused_gdn_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer GDN O projection kernels with baked weights.
@@ -2281,6 +2289,10 @@ impl PrePackedWeights {
             fused_ffn_bwd_kernels: None,
             fused_ffn_bwd_shared: None,
             fused_ffn_bwd_weight_blobs: None,
+            split_ffn_bwd_a_shared: None,
+            split_ffn_bwd_b_shared: None,
+            split_ffn_bwd_a_blobs: None,
+            split_ffn_bwd_b_blobs: None,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2389,6 +2401,10 @@ impl PrePackedWeights {
             fused_ffn_bwd_kernels: None,
             fused_ffn_bwd_shared: None,
             fused_ffn_bwd_weight_blobs: None,
+            split_ffn_bwd_a_shared: None,
+            split_ffn_bwd_b_shared: None,
+            split_ffn_bwd_a_blobs: None,
+            split_ffn_bwd_b_blobs: None,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2486,6 +2502,10 @@ impl PrePackedWeights {
         self.fused_ffn_bwd_kernels = None;
         self.fused_ffn_bwd_shared = None;
         self.fused_ffn_bwd_weight_blobs = None;
+        self.split_ffn_bwd_a_shared = None;
+        self.split_ffn_bwd_b_shared = None;
+        self.split_ffn_bwd_a_blobs = None;
+        self.split_ffn_bwd_b_blobs = None;
         self.fused_gdn_proj_kernels = None;
         self.gdn_o_proj_kernels = None;
     }
@@ -3292,6 +3312,150 @@ impl PrePackedWeights {
 
         let dx = out[..dim * seq].to_vec();
         let dsilu = out[dim * seq..].to_vec();
+        Some(Ok((dx, dsilu)))
+    }
+
+    /// Prime split FFN backward kernels (2 shallower BLOBFILE kernels, 2 ANE slots).
+    ///
+    /// Kernel A: W2^T + SiLU bwd → dh1|dh3|dsilu (1 weight per layer).
+    /// Kernel B: W1^T + W3^T → dx (2 weights per layer).
+    ///
+    /// Uses shared hotswap: 2 ANE program slots total, weight blobs swapped per layer.
+    /// This compiles at 35B dims where the monolithic 3-matmul `gen_fused_ffn_bwd` fails.
+    pub fn prime_split_ffn_bwd<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let t0 = std::time::Instant::now();
+
+        let result_a = super::ane_mil::gen_ffn_bwd_w2t_silu_blob(cfg);
+        let result_b = super::ane_mil::gen_ffn_bwd_w13t_blob(cfg);
+
+        // Pre-build weight blobs for all layers
+        let mut a_blobs = Vec::with_capacity(n_layers);
+        let mut b_blobs = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            // Kernel A: W2 [dim, hidden] (NOT transposed — BLOBFILE must be y-operand)
+            a_blobs.push(build_fp16_blob(&lw.w2));
+            // Kernel B: W1 [hidden, dim], W3 [hidden, dim] (NOT transposed)
+            b_blobs.push([build_fp16_blob(&lw.w1), build_fp16_blob(&lw.w3)]);
+        }
+
+        // Compile kernel A with layer 0's weights
+        let names_a: Vec<&str> = result_a.weight_names.iter().copied().collect();
+        let datas_a: Vec<&[u8]> = vec![&a_blobs[0]];
+        let kernel_a = super::ane_bridge::AneKernel::compile_multi_weights(
+            &result_a.mil_text,
+            &names_a,
+            &datas_a,
+            &[result_a.input_bytes],
+            &[result_a.output_bytes],
+        )
+        .map_err(|e| format!("split_ffn_bwd kernel A compile: {e}"))?;
+
+        // Compile kernel B with layer 0's weights
+        let names_b: Vec<&str> = result_b.weight_names.iter().copied().collect();
+        let datas_b: Vec<&[u8]> = vec![&b_blobs[0][0], &b_blobs[0][1]];
+        let kernel_b = super::ane_bridge::AneKernel::compile_multi_weights(
+            &result_b.mil_text,
+            &names_b,
+            &datas_b,
+            &[result_b.input_bytes],
+            &[result_b.output_bytes],
+        )
+        .map_err(|e| format!("split_ffn_bwd kernel B compile: {e}"))?;
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed split FFN bwd kernels (2 slots, {} layers hotswap) in {:.1}ms",
+            n_layers,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+
+        self.split_ffn_bwd_a_shared = Some(kernel_a);
+        self.split_ffn_bwd_b_shared = Some(kernel_b);
+        self.split_ffn_bwd_a_blobs = Some(a_blobs);
+        self.split_ffn_bwd_b_blobs = Some(b_blobs);
+        Ok(())
+    }
+
+    /// Evaluate split FFN backward (2 dispatches) with weight hotswap.
+    ///
+    /// Returns `(dx, dsilu)` — same interface as `eval_fused_ffn_bwd`.
+    pub fn eval_split_ffn_bwd(
+        &self,
+        layer: usize,
+        dx_ffn: &[f32],
+        h1: &[f32],
+        h3: &[f32],
+        dim: usize,
+        hidden: usize,
+        seq: usize,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
+        let ka = self.split_ffn_bwd_a_shared.as_ref()?;
+        let kb = self.split_ffn_bwd_b_shared.as_ref()?;
+        let a_blobs = self.split_ffn_bwd_a_blobs.as_ref()?;
+        let b_blobs = self.split_ffn_bwd_b_blobs.as_ref()?;
+
+        // Kernel A: hotswap W2^T, eval dx_ffn|h1|h3 → dh1|dh3|dsilu
+        if let Err(e) = ka.reload_weights(&[&a_blobs[layer]]) {
+            return Some(Err(format!("split_ffn_bwd_a hotswap layer {layer}: {e}")));
+        }
+
+        let mut input_a = Vec::with_capacity(dx_ffn.len() + h1.len() + h3.len());
+        input_a.extend_from_slice(dx_ffn);
+        input_a.extend_from_slice(h1);
+        input_a.extend_from_slice(h3);
+        let input_a_bytes =
+            unsafe { std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4) };
+        ka.write_input(0, input_a_bytes);
+
+        if let Err(e) = ka.eval() {
+            return Some(Err(format!("split_ffn_bwd_a eval layer {layer}: {e}")));
+        }
+
+        let out_a_ch = 3 * hidden;
+        let mut buf_a = vec![0u8; out_a_ch * seq * 4];
+        ka.read_output(0, &mut buf_a);
+        let out_a: Vec<f32> = buf_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let dh1 = &out_a[..hidden * seq];
+        let dh3 = &out_a[hidden * seq..2 * hidden * seq];
+        let dsilu = out_a[2 * hidden * seq..].to_vec();
+
+        // Kernel B: hotswap W1^T + W3^T, eval dh1|dh3 → dx
+        let layer_b = &b_blobs[layer];
+        if let Err(e) = kb.reload_weights(&[&layer_b[0], &layer_b[1]]) {
+            return Some(Err(format!("split_ffn_bwd_b hotswap layer {layer}: {e}")));
+        }
+
+        let mut input_b = Vec::with_capacity(dh1.len() + dh3.len());
+        input_b.extend_from_slice(dh1);
+        input_b.extend_from_slice(dh3);
+        let input_b_bytes =
+            unsafe { std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4) };
+        kb.write_input(0, input_b_bytes);
+
+        if let Err(e) = kb.eval() {
+            return Some(Err(format!("split_ffn_bwd_b eval layer {layer}: {e}")));
+        }
+
+        let mut buf_b = vec![0u8; dim * seq * 4];
+        kb.read_output(0, &mut buf_b);
+        let dx: Vec<f32> = buf_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
         Some(Ok((dx, dsilu)))
     }
 

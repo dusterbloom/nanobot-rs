@@ -6,6 +6,7 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <IOSurface/IOSurface.h>
+#import <CommonCrypto/CommonDigest.h>
 #include "ane_bridge.h"
 
 #if defined(__aarch64__)
@@ -20,6 +21,22 @@ static Class g_ANEIO = nil;
 static bool g_initialized = false;
 static int g_compile_count = 0;
 
+// Persistent cache directory for compiled net.plist files.
+// ANE's unloadWithQoS: deletes its temp dir, so we copy net.plist
+// to our own cache before unloading. On next compile with the same
+// hexId, we restore it — skipping compileWithQoS: entirely.
+static NSString *g_cache_dir = nil;
+
+static NSString *ane_cache_dir(void) {
+    if (!g_cache_dir) {
+        NSString *home = NSHomeDirectory();
+        g_cache_dir = [home stringByAppendingPathComponent:@".nanobot/ane_cache"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:g_cache_dir
+            withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return g_cache_dir;
+}
+
 // --- Kernel handle struct ---
 struct ANEKernelHandle {
     id model;               // _ANEInMemoryModel
@@ -30,7 +47,19 @@ struct ANEKernelHandle {
     int nInputs, nOutputs;
     size_t *inputBytes;
     size_t *outputBytes;
+    int *refcount;          // shared refcount for model lifetime (NULL = legacy)
+    bool loaded;            // ANE load state (for delta reload path)
+    bool cached;            // true if loaded from compilation cache (no compileWithQoS:)
+    bool direct;            // true if compiled via _ANEClient (conv support)
+    // Weight metadata for delta reload — parallel arrays, length = nWeightFiles
+    int nWeightFiles;
+    char **weightRelPaths;  // relative paths within tmpDir (e.g. "weights/wq.bin")
 };
+
+// --- _ANEClient direct path (supports conv, full op set) ---
+static Class g_ANEClient = nil;
+static Class g_ANEModelCls = nil;
+static id    g_ane_client = nil;
 
 // --- Public API ---
 
@@ -53,6 +82,13 @@ int ane_bridge_init(void) {
     if (!g_ANEDesc || !g_ANEInMem || !g_ANEReq || !g_ANEIO) {
         fprintf(stderr, "ane_bridge: Failed to resolve ANE private classes\n");
         return -1;
+    }
+
+    // Resolve _ANEClient + _ANEModel for direct compilation path (conv support)
+    g_ANEClient  = NSClassFromString(@"_ANEClient");
+    g_ANEModelCls = NSClassFromString(@"_ANEModel");
+    if (g_ANEClient && g_ANEModelCls) {
+        g_ane_client = ((id(*)(Class,SEL))objc_msgSend)(g_ANEClient, @selector(sharedConnection));
     }
 
     g_initialized = true;
@@ -149,25 +185,66 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             [data writeToFile:fullPath atomically:YES];
         }
 
-        // Compile
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-            fprintf(stderr, "ane_bridge: ANE compile failed: %s\n",
-                    e ? [[e description] UTF8String] : "unknown");
-            [fm removeItemAtPath:td error:nil];
-            return NULL;
+        // Delta compilation cache: if net.plist already exists from a previous
+        // run (same MIL text + weight keys → same hexId → same tmpDir), skip
+        // compileWithQoS: and go straight to loadWithQoS:. This is the Orion
+        // delta compilation fast path — 8.5× faster per kernel.
+        // Delta compilation cache: check our persistent cache for a pre-compiled
+        // net.plist with this hexId. ANE's unloadWithQoS: deletes its temp dir,
+        // so we maintain our own cache at ~/.nanobot/ane_cache/<hexId>/net.plist.
+        NSString *plistPath = [td stringByAppendingPathComponent:@"net.plist"];
+        NSString *cachePlist = [[ane_cache_dir()
+            stringByAppendingPathComponent:hx]
+            stringByAppendingPathComponent:@"net.plist"];
+        bool cached = false;
+
+        if ([fm fileExistsAtPath:cachePlist]) {
+            // Restore net.plist from our persistent cache
+            NSError *cpErr = nil;
+            if ([fm copyItemAtPath:cachePlist toPath:plistPath error:&cpErr]) {
+                cached = true;
+            }
+        }
+
+        if (!cached) {
+            // Full compile (cold path)
+            if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                    mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
+                fprintf(stderr, "ane_bridge: ANE compile failed: %s\n",
+                        e ? [[e description] UTF8String] : "unknown");
+                [fm removeItemAtPath:td error:nil];
+                return NULL;
+            }
+            g_compile_count++;
         }
 
         // Load (with one retry after a brief pause for ANE slot reclamation)
         BOOL loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                 mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
         if (!loaded) {
-            fprintf(stderr, "ane_bridge: ANE load failed (retrying in 100ms): %s\n",
+            fprintf(stderr, "ane_bridge: ANE load %s (retrying in 100ms): %s\n",
+                    cached ? "cached" : "fresh",
                     e ? [[e description] UTF8String] : "unknown");
-            usleep(100000); // 100ms
-            e = nil;
-            loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                    mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+            if (cached) {
+                // Cached net.plist may be stale — fall back to full compile
+                e = nil;
+                if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                        mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
+                    fprintf(stderr, "ane_bridge: ANE fallback compile failed: %s\n",
+                            e ? [[e description] UTF8String] : "unknown");
+                    [fm removeItemAtPath:td error:nil];
+                    return NULL;
+                }
+                g_compile_count++;
+                e = nil;
+                loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+            } else {
+                usleep(100000); // 100ms
+                e = nil;
+                loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+            }
         }
         if (!loaded) {
             fprintf(stderr, "ane_bridge: ANE load failed after retry: %s\n",
@@ -176,18 +253,36 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             return NULL;
         }
 
-        g_compile_count++;
-
         // Create kernel handle
         ANEKernelHandle *k = (ANEKernelHandle *)calloc(1, sizeof(ANEKernelHandle));
         k->model = mdl;
         k->tmpDir = td;
+        k->refcount = (int *)malloc(sizeof(int));
+        *k->refcount = 1;
+        k->loaded = true;
+        k->cached = cached;
         k->nInputs = n_inputs;
         k->nOutputs = n_outputs;
         k->inputBytes = (size_t *)malloc(n_inputs * sizeof(size_t));
         k->outputBytes = (size_t *)malloc(n_outputs * sizeof(size_t));
         memcpy(k->inputBytes, input_sizes, n_inputs * sizeof(size_t));
         memcpy(k->outputBytes, output_sizes, n_outputs * sizeof(size_t));
+
+        // Store weight relative paths for delta reload
+        k->nWeightFiles = n_weights;
+        if (n_weights > 0) {
+            k->weightRelPaths = (char **)malloc(n_weights * sizeof(char *));
+            for (int i = 0; i < n_weights; i++) {
+                NSString *name = [NSString stringWithUTF8String:weight_names[i]];
+                NSString *relPath = name;
+                if ([name hasPrefix:@"@model_path/"]) {
+                    relPath = [name substringFromIndex:12];
+                }
+                k->weightRelPaths[i] = strdup([relPath UTF8String]);
+            }
+        } else {
+            k->weightRelPaths = NULL;
+        }
 
         // Create IOSurfaces
         // Inputs use write-combining: CPU only writes, ANE reads via DMA.
@@ -244,13 +339,184 @@ ANEKernelHandle *ane_bridge_compile(const char *mil_text, size_t mil_len,
     }
 }
 
+/// Compile via _ANEClient direct path (supports conv, full MIL op set).
+///
+/// Unlike `ane_bridge_compile_multi_weights` which uses _ANEInMemoryModel
+/// (restricted op subset, conv blocked), this path goes through _ANEClient
+/// which calls ANECCompile with full support for conv, matmul, etc.
+///
+/// The calling convention and returned ANEKernelHandle are identical —
+/// same IOSurface setup, same eval/write/read API.
+ANEKernelHandle *ane_bridge_compile_direct(
+    const char *mil_text, size_t mil_len,
+    const char **weight_names, const uint8_t **weight_datas,
+    const size_t *weight_lens, int n_weights,
+    int n_inputs, const size_t *input_sizes,
+    int n_outputs, const size_t *output_sizes)
+{
+    @autoreleasepool {
+        if (!g_initialized || !g_ane_client || !g_ANEModelCls) {
+            fprintf(stderr, "ane_bridge: _ANEClient not available\n");
+            return NULL;
+        }
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSData *milData = [NSData dataWithBytes:mil_text length:mil_len];
+
+        // Create unique bundle directory based on MIL hash
+        CC_SHA256_CTX sha;
+        CC_SHA256_Init(&sha);
+        CC_SHA256_Update(&sha, mil_text, (CC_LONG)mil_len);
+        for (int i = 0; i < n_weights; i++)
+            CC_SHA256_Update(&sha, weight_datas[i], (CC_LONG)weight_lens[i]);
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256_Final(digest, &sha);
+        NSMutableString *hashStr = [NSMutableString stringWithCapacity:64];
+        for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+            [hashStr appendFormat:@"%02x", digest[i]];
+        NSString *programKey = [NSString stringWithFormat:@"nanobot_direct_%@", hashStr];
+
+        NSString *bundleDir = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:programKey];
+        NSString *modelDir = [bundleDir stringByAppendingPathComponent:@"model"];
+        [fm createDirectoryAtPath:[modelDir stringByAppendingPathComponent:@"weights"]
+            withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // Write MIL text
+        [milData writeToFile:[modelDir stringByAppendingPathComponent:@"model.mil"]
+                  atomically:NO];
+
+        // Write weight BLOBFILEs
+        for (int i = 0; i < n_weights; i++) {
+            NSString *name = [NSString stringWithUTF8String:weight_names[i]];
+            NSString *relPath = name;
+            if ([name hasPrefix:@"@model_path/"]) {
+                relPath = [name substringFromIndex:12];
+            }
+            NSString *fullPath = [modelDir stringByAppendingPathComponent:relPath];
+            NSString *dir = [fullPath stringByDeletingLastPathComponent];
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                           attributes:nil error:nil];
+            NSData *data = [NSData dataWithBytes:weight_datas[i] length:weight_lens[i]];
+            [data writeToFile:fullPath atomically:NO];
+        }
+
+        // Create _ANEModel from bundle URL
+        NSURL *bundleURL = [NSURL fileURLWithPath:bundleDir];
+        id mdl = ((id(*)(Class,SEL,id,id))objc_msgSend)(
+            g_ANEModelCls, @selector(modelAtURL:key:),
+            bundleURL, programKey);
+        if (!mdl) {
+            fprintf(stderr, "ane_bridge: _ANEModel modelAtURL failed\n");
+            return NULL;
+        }
+
+        // Compile via _ANEClient (full op support — conv works here)
+        NSError *e = nil;
+        NSDictionary *compileOpts = @{
+            @"kANEFModelType": @"kANEFModelMIL",
+            @"NetworkSourceFileName": @"model/model.mil",
+        };
+        BOOL compiled = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+            g_ane_client, @selector(compileModel:options:qos:error:),
+            mdl, compileOpts, 21, &e);
+        if (!compiled) {
+            fprintf(stderr, "ane_bridge: _ANEClient compile failed: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            [fm removeItemAtPath:bundleDir error:nil];
+            return NULL;
+        }
+        g_compile_count++;
+
+        // Load onto ANE
+        e = nil;
+        BOOL loaded = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+            g_ane_client, @selector(loadModel:options:qos:error:),
+            mdl, @{}, 21, &e);
+        if (!loaded) {
+            fprintf(stderr, "ane_bridge: _ANEClient load failed: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            return NULL;
+        }
+
+        // Build kernel handle (same structure as _ANEInMemoryModel path)
+        ANEKernelHandle *k = (ANEKernelHandle *)calloc(1, sizeof(ANEKernelHandle));
+        k->model = mdl;  // _ANEModel, not _ANEInMemoryModel — eval uses g_ane_client
+        k->tmpDir = modelDir;
+        k->refcount = (int *)malloc(sizeof(int));
+        *k->refcount = 1;
+        k->loaded = true;
+        k->cached = false;
+        k->direct = true;
+        k->nInputs = n_inputs;
+        k->nOutputs = n_outputs;
+        k->inputBytes = (size_t *)malloc(n_inputs * sizeof(size_t));
+        k->outputBytes = (size_t *)malloc(n_outputs * sizeof(size_t));
+        memcpy(k->inputBytes, input_sizes, n_inputs * sizeof(size_t));
+        memcpy(k->outputBytes, output_sizes, n_outputs * sizeof(size_t));
+
+        k->nWeightFiles = n_weights;
+        if (n_weights > 0) {
+            k->weightRelPaths = (char **)malloc(n_weights * sizeof(char *));
+            for (int i = 0; i < n_weights; i++) {
+                NSString *name = [NSString stringWithUTF8String:weight_names[i]];
+                NSString *relPath = name;
+                if ([name hasPrefix:@"@model_path/"])
+                    relPath = [name substringFromIndex:12];
+                k->weightRelPaths[i] = strdup([relPath UTF8String]);
+            }
+        } else {
+            k->weightRelPaths = NULL;
+        }
+
+        // IOSurfaces (same as _ANEInMemoryModel path)
+        k->ioInputs = (IOSurfaceRef *)malloc(n_inputs * sizeof(IOSurfaceRef));
+        k->ioOutputs = (IOSurfaceRef *)malloc(n_outputs * sizeof(IOSurfaceRef));
+        for (int i = 0; i < n_inputs; i++)
+            k->ioInputs[i] = create_surface_wc(input_sizes[i]);
+        for (int i = 0; i < n_outputs; i++)
+            k->ioOutputs[i] = create_surface(output_sizes[i]);
+
+        // Build request (same as _ANEInMemoryModel path)
+        NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:n_inputs];
+        NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:n_inputs];
+        for (int i = 0; i < n_inputs; i++) {
+            [wIns addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioInputs[i])];
+            [iIdx addObject:@(i)];
+        }
+        NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:n_outputs];
+        NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:n_outputs];
+        for (int i = 0; i < n_outputs; i++) {
+            [wOuts addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioOutputs[i])];
+            [oIdx addObject:@(i)];
+        }
+        k->request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+            g_ANEReq,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+
+        return k;
+    }
+}
+
 bool ane_bridge_eval(ANEKernelHandle *kernel) {
     @autoreleasepool {
         if (!kernel || !kernel->model) return false;
         NSError *e = nil;
-        return ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
-            kernel->model, @selector(evaluateWithQoS:options:request:error:),
-            21, @{}, kernel->request, &e);
+        if (kernel->direct && g_ane_client) {
+            // _ANEClient path: evaluateWithModel:options:request:qos:error:
+            return ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                g_ane_client,
+                @selector(evaluateWithModel:options:request:qos:error:),
+                kernel->model, @{}, kernel->request, 21, &e);
+        } else {
+            // _ANEInMemoryModel path: evaluateWithQoS:options:request:error:
+            return ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+                kernel->model, @selector(evaluateWithQoS:options:request:error:),
+                21, @{}, kernel->request, &e);
+        }
     }
 }
 
@@ -299,31 +565,125 @@ void ane_bridge_read_output(ANEKernelHandle *kernel, int idx,
     IOSurfaceUnlock(kernel->ioOutputs[idx], kIOSurfaceLockReadOnly, NULL);
 }
 
+ANEKernelHandle *ane_bridge_clone_kernel(ANEKernelHandle *source) {
+    @autoreleasepool {
+        if (!source || !source->model) return NULL;
+
+        ANEKernelHandle *k = (ANEKernelHandle *)calloc(1, sizeof(ANEKernelHandle));
+        k->model = source->model;    // share compiled model (ARC retains)
+        k->tmpDir = source->tmpDir;  // share tmpDir (not owned by clone)
+        k->loaded = source->loaded;
+        k->nInputs = source->nInputs;
+        k->nOutputs = source->nOutputs;
+        k->nWeightFiles = 0;         // clones don't own weight paths
+        k->weightRelPaths = NULL;
+
+        // Share refcount
+        k->refcount = source->refcount;
+        if (k->refcount) (*k->refcount)++;
+
+        k->inputBytes = (size_t *)malloc(k->nInputs * sizeof(size_t));
+        k->outputBytes = (size_t *)malloc(k->nOutputs * sizeof(size_t));
+        memcpy(k->inputBytes, source->inputBytes, k->nInputs * sizeof(size_t));
+        memcpy(k->outputBytes, source->outputBytes, k->nOutputs * sizeof(size_t));
+
+        // Create fresh IOSurfaces (write-combining for inputs, cached for outputs)
+        k->ioInputs = (IOSurfaceRef *)malloc(k->nInputs * sizeof(IOSurfaceRef));
+        k->ioOutputs = (IOSurfaceRef *)malloc(k->nOutputs * sizeof(IOSurfaceRef));
+        for (int i = 0; i < k->nInputs; i++)
+            k->ioInputs[i] = create_surface_wc(source->inputBytes[i]);
+        for (int i = 0; i < k->nOutputs; i++)
+            k->ioOutputs[i] = create_surface(source->outputBytes[i]);
+
+        // Build new request bound to the fresh IOSurfaces
+        NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:k->nInputs];
+        NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:k->nInputs];
+        for (int i = 0; i < k->nInputs; i++) {
+            [wIns addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioInputs[i])];
+            [iIdx addObject:@(i)];
+        }
+        NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:k->nOutputs];
+        NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:k->nOutputs];
+        for (int i = 0; i < k->nOutputs; i++) {
+            [wOuts addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioOutputs[i])];
+            [oIdx addObject:@(i)];
+        }
+        k->request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+            g_ANEReq,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+
+        return k;
+    }
+}
+
 void ane_bridge_free(ANEKernelHandle *kernel) {
     @autoreleasepool {
         if (!kernel) return;
-        NSError *e = nil;
-        if (kernel->model) {
-            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
-                kernel->model, @selector(unloadWithQoS:error:), 21, &e);
+
+        // Decrement refcount; only unload model + clean tmpDir when last reference drops
+        bool last_ref = true;
+        if (kernel->refcount) {
+            last_ref = (--*kernel->refcount == 0);
         }
+
+        if (last_ref) {
+            // Save net.plist to persistent cache before unload destroys it.
+            // ANE's unloadWithQoS: deletes the entire temp directory.
+            if (kernel->tmpDir && kernel->model) {
+                NSFileManager *fmSave = [NSFileManager defaultManager];
+                NSString *plist = [kernel->tmpDir
+                    stringByAppendingPathComponent:@"net.plist"];
+                if ([fmSave fileExistsAtPath:plist]) {
+                    id hexId = ((id(*)(id,SEL))objc_msgSend)(
+                        kernel->model, @selector(hexStringIdentifier));
+                    NSString *cacheSubdir = [ane_cache_dir()
+                        stringByAppendingPathComponent:hexId];
+                    [fmSave createDirectoryAtPath:cacheSubdir
+                        withIntermediateDirectories:YES attributes:nil error:nil];
+                    NSString *cacheDst = [cacheSubdir
+                        stringByAppendingPathComponent:@"net.plist"];
+                    // Overwrite if exists (may be updated by newer compile)
+                    [fmSave removeItemAtPath:cacheDst error:nil];
+                    [fmSave copyItemAtPath:plist toPath:cacheDst error:nil];
+                }
+            }
+
+            NSError *e = nil;
+            if (kernel->model) {
+                ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+                    kernel->model, @selector(unloadWithQoS:error:), 21, &e);
+            }
+            // Preserve tmpDir for delta compilation cache — net.plist persists
+            // across process restarts so subsequent launches skip compileWithQoS:.
+            // macOS cleans /tmp on reboot. Weight files are small (~KBs).
+            // Only delete if this was a patched kernel (no compile happened)
+            // and it created a NEW directory (not reusing donor's dir).
+            // For simplicity: always preserve. OS reclaims on reboot.
+            free(kernel->refcount);
+            kernel->model = nil;
+            kernel->tmpDir = nil;
+        } else {
+            // Clone: don't unload shared model or delete tmpDir
+            kernel->model = nil;
+            kernel->tmpDir = nil;
+        }
+
         for (int i = 0; i < kernel->nInputs; i++)
             if (kernel->ioInputs[i]) CFRelease(kernel->ioInputs[i]);
         for (int i = 0; i < kernel->nOutputs; i++)
             if (kernel->ioOutputs[i]) CFRelease(kernel->ioOutputs[i]);
-        if (kernel->tmpDir) {
-            [[NSFileManager defaultManager] removeItemAtPath:kernel->tmpDir error:nil];
-        }
         free(kernel->ioInputs);
         free(kernel->ioOutputs);
         free(kernel->inputBytes);
         free(kernel->outputBytes);
-        
-        // Explicitly nil Objective-C objects to trigger ARC release before freeing struct
-        kernel->model = nil;
+        for (int i = 0; i < kernel->nWeightFiles; i++)
+            free(kernel->weightRelPaths[i]);
+        free(kernel->weightRelPaths);
+
         kernel->request = nil;
-        kernel->tmpDir = nil;
-        
         free(kernel);
     }
 }
@@ -334,6 +694,320 @@ int ane_bridge_get_compile_count(void) {
 
 void ane_bridge_reset_compile_count(void) {
     g_compile_count = 0;
+}
+
+void ane_bridge_clear_cache(void) {
+    NSString *dir = ane_cache_dir();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:dir error:nil];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+}
+
+bool ane_bridge_was_cached(ANEKernelHandle *kernel) {
+    return kernel ? kernel->cached : false;
+}
+
+// --- Delta compilation: reload weights without recompiling ---
+//
+// Orion-style delta patching: the compiled ANE microcode (net.plist) is
+// shape-dependent but weight-value-independent. After the initial compile,
+// we can update weights by writing new BLOBFILEs to disk and calling
+// loadWithQoS: — the ANE picks up the new data without recompilation.
+//
+// Two paths:
+//   reload_weights — same model, unload → patch files → reload (fast path)
+//   patch_from_donor — new model reuses donor's net.plist (zero-compile clone)
+
+bool ane_bridge_reload_weights(ANEKernelHandle *kernel,
+                                const uint8_t **weight_datas,
+                                const size_t *weight_lens,
+                                int n_weights) {
+    if (!kernel || !kernel->model || !kernel->tmpDir) return false;
+    if (n_weights != kernel->nWeightFiles) {
+        fprintf(stderr, "ane_bridge: reload_weights: weight count mismatch (%d vs %d)\n",
+                n_weights, kernel->nWeightFiles);
+        return false;
+    }
+
+    @autoreleasepool {
+        // Delta weight reload via fresh _ANEModel per call.
+        //
+        // Creates a new model with updated weights, populates its tmpDir with
+        // net.plist (from old model's persistent cache → skip compile) + weight
+        // files, then loads. The fresh model reads new weights from disk.
+        //
+        // Model caching doesn't help because unloadWithQoS deletes the tmpDir,
+        // and loadWithQoS on a cached model without its tmpDir triggers a full
+        // recompile (slower than creating a fresh model with a populated tmpDir).
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // Read MIL text from current tmpDir
+        NSString *milPath = [kernel->tmpDir stringByAppendingPathComponent:@"model.mil"];
+        NSData *milData = [NSData dataWithContentsOfFile:milPath];
+        if (!milData) {
+            fprintf(stderr, "ane_bridge: reload_weights: model.mil not found\n");
+            return false;
+        }
+
+        // Build descriptor with new weight data
+        NSMutableDictionary *wdict = [NSMutableDictionary dictionary];
+        for (int i = 0; i < n_weights; i++) {
+            NSString *name = [NSString stringWithUTF8String:kernel->weightRelPaths[i]];
+            NSString *fullName = [@"@model_path/" stringByAppendingString:name];
+            NSData *data = [NSData dataWithBytes:weight_datas[i] length:weight_lens[i]];
+            wdict[fullName] = @{@"offset": @0, @"data": data};
+        }
+
+        id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
+            g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
+            milData, wdict, nil);
+        if (!desc) {
+            fprintf(stderr, "ane_bridge: reload_weights: descriptor failed\n");
+            return false;
+        }
+
+        id newModel = ((id(*)(Class,SEL,id))objc_msgSend)(
+            g_ANEInMem, @selector(inMemoryModelWithDescriptor:), desc);
+        if (!newModel) {
+            fprintf(stderr, "ane_bridge: reload_weights: model creation failed\n");
+            return false;
+        }
+
+        // Populate new model's tmpDir
+        id newHexId = ((id(*)(id,SEL))objc_msgSend)(newModel, @selector(hexStringIdentifier));
+        NSString *newTmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:newHexId];
+        [fm createDirectoryAtPath:[newTmpDir stringByAppendingPathComponent:@"weights"]
+            withIntermediateDirectories:YES attributes:nil error:nil];
+        [milData writeToFile:[newTmpDir stringByAppendingPathComponent:@"model.mil"] atomically:NO];
+        for (int i = 0; i < n_weights; i++) {
+            NSString *fullPath = [newTmpDir
+                stringByAppendingPathComponent:
+                    [NSString stringWithUTF8String:kernel->weightRelPaths[i]]];
+            NSData *data = [NSData dataWithBytes:weight_datas[i] length:weight_lens[i]];
+            [data writeToFile:fullPath atomically:NO];
+        }
+
+        // Copy net.plist to skip compile (from persistent cache or old model's dir)
+        NSString *newPlist = [newTmpDir stringByAppendingPathComponent:@"net.plist"];
+        if (![fm fileExistsAtPath:newPlist]) {
+            NSString *oldPlist = [kernel->tmpDir stringByAppendingPathComponent:@"net.plist"];
+            if ([fm fileExistsAtPath:oldPlist]) {
+                [fm copyItemAtPath:oldPlist toPath:newPlist error:nil];
+            } else {
+                id oldHex = ((id(*)(id,SEL))objc_msgSend)(kernel->model, @selector(hexStringIdentifier));
+                NSString *cachePlist = [[ane_cache_dir()
+                    stringByAppendingPathComponent:oldHex]
+                    stringByAppendingPathComponent:@"net.plist"];
+                if ([fm fileExistsAtPath:cachePlist]) {
+                    [fm copyItemAtPath:cachePlist toPath:newPlist error:nil];
+                }
+            }
+        }
+
+        // Unload old model (frees ANE slot)
+        if (kernel->loaded) {
+            NSError *ue = nil;
+            ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(
+                kernel->model, @selector(unloadWithQoS:error:), 21, &ue);
+            kernel->loaded = false;
+        }
+
+        // Load new model
+        NSError *e = nil;
+        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+            newModel, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        if (!ok) {
+            fprintf(stderr, "ane_bridge: reload_weights LOAD FAILED: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            return false;
+        }
+
+        // Transfer ownership
+        kernel->model = newModel;
+        kernel->tmpDir = newTmpDir;
+        kernel->loaded = true;
+
+        // Rebuild ANE request with existing IOSurfaces
+        NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:kernel->nInputs];
+        NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:kernel->nInputs];
+        for (int i = 0; i < kernel->nInputs; i++) {
+            [wIns addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), kernel->ioInputs[i])];
+            [iIdx addObject:@(i)];
+        }
+        NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:kernel->nOutputs];
+        NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:kernel->nOutputs];
+        for (int i = 0; i < kernel->nOutputs; i++) {
+            [wOuts addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), kernel->ioOutputs[i])];
+            [oIdx addObject:@(i)];
+        }
+        kernel->request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+            g_ANEReq,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+
+        return true;
+    }
+}
+
+ANEKernelHandle *ane_bridge_patch_from_donor(
+    ANEKernelHandle *donor,
+    const char *mil_text, size_t mil_len,
+    const char **weight_names, const uint8_t **weight_datas,
+    const size_t *weight_lens, int n_weights,
+    int n_inputs, const size_t *input_sizes,
+    int n_outputs, const size_t *output_sizes)
+{
+    if (!g_initialized || !donor || !donor->tmpDir) return NULL;
+
+    @autoreleasepool {
+        NSData *milData = [NSData dataWithBytes:mil_text length:mil_len];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // Build weight dictionary for descriptor
+        NSMutableDictionary *wdict = [NSMutableDictionary dictionary];
+        for (int i = 0; i < n_weights; i++) {
+            NSString *name = [NSString stringWithUTF8String:weight_names[i]];
+            NSData *data = [NSData dataWithBytes:weight_datas[i] length:weight_lens[i]];
+            wdict[name] = @{@"offset": @0, @"data": data};
+        }
+
+        // Create descriptor + model (gives us the hexStringIdentifier)
+        id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
+            g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
+            milData, wdict, nil);
+        if (!desc) {
+            fprintf(stderr, "ane_bridge: patch_from_donor: descriptor failed\n");
+            return NULL;
+        }
+
+        id mdl = ((id(*)(Class,SEL,id))objc_msgSend)(
+            g_ANEInMem, @selector(inMemoryModelWithDescriptor:), desc);
+        if (!mdl) {
+            fprintf(stderr, "ane_bridge: patch_from_donor: model creation failed\n");
+            return NULL;
+        }
+
+        id hexId = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
+        NSString *newDir = [NSTemporaryDirectory() stringByAppendingPathComponent:hexId];
+        bool sameDir = [newDir isEqualToString:donor->tmpDir];
+
+        if (sameDir) {
+            // Same MIL text + weight dict keys → same hexId → reuse directory.
+            // Just update weight files in place.
+        } else {
+            // Different hexId — copy compiled microcode from donor
+            [fm removeItemAtPath:newDir error:nil];
+            [fm createDirectoryAtPath:newDir withIntermediateDirectories:YES
+                           attributes:nil error:nil];
+
+            NSString *srcPlist = [donor->tmpDir
+                stringByAppendingPathComponent:@"net.plist"];
+            NSString *dstPlist = [newDir
+                stringByAppendingPathComponent:@"net.plist"];
+            NSError *copyErr = nil;
+            if (![fm copyItemAtPath:srcPlist toPath:dstPlist error:&copyErr]) {
+                fprintf(stderr, "ane_bridge: patch_from_donor: net.plist copy failed: %s\n",
+                        copyErr ? [[copyErr description] UTF8String] : "unknown");
+                [fm removeItemAtPath:newDir error:nil];
+                return NULL;
+            }
+        }
+
+        // Write MIL text + weight files
+        [milData writeToFile:[newDir stringByAppendingPathComponent:@"model.mil"]
+                  atomically:YES];
+        [fm createDirectoryAtPath:[newDir stringByAppendingPathComponent:@"weights"]
+            withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // Track relative paths for delta reload
+        char **relPaths = n_weights > 0 ? (char **)malloc(n_weights * sizeof(char *)) : NULL;
+        bool dataWritten = false;
+
+        for (int i = 0; i < n_weights; i++) {
+            NSString *name = [NSString stringWithUTF8String:weight_names[i]];
+            NSString *relPath = name;
+            if ([name hasPrefix:@"@model_path/"]) {
+                relPath = [name substringFromIndex:12];
+            }
+            relPaths[i] = strdup([relPath UTF8String]);
+
+            NSString *fullPath = [newDir stringByAppendingPathComponent:relPath];
+            NSString *dir = [fullPath stringByDeletingLastPathComponent];
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                           attributes:nil error:nil];
+            NSData *data = [NSData dataWithBytes:weight_datas[i] length:weight_lens[i]];
+            [data writeToFile:fullPath atomically:NO];
+
+            // First blob also becomes the data file (ANE compiler convention)
+            if (!dataWritten) {
+                [data writeToFile:[newDir stringByAppendingPathComponent:@"data"]
+                       atomically:NO];
+                dataWritten = true;
+            }
+        }
+
+        // Load WITHOUT compiling — the key delta optimization
+        NSError *e = nil;
+        BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+            mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        if (!ok) {
+            fprintf(stderr, "ane_bridge: patch_from_donor LOAD FAILED: %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            for (int i = 0; i < n_weights; i++) free(relPaths[i]);
+            free(relPaths);
+            if (!sameDir) [fm removeItemAtPath:newDir error:nil];
+            return NULL;
+        }
+
+        // Build kernel handle
+        ANEKernelHandle *k = (ANEKernelHandle *)calloc(1, sizeof(ANEKernelHandle));
+        k->model = mdl;
+        k->tmpDir = newDir;
+        k->loaded = true;
+        k->refcount = (int *)malloc(sizeof(int));
+        *k->refcount = 1;
+        k->nInputs = n_inputs;
+        k->nOutputs = n_outputs;
+        k->inputBytes = (size_t *)malloc(n_inputs * sizeof(size_t));
+        k->outputBytes = (size_t *)malloc(n_outputs * sizeof(size_t));
+        memcpy(k->inputBytes, input_sizes, n_inputs * sizeof(size_t));
+        memcpy(k->outputBytes, output_sizes, n_outputs * sizeof(size_t));
+        k->nWeightFiles = n_weights;
+        k->weightRelPaths = relPaths;
+
+        // Create IOSurfaces + request (same as compile path)
+        k->ioInputs = (IOSurfaceRef *)malloc(n_inputs * sizeof(IOSurfaceRef));
+        k->ioOutputs = (IOSurfaceRef *)malloc(n_outputs * sizeof(IOSurfaceRef));
+        for (int i = 0; i < n_inputs; i++)
+            k->ioInputs[i] = create_surface_wc(input_sizes[i]);
+        for (int i = 0; i < n_outputs; i++)
+            k->ioOutputs[i] = create_surface(output_sizes[i]);
+
+        NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:n_inputs];
+        NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:n_inputs];
+        for (int i = 0; i < n_inputs; i++) {
+            [wIns addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioInputs[i])];
+            [iIdx addObject:@(i)];
+        }
+        NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:n_outputs];
+        NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:n_outputs];
+        for (int i = 0; i < n_outputs; i++) {
+            [wOuts addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), k->ioOutputs[i])];
+            [oIdx addObject:@(i)];
+        }
+        k->request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+            g_ANEReq,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+
+        // Note: does NOT increment g_compile_count
+        return k;
+    }
 }
 
 uint8_t *ane_bridge_build_weight_blob(const float *src, int rows, int cols,
