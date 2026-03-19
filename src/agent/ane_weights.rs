@@ -3509,13 +3509,14 @@ impl PrePackedWeights {
             }
 
             // Build weight blobs: transpose to [in, out] layout for matmul pattern
-            // GQA-aware: Wk/Wv are [kv_dim, dim], Wo is [attn_dim, dim]
-            let kv_dim = cfg.n_kv_heads * cfg.head_dim();
-            let attn_dim = cfg.n_heads * cfg.head_dim();
-            let wq = build_fp16_blob(&transpose_weight(&lw.wq, attn_dim, dim));
-            let wk = build_fp16_blob(&transpose_weight(&lw.wk, kv_dim, dim));
-            let wv = build_fp16_blob(&transpose_weight(&lw.wv, kv_dim, dim));
-            let wo = build_fp16_blob(&transpose_weight(&lw.wo, dim, attn_dim));
+            // Derive dims from actual weight sizes to handle attn_output_gate (Wq doubles)
+            let qpd = lw.wq.len() / dim;   // q_proj_dim (attn_dim or 2*attn_dim with gate)
+            let kvd = lw.wk.len() / dim;   // kv_dim
+            let ad = lw.wo.len() / dim;    // attn_dim
+            let wq = build_fp16_blob(&transpose_weight(&lw.wq, qpd, dim));
+            let wk = build_fp16_blob(&transpose_weight(&lw.wk, kvd, dim));
+            let wv = build_fp16_blob(&transpose_weight(&lw.wv, kvd, dim));
+            let wo = build_fp16_blob(&transpose_weight(&lw.wo, dim, ad));
             let w1 = build_fp16_blob(&transpose_weight(&lw.w1, hidden, dim));
             let w3 = build_fp16_blob(&transpose_weight(&lw.w3, hidden, dim));
             let w2 = build_fp16_blob(&transpose_weight(&lw.w2, dim, hidden));

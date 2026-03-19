@@ -1605,25 +1605,44 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xn2 = reshape(shape=r2d,x=xnorm)[name=string(\"xn2\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> xnt = transpose(perm=pm,x=xn2)[name=string(\"xnt\")];");
 
-    // Weight constants — GQA-aware: Wk/Wv use kv_dim, Wo uses attn_dim
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{attn_dim}]> Wq = const()[name=string(\"Wq\"), val=tensor<fp16, [1,1,{dim},{attn_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wq.bin\"), offset=uint64(64)))];");
+    // Weight constants — GQA-aware + gate-aware
+    let qpd = cfg.q_proj_dim(); // = attn_dim (no gate) or 2*attn_dim (with gate)
+    let has_gate = cfg.attn_output_gate;
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{qpd}]> Wq = const()[name=string(\"Wq\"), val=tensor<fp16, [1,1,{dim},{qpd}]>(BLOBFILE(path=string(\"@model_path/weights/wq.bin\"), offset=uint64(64)))];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{kv_dim}]> Wk = const()[name=string(\"Wk\"), val=tensor<fp16, [1,1,{dim},{kv_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wk.bin\"), offset=uint64(64)))];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{kv_dim}]> Wv = const()[name=string(\"Wv\"), val=tensor<fp16, [1,1,{dim},{kv_dim}]>(BLOBFILE(path=string(\"@model_path/weights/wv.bin\"), offset=uint64(64)))];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{dim}]> Wo = const()[name=string(\"Wo\"), val=tensor<fp16, [1,1,{attn_dim},{dim}]>(BLOBFILE(path=string(\"@model_path/weights/wo.bin\"), offset=uint64(64)))];");
 
-    // QKV matmuls — Q outputs attn_dim, K/V output kv_dim
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{attn_dim}]> qm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wq)[name=string(\"qm\")];");
+    // QKV matmuls — Q outputs qpd (may include gate), K/V output kv_dim
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{qpd}]> qm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wq)[name=string(\"qm\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{kv_dim}]> km = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wk)[name=string(\"km\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{kv_dim}]> vm = matmul(transpose_x=bF,transpose_y=bF,x=xnt,y=Wv)[name=string(\"vm\")];");
 
-    // Q: [1,1,S,ad] → reshape to head layout [1,H,S,hd]
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{seq}]> qt = transpose(perm=pm,x=qm)[name=string(\"qt\")];");
+    // Q: [1,1,S,qpd] → head layout, optionally split gate
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{qpd},{seq}]> qt = transpose(perm=pm,x=qm)[name=string(\"qt\")];");
     let _ = writeln!(m, "        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
     let _ = writeln!(m, "        tensor<int32, [4]> osa = const()[name=string(\"osa\"), val=tensor<int32, [4]>([1,{attn_dim},1,{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> qf = reshape(shape=osa,x=qt)[name=string(\"qf\")];");
-    let _ = writeln!(m, "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x=qf)[name=string(\"rq\")];");
-    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = transpose(perm=pm,x=q4)[name=string(\"tq\")];");
+
+    if has_gate {
+        let two_hd = 2 * hd;
+        // [1,1,2*ad,S] → [1,H,2*hd,S] → [1,H,S,2*hd] → slice Q and gate
+        let _ = writeln!(m, "        tensor<int32, [4]> rqg = const()[name=string(\"rqg\"), val=tensor<int32, [4]>([1,{heads},{two_hd},{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{two_hd},{seq}]> q4g = reshape(shape=rqg,x=qt)[name=string(\"q4g\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{two_hd}]> qg = transpose(perm=pm,x=q4g)[name=string(\"qg\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> bq0 = const()[name=string(\"bq0\"), val=tensor<int32, [4]>([0,0,0,0])];");
+        let _ = writeln!(m, "        tensor<int32, [4]> sqh = const()[name=string(\"sqh\"), val=tensor<int32, [4]>([1,{heads},{seq},{hd}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = slice_by_size(x=qg,begin=bq0,size=sqh)[name=string(\"q\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> bgh = const()[name=string(\"bgh\"), val=tensor<int32, [4]>([0,0,0,{hd}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> graw = slice_by_size(x=qg,begin=bgh,size=sqh)[name=string(\"graw\")];");
+        // qf for output packing: flatten Q (without gate) to [1,ad,1,S]
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> q_t = transpose(perm=pm,x=q)[name=string(\"q_t\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> qf = reshape(shape=osa,x=q_t)[name=string(\"qf\")];");
+    } else {
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> qf = reshape(shape=osa,x=qt)[name=string(\"qf\")];");
+        let _ = writeln!(m, "        tensor<int32, [4]> qsh = const()[name=string(\"qsh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> q4 = reshape(shape=qsh,x=qf)[name=string(\"rq\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = transpose(perm=pm,x=q4)[name=string(\"tq\")];");
+    }
 
     // K: [1,1,S,kvd] → [1,kvH,S,hd]
     let _ = writeln!(m, "        tensor<fp16, [1,1,{kv_dim},{seq}]> kt = transpose(perm=pm,x=km)[name=string(\"kt\")];");
@@ -1720,9 +1739,20 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
         let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> af = reshape(shape=osa,x=at)[name=string(\"ra\")];");
     }
 
+    // Sigmoid gate (if attn_output_gate): af = af * sigmoid(graw)
+    // graw is [1,H,S,hd], af is [1,ad,1,S]
+    if has_gate {
+        // Flatten graw: [1,H,S,hd] → [1,H,hd,S] → [1,ad,1,S]
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> gt = transpose(perm=pm,x=graw)[name=string(\"gt\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> gf = reshape(shape=osa,x=gt)[name=string(\"gf\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> gsig = sigmoid(x=gf)[name=string(\"gsig\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> af_gated = mul(x=af,y=gsig)[name=string(\"afg\")];");
+    }
+    let af_name = if has_gate { "af_gated" } else { "af" };
+
     // === Wo projection: [1,ad,1,S] → [1,1,S,ad] @ Wo[1,1,ad,D] → [1,1,S,D] ===
     let _ = writeln!(m, "        tensor<int32, [4]> r2a = const()[name=string(\"r2a\"), val=tensor<int32, [4]>([1,1,{attn_dim},{seq}])];");
-    let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{seq}]> af2 = reshape(shape=r2a,x=af)[name=string(\"af2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{seq}]> af2 = reshape(shape=r2a,x={af_name})[name=string(\"af2\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{attn_dim}]> aft = transpose(perm=pm,x=af2)[name=string(\"aft\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> om = matmul(transpose_x=bF,transpose_y=bF,x=aft,y=Wo)[name=string(\"om\")];");
     let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ot = transpose(perm=pm,x=om)[name=string(\"ot\")];");
