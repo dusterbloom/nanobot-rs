@@ -3503,16 +3503,19 @@ impl PrePackedWeights {
             let lw_cow = model.layer(l);
             let lw = &*lw_cow;
 
-            // Skip GDN layers and GQA layers (fused layer is MHA-only, equal heads)
-            if lw.gdn.is_some() || cfg.n_kv_heads != cfg.n_heads {
+            // Skip GDN layers (fused layer handles both MHA and GQA)
+            if lw.gdn.is_some() {
                 continue;
             }
 
             // Build weight blobs: transpose to [in, out] layout for matmul pattern
-            let wq = build_fp16_blob(&transpose_weight(&lw.wq, dim, dim));
-            let wk = build_fp16_blob(&transpose_weight(&lw.wk, dim, dim));
-            let wv = build_fp16_blob(&transpose_weight(&lw.wv, dim, dim));
-            let wo = build_fp16_blob(&transpose_weight(&lw.wo, dim, dim));
+            // GQA-aware: Wk/Wv are [kv_dim, dim], Wo is [attn_dim, dim]
+            let kv_dim = cfg.n_kv_heads * cfg.head_dim();
+            let attn_dim = cfg.n_heads * cfg.head_dim();
+            let wq = build_fp16_blob(&transpose_weight(&lw.wq, attn_dim, dim));
+            let wk = build_fp16_blob(&transpose_weight(&lw.wk, kv_dim, dim));
+            let wv = build_fp16_blob(&transpose_weight(&lw.wv, kv_dim, dim));
+            let wo = build_fp16_blob(&transpose_weight(&lw.wo, dim, attn_dim));
             let w1 = build_fp16_blob(&transpose_weight(&lw.w1, hidden, dim));
             let w3 = build_fp16_blob(&transpose_weight(&lw.w3, hidden, dim));
             let w2 = build_fp16_blob(&transpose_weight(&lw.w2, dim, hidden));
