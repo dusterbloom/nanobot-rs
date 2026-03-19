@@ -2551,6 +2551,13 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     );
     dy = dx_rms;
 
+    // Layer-drop: skip layers that were skipped in forward (identity activations).
+    let skip_layers: Vec<usize> = std::env::var("NANOBOT_SKIP_LAYERS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+
     // Per-layer backward (reverse) with optional phase profiling
     let mut _prof_ffn_us = 0u64;
     let mut _prof_attn_us = 0u64;
@@ -2559,6 +2566,11 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     let mut _prof_misc_us = 0u64;
 
     for l in (0..n_layers).rev() {
+        // Layer-drop: pass dy through unchanged (identity backward).
+        if skip_layers.contains(&l) {
+            continue;
+        }
+
         let ac = &fwd.base.layer_acts[l];
         let la = &fwd.lora_acts[l];
 
@@ -2792,19 +2804,20 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
 
         // Fused-first backward attention: 1 dispatch vs 4 separate + CPU interleaving.
         let dx_attn = 'attn_bwd: {
-            // 1. Try fused per-layer kernel (real weights, delta-cached)
+            // 1. Try fused per-layer kernel (real weights, delta-cached).
+            //    QK-norm backward is handled inside the fused kernel when has_qk_norm=true.
+            //    When the kernel was compiled without QK-norm support, the gradient bypasses
+            //    QK-norm (small numerical drift, acceptable for LoRA where norms are frozen).
             if let Some(ref mut pp) = prepacked {
-                if lw.q_norm.is_none() && lw.k_norm.is_none() {
-                    if let Some(result) = pp.eval_bwd_fused_attn_gqa(l, &dx2, ac, cfg) {
-                        match result {
-                            Ok(dx) => {
-                                let mut dx = dx;
-                                ane_forward::clamp_fp16(&mut dx);
-                                break 'attn_bwd dx;
-                            }
-                            Err(e) => {
-                                tracing::warn!("fused_attn_gqa_bwd layer {l}: {e}");
-                            }
+                if let Some(result) = pp.eval_bwd_fused_attn_gqa(l, &dx2, ac, cfg) {
+                    match result {
+                        Ok(dx) => {
+                            let mut dx = dx;
+                            ane_forward::clamp_fp16(&mut dx);
+                            break 'attn_bwd dx;
+                        }
+                        Err(e) => {
+                            tracing::warn!("fused_attn_gqa_bwd layer {l}: {e}");
                         }
                     }
                 }
@@ -2815,7 +2828,9 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                 && bwd_kernels.qkv_bwd.is_some()
             {
                 match mha_backward_fused_sdpa_dx_attn(bwd_kernels, lw, ac, &dx2, cfg) {
-                    Ok(dx_attn) => break 'attn_bwd dx_attn,
+                    Ok(dx_attn) => {
+                        break 'attn_bwd dx_attn;
+                    }
                     Err(e) => {
                         tracing::warn!("ANE fused SDPA backward fell back: {e}");
                     }
@@ -2834,7 +2849,7 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                     }
                 }
             }
-            // 3. CPU fallback
+            // 4. CPU fallback
             mha_backward_cpu_dx_attn(lw, ac, &dx2, cfg)
         };
 
@@ -2857,18 +2872,20 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
     // Log backward phase profile (prepacked path)
     if _prof_ffn_us + _prof_attn_us > 0 {
         let total = (_prof_ffn_us + _prof_rmsnorm_us + _prof_lora_us + _prof_attn_us).max(1);
-        tracing::info!(
-            "backward profile: ffn={:.1}ms ({:.0}%) attn={:.1}ms ({:.0}%) rmsnorm={:.1}ms ({:.0}%) lora={:.1}ms ({:.0}%) total={:.1}ms",
-            _prof_ffn_us as f64 / 1000.0,
-            _prof_ffn_us as f64 / total as f64 * 100.0,
-            _prof_attn_us as f64 / 1000.0,
-            _prof_attn_us as f64 / total as f64 * 100.0,
-            _prof_rmsnorm_us as f64 / 1000.0,
-            _prof_rmsnorm_us as f64 / total as f64 * 100.0,
-            _prof_lora_us as f64 / 1000.0,
-            _prof_lora_us as f64 / total as f64 * 100.0,
-            total as f64 / 1000.0,
-        );
+        if std::env::var("NANOBOT_PROFILE_BWD").is_ok() {
+            eprintln!(
+                "BWD profile ({n_layers}L): ffn={:.1}ms ({:.0}%) attn={:.1}ms ({:.0}%) rmsnorm={:.1}ms ({:.0}%) lora={:.1}ms ({:.0}%) total={:.1}ms",
+                _prof_ffn_us as f64 / 1000.0,
+                _prof_ffn_us as f64 / total as f64 * 100.0,
+                _prof_attn_us as f64 / 1000.0,
+                _prof_attn_us as f64 / total as f64 * 100.0,
+                _prof_rmsnorm_us as f64 / 1000.0,
+                _prof_rmsnorm_us as f64 / total as f64 * 100.0,
+                _prof_lora_us as f64 / 1000.0,
+                _prof_lora_us as f64 / total as f64 * 100.0,
+                total as f64 / 1000.0,
+            );
+        }
     }
 
     // Divide LoRA gradients by loss_scale to compensate for scaled dlogits

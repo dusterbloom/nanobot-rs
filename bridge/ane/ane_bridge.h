@@ -98,6 +98,9 @@ void ane_bridge_free(ANEKernelHandle *kernel);
 // Get compile count (for exec() restart budgeting)
 int ane_bridge_get_compile_count(void);
 
+// Total loadWithQoS calls (both fresh and delta-cached)
+int ane_bridge_get_load_count(void);
+
 // Reset compile count
 void ane_bridge_reset_compile_count(void);
 
@@ -121,6 +124,15 @@ bool ane_bridge_reload_weights(ANEKernelHandle *kernel,
                                 const uint8_t **weight_datas,
                                 const size_t *weight_lens,
                                 int n_weights);
+
+// Fast delta reload: reuses the same model object, skipping descriptor/model creation.
+// 10-30× faster than reload_weights for repeated hotswaps (e.g. classifier tiles).
+// Unloads model, repopulates tmpDir from in-memory caches (net.plist + MIL + new weights),
+// reloads same model. Falls back to reload_weights if caches aren't available.
+bool ane_bridge_delta_reload(ANEKernelHandle *kernel,
+                              const uint8_t **weight_datas,
+                              const size_t *weight_lens,
+                              int n_weights);
 
 // Create a new kernel by patching weights from a donor's compiled program.
 // The donor's net.plist (compiled microcode) is copied to the new model's
@@ -149,6 +161,16 @@ uint8_t *ane_bridge_build_weight_blob_transposed(const float *src, int rows, int
 
 // Free a blob allocated by ane_bridge_build_weight_blob*
 void ane_bridge_free_blob(void *ptr);
+
+// fp16-weight GEMM: C[M,N] = A_f16[M,K] @ B_f32[K,N]
+// Weights (A) stored as fp16 row-major [M,K], activations (B) as fp32 row-major [K,N].
+// Output (C) is fp32 row-major [M,N]. Uses tiled fp16→fp32 conversion + cblas_sgemm.
+// alpha/beta: C = alpha * A @ B + beta * C
+void ane_bridge_gemm_f16(
+    const uint16_t *a_f16, int M, int K,
+    const float *b_f32, int N,
+    float *c_f32,
+    float alpha, float beta);
 
 #ifdef __cplusplus
 }

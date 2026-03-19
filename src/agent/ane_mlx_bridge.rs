@@ -176,11 +176,22 @@ pub struct AneTrainingConfig {
     pub strict_ane: bool,
     /// Number of micro-batches to accumulate before one optimizer step (default: 1).
     pub accum_steps: usize,
+    /// Adaptive layer drop: skip layers with <1% gradient signal. Default: true.
+    pub adaptive_layer_drop: bool,
 }
 
 /// Seq-len bucket sizes for ANE kernel compilation. Samples are padded to
 /// the nearest bucket. Keeps compilation count low (3 × 10 = 30 kernels).
 const BUCKET_SIZES: &[usize] = &[128, 256, 512, 1024];
+
+/// Compute bucket seq_len for a given sample length (same logic as BucketKernels::compile).
+fn bucket_seq_for(sample_len: usize) -> usize {
+    BUCKET_SIZES
+        .iter()
+        .copied()
+        .find(|&b| b >= sample_len)
+        .unwrap_or(*BUCKET_SIZES.last().unwrap())
+}
 
 /// Pre-compiled forward + backward kernels for multiple seq_len buckets.
 pub struct BucketKernels {
@@ -595,6 +606,8 @@ struct AneTrainerSession {
     prepacked_weights: Vec<(usize, super::ane_weights::PrePackedWeights)>,
     /// BLOBFILE classifier kernel for fused CE (1 ANE slot, per-tile hotswap).
     cls_blob: Option<super::ane_forward::ClassifierBlobKernel>,
+    /// Whether GDN pre-recurrence kernels have been primed (compiled at loads=0).
+    pre_recur_primed: bool,
 }
 
 #[cfg(feature = "mlx")]
@@ -653,6 +666,7 @@ impl AneTrainerSession {
             bucket_lora_grad_kernels: Vec::new(),
             prepacked_weights: Vec::new(),
             cls_blob: None,
+            pre_recur_primed: false,
         })
     }
 
@@ -713,6 +727,18 @@ impl AneTrainerSession {
                 bucket_seq,
                 pp.memory_bytes() as f64 / 1_048_576.0,
             );
+
+            // GDN pre-recurrence per-layer kernels: compiled at loads=0 on first call.
+            if !self.pre_recur_primed && !self.model.cfg().linear_attn_indices.is_empty() {
+                let _ = super::ane_bridge::ane_init();
+                let pr_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                pp.prime_gdn_pre_recurrence_kernels(&pr_cfg, &self.model);
+                self.pre_recur_primed = true;
+            }
 
             // Prime per-layer kernel clones: weights baked into IOSurface.
             // After priming, only activation data traverses CPU caches per step.
@@ -1120,6 +1146,10 @@ impl AneTrainerSession {
 
         let t0 = std::time::Instant::now();
         let sample_lens: Vec<usize> = samples.iter().map(|(tokens, _, _)| tokens.len()).collect();
+
+        // GDN pre-recurrence per-layer kernels must compile at loads=0 (Bug 11).
+        // Done once, before any bucket kernel compilation.
+
         let use_ane = match self.ensure_bucket_kernels(&sample_lens, stats) {
             Ok(()) => !self.bucket_kernels.buckets.is_empty(),
             Err(e) => {
@@ -1440,6 +1470,31 @@ impl AneTrainerSession {
                 }
 
                 total_opt_us += t_opt.elapsed().as_micros() as u64;
+
+                // Adaptive layer drop: skip layers with <1% gradient signal.
+                // Recompute every step from accumulated gradients.
+                if cfg.adaptive_layer_drop {
+                    let norms = super::ane_lora::lora_per_layer_grad_norms(&grad_accum);
+                    let max_norm = norms.iter().cloned().fold(0.0f32, f32::max);
+                    if max_norm > 0.0 {
+                        let threshold = max_norm * 0.01; // 1% of max
+                        let dead: Vec<String> = norms.iter().enumerate()
+                            .filter(|(_, &n)| n < threshold)
+                            .map(|(i, _)| i.to_string())
+                            .collect();
+                        if !dead.is_empty() {
+                            std::env::set_var("NANOBOT_SKIP_LAYERS", dead.join(","));
+                            if opt_step <= 2 {
+                                tracing::info!(
+                                    "adaptive layer drop: skipping {}/{} layers (threshold={:.6})",
+                                    dead.len(), norms.len(), threshold
+                                );
+                            }
+                        } else {
+                            std::env::remove_var("NANOBOT_SKIP_LAYERS");
+                        }
+                    }
+                }
 
                 let t_clone = std::time::Instant::now();
                 if chunk_loss < best_loss {
@@ -2111,7 +2166,7 @@ mod tests {
             residual_scale: 0.0,
             optimizer: AneTrainingOptimizer::AdamW,
             strict_ane: false,
-            accum_steps: 1,
+            accum_steps: 1, adaptive_layer_drop: false,
         };
 
         eprintln!("spawning ANE training thread...");
@@ -2295,7 +2350,7 @@ mod tests {
             residual_scale: 0.0,
             optimizer: AneTrainingOptimizer::AdamW,
             strict_ane: false,
-            accum_steps: 1,
+            accum_steps: 1, adaptive_layer_drop: false,
         };
         let _ane_handle = spawn_ane_training(ane_cfg, vec![(tokens, targets, 1.0)], Some(ane_tx));
 
@@ -4216,7 +4271,14 @@ mod tests {
         let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
         let targets_u32: Vec<u32> = targets.iter().map(|&t| t as u32).collect();
 
-        // --- Load + compile (timed separately) ---
+        // --- Load model ---
+        let t_model = std::time::Instant::now();
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config)
+            .expect("load 35B");
+        let mut model = DenseCachedModel::auto(quantized);
+        let load_ms = t_model.elapsed().as_millis();
+
+        // --- Compile bucket kernels (loads delta-cached programs) ---
         let t_load = std::time::Instant::now();
         let bucket_kernels = BucketKernels::compile(&[tokens_u32.len()], &train_cfg.mil_config)
             .expect("bucket compile");
@@ -4226,10 +4288,6 @@ mod tests {
             .get(tokens_u32.len())
             .expect("bucket must exist");
 
-        let t_model = std::time::Instant::now();
-        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &train_cfg.mil_config)
-            .expect("load 35B");
-        let mut model = DenseCachedModel::auto(quantized);
         model.cfg_mut().seq_len = *bucket_seq;
         let load_ms = t_model.elapsed().as_millis();
 
@@ -4255,6 +4313,14 @@ mod tests {
         // Create prepacked weights (like real training path)
         let fused_ffn = bucket_fwd_k.ffn.is_fully_fused();
         let mut pp = ane_weights::PrePackedWeights::build(&model, *bucket_seq, fused_ffn);
+        // GDN pre-recurrence per-layer kernels (compiled at loads=0 = first thing after ane_init)
+        {
+            let pr_cfg = { let mut c = model.cfg().clone(); c.seq_len = *bucket_seq; c };
+            if !pr_cfg.linear_attn_indices.is_empty() {
+                let _ = crate::agent::ane_bridge::ane_init();
+                pp.prime_gdn_pre_recurrence_kernels(&pr_cfg, &model);
+            }
+        }
         {
             let fwd_tmpl = bucket_fwd_k.ffn.fused_kernel();
             let (bwd_w2t, bwd_w13t) = bucket_bwd_k.ffn_bwd.fused_kernels()
@@ -4309,6 +4375,18 @@ mod tests {
             }
         }
 
+        // Note: per-layer fused backward attention GQA kernels exceed ANE SRAM at 35B dims
+        // (4 weight matrices × [2048,2048] × fp16 > 32MB SRAM limit). Using 3-dispatch path.
+
+        // Log backward kernel status
+        eprintln!("35B bench: bwd kernels: wot={} sdpa_bwd1={} sdpa_bwd2={} qkv={} fused_sdpa={} rmsnorm={}",
+            bucket_bwd_k.wot_bwd.is_some(),
+            bucket_bwd_k.sdpa_bwd1.is_some(),
+            bucket_bwd_k.sdpa_bwd2.is_some(),
+            bucket_bwd_k.qkv_bwd.is_some(),
+            bucket_bwd_k.fused_attn_gqa_bwd.is_some(),
+            bucket_bwd_k.rmsnorm_bwd.is_some(),
+        );
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
         eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);
 
@@ -4366,6 +4444,19 @@ mod tests {
             );
             let upd_us = t2.elapsed().as_micros();
             update_times.push(upd_us);
+
+            // Print per-layer gradient norms on last step for layer drop analysis
+            if step == n_steps - 1 {
+                let norms = crate::agent::ane_lora::lora_per_layer_grad_norms(&bwd.lora_grads);
+                let max_norm = norms.iter().cloned().fold(0.0f32, f32::max);
+                eprintln!("\n  Layer gradient norms (relative to max={:.6}):", max_norm);
+                for (i, &n) in norms.iter().enumerate() {
+                    let pct = if max_norm > 0.0 { n / max_norm * 100.0 } else { 0.0 };
+                    let marker = if pct < 5.0 { " ** DEAD" } else if pct < 15.0 { " * LOW" } else { "" };
+                    eprintln!("    L{:2}: {:.6} ({:5.1}%){}", i, n, pct, marker);
+                }
+                eprintln!();
+            }
 
             losses.push(fwd.base.loss);
             let total_ms = (fwd_us + bwd_us + upd_us) as f64 / 1000.0;
@@ -5544,7 +5635,7 @@ mod tests {
             mil_config: mil_cfg,
             lr: 5e-4,
             epochs: train_epochs,
-            accum_steps: 1,
+            accum_steps: 1, adaptive_layer_drop: false,
             loss_scale: 1.0,
             softcap: 0.0,
             residual_scale: 0.0,
@@ -5901,7 +5992,7 @@ mod tests {
             mil_config: mil_cfg,
             lr: 5e-4,
             epochs: 2,
-            accum_steps: 1,
+            accum_steps: 1, adaptive_layer_drop: false,
             loss_scale: 1.0,
             softcap: 0.0,
             residual_scale: 0.0,
@@ -6100,7 +6191,7 @@ mod tests {
             mil_config: mil_cfg.clone(),
             lr: 5e-4,
             epochs: 1,
-            accum_steps: 1,
+            accum_steps: 1, adaptive_layer_drop: false,
             loss_scale: 1.0,
             softcap: 0.0,
             residual_scale: 0.0,

@@ -2269,6 +2269,9 @@ pub struct PrePackedWeights {
     fused_gdn_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer GDN O projection kernels with baked weights.
     gdn_o_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer GDN pre-recurrence kernels (fused: conv+SiLU+RMSNorm+GQA+decay+gate).
+    gdn_pre_recur_per_layer: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    gdn_pre_recur_output_bytes: usize,
 }
 
 impl PrePackedWeights {
@@ -2308,6 +2311,8 @@ impl PrePackedWeights {
             fused_ffn_fwd_output_bytes: 0,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
+            gdn_pre_recur_per_layer: None,
+            gdn_pre_recur_output_bytes: 0,
         }
     }
 
@@ -2424,6 +2429,8 @@ impl PrePackedWeights {
             fused_ffn_fwd_output_bytes: 0,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
+            gdn_pre_recur_per_layer: None,
+            gdn_pre_recur_output_bytes: 0,
         }
     }
 
@@ -2532,6 +2539,7 @@ impl PrePackedWeights {
         self.fused_ffn_fwd_kernels = None;
         self.fused_gdn_proj_kernels = None;
         self.gdn_o_proj_kernels = None;
+        self.gdn_pre_recur_per_layer = None;
     }
 
     /// Prime per-layer kernel clones with IOSurface-resident weights.
@@ -3261,7 +3269,7 @@ impl PrePackedWeights {
 
         // Hotswap weights for this layer
         let weight_datas: Vec<&[u8]> = vec![&layer_blobs[0], &layer_blobs[1], &layer_blobs[2]];
-        if let Err(e) = kernel.reload_weights(&weight_datas) {
+        if let Err(e) = kernel.delta_reload(&weight_datas) {
             return Some(Err(format!("fused_ffn_bwd hotswap layer {layer}: {e}")));
         }
 
@@ -3428,7 +3436,7 @@ impl PrePackedWeights {
         let b_blobs = self.split_ffn_bwd_b_blobs.as_ref()?;
 
         // Kernel A: hotswap W2^T, eval dx_ffn|h1|h3 → dh1|dh3|dsilu
-        if let Err(e) = ka.reload_weights(&[&a_blobs[layer]]) {
+        if let Err(e) = ka.delta_reload(&[&a_blobs[layer]]) {
             return Some(Err(format!("split_ffn_bwd_a hotswap layer {layer}: {e}")));
         }
 
@@ -3458,7 +3466,7 @@ impl PrePackedWeights {
 
         // Kernel B: hotswap W1^T + W3^T, eval dh1|dh3 → dx
         let layer_b = &b_blobs[layer];
-        if let Err(e) = kb.reload_weights(&[&layer_b[0], &layer_b[1]]) {
+        if let Err(e) = kb.delta_reload(&[&layer_b[0], &layer_b[1]]) {
             return Some(Err(format!("split_ffn_bwd_b hotswap layer {layer}: {e}")));
         }
 
@@ -3759,21 +3767,164 @@ impl PrePackedWeights {
                 }
             }
 
-            // Skip per-layer O projection to save 30 compile/load slots.
-            // The existing DynMatmul O projection path is only ~5ms/layer.
-            // Saving 30 slots for FFN bwd is more valuable (saves ~200ms total).
-            o_kernels.push(None);
+            // O projection: BLOBFILE matmul on ANE (~0.5ms vs ~5ms CPU cblas_sgemm).
+            // Budget: 30 GDN o_proj + 63 existing = 93, well under ~119 loaded limit.
+            let wo_blob = build_fp16_blob(&wo_t);
+            let o_names: Vec<&str> = o_result.weight_names.iter().copied().collect();
+            let o_datas: Vec<&[u8]> = vec![&wo_blob];
+            match super::ane_bridge::AneKernel::compile_multi_weights(
+                &o_result.mil_text,
+                &o_names,
+                &o_datas,
+                &[o_result.input_bytes],
+                &[o_result.output_bytes],
+            ) {
+                Ok(k) => o_kernels.push(Some(k)),
+                Err(_) => o_kernels.push(None), // graceful fallback to CPU matmul
+            }
         }
 
         let gdn_count = proj_kernels.iter().filter(|k| k.is_some()).count();
+        let o_count = o_kernels.iter().filter(|k| k.is_some()).count();
         let elapsed = t0.elapsed();
         eprintln!(
-            "primed {gdn_count}/{n_layers} GDN projection kernels in {:.1}ms",
+            "primed {gdn_count}/{n_layers} GDN proj + {o_count} o_proj in {:.1}ms",
             elapsed.as_secs_f64() * 1000.0,
         );
         self.fused_gdn_proj_kernels = Some(proj_kernels);
         self.gdn_o_proj_kernels = Some(o_kernels);
         Ok(())
+    }
+
+    /// Compile per-layer GDN pre-recurrence split kernels with real weights.
+    ///
+    /// Each GDN layer gets its own fused kernel (4 BLOBFILEs baked at compile time).
+    /// conv_bias fix: models without conv bias store an empty Vec — pad to expected size.
+    pub fn prime_gdn_pre_recurrence_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) {
+        let n_layers = model.n_layers();
+        let pre_r = super::ane_mil::gen_gdn_pre_recurrence_fwd(cfg);
+        let mut kernels: Vec<Option<super::ane_bridge::AneKernel>> = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
+        // Pre-compute expected bias size for empty-bias fix
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let qkv_dim = 2 * h_k * d_k + h_v * d_v;
+
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if let Some(gdn) = lw.gdn.as_ref() {
+                // Fix: conv_bias may be empty (model has no bias term).
+                // MIL kernel expects [1, qkv_dim, 1, 1] BLOBFILE — pad to correct size.
+                let conv_bias = if gdn.conv_bias.is_empty() {
+                    vec![0.0f32; qkv_dim]
+                } else {
+                    gdn.conv_bias.clone()
+                };
+                let blobs = [
+                    build_fp16_blob(&gdn.conv_weight),
+                    build_fp16_blob(&conv_bias),
+                    build_fp16_blob(&gdn.a_log),
+                    build_fp16_blob(&gdn.dt_bias),
+                ];
+                let names: Vec<&str> = pre_r.weight_names.iter().copied().collect();
+                let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+                match super::ane_bridge::AneKernel::compile_multi_weights(
+                    &pre_r.mil_text, &names, &datas,
+                    &[pre_r.input_bytes], &[pre_r.output_bytes],
+                ) {
+                    Ok(k) => kernels.push(Some(k)),
+                    Err(e) => {
+                        eprintln!("GDN pre-recurrence layer {l} compile failed: {e}");
+                        kernels.push(None);
+                    }
+                }
+            } else {
+                kernels.push(None);
+            }
+        }
+
+        let count = kernels.iter().filter(|k| k.is_some()).count();
+        let elapsed = t0.elapsed();
+        eprintln!("GDN pre-recurrence: {count}/{n_layers} per-layer kernels in {:.1}ms",
+            elapsed.as_secs_f64() * 1000.0);
+        self.gdn_pre_recur_output_bytes = pre_r.output_bytes;
+        self.gdn_pre_recur_per_layer = Some(kernels);
+    }
+
+    /// Evaluate fused GDN pre-recurrence on ANE (single dispatch).
+    ///
+    /// Input: qkv|a|b concatenated `[in_ch, seq]` fp32.
+    /// Returns: (q_exp, k_exp, v, g, beta) — same as `cpu_gdn_pre_recurrence`.
+    pub fn eval_gdn_pre_recurrence(
+        &self,
+        layer: usize,
+        qkv: &[f32],
+        a: &[f32],
+        b: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<super::ane_forward::GdnPreRecurrenceOutput, String>> {
+        let kernels = self.gdn_pre_recur_per_layer.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let seq = cfg.seq_len;
+        let in_ch = qkv_dim + 2 * h_v;
+
+        let mut input = Vec::with_capacity(in_ch * seq);
+        input.extend_from_slice(qkv);
+        input.extend_from_slice(a);
+        input.extend_from_slice(b);
+        debug_assert_eq!(input.len(), in_ch * seq);
+
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        kernel.write_input(0, input_bytes);
+
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("pre-recurrence eval layer {layer}: {e}")));
+        }
+
+        let mut out_buf = vec![0u8; self.gdn_pre_recur_output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        let out: Vec<f32> = out_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Unpack: q_exp[h_v*d_k,seq] | k_exp[h_v*d_k,seq] | v[value_dim,seq] | g[h_v,seq] | beta[h_v,seq]
+        let q_dim = h_v * d_k;
+        let mut offset = 0;
+        let q_exp = out[offset..offset + q_dim * seq].to_vec();
+        offset += q_dim * seq;
+        let k_exp = out[offset..offset + q_dim * seq].to_vec();
+        offset += q_dim * seq;
+        let v_raw = out[offset..offset + value_dim * seq].to_vec();
+        offset += value_dim * seq;
+        let g = out[offset..offset + h_v * seq].to_vec();
+        offset += h_v * seq;
+        let beta = out[offset..offset + h_v * seq].to_vec();
+
+        Some(Ok(super::ane_forward::GdnPreRecurrenceOutput {
+            q_exp,
+            k_exp,
+            v_raw,
+            g,
+            beta,
+        }))
     }
 
     /// Evaluate fused GDN projections on per-layer kernel.

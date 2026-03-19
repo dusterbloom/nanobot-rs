@@ -98,6 +98,7 @@ extern "C" {
     fn ane_bridge_free(kernel: *mut ANEKernelHandle);
 
     fn ane_bridge_get_compile_count() -> c_int;
+    fn ane_bridge_get_load_count() -> c_int;
     fn ane_bridge_reset_compile_count();
     fn ane_bridge_clear_cache();
     fn ane_bridge_was_cached(kernel: *mut ANEKernelHandle) -> bool;
@@ -118,8 +119,28 @@ extern "C" {
 
     fn ane_bridge_free_blob(ptr: *mut c_void);
 
+    // fp16-weight GEMM: C[M,N] = alpha * A_f16[M,K] @ B_f32[K,N] + beta * C
+    fn ane_bridge_gemm_f16(
+        a_f16: *const u16,
+        m: c_int,
+        k: c_int,
+        b_f32: *const f32,
+        n: c_int,
+        c_f32: *mut f32,
+        alpha: f32,
+        beta: f32,
+    );
+
     // Delta compilation (Orion-style)
     fn ane_bridge_reload_weights(
+        kernel: *mut ANEKernelHandle,
+        weight_datas: *const *const u8,
+        weight_lens: *const usize,
+        n_weights: c_int,
+    ) -> bool;
+
+    // Fast delta reload: reuses same model object, skips descriptor/model creation.
+    fn ane_bridge_delta_reload(
         kernel: *mut ANEKernelHandle,
         weight_datas: *const *const u8,
         weight_lens: *const usize,
@@ -155,9 +176,14 @@ pub fn ane_init() -> Result<(), String> {
     }
 }
 
-/// Current global kernel compile count.
+/// Current global kernel compile count (fresh compileWithQoS calls only).
 pub fn compile_count() -> i32 {
     unsafe { ane_bridge_get_compile_count() }
+}
+
+/// Total loadWithQoS calls (both fresh compiles and delta-cached loads).
+pub fn load_count() -> i32 {
+    unsafe { ane_bridge_get_load_count() }
 }
 
 /// Reset the global compile counter.
@@ -168,6 +194,37 @@ pub fn reset_compile_count() {
 /// Clear the persistent compilation cache (~/.nanobot/ane_cache/).
 pub fn clear_cache() {
     unsafe { ane_bridge_clear_cache() }
+}
+
+/// fp16-weight GEMM: `c[m,n] = alpha * a_f16[m,k] @ b_f32[k,n] + beta * c[m,n]`.
+///
+/// `a_f16` is row-major fp16 (stored as `u16`), `b_f32` and `c_f32` are row-major fp32.
+/// Uses tiled NEON fp16→fp32 conversion + cblas_sgemm. Halves weight bandwidth.
+pub fn gemm_f16(
+    a_f16: &[u16],
+    m: usize,
+    k: usize,
+    b_f32: &[f32],
+    n: usize,
+    c_f32: &mut [f32],
+    alpha: f32,
+    beta: f32,
+) {
+    debug_assert_eq!(a_f16.len(), m * k);
+    debug_assert_eq!(b_f32.len(), k * n);
+    debug_assert!(c_f32.len() >= m * n);
+    unsafe {
+        ane_bridge_gemm_f16(
+            a_f16.as_ptr(),
+            m as c_int,
+            k as c_int,
+            b_f32.as_ptr(),
+            n as c_int,
+            c_f32.as_mut_ptr(),
+            alpha,
+            beta,
+        );
+    }
 }
 
 /// Convert f32 weights into ANE blob format (128-byte header + fp16 data).
@@ -466,6 +523,28 @@ impl AneKernel {
         }
     }
 
+    /// Fast delta reload: reuses the same model object, skipping descriptor and
+    /// model creation. 10-30× faster than `reload_weights` for repeated hotswaps
+    /// (e.g. classifier tiles). Falls back to `reload_weights` if in-memory caches
+    /// (net.plist, MIL) aren't available.
+    pub fn delta_reload(&self, weight_datas: &[&[u8]]) -> Result<(), String> {
+        let data_ptrs: Vec<*const u8> = weight_datas.iter().map(|d| d.as_ptr()).collect();
+        let data_lens: Vec<usize> = weight_datas.iter().map(|d| d.len()).collect();
+        let ok = unsafe {
+            ane_bridge_delta_reload(
+                self.handle,
+                data_ptrs.as_ptr(),
+                data_lens.as_ptr(),
+                weight_datas.len() as c_int,
+            )
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err("ANE delta reload failed".into())
+        }
+    }
+
     /// Create a new kernel by patching weights from this kernel's compiled
     /// program (Orion-style zero-compile clone).
     ///
@@ -735,6 +814,62 @@ mod tests {
             input_f32, output_f32,
             "cast identity should still work after weight reload"
         );
+    }
+
+    /// Test delta_reload: fast weight hotswap reusing same model object.
+    /// Verifies multiple consecutive delta reloads produce correct results.
+    #[test]
+    fn smoke_delta_reload() {
+        ane_init().expect("ane_init failed");
+
+        let tensor_bytes = N * 4;
+        let weight_name = "@model_path/weights/weight.bin";
+        let dummy_weight = vec![0u8; 128 + 64 * 2];
+
+        let kernel = AneKernel::compile_multi_weights(
+            CAST_IDENTITY_MIL,
+            &[weight_name],
+            &[&dummy_weight],
+            &[tensor_bytes],
+            &[tensor_bytes],
+        )
+        .expect("compile failed");
+
+        let input_f32: Vec<f32> = (0..N).map(|i| (i % 50) as f32).collect();
+        let input_bytes: Vec<u8> = input_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        // Verify initial eval
+        kernel.write_input(0, &input_bytes);
+        kernel.eval().expect("initial eval failed");
+
+        // Do 3 consecutive delta reloads (simulates classifier tile hotswap)
+        for round in 0..3 {
+            let new_weight = vec![(0x10 + round as u8); 128 + 64 * 2];
+            let count_before = compile_count();
+            kernel
+                .delta_reload(&[&new_weight])
+                .expect(&format!("delta_reload round {round} failed"));
+            assert_eq!(
+                compile_count(),
+                count_before,
+                "delta_reload should NOT increment compile count"
+            );
+
+            // Verify kernel still produces correct output
+            kernel.write_input(0, &input_bytes);
+            kernel.eval().expect(&format!("eval after delta_reload round {round} failed"));
+
+            let mut output_bytes = vec![0u8; tensor_bytes];
+            kernel.read_output(0, &mut output_bytes);
+            let output_f32: Vec<f32> = output_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(
+                input_f32, output_f32,
+                "cast identity should work after delta_reload round {round}"
+            );
+        }
     }
 
     /// Test patch_from_donor: create kernel from donor's compiled microcode.

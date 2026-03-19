@@ -2130,6 +2130,9 @@ pub fn gen_fused_attn_gqa_fwd(cfg: &MilConfig, has_qk_norm: bool) -> FusedLayerM
     let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> a_out = reshape(shape=rha,x=a4)[name=string(\"aout\")];");
 
     // --- Sigmoid gate ---
+    // ANE rejects ANY fp32 ops mid-graph (fp32 matmul, sigmoid, and even bare
+    // fp32 cast→recast all cause CompilationFailure). Gate stays fp16.
+    // External Wo (3-dispatch path) provides the fp32 precision reset instead.
     let o_in = if has_gate {
         let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> gsig = sigmoid(x=graw)[name=string(\"gsig\")];");
         let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> gated = mul(x=a_out,y=gsig)[name=string(\"gated\")];");
@@ -2783,6 +2786,436 @@ pub fn gen_fused_gdn_proj(cfg: &MilConfig) -> FusedLayerMil {
     }
 }
 
+/// Generate fused GDN pre-recurrence kernel: conv1d+SiLU → Q/K RMSNorm → GQA expand → decay+gate.
+///
+/// Takes the QKV+A+B projection outputs and produces everything the CPU recurrence needs.
+///
+/// Input: `[1, in_ch, 1, seq]` fp32 — `qkv[qkv_dim] | a[h_v] | b[h_v]` concatenated on channel axis.
+///   (in_ch = qkv_dim + 2*h_v, same as gen_fused_gdn_proj output minus z which goes to output gate)
+///
+/// Weights (4 BLOBFILEs):
+///   - conv_w.bin: `[1, qkv_dim, 1, kernel]` fp16  (depthwise conv weight)
+///   - conv_b.bin: `[1, qkv_dim, 1, 1]` fp16       (conv bias)
+///   - a_log.bin:  `[1, h_v, 1, 1]` fp16            (learned per-head decay constant)
+///   - dt_bias.bin:`[1, h_v, 1, 1]` fp16            (learned per-head dt bias)
+///
+/// Output: `[1, out_ch, 1, seq]` fp32 — `q_exp[h_v*d_k] | k_exp[h_v*d_k] | v[value_dim] | g[h_v] | beta[h_v]`
+///
+/// All ops are ANE-proven: conv1d (proven Session 3), SiLU (elementwise), RMSNorm via
+/// reduce_mean+pow(-0.5) (proven gen_rmsnorm_fwd), GQA expand (tile), softplus/exp/sigmoid (elementwise).
+pub fn gen_gdn_pre_recurrence_fwd(cfg: &MilConfig) -> FusedLayerMil {
+    let seq = cfg.seq_len;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let kernel = cfg.conv_kernel_size;
+    let kv_repeat = h_v / h_k.max(1);
+
+    let in_ch = qkv_dim + 2 * h_v; // qkv|a|b (z not included — goes to output gate separately)
+    let out_ch = 2 * h_v * d_k + value_dim + 2 * h_v; // q_exp|k_exp|v|g|beta
+
+    let inv_scale = (d_k as f64).powf(-0.5);
+    let eps = 1e-6_f64;
+
+    let mut m = String::with_capacity(16384);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> input) {{");
+
+    // --- Constants ---
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+    let _ = writeln!(m, "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];");
+    let _ = writeln!(m, "        fp16 nhalf = const()[name=string(\"nh\"), val=fp16(-0.5)];");
+    let _ = writeln!(m, "        fp16 inv_sc = const()[name=string(\"isc\"), val=fp16({inv_scale})];");
+    let _ = writeln!(m, "        fp16 one = const()[name=string(\"one\"), val=fp16(1.0)];");
+    let _ = writeln!(m, "        fp16 neg1 = const()[name=string(\"neg1\"), val=fp16(-1.0)];");
+
+    // Reduce axis for per-head RMSNorm (channel axis = 1)
+    let _ = writeln!(m, "        tensor<int32, [1]> ch_ax = const()[name=string(\"chax\"), val=tensor<int32, [1]>([1])];");
+
+    // --- BLOBFILE weights (4 total) ---
+    // Conv weight: [qkv_dim, 1, 1, kernel] — depthwise conv format (out_ch, in_ch/groups, H, W)
+    let _ = writeln!(m, "        tensor<fp16, [{qkv_dim},1,1,{kernel}]> Wconv = const()[name=string(\"Wconv\"), val=tensor<fp16, [{qkv_dim},1,1,{kernel}]>(BLOBFILE(path=string(\"@model_path/weights/conv_w.bin\"), offset=uint64(64)))];");
+    // Conv bias: [1, qkv_dim, 1, 1]
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,1]> Bconv = const()[name=string(\"Bconv\"), val=tensor<fp16, [1,{qkv_dim},1,1]>(BLOBFILE(path=string(\"@model_path/weights/conv_b.bin\"), offset=uint64(64)))];");
+    // a_log: [1, h_v, 1, 1] — per-head learned decay
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> Alog = const()[name=string(\"Alog\"), val=tensor<fp16, [1,{h_v},1,1]>(BLOBFILE(path=string(\"@model_path/weights/a_log.bin\"), offset=uint64(64)))];");
+    // dt_bias: [1, h_v, 1, 1] — per-head dt bias
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> Dtb = const()[name=string(\"Dtb\"), val=tensor<fp16, [1,{h_v},1,1]>(BLOBFILE(path=string(\"@model_path/weights/dt_bias.bin\"), offset=uint64(64)))];");
+
+    // --- Cast input to fp16 ---
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> ih = cast(dtype=to16,x=input)[name=string(\"cin\")];");
+
+    // --- Slice QKV, A, B from input ---
+    let _ = writeln!(m, "        tensor<int32, [4]> qkv_b = const()[name=string(\"qb\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> qkv_e = const()[name=string(\"qe\"), val=tensor<int32, [4]>([1,{qkv_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> qkv_raw = slice_by_index(begin=qkv_b,end=qkv_e,x=ih)[name=string(\"qkvs\")];");
+
+    let a_start = qkv_dim;
+    let b_start = qkv_dim + h_v;
+    let _ = writeln!(m, "        tensor<int32, [4]> a_b = const()[name=string(\"ab\"), val=tensor<int32, [4]>([0,{a_start},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> a_e = const()[name=string(\"ae\"), val=tensor<int32, [4]>([1,{b_start},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> a_raw = slice_by_index(begin=a_b,end=a_e,x=ih)[name=string(\"as\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> b_b = const()[name=string(\"bb\"), val=tensor<int32, [4]>([0,{b_start},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> b_e = const()[name=string(\"be\"), val=tensor<int32, [4]>([1,{in_ch},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> b_raw = slice_by_index(begin=b_b,end=b_e,x=ih)[name=string(\"bs\")];");
+
+    // ===== Step 1: Causal depthwise conv1d + SiLU =====
+    // conv op: depthwise (groups=qkv_dim), causal pad left by (kernel-1), valid right
+    let pad_left = kernel - 1;
+    let _ = writeln!(m, "        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,{pad_left},0])];");
+    let _ = writeln!(m, "        string pt = const()[name=string(\"pt\"), val=string(\"custom\")];");
+    let _ = writeln!(m, "        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];");
+    let _ = writeln!(m, "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];");
+    let _ = writeln!(m, "        int32 gr = const()[name=string(\"gr\"), val=int32({qkv_dim})];");
+
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cv = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wconv,x=qkv_raw)[name=string(\"cv\")];");
+    // Add bias
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cvb = add(x=cv,y=Bconv)[name=string(\"cvb\")];");
+    // SiLU: x * sigmoid(x) — proven pattern from gen_fused_ffn_fwd
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cvsig = sigmoid(x=cvb)[name=string(\"cvsig\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> qkv_silu = mul(x=cvb,y=cvsig)[name=string(\"qkvsilu\")];");
+
+    // ===== Step 2: Split QKV, weight-free RMSNorm on Q and K =====
+    // Slice Q [0..key_dim], K [key_dim..2*key_dim], V [2*key_dim..qkv_dim]
+    let _ = writeln!(m, "        tensor<int32, [4]> q_b = const()[name=string(\"qsb\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> q_e = const()[name=string(\"qse\"), val=tensor<int32, [4]>([1,{key_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> q_raw = slice_by_index(begin=q_b,end=q_e,x=qkv_silu)[name=string(\"qraw\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> k_b = const()[name=string(\"ksb\"), val=tensor<int32, [4]>([0,{key_dim},0,0])];");
+    let k_end = 2 * key_dim;
+    let _ = writeln!(m, "        tensor<int32, [4]> k_e = const()[name=string(\"kse\"), val=tensor<int32, [4]>([1,{k_end},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> k_raw = slice_by_index(begin=k_b,end=k_e,x=qkv_silu)[name=string(\"kraw\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> v_b = const()[name=string(\"vsb\"), val=tensor<int32, [4]>([0,{k_end},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> v_e = const()[name=string(\"vse\"), val=tensor<int32, [4]>([1,{qkv_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{value_dim},1,{seq}]> v_out = slice_by_index(begin=v_b,end=v_e,x=qkv_silu)[name=string(\"vout\")];");
+
+    // RMSNorm on Q: per-head across d_k channels
+    // Reshape Q to [1, h_k, d_k, seq] for per-head reduce
+    let _ = writeln!(m, "        tensor<int32, [4]> qhr = const()[name=string(\"qhr\"), val=tensor<int32, [4]>([1,{h_k},{d_k},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q3 = reshape(shape=qhr,x=q_raw)[name=string(\"q3\")];");
+    // reduce_mean on axis 2 (d_k dim) for per-head norm
+    let _ = writeln!(m, "        tensor<int32, [1]> dk_ax = const()[name=string(\"dkax\"), val=tensor<int32, [1]>([2])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_sq = mul(x=q3,y=q3)[name=string(\"qsq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_ms = reduce_mean(x=q_sq,axes=dk_ax,keep_dims=kd)[name=string(\"qms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_me = add(x=q_ms,y=eps_v)[name=string(\"qme\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_rr = pow(x=q_me,y=nhalf)[name=string(\"qrr\")];");
+    // Normalize and scale: q_norm = q / rms * inv_scale^2 (CPU applies inv_scale twice to Q)
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_n = mul(x=q3,y=q_rr)[name=string(\"qn\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_s1 = mul(x=q_n,y=inv_sc)[name=string(\"qs1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_s = mul(x=q_s1,y=inv_sc)[name=string(\"qs\")];");
+
+    // RMSNorm on K: same pattern
+    let _ = writeln!(m, "        tensor<int32, [4]> khr = const()[name=string(\"khr\"), val=tensor<int32, [4]>([1,{h_k},{d_k},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k3 = reshape(shape=khr,x=k_raw)[name=string(\"k3\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_sq = mul(x=k3,y=k3)[name=string(\"ksq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_ms = reduce_mean(x=k_sq,axes=dk_ax,keep_dims=kd)[name=string(\"kms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_me = add(x=k_ms,y=eps_v)[name=string(\"kme\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_rr = pow(x=k_me,y=nhalf)[name=string(\"krr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_n = mul(x=k3,y=k_rr)[name=string(\"kn\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_s = mul(x=k_n,y=inv_sc)[name=string(\"ks\")];");
+
+    // ===== Step 3: GQA expansion =====
+    // If kv_repeat > 1, expand Q and K from [1, h_k, d_k, seq] → [1, h_v, d_k, seq]
+    // Uses concat (proven ANE op) instead of tile (unverified).
+    // Reshape to [1, h_k, 1, d_k*seq], concat kv_repeat copies on axis 2,
+    // → [1, h_k, kv_repeat, d_k*seq], reshape → [1, h_v*d_k, 1, seq]
+    // This gives interleaved ordering matching the CPU reference.
+    if kv_repeat > 1 {
+        let dk_seq = d_k * seq;
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r1 = const()[name=string(\"gr1\"), val=tensor<int32, [4]>([1,{h_k},1,{dk_seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{dk_seq}]> q_f = reshape(shape=gqa_r1,x=q_s)[name=string(\"qf\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{dk_seq}]> k_f = reshape(shape=gqa_r1,x=k_s)[name=string(\"kf\")];");
+
+        // GQA expand via concat on axis 2 (kv_repeat copies)
+        let hv_dk = h_v * d_k;
+        let _ = writeln!(m, "        int32 ax2 = const()[name=string(\"ax2\"), val=int32(2)];");
+        if kv_repeat == 2 {
+            let _ = writeln!(m, "        tensor<fp16, [1,{h_k},2,{dk_seq}]> q_t = concat(values=(q_f,q_f),axis=ax2,interleave=bF)[name=string(\"qt\")];");
+            let _ = writeln!(m, "        tensor<fp16, [1,{h_k},2,{dk_seq}]> k_t = concat(values=(k_f,k_f),axis=ax2,interleave=bF)[name=string(\"kt\")];");
+        } else {
+            panic!("GDN pre-recurrence: kv_repeat={kv_repeat} not yet supported (only 1 or 2)");
+        }
+
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r2 = const()[name=string(\"gr2\"), val=tensor<int32, [4]>([1,{hv_dk},1,{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{hv_dk},1,{seq}]> q_exp = reshape(shape=gqa_r2,x=q_t)[name=string(\"qexp\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{hv_dk},1,{seq}]> k_exp = reshape(shape=gqa_r2,x=k_t)[name=string(\"kexp\")];");
+    } else {
+        // No expansion needed — just reshape from [1, h_k, d_k, seq] to [1, key_dim, 1, seq]
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r2 = const()[name=string(\"gr2\"), val=tensor<int32, [4]>([1,{key_dim},1,{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> q_exp = reshape(shape=gqa_r2,x=q_s)[name=string(\"qexp\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> k_exp = reshape(shape=gqa_r2,x=k_s)[name=string(\"kexp\")];");
+    }
+
+    let q_out_ch = h_v * d_k;
+
+    // ===== Step 4: Decay g and gate beta =====
+    // g = exp(-exp(a_log) * softplus(a_raw + dt_bias))
+    //   = (1 + exp(a_raw + dt_bias))^(-exp(a_log))    [algebraic identity]
+    // This avoids log/select/greater/minimum — only uses exp, add, pow, mul (all ANE-proven).
+    // beta = sigmoid(b_raw) — ANE has native sigmoid op.
+
+    // exp(a_log): [1, h_v, 1, 1]
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> ea = exp(x=Alog)[name=string(\"ea\")];");
+    // -exp(a_log) for pow exponent
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> neg_ea = mul(x=ea,y=neg1)[name=string(\"negea\")];");
+
+    // a_raw + dt_bias: [1, h_v, 1, seq] + [1, h_v, 1, 1] → broadcast
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> adb = add(x=a_raw,y=Dtb)[name=string(\"adb\")];");
+
+    // g = pow(1 + exp(x), -A) where x = a_raw + dt_bias, A = exp(a_log)
+    // In fp16, exp(x) overflows for x > ~11 → 1+inf=inf → pow(inf, -A) = 0 (correct: strong decay)
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> adb_e = exp(x=adb)[name=string(\"adbe\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> sp_1e = add(x=one,y=adb_e)[name=string(\"sp1e\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> g_out = pow(x=sp_1e,y=neg_ea)[name=string(\"gout\")];");
+
+    // beta = sigmoid(b_raw) — native ANE op (proven in gen_fused_ffn_fwd)
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> beta_out = sigmoid(x=b_raw)[name=string(\"bout\")];");
+
+    // ===== Concatenate outputs: q_exp | k_exp | v | g | beta =====
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(q_exp,k_exp,v_out,g_out,beta_out),axis=cax,interleave=bF)[name=string(\"cat\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out = cast(dtype=to32,x=cat)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = in_ch * seq * 4;
+    let output_bytes = out_ch * seq * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/conv_w.bin",
+            "@model_path/weights/conv_b.bin",
+            "@model_path/weights/a_log.bin",
+            "@model_path/weights/dt_bias.bin",
+        ],
+        input_bytes,
+        output_bytes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split GDN pre-recurrence: 2 smaller kernels to work around Bug 11
+// ---------------------------------------------------------------------------
+
+/// Kernel A: Depthwise conv1d + SiLU on QKV channels.
+///
+/// Input: `[1, qkv_dim, 1, seq]` fp32 (the raw QKV projection output).
+/// BLOBFILEs (2): conv_w `[qkv_dim,1,1,kernel]`, conv_b `[1,qkv_dim,1,1]`.
+/// Output: `[1, qkv_dim, 1, seq]` fp32 (QKV after conv+SiLU).
+pub fn gen_gdn_conv_silu_fwd(cfg: &MilConfig) -> FusedLayerMil {
+    let seq = cfg.seq_len;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let kernel = cfg.conv_kernel_size;
+
+    let mut m = String::with_capacity(4096);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {qkv_dim}, 1, {seq}]> input) {{");
+
+    // Constants
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+
+    // BLOBFILE weights (2)
+    let _ = writeln!(m, "        tensor<fp16, [{qkv_dim},1,1,{kernel}]> Wconv = const()[name=string(\"Wconv\"), val=tensor<fp16, [{qkv_dim},1,1,{kernel}]>(BLOBFILE(path=string(\"@model_path/weights/conv_w.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,1]> Bconv = const()[name=string(\"Bconv\"), val=tensor<fp16, [1,{qkv_dim},1,1]>(BLOBFILE(path=string(\"@model_path/weights/conv_b.bin\"), offset=uint64(64)))];");
+
+    // Cast + conv + SiLU
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> ih = cast(dtype=to16,x=input)[name=string(\"cin\")];");
+
+    let pad_left = kernel - 1;
+    let _ = writeln!(m, "        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,{pad_left},0])];");
+    let _ = writeln!(m, "        string pt = const()[name=string(\"pt\"), val=string(\"custom\")];");
+    let _ = writeln!(m, "        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];");
+    let _ = writeln!(m, "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];");
+    let _ = writeln!(m, "        int32 gr = const()[name=string(\"gr\"), val=int32({qkv_dim})];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cv = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wconv,x=ih)[name=string(\"cv\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cvb = add(x=cv,y=Bconv)[name=string(\"cvb\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> cvsig = sigmoid(x=cvb)[name=string(\"cvsig\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> silu = mul(x=cvb,y=cvsig)[name=string(\"silu\")];");
+
+    let _ = writeln!(m, "        tensor<fp32, [1,{qkv_dim},1,{seq}]> out = cast(dtype=to32,x=silu)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = qkv_dim * seq * 4;
+    let output_bytes = qkv_dim * seq * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/conv_w.bin",
+            "@model_path/weights/conv_b.bin",
+        ],
+        input_bytes,
+        output_bytes,
+    }
+}
+
+/// Kernel B: RMSNorm + GQA expansion + decay/gate from conv+SiLU output.
+///
+/// Input: `[1, in_ch, 1, seq]` fp32 — `qkv_silu[qkv_dim] | a[h_v] | b[h_v]`.
+/// BLOBFILEs (2): a_log `[1,h_v,1,1]`, dt_bias `[1,h_v,1,1]`.
+/// Output: `[1, out_ch, 1, seq]` fp32 — `q_exp | k_exp | v | g | beta`.
+pub fn gen_gdn_post_conv_fwd(cfg: &MilConfig) -> FusedLayerMil {
+    let seq = cfg.seq_len;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let kv_repeat = h_v / h_k.max(1);
+
+    let in_ch = qkv_dim + 2 * h_v; // qkv_silu | a | b
+    let out_ch = 2 * h_v * d_k + value_dim + 2 * h_v; // q_exp | k_exp | v | g | beta
+
+    let inv_scale = (d_k as f64).powf(-0.5);
+    let eps = 1e-6_f64;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> input) {{");
+
+    // Constants
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+    let _ = writeln!(m, "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];");
+    let _ = writeln!(m, "        fp16 nhalf = const()[name=string(\"nh\"), val=fp16(-0.5)];");
+    let _ = writeln!(m, "        fp16 inv_sc = const()[name=string(\"isc\"), val=fp16({inv_scale})];");
+    let _ = writeln!(m, "        fp16 one = const()[name=string(\"one\"), val=fp16(1.0)];");
+    let _ = writeln!(m, "        fp16 neg1 = const()[name=string(\"neg1\"), val=fp16(-1.0)];");
+    let _ = writeln!(m, "        tensor<int32, [1]> dk_ax = const()[name=string(\"dkax\"), val=tensor<int32, [1]>([2])];");
+
+    // BLOBFILEs (2)
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> Alog = const()[name=string(\"Alog\"), val=tensor<fp16, [1,{h_v},1,1]>(BLOBFILE(path=string(\"@model_path/weights/a_log.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> Dtb = const()[name=string(\"Dtb\"), val=tensor<fp16, [1,{h_v},1,1]>(BLOBFILE(path=string(\"@model_path/weights/dt_bias.bin\"), offset=uint64(64)))];");
+
+    // Cast input
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> ih = cast(dtype=to16,x=input)[name=string(\"cin\")];");
+
+    // Slice qkv_silu, a, b
+    let _ = writeln!(m, "        tensor<int32, [4]> qkv_b = const()[name=string(\"qb\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> qkv_e = const()[name=string(\"qe\"), val=tensor<int32, [4]>([1,{qkv_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{qkv_dim},1,{seq}]> qkv_silu = slice_by_index(begin=qkv_b,end=qkv_e,x=ih)[name=string(\"qkvs\")];");
+
+    let a_start = qkv_dim;
+    let b_start = qkv_dim + h_v;
+    let _ = writeln!(m, "        tensor<int32, [4]> a_b = const()[name=string(\"ab\"), val=tensor<int32, [4]>([0,{a_start},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> a_e = const()[name=string(\"ae\"), val=tensor<int32, [4]>([1,{b_start},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> a_raw = slice_by_index(begin=a_b,end=a_e,x=ih)[name=string(\"as\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> b_b = const()[name=string(\"bb\"), val=tensor<int32, [4]>([0,{b_start},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> b_e = const()[name=string(\"be\"), val=tensor<int32, [4]>([1,{in_ch},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> b_raw = slice_by_index(begin=b_b,end=b_e,x=ih)[name=string(\"bs\")];");
+
+    // Split Q, K, V from qkv_silu
+    let _ = writeln!(m, "        tensor<int32, [4]> q_b = const()[name=string(\"qsb\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> q_e = const()[name=string(\"qse\"), val=tensor<int32, [4]>([1,{key_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> q_raw = slice_by_index(begin=q_b,end=q_e,x=qkv_silu)[name=string(\"qraw\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> k_b = const()[name=string(\"ksb\"), val=tensor<int32, [4]>([0,{key_dim},0,0])];");
+    let k_end = 2 * key_dim;
+    let _ = writeln!(m, "        tensor<int32, [4]> k_e = const()[name=string(\"kse\"), val=tensor<int32, [4]>([1,{k_end},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> k_raw = slice_by_index(begin=k_b,end=k_e,x=qkv_silu)[name=string(\"kraw\")];");
+
+    let _ = writeln!(m, "        tensor<int32, [4]> v_b = const()[name=string(\"vsb\"), val=tensor<int32, [4]>([0,{k_end},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> v_e = const()[name=string(\"vse\"), val=tensor<int32, [4]>([1,{qkv_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{value_dim},1,{seq}]> v_out = slice_by_index(begin=v_b,end=v_e,x=qkv_silu)[name=string(\"vout\")];");
+
+    // RMSNorm on Q
+    let _ = writeln!(m, "        tensor<int32, [4]> qhr = const()[name=string(\"qhr\"), val=tensor<int32, [4]>([1,{h_k},{d_k},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q3 = reshape(shape=qhr,x=q_raw)[name=string(\"q3\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_sq = mul(x=q3,y=q3)[name=string(\"qsq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_ms = reduce_mean(x=q_sq,axes=dk_ax,keep_dims=kd)[name=string(\"qms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_me = add(x=q_ms,y=eps_v)[name=string(\"qme\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> q_rr = pow(x=q_me,y=nhalf)[name=string(\"qrr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_n = mul(x=q3,y=q_rr)[name=string(\"qn\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_s1 = mul(x=q_n,y=inv_sc)[name=string(\"qs1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> q_s = mul(x=q_s1,y=inv_sc)[name=string(\"qs\")];");
+
+    // RMSNorm on K
+    let _ = writeln!(m, "        tensor<int32, [4]> khr = const()[name=string(\"khr\"), val=tensor<int32, [4]>([1,{h_k},{d_k},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k3 = reshape(shape=khr,x=k_raw)[name=string(\"k3\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_sq = mul(x=k3,y=k3)[name=string(\"ksq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_ms = reduce_mean(x=k_sq,axes=dk_ax,keep_dims=kd)[name=string(\"kms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_me = add(x=k_ms,y=eps_v)[name=string(\"kme\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{seq}]> k_rr = pow(x=k_me,y=nhalf)[name=string(\"krr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_n = mul(x=k3,y=k_rr)[name=string(\"kn\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_k},{d_k},{seq}]> k_s = mul(x=k_n,y=inv_sc)[name=string(\"ks\")];");
+
+    // GQA expansion
+    if kv_repeat > 1 {
+        let dk_seq = d_k * seq;
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r1 = const()[name=string(\"gr1\"), val=tensor<int32, [4]>([1,{h_k},1,{dk_seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{dk_seq}]> q_f = reshape(shape=gqa_r1,x=q_s)[name=string(\"qf\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{h_k},1,{dk_seq}]> k_f = reshape(shape=gqa_r1,x=k_s)[name=string(\"kf\")];");
+
+        let hv_dk = h_v * d_k;
+        let _ = writeln!(m, "        int32 ax2 = const()[name=string(\"ax2\"), val=int32(2)];");
+        if kv_repeat == 2 {
+            let _ = writeln!(m, "        tensor<fp16, [1,{h_k},2,{dk_seq}]> q_t = concat(values=(q_f,q_f),axis=ax2,interleave=bF)[name=string(\"qt\")];");
+            let _ = writeln!(m, "        tensor<fp16, [1,{h_k},2,{dk_seq}]> k_t = concat(values=(k_f,k_f),axis=ax2,interleave=bF)[name=string(\"kt\")];");
+        } else {
+            panic!("GDN post-conv: kv_repeat={kv_repeat} not yet supported (only 1 or 2)");
+        }
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r2 = const()[name=string(\"gr2\"), val=tensor<int32, [4]>([1,{hv_dk},1,{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{hv_dk},1,{seq}]> q_exp = reshape(shape=gqa_r2,x=q_t)[name=string(\"qexp\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{hv_dk},1,{seq}]> k_exp = reshape(shape=gqa_r2,x=k_t)[name=string(\"kexp\")];");
+    } else {
+        let _ = writeln!(m, "        tensor<int32, [4]> gqa_r2 = const()[name=string(\"gr2\"), val=tensor<int32, [4]>([1,{key_dim},1,{seq}])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> q_exp = reshape(shape=gqa_r2,x=q_s)[name=string(\"qexp\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{key_dim},1,{seq}]> k_exp = reshape(shape=gqa_r2,x=k_s)[name=string(\"kexp\")];");
+    }
+
+    // Decay g and gate beta
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> ea = exp(x=Alog)[name=string(\"ea\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,1]> neg_ea = mul(x=ea,y=neg1)[name=string(\"negea\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> adb = add(x=a_raw,y=Dtb)[name=string(\"adb\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> adb_e = exp(x=adb)[name=string(\"adbe\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> sp_1e = add(x=one,y=adb_e)[name=string(\"sp1e\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> g_out = pow(x=sp_1e,y=neg_ea)[name=string(\"gout\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{h_v},1,{seq}]> beta_out = sigmoid(x=b_raw)[name=string(\"bout\")];");
+
+    // Concatenate outputs
+    let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> cat = concat(values=(q_exp,k_exp,v_out,g_out,beta_out),axis=cax,interleave=bF)[name=string(\"cat\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> out = cast(dtype=to32,x=cat)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = in_ch * seq * 4;
+    let output_bytes = out_ch * seq * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/a_log.bin",
+            "@model_path/weights/dt_bias.bin",
+        ],
+        input_bytes,
+        output_bytes,
+    }
+}
+
 /// Generate a single BLOBFILE matmul kernel: out = x @ W.
 ///
 /// Input: `[1, in_dim, 1, seq]` fp32.
@@ -3314,6 +3747,48 @@ pub fn gen_classifier_tile_fwd(dim: usize, tile_rows: usize, seq: usize) -> Fuse
         weight_names: vec!["@model_path/weights/embed_tile.bin"],
         input_bytes,
         output_bytes,
+    }
+}
+
+/// Classifier tile MIL with a per-tile weight key name.
+///
+/// Same program as `gen_classifier_tile_fwd` but the BLOBFILE path includes
+/// the tile index (e.g. `embed_tile_3.bin`), giving each tile a distinct
+/// `hexStringIdentifier` when loaded simultaneously on ANE.
+pub fn gen_classifier_tile_fwd_keyed(
+    dim: usize,
+    tile_rows: usize,
+    seq: usize,
+    tile_idx: usize,
+) -> FusedLayerMil {
+    let weight_key = format!("@model_path/weights/embed_tile_{tile_idx}.bin");
+
+    let mut m = String::with_capacity(4096);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{tile_rows}]> W = const()[name=string(\"W\"), val=tensor<fp16, [1,1,{dim},{tile_rows}]>(BLOBFILE(path=string(\"{weight_key}\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> xmt = transpose(perm=pm,x=xm)[name=string(\"xmt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{tile_rows}]> logm = matmul(transpose_x=bF,transpose_y=bF,x=xmt,y=W)[name=string(\"logm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{tile_rows},{seq}]> logt = transpose(perm=pm,x=logm)[name=string(\"logt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{tile_rows},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{tile_rows},1,{seq}]> logr = reshape(shape=ro,x=logt)[name=string(\"logr\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{tile_rows},1,{seq}]> out = cast(dtype=to32,x=logr)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![Box::leak(weight_key.into_boxed_str())],
+        input_bytes: dim * seq * 4,
+        output_bytes: tile_rows * seq * 4,
     }
 }
 
@@ -4396,6 +4871,229 @@ mod tests {
             "Fused attn GQA OK: {} output values, max_abs={max_abs:.4}, nonzero={nonzero}",
             output.len()
         );
+    }
+
+    /// Run fused attn GQA L∞ pindown at a given config. Returns (worst_name, worst_err).
+    /// `weight_scale` controls magnitude: 0.1 for test, 0.5 for realistic.
+    fn linf_pindown_inner(cfg: &MilConfig, label: &str, weight_scale: f32) -> (&'static str, f32) {
+        use crate::agent::ane_forward::{apply_sigmoid_gate, cpu_matmul, cpu_rope, cpu_sdpa};
+        use crate::agent::ane_weights::{
+            build_fp16_blob, generate_rope_blobs, transpose_weight, unpack_fused_attn_gqa,
+        };
+
+        let hd = cfg.head_dim();
+        let heads = cfg.n_heads;
+        let kv_heads = cfg.n_kv_heads;
+        let hpg = cfg.heads_per_group();
+        let attn_dim = cfg.attn_dim();
+        let kv_dim = cfg.kv_dim();
+        let qpd = cfg.q_proj_dim();
+        let seq = cfg.seq_len;
+        let dim = cfg.dim;
+
+        eprintln!("\n=== {label}: dim={dim} hd={hd} heads={heads} kv_heads={kv_heads} seq={seq} scale={weight_scale} ===");
+
+        let make_weight = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0037).sin() * weight_scale)
+                .collect()
+        };
+
+        let wq_model = make_weight(qpd * dim, 100);
+        let wk_model = make_weight(kv_dim * dim, 200);
+        let wv_model = make_weight(kv_dim * dim, 300);
+        let wo_model = make_weight(dim * attn_dim, 400);
+
+        let wq_blob = build_fp16_blob(&transpose_weight(&wq_model, qpd, dim));
+        let wk_blob = build_fp16_blob(&transpose_weight(&wk_model, kv_dim, dim));
+        let wv_blob = build_fp16_blob(&transpose_weight(&wv_model, kv_dim, dim));
+        let wo_blob = build_fp16_blob(&transpose_weight(&wo_model, dim, attn_dim));
+        let (rc_blob, rs_blob) = generate_rope_blobs(seq, hd, cfg.rope_theta);
+        let mask_blob = build_causal_mask_blob(seq);
+
+        let has_qk_norm = false;
+        let result = gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
+        let weight_names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let weight_datas: Vec<&[u8]> =
+            vec![&wq_blob, &wk_blob, &wv_blob, &wo_blob, &rc_blob, &rs_blob, &mask_blob];
+
+        let kernel = AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &weight_names,
+            &weight_datas,
+            &[result.input_bytes],
+            &[result.output_bytes],
+        )
+        .expect("fused attn GQA kernel compile failed");
+
+        let input: Vec<f32> = (0..dim * seq)
+            .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.1)
+            .collect();
+        kernel.write_input(0, &f32_to_bytes(&input));
+        kernel.eval().expect("fused attn GQA eval failed");
+
+        let mut out_buf = vec![0u8; result.output_bytes];
+        kernel.read_output(0, &mut out_buf);
+        let ane = unpack_fused_attn_gqa(&out_buf, cfg, true, has_qk_norm);
+
+        // CPU fp32 reference
+        let cpu_qm = cpu_matmul(&wq_model, &input, qpd, dim, seq);
+        let cpu_km = cpu_matmul(&wk_model, &input, kv_dim, dim, seq);
+        let cpu_vm = cpu_matmul(&wv_model, &input, kv_dim, dim, seq);
+
+        // Split Q → q + graw
+        let mut cpu_q = vec![0.0f32; attn_dim * seq];
+        let mut cpu_graw = vec![0.0f32; attn_dim * seq];
+        for h in 0..heads {
+            for d in 0..hd {
+                let src_q = (h * 2 * hd + d) * seq;
+                let src_g = (h * 2 * hd + hd + d) * seq;
+                let dst = (h * hd + d) * seq;
+                cpu_q[dst..dst + seq].copy_from_slice(&cpu_qm[src_q..src_q + seq]);
+                cpu_graw[dst..dst + seq].copy_from_slice(&cpu_qm[src_g..src_g + seq]);
+            }
+        }
+
+        // RoPE
+        let mut cpu_q_rot = cpu_q.clone();
+        let mut cpu_k_rot = cpu_km.clone();
+        {
+            let mut dummy = vec![0.0f32; attn_dim * seq];
+            cpu_rope(&mut cpu_q_rot, &mut dummy, heads, hd, seq, cfg.rope_theta);
+        }
+        {
+            let mut dummy = vec![0.0f32; kv_dim * seq];
+            cpu_rope(&mut dummy, &mut cpu_k_rot, kv_heads, hd, seq, cfg.rope_theta);
+        }
+
+        // GQA expand K/V
+        let mut cpu_k_exp = vec![0.0f32; attn_dim * seq];
+        let mut cpu_v_exp = vec![0.0f32; attn_dim * seq];
+        for kv_h in 0..kv_heads {
+            for rep in 0..hpg {
+                let dst_h = kv_h * hpg + rep;
+                for d in 0..hd {
+                    let src = (kv_h * hd + d) * seq;
+                    let dst = (dst_h * hd + d) * seq;
+                    cpu_k_exp[dst..dst + seq].copy_from_slice(&cpu_k_rot[src..src + seq]);
+                    cpu_v_exp[dst..dst + seq].copy_from_slice(&cpu_vm[src..src + seq]);
+                }
+            }
+        }
+
+        let cpu_attn_out = cpu_sdpa(&cpu_q_rot, &cpu_k_exp, &cpu_v_exp, heads, hd, seq);
+
+        let mut cpu_gated = cpu_attn_out.clone();
+        apply_sigmoid_gate(&mut cpu_gated, &cpu_graw);
+
+        let cpu_o_out = cpu_matmul(&wo_model, &cpu_gated, dim, attn_dim, seq);
+
+        // L∞ comparison
+        let linf = |a: &[f32], b: &[f32]| -> f32 {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let mean_abs = |a: &[f32]| -> f32 {
+            a.iter().map(|v| v.abs()).sum::<f32>() / a.len() as f32
+        };
+        let report = |name: &str, err: f32, scale: f32, marker: &str| {
+            eprintln!(
+                "{marker}{name:10} L∞={err:.6}  rel={:.4}  (mean_abs={scale:.4})",
+                err / scale.max(1e-10)
+            );
+        };
+
+        let err_q = linf(&ane.q, &cpu_q_rot);
+        report("q_rot", err_q, mean_abs(&cpu_q_rot), "");
+        let err_k = linf(&ane.k, &cpu_k_rot);
+        report("k_rot", err_k, mean_abs(&cpu_k_rot), "");
+        let err_v = linf(&ane.v, &cpu_vm);
+        report("v", err_v, mean_abs(&cpu_vm), "");
+        let err_graw = linf(ane.attn_gate.as_ref().unwrap(), &cpu_graw);
+        report("graw", err_graw, mean_abs(&cpu_graw), "");
+        let err_aout = linf(ane.attn_pre_gate.as_ref().unwrap(), &cpu_attn_out);
+        report("a_out", err_aout, mean_abs(&cpu_attn_out), "");
+        let err_gated = linf(&ane.attn_out, &cpu_gated);
+        report("gated", err_gated, mean_abs(&cpu_gated), ">>> ");
+        let err_o = linf(&ane.o_out, &cpu_o_out);
+        report("o_out", err_o, mean_abs(&cpu_o_out), "");
+
+        // External Wo fix: use gated tap (fp32 from kernel output) + CPU Wo (fp32 BLAS)
+        let ext_o_out = cpu_matmul(&wo_model, &ane.attn_out, dim, attn_dim, seq);
+        let err_ext_o = linf(&ext_o_out, &cpu_o_out);
+        report("o_ext", err_ext_o, mean_abs(&cpu_o_out), "FIX ");
+        let improvement = if err_ext_o > 0.0 { err_o / err_ext_o } else { f32::INFINITY };
+        eprintln!("  Wo fix: {improvement:.1}x improvement ({err_o:.6} → {err_ext_o:.6})");
+
+        let intermediates: [(&str, f32); 7] = [
+            ("q_rot", err_q),
+            ("k_rot", err_k),
+            ("v", err_v),
+            ("graw", err_graw),
+            ("a_out", err_aout),
+            ("gated", err_gated),
+            ("o_out", err_o),
+        ];
+        eprintln!("--- Error jumps ---");
+        for i in 1..intermediates.len() {
+            let (name, err) = intermediates[i];
+            let (_, prev_err) = intermediates[i - 1];
+            let jump = err - prev_err;
+            if jump > 0.0001 {
+                eprintln!("  {name}: +{jump:.6} (from {prev_err:.6} to {err:.6})");
+            }
+        }
+
+        let worst = intermediates
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        eprintln!("Worst: {} (L∞ = {:.6})\n", worst.0, worst.1);
+        (worst.0, worst.1)
+    }
+
+    /// L∞ pindown at small dims (hd=16) and 35B-proportional dims (hd=128).
+    ///
+    /// Run: cargo test --features ane --release --lib -- "test_fused_attn_gqa_linf_pindown" --nocapture --test-threads=1
+    #[test]
+    fn test_fused_attn_gqa_linf_pindown() {
+        init_ane();
+
+        // Small config (fast, baseline)
+        let small = MilConfig {
+            dim: 64, hidden_dim: 128, n_heads: 8, seq_len: 32, n_kv_heads: 4,
+            rope_theta: 1e6, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 16,
+            linear_attn_indices: vec![], linear_n_heads: 0, linear_head_dim: 0,
+            linear_n_value_heads: 0, linear_value_head_dim: 0, conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let (_, small_worst) = linf_pindown_inner(&small, "Small (hd=16)", 0.1);
+        assert!(small_worst < 0.01, "small config worst L∞ {small_worst} too high");
+
+        // 35B-proportional: same head_dim=128, GQA 4:1, longer seq
+        let medium = MilConfig {
+            dim: 256, hidden_dim: 512, n_heads: 4, seq_len: 64, n_kv_heads: 1,
+            rope_theta: 10_000_000.0, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 128,
+            linear_attn_indices: vec![], linear_n_heads: 0, linear_head_dim: 0,
+            linear_n_value_heads: 0, linear_value_head_dim: 0, conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+        let (med_name, med_worst) = linf_pindown_inner(&medium, "35B-proportional (hd=128)", 0.1);
+        eprintln!("35B-proportional (0.1 scale) worst = {med_name} L∞={med_worst:.6}");
+
+        // Same dims, realistic weight magnitudes (5x larger)
+        let (real_name, real_worst) = linf_pindown_inner(&medium, "35B-proportional (real scale)", 0.5);
+        eprintln!("35B-proportional (0.5 scale) worst = {real_name} L∞={real_worst:.6}");
+
+        // Extreme: 1.0 scale to see nonlinear error growth
+        let (ext_name, ext_worst) = linf_pindown_inner(&medium, "35B-proportional (extreme)", 1.0);
+        eprintln!("\n=== SCALING VERDICT ===");
+        eprintln!("  0.1 scale: {med_worst:.6}");
+        eprintln!("  0.5 scale: {real_worst:.6}  ({:.1}x)", real_worst / med_worst);
+        eprintln!("  1.0 scale: {ext_worst:.6}  ({:.1}x)", ext_worst / med_worst);
     }
 
     #[test]
@@ -5492,6 +6190,262 @@ mod tests {
                 panic!("Fused GDN proj kernel does not compile");
             }
         }
+    }
+
+    // ---- Round 10.45: gen_gdn_pre_recurrence_fwd (conv1d+SiLU → RMSNorm → GQA → decay+gate) ----
+
+    #[test]
+    fn test_gdn_pre_recurrence_fwd_compile_and_correctness() {
+        use crate::agent::ane_weights::build_fp16_blob;
+        use crate::agent::ane_forward::cpu_gdn_pre_recurrence;
+
+        init_ane();
+
+        // 35B GDN dimensions at seq=128 (production bucket size)
+        let cfg = MilConfig {
+            dim: 2048, hidden_dim: 512, n_heads: 16, seq_len: 128, n_kv_heads: 2,
+            rope_theta: 1e6, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 256,
+            linear_attn_indices: (0..30).collect(), linear_n_heads: 16, linear_head_dim: 128,
+            linear_n_value_heads: 32, linear_value_head_dim: 128, conv_kernel_size: 4,
+            attn_output_gate: true,
+        };
+
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = cfg.conv_kernel_size;
+        let seq = cfg.seq_len;
+
+        let result = gen_gdn_pre_recurrence_fwd(&cfg);
+        eprintln!(
+            "GDN pre-recurrence FWD: {} bytes MIL, {} weights, in={}B, out={}B",
+            result.mil_text.len(), result.weight_names.len(), result.input_bytes, result.output_bytes
+        );
+        assert_eq!(result.weight_names.len(), 4, "should have exactly 4 BLOBFILEs");
+
+        // Deterministic weights
+        let make = |n: usize, s: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i + s) as f32 * 0.001).sin() * 0.1).collect()
+        };
+        let conv_w_f32 = make(qkv_dim * kernel, 100);
+        let conv_b_f32 = make(qkv_dim, 200);
+        let a_log_f32 = make(h_v, 300);
+        let dt_bias_f32 = make(h_v, 400);
+
+        let conv_w_blob = build_fp16_blob(&conv_w_f32);
+        let conv_b_blob = build_fp16_blob(&conv_b_f32);
+        let a_log_blob = build_fp16_blob(&a_log_f32);
+        let dt_bias_blob = build_fp16_blob(&dt_bias_f32);
+
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let datas: Vec<&[u8]> = vec![&conv_w_blob, &conv_b_blob, &a_log_blob, &dt_bias_blob];
+
+        let ane_kernel = AneKernel::compile_multi_weights(
+            &result.mil_text, &names, &datas, &[result.input_bytes], &[result.output_bytes],
+        ).expect("GDN pre-recurrence FWD compile failed");
+        eprintln!("GDN pre-recurrence: COMPILED OK on ANE!");
+
+        // Deterministic input: qkv[qkv_dim,seq] | a[h_v,seq] | b[h_v,seq]
+        let in_ch = qkv_dim + 2 * h_v;
+        let input: Vec<f32> = (0..in_ch * seq)
+            .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.3)
+            .collect();
+        ane_kernel.write_input(0, &f32_to_bytes(&input));
+        ane_kernel.eval().expect("eval failed");
+
+        let mut out_buf = vec![0u8; result.output_bytes];
+        ane_kernel.read_output(0, &mut out_buf);
+        let ane_out = bytes_to_f32(&out_buf);
+
+        // CPU reference: extract qkv, a, b from the same input
+        let qkv_raw = &input[0..qkv_dim * seq];
+        let a_raw = &input[qkv_dim * seq..(qkv_dim + h_v) * seq];
+        let b_raw = &input[(qkv_dim + h_v) * seq..(qkv_dim + 2 * h_v) * seq];
+
+        let cpu_pre = cpu_gdn_pre_recurrence(
+            qkv_raw, a_raw, b_raw,
+            &a_log_f32, &dt_bias_f32, &conv_w_f32, &conv_b_f32,
+            &cfg,
+        );
+
+        // Build CPU reference in same layout as ANE output: q_exp | k_exp | v | g | beta
+        let q_dim = h_v * d_k;
+        let mut cpu_out = Vec::with_capacity(ane_out.len());
+        cpu_out.extend_from_slice(&cpu_pre.q_exp);
+        cpu_out.extend_from_slice(&cpu_pre.k_exp);
+        cpu_out.extend_from_slice(&cpu_pre.v_raw);
+        cpu_out.extend_from_slice(&cpu_pre.g);
+        cpu_out.extend_from_slice(&cpu_pre.beta);
+        assert_eq!(ane_out.len(), cpu_out.len(), "output size mismatch");
+
+        // Compare per-section for diagnostics
+        let sections = [
+            ("q_exp", 0, q_dim * seq),
+            ("k_exp", q_dim * seq, 2 * q_dim * seq),
+            ("v", 2 * q_dim * seq, 2 * q_dim * seq + value_dim * seq),
+            ("g", 2 * q_dim * seq + value_dim * seq, 2 * q_dim * seq + value_dim * seq + h_v * seq),
+            ("beta", 2 * q_dim * seq + value_dim * seq + h_v * seq, ane_out.len()),
+        ];
+
+        let mut overall_max = 0.0f32;
+        for (name, start, end) in &sections {
+            let max_err = ane_out[*start..*end]
+                .iter()
+                .zip(cpu_out[*start..*end].iter())
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
+            let mean_err = ane_out[*start..*end]
+                .iter()
+                .zip(cpu_out[*start..*end].iter())
+                .map(|(a, c)| (a - c).abs())
+                .sum::<f32>()
+                / (*end - *start) as f32;
+            eprintln!("  {name}: max_err={max_err:.6}, mean_err={mean_err:.6}");
+            overall_max = overall_max.max(max_err);
+        }
+        eprintln!("GDN pre-recurrence ANE vs CPU: overall max_err={overall_max:.6}");
+        assert!(
+            overall_max < 0.05,
+            "GDN pre-recurrence: max_err {overall_max:.6} exceeds fp16 tolerance"
+        );
+    }
+
+    /// Test split kernels: conv+SiLU (kernel A) + post-conv (kernel B) match CPU reference.
+    /// Bug 11 workaround: the fused kernel fails with real 35B weights, so we split into
+    /// 2 smaller kernels of 2 BLOBFILEs each.
+    #[test]
+    fn test_gdn_split_kernels_compile_and_correctness() {
+        use crate::agent::ane_weights::build_fp16_blob;
+        use crate::agent::ane_forward::cpu_gdn_pre_recurrence;
+
+        init_ane();
+
+        let cfg = MilConfig {
+            dim: 2048, hidden_dim: 512, n_heads: 16, seq_len: 128, n_kv_heads: 2,
+            rope_theta: 1e6, rms_eps: 1e-6, has_lm_head: false, head_dim_explicit: 256,
+            linear_attn_indices: (0..30).collect(), linear_n_heads: 16, linear_head_dim: 128,
+            linear_n_value_heads: 32, linear_value_head_dim: 128, conv_kernel_size: 4,
+            attn_output_gate: true,
+        };
+
+        let h_k = cfg.linear_n_heads;
+        let d_k = cfg.linear_head_dim;
+        let h_v = cfg.linear_n_value_heads;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = h_k * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = cfg.conv_kernel_size;
+        let seq = cfg.seq_len;
+
+        // --- Build kernel A: conv+SiLU ---
+        let ka = gen_gdn_conv_silu_fwd(&cfg);
+        eprintln!("Kernel A (conv+SiLU): {} bytes MIL, {} BLOBFILEs", ka.mil_text.len(), ka.weight_names.len());
+        assert_eq!(ka.weight_names.len(), 2);
+
+        // --- Build kernel B: post-conv ---
+        let kb = gen_gdn_post_conv_fwd(&cfg);
+        eprintln!("Kernel B (post-conv): {} bytes MIL, {} BLOBFILEs", kb.mil_text.len(), kb.weight_names.len());
+        assert_eq!(kb.weight_names.len(), 2);
+
+        // Deterministic weights
+        let make = |n: usize, s: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i + s) as f32 * 0.001).sin() * 0.1).collect()
+        };
+        let conv_w = make(qkv_dim * kernel, 100);
+        let conv_b = make(qkv_dim, 200);
+        let a_log = make(h_v, 300);
+        let dt_bias = make(h_v, 400);
+
+        // Compile kernel A
+        let conv_w_blob = build_fp16_blob(&conv_w);
+        let conv_b_blob = build_fp16_blob(&conv_b);
+        let ka_names: Vec<&str> = ka.weight_names.iter().copied().collect();
+        let ka_datas: Vec<&[u8]> = vec![&conv_w_blob, &conv_b_blob];
+        let ane_ka = AneKernel::compile_multi_weights(
+            &ka.mil_text, &ka_names, &ka_datas, &[ka.input_bytes], &[ka.output_bytes],
+        ).expect("Kernel A compile failed");
+        eprintln!("Kernel A: COMPILED OK");
+
+        // Compile kernel B
+        let a_log_blob = build_fp16_blob(&a_log);
+        let dt_bias_blob = build_fp16_blob(&dt_bias);
+        let kb_names: Vec<&str> = kb.weight_names.iter().copied().collect();
+        let kb_datas: Vec<&[u8]> = vec![&a_log_blob, &dt_bias_blob];
+        let ane_kb = AneKernel::compile_multi_weights(
+            &kb.mil_text, &kb_names, &kb_datas, &[kb.input_bytes], &[kb.output_bytes],
+        ).expect("Kernel B compile failed");
+        eprintln!("Kernel B: COMPILED OK");
+
+        // Deterministic input
+        let in_ch = qkv_dim + 2 * h_v;
+        let input: Vec<f32> = (0..in_ch * seq)
+            .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.3)
+            .collect();
+
+        // Run kernel A: qkv portion only
+        let qkv_input = &input[0..qkv_dim * seq];
+        ane_ka.write_input(0, &f32_to_bytes(qkv_input));
+        ane_ka.eval().expect("Kernel A eval failed");
+        let mut ka_out_buf = vec![0u8; ka.output_bytes];
+        ane_ka.read_output(0, &mut ka_out_buf);
+        let qkv_silu = bytes_to_f32(&ka_out_buf);
+
+        // Run kernel B: qkv_silu | a | b
+        let a_raw = &input[qkv_dim * seq..(qkv_dim + h_v) * seq];
+        let b_raw = &input[(qkv_dim + h_v) * seq..in_ch * seq];
+        let mut kb_input = Vec::with_capacity(kb.input_bytes / 4);
+        kb_input.extend_from_slice(&qkv_silu);
+        kb_input.extend_from_slice(a_raw);
+        kb_input.extend_from_slice(b_raw);
+        ane_kb.write_input(0, &f32_to_bytes(&kb_input));
+        ane_kb.eval().expect("Kernel B eval failed");
+        let mut kb_out_buf = vec![0u8; kb.output_bytes];
+        ane_kb.read_output(0, &mut kb_out_buf);
+        let ane_out = bytes_to_f32(&kb_out_buf);
+
+        // CPU reference
+        let cpu_pre = cpu_gdn_pre_recurrence(
+            qkv_input, a_raw, b_raw,
+            &a_log, &dt_bias, &conv_w, &conv_b, &cfg,
+        );
+
+        let q_dim = h_v * d_k;
+        let mut cpu_out = Vec::with_capacity(ane_out.len());
+        cpu_out.extend_from_slice(&cpu_pre.q_exp);
+        cpu_out.extend_from_slice(&cpu_pre.k_exp);
+        cpu_out.extend_from_slice(&cpu_pre.v_raw);
+        cpu_out.extend_from_slice(&cpu_pre.g);
+        cpu_out.extend_from_slice(&cpu_pre.beta);
+        assert_eq!(ane_out.len(), cpu_out.len(), "output size mismatch");
+
+        let sections = [
+            ("q_exp", 0, q_dim * seq),
+            ("k_exp", q_dim * seq, 2 * q_dim * seq),
+            ("v", 2 * q_dim * seq, 2 * q_dim * seq + value_dim * seq),
+            ("g", 2 * q_dim * seq + value_dim * seq, 2 * q_dim * seq + value_dim * seq + h_v * seq),
+            ("beta", 2 * q_dim * seq + value_dim * seq + h_v * seq, ane_out.len()),
+        ];
+
+        let mut overall_max = 0.0f32;
+        for (name, start, end) in &sections {
+            let max_err = ane_out[*start..*end]
+                .iter()
+                .zip(cpu_out[*start..*end].iter())
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("  {name}: max_err={max_err:.6}");
+            overall_max = overall_max.max(max_err);
+        }
+        eprintln!("Split kernels ANE vs CPU: overall max_err={overall_max:.6}");
+        assert!(
+            overall_max < 0.05,
+            "Split kernels: max_err {overall_max:.6} exceeds fp16 tolerance"
+        );
     }
 
     // ---- Round 10.5: gen_fused_ffn_bwd (W2T + SiLU bwd + W13T) ----

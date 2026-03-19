@@ -777,6 +777,7 @@ pub(crate) fn build_ane_training_config(
                 optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
                 strict_ane: false,
                 accum_steps: 1,
+                adaptive_layer_drop: true,
             });
         }
     }
@@ -802,6 +803,7 @@ pub(crate) fn build_ane_training_config(
             optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
             strict_ane: false,
             accum_steps: 1,
+            adaptive_layer_drop: true,
         });
     }
 
