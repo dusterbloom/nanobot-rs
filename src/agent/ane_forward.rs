@@ -3521,14 +3521,14 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     continue;
                 }
 
-                // 2-DISPATCH PATH: fused attn (RMSNorm+QKV+RoPE+SDPA+gate+Wo)
-                //                + fused FFN (RMSNorm+W1×SiLU×W3+W2+residual)
-                if pp.has_fused_ffn_fwd() {
-                    // CPU: RMSNorm for attention
+                // 2-DISPATCH PATH: fused attn + fused FFN
+                if pp.has_fused_ffn_fwd() && pp.has_per_layer_kernels() {
+                    // CPU: RMSNorm for attention (fp32, matches multi-dispatch)
+                    clamp_fp16(&mut x_cur);
                     let mut xnorm = vec![0.0f32; dim * seq];
                     rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
 
-                    // ANE dispatch 1: fused attention
+                    // ANE dispatch 1: fused attention (takes xnorm, returns o_out + taps)
                     if let Some(Ok(attn)) = pp.eval_fwd_fused_attn_gqa(l, &xnorm, cfg) {
                         // CPU: residual add
                         let x2: Vec<f32> = x_cur.iter().zip(attn.o_out.iter()).map(|(a, b)| a + b).collect();
