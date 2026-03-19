@@ -535,6 +535,22 @@ pub fn lora_grad_norm(grads: &LoraModelGrads) -> f32 {
     (sum_sq as f32).sqrt()
 }
 
+/// Per-layer gradient L2 norms (before clipping).
+pub fn lora_per_layer_grad_norms(grads: &LoraModelGrads) -> Vec<f32> {
+    let adapter_ss = |g: &Option<LoraAdapterGrads>| -> f64 {
+        g.as_ref().map_or(0.0, |g| {
+            g.da.iter().chain(g.db.iter())
+                .map(|&v| (v as f64) * (v as f64))
+                .sum::<f64>()
+        })
+    };
+    grads.layers.iter().map(|lg| {
+        let ss = adapter_ss(&lg.wq) + adapter_ss(&lg.wv)
+               + adapter_ss(&lg.wo) + adapter_ss(&lg.w2);
+        (ss as f32).sqrt()
+    }).collect()
+}
+
 /// Clip LoRA gradients: if norm > clip, scale all grads by clip / norm.
 pub fn lora_clip_gradients(grads: &mut LoraModelGrads, clip: f32) {
     let norm = lora_grad_norm(grads);

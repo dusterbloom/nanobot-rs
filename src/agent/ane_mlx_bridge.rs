@@ -900,6 +900,38 @@ impl AneTrainerSession {
                 }
             }
 
+            // Prime per-layer fused Wot+SDPA backward kernels (2-dispatch attn bwd).
+            {
+                let attn_cfg = {
+                    let mut c = self.model.cfg().clone();
+                    c.seq_len = *bucket_seq;
+                    c
+                };
+                match pp.prime_bwd_wot_sdpa_kernels(&attn_cfg, &self.model) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ANE train: Wot+SDPA bwd per-layer primed for seq_len={}",
+                            bucket_seq,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ANE train: Wot+SDPA bwd priming failed for seq_len={}: {}",
+                            bucket_seq, e,
+                        );
+                    }
+                }
+                // Also prime separate Wot + QKV as fallback
+                match pp.prime_bwd_wot_kernels(&attn_cfg, &self.model) {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!("ANE train: Wot bwd priming failed: {e}"),
+                }
+                match pp.prime_bwd_qkvb_kernels(&attn_cfg, &self.model) {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!("ANE train: QKV bwd priming failed: {e}"),
+                }
+            }
+
             // Prime per-layer fused GDN projection kernels (QKV+A+B+Z + O).
             if !self.model.cfg().linear_attn_indices.is_empty() {
                 let gdn_cfg = {
@@ -4375,7 +4407,12 @@ mod tests {
             }
         }
 
-        // Per-layer Wot + QKV backward kernels (BLOBFILE, replaces DynMatmul packing)
+        // Per-layer fused Wot+SDPA backward kernels (2-dispatch attn bwd)
+        match pp.prime_bwd_wot_sdpa_kernels(&pp_cfg, &model) {
+            Ok(()) => eprintln!("35B bench: Wot+SDPA bwd per-layer primed OK"),
+            Err(e) => eprintln!("35B bench: Wot+SDPA bwd per-layer FAILED: {e}"),
+        }
+        // Per-layer Wot + QKV backward kernels (BLOBFILE, fallback for 3-dispatch)
         match pp.prime_bwd_wot_kernels(&pp_cfg, &model) {
             Ok(()) => eprintln!("35B bench: MHA bwd Wot per-layer primed OK"),
             Err(e) => eprintln!("35B bench: MHA bwd Wot per-layer FAILED: {e}"),

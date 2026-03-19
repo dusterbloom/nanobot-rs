@@ -4035,6 +4035,199 @@ pub fn gen_sdpa_rope_bwd(cfg: &MilConfig, _has_gate: bool) -> FusedLayerMil {
     }
 }
 
+/// Generate fused Wo^T + gate backward + SDPA backward kernel for GQA.
+///
+/// Merges the Wo^T dispatch into the SDPA backward kernel, reducing the attention
+/// backward from 3 dispatches (Wot | SDPA | QKV) to 2 (Wot+SDPA | QKV).
+///
+/// Input layout `[1, in_ch, 1, seq]` fp32:
+///   Without gate: `dx2[dim] | Q_rot[ad] | K_expanded[ad] | V_expanded[ad]`
+///   With gate:    `dx2[dim] | Q_rot[ad] | K_expanded[ad] | V_expanded[ad] | pre_gate[ad] | gate_raw[ad]`
+///
+/// Output: `[1, 3*H, S, hd]` fp32 — dQ|dK|dV stacked on head axis (same as gen_sdpa_rope_bwd).
+///
+/// BLOBFILE weights: Wo (output projection, for Wo^T matmul) + mask (causal).
+/// K/V expansion happens on CPU before input (same as gen_sdpa_rope_bwd).
+pub fn gen_wot_sdpa_bwd(cfg: &MilConfig, has_gate: bool) -> FusedLayerMil {
+    let dim = cfg.dim;
+    let seq = cfg.seq_len;
+    let heads = cfg.n_heads;
+    let hd = cfg.head_dim();
+    let attn_dim = cfg.attn_dim();
+    let sc = 1.0 / (hd as f64).sqrt();
+
+    // Input channels: dx2[dim] + Q_rot[ad] + K_exp[ad] + V_exp[ad] [+ pre_gate[ad] + gate_raw[ad]]
+    let in_ch = if has_gate {
+        dim + 3 * attn_dim + 2 * attn_dim // dx2 + Q + K_exp + V_exp + pre_gate + gate_raw
+    } else {
+        dim + 3 * attn_dim // dx2 + Q + K_exp + V_exp
+    };
+    // Output: [1, 3*H, S, hd] (non-gated) or [1, 4*H, S, hd] (gated: +d_gate)
+
+    let mut m = String::with_capacity(32768);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> x) {{");
+
+    // --- Constants ---
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        bool bT = const()[name=string(\"bT\"), val=bool(true)];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        fp16 scv = const()[name=string(\"scv\"), val=fp16({sc})];");
+    let _ = writeln!(m, "        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([-1])];");
+    let _ = writeln!(m, "        int32 sax = const()[name=string(\"sax\"), val=int32(-1)];");
+    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(m, "        fp16 seq_v = const()[name=string(\"seqv\"), val=fp16({seq})];");
+
+    // --- BLOBFILEs: Wo + mask ---
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{dim}]> Wo = const()[name=string(\"Wo\"), val=tensor<fp16, [1,1,{attn_dim},{dim}]>(BLOBFILE(path=string(\"@model_path/weights/wo.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{seq}]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,{seq},{seq}]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];");
+
+    // --- Cast + slice input ---
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let mut off = 0usize;
+
+    // dx2: [1, dim, 1, S]
+    let _ = writeln!(m, "        tensor<int32, [4]> b_dx = const()[name=string(\"bdx\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> s_dm = const()[name=string(\"sdm\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> dx2h = slice_by_size(x=xh,begin=b_dx,size=s_dm)[name=string(\"dx2h\")];");
+    off += dim;
+
+    // Q_rot: [1, ad, 1, S]
+    let _ = writeln!(m, "        tensor<int32, [4]> s_ad = const()[name=string(\"sad\"), val=tensor<int32, [4]>([1,{attn_dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> b_qr = const()[name=string(\"bqr\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> qrh = slice_by_size(x=xh,begin=b_qr,size=s_ad)[name=string(\"qrh\")];");
+    off += attn_dim;
+
+    // K_expanded: [1, ad, 1, S]
+    let _ = writeln!(m, "        tensor<int32, [4]> b_ke = const()[name=string(\"bke\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> keh = slice_by_size(x=xh,begin=b_ke,size=s_ad)[name=string(\"keh\")];");
+    off += attn_dim;
+
+    // V_expanded: [1, ad, 1, S]
+    let _ = writeln!(m, "        tensor<int32, [4]> b_ve = const()[name=string(\"bve\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> veh = slice_by_size(x=xh,begin=b_ve,size=s_ad)[name=string(\"veh\")];");
+    off += attn_dim;
+
+    if has_gate {
+        // pre_gate (attention output before gating): [1, ad, 1, S]
+        let _ = writeln!(m, "        tensor<int32, [4]> b_pg = const()[name=string(\"bpg\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> pgh = slice_by_size(x=xh,begin=b_pg,size=s_ad)[name=string(\"pgh\")];");
+        off += attn_dim;
+        // gate_raw: [1, ad, 1, S]
+        let _ = writeln!(m, "        tensor<int32, [4]> b_gr = const()[name=string(\"bgr\"), val=tensor<int32, [4]>([0,{off},0,0])];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> grh = slice_by_size(x=xh,begin=b_gr,size=s_ad)[name=string(\"grh\")];");
+        off += attn_dim;
+    }
+    let _ = off;
+
+    // --- Phase 1: Wo^T projection ---
+    // dx2: [1,dim,1,S] → [1,1,dim,S] → transpose [1,1,S,dim]
+    let _ = writeln!(m, "        tensor<int32, [4]> r2d = const()[name=string(\"r2d\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> dx_r = reshape(shape=r2d,x=dx2h)[name=string(\"dxr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> dx_nt = transpose(perm=pm,x=dx_r)[name=string(\"dxnt\")];");
+    // da = dx_nt @ Wo^T: [1,1,S,dim] @ [1,1,dim,ad] → [1,1,S,ad]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{attn_dim}]> da_nt = matmul(transpose_x=bF,transpose_y=bT,x=dx_nt,y=Wo)[name=string(\"dant\")];");
+
+    // --- Phase 2: Gate backward (optional) ---
+    // When gated: computes d_attn = da * sig AND d_gate = da * pre_gate * sig * (1-sig).
+    // d_gate is output as an extra [1,H,S,hd] block for merge_q_gate on CPU.
+    let da_var = if has_gate {
+        // da_nt [1,1,S,ad] → transpose [1,1,ad,S] → reshape [1,ad,1,S]
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{seq}]> da_t = transpose(perm=pm,x=da_nt)[name=string(\"dat\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> da_ch = reshape(shape=s_ad,x=da_t)[name=string(\"dach\")];");
+        // sigmoid(gate_raw)
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> sig = sigmoid(x=grh)[name=string(\"sig\")];");
+        // d_attn = da * sig (for SDPA backward)
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> d_at = mul(x=da_ch,y=sig)[name=string(\"dat2\")];");
+        // d_gate = da * pre_gate * sig * (1-sig) = da * pre_gate * (sig - sig^2)
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> sig2 = mul(x=sig,y=sig)[name=string(\"sig2\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> sder = sub(x=sig,y=sig2)[name=string(\"sder\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> dg1 = mul(x=da_ch,y=pgh)[name=string(\"dg1\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> dg_ch = mul(x=dg1,y=sder)[name=string(\"dgch\")];");
+        "d_at"
+    } else {
+        // No gate: da_nt [1,1,S,ad] → transpose [1,1,ad,S] → reshape [1,ad,1,S]
+        let _ = writeln!(m, "        tensor<fp16, [1,1,{attn_dim},{seq}]> da_t = transpose(perm=pm,x=da_nt)[name=string(\"dat\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{attn_dim},1,{seq}]> d_at = reshape(shape=s_ad,x=da_t)[name=string(\"dat2\")];");
+        "d_at"
+    };
+
+    // --- Phase 3: Reshape to [1,H,S,hd] head form ---
+    let _ = writeln!(m, "        tensor<int32, [4]> rqh = const()[name=string(\"rqh\"), val=tensor<int32, [4]>([1,{heads},{hd},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> da_4 = reshape(shape=rqh,x={da_var})[name=string(\"da4\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> da = transpose(perm=pm,x=da_4)[name=string(\"da\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> qr_4 = reshape(shape=rqh,x=qrh)[name=string(\"qr4\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> q = transpose(perm=pm,x=qr_4)[name=string(\"q\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> ke_4 = reshape(shape=rqh,x=keh)[name=string(\"ke4\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> k = transpose(perm=pm,x=ke_4)[name=string(\"k\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> ve_4 = reshape(shape=rqh,x=veh)[name=string(\"ve4\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> v = transpose(perm=pm,x=ve_4)[name=string(\"v\")];");
+
+    // --- Phase 4: SDPA backward (same as gen_sdpa_rope_bwd) ---
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=q,y=k)[name=string(\"sc1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> sc2 = mul(x=sc1,y=scv)[name=string(\"sc2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ms = add(x=sc2,y=cm)[name=string(\"ms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> aw = softmax(axis=sax,x=ms)[name=string(\"aw\")];");
+
+    // dV = A^T @ dO
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> aw_t = transpose(perm=pm,x=aw)[name=string(\"awt\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dv_all = matmul(transpose_x=bF,transpose_y=bF,x=aw_t,y=da)[name=string(\"dva\")];");
+
+    // dP = dO @ V^T
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> dp = matmul(transpose_x=bF,transpose_y=bT,x=da,y=v)[name=string(\"dp\")];");
+
+    // Softmax backward: dS = aw * (dP - sum(dP*aw, axis=-1))
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> dpaw = mul(x=dp,y=aw)[name=string(\"dpaw\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> dot_m = reduce_mean(x=dpaw,axes=rax,keep_dims=kd)[name=string(\"dotm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},1]> dot = mul(x=dot_m,y=seq_v)[name=string(\"dot\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> dps = sub(x=dp,y=dot)[name=string(\"dps\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ds = mul(x=aw,y=dps)[name=string(\"ds\")];");
+
+    // dQ = scale * dS @ K
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dqr = matmul(transpose_x=bF,transpose_y=bF,x=ds,y=k)[name=string(\"dqr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dq_s = mul(x=dqr,y=scv)[name=string(\"dqs\")];");
+
+    // dK = scale * dS^T @ Q
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{seq}]> ds_t = transpose(perm=pm,x=ds)[name=string(\"dst\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dkr = matmul(transpose_x=bF,transpose_y=bF,x=ds_t,y=q)[name=string(\"dkr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dk_s = mul(x=dkr,y=scv)[name=string(\"dks\")];");
+
+    // --- Output: concat dq/dk/dv [+ d_gate] on head axis ---
+    let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+    let _ = writeln!(m, "        bool cid = const()[name=string(\"cid\"), val=bool(false)];");
+
+    let out_ch = if has_gate {
+        // [1, 4*H, S, hd] — dQ | dK | dV | d_gate (all in head form)
+        // Reshape d_gate from [1,ad,1,S] to [1,H,S,hd]
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{hd},{seq}]> dg_4 = reshape(shape=rqh,x=dg_ch)[name=string(\"dg4\")];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads},{seq},{hd}]> dg_hs = transpose(perm=pm,x=dg_4)[name=string(\"dghs\")];");
+        let heads4 = 4 * heads;
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads4},{seq},{hd}]> out_h = concat(axis=cax,interleave=cid,values=(dq_s,dk_s,dv_all,dg_hs))[name=string(\"outh\")];");
+        let _ = writeln!(m, "        tensor<fp32, [1,{heads4},{seq},{hd}]> out = cast(dtype=to32,x=out_h)[name=string(\"cout\")];");
+        4 * heads
+    } else {
+        // [1, 3*H, S, hd] — dQ | dK | dV
+        let heads3 = 3 * heads;
+        let _ = writeln!(m, "        tensor<fp16, [1,{heads3},{seq},{hd}]> out_h = concat(axis=cax,interleave=cid,values=(dq_s,dk_s,dv_all))[name=string(\"outh\")];");
+        let _ = writeln!(m, "        tensor<fp32, [1,{heads3},{seq},{hd}]> out = cast(dtype=to32,x=out_h)[name=string(\"cout\")];");
+        3 * heads
+    };
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    let input_bytes = in_ch * seq * 4;
+    let output_bytes = out_ch * seq * hd * 4;
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec!["@model_path/weights/wo.bin", "@model_path/weights/mask.bin"],
+        input_bytes,
+        output_bytes,
+    }
+}
+
 /// Generate fused SDPA backward + RoPE backward + QKV^T projections for GQA.
 ///
 /// Replaces sdpa_bwd1 + sdpa_bwd2 + CPU RoPE backward + qkv_bwd with a single dispatch.
@@ -5492,6 +5685,88 @@ mod tests {
             Err(e) => {
                 eprintln!("SDPA+RoPE+QKV^T BWD: COMPILE FAILED: {e}");
                 // Don't panic — this is experimental
+            }
+        }
+    }
+
+    // ---- Round 10.5: gen_wot_sdpa_bwd at 35B dims ----
+
+    #[test]
+    fn test_wot_sdpa_bwd_compile_35b() {
+        use crate::agent::ane_weights::build_fp16_blob;
+
+        init_ane();
+
+        // Qwen3.5-35B-A3B actual dims
+        let cfg = MilConfig {
+            dim: 2048,
+            hidden_dim: 512,
+            n_heads: 16,
+            seq_len: 128,
+            n_kv_heads: 2,
+            rope_theta: 10_000_000.0,
+            rms_eps: 1e-6,
+            has_lm_head: false,
+            head_dim_explicit: 256,
+            linear_attn_indices: vec![],
+            linear_n_heads: 0,
+            linear_head_dim: 0,
+            linear_n_value_heads: 0,
+            linear_value_head_dim: 0,
+            conv_kernel_size: 0,
+            attn_output_gate: true,
+        };
+
+        let attn_dim = cfg.attn_dim();
+        let result = gen_wot_sdpa_bwd(&cfg, cfg.attn_output_gate);
+        eprintln!(
+            "35B Wot+SDPA BWD: {} bytes MIL, {} weights, in={}B, out={}B",
+            result.mil_text.len(),
+            result.weight_names.len(),
+            result.input_bytes,
+            result.output_bytes,
+        );
+        eprintln!(
+            "  dims: dim={} ad={} hd={} H={} kvH={} hpg={} seq={}",
+            cfg.dim, attn_dim, cfg.head_dim(), cfg.n_heads,
+            cfg.n_kv_heads, cfg.heads_per_group(), cfg.seq_len,
+        );
+        let wo_bytes = attn_dim * cfg.dim * 2;
+        eprintln!("  Wo BLOBFILE: {} bytes ({:.1} MB)", wo_bytes, wo_bytes as f64 / 1e6);
+
+        let mask_blob = build_causal_mask_blob(cfg.seq_len);
+        let wo_blob = build_fp16_blob(&vec![0.01f32; attn_dim * cfg.dim]);
+
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let mut datas: Vec<&[u8]> = Vec::new();
+        for name in &names {
+            match *name {
+                "@model_path/weights/wo.bin" => datas.push(&wo_blob),
+                "@model_path/weights/mask.bin" => datas.push(&mask_blob),
+                _ => panic!("unexpected weight: {name}"),
+            }
+        }
+
+        match AneKernel::compile_multi_weights(
+            &result.mil_text,
+            &names,
+            &datas,
+            &[result.input_bytes],
+            &[result.output_bytes],
+        ) {
+            Ok(kernel) => {
+                eprintln!("35B Wot+SDPA BWD: COMPILED OK");
+                let input = vec![0.01f32; result.input_bytes / 4];
+                kernel.write_input(0, &f32_to_bytes(&input));
+                kernel.eval().expect("eval failed");
+                let mut out = vec![0u8; result.output_bytes];
+                kernel.read_output(0, &mut out);
+                let vals = bytes_to_f32(&out);
+                let nonzero = vals.iter().filter(|v| v.abs() > 1e-10).count();
+                eprintln!("35B Wot+SDPA BWD: {}/{} non-zero output elements", nonzero, vals.len());
+            }
+            Err(e) => {
+                panic!("35B Wot+SDPA BWD: COMPILE FAILED: {e}");
             }
         }
     }

@@ -2235,6 +2235,9 @@ pub struct PrePackedWeights {
     bwd_fused_attn_gqa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer Wo^T backward kernels with BLOBFILE weights (replaces DynMatmul).
     bwd_wot_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer fused Wot+SDPA backward kernels (2 BLOBFILEs: Wo + mask).
+    /// Merges Wot dispatch into SDPA → 2-dispatch attn backward (Wot+SDPA | QKV).
+    bwd_wot_sdpa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer QKV backward kernels with BLOBFILE weights (replaces DynMatmul).
     bwd_qkvb_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer RMSNorm (attention) kernels with baked weights.
@@ -2299,6 +2302,7 @@ impl PrePackedWeights {
             fwd_fused_attn_gqa_kernels: None,
             bwd_fused_attn_gqa_kernels: None,
             bwd_wot_kernels: None,
+            bwd_wot_sdpa_kernels: None,
             bwd_qkvb_kernels: None,
             rmsnorm_att_kernels: None,
             rmsnorm_ffn_kernels: None,
@@ -2419,6 +2423,7 @@ impl PrePackedWeights {
             fwd_fused_attn_gqa_kernels: None,
             bwd_fused_attn_gqa_kernels: None,
             bwd_wot_kernels: None,
+            bwd_wot_sdpa_kernels: None,
             bwd_qkvb_kernels: None,
             rmsnorm_att_kernels: None,
             rmsnorm_ffn_kernels: None,
@@ -2533,6 +2538,7 @@ impl PrePackedWeights {
         self.fwd_fused_attn_gqa_kernels = None;
         self.bwd_fused_attn_gqa_kernels = None;
         self.bwd_wot_kernels = None;
+        self.bwd_wot_sdpa_kernels = None;
         self.bwd_qkvb_kernels = None;
         self.rmsnorm_att_kernels = None;
         self.rmsnorm_ffn_kernels = None;
@@ -3019,6 +3025,91 @@ impl PrePackedWeights {
         let ad = cfg.attn_dim();
         let seq = cfg.seq_len;
         let mut buf = vec![0u8; ad * seq * 4];
+        kernel.read_output(0, &mut buf);
+        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+    }
+
+    /// Prime per-layer fused Wot+SDPA backward kernels (2 BLOBFILEs: Wo + mask).
+    ///
+    /// Merges the Wo^T dispatch into the SDPA backward kernel, reducing
+    /// attention backward from 3 dispatches (Wot | SDPA | QKV) to 2 (Wot+SDPA | QKV).
+    /// Each MHA layer gets a compiled kernel with Wo baked in as BLOBFILE.
+    pub fn prime_bwd_wot_sdpa_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let ad = cfg.attn_dim();
+        let has_gate = cfg.attn_output_gate;
+        let result = super::ane_mil::gen_wot_sdpa_bwd(cfg, has_gate);
+        let mask_blob = super::ane_mil::build_causal_mask_blob(cfg.seq_len);
+        let t0 = std::time::Instant::now();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if lw.gdn.is_some() || lw.wo.is_empty() {
+                kernels.push(None);
+                continue;
+            }
+            // Wo is [dim, ad] row-major. MIL expects [ad, dim] for transpose_y=bT matmul.
+            let wo_ad_dim = transpose_weight(&lw.wo, dim, ad);
+            let wo_blob = build_fp16_blob(&wo_ad_dim);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            match super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text, &names, &[&wo_blob, &mask_blob],
+                &[result.input_bytes], &[result.output_bytes],
+            ) {
+                Ok(k) => kernels.push(Some(k)),
+                Err(e) => {
+                    tracing::warn!("layer {l} bwd_wot_sdpa compile failed: {e}");
+                    kernels.push(None);
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        let count = kernels.iter().filter(|k| k.is_some()).count();
+        tracing::info!("primed {count}/{n_layers} per-layer Wot+SDPA backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        self.bwd_wot_sdpa_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Check if fused Wot+SDPA backward kernel is primed for a given layer.
+    pub fn has_bwd_wot_sdpa(&self, layer: usize) -> bool {
+        self.bwd_wot_sdpa_kernels
+            .as_ref()
+            .and_then(|ks| ks.get(layer))
+            .and_then(|k| k.as_ref())
+            .is_some()
+    }
+
+    /// Evaluate per-layer fused Wot+SDPA backward.
+    ///
+    /// Input: `dx2[dim,seq] | Q_rot[ad,seq] | K_exp[ad,seq] | V_exp[ad,seq]` concatenated f32.
+    /// With gate: append `pre_gate[ad,seq] | gate_raw[ad,seq]`.
+    /// Output: `[1, N*H, S, hd]` fp32 — dQ|dK|dV [|d_gate] on head axis.
+    ///   N=3 (non-gated) or N=4 (gated, 4th block is d_gate).
+    /// Returns None if not primed.
+    pub fn eval_bwd_wot_sdpa(
+        &self, layer: usize, input: &[f32], cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_wot_sdpa_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+        let bytes = unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        kernel.write_input(0, bytes);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("bwd_wot_sdpa eval layer {layer}: {e}")));
+        }
+        let heads = cfg.n_heads;
+        let hd = cfg.head_dim();
+        let seq = cfg.seq_len;
+        let n_blocks = if cfg.attn_output_gate { 4 } else { 3 };
+        let out_elems = n_blocks * heads * seq * hd;
+        let mut buf = vec![0u8; out_elems * 4];
         kernel.read_output(0, &mut buf);
         Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
     }
