@@ -18,7 +18,8 @@ pub(crate) use core_builder::{
 #[cfg(feature = "mlx")]
 pub(crate) use core_builder::{
     build_core_handle_mlx, create_agent_loop_mlx, find_mlx_dir_for_model, model_config_from_preset,
-    preset_from_model_dir, rebuild_core_mlx, resolve_mlx_model_dir, start_mlx_provider, MlxHandle,
+    preset_from_model_dir, rebuild_core_mlx, resolve_mlx_inference_url, resolve_mlx_model_dir,
+    start_mlx_provider, MlxHandle,
 };
 pub(crate) use eval::{
     cmd_eval_hanoi, cmd_eval_haystack, cmd_eval_learn, cmd_eval_report, cmd_eval_sprint,
@@ -247,6 +248,36 @@ mod tests {
                 "should still resolve to some path"
             );
         }
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_resolve_mlx_inference_url_prefers_explicit_setting() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.mlx_lm_url = Some("http://127.0.0.1:9090".to_string());
+        cfg.agents.defaults.local_api_base = "http://127.0.0.1:8080/v1".to_string();
+        assert_eq!(
+            core_builder::resolve_mlx_inference_url(&cfg),
+            "http://127.0.0.1:9090"
+        );
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_resolve_mlx_inference_url_uses_local_api_base_when_present() {
+        let mut cfg = Config::default();
+        cfg.agents.defaults.local_api_base = "http://127.0.0.1:8080/v1".to_string();
+        assert_eq!(
+            core_builder::resolve_mlx_inference_url(&cfg),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[cfg(feature = "mlx")]
+    #[test]
+    fn test_resolve_mlx_inference_url_defaults_to_auto() {
+        let cfg = Config::default();
+        assert_eq!(core_builder::resolve_mlx_inference_url(&cfg), "auto");
     }
 
     #[cfg(feature = "mlx")]

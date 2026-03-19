@@ -369,12 +369,11 @@ pub(crate) fn render_input_bar(
         let total = counters.training_total_steps.load(Ordering::Relaxed);
         let loss_x10k = counters.training_loss_x10k.load(Ordering::Relaxed);
         let loss = loss_x10k as f64 / 10000.0;
-        let runs = counters.training_steps_total.load(Ordering::Relaxed);
+        let completed_runs = counters.training_steps_total.load(Ordering::Relaxed);
         if total > 0 {
             let pct = (cur * 100).checked_div(total).unwrap_or(0);
             hints.push(format!(
-                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} {cur}/{total} L={loss:.2} #{}{RESET}",
-                runs + 1,
+                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} {cur}/{total} L={loss:.2} done={completed_runs}{RESET}",
             ));
         } else {
             hints.push(format!("{YELLOW}train:starting{RESET}"));
@@ -544,7 +543,7 @@ pub(crate) fn print_status_bar(
     }
 
     // Training status indicator
-    let train_total = core_handle
+    let completed_runs = core_handle
         .counters
         .training_steps_total
         .load(Ordering::Relaxed);
@@ -565,19 +564,17 @@ pub(crate) fn print_status_bar(
         if total > 0 {
             let pct = (cur * 100).checked_div(total).unwrap_or(0);
             parts.push(format!(
-                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} ({cur}/{total} loss={loss:.3} #{}){}",
-                train_total + 1,
+                "{YELLOW}train:{BOLD}{pct}%{RESET}{DIM} ({cur}/{total} loss={loss:.3} done={completed_runs}){}",
                 RESET
             ));
         } else {
             parts.push(format!(
-                "{YELLOW}train:{BOLD}starting{RESET}{DIM} (#{}){}",
-                train_total + 1,
+                "{YELLOW}train:{BOLD}starting{RESET}{DIM} (done={completed_runs}){}",
                 RESET
             ));
         }
-    } else if train_total > 0 {
-        parts.push(format!("{DIM}train:#{train_total}{RESET}"));
+    } else if completed_runs > 0 {
+        parts.push(format!("{DIM}train:done={completed_runs}{RESET}"));
     }
 
     parts.push(format!("t:{}", turn));
@@ -650,7 +647,7 @@ pub(crate) fn print_mlx_splash(model_name: &str, mlx_lm_mode: Option<&str>) {
         Some("auto") => "mlx-lm (managed)",
         Some("vllm-mlx") => "vllm-mlx (managed)",
         Some(_) => "mlx-lm (external)",
-        None => "in-process GPU",
+        None => "mlx-lm (managed default)",
     };
     print!("  {BOLD}{YELLOW}MLX{RESET} {DIM}{model_name} · {mode_hint}{RESET}\r\n");
     print!(

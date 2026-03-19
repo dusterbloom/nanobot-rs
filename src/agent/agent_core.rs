@@ -209,7 +209,7 @@ pub struct RuntimeCounters {
     // --- Training observability ---
     /// True while an ANE or HTTP training step is in progress.
     pub training_active: AtomicBool,
-    /// Total training steps completed (ANE + HTTP combined).
+    /// Total successful training runs completed in this process (ANE + HTTP combined).
     pub training_steps_total: AtomicU64,
     /// Timestamp (epoch ms) when the current training step started. 0 = idle.
     pub training_started_ms: AtomicU64,

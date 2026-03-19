@@ -292,11 +292,11 @@ pub struct AgentDefaults {
     #[serde(default = "default_lms_port")]
     pub lms_port: u16,
     /// Inference engine preference: "auto" | "lms" | "mlx".
-    /// "mlx" uses the in-process MLX provider for Apple Silicon GPU inference.
+    /// "mlx" uses the MLX provider with external mlx-lm/vllm-mlx/oMLX inference.
     #[serde(default = "default_inference_engine")]
     pub inference_engine: String,
     /// Local backend for `-l` mode: "lmstudio" (default, HTTP to LM Studio),
-    /// "mlx" (in-process MLX inference on Apple Silicon GPU), or
+    /// "mlx" (MLX model dir + managed/external mlx-lm inference), or
     /// "omlx" (external oMLX server at `localApiBase`, no managed spawn).
     #[serde(default = "default_local_backend")]
     pub local_backend: String,
@@ -308,10 +308,10 @@ pub struct AgentDefaults {
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
     /// MLX inference server URL or backend selector.
-    /// - `"auto"`: spawn managed `mlx_lm.server` on port 8090 (default, supports adapter reload)
+    /// - `"auto"`: spawn managed `mlx_lm.server` on port 8090 (default when unset and `localApiBase` is empty)
     /// - `"vllm-mlx"`: spawn managed `vllm-mlx serve` on port 8090 (continuous batching, tool calling)
     /// - `"http://..."`: connect to an external server
-    /// - `null`/absent: in-process inference only (no server)
+    /// - `null`/absent: prefer `localApiBase` if set, else behave like `"auto"`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mlx_lm_url: Option<String>,
     /// Path to a YAML instruction profiles file for model-specific prompt

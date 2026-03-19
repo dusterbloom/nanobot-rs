@@ -230,15 +230,11 @@ mod inner {
                             )
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "{backend_name} server failed to start: {e}, falling back to in-process"
+                            tracing::warn!("{backend_name} server failed to start: {e}");
+                            anyhow::bail!(
+                                "{backend_name} server failed to start: {e}. \
+                                 Install {backend_name} or set agents.defaults.mlxLmUrl to a reachable external server."
                             );
-                            eprintln!(
-                                "\x1b[33mwarning:\x1b[0m {backend_name} server failed to start: {e}\n\
-                                 Falling back to in-process inference (slower, 4K context cap).\n\
-                                 Install {backend_name} or set mlxLmUrl to null in config to silence this."
-                            );
-                            (None, None)
                         }
                     }
                 }

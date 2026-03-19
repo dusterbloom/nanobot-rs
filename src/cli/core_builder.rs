@@ -264,6 +264,29 @@ pub(super) fn make_local_providers(
     }
 }
 
+/// Resolve how MLX inference should connect to an external server.
+///
+/// Preference order:
+/// 1. explicit `mlxLmUrl`
+/// 2. `localApiBase` when it already points at an external local server
+/// 3. managed `mlx_lm.server` (`"auto"`)
+#[cfg(feature = "mlx")]
+pub(crate) fn resolve_mlx_inference_url(config: &Config) -> String {
+    if let Some(url) = config.agents.defaults.mlx_lm_url.clone() {
+        return url;
+    }
+
+    let local_api_base = config.agents.defaults.local_api_base.trim();
+    if !local_api_base.is_empty() {
+        return local_api_base
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+    }
+
+    "auto".to_string()
+}
+
 /// Resolve the MLX model directory from config or default location.
 ///
 /// Priority:
@@ -469,8 +492,8 @@ pub(crate) fn model_config_from_preset(preset: &str) -> Option<ModelConfig> {
     }
 }
 
-/// Start the in-process MLX provider. Returns the handle and an Arc provider
-/// for use as the main LLM provider.
+/// Start the MLX provider, forcing inference onto an external mlx-lm/oMLX
+/// server while keeping the local worker for training/perplexity duties.
 #[cfg(feature = "mlx")]
 pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     use crate::agent::mlx_lora::LoraConfig;
@@ -505,10 +528,16 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
     tracing::info!(
         model_dir = %model_dir.display(),
         preset = %config.agents.defaults.mlx_preset,
-        "starting in-process MLX provider"
+        "starting MLX provider"
     );
 
-    let mlx_lm_url = config.agents.defaults.mlx_lm_url.clone();
+    let mlx_lm_url = Some(resolve_mlx_inference_url(config));
+    tracing::info!(
+        inference_target = %mlx_lm_url.as_deref().unwrap_or("auto"),
+        is_moe = model_config.is_moe,
+        "MLX inference forced to external server"
+    );
+
     let provider = crate::providers::mlx::MlxProvider::start_with_mlx_lm(
         model_dir,
         model_config,

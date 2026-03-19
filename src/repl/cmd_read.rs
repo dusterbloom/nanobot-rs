@@ -772,8 +772,21 @@ impl ReplContext {
     pub(super) fn cmd_train_status(&self) {
         let counters = &self.core_handle.counters;
         let active = counters.training_active.load(Ordering::Relaxed);
-        let runs_completed = counters.training_steps_total.load(Ordering::Relaxed);
+        let session_completed_runs = counters.training_steps_total.load(Ordering::Relaxed);
         let started_ms = counters.training_started_ms.load(Ordering::Relaxed);
+        let persistent_completed_runs = {
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            {
+                self.agent_loop
+                    .ane_trainer()
+                    .map(|trainer| trainer.stats().completed_runs as u64)
+            }
+            #[cfg(not(all(feature = "ane", feature = "mlx")))]
+            {
+                None
+            }
+        };
+        let completed_runs = persistent_completed_runs.unwrap_or(session_completed_runs);
 
         println!("\n  Training Status:");
         if active {
@@ -816,16 +829,31 @@ impl ReplContext {
         } else {
             println!("    State:  \x1b[32midle\x1b[0m");
         }
-        println!("    Runs completed: {}", runs_completed);
+        println!("    Completed runs: {}", completed_runs);
+        if active {
+            println!("    Current run: counted only after a successful finish");
+        }
+        if persistent_completed_runs
+            .map(|runs| runs != session_completed_runs)
+            .unwrap_or(false)
+        {
+            println!(
+                "    Session counter: {} successful runs observed by the learn loop",
+                session_completed_runs
+            );
+        }
 
         // Show experience buffer stats if available.
         if let Ok(eb) = crate::agent::lora_bridge::ExperienceBuffer::open_default() {
             if let Ok(stats) = eb.stats() {
                 println!(
-                    "    Experiences: {} total, {} pending export",
+                    "    Experience buffer: {} lifetime, {} awaiting export on successful completion",
                     stats.total, stats.unexported
                 );
             }
+        }
+        if persistent_completed_runs.is_some() {
+            println!("    Resume mode: LoRA weights warm-start; optimizer state resets each run");
         }
 
         // Show perplexity gate config (use runtime state, not persisted config,
