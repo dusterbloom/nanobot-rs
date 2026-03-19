@@ -3518,7 +3518,59 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     lora_acts_vec.push(LoraLayerActivations::empty());
 
                     x_cur = next_x;
-                    continue; // Skip the multi-dispatch path
+                    continue;
+                }
+
+                // 2-DISPATCH PATH: fused attn (RMSNorm+QKV+RoPE+SDPA+gate+Wo)
+                //                + fused FFN (RMSNorm+W1×SiLU×W3+W2+residual)
+                if pp.has_fused_ffn_fwd() {
+                    // CPU: RMSNorm for attention
+                    let mut xnorm = vec![0.0f32; dim * seq];
+                    rmsnorm(&mut xnorm, &x_cur, &lw.rms_att, dim, seq, cfg.rms_eps);
+
+                    // ANE dispatch 1: fused attention
+                    if let Some(Ok(attn)) = pp.eval_fwd_fused_attn_gqa(l, &xnorm, cfg) {
+                        // CPU: residual add
+                        let x2: Vec<f32> = x_cur.iter().zip(attn.o_out.iter()).map(|(a, b)| a + b).collect();
+
+                        // ANE dispatch 2: fused FFN (RMSNorm + W1×SiLU×W3 + W2 + residual)
+                        if let Some(Ok((next_x, ffn_acts))) = pp.eval_fused_ffn_fwd(l, &x2, cfg) {
+                            // Unpack FFN acts: x2norm[dim] | h1[hidden] | h3[hidden]
+                            let hidden = cfg.hidden_dim;
+                            let s = seq;
+                            let x2norm = ffn_acts[..dim * s].to_vec();
+                            let h1 = ffn_acts[dim * s..dim * s + hidden * s].to_vec();
+                            let h3 = ffn_acts[dim * s + hidden * s..].to_vec();
+                            let gate: Vec<f32> = h1.iter().zip(h3.iter()).map(|(&a, &b)| {
+                                let sig = 1.0 / (1.0 + (-a).exp());
+                                a * sig * b
+                            }).collect();
+                            let ffn_out: Vec<f32> = next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
+
+                            layer_acts.push(LayerActivations {
+                                layer_in: layer_in.clone(),
+                                xnorm,
+                                q: attn.q,
+                                k: attn.k,
+                                v: attn.v,
+                                attn_out: attn.attn_out,
+                                o_out: attn.o_out,
+                                x2,
+                                x2norm,
+                                h1,
+                                h3,
+                                gate,
+                                ffn_out,
+                                q_pre_norm: attn.q_pre_norm,
+                                k_pre_norm: attn.k_pre_norm,
+                                attn_gate: attn.attn_gate,
+                                attn_pre_gate: attn.attn_pre_gate,
+                            });
+                            lora_acts_vec.push(LoraLayerActivations::empty());
+                            x_cur = next_x;
+                            continue;
+                        }
+                    }
                 }
             }
         }

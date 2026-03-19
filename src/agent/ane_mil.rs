@@ -3148,6 +3148,121 @@ pub fn gen_conv1x1_blob(c_in: usize, c_out: usize, seq: usize) -> FusedLayerMil 
     }
 }
 
+/// Fused FFN forward: RMSNorm + W1×SiLU×W3 + W2 + residual in 1 dispatch.
+///
+/// 4 BLOBFILE weights (rms_ffn, W1, W3, W2). ~24MB at 35B dims — under 32MB SRAM.
+/// Input: x2 `[1, dim, 1, seq]` fp32 (post-attention residual).
+/// Output: depends on `has_lm_head` (training mode):
+///   - Inference: `[1, dim, 1, seq]` fp32 — layer output
+///   - Training:  `[1, 3*dim + 2*hidden, 1, seq]` fp32 — xout|x2norm|h1|h3
+pub fn gen_fused_ffn_fwd_blob(cfg: &MilConfig) -> FusedLayerMil {
+    let dim = cfg.dim;
+    let hidden = cfg.hidden_dim;
+    let seq = cfg.seq_len;
+    let eps = cfg.rms_eps as f64;
+
+    let mut m = String::with_capacity(8192);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+
+    // Constants
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        bool kd = const()[name=string(\"kd\"), val=bool(true)];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    let _ = writeln!(m, "        tensor<int32, [1]> ch_ax = const()[name=string(\"chax\"), val=tensor<int32, [1]>([1])];");
+    let _ = writeln!(m, "        fp16 eps_v = const()[name=string(\"epsv\"), val=fp16({eps})];");
+    let _ = writeln!(m, "        fp16 nhalf = const()[name=string(\"nh\"), val=fp16(-0.5)];");
+
+    // Cast input
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+
+    // RMSNorm
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> sq = mul(x=xh,y=xh)[name=string(\"sq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> ms = reduce_mean(x=sq,axes=ch_ax,keep_dims=kd)[name=string(\"ms\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> me = add(x=ms,y=eps_v)[name=string(\"me\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,1,{seq}]> rr = pow(x=me,y=nhalf)[name=string(\"rr\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xn = mul(x=xh,y=rr)[name=string(\"xn\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,{dim},1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_ffn.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x2norm = mul(x=xn,y=rw)[name=string(\"x2norm\")];");
+
+    // Reshape for matmul: [1,D,1,S] → [1,1,S,D]
+    let _ = writeln!(m, "        tensor<int32, [4]> r2d = const()[name=string(\"r2d\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> fn2 = reshape(shape=r2d,x=x2norm)[name=string(\"fn2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> fnt = transpose(perm=pm,x=fn2)[name=string(\"fnt\")];");
+
+    // W1, W3 BLOBFILE
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W1 = const()[name=string(\"W1\"), val=tensor<fp16, [1,1,{dim},{hidden}]>(BLOBFILE(path=string(\"@model_path/weights/w1.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{hidden}]> W3 = const()[name=string(\"W3\"), val=tensor<fp16, [1,1,{dim},{hidden}]>(BLOBFILE(path=string(\"@model_path/weights/w3.bin\"), offset=uint64(64)))];");
+
+    // W1/W3 matmuls
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{hidden}]> h1m = matmul(transpose_x=bF,transpose_y=bF,x=fnt,y=W1)[name=string(\"h1m\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{hidden}]> h3m = matmul(transpose_x=bF,transpose_y=bF,x=fnt,y=W3)[name=string(\"h3m\")];");
+
+    // Reshape to [1,hidden,1,seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> h1t = transpose(perm=pm,x=h1m)[name=string(\"h1t\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> h3t = transpose(perm=pm,x=h3m)[name=string(\"h3t\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rh = const()[name=string(\"rh\"), val=tensor<int32, [4]>([1,{hidden},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h1 = reshape(shape=rh,x=h1t)[name=string(\"h1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> h3 = reshape(shape=rh,x=h3t)[name=string(\"h3\")];");
+
+    // SiLU + gate
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> sig = sigmoid(x=h1)[name=string(\"sg\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> silu = mul(x=h1,y=sig)[name=string(\"si\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{hidden},1,{seq}]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];");
+
+    // W2 projection
+    let _ = writeln!(m, "        tensor<int32, [4]> rh2 = const()[name=string(\"rh2\"), val=tensor<int32, [4]>([1,1,{hidden},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{seq}]> g2 = reshape(shape=rh2,x=gate)[name=string(\"g2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{hidden}]> gt2 = transpose(perm=pm,x=g2)[name=string(\"gt2\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{hidden},{dim}]> W2 = const()[name=string(\"W2\"), val=tensor<fp16, [1,1,{hidden},{dim}]>(BLOBFILE(path=string(\"@model_path/weights/w2.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> fm = matmul(transpose_x=bF,transpose_y=bF,x=gt2,y=W2)[name=string(\"fm\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> ft = transpose(perm=pm,x=fm)[name=string(\"ft\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> ros = const()[name=string(\"ros\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> ffn_out = reshape(shape=ros,x=ft)[name=string(\"ffn\")];");
+
+    // Residual
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xout = add(x=xh,y=ffn_out)[name=string(\"xout\")];");
+
+    if cfg.has_lm_head {
+        // Training: pack xout|x2norm|h1|h3
+        let act_ch = 2 * dim + 2 * hidden;
+        let out_ch = dim + act_ch;
+        let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{out_ch},1,{seq}]> packed = concat(values=(xout,x2norm,h1,h3),axis=cax,interleave=bF)[name=string(\"packed\")];");
+        let _ = writeln!(m, "        tensor<fp32, [1,{out_ch},1,{seq}]> y = cast(dtype=to32,x=packed)[name=string(\"cout\")];");
+        let _ = writeln!(m, "    }} -> (y);");
+        m.push_str("}\n");
+        FusedLayerMil {
+            mil_text: m,
+            weight_names: vec![
+                "@model_path/weights/rms_ffn.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+            ],
+            input_bytes: dim * seq * 4,
+            output_bytes: out_ch * seq * 4,
+        }
+    } else {
+        let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=xout)[name=string(\"cout\")];");
+        let _ = writeln!(m, "    }} -> (y);");
+        m.push_str("}\n");
+        FusedLayerMil {
+            mil_text: m,
+            weight_names: vec![
+                "@model_path/weights/rms_ffn.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+            ],
+            input_bytes: dim * seq * 4,
+            output_bytes: dim * seq * 4,
+        }
+    }
+}
+
 /// Classifier tile forward via BLOBFILE weight hotswap.
 ///
 /// Computes `logits = x^T @ embed_tile` for one vocab tile.
@@ -5272,6 +5387,50 @@ mod tests {
                     eprintln!("  fused_layer [{dim:>4}×{hidden:>4}×{seq}] {gqa} {mode}: REJECTED  ({weight_mb:.1}MB)");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_fused_ffn_fwd_blob_35b() {
+        use crate::agent::ane_weights::build_fp16_blob;
+        init_ane();
+
+        // 35B FFN dims (MoE — small hidden per expert)
+        let dim = 2048;
+        let hidden = 512; // actual 35B-A3B FFN hidden
+        let seq = 128;
+        let mut cfg = MilConfig::mha(dim, hidden, 16, seq);
+        cfg.has_lm_head = true; // training mode
+
+        let result = gen_fused_ffn_fwd_blob(&cfg);
+        let mk = |n: usize, s: usize| -> Vec<u8> {
+            build_fp16_blob(&(0..n).map(|i| ((i+s) as f32 * 0.001).sin() * 0.01).collect::<Vec<_>>())
+        };
+        let rms = mk(dim, 1);
+        let w1 = mk(dim * hidden, 2);
+        let w3 = mk(dim * hidden, 3);
+        let w2 = mk(hidden * dim, 4);
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+        let datas: Vec<&[u8]> = vec![&rms, &w1, &w3, &w2];
+
+        match AneKernel::compile_multi_weights(
+            &result.mil_text, &names, &datas,
+            &[result.input_bytes], &[result.output_bytes],
+        ) {
+            Ok(k) => {
+                let input = vec![0.01f32; dim * seq];
+                let ib = f32_to_bytes(&input);
+                for _ in 0..3 { k.write_input(0, &ib); k.eval().unwrap(); }
+                let n = 50;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n { k.write_input(0, &ib); k.eval().unwrap(); }
+                let us = t0.elapsed().as_micros() as f64 / n as f64;
+                let flops = 2.0 * 3.0 * dim as f64 * hidden as f64 * seq as f64;
+                let tflops = flops / us / 1e6;
+                let ws = datas.iter().map(|d| d.len()).sum::<usize>() as f64 / 1e6;
+                eprintln!("fused FFN fwd [35B]: {us:.1}µs  {tflops:.2} TFLOPS  ({ws:.1}MB weights)");
+            }
+            Err(e) => eprintln!("fused FFN fwd [35B]: REJECTED — {e}"),
         }
     }
 

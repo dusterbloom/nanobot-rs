@@ -2261,6 +2261,10 @@ pub struct PrePackedWeights {
     fused_layer_fwd_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Output size per fused layer dispatch (varies: inference vs training).
     fused_layer_fwd_output_bytes: usize,
+    /// Per-layer fused FFN forward kernels: RMSNorm + W1×SiLU×W3 + W2 + residual.
+    fused_ffn_fwd_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
+    /// Output size per fused FFN dispatch.
+    fused_ffn_fwd_output_bytes: usize,
     /// Per-layer fused GDN projection kernels: QKV+A+B+Z in 1 dispatch.
     fused_gdn_proj_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer GDN O projection kernels with baked weights.
@@ -2300,6 +2304,8 @@ impl PrePackedWeights {
             split_ffn_bwd_b_blobs: None,
             fused_layer_fwd_kernels: None,
             fused_layer_fwd_output_bytes: 0,
+            fused_ffn_fwd_kernels: None,
+            fused_ffn_fwd_output_bytes: 0,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2414,6 +2420,8 @@ impl PrePackedWeights {
             split_ffn_bwd_b_blobs: None,
             fused_layer_fwd_kernels: None,
             fused_layer_fwd_output_bytes: 0,
+            fused_ffn_fwd_kernels: None,
+            fused_ffn_fwd_output_bytes: 0,
             fused_gdn_proj_kernels: None,
             gdn_o_proj_kernels: None,
         }
@@ -2521,6 +2529,7 @@ impl PrePackedWeights {
         self.split_ffn_bwd_a_blobs = None;
         self.split_ffn_bwd_b_blobs = None;
         self.fused_layer_fwd_kernels = None;
+        self.fused_ffn_fwd_kernels = None;
         self.fused_gdn_proj_kernels = None;
         self.gdn_o_proj_kernels = None;
     }
@@ -3610,6 +3619,84 @@ impl PrePackedWeights {
         let next_x = full[..dim * seq].to_vec();
         let acts = full[dim * seq..].to_vec();
         Some(Ok((next_x, acts)))
+    }
+
+    /// Prime per-layer fused FFN forward kernels (RMSNorm + W1×SiLU×W3 + W2 + residual).
+    pub fn prime_fused_ffn_fwd<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+        train: bool,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let hidden = cfg.hidden_dim;
+        let t0 = std::time::Instant::now();
+
+        let mut train_cfg = cfg.clone();
+        train_cfg.has_lm_head = train;
+        let result = super::ane_mil::gen_fused_ffn_fwd_blob(&train_cfg);
+        let names: Vec<&str> = result.weight_names.iter().copied().collect();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if lw.gdn.is_some() { continue; } // GDN layers use separate path
+
+            let rms = build_fp16_blob(&lw.rms_ffn);
+            let w1 = build_fp16_blob(&transpose_weight(&lw.w1, hidden, dim));
+            let w3 = build_fp16_blob(&transpose_weight(&lw.w3, hidden, dim));
+            let w2 = build_fp16_blob(&transpose_weight(&lw.w2, dim, hidden));
+
+            let datas: Vec<&[u8]> = vec![&rms, &w1, &w3, &w2];
+            let kernel = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text, &names, &datas,
+                &[result.input_bytes], &[result.output_bytes],
+            ).map_err(|e| format!("fused_ffn_fwd layer {l}: {e}"))?;
+            kernels.push(kernel);
+        }
+
+        let elapsed = t0.elapsed();
+        tracing::info!(
+            "primed {} fused FFN fwd kernels ({}) in {:.1}ms",
+            kernels.len(), if train { "train" } else { "infer" },
+            elapsed.as_secs_f64() * 1000.0,
+        );
+        self.fused_ffn_fwd_output_bytes = result.output_bytes;
+        self.fused_ffn_fwd_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate fused FFN forward for an MHA layer.
+    pub fn eval_fused_ffn_fwd(
+        &self, layer: usize, x2: &[f32], cfg: &super::ane_mil::MilConfig,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
+        let kernels = self.fused_ffn_fwd_kernels.as_ref()?;
+        if layer >= kernels.len() { return None; }
+        let kernel = &kernels[layer];
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+
+        let bytes = unsafe { std::slice::from_raw_parts(x2.as_ptr() as *const u8, x2.len() * 4) };
+        kernel.write_input(0, bytes);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("fused_ffn_fwd eval layer {layer}: {e}")));
+        }
+
+        let mut buf = vec![0u8; self.fused_ffn_fwd_output_bytes];
+        kernel.read_output(0, &mut buf);
+        let full: Vec<f32> = buf.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let next_x = full[..dim * seq].to_vec();
+        let acts = full[dim * seq..].to_vec();
+        Some(Ok((next_x, acts)))
+    }
+
+    pub fn has_fused_ffn_fwd(&self) -> bool {
+        self.fused_ffn_fwd_kernels.is_some()
     }
 
     /// Prime per-layer fused GDN projection kernels (QKV+A+B+Z) and O projection.

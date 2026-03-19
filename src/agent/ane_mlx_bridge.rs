@@ -927,7 +927,8 @@ impl AneTrainerSession {
         }
 
         // Prime fused full-layer forward kernels (MHA layers — 1 dispatch per layer)
-        let has_fused = self.prepacked_weights.first().map_or(false, |(_, pp)| pp.has_fused_layer_fwd());
+        // Prime fused layer OR fused FFN forward
+        let has_fused = self.prepacked_weights.first().map_or(false, |(_, pp)| pp.has_fused_layer_fwd() || pp.has_fused_ffn_fwd());
         if !has_fused {
             if let Some((bucket_seq, pp)) = self.prepacked_weights.first_mut() {
                 let mut layer_cfg = self.model.cfg().clone();
@@ -947,6 +948,11 @@ impl AneTrainerSession {
                         }
                         Err(e) => {
                             tracing::warn!("ANE train: fused layer fwd failed: {e}");
+                            // Fallback: fused FFN for 2-dispatch path
+                            match pp.prime_fused_ffn_fwd(&layer_cfg, &self.model, true) {
+                                Ok(()) => tracing::info!("ANE train: fused FFN fwd primed (2-dispatch path)"),
+                                Err(e2) => tracing::warn!("ANE train: fused FFN fwd failed: {e2}"),
+                            }
                         }
                     }
                 }
@@ -4293,7 +4299,14 @@ mod tests {
         // Fused full-layer forward (MHA layers — 1 dispatch per layer, training mode)
         match pp.prime_fused_layer_fwd(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob, true) {
             Ok(()) => eprintln!("35B bench: fused layer fwd primed OK"),
-            Err(e) => eprintln!("35B bench: fused layer fwd FAILED: {e}"),
+            Err(e) => {
+                eprintln!("35B bench: fused layer fwd FAILED: {e}");
+                // Fallback: prime separate fused FFN forward
+                match pp.prime_fused_ffn_fwd(&pp_cfg, &model, true) {
+                    Ok(()) => eprintln!("35B bench: fused FFN fwd primed OK"),
+                    Err(e2) => eprintln!("35B bench: fused FFN fwd FAILED: {e2}"),
+                }
+            }
         }
 
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
