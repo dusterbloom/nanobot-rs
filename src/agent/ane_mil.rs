@@ -3750,6 +3750,111 @@ pub fn gen_classifier_tile_fwd(dim: usize, tile_rows: usize, seq: usize) -> Fuse
     }
 }
 
+/// Wot backward with BLOBFILE weight (per-layer, no DynMatmul packing at eval time).
+///
+/// `da[ad, seq] = Wo^T[ad, dim] @ dx2[dim, seq]`
+/// Weight: Wo transposed as fp16 BLOBFILE `[1,1,ad,dim]`.
+/// Input: dx2 `[1,dim,1,seq]` fp32. Output: da `[1,ad,1,seq]` fp32.
+pub fn gen_wot_bwd_blob(dim: usize, ad: usize, seq: usize) -> FusedLayerMil {
+    let mut m = String::with_capacity(2048);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+    // BLOBFILE weight: Wo^T [ad, dim] stored as [1,1,ad,dim] fp16
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ad},{dim}]> W = const()[name=string(\"W\"), val=tensor<fp16, [1,1,{ad},{dim}]>(BLOBFILE(path=string(\"@model_path/weights/wot.bin\"), offset=uint64(64)))];");
+    // Cast input to fp16, reshape to [1,1,dim,seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+    // Matmul: W[ad,dim] @ x[dim,seq] → [ad,seq]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ad},{seq}]> ym = matmul(transpose_x=bF,transpose_y=bF,x=W,y=xm)[name=string(\"ym\")];");
+    // Reshape back to [1,ad,1,seq]
+    let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{ad},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{ad},1,{seq}]> yr = reshape(shape=ro,x=ym)[name=string(\"yr\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{ad},1,{seq}]> out = cast(dtype=to32,x=yr)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec!["@model_path/weights/wot.bin"],
+        input_bytes: dim * seq * 4,
+        output_bytes: ad * seq * 4,
+    }
+}
+
+/// QKV backward with BLOBFILE weights (per-layer, no DynMatmul packing).
+///
+/// `dx[dim, seq] = WQ^T[dim, qpd] @ dQ[qpd, seq] + WK^T[dim, ad] @ dK[ad, seq] + WV^T[dim, ad] @ dV[ad, seq]`
+/// 3 weights as fp16 BLOBFILEs. Input: dQ|dK|dV concatenated `[1, qpd+2*ad, 1, seq]`.
+/// Output: dx `[1, dim, 1, seq]` fp32.
+pub fn gen_qkvb_blob(cfg: &MilConfig) -> FusedLayerMil {
+    let dim = cfg.dim;
+    let qpd = cfg.q_proj_dim();
+    let ad = cfg.attn_dim();
+    let seq = cfg.seq_len;
+    let in_ch = qpd + 2 * ad;
+
+    let mut m = String::with_capacity(4096);
+    m.push_str(MIL_HDR);
+    let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {in_ch}, 1, {seq}]> x) {{");
+    let _ = writeln!(m, "        string to16 = const()[name=string(\"to16\"), val=string(\"fp16\")];");
+    let _ = writeln!(m, "        string to32 = const()[name=string(\"to32\"), val=string(\"fp32\")];");
+    let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+    let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+
+    // 3 BLOBFILE weights: WQ^T[dim,qpd], WK^T[dim,ad], WV^T[dim,ad]
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{qpd}]> Wq = const()[name=string(\"Wq\"), val=tensor<fp16, [1,1,{dim},{qpd}]>(BLOBFILE(path=string(\"@model_path/weights/wqt.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{ad}]> Wk = const()[name=string(\"Wk\"), val=tensor<fp16, [1,1,{dim},{ad}]>(BLOBFILE(path=string(\"@model_path/weights/wkt.bin\"), offset=uint64(64)))];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{ad}]> Wv = const()[name=string(\"Wv\"), val=tensor<fp16, [1,1,{dim},{ad}]>(BLOBFILE(path=string(\"@model_path/weights/wvt.bin\"), offset=uint64(64)))];");
+
+    // Cast + reshape input
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},1,{seq}]> xh = cast(dtype=to16,x=x)[name=string(\"cin\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{in_ch},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{in_ch},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{in_ch},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+
+    // Slice dQ, dK, dV from concatenated input
+    let _ = writeln!(m, "        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> sq = const()[name=string(\"sq\"), val=tensor<int32, [4]>([1,1,{qpd},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{qpd},{seq}]> dQ = slice_by_size(x=xm,begin=b0,size=sq)[name=string(\"dQ\")];");
+    let _ = writeln!(m, "        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,0,{qpd},0])];");
+    let _ = writeln!(m, "        tensor<int32, [4]> sk = const()[name=string(\"sk\"), val=tensor<int32, [4]>([1,1,{ad},{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ad},{seq}]> dK = slice_by_size(x=xm,begin=b1,size=sk)[name=string(\"dK\")];");
+    let bv = qpd + ad;
+    let _ = writeln!(m, "        tensor<int32, [4]> b2 = const()[name=string(\"b2\"), val=tensor<int32, [4]>([0,0,{bv},0])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{ad},{seq}]> dV = slice_by_size(x=xm,begin=b2,size=sk)[name=string(\"dV\")];");
+
+    // 3 matmuls: WQ^T @ dQ + WK^T @ dK + WV^T @ dV
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xq = matmul(transpose_x=bF,transpose_y=bF,x=Wq,y=dQ)[name=string(\"xq\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xk = matmul(transpose_x=bF,transpose_y=bF,x=Wk,y=dK)[name=string(\"xk\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xv = matmul(transpose_x=bF,transpose_y=bF,x=Wv,y=dV)[name=string(\"xv\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> s1 = add(x=xq,y=xk)[name=string(\"s1\")];");
+    let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> s2 = add(x=s1,y=xv)[name=string(\"s2\")];");
+
+    // Reshape back to [1,dim,1,seq]
+    let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+    let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> yr = reshape(shape=ro,x=s2)[name=string(\"yr\")];");
+    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> out = cast(dtype=to32,x=yr)[name=string(\"cout\")];");
+    let _ = writeln!(m, "    }} -> (out);");
+    m.push_str("}\n");
+
+    FusedLayerMil {
+        mil_text: m,
+        weight_names: vec![
+            "@model_path/weights/wqt.bin",
+            "@model_path/weights/wkt.bin",
+            "@model_path/weights/wvt.bin",
+        ],
+        input_bytes: in_ch * seq * 4,
+        output_bytes: dim * seq * 4,
+    }
+}
+
 /// Classifier tile MIL with a per-tile weight key name.
 ///
 /// Same program as `gen_classifier_tile_fwd` but the BLOBFILE path includes

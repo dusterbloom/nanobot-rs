@@ -4375,8 +4375,15 @@ mod tests {
             }
         }
 
-        // Note: per-layer fused backward attention GQA kernels exceed ANE SRAM at 35B dims
-        // (4 weight matrices × [2048,2048] × fp16 > 32MB SRAM limit). Using 3-dispatch path.
+        // Per-layer Wot + QKV backward kernels (BLOBFILE, replaces DynMatmul packing)
+        match pp.prime_bwd_wot_kernels(&pp_cfg, &model) {
+            Ok(()) => eprintln!("35B bench: MHA bwd Wot per-layer primed OK"),
+            Err(e) => eprintln!("35B bench: MHA bwd Wot per-layer FAILED: {e}"),
+        }
+        match pp.prime_bwd_qkvb_kernels(&pp_cfg, &model) {
+            Ok(()) => eprintln!("35B bench: MHA bwd QKV per-layer primed OK"),
+            Err(e) => eprintln!("35B bench: MHA bwd QKV per-layer FAILED: {e}"),
+        }
 
         // Log backward kernel status
         eprintln!("35B bench: bwd kernels: wot={} sdpa_bwd1={} sdpa_bwd2={} qkv={} fused_sdpa={} rmsnorm={}",

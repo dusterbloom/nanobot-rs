@@ -1366,7 +1366,7 @@ fn mha_backward_fused_sdpa_dx_attn(
     let kv_heads = cfg.n_kv_heads;
     let hpg = cfg.heads_per_group();
 
-    // Step 1: Wo^T projection (same as 4-kernel path)
+    // Step 1: Wo^T projection (DynMatmul — per-layer BLOBFILE handled by caller)
     let wot_input = ane_weights::pack_dyn_matmul(dx2, &lw.wo, dim, ad, seq);
     let wot_spec = KernelSpec::for_kernel(cfg, KernelType::Wot);
     let wot_kernel = kernels
@@ -2822,7 +2822,153 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                     }
                 }
             }
-            // 2. Try fused SDPA path (3 dispatches: wot + fused_sdpa + qkv)
+            // 2. Per-layer BLOBFILE path: Wot(1 dispatch) + SDPA(1 dispatch) + QKV(1 dispatch)
+            //    Eliminates DynMatmul weight packing (~64MB/layer). Falls through
+            //    to DynMatmul path if per-layer kernels aren't primed.
+            if let Some(ref pp) = prepacked {
+                if let (Some(Ok(da_raw)), true) = (
+                    pp.eval_bwd_wot(l, &dx2, cfg),
+                    bwd_kernels.fused_attn_gqa_bwd.is_some(),
+                ) {
+                    // Gate backward (CPU)
+                    let (da, d_gate) = if cfg.attn_output_gate {
+                        let gate_raw = ac.attn_gate.as_ref().unwrap();
+                        let pre_gate = ac.attn_pre_gate.as_ref().unwrap();
+                        let (d_attn, dg) = sigmoid_gate_backward(&da_raw, gate_raw, pre_gate);
+                        (d_attn, Some(dg))
+                    } else {
+                        (da_raw, None)
+                    };
+
+                    // Fused SDPA backward (same as 3-dispatch path step 3)
+                    let ad = cfg.attn_dim();
+                    let hd = cfg.head_dim();
+                    let heads = cfg.n_heads;
+                    let kv_heads = cfg.n_kv_heads;
+                    let hpg = cfg.heads_per_group();
+                    let kvd = cfg.kv_dim();
+
+                    let mut k_expanded = vec![0.0f32; ad * seq];
+                    for kv_h in 0..kv_heads {
+                        for rep in 0..hpg {
+                            let dst_h = kv_h * hpg + rep;
+                            k_expanded[dst_h * hd * seq..(dst_h * hd + hd) * seq]
+                                .copy_from_slice(&ac.k[kv_h * hd * seq..(kv_h * hd + hd) * seq]);
+                        }
+                    }
+                    let mut v_expanded = vec![0.0f32; ad * seq];
+                    for kv_h in 0..kv_heads {
+                        for rep in 0..hpg {
+                            let dst_h = kv_h * hpg + rep;
+                            v_expanded[dst_h * hd * seq..(dst_h * hd + hd) * seq]
+                                .copy_from_slice(&ac.v[kv_h * hd * seq..(kv_h * hd + hd) * seq]);
+                        }
+                    }
+
+                    let mut sdpa_input = Vec::with_capacity(4 * ad * seq);
+                    sdpa_input.extend_from_slice(&da);
+                    sdpa_input.extend_from_slice(&ac.q[..ad * seq]);
+                    sdpa_input.extend_from_slice(&k_expanded);
+                    sdpa_input.extend_from_slice(&v_expanded);
+
+                    let fused_kernel = bwd_kernels.fused_attn_gqa_bwd.as_ref().unwrap();
+                    let input_bytes = unsafe {
+                        std::slice::from_raw_parts(sdpa_input.as_ptr() as *const u8, sdpa_input.len() * 4)
+                    };
+                    fused_kernel.write_input(0, input_bytes);
+                    if let Ok(()) = fused_kernel.eval() {
+                        let out_elems = 3 * heads * seq * hd;
+                        let mut out_buf = vec![0u8; out_elems * 4];
+                        fused_kernel.read_output(0, &mut out_buf);
+                        let output: Vec<f32> = out_buf.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+                        let head_stride = seq * hd;
+                        let mut dq = vec![0.0f32; ad * seq];
+                        let mut dk = vec![0.0f32; ad * seq];
+                        for h in 0..heads {
+                            for t in 0..seq {
+                                for d in 0..hd {
+                                    dq[(h * hd + d) * seq + t] = output[h * head_stride + t * hd + d];
+                                    dk[(h * hd + d) * seq + t] = output[heads * head_stride + h * head_stride + t * hd + d];
+                                }
+                            }
+                        }
+
+                        // RoPE + QK-norm backward (CPU)
+                        ane_forward::rope_backward(&mut dq, &mut dk, heads, hd, seq, cfg.rope_theta);
+                        if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
+                            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; hd], q_pre, q_nw, heads, hd, seq, cfg.rms_eps);
+                        }
+                        if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
+                            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; hd], k_pre, k_nw, heads, hd, seq, cfg.rms_eps);
+                        }
+
+                        // GQA-reduce dK, dV
+                        let inv_hpg = 1.0 / hpg as f32;
+                        let mut dk_r = vec![0.0f32; kvd * seq];
+                        for kv_h in 0..kv_heads {
+                            for rep in 0..hpg {
+                                let src_h = kv_h * hpg + rep;
+                                for c in 0..hd { for t in 0..seq {
+                                    dk_r[(kv_h * hd + c) * seq + t] += dk[(src_h * hd + c) * seq + t] * inv_hpg;
+                                }}
+                            }
+                        }
+                        let mut dv = vec![0.0f32; kvd * seq];
+                        for kv_h in 0..kv_heads {
+                            for rep in 0..hpg {
+                                let src_h = kv_h * hpg + rep;
+                                for t in 0..seq { for d in 0..hd {
+                                    dv[(kv_h * hd + d) * seq + t] +=
+                                        output[2 * heads * head_stride + src_h * head_stride + t * hd + d] * inv_hpg;
+                                }}
+                            }
+                        }
+
+                        // Merge gate into dQ if needed
+                        let dq_for_wq = if let Some(dg) = &d_gate {
+                            ane_forward::merge_q_gate(&dq, dg, heads, hd, seq)
+                        } else { dq };
+
+                        // Re-expand for QKV backward
+                        let dk_exp = if hpg > 1 {
+                            let mut exp = vec![0.0f32; ad * seq];
+                            for kv_h in 0..kv_heads { for rep in 0..hpg {
+                                let dst_h = kv_h * hpg + rep;
+                                for c in 0..hd {
+                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                        .copy_from_slice(&dk_r[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                                }
+                            }} exp
+                        } else { dk_r };
+                        let dv_exp = if hpg > 1 {
+                            let mut exp = vec![0.0f32; ad * seq];
+                            for kv_h in 0..kv_heads { for rep in 0..hpg {
+                                let dst_h = kv_h * hpg + rep;
+                                for c in 0..hd {
+                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                        .copy_from_slice(&dv[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                                }
+                            }} exp
+                        } else { dv };
+
+                        // Per-layer QKV backward (BLOBFILE, no DynMatmul packing)
+                        let qpd = cfg.q_proj_dim();
+                        let mut dqkv = Vec::with_capacity((qpd + 2 * ad) * seq);
+                        dqkv.extend_from_slice(&dq_for_wq);
+                        dqkv.extend_from_slice(&dk_exp);
+                        dqkv.extend_from_slice(&dv_exp);
+
+                        if let Some(Ok(dx_attn)) = pp.eval_bwd_qkvb(l, &dqkv, cfg) {
+                            break 'attn_bwd dx_attn;
+                        }
+                        // QKV per-layer failed, fall through to DynMatmul path
+                    }
+                }
+            }
+
+            // 3. DynMatmul SDPA path (3 dispatches: wot + fused_sdpa + qkv)
             if bwd_kernels.fused_attn_gqa_bwd.is_some()
                 && bwd_kernels.wot_bwd.is_some()
                 && bwd_kernels.qkv_bwd.is_some()

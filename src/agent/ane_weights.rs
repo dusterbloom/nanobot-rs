@@ -2233,6 +2233,10 @@ pub struct PrePackedWeights {
     /// Per-layer fused backward attention GQA kernels with real weights baked in.
     /// Same delta-cache pattern as forward: same MIL text → cached net.plist → load-only.
     bwd_fused_attn_gqa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer Wo^T backward kernels with BLOBFILE weights (replaces DynMatmul).
+    bwd_wot_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Per-layer QKV backward kernels with BLOBFILE weights (replaces DynMatmul).
+    bwd_qkvb_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer RMSNorm (attention) kernels with baked weights.
     rmsnorm_att_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer RMSNorm (FFN) kernels with baked weights.
@@ -2294,6 +2298,8 @@ impl PrePackedWeights {
             bwd_w13t_kernels: None,
             fwd_fused_attn_gqa_kernels: None,
             bwd_fused_attn_gqa_kernels: None,
+            bwd_wot_kernels: None,
+            bwd_qkvb_kernels: None,
             rmsnorm_att_kernels: None,
             rmsnorm_ffn_kernels: None,
             rmsnorm_bwd_att_kernels: None,
@@ -2412,6 +2418,8 @@ impl PrePackedWeights {
             bwd_w13t_kernels: None,
             fwd_fused_attn_gqa_kernels: None,
             bwd_fused_attn_gqa_kernels: None,
+            bwd_wot_kernels: None,
+            bwd_qkvb_kernels: None,
             rmsnorm_att_kernels: None,
             rmsnorm_ffn_kernels: None,
             rmsnorm_bwd_att_kernels: None,
@@ -2524,6 +2532,8 @@ impl PrePackedWeights {
         self.bwd_w13t_kernels = None;
         self.fwd_fused_attn_gqa_kernels = None;
         self.bwd_fused_attn_gqa_kernels = None;
+        self.bwd_wot_kernels = None;
+        self.bwd_qkvb_kernels = None;
         self.rmsnorm_att_kernels = None;
         self.rmsnorm_ffn_kernels = None;
         self.rmsnorm_bwd_att_kernels = None;
@@ -2952,6 +2962,137 @@ impl PrePackedWeights {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Some(Ok(dx_attn))
+    }
+
+    /// Prime per-layer Wot backward kernels with BLOBFILE weights.
+    ///
+    /// Each MHA layer gets a compiled kernel with Wo transposed baked in.
+    /// Eliminates DynMatmul packing overhead (~16MB memcpy per layer per step).
+    pub fn prime_bwd_wot_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let ad = cfg.attn_dim();
+        let seq = cfg.seq_len;
+        let result = super::ane_mil::gen_wot_bwd_blob(dim, ad, seq);
+        let t0 = std::time::Instant::now();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if lw.gdn.is_some() || lw.wo.is_empty() {
+                kernels.push(None);
+                continue;
+            }
+            // Wo is [dim, ad] row-major. Wot = transpose(Wo) = [ad, dim].
+            let wot = transpose_weight(&lw.wo, dim, ad);
+            let blob = build_fp16_blob(&wot);
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let k = super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text, &names, &[&blob],
+                &[result.input_bytes], &[result.output_bytes],
+            ).map_err(|e| format!("layer {l} bwd_wot compile: {e}"))?;
+            kernels.push(Some(k));
+        }
+
+        let elapsed = t0.elapsed();
+        let count = kernels.iter().filter(|k| k.is_some()).count();
+        tracing::info!("primed {count}/{n_layers} per-layer Wot backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        self.bwd_wot_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate per-layer Wot backward: da = Wo^T @ dx2.
+    /// Returns None if not primed.
+    pub fn eval_bwd_wot(&self, layer: usize, dx2: &[f32], cfg: &super::ane_mil::MilConfig) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_wot_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+        let bytes = unsafe { std::slice::from_raw_parts(dx2.as_ptr() as *const u8, dx2.len() * 4) };
+        kernel.write_input(0, bytes);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("bwd_wot eval layer {layer}: {e}")));
+        }
+        let ad = cfg.attn_dim();
+        let seq = cfg.seq_len;
+        let mut buf = vec![0u8; ad * seq * 4];
+        kernel.read_output(0, &mut buf);
+        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+    }
+
+    /// Prime per-layer QKV backward kernels with BLOBFILE weights.
+    ///
+    /// Each MHA layer gets a compiled kernel with WQ^T, WK^T, WV^T baked in.
+    /// 3 BLOBFILEs per kernel. Eliminates DynMatmul packing (~48MB per layer).
+    pub fn prime_bwd_qkvb_kernels<W: WeightSource>(
+        &mut self,
+        cfg: &super::ane_mil::MilConfig,
+        model: &W,
+    ) -> Result<(), String> {
+        let n_layers = model.n_layers();
+        let dim = cfg.dim;
+        let qpd = cfg.q_proj_dim();
+        let ad = cfg.attn_dim();
+        let result = super::ane_mil::gen_qkvb_blob(cfg);
+        let t0 = std::time::Instant::now();
+
+        let mut kernels = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if lw.gdn.is_some() || lw.wq.is_empty() {
+                kernels.push(None);
+                continue;
+            }
+            // WQ is [qpd, dim] → WQ^T = [dim, qpd]
+            let wqt = transpose_weight(&lw.wq, qpd, dim);
+            let wqt_blob = build_fp16_blob(&wqt);
+            // WK is [ad, dim] → WK^T = [dim, ad]
+            let wkt = transpose_weight(&lw.wk, ad, dim);
+            let wkt_blob = build_fp16_blob(&wkt);
+            // WV is [ad, dim] → WV^T = [dim, ad]
+            let wvt = transpose_weight(&lw.wv, ad, dim);
+            let wvt_blob = build_fp16_blob(&wvt);
+
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            match super::ane_bridge::AneKernel::compile_multi_weights(
+                &result.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
+                &[result.input_bytes], &[result.output_bytes],
+            ) {
+                Ok(k) => kernels.push(Some(k)),
+                Err(e) => {
+                    tracing::warn!("layer {l} bwd_qkvb compile failed: {e}");
+                    kernels.push(None);
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        let count = kernels.iter().filter(|k| k.is_some()).count();
+        tracing::info!("primed {count}/{n_layers} per-layer QKV backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        self.bwd_qkvb_kernels = Some(kernels);
+        Ok(())
+    }
+
+    /// Evaluate per-layer QKV backward: dx = WQ^T@dQ + WK^T@dK + WV^T@dV.
+    /// Input: dQ[qpd,seq] | dK[ad,seq] | dV[ad,seq] concatenated.
+    /// Returns None if not primed.
+    pub fn eval_bwd_qkvb(&self, layer: usize, dqkv: &[f32], cfg: &super::ane_mil::MilConfig) -> Option<Result<Vec<f32>, String>> {
+        let kernels = self.bwd_qkvb_kernels.as_ref()?;
+        let kernel = kernels[layer].as_ref()?;
+        let bytes = unsafe { std::slice::from_raw_parts(dqkv.as_ptr() as *const u8, dqkv.len() * 4) };
+        kernel.write_input(0, bytes);
+        if let Err(e) = kernel.eval() {
+            return Some(Err(format!("bwd_qkvb eval layer {layer}: {e}")));
+        }
+        let dim = cfg.dim;
+        let seq = cfg.seq_len;
+        let mut buf = vec![0u8; dim * seq * 4];
+        kernel.read_output(0, &mut buf);
+        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
     }
 
     /// Prime per-layer RMSNorm kernels (attention + FFN) with baked weights.
