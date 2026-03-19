@@ -3456,6 +3456,75 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
         let layer_in = x_cur.clone();
         let mut lora_layer_acts = LoraLayerActivations::empty();
 
+        // === FUSED LAYER FAST PATH ===
+        // For MHA layers with a pre-compiled fused kernel: 1 dispatch does
+        // RMSNorm + QKV + RoPE + SDPA + Wo + residual + RMSNorm + FFN + residual.
+        // Output includes packed activations for backward (training mode).
+        if let Some(ref mut pp) = prepacked {
+            let lw_cow = model.layer(l);
+            let lw = &*lw_cow;
+            if lw.gdn.is_none() {
+                // MHA layer — try fused kernel
+                if let Some(Ok((next_x, acts))) = pp.eval_fused_layer_fwd(l, &x_cur, cfg) {
+                    // Unpack activations: xout[dim] | xnorm[dim] | qf[dim] | kf[dim] | vf[dim] | x2[dim] | h1[hidden] | h3[hidden]
+                    let hidden = cfg.hidden_dim;
+                    let s = seq;
+                    let mut off = 0;
+                    // xout is the first dim*seq — that's next_x (already extracted)
+                    off += dim * s;
+                    let xnorm = acts[off..off + dim * s].to_vec(); off += dim * s;
+                    let q = acts[off..off + dim * s].to_vec(); off += dim * s;
+                    let k = acts[off..off + dim * s].to_vec(); off += dim * s;
+                    let v = acts[off..off + dim * s].to_vec(); off += dim * s;
+                    let x2 = acts[off..off + dim * s].to_vec(); off += dim * s;
+                    let h1 = acts[off..off + hidden * s].to_vec(); off += hidden * s;
+                    let h3 = acts[off..off + hidden * s].to_vec();
+
+                    // Compute o_out = x2 - layer_in (since x2 = layer_in + o_out)
+                    let o_out: Vec<f32> = x2.iter().zip(layer_in.iter()).map(|(a, b)| a - b).collect();
+                    let attn_out = o_out.clone();
+
+                    // Compute derived activations needed by backward
+                    let hidden = cfg.hidden_dim;
+                    let mut x2norm = vec![0.0f32; dim * seq];
+                    rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+                    // gate = silu(h1) * h3
+                    let gate: Vec<f32> = h1.iter().zip(h3.iter()).map(|(&a, &b)| {
+                        let sig = 1.0 / (1.0 + (-a).exp());
+                        a * sig * b
+                    }).collect();
+                    // ffn_out = next_x - x2 (since next_x = x2 + ffn_out)
+                    let ffn_out: Vec<f32> = next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
+
+                    layer_acts.push(LayerActivations {
+                        layer_in: layer_in.clone(),
+                        xnorm,
+                        q,
+                        k,
+                        v,
+                        attn_out,
+                        o_out,
+                        x2,
+                        x2norm,
+                        h1,
+                        h3,
+                        gate,
+                        ffn_out,
+                        q_pre_norm: None,
+                        k_pre_norm: None,
+                        attn_gate: None,
+                        attn_pre_gate: None,
+                    });
+                    lora_acts_vec.push(LoraLayerActivations::empty());
+
+                    x_cur = next_x;
+                    continue; // Skip the multi-dispatch path
+                }
+            }
+        }
+
+        // === MULTI-DISPATCH FALLBACK ===
+
         // Dequantize layer (borrows for ModelWeights, allocates for QuantizedModelWeights)
         let _t_dq = std::time::Instant::now();
         let lw_cow = model.layer(l);

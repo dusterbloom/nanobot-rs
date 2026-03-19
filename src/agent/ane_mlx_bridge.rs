@@ -926,6 +926,33 @@ impl AneTrainerSession {
             }
         }
 
+        // Prime fused full-layer forward kernels (MHA layers — 1 dispatch per layer)
+        let has_fused = self.prepacked_weights.first().map_or(false, |(_, pp)| pp.has_fused_layer_fwd());
+        if !has_fused {
+            if let Some((bucket_seq, pp)) = self.prepacked_weights.first_mut() {
+                let mut layer_cfg = self.model.cfg().clone();
+                layer_cfg.seq_len = *bucket_seq;
+                // Need rope + mask blobs — get from bucket kernels
+                if let Some((_, fwd_k, _)) = self.bucket_kernels.buckets.first() {
+                    match pp.prime_fused_layer_fwd(
+                        &layer_cfg,
+                        &self.model,
+                        &fwd_k.rope_cos_blob,
+                        &fwd_k.rope_sin_blob,
+                        &fwd_k.mask_blob,
+                        true, // training mode — packed activations
+                    ) {
+                        Ok(()) => {
+                            tracing::info!("ANE train: fused layer fwd primed (1 dispatch per MHA layer)");
+                        }
+                        Err(e) => {
+                            tracing::warn!("ANE train: fused layer fwd failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         let total_heap_bytes: usize = self
             .prepacked_weights
             .iter()
@@ -4263,8 +4290,11 @@ mod tests {
                 Err(e) => eprintln!("35B bench: MHA fwd attn FAILED: {e}"),
             }
         }
-        // RMSNorm fwd/bwd: 0.25ms per kernel — not worth compile slots
-        // They fall back to CPU (2ms total for 40 layers, negligible)
+        // Fused full-layer forward (MHA layers — 1 dispatch per layer, training mode)
+        match pp.prime_fused_layer_fwd(&pp_cfg, &model, &bucket_fwd_k.rope_cos_blob, &bucket_fwd_k.rope_sin_blob, &bucket_fwd_k.mask_blob, true) {
+            Ok(()) => eprintln!("35B bench: fused layer fwd primed OK"),
+            Err(e) => eprintln!("35B bench: fused layer fwd FAILED: {e}"),
+        }
 
         eprintln!("35B bench: compile={compile_ms}ms, load={load_ms}ms, seq={bucket_seq}, layers={n_layers}, dim={dim}, hidden={hidden}");
         eprintln!("35B bench: prepacked={:.1}MB", pp.memory_bytes() as f64 / 1_048_576.0);

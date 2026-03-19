@@ -1785,32 +1785,66 @@ pub fn gen_fused_layer_fwd(cfg: &MilConfig) -> FusedLayerMil {
     // === Residual 2 ===
     let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xout = add(x=x2,y=ffn_out)[name=string(\"xout\")];");
 
-    // Cast back to fp32
-    let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=xout)[name=string(\"cout\")];");
-    let _ = writeln!(m, "    }} -> (y);");
-    m.push_str("}\n");
+    if cfg.has_lm_head {
+        // Training mode: pack output + all activations needed by backward
+        // Layout: xout[dim] | xnorm[dim] | qf[dim] | kf[dim] | vf[dim] | x2[dim] | h1[hidden] | h3[hidden]
+        let act_ch = 7 * dim + 2 * hidden;
+        let _ = writeln!(m, "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];");
+        let _ = writeln!(m, "        tensor<fp16, [1,{act_ch},1,{seq}]> packed = concat(values=(xout,xnorm,qf,kf,vf,x2,h1,h3),axis=cax,interleave=bF)[name=string(\"packed\")];");
+        let _ = writeln!(m, "        tensor<fp32, [1,{act_ch},1,{seq}]> y = cast(dtype=to32,x=packed)[name=string(\"cout\")];");
+        let _ = writeln!(m, "    }} -> (y);");
+        m.push_str("}\n");
 
-    let input_bytes = dim * seq * 4; // fp32
-    let output_bytes = dim * seq * 4; // fp32
+        let input_bytes = dim * seq * 4;
+        let output_bytes = act_ch * seq * 4;
 
-    FusedLayerMil {
-        mil_text: m,
-        weight_names: vec![
-            "@model_path/weights/rms_att.bin",
-            "@model_path/weights/rms_ffn.bin",
-            "@model_path/weights/wq.bin",
-            "@model_path/weights/wk.bin",
-            "@model_path/weights/wv.bin",
-            "@model_path/weights/wo.bin",
-            "@model_path/weights/w1.bin",
-            "@model_path/weights/w3.bin",
-            "@model_path/weights/w2.bin",
-            "@model_path/weights/rope_cos.bin",
-            "@model_path/weights/rope_sin.bin",
-            "@model_path/weights/mask.bin",
-        ],
-        input_bytes,
-        output_bytes,
+        FusedLayerMil {
+            mil_text: m,
+            weight_names: vec![
+                "@model_path/weights/rms_att.bin",
+                "@model_path/weights/rms_ffn.bin",
+                "@model_path/weights/wq.bin",
+                "@model_path/weights/wk.bin",
+                "@model_path/weights/wv.bin",
+                "@model_path/weights/wo.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+                "@model_path/weights/rope_cos.bin",
+                "@model_path/weights/rope_sin.bin",
+                "@model_path/weights/mask.bin",
+            ],
+            input_bytes,
+            output_bytes,
+        }
+    } else {
+        // Inference mode: just output the hidden state
+        let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=to32,x=xout)[name=string(\"cout\")];");
+        let _ = writeln!(m, "    }} -> (y);");
+        m.push_str("}\n");
+
+        let input_bytes = dim * seq * 4;
+        let output_bytes = dim * seq * 4;
+
+        FusedLayerMil {
+            mil_text: m,
+            weight_names: vec![
+                "@model_path/weights/rms_att.bin",
+                "@model_path/weights/rms_ffn.bin",
+                "@model_path/weights/wq.bin",
+                "@model_path/weights/wk.bin",
+                "@model_path/weights/wv.bin",
+                "@model_path/weights/wo.bin",
+                "@model_path/weights/w1.bin",
+                "@model_path/weights/w3.bin",
+                "@model_path/weights/w2.bin",
+                "@model_path/weights/rope_cos.bin",
+                "@model_path/weights/rope_sin.bin",
+                "@model_path/weights/mask.bin",
+            ],
+            input_bytes,
+            output_bytes,
+        }
     }
 }
 
@@ -4943,6 +4977,246 @@ mod tests {
             let flops = 2.0 * c_in as f64 * c_out as f64 * seq as f64;
             let tflops = flops / us / 1e6;
             eprintln!("  conv  [{c_in:>4}x{c_out:>4}x{seq:>3}]: {us:>7.1}us  {tflops:.2} TFLOPS");
+        }
+    }
+
+    /// Chain N conv1x1 ops to probe ANE graph depth limits.
+    /// Does the compiler allow deeper conv chains than matmul chains?
+    #[test]
+    fn test_conv_chain_depth_limit() {
+        use crate::agent::ane_weights::build_fp16_blob;
+        init_ane();
+
+        let dim = 512; // balance: D×D weight = 0.5MB per layer, 16 layers = 8MB < 32MB SRAM
+        let seq = 128;
+
+        for n_layers in [16, 17, 18, 19] {
+            // Generate MIL: chain of N conv1x1 ops, D→D (same shape throughout)
+            let mut m = String::with_capacity(4096);
+            m.push_str(MIL_HDR);
+            let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+
+            // Constants (shared across all conv ops)
+            let _ = writeln!(m, "        string dt16 = const()[name=string(\"dt16\"), val=string(\"fp16\")];");
+            let _ = writeln!(m, "        string dt32 = const()[name=string(\"dt32\"), val=string(\"fp32\")];");
+            let _ = writeln!(m, "        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];");
+            let _ = writeln!(m, "        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];");
+            let _ = writeln!(m, "        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];");
+            let _ = writeln!(m, "        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];");
+            let _ = writeln!(m, "        int32 gr = const()[name=string(\"gr\"), val=int32(1)];");
+
+            // Cast input
+            let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> x0 = cast(dtype=dt16,x=x)[name=string(\"x0\")];");
+
+            // N weight BLOBFILEs + conv ops
+            let mut weight_names = Vec::new();
+            for i in 0..n_layers {
+                let wname = format!("@model_path/weights/w{i}.bin");
+                let _ = writeln!(m, "        tensor<fp16, [{dim},{dim},1,1]> w{i} = const()[name=string(\"w{i}\"), val=tensor<fp16, [{dim},{dim},1,1]>(BLOBFILE(path=string(\"{wname}\"), offset=uint64(64)))];");
+                let prev = if i == 0 { "x0".to_string() } else { format!("c{}", i - 1) };
+                let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> c{i} = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=w{i},x={prev})[name=string(\"c{i}\")];");
+                weight_names.push(wname);
+            }
+
+            // Cast output
+            let last = format!("c{}", n_layers - 1);
+            let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=dt32,x={last})[name=string(\"y\")];");
+            let _ = writeln!(m, "    }} -> (y);");
+            m.push_str("}\n");
+
+            // Build weight blobs
+            let w_blob = build_fp16_blob(
+                &(0..dim * dim).map(|i| ((i + 1) as f32 * 0.001).sin() * 0.01).collect::<Vec<_>>()
+            );
+            let name_strs: Vec<&str> = weight_names.iter().map(|s| s.as_str()).collect();
+            let blobs: Vec<&[u8]> = (0..n_layers).map(|_| w_blob.as_slice()).collect();
+
+            let in_bytes = dim * seq * 4;
+            let out_bytes = dim * seq * 4;
+
+            let result = AneKernel::compile_multi_weights(
+                &m, &name_strs, &blobs, &[in_bytes], &[out_bytes],
+            );
+
+            match result {
+                Ok(kernel) => {
+                    // Compiled! Benchmark it
+                    let input = vec![0.01f32; dim * seq];
+                    let ib = f32_to_bytes(&input);
+                    for _ in 0..3 { kernel.write_input(0, &ib); kernel.eval().unwrap(); }
+                    let n = 50;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..n { kernel.write_input(0, &ib); kernel.eval().unwrap(); }
+                    let us = t0.elapsed().as_micros() as f64 / n as f64;
+                    let flops = 2.0 * dim as f64 * dim as f64 * seq as f64 * n_layers as f64;
+                    let tflops = flops / us / 1e6;
+                    eprintln!(
+                        "  conv chain {n_layers:>2}: COMPILED  {us:>7.1}us  {tflops:.2} TFLOPS  ({n_layers} conv1x1 × {dim}x{dim})"
+                    );
+                }
+                Err(_) => {
+                    eprintln!("  conv chain {n_layers:>2}: REJECTED");
+                }
+            }
+        }
+
+        // Same test with matmul chains for comparison
+        eprintln!("\n  --- matmul chain comparison ---");
+        for n_layers in [16, 17, 18, 19] {
+            let mut m = String::with_capacity(4096);
+            m.push_str(MIL_HDR);
+            let _ = writeln!(m, "    func main<ios18>(tensor<fp32, [1, {dim}, 1, {seq}]> x) {{");
+            let _ = writeln!(m, "        string dt16 = const()[name=string(\"dt16\"), val=string(\"fp16\")];");
+            let _ = writeln!(m, "        string dt32 = const()[name=string(\"dt32\"), val=string(\"fp32\")];");
+            let _ = writeln!(m, "        bool bF = const()[name=string(\"bF\"), val=bool(false)];");
+            let _ = writeln!(m, "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];");
+
+            // Cast + reshape input to [1,1,seq,dim] for matmul pattern
+            let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> xh = cast(dtype=dt16,x=x)[name=string(\"xh\")];");
+            let _ = writeln!(m, "        tensor<fp16, [1,{dim},{seq},1]> xt = transpose(perm=pm,x=xh)[name=string(\"xt\")];");
+            let _ = writeln!(m, "        tensor<int32, [4]> rd = const()[name=string(\"rd\"), val=tensor<int32, [4]>([1,1,{dim},{seq}])];");
+            let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> xm = reshape(shape=rd,x=xt)[name=string(\"xm\")];");
+            let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> x0 = transpose(perm=pm,x=xm)[name=string(\"x0\")];");
+
+            let mut weight_names = Vec::new();
+            for i in 0..n_layers {
+                let wname = format!("@model_path/weights/w{i}.bin");
+                let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{dim}]> w{i} = const()[name=string(\"w{i}\"), val=tensor<fp16, [1,1,{dim},{dim}]>(BLOBFILE(path=string(\"{wname}\"), offset=uint64(64)))];");
+                let prev = if i == 0 { "x0".to_string() } else { format!("m{}", i - 1) };
+                let _ = writeln!(m, "        tensor<fp16, [1,1,{seq},{dim}]> m{i} = matmul(transpose_x=bF,transpose_y=bF,x={prev},y=w{i})[name=string(\"m{i}\")];");
+                weight_names.push(wname);
+            }
+
+            // Reshape back + cast
+            let last = format!("m{}", n_layers - 1);
+            let _ = writeln!(m, "        tensor<fp16, [1,1,{dim},{seq}]> yt = transpose(perm=pm,x={last})[name=string(\"yt\")];");
+            let _ = writeln!(m, "        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,{dim},1,{seq}])];");
+            let _ = writeln!(m, "        tensor<fp16, [1,{dim},1,{seq}]> yr = reshape(shape=ro,x=yt)[name=string(\"yr\")];");
+            let _ = writeln!(m, "        tensor<fp32, [1,{dim},1,{seq}]> y = cast(dtype=dt32,x=yr)[name=string(\"y\")];");
+            let _ = writeln!(m, "    }} -> (y);");
+            m.push_str("}\n");
+
+            let w_blob = build_fp16_blob(
+                &(0..dim * dim).map(|i| ((i + 1) as f32 * 0.001).sin() * 0.01).collect::<Vec<_>>()
+            );
+            let name_strs: Vec<&str> = weight_names.iter().map(|s| s.as_str()).collect();
+            let blobs: Vec<&[u8]> = (0..n_layers).map(|_| w_blob.as_slice()).collect();
+
+            let result = AneKernel::compile_multi_weights(
+                &m, &name_strs, &blobs, &[dim * seq * 4], &[dim * seq * 4],
+            );
+
+            match result {
+                Ok(kernel) => {
+                    let input = vec![0.01f32; dim * seq];
+                    let ib = f32_to_bytes(&input);
+                    for _ in 0..3 { kernel.write_input(0, &ib); kernel.eval().unwrap(); }
+                    let n = 50;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..n { kernel.write_input(0, &ib); kernel.eval().unwrap(); }
+                    let us = t0.elapsed().as_micros() as f64 / n as f64;
+                    let flops = 2.0 * dim as f64 * dim as f64 * seq as f64 * n_layers as f64;
+                    let tflops = flops / us / 1e6;
+                    eprintln!(
+                        "  matmul chain {n_layers:>2}: COMPILED  {us:>7.1}us  {tflops:.2} TFLOPS"
+                    );
+                }
+                Err(_) => {
+                    eprintln!("  matmul chain {n_layers:>2}: REJECTED");
+                }
+            }
+        }
+    }
+
+    /// Test gen_fused_layer_fwd at production dims — both inference and training modes.
+    /// Training mode packs activations into output (7*dim + 2*hidden channels).
+    #[test]
+    fn test_fused_layer_dim_scaling() {
+        use crate::agent::ane_weights::{build_fp16_blob, generate_rope_blobs, transpose_weight};
+
+        init_ane();
+
+        let seq = 128;
+        for (dim, hidden, n_heads, train) in [
+            (512, 1024, 8, false),   // inference
+            (512, 1024, 8, true),    // training (packed acts output)
+            (1024, 2048, 8, false),
+            (1024, 2048, 8, true),
+            (2048, 512, 16, false),  // 35B dims inference
+            (2048, 512, 16, true),   // 35B dims training
+        ] {
+            let mut cfg = MilConfig::mha(dim, hidden, n_heads, seq);
+            cfg.has_lm_head = train; // has_lm_head triggers training mode output
+            let hd = dim / n_heads;
+            let result = gen_fused_layer_fwd(&cfg);
+
+            // Build weight blobs
+            let mk = |n: usize, s: usize| -> Vec<u8> {
+                build_fp16_blob(&(0..n).map(|i| ((i+s) as f32 * 0.001).sin() * 0.01).collect::<Vec<_>>())
+            };
+            let (cos_blob, sin_blob) = generate_rope_blobs(seq, hd, 10000.0);
+            let mask_blob = crate::agent::ane_mil::build_causal_mask_blob(seq);
+
+            let wq = mk(dim * dim, 1);
+            let wk = mk(dim * dim, 2);
+            let wv = mk(dim * dim, 3);
+            let wo = mk(dim * dim, 4);
+            let w1 = mk(dim * hidden, 5);
+            let w3 = mk(dim * hidden, 6);
+            let w2 = mk(hidden * dim, 7);
+            let rms_att = mk(dim, 8);
+            let rms_ffn = mk(dim, 9);
+
+            let names: Vec<&str> = result.weight_names.iter().copied().collect();
+            let mut datas: Vec<&[u8]> = Vec::new();
+            for name in &names {
+                match *name {
+                    "@model_path/weights/wq.bin" => datas.push(&wq),
+                    "@model_path/weights/wk.bin" => datas.push(&wk),
+                    "@model_path/weights/wv.bin" => datas.push(&wv),
+                    "@model_path/weights/wo.bin" => datas.push(&wo),
+                    "@model_path/weights/w1.bin" => datas.push(&w1),
+                    "@model_path/weights/w3.bin" => datas.push(&w3),
+                    "@model_path/weights/w2.bin" => datas.push(&w2),
+                    "@model_path/weights/rms_att.bin" => datas.push(&rms_att),
+                    "@model_path/weights/rms_ffn.bin" => datas.push(&rms_ffn),
+                    "@model_path/weights/rope_cos.bin" => datas.push(&cos_blob),
+                    "@model_path/weights/rope_sin.bin" => datas.push(&sin_blob),
+                    "@model_path/weights/mask.bin" => datas.push(&mask_blob),
+                    _ => datas.push(&wq),
+                }
+            }
+
+            let r = AneKernel::compile_multi_weights(
+                &result.mil_text, &names, &datas,
+                &[result.input_bytes], &[result.output_bytes],
+            );
+            match r {
+                Ok(k) => {
+                    let input = vec![0.01f32; result.input_bytes / 4];
+                    let ib = f32_to_bytes(&input);
+                    for _ in 0..3 { k.write_input(0, &ib); k.eval().unwrap(); }
+                    let n = 50;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..n { k.write_input(0, &ib); k.eval().unwrap(); }
+                    let us = t0.elapsed().as_micros() as f64 / n as f64;
+                    // FLOPs: 4 matmuls (QKV+O) × 2×dim²×seq + 3 FFN matmuls × 2×dim×hidden×seq + SDPA
+                    let proj_flops = 4.0 * 2.0 * (dim*dim) as f64 * seq as f64;
+                    let ffn_flops = 3.0 * 2.0 * (dim*hidden) as f64 * seq as f64;
+                    let total_flops = proj_flops + ffn_flops;
+                    let tflops = total_flops / us / 1e6;
+                    let weight_mb = names.iter().zip(datas.iter()).map(|(_, d)| d.len()).sum::<usize>() as f64 / 1e6;
+                    let mode = if train { "TRAIN" } else { "INFER" };
+                    eprintln!(
+                        "  fused_layer [{dim:>4}×{hidden:>4}×{seq}] {mode}: COMPILED  {us:>7.1}µs  {tflops:.2} TFLOPS  ({weight_mb:.1}MB)",
+                    );
+                }
+                Err(_) => {
+                    let weight_mb = datas.iter().map(|d| d.len()).sum::<usize>() as f64 / 1e6;
+                    let mode = if train { "TRAIN" } else { "INFER" };
+                    eprintln!("  fused_layer [{dim:>4}×{hidden:>4}×{seq}] {mode}: REJECTED  ({weight_mb:.1}MB)");
+                }
+            }
         }
     }
 
