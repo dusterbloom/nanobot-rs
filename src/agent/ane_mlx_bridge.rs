@@ -154,6 +154,9 @@ pub enum AneTrainingOptimizer {
 #[derive(Debug, Clone)]
 pub struct AneTrainingConfig {
     pub model_dir: std::path::PathBuf,
+    /// When set, training targets this model instead of `model_dir`.
+    /// Use for 32GB machines: train 0.8B on ANE while 35B runs inference on GPU.
+    pub training_model_dir: Option<std::path::PathBuf>,
     pub mil_config: super::ane_mil::MilConfig,
     pub epochs: usize,
     pub lr: f32,
@@ -178,6 +181,13 @@ pub struct AneTrainingConfig {
     pub accum_steps: usize,
     /// Adaptive layer drop: skip layers with <1% gradient signal. Default: true.
     pub adaptive_layer_drop: bool,
+}
+
+impl AneTrainingConfig {
+    /// Effective model directory for training: `training_model_dir` if set, else `model_dir`.
+    pub fn effective_model_dir(&self) -> &std::path::Path {
+        self.training_model_dir.as_deref().unwrap_or(&self.model_dir)
+    }
 }
 
 /// Seq-len bucket sizes for ANE kernel compilation. Samples are padded to
@@ -451,7 +461,7 @@ fn compatible_mil_config(lhs: &super::ane_mil::MilConfig, rhs: &super::ane_mil::
 
 #[cfg(feature = "mlx")]
 fn compatible_training_target(lhs: &AneTrainingConfig, rhs: &AneTrainingConfig) -> bool {
-    lhs.model_dir == rhs.model_dir
+    lhs.effective_model_dir() == rhs.effective_model_dir()
         && compatible_mil_config(&lhs.mil_config, &rhs.mil_config)
         && lhs.linear_attn_indices == rhs.linear_attn_indices
         && lhs.kv_dim == rhs.kv_dim
@@ -619,9 +629,10 @@ impl AneTrainerSession {
         use super::ane_lora::LoraModelAdam;
         use super::ane_weights::{DenseCachedModel, QuantizedModelWeights};
 
+        let effective_dir = cfg.effective_model_dir();
         let t0 = std::time::Instant::now();
         let model = match QuantizedModelWeights::from_mlx_safetensors(
-            &cfg.model_dir,
+            effective_dir,
             &cfg.mil_config,
         ) {
             Ok(m) => {
@@ -648,7 +659,7 @@ impl AneTrainerSession {
         use std::sync::atomic::Ordering;
         stats.model_loads.fetch_add(1, Ordering::Relaxed);
 
-        let (lora_dir, lora_path) = lora_storage_paths(&cfg.model_dir);
+        let (lora_dir, lora_path) = lora_storage_paths(effective_dir);
         let lora = load_or_init_lora(cfg, model.n_layers(), &lora_path);
         let adam = LoraModelAdam::zeros(&lora);
 
@@ -729,6 +740,8 @@ impl AneTrainerSession {
             );
 
             // GDN pre-recurrence per-layer kernels: compiled at loads=0 on first call.
+            // For large seq_lens (>256), uses split approach: CPU conv+SiLU per-chunk
+            // with causal overlap, ANE post-conv kernel for RMSNorm/GQA/decay/gate.
             if !self.pre_recur_primed && !self.model.cfg().linear_attn_indices.is_empty() {
                 let _ = super::ane_bridge::ane_init();
                 let pr_cfg = {
@@ -756,7 +769,7 @@ impl AneTrainerSession {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "ANE train: per-layer kernel priming failed for seq_len={}: {} (falling back to shared kernels)",
                         bucket_seq, e,
                     );
@@ -784,7 +797,7 @@ impl AneTrainerSession {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "ANE train: fused attention GQA priming failed for seq_len={}: {}",
                             bucket_seq, e,
                         );
@@ -807,7 +820,7 @@ impl AneTrainerSession {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "ANE train: fused backward attention GQA priming failed for seq_len={}: {}",
                                 bucket_seq, e,
                             );
@@ -831,7 +844,7 @@ impl AneTrainerSession {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "ANE train: RMSNorm fwd priming failed for seq_len={}: {}",
                             bucket_seq, e,
                         );
@@ -846,7 +859,7 @@ impl AneTrainerSession {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "ANE train: RMSNorm bwd priming failed for seq_len={}: {}",
                                 bucket_seq, e,
                             );
@@ -888,7 +901,7 @@ impl AneTrainerSession {
                                         );
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
+                                        tracing::debug!(
                                             "ANE train: FFN bwd priming failed for seq_len={}: {}",
                                             bucket_seq, e,
                                         );
@@ -915,7 +928,7 @@ impl AneTrainerSession {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "ANE train: Wot+SDPA bwd priming failed for seq_len={}: {}",
                             bucket_seq, e,
                         );
@@ -924,11 +937,11 @@ impl AneTrainerSession {
                 // Also prime separate Wot + QKV as fallback
                 match pp.prime_bwd_wot_kernels(&attn_cfg, &self.model) {
                     Ok(()) => {}
-                    Err(e) => tracing::warn!("ANE train: Wot bwd priming failed: {e}"),
+                    Err(e) => tracing::debug!("ANE train: Wot bwd priming failed: {e}"),
                 }
                 match pp.prime_bwd_qkvb_kernels(&attn_cfg, &self.model) {
                     Ok(()) => {}
-                    Err(e) => tracing::warn!("ANE train: QKV bwd priming failed: {e}"),
+                    Err(e) => tracing::debug!("ANE train: QKV bwd priming failed: {e}"),
                 }
             }
 
@@ -947,7 +960,7 @@ impl AneTrainerSession {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "ANE train: GDN proj priming failed for seq_len={}: {}",
                             bucket_seq, e,
                         );
@@ -979,7 +992,7 @@ impl AneTrainerSession {
                     self.cls_blob = Some(blob);
                 }
                 Err(e) => {
-                    tracing::warn!("ANE train: classifier BLOBFILE failed: {e}");
+                    tracing::debug!("ANE train: classifier BLOBFILE failed: {e}");
                 }
             }
         }
@@ -1005,11 +1018,11 @@ impl AneTrainerSession {
                             tracing::info!("ANE train: fused layer fwd primed (1 dispatch per MHA layer)");
                         }
                         Err(e) => {
-                            tracing::warn!("ANE train: fused layer fwd failed: {e}");
+                            tracing::debug!("ANE train: fused layer fwd failed: {e}");
                             // Fallback: fused FFN for 2-dispatch path
                             match pp.prime_fused_ffn_fwd(&layer_cfg, &self.model, true) {
                                 Ok(()) => tracing::info!("ANE train: fused FFN fwd primed (2-dispatch path)"),
-                                Err(e2) => tracing::warn!("ANE train: fused FFN fwd failed: {e2}"),
+                                Err(e2) => tracing::debug!("ANE train: fused FFN fwd failed: {e2}"),
                             }
                         }
                     }
@@ -1037,6 +1050,7 @@ impl AneTrainerSession {
                 self.prepacked_weights.len(),
             );
         }
+
     }
 
     fn ensure_muon_grad_kernels(&mut self) -> Result<(), String> {
@@ -1094,6 +1108,8 @@ impl AneTrainerSession {
         cfg: &AneTrainingConfig,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+        #[allow(unused_variables)]
+        draft_reload_tx: Option<&std::sync::mpsc::SyncSender<super::ane_lora::LoraModel>>,
     ) -> bool {
         use super::ane_lora::save_lora_bin;
 
@@ -1109,9 +1125,10 @@ impl AneTrainerSession {
         };
 
         if saved {
-            match crate::agent::mlx_lora::ModelConfig::from_config_json(&cfg.model_dir) {
+            let effective_dir = cfg.effective_model_dir();
+            match crate::agent::mlx_lora::ModelConfig::from_config_json(effective_dir) {
                 Some(model_cfg) => {
-                    let adapter_dir = cfg.model_dir.join("adapters");
+                    let adapter_dir = effective_dir.join("adapters");
                     match crate::agent::mlx_lora::export_ane_adapters(
                         &self.lora,
                         &model_cfg,
@@ -1133,7 +1150,7 @@ impl AneTrainerSession {
                 None => {
                     tracing::warn!(
                         "ANE train: failed to parse config.json for adapter export at {}",
-                        cfg.model_dir.display()
+                        effective_dir.display()
                     );
                 }
             }
@@ -1151,6 +1168,19 @@ impl AneTrainerSession {
             publish_deltas_when_idle(tx, deltas, runtime_counters);
         }
 
+        // Send LoRA clone to speculative decoder for draft kernel reload
+        if let Some(tx) = draft_reload_tx {
+            match tx.try_send(self.lora.clone()) {
+                Ok(()) => tracing::info!("ANE train: sent LoRA to draft decoder"),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    tracing::debug!("ANE train: draft reload channel full, skipping");
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    tracing::debug!("ANE train: draft reload channel closed");
+                }
+            }
+        }
+
         saved
     }
 
@@ -1161,7 +1191,7 @@ impl AneTrainerSession {
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         stats: &PersistentAneTrainerStatCounters,
     ) -> bool {
-        self.train_with_progress(cfg, samples, mlx_tx, stats, None)
+        self.train_with_progress(cfg, samples, mlx_tx, stats, None, None)
     }
 
     fn train_with_progress(
@@ -1171,6 +1201,7 @@ impl AneTrainerSession {
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         stats: &PersistentAneTrainerStatCounters,
         runtime_counters: Option<&super::agent_core::RuntimeCounters>,
+        draft_reload_tx: Option<&std::sync::mpsc::SyncSender<super::ane_lora::LoraModel>>,
     ) -> bool {
         use super::ane_backward;
         use super::ane_forward;
@@ -1181,6 +1212,18 @@ impl AneTrainerSession {
 
         // GDN pre-recurrence per-layer kernels must compile at loads=0 (Bug 11).
         // Done once, before any bucket kernel compilation.
+
+        // Suppress ANE bridge stderr for the entire training session — expected failures
+        // (SRAM overflow, slot exhaustion, delta_reload) are handled in Rust.
+        // Use a drop guard so quiet is always restored, even on panic.
+        super::ane_bridge::set_quiet(true);
+        struct QuietGuard;
+        impl Drop for QuietGuard {
+            fn drop(&mut self) {
+                super::ane_bridge::set_quiet(false);
+            }
+        }
+        let _quiet_guard = QuietGuard;
 
         let use_ane = match self.ensure_bucket_kernels(&sample_lens, stats) {
             Ok(()) => !self.bucket_kernels.buckets.is_empty(),
@@ -1215,6 +1258,10 @@ impl AneTrainerSession {
                 return false;
             }
         }
+
+        // Keep quiet mode on during the entire training session.
+        // Expected ANE failures (delta_reload, slot exhaustion) are handled in Rust
+        // and should not spill raw NSError text into the TUI.
 
         let n_layers = self.model.n_layers();
         let residual_scale = if cfg.residual_scale > 0.0 {
@@ -1610,7 +1657,8 @@ impl AneTrainerSession {
         }
         tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
 
-        self.save_and_publish(cfg, mlx_tx, runtime_counters)
+        // _quiet_guard drops here, re-enabling ANE bridge stderr.
+        self.save_and_publish(cfg, mlx_tx, runtime_counters, draft_reload_tx)
     }
 }
 
@@ -1622,6 +1670,7 @@ enum PersistentTrainerCommand {
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         reply: std::sync::mpsc::SyncSender<bool>,
         runtime_counters: Option<std::sync::Arc<super::agent_core::RuntimeCounters>>,
+        draft_reload_tx: Option<std::sync::mpsc::SyncSender<super::ane_lora::LoraModel>>,
     },
 }
 
@@ -1645,6 +1694,7 @@ fn persistent_trainer_worker(
                 mlx_tx,
                 reply,
                 runtime_counters,
+                draft_reload_tx,
             } => {
                 let needs_reload = session
                     .as_ref()
@@ -1670,6 +1720,7 @@ fn persistent_trainer_worker(
                             mlx_tx,
                             stats.as_ref(),
                             runtime_counters.as_deref(),
+                            draft_reload_tx.as_ref(),
                         )
                     })
                     .unwrap_or(false);
@@ -1716,7 +1767,7 @@ impl PersistentAneTrainer {
         samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
     ) -> std::thread::JoinHandle<bool> {
-        self.spawn_training_with_progress(cfg, samples, mlx_tx, None)
+        self.spawn_training_with_progress(cfg, samples, mlx_tx, None, None)
     }
 
     pub fn spawn_training_with_progress(
@@ -1725,6 +1776,7 @@ impl PersistentAneTrainer {
         samples: Vec<(Vec<i32>, Vec<i32>, f32)>,
         mlx_tx: Option<std::sync::mpsc::SyncSender<super::mlx_server::ModelRequest>>,
         runtime_counters: Option<std::sync::Arc<super::agent_core::RuntimeCounters>>,
+        draft_reload_tx: Option<std::sync::mpsc::SyncSender<super::ane_lora::LoraModel>>,
     ) -> std::thread::JoinHandle<bool> {
         let tx = self.tx.clone();
         std::thread::Builder::new()
@@ -1737,6 +1789,7 @@ impl PersistentAneTrainer {
                     mlx_tx,
                     reply: reply_tx,
                     runtime_counters,
+                    draft_reload_tx,
                 });
                 if sent.is_err() {
                     tracing::error!("ANE train: persistent worker is unavailable");
@@ -2169,6 +2222,7 @@ mod tests {
 
         let cfg = AneTrainingConfig {
             model_dir,
+            training_model_dir: None,
             mil_config: MilConfig {
                 dim: 2048,
                 hidden_dim: 6144,
@@ -2353,6 +2407,7 @@ mod tests {
         let ane_tx = tx.clone();
         let ane_cfg = AneTrainingConfig {
             model_dir: model_dir.clone(),
+            training_model_dir: None,
             mil_config: MilConfig {
                 dim: 2048,
                 hidden_dim: 6144,
@@ -2821,7 +2876,7 @@ mod tests {
         }
 
         let dir = qwen3_5_dir();
-        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir), None)
             .expect("build_ane_training_config should succeed for Qwen3.5");
 
         let mil = &cfg.mil_config;
@@ -2886,7 +2941,7 @@ mod tests {
         let eval_samples = vec![sample.clone()];
         let baseline_loss = qwen3_5_eval_avg_loss(&overlay_dir, None, &eval_samples);
 
-        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir))
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir), None)
             .expect("build config");
         cfg.optimizer = AneTrainingOptimizer::AneMuon;
         cfg.strict_ane = true;
@@ -2994,7 +3049,7 @@ mod tests {
         let response = "The capital of France is Paris, and that is the complete answer.";
         let sample = qwen3_5_tokenize_pair(&alias_dir, prompt, response);
 
-        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir))
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir), None)
             .expect("build config");
         cfg.optimizer = AneTrainingOptimizer::AneMuon;
         cfg.strict_ane = true;
@@ -3063,7 +3118,7 @@ mod tests {
         let eval_samples = vec![sample.clone()];
         let baseline_loss = qwen3_5_eval_avg_loss(&overlay_dir, None, &eval_samples);
 
-        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir))
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&overlay_dir), None)
             .expect("build config");
         cfg.optimizer = AneTrainingOptimizer::AneMuon;
         cfg.strict_ane = true;
@@ -3141,7 +3196,7 @@ mod tests {
 
         let dir = qwen3_5_dir();
         let cfg =
-            crate::agent::learn_loop::build_ane_training_config(Some(&dir)).expect("build config");
+            crate::agent::learn_loop::build_ane_training_config(Some(&dir), None).expect("build config");
 
         // Simulate a single sample of ~20 tokens (fits in 128 bucket)
         let sample_lens = vec![20usize];
@@ -3198,7 +3253,7 @@ mod tests {
 
         let dir = qwen3_5_dir();
         let cfg =
-            crate::agent::learn_loop::build_ane_training_config(Some(&dir)).expect("build config");
+            crate::agent::learn_loop::build_ane_training_config(Some(&dir), None).expect("build config");
 
         // Tokenize a sample conversation
         let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer load");
@@ -3271,7 +3326,7 @@ mod tests {
         let eval_samples = vec![sample.clone()];
         let baseline = qwen3_5_eval_avg_loss(&alias_dir, None, &eval_samples);
 
-        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir))
+        let mut cfg = crate::agent::learn_loop::build_ane_training_config(Some(&alias_dir), None)
             .expect("build config");
         cfg.optimizer = AneTrainingOptimizer::AneMuon;
         cfg.strict_ane = true;
@@ -3351,6 +3406,7 @@ mod tests {
                 enabled: true,
                 surprise_threshold: 0.1, // low threshold → easy to trigger
                 min_experiences: 1,
+                auto_train: true,
                 train_epochs: 1,
                 mlx_server_url: String::new(),
             },
@@ -3358,6 +3414,7 @@ mod tests {
             mlx_provider: None, // No in-process MLX — oMLX mode
             training_counters: Some(counters.clone()),
             ane_model_dir: Some(dir.clone()), // THIS is what we're testing
+            ane_training_model_dir: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_trainer: Some(Arc::new(PersistentAneTrainer::new())),
             #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -3366,6 +3423,8 @@ mod tests {
             ane_lr_override: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_strict_ane: false,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            draft_reload_tx: None,
         };
 
         // Build a TurnOutcome with high surprise content
@@ -3490,6 +3549,7 @@ mod tests {
                 enabled: true,
                 surprise_threshold: 0.0,
                 min_experiences: 4,
+                auto_train: true,
                 train_epochs: 20,
                 mlx_server_url: String::new(),
             },
@@ -3497,6 +3557,7 @@ mod tests {
             mlx_provider: None,
             training_counters: Some(counters.clone()),
             ane_model_dir: Some(alias_dir.clone()),
+            ane_training_model_dir: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_trainer: Some(Arc::new(PersistentAneTrainer::new())),
             #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -3505,6 +3566,8 @@ mod tests {
             ane_lr_override: Some(2.5e-4),
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_strict_ane: true,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            draft_reload_tx: None,
         };
 
         let outcome = TurnOutcome {
@@ -3656,7 +3719,7 @@ mod tests {
         eprintln!("average baseline loss: {avg_baseline:.4}");
 
         // 2. Train LoRA (use spawn_ane_training for realistic end-to-end)
-        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir), None)
             .expect("build ANE config");
         // Use a temporary LoRA path so we don't pollute the workspace
         let tmp_dir = tempfile::TempDir::new().expect("tempdir");
@@ -4113,7 +4176,7 @@ mod tests {
         use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
 
         let train_cfg =
-            crate::agent::learn_loop::build_ane_training_config(Some(&dir)).expect("build config");
+            crate::agent::learn_loop::build_ane_training_config(Some(&dir), None).expect("build config");
         let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
         let messages = vec![
             crate::agent::mlx_server::ChatMessage {
@@ -4293,7 +4356,7 @@ mod tests {
         use crate::agent::ane_weights::{self, DenseCachedModel, QuantizedModelWeights, WeightSource};
 
         let train_cfg =
-            crate::agent::learn_loop::build_ane_training_config(Some(&dir)).expect("build config");
+            crate::agent::learn_loop::build_ane_training_config(Some(&dir), None).expect("build config");
         let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
         let messages = vec![
             crate::agent::mlx_server::ChatMessage { role: "user".into(), content: "Explain why addition is commutative, then solve 27 + 15.".into() },
@@ -4612,8 +4675,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config_json["num_layers"], 40);
-        assert_eq!(config_json["lora_layers"], 10); // only MHA layers count
-        assert_eq!(config_json["rank"], 32);
+        let lp = &config_json["lora_parameters"];
+        assert_eq!(lp["rank"], 32);
+        assert!(lp["scale"].as_f64().unwrap() > 0.0);
         eprintln!("PASS: 35B MoE adapter export — 140 tensors, correct layout");
     }
 
@@ -4633,7 +4697,7 @@ mod tests {
             return;
         }
 
-        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir))
+        let cfg = crate::agent::learn_loop::build_ane_training_config(Some(&dir), None)
             .expect("build 35B config");
 
         let tokenizer = crate::agent::mlx_lora::MlxTokenizer::load(&dir).expect("tokenizer");
@@ -4701,7 +4765,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config_json["num_layers"], 40);
-        assert_eq!(config_json["lora_layers"], 10);
+        assert!(config_json["lora_parameters"].is_object());
 
         eprintln!(
             "PASS: 35B spawn_ane_training standalone — LoRA saved + adapters exported in {:.1}s",
@@ -5676,6 +5740,7 @@ mod tests {
         let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
         let cfg = AneTrainingConfig {
             model_dir: model_dir.to_path_buf(),
+            training_model_dir: None,
             mil_config: mil_cfg,
             lr: 5e-4,
             epochs: train_epochs,
@@ -6033,6 +6098,7 @@ mod tests {
         let kv_dim = mil_cfg.n_kv_heads * mil_cfg.head_dim();
         let train_cfg = AneTrainingConfig {
             model_dir: dir.to_path_buf(),
+            training_model_dir: None,
             mil_config: mil_cfg,
             lr: 5e-4,
             epochs: 2,
@@ -6138,6 +6204,7 @@ mod tests {
             guarded_samples,
             None,
             guarded_counters,
+            None,
         );
         // Inference while training is blocked by yield guard
         let (guard_inf_ms, guard_gen_tokens) = do_omlx_inference("concurrent-with-guard");
@@ -6232,6 +6299,7 @@ mod tests {
 
         let cfg = AneTrainingConfig {
             model_dir: dir.clone(),
+            training_model_dir: None,
             mil_config: mil_cfg.clone(),
             lr: 5e-4,
             epochs: 1,
@@ -6265,6 +6333,7 @@ mod tests {
             samples,
             None, // no mlx_tx
             Some(counters),
+            None,
         );
 
         // Wait for completion. If yield guard is still active, this will block

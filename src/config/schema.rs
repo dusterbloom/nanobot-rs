@@ -304,6 +304,20 @@ pub struct AgentDefaults {
     /// Default: ~/.cache/lm-studio/models/mlx-community/Qwen3.5-2B-MLX-8bit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mlx_model_dir: Option<String>,
+    /// Path to a smaller draft model for speculative decoding (e.g. 0.8B Qwen3.5).
+    /// When set, mlx_lm.server uses `--draft-model` for GPU-based spec decode.
+    /// Expected speedup: 2-3x on 35B models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model: Option<String>,
+    /// Number of draft tokens per speculative decoding step (default: 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_draft_tokens: Option<u32>,
+    /// Path to model used for ANE training (e.g. 0.8B for 32GB machines).
+    /// When set, ANE training targets this model instead of the inference model.
+    /// LoRA is applied to the draft model (if draft_model matches) or saved separately.
+    /// Default: same as inference model (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_model: Option<String>,
     /// MLX model config preset: "qwen3-1.7b" or "qwen3.5-2b". Default: "qwen3.5-2b".
     #[serde(default = "default_mlx_preset")]
     pub mlx_preset: String,
@@ -474,6 +488,9 @@ impl Default for AgentDefaults {
             inference_engine: default_inference_engine(),
             local_backend: default_local_backend(),
             mlx_model_dir: None,
+            draft_model: None,
+            num_draft_tokens: None,
+            training_model: None,
             mlx_preset: default_mlx_preset(),
             mlx_lm_url: None,
             instructions_path: None,
@@ -487,6 +504,23 @@ impl Default for AgentDefaults {
             adaptive_tool_heavy_max_tokens: default_adaptive_tool_heavy_max_tokens(),
             adaptive_tool_heavy_min_tokens: default_adaptive_tool_heavy_min_tokens(),
         }
+    }
+}
+
+impl AgentDefaults {
+    /// Validate speculative decoding + training config consistency.
+    /// Returns a list of human-readable warnings (empty = all good).
+    pub fn validate_speculative_config(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let (Some(draft), Some(train)) = (&self.draft_model, &self.training_model) {
+            if draft != train {
+                warnings.push(format!(
+                    "training_model ({train}) differs from draft_model ({draft}); \
+                     trained LoRA adapters won't apply to the speculative decoding draft model"
+                ));
+            }
+        }
+        warnings
     }
 }
 
@@ -2102,6 +2136,11 @@ pub struct PerplexityGateConfig {
     /// a training run. Default: 5.
     #[serde(default = "default_min_experiences")]
     pub min_experiences: usize,
+    /// Automatically spawn training after accumulating enough surprising
+    /// experiences.  Default: false — training only runs when explicitly
+    /// triggered via `/train` or `--train`.
+    #[serde(default)]
+    pub auto_train: bool,
     /// URL of the MLX LoRA training server (Ex0bit /train endpoint).
     /// Default: "http://127.0.0.1:8766".
     #[serde(default = "default_mlx_server_url")]
@@ -2130,6 +2169,7 @@ impl Default for PerplexityGateConfig {
             enabled: false,
             surprise_threshold: default_surprise_threshold(),
             min_experiences: default_min_experiences(),
+            auto_train: false,
             mlx_server_url: default_mlx_server_url(),
             train_epochs: default_train_epochs(),
         }
@@ -3075,5 +3115,41 @@ mod tests {
             debug_output.contains("[REDACTED"),
             "missing redaction markers"
         );
+    }
+
+    #[test]
+    fn test_speculative_config_warns_when_training_model_differs_from_draft() {
+        let mut defaults = AgentDefaults::default();
+        defaults.draft_model = Some("~/.cache/models/Qwen3.5-0.6B".to_string());
+        defaults.training_model = Some("~/.cache/models/Qwen3-1.7B".to_string());
+        let warnings = defaults.validate_speculative_config();
+        assert!(
+            warnings.iter().any(|w| w.contains("training_model") && w.contains("draft_model")),
+            "expected warning about training_model != draft_model mismatch, got: {:?}",
+            warnings,
+        );
+    }
+
+    #[test]
+    fn test_speculative_config_no_warning_when_same_model() {
+        let mut defaults = AgentDefaults::default();
+        let model = "~/.cache/models/Qwen3.5-0.6B".to_string();
+        defaults.draft_model = Some(model.clone());
+        defaults.training_model = Some(model);
+        let warnings = defaults.validate_speculative_config();
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings when training_model == draft_model, got: {:?}",
+            warnings,
+        );
+    }
+
+    #[test]
+    fn test_speculative_config_no_warning_when_only_one_set() {
+        let mut defaults = AgentDefaults::default();
+        defaults.draft_model = Some("~/.cache/models/Qwen3.5-0.6B".to_string());
+        defaults.training_model = None;
+        let warnings = defaults.validate_speculative_config();
+        assert!(warnings.is_empty());
     }
 }

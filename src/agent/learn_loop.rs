@@ -16,8 +16,8 @@ use crate::agent::budget_calibrator::BudgetCalibrator;
 use crate::agent::lora_bridge::ExperienceBuffer;
 use crate::config::schema::PerplexityGateConfig;
 
-const DEFAULT_LEARN_IDLE_MS: u64 = 30_000;
-const MAX_LEARN_IDLE_MS: u64 = 10 * 60 * 1000;
+const DEFAULT_LEARN_IDLE_MS: u64 = 30 * 60 * 1_000; // 30 minutes
+const MAX_LEARN_IDLE_MS: u64 = 60 * 60 * 1_000; // 1 hour
 
 /// Flat struct capturing all observer-needed data from a completed turn.
 ///
@@ -81,6 +81,9 @@ pub(crate) struct DefaultLearnLoop {
     /// Resolved model directory for standalone ANE training.
     /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
     pub ane_model_dir: Option<std::path::PathBuf>,
+    /// Separate model directory for ANE training (e.g. 0.8B on 32GB machines).
+    /// When set, training targets this model instead of the inference model.
+    pub ane_training_model_dir: Option<std::path::PathBuf>,
     #[cfg(all(feature = "ane", feature = "mlx"))]
     pub ane_trainer: Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
     #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -89,6 +92,9 @@ pub(crate) struct DefaultLearnLoop {
     pub ane_lr_override: Option<f32>,
     #[cfg(all(feature = "ane", feature = "mlx"))]
     pub ane_strict_ane: bool,
+    /// Sender for LoRA hot-reload into the speculative decoder's draft model.
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    pub draft_reload_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>>,
 }
 
 impl DefaultLearnLoop {
@@ -148,11 +154,15 @@ fn emit_learn_metric(
 }
 
 fn learn_idle_wait_ms() -> u64 {
+    const _: () = assert!(
+        DEFAULT_LEARN_IDLE_MS <= MAX_LEARN_IDLE_MS,
+        "DEFAULT_LEARN_IDLE_MS must not exceed MAX_LEARN_IDLE_MS"
+    );
     std::env::var("NANOBOT_LEARN_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(|v| v.min(MAX_LEARN_IDLE_MS))
         .unwrap_or(DEFAULT_LEARN_IDLE_MS)
+        .min(MAX_LEARN_IDLE_MS)
 }
 
 fn reserve_training_slot(
@@ -334,6 +344,7 @@ impl LearnLoop for DefaultLearnLoop {
         let pg_config = self.perplexity_gate_config.clone();
         let train_counters = self.training_counters.clone();
         let ane_model_dir = self.ane_model_dir.clone();
+        let ane_training_model_dir = self.ane_training_model_dir.clone();
         #[cfg(all(feature = "ane", feature = "mlx"))]
         let ane_trainer = self.ane_trainer.clone();
         #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -342,6 +353,8 @@ impl LearnLoop for DefaultLearnLoop {
         let ane_lr_override = self.ane_lr_override;
         #[cfg(all(feature = "ane", feature = "mlx"))]
         let ane_strict_ane = self.ane_strict_ane;
+        #[cfg(all(feature = "ane", feature = "mlx"))]
+        let draft_reload_tx = self.draft_reload_tx.clone();
 
         #[cfg(feature = "mlx")]
         let mlx_provider = self.mlx_provider.clone();
@@ -431,7 +444,7 @@ impl LearnLoop for DefaultLearnLoop {
                     .unwrap_or(false)
             }; // lock released
 
-            if !should_train {
+            if !should_train || !pg_config.auto_train {
                 return;
             }
 
@@ -529,7 +542,10 @@ impl LearnLoop for DefaultLearnLoop {
                     ane_model_dir.clone()
                 };
                 if let Some(ref model_dir) = model_dir_opt {
-                    if let Some(mut ane_cfg) = build_ane_training_config(Some(model_dir)) {
+                    if let Some(mut ane_cfg) = build_ane_training_config(
+                    Some(model_dir),
+                    ane_training_model_dir.as_deref(),
+                ) {
                         // Scale epochs: target ≤90 optimizer steps to keep
                         // wall-clock manageable on large models (~7 min on 35B).
                         let n_data = exps_data.len();
@@ -549,7 +565,7 @@ impl LearnLoop for DefaultLearnLoop {
                             ane_cfg.strict_ane = true;
                         }
                         let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
-                            std::path::Path::new(&ane_cfg.model_dir),
+                            ane_cfg.effective_model_dir(),
                         ) {
                             Ok(t) => t,
                             Err(e) => {
@@ -620,6 +636,7 @@ impl LearnLoop for DefaultLearnLoop {
                                     samples,
                                     mlx_tx,
                                     train_counters.clone(),
+                                    draft_reload_tx.clone(),
                                 )
                             } else {
                                 crate::agent::ane_mlx_bridge::spawn_ane_training(
@@ -694,6 +711,8 @@ impl LearnLoop for DefaultLearnLoop {
             // Suppress unused-variable warning when ANE features are off.
             #[cfg(not(all(feature = "ane", feature = "mlx")))]
             let _ = &ane_model_dir;
+            #[cfg(not(all(feature = "ane", feature = "mlx")))]
+            let _ = &ane_training_model_dir;
 
             // HTTP-only training fallback (short timeout, no model worker contention).
             // In-process MLX training is skipped — it sends ModelRequest::Train to
@@ -751,45 +770,33 @@ pub(crate) async fn query_perplexity(
 /// `config.json`. Falls back to hardcoded Qwen3-1.7B if the active model
 /// directory is not provided.
 ///
+/// `training_model_dir`: when set, training targets a different model than inference
+/// (e.g. 0.8B for 32GB machines while 35B runs on GPU).
+///
 /// Returns `None` if no ANE-compatible model is available.
 #[cfg(all(feature = "ane", feature = "mlx"))]
 pub(crate) fn build_ane_training_config(
     model_dir: Option<&std::path::Path>,
+    training_model_dir: Option<&std::path::Path>,
 ) -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
     use crate::agent::mlx_lora::ModelConfig;
 
-    // Prefer the active inference model directory when available.
-    if let Some(dir) = model_dir {
-        if dir.join("config.json").exists() {
-            let mc = ModelConfig::from_config_json(dir)?;
-            return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
-                model_dir: dir.to_path_buf(),
-                mil_config: mc.to_mil_config(64),
-                epochs: 3,
-                lr: 1e-5,
-                linear_attn_indices: mc.linear_attn_indices.clone(),
-                kv_dim: mc.n_kv_heads * mc.head_dim,
-                softcap: 15.0,
-                loss_scale: 256.0,
-                lr_scale_attn: 0.05,
-                lr_scale_ffn: 1.0,
-                residual_scale: 0.0,
-                optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
-                strict_ane: false,
-                accum_steps: 1,
-                adaptive_layer_drop: true,
-            });
-        }
-    }
+    // When a separate training model is configured, use it for architecture
+    // detection and weight loading. The inference model_dir is still stored
+    // for adapter publishing (so LoRA knows where to export).
+    let effective_dir = training_model_dir.or(model_dir);
 
-    // Fallback: look for a known model in the LM Studio cache.
-    let home = dirs::home_dir()?;
-    let models_dir = home.join(".cache/lm-studio/models");
-    let qwen3_1_7b = models_dir.join("lmstudio-community/Qwen3-1.7B-MLX-8bit");
-    if qwen3_1_7b.join("config.json").exists() {
-        let mc = ModelConfig::from_config_json(&qwen3_1_7b)?;
-        return Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
-            model_dir: qwen3_1_7b,
+    let build_cfg = |dir: &std::path::Path,
+                     inference_dir: &std::path::Path,
+                     training_dir: Option<std::path::PathBuf>|
+     -> Option<crate::agent::ane_mlx_bridge::AneTrainingConfig> {
+        if !dir.join("config.json").exists() {
+            return None;
+        }
+        let mc = ModelConfig::from_config_json(dir)?;
+        Some(crate::agent::ane_mlx_bridge::AneTrainingConfig {
+            model_dir: inference_dir.to_path_buf(),
+            training_model_dir: training_dir,
             mil_config: mc.to_mil_config(64),
             epochs: 3,
             lr: 1e-5,
@@ -804,10 +811,23 @@ pub(crate) fn build_ane_training_config(
             strict_ane: false,
             accum_steps: 1,
             adaptive_layer_drop: true,
-        });
+        })
+    };
+
+    // Prefer the effective model directory when available.
+    if let Some(dir) = effective_dir {
+        let inference_dir = model_dir.unwrap_or(dir);
+        let training_dir = training_model_dir.map(|d| d.to_path_buf());
+        if let Some(cfg) = build_cfg(dir, inference_dir, training_dir) {
+            return Some(cfg);
+        }
     }
 
-    None
+    // Fallback: look for a known model in the LM Studio cache.
+    let home = dirs::home_dir()?;
+    let models_dir = home.join(".cache/lm-studio/models");
+    let qwen3_1_7b = models_dir.join("lmstudio-community/Qwen3-1.7B-MLX-8bit");
+    build_cfg(&qwen3_1_7b, &qwen3_1_7b, None)
 }
 
 /// After training, unload the model on oMLX/LM Studio so the next inference
@@ -1076,6 +1096,7 @@ mod tests {
             mlx_provider: None,
             training_counters: None,
             ane_model_dir: None,
+            ane_training_model_dir: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_trainer: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -1084,6 +1105,8 @@ mod tests {
             ane_lr_override: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_strict_ane: false,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            draft_reload_tx: None,
         };
         let outcome = make_test_outcome();
         // Should not panic even with no calibrator and audit disabled.
@@ -1110,6 +1133,23 @@ mod tests {
         outcome.used_tools.clear();
         outcome.used_tools.insert("read_file".into());
         assert_eq!(DefaultLearnLoop::task_type(&outcome), "tool_use");
+    }
+
+    // Test: learn_idle_wait_ms always returns <= MAX_LEARN_IDLE_MS.
+    // The default must not exceed the maximum — otherwise training never
+    // starts within a reasonable window.
+    #[test]
+    fn test_learn_idle_default_within_max() {
+        // Clear env to test the default path
+        std::env::remove_var("NANOBOT_LEARN_IDLE_MS");
+        let ms = learn_idle_wait_ms();
+        assert!(
+            ms <= MAX_LEARN_IDLE_MS,
+            "DEFAULT_LEARN_IDLE_MS ({}) exceeds MAX_LEARN_IDLE_MS ({}); \
+             default idle wait must be clamped to the max",
+            ms,
+            MAX_LEARN_IDLE_MS,
+        );
     }
 
     // Test 5: observe_async returns a JoinHandle that completes without panic.
