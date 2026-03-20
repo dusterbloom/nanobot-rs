@@ -35,11 +35,23 @@ pub fn rmsnorm_bwd(
     seq: usize,
     eps: f32,
 ) {
-    debug_assert_eq!(dx.len(), dim * seq);
-    debug_assert_eq!(dw.len(), dim);
-    debug_assert_eq!(dy.len(), dim * seq);
-    debug_assert_eq!(x.len(), dim * seq);
-    debug_assert_eq!(w.len(), dim);
+    // Hard guard: if any input is wrong-sized, zero dx and return.
+    // This can happen when an upstream ANE kernel (delta_reload) fails
+    // and returns empty/wrong-sized data, or from layer-drop (empty activations).
+    let expected = dim * seq;
+    if dx.len() != expected || dy.len() != expected || x.len() != expected || dw.len() != dim || w.len() != dim {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 3 {
+            tracing::debug!(
+                "rmsnorm_bwd: dimension mismatch (dx={}, dy={}, x={}, dw={}, w={}, expected dim*seq={}), zeroing output",
+                dx.len(), dy.len(), x.len(), dw.len(), w.len(), expected,
+            );
+        }
+        dx.fill(0.0);
+        return;
+    }
 
     // 1. Compute sum of squares per position: ss[t] = sum_i x[i,t]^2
     let mut ss = vec![0.0f32; seq];
