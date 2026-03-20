@@ -125,12 +125,31 @@ mod inner {
         http_client: reqwest::Client,
         /// Managed mlx-lm subprocess (when mlxLmUrl is "auto").
         managed_server: Option<Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>>,
+        /// Channel to the speculative decoder's dedicated thread.
+        #[cfg(feature = "ane")]
+        spec_decode_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_decode::SpecDecodeRequest>>,
+        /// Sender for LoRA hot-reload into the draft model's decode kernels.
+        #[cfg(feature = "ane")]
+        draft_reload_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>>,
+        /// Initial draft length for speculative decoding.
+        #[cfg(feature = "ane")]
+        draft_length: usize,
     }
 
     impl MlxProvider {
         /// Full model directory path (e.g. `~/.cache/lm-studio/models/...`).
         pub fn model_path(&self) -> &str {
             &self.model_path
+        }
+
+        /// Get the draft reload sender for wiring into the learn loop.
+        ///
+        /// When the learn loop finishes a training step, it sends the updated
+        /// LoRA model through this channel. The speculative decoder picks it up
+        /// and recompiles its decode kernels with the merged weights.
+        #[cfg(feature = "ane")]
+        pub fn draft_reload_tx(&self) -> Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>> {
+            self.draft_reload_tx.clone()
         }
 
         /// Start the model worker thread and return the provider.
@@ -157,6 +176,18 @@ mod inner {
             model_config: ModelConfig,
             lora_config: LoraConfig,
             mlx_lm_url: Option<String>,
+        ) -> Result<Self> {
+            Self::start_with_options(model_dir, model_config, lora_config, mlx_lm_url, None, None)
+        }
+
+        /// Start with optional mlx-lm server URL and draft model for speculative decoding.
+        pub fn start_with_options(
+            model_dir: PathBuf,
+            model_config: ModelConfig,
+            lora_config: LoraConfig,
+            mlx_lm_url: Option<String>,
+            draft_model: Option<PathBuf>,
+            num_draft_tokens: Option<u32>,
         ) -> Result<Self> {
             let tokenizer = MlxTokenizer::load(&model_dir).context("Failed to load tokenizer")?;
             let model_name = model_dir
@@ -199,6 +230,8 @@ mod inner {
                         // Qwen3 templates default to enable_thinking=true which causes
                         // <think> blocks in every response. /t toggles this at runtime.
                         chat_template_args: Some(r#"{"enable_thinking": false}"#.to_string()),
+                        draft_model: draft_model.clone(),
+                        num_draft_tokens,
                     };
                     // Auto-detect vllm-mlx options from model name.
                     let vllm_options = crate::agent::mlx_lm::VllmMlxOptions {
@@ -285,6 +318,47 @@ mod inner {
                 .unwrap_or("mlx://in-process")
                 .to_string();
 
+            // Initialize speculative decoder when draft model is configured.
+            // The decoder runs on a background thread; LoRA updates arrive via draft_reload_tx.
+            #[cfg(feature = "ane")]
+            let (spec_decode_tx, draft_reload_tx, initial_draft_len) = match draft_model.as_ref() {
+                Some(draft_dir) if resolved_url.is_none() => {
+                    // In-process mode: load draft model for ANE speculative decode
+                    match crate::agent::ane_decode::load_draft_model(draft_dir) {
+                        Ok(draft_weights) => {
+                            let (reload_tx, reload_rx) = std::sync::mpsc::sync_channel(1);
+                            let initial_draft_len = num_draft_tokens.unwrap_or(4) as usize;
+                            tracing::info!(
+                                draft = %draft_dir.display(),
+                                draft_length = initial_draft_len,
+                                "speculative decoder initialized"
+                            );
+                            let (sd_tx, sd_rx) = std::sync::mpsc::sync_channel(4);
+                            std::thread::Builder::new()
+                                .name("spec-decode".into())
+                                .spawn(move || {
+                                    // Construct inside thread — BlobDecodeKernels has raw
+                                    // pointers that aren't Send, but are fine once pinned
+                                    // to a single thread.
+                                    let decoder = crate::agent::ane_decode::SpeculativeDecoder::new(
+                                        draft_weights,
+                                        reload_rx,
+                                        4096,
+                                    );
+                                    crate::agent::ane_decode::run_spec_decode_worker(decoder, sd_rx);
+                                })
+                                .expect("failed to spawn spec-decode thread");
+                            (Some(sd_tx), Some(reload_tx), initial_draft_len)
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to load draft model: {e}");
+                            (None, None, 4)
+                        }
+                    }
+                }
+                _ => (None, None, 4),
+            };
+
             Ok(Self {
                 tx,
                 tokenizer: Arc::new(tokenizer),
@@ -293,8 +367,17 @@ mod inner {
                 api_base,
                 thinking_model,
                 mlx_lm_url: resolved_url,
-                http_client: reqwest::Client::new(),
+                http_client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(300))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
                 managed_server,
+                #[cfg(feature = "ane")]
+                spec_decode_tx,
+                #[cfg(feature = "ane")]
+                draft_reload_tx,
+                #[cfg(feature = "ane")]
+                draft_length: initial_draft_len,
             })
         }
 
@@ -615,6 +698,83 @@ mod inner {
                 .map_err(|_| anyhow::anyhow!("model worker died"))?;
 
             Ok(())
+        }
+    }
+
+    impl MlxProvider {
+        /// Speculative decode: ANE draft → GPU verify → accept/reject.
+        ///
+        /// Falls back to normal `chat()` when spec decode is unavailable.
+        #[cfg(feature = "ane")]
+        pub async fn chat_speculative(
+            &self,
+            messages: &[serde_json::Value],
+            max_tokens: u32,
+            temperature: f64,
+            thinking_budget: Option<u32>,
+        ) -> Result<LLMResponse> {
+            let Some(ref spec_tx) = self.spec_decode_tx else {
+                return self
+                    .chat(messages, None, None, max_tokens, temperature, thinking_budget, None)
+                    .await;
+            };
+
+            // Only works for in-process inference
+            if self.mlx_lm_url.is_some() {
+                return self
+                    .chat(messages, None, None, max_tokens, temperature, thinking_budget, None)
+                    .await;
+            }
+
+            let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+            let chat_messages: Vec<crate::agent::mlx_server::ChatMessage> = messages
+                .iter()
+                .filter_map(|m| {
+                    let role = m.get("role")?.as_str()?.to_string();
+                    let content = m.get("content")?.as_str()?.to_string();
+                    Some(crate::agent::mlx_server::ChatMessage { role, content })
+                })
+                .collect();
+
+            let prompt = if self.thinking_model && !want_thinking {
+                crate::agent::mlx_server::apply_chat_template_nothink(&chat_messages)
+            } else {
+                crate::agent::mlx_server::apply_chat_template(&chat_messages)
+            };
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.tx
+                .send(ModelRequest::ChatSpeculative {
+                    prompt,
+                    max_tokens: max_tokens as usize,
+                    temperature: temperature as f32,
+                    draft_length: self.draft_length,
+                    spec_tx: spec_tx.clone(),
+                    reply: reply_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("model worker died"))?;
+
+            let (raw_text, prompt_tokens, completion_tokens) = reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("model worker dropped reply"))?
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let text = strip_think_blocks(&raw_text);
+
+            let mut usage = HashMap::new();
+            usage.insert("prompt_tokens".to_string(), prompt_tokens as i64);
+            usage.insert("completion_tokens".to_string(), completion_tokens as i64);
+            usage.insert(
+                "total_tokens".to_string(),
+                (prompt_tokens + completion_tokens) as i64,
+            );
+
+            Ok(LLMResponse {
+                content: Some(text),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage,
+            })
         }
     }
 
@@ -1217,5 +1377,195 @@ mod tests {
             .expect("train should not error");
 
         eprintln!("4B closed loop complete: inference → perplexity → train");
+    }
+
+    // -----------------------------------------------------------------------
+    // Parity tests: verify in-process and mlx-lm paths produce equivalent results
+    // -----------------------------------------------------------------------
+
+    /// The in-process chat path must support tool_calls parsing from model output.
+    /// This test sends a tool-schema prompt and verifies the response contains
+    /// at least one parsed tool call. If the in-process path always returns empty
+    /// tool_calls, it is NOT on par with mlx-lm/oMLX/LM Studio.
+    #[tokio::test]
+    async fn test_inprocess_tool_calls_not_empty() {
+        if skip_if_no_model() {
+            eprintln!("SKIP: model not found");
+            return;
+        }
+
+        // Start in-process (no mlx_lm_url) — this is the path tests exercise
+        let provider = MlxProvider::start(
+            model_dir(),
+            ModelConfig::qwen3_5_2b(),
+            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
+        ).expect("start failed");
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "What's the weather in Paris?"
+        })];
+
+        let resp = provider
+            .chat(&messages, Some(&tools), None, 256, 0.0, None, None)
+            .await
+            .expect("chat failed");
+
+        eprintln!("in-process response: content={:?}, tool_calls={:?}",
+            resp.content, resp.tool_calls);
+
+        // The in-process path should be able to produce tool calls.
+        // If this fails, it proves in-process inference is NOT on par with
+        // mlx-lm server (which returns native tool_calls).
+        assert!(
+            !resp.tool_calls.is_empty(),
+            "in-process inference returned no tool_calls — it cannot match mlx-lm/oMLX parity. \
+             The in-process path does not pass tool schemas to the model and has no function-calling template."
+        );
+    }
+
+    /// In-process and mlx-lm should produce the same tokens for a deterministic
+    /// (temperature=0) prompt. This test starts both paths and compares outputs.
+    ///
+    /// Requires mlx_lm.server to be running on port 8090 (or set MLX_LM_TEST_URL).
+    #[tokio::test]
+    async fn test_inprocess_vs_mlx_lm_parity() {
+        if skip_if_no_model() {
+            eprintln!("SKIP: model not found");
+            return;
+        }
+
+        let mlx_lm_url = std::env::var("MLX_LM_TEST_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+
+        // Check if mlx-lm server is reachable
+        let client = reqwest::Client::new();
+        let health = client.get(format!("{mlx_lm_url}/v1/models")).send().await;
+        if health.is_err() || !health.unwrap().status().is_success() {
+            eprintln!("SKIP: mlx-lm server not reachable at {mlx_lm_url}");
+            return;
+        }
+
+        // In-process provider
+        let inproc = MlxProvider::start(
+            model_dir(),
+            ModelConfig::qwen3_5_2b(),
+            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
+        ).expect("in-process start failed");
+
+        // mlx-lm provider
+        let mlx_lm = MlxProvider::start_with_mlx_lm(
+            model_dir(),
+            ModelConfig::qwen3_5_2b(),
+            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
+            Some(mlx_lm_url.clone()),
+        ).expect("mlx-lm start failed");
+
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "What is 2+2? Answer with just the number."
+        })];
+
+        let resp_inproc = inproc
+            .chat(&messages, None, None, 16, 0.0, None, None)
+            .await
+            .expect("in-process chat failed");
+
+        let resp_mlx_lm = mlx_lm
+            .chat(&messages, None, None, 16, 0.0, None, None)
+            .await
+            .expect("mlx-lm chat failed");
+
+        let text_inproc = resp_inproc.content.unwrap_or_default();
+        let text_mlx_lm = resp_mlx_lm.content.unwrap_or_default();
+
+        eprintln!("in-process: {text_inproc:?}");
+        eprintln!("mlx-lm:     {text_mlx_lm:?}");
+
+        // Both should produce "4" (or contain "4") for this trivial prompt.
+        assert!(text_inproc.contains('4'), "in-process didn't answer '4': {text_inproc:?}");
+        assert!(text_mlx_lm.contains('4'), "mlx-lm didn't answer '4': {text_mlx_lm:?}");
+
+        // The outputs should match exactly at temperature=0 with same model.
+        // If they don't, the chat templates diverge.
+        assert_eq!(
+            text_inproc.trim(), text_mlx_lm.trim(),
+            "PARITY FAILURE: in-process and mlx-lm produce different outputs for the same prompt. \
+             This means the hardcoded ChatML template diverges from mlx-lm's Jinja template."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Speculative decode
+    // -----------------------------------------------------------------------
+
+    fn draft_model_dir() -> PathBuf {
+        dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit")
+    }
+
+    fn skip_if_no_draft() -> bool {
+        !draft_model_dir().join("tokenizer.json").exists()
+    }
+
+    /// E2E: speculative decode with ANE draft (0.8B) → GPU verify (2B).
+    #[cfg(feature = "ane")]
+    #[tokio::test]
+    async fn test_speculative_decode_e2e() {
+        if skip_if_no_model() {
+            eprintln!("SKIP: target model not found at {:?}", model_dir());
+            return;
+        }
+        if skip_if_no_draft() {
+            eprintln!("SKIP: draft model not found at {:?}", draft_model_dir());
+            return;
+        }
+
+        let provider = MlxProvider::start_with_options(
+            model_dir(),
+            ModelConfig::qwen3_5_2b(),
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+            None, // in-process inference (required for spec decode)
+            Some(draft_model_dir()),
+            Some(4), // draft 4 tokens per step
+        )
+        .expect("MlxProvider::start_with_options failed");
+
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "What is 2+2? Answer with just the number."
+        })];
+
+        let resp = provider
+            .chat_speculative(&messages, 32, 0.0, None)
+            .await
+            .expect("chat_speculative failed");
+
+        assert!(resp.content.is_some(), "response should have content");
+        let text = resp.content.unwrap();
+        assert!(!text.is_empty(), "response text should not be empty");
+        eprintln!("Speculative decode response: {text:?}");
+        assert_eq!(resp.finish_reason, "stop");
+        assert!(*resp.usage.get("prompt_tokens").unwrap() > 0);
+        assert!(*resp.usage.get("completion_tokens").unwrap() > 0);
     }
 }
