@@ -2216,6 +2216,23 @@ pub struct PrePackedLayerWeights {
     pub bwd_w13t: Option<Vec<f32>>,
 }
 
+/// QKV backward kernel variant: single (3 BLOBFILEs) or split (2 × 2 BLOBFILEs).
+///
+/// At 35B, WQ^T is 32MB which exceeds ANE SRAM per-BLOBFILE limit (16MB).
+/// Split halves WQ^T along the reduction axis → 2 kernels of ~16MB max BLOBFILE each.
+/// `dx = dx_a + dx_b` (exact math, no approximation).
+pub enum QkvbKernel {
+    /// Single kernel with 3 BLOBFILEs: WQ^T + WK^T + WV^T (fits in SRAM).
+    Single(super::ane_bridge::AneKernel),
+    /// Split into 2 kernels when WQ^T exceeds SRAM:
+    ///  - half_a: WQ^T_first_half + WK^T
+    ///  - half_b: WQ^T_second_half + WV^T
+    Split {
+        half_a: super::ane_bridge::AneKernel,
+        half_b: super::ane_bridge::AneKernel,
+    },
+}
+
 /// Complete set of pre-packed weights for all layers.
 pub struct PrePackedWeights {
     pub layers: Vec<PrePackedLayerWeights>,
@@ -2239,7 +2256,8 @@ pub struct PrePackedWeights {
     /// Merges Wot dispatch into SDPA → 2-dispatch attn backward (Wot+SDPA | QKV).
     bwd_wot_sdpa_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     /// Per-layer QKV backward kernels with BLOBFILE weights (replaces DynMatmul).
-    bwd_qkvb_kernels: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
+    /// Uses `QkvbKernel::Split` when WQ^T exceeds ANE SRAM per-BLOBFILE limit.
+    bwd_qkvb_kernels: Option<Vec<Option<QkvbKernel>>>,
     /// Per-layer RMSNorm (attention) kernels with baked weights.
     rmsnorm_att_kernels: Option<Vec<super::ane_bridge::AneKernel>>,
     /// Per-layer RMSNorm (FFN) kernels with baked weights.
@@ -2279,6 +2297,14 @@ pub struct PrePackedWeights {
     /// Per-layer GDN pre-recurrence kernels (fused: conv+SiLU+RMSNorm+GQA+decay+gate).
     gdn_pre_recur_per_layer: Option<Vec<Option<super::ane_bridge::AneKernel>>>,
     gdn_pre_recur_output_bytes: usize,
+    gdn_pre_recur_input_bytes: usize,
+    /// Chunk size for GDN pre-recurrence (0 = no chunking, kernel seq_len = full seq).
+    gdn_pre_recur_chunk: usize,
+    /// Conv overlap for chunked mode (kernel_size - 1).
+    gdn_pre_recur_overlap: usize,
+    /// Per-layer conv weights for CPU conv in chunked mode.
+    /// Only populated when gdn_pre_recur_chunk > 0.
+    gdn_pre_recur_conv_weights: Option<Vec<(Vec<f32>, Vec<f32>)>>, // (conv_weight, conv_bias)
 }
 
 impl PrePackedWeights {
@@ -2323,6 +2349,10 @@ impl PrePackedWeights {
             gdn_o_proj_kernels: None,
             gdn_pre_recur_per_layer: None,
             gdn_pre_recur_output_bytes: 0,
+            gdn_pre_recur_input_bytes: 0,
+            gdn_pre_recur_chunk: 0,
+            gdn_pre_recur_overlap: 0,
+            gdn_pre_recur_conv_weights: None,
         }
     }
 
@@ -2444,6 +2474,10 @@ impl PrePackedWeights {
             gdn_o_proj_kernels: None,
             gdn_pre_recur_per_layer: None,
             gdn_pre_recur_output_bytes: 0,
+            gdn_pre_recur_input_bytes: 0,
+            gdn_pre_recur_chunk: 0,
+            gdn_pre_recur_overlap: 0,
+            gdn_pre_recur_conv_weights: None,
         }
     }
 
@@ -2657,12 +2691,25 @@ impl PrePackedWeights {
         mask_blob: &[u8],
     ) -> Result<(), String> {
         let n_layers = model.n_layers();
-        let has_qk_norm = true; // QK-norm via reduce_mean(axis=-1) in [1,H,S,hd]
-        let result = super::ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
         let dim = cfg.dim;
         let qpd = cfg.q_proj_dim();
         let kv_dim = cfg.kv_dim();
         let attn_dim = cfg.attn_dim();
+
+        // Fused attn fwd has WQ [dim,qpd], WK [dim,kv], WV [dim,kv], Wo [ad,dim].
+        // If the largest blob exceeds ANE SRAM, skip silently.
+        let max_blob_bytes = (dim * qpd).max(dim * attn_dim) * 2;
+        if max_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES {
+            tracing::debug!(
+                "skipping fused attn fwd: max blob {:.1}MB exceeds SRAM limit",
+                max_blob_bytes as f64 / (1024.0 * 1024.0),
+            );
+            self.fwd_fused_attn_gqa_kernels = Some((0..n_layers).map(|_| None).collect());
+            return Ok(());
+        }
+
+        let has_qk_norm = true; // QK-norm via reduce_mean(axis=-1) in [1,H,S,hd]
+        let result = super::ane_mil::gen_fused_attn_gqa_fwd(cfg, has_qk_norm);
 
         let mut kernels = Vec::with_capacity(n_layers);
         let t0 = std::time::Instant::now();
@@ -2814,12 +2861,25 @@ impl PrePackedWeights {
         mask_blob: &[u8],
     ) -> Result<(), String> {
         let n_layers = model.n_layers();
-        let has_qk_norm = false; // backward QK-norm not yet ported to axis=-1 approach
-        let result = super::ane_mil::gen_fused_attn_gqa_bwd(cfg, has_qk_norm);
         let dim = cfg.dim;
         let qpd = cfg.q_proj_dim();
         let kv_dim = cfg.kv_dim();
         let attn_dim = cfg.attn_dim();
+
+        // Fused attn bwd has WQ [qpd,dim], WK [kv,dim], WV [kv,dim], Wo [dim,ad].
+        // If the largest blob exceeds ANE SRAM, skip silently.
+        let max_blob_bytes = (dim * qpd).max(dim * attn_dim) * 2;
+        if max_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES {
+            tracing::debug!(
+                "skipping fused attn bwd: max blob {:.1}MB exceeds SRAM limit",
+                max_blob_bytes as f64 / (1024.0 * 1024.0),
+            );
+            self.bwd_fused_attn_gqa_kernels = Some((0..n_layers).map(|_| None).collect());
+            return Ok(());
+        }
+
+        let has_qk_norm = false; // backward QK-norm not yet ported to axis=-1 approach
+        let result = super::ane_mil::gen_fused_attn_gqa_bwd(cfg, has_qk_norm);
 
         let mut kernels = Vec::with_capacity(n_layers);
         let t0 = std::time::Instant::now();
@@ -2983,6 +3043,18 @@ impl PrePackedWeights {
         let dim = cfg.dim;
         let ad = cfg.attn_dim();
         let seq = cfg.seq_len;
+
+        // Wot blob is dim*ad fp16 = dim*ad*2 bytes. Skip if exceeds ANE SRAM.
+        let wot_blob_bytes = dim * ad * 2;
+        if wot_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES {
+            tracing::debug!(
+                "skipping Wot bwd: blob {:.1}MB exceeds SRAM limit",
+                wot_blob_bytes as f64 / (1024.0 * 1024.0),
+            );
+            self.bwd_wot_kernels = Some((0..n_layers).map(|_| None).collect());
+            return Ok(());
+        }
+
         let result = super::ane_mil::gen_wot_bwd_blob(dim, ad, seq);
         let t0 = std::time::Instant::now();
 
@@ -3034,6 +3106,11 @@ impl PrePackedWeights {
     /// Merges the Wo^T dispatch into the SDPA backward kernel, reducing
     /// attention backward from 3 dispatches (Wot | SDPA | QKV) to 2 (Wot+SDPA | QKV).
     /// Each MHA layer gets a compiled kernel with Wo baked in as BLOBFILE.
+    /// Max single BLOBFILE size the ANE compiler can handle (~32 MB SRAM).
+    /// We use a conservative 16 MB threshold — anything above triggers the
+    /// "MIR attributes missing from RESHAPE" compiler internal error (Bug 14).
+    const ANE_MAX_BLOBFILE_BYTES: usize = 16 * 1024 * 1024;
+
     pub fn prime_bwd_wot_sdpa_kernels<W: WeightSource>(
         &mut self,
         cfg: &super::ane_mil::MilConfig,
@@ -3042,6 +3119,20 @@ impl PrePackedWeights {
         let n_layers = model.n_layers();
         let dim = cfg.dim;
         let ad = cfg.attn_dim();
+
+        // Wo blob is dim*ad fp16 values = dim*ad*2 bytes.
+        // If it exceeds ANE SRAM the compiler will fail noisily — skip silently.
+        let wo_blob_bytes = dim * ad * 2;
+        if wo_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES {
+            tracing::debug!(
+                "skipping fused Wot+SDPA bwd: Wo blob {:.1}MB exceeds {:.0}MB SRAM limit",
+                wo_blob_bytes as f64 / (1024.0 * 1024.0),
+                Self::ANE_MAX_BLOBFILE_BYTES as f64 / (1024.0 * 1024.0),
+            );
+            self.bwd_wot_sdpa_kernels = Some((0..n_layers).map(|_| None).collect());
+            return Ok(());
+        }
+
         let has_gate = cfg.attn_output_gate;
         let result = super::ane_mil::gen_wot_sdpa_bwd(cfg, has_gate);
         let mask_blob = super::ane_mil::build_causal_mask_blob(cfg.seq_len);
@@ -3117,7 +3208,9 @@ impl PrePackedWeights {
     /// Prime per-layer QKV backward kernels with BLOBFILE weights.
     ///
     /// Each MHA layer gets a compiled kernel with WQ^T, WK^T, WV^T baked in.
-    /// 3 BLOBFILEs per kernel. Eliminates DynMatmul packing (~48MB per layer).
+    /// When WQ^T fits in SRAM (≤16MB), uses a single kernel with 3 BLOBFILEs.
+    /// When WQ^T exceeds SRAM (e.g. 32MB at 35B), splits into 2 kernels of
+    /// 2 BLOBFILEs each. Eliminates DynMatmul packing (~48MB per layer).
     pub fn prime_bwd_qkvb_kernels<W: WeightSource>(
         &mut self,
         cfg: &super::ane_mil::MilConfig,
@@ -3127,43 +3220,117 @@ impl PrePackedWeights {
         let dim = cfg.dim;
         let qpd = cfg.q_proj_dim();
         let ad = cfg.attn_dim();
-        let result = super::ane_mil::gen_qkvb_blob(cfg);
-        let t0 = std::time::Instant::now();
 
-        let mut kernels = Vec::with_capacity(n_layers);
-        for l in 0..n_layers {
-            let lw_cow = model.layer(l);
-            let lw = &*lw_cow;
-            if lw.gdn.is_some() || lw.wq.is_empty() {
-                kernels.push(None);
-                continue;
+        let max_blob_bytes = dim * qpd.max(ad) * 2;
+        let needs_split = max_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES;
+
+        // Check if split halves also exceed SRAM (would need further splitting)
+        if needs_split {
+            let half_qpd = qpd / 2;
+            let half_blob_bytes = dim * half_qpd.max(ad) * 2;
+            if half_blob_bytes > Self::ANE_MAX_BLOBFILE_BYTES {
+                tracing::debug!(
+                    "skipping QKV bwd: even split half {:.1}MB exceeds SRAM limit",
+                    half_blob_bytes as f64 / (1024.0 * 1024.0),
+                );
+                self.bwd_qkvb_kernels = Some((0..n_layers).map(|_| None).collect());
+                return Ok(());
             }
-            // WQ is [qpd, dim] → WQ^T = [dim, qpd]
-            let wqt = transpose_weight(&lw.wq, qpd, dim);
-            let wqt_blob = build_fp16_blob(&wqt);
-            // WK is [ad, dim] → WK^T = [dim, ad]
-            let wkt = transpose_weight(&lw.wk, ad, dim);
-            let wkt_blob = build_fp16_blob(&wkt);
-            // WV is [ad, dim] → WV^T = [dim, ad]
-            let wvt = transpose_weight(&lw.wv, ad, dim);
-            let wvt_blob = build_fp16_blob(&wvt);
+            tracing::info!(
+                "QKV bwd: WQ^T {:.1}MB exceeds SRAM, using split path (2 × {:.1}MB)",
+                max_blob_bytes as f64 / (1024.0 * 1024.0),
+                half_blob_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
 
-            let names: Vec<&str> = result.weight_names.iter().copied().collect();
-            match super::ane_bridge::AneKernel::compile_multi_weights(
-                &result.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
-                &[result.input_bytes], &[result.output_bytes],
-            ) {
-                Ok(k) => kernels.push(Some(k)),
-                Err(e) => {
-                    tracing::warn!("layer {l} bwd_qkvb compile failed: {e}");
+        let t0 = std::time::Instant::now();
+        let mut kernels = Vec::with_capacity(n_layers);
+
+        if needs_split {
+            let mil_a = super::ane_mil::gen_qkvb_blob_split_half(cfg, 0);
+            let mil_b = super::ane_mil::gen_qkvb_blob_split_half(cfg, 1);
+            let half_qpd = qpd / 2;
+
+            for l in 0..n_layers {
+                let lw_cow = model.layer(l);
+                let lw = &*lw_cow;
+                if lw.gdn.is_some() || lw.wq.is_empty() {
                     kernels.push(None);
+                    continue;
+                }
+                // WQ^T = [dim, qpd], split into [dim, half_qpd] halves
+                let wqt = transpose_weight(&lw.wq, qpd, dim);
+                let wqt_h0: Vec<f32> = wqt.chunks_exact(qpd)
+                    .flat_map(|row| &row[..half_qpd])
+                    .copied()
+                    .collect();
+                let wqt_h1: Vec<f32> = wqt.chunks_exact(qpd)
+                    .flat_map(|row| &row[half_qpd..])
+                    .copied()
+                    .collect();
+                let wqt_h0_blob = build_fp16_blob(&wqt_h0);
+                let wqt_h1_blob = build_fp16_blob(&wqt_h1);
+                // WK^T and WV^T
+                let wkt = transpose_weight(&lw.wk, ad, dim);
+                let wkt_blob = build_fp16_blob(&wkt);
+                let wvt = transpose_weight(&lw.wv, ad, dim);
+                let wvt_blob = build_fp16_blob(&wvt);
+
+                // Compile kernel A: Wq_h0 + Wk
+                let names_a: Vec<&str> = mil_a.weight_names.iter().copied().collect();
+                let ka = super::ane_bridge::AneKernel::compile_multi_weights(
+                    &mil_a.mil_text, &names_a, &[&wqt_h0_blob, &wkt_blob],
+                    &[mil_a.input_bytes], &[mil_a.output_bytes],
+                );
+                // Compile kernel B: Wq_h1 + Wv
+                let names_b: Vec<&str> = mil_b.weight_names.iter().copied().collect();
+                let kb = super::ane_bridge::AneKernel::compile_multi_weights(
+                    &mil_b.mil_text, &names_b, &[&wqt_h1_blob, &wvt_blob],
+                    &[mil_b.input_bytes], &[mil_b.output_bytes],
+                );
+
+                match (ka, kb) {
+                    (Ok(a), Ok(b)) => kernels.push(Some(QkvbKernel::Split { half_a: a, half_b: b })),
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::debug!("layer {l} bwd_qkvb split compile failed: {e}");
+                        kernels.push(None);
+                    }
+                }
+            }
+        } else {
+            let result = super::ane_mil::gen_qkvb_blob(cfg);
+            for l in 0..n_layers {
+                let lw_cow = model.layer(l);
+                let lw = &*lw_cow;
+                if lw.gdn.is_some() || lw.wq.is_empty() {
+                    kernels.push(None);
+                    continue;
+                }
+                let wqt = transpose_weight(&lw.wq, qpd, dim);
+                let wqt_blob = build_fp16_blob(&wqt);
+                let wkt = transpose_weight(&lw.wk, ad, dim);
+                let wkt_blob = build_fp16_blob(&wkt);
+                let wvt = transpose_weight(&lw.wv, ad, dim);
+                let wvt_blob = build_fp16_blob(&wvt);
+
+                let names: Vec<&str> = result.weight_names.iter().copied().collect();
+                match super::ane_bridge::AneKernel::compile_multi_weights(
+                    &result.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
+                    &[result.input_bytes], &[result.output_bytes],
+                ) {
+                    Ok(k) => kernels.push(Some(QkvbKernel::Single(k))),
+                    Err(e) => {
+                        tracing::debug!("layer {l} bwd_qkvb compile failed: {e}");
+                        kernels.push(None);
+                    }
                 }
             }
         }
 
         let elapsed = t0.elapsed();
         let count = kernels.iter().filter(|k| k.is_some()).count();
-        tracing::info!("primed {count}/{n_layers} per-layer QKV backward kernels in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+        let mode = if needs_split { "split" } else { "single" };
+        tracing::info!("primed {count}/{n_layers} per-layer QKV backward kernels ({mode}) in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
         self.bwd_qkvb_kernels = Some(kernels);
         Ok(())
     }
@@ -3171,19 +3338,77 @@ impl PrePackedWeights {
     /// Evaluate per-layer QKV backward: dx = WQ^T@dQ + WK^T@dK + WV^T@dV.
     /// Input: dQ[qpd,seq] | dK[ad,seq] | dV[ad,seq] concatenated.
     /// Returns None if not primed.
+    ///
+    /// Dispatches `QkvbKernel::Single` (1 eval) or `QkvbKernel::Split` (2 evals + sum).
     pub fn eval_bwd_qkvb(&self, layer: usize, dqkv: &[f32], cfg: &super::ane_mil::MilConfig) -> Option<Result<Vec<f32>, String>> {
         let kernels = self.bwd_qkvb_kernels.as_ref()?;
-        let kernel = kernels[layer].as_ref()?;
-        let bytes = unsafe { std::slice::from_raw_parts(dqkv.as_ptr() as *const u8, dqkv.len() * 4) };
-        kernel.write_input(0, bytes);
-        if let Err(e) = kernel.eval() {
-            return Some(Err(format!("bwd_qkvb eval layer {layer}: {e}")));
-        }
+        let qkvb = kernels[layer].as_ref()?;
         let dim = cfg.dim;
         let seq = cfg.seq_len;
-        let mut buf = vec![0u8; dim * seq * 4];
-        kernel.read_output(0, &mut buf);
-        Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+        let out_floats = dim * seq;
+
+        match qkvb {
+            QkvbKernel::Single(kernel) => {
+                let bytes = unsafe { std::slice::from_raw_parts(dqkv.as_ptr() as *const u8, dqkv.len() * 4) };
+                kernel.write_input(0, bytes);
+                if let Err(e) = kernel.eval() {
+                    return Some(Err(format!("bwd_qkvb eval layer {layer}: {e}")));
+                }
+                let mut buf = vec![0u8; out_floats * 4];
+                kernel.read_output(0, &mut buf);
+                Some(Ok(buf.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+            }
+            QkvbKernel::Split { half_a, half_b } => {
+                let qpd = cfg.q_proj_dim();
+                let ad = cfg.attn_dim();
+                let half_qpd = qpd / 2;
+
+                // Build input A: dQ[0..half_qpd] | dK
+                // dqkv layout: dQ[qpd*seq] | dK[ad*seq] | dV[ad*seq]
+                let dq_offset = 0;
+                let dk_offset = qpd * seq;
+                let dv_offset = (qpd + ad) * seq;
+
+                let input_a_len = (half_qpd + ad) * seq;
+                let mut input_a = Vec::with_capacity(input_a_len);
+                input_a.extend_from_slice(&dqkv[dq_offset..dq_offset + half_qpd * seq]);
+                input_a.extend_from_slice(&dqkv[dk_offset..dk_offset + ad * seq]);
+
+                let bytes_a = unsafe { std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4) };
+                half_a.write_input(0, bytes_a);
+                if let Err(e) = half_a.eval() {
+                    return Some(Err(format!("bwd_qkvb split half_a eval layer {layer}: {e}")));
+                }
+
+                // Build input B: dQ[half_qpd..qpd] | dV
+                let input_b_len = (half_qpd + ad) * seq;
+                let mut input_b = Vec::with_capacity(input_b_len);
+                input_b.extend_from_slice(&dqkv[dq_offset + half_qpd * seq..dq_offset + qpd * seq]);
+                input_b.extend_from_slice(&dqkv[dv_offset..dv_offset + ad * seq]);
+
+                let bytes_b = unsafe { std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4) };
+                half_b.write_input(0, bytes_b);
+                if let Err(e) = half_b.eval() {
+                    return Some(Err(format!("bwd_qkvb split half_b eval layer {layer}: {e}")));
+                }
+
+                // Read both outputs and sum
+                let mut buf_a = vec![0u8; out_floats * 4];
+                let mut buf_b = vec![0u8; out_floats * 4];
+                half_a.read_output(0, &mut buf_a);
+                half_b.read_output(0, &mut buf_b);
+
+                let dx: Vec<f32> = buf_a.chunks_exact(4)
+                    .zip(buf_b.chunks_exact(4))
+                    .map(|(a, b)| {
+                        f32::from_le_bytes([a[0], a[1], a[2], a[3]])
+                        + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    })
+                    .collect();
+
+                Some(Ok(dx))
+            }
+        }
     }
 
     /// Prime per-layer RMSNorm kernels (attention + FFN) with baked weights.
@@ -3474,7 +3699,7 @@ impl PrePackedWeights {
         .map_err(|e| format!("fused_ffn_bwd shared compile: {e}"))?;
 
         let elapsed = t0.elapsed();
-        eprintln!(
+        tracing::info!(
             "primed shared FFN bwd kernel (1 slot, {} layers hotswap) in {:.1}ms",
             n_layers,
             elapsed.as_secs_f64() * 1000.0,
@@ -4019,7 +4244,7 @@ impl PrePackedWeights {
         let gdn_count = proj_kernels.iter().filter(|k| k.is_some()).count();
         let o_count = o_kernels.iter().filter(|k| k.is_some()).count();
         let elapsed = t0.elapsed();
-        eprintln!(
+        tracing::info!(
             "primed {gdn_count}/{n_layers} GDN proj + {o_count} o_proj in {:.1}ms",
             elapsed.as_secs_f64() * 1000.0,
         );
@@ -4032,15 +4257,17 @@ impl PrePackedWeights {
     ///
     /// Each GDN layer gets its own fused kernel (4 BLOBFILEs baked at compile time).
     /// conv_bias fix: models without conv bias store an empty Vec — pad to expected size.
+    /// Max seq_len for non-chunked GDN pre-recurrence (ANE SRAM limit at 35B dims).
+    const GDN_PRE_RECUR_MAX_SEQ: usize = 256;
+
     pub fn prime_gdn_pre_recurrence_kernels<W: WeightSource>(
         &mut self,
         cfg: &super::ane_mil::MilConfig,
         model: &W,
     ) {
         let n_layers = model.n_layers();
-        let pre_r = super::ane_mil::gen_gdn_pre_recurrence_fwd(cfg);
-        let mut kernels: Vec<Option<super::ane_bridge::AneKernel>> = Vec::with_capacity(n_layers);
-        let t0 = std::time::Instant::now();
+        let full_seq = cfg.seq_len;
+        let kernel_size = cfg.conv_kernel_size;
 
         // Pre-compute expected bias size for empty-bias fix
         let h_k = cfg.linear_n_heads;
@@ -4049,24 +4276,82 @@ impl PrePackedWeights {
         let d_v = cfg.linear_value_head_dim;
         let qkv_dim = 2 * h_k * d_k + h_v * d_v;
 
+        // For large seq_lens, use split approach: CPU conv + ANE post-conv.
+        // ANE can't run conv with pad=[0,0,0,0] (Program Inference error),
+        // so we run conv+SiLU on CPU and feed post-SiLU data to ANE post-conv kernel.
+        let chunked = full_seq > Self::GDN_PRE_RECUR_MAX_SEQ;
+        let (chunk_size, overlap) = if chunked {
+            let chunk = Self::GDN_PRE_RECUR_MAX_SEQ;
+            let olap = kernel_size.saturating_sub(1);
+            tracing::info!(
+                "GDN pre-recurrence: chunked mode seq={full_seq} → chunk={chunk} overlap={olap} (CPU conv + ANE post-conv)",
+            );
+            (chunk, olap)
+        } else {
+            (0, 0)
+        };
+
+        // Generate the appropriate MIL
+        let pre_r = if chunked {
+            let mut chunk_cfg = cfg.clone();
+            chunk_cfg.seq_len = Self::GDN_PRE_RECUR_MAX_SEQ;
+            // Post-conv kernel: no conv, just SiLU/RMSNorm/GQA/decay/gate (2 BLOBFILEs)
+            super::ane_mil::gen_gdn_post_conv_fwd(&chunk_cfg)
+        } else {
+            // Fused kernel: conv + SiLU + everything (4 BLOBFILEs)
+            super::ane_mil::gen_gdn_pre_recurrence_fwd(cfg)
+        };
+
+        let mut kernels: Vec<Option<super::ane_bridge::AneKernel>> = Vec::with_capacity(n_layers);
+        let mut conv_weights_per_layer: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(n_layers);
+        let t0 = std::time::Instant::now();
+
         for l in 0..n_layers {
+            // Only GDN (linear attention) layers have pre-recurrence.
+            // MHA layers may have gdn weights populated but different head geometry.
+            if !cfg.is_linear_attn_layer(l) {
+                kernels.push(None);
+                if chunked {
+                    conv_weights_per_layer.push((vec![], vec![]));
+                }
+                continue;
+            }
             let lw_cow = model.layer(l);
             let lw = &*lw_cow;
             if let Some(gdn) = lw.gdn.as_ref() {
-                // Fix: conv_bias may be empty (model has no bias term).
-                // MIL kernel expects [1, qkv_dim, 1, 1] BLOBFILE — pad to correct size.
                 let conv_bias = if gdn.conv_bias.is_empty() {
                     vec![0.0f32; qkv_dim]
                 } else {
                     gdn.conv_bias.clone()
                 };
-                let blobs = [
-                    build_fp16_blob(&gdn.conv_weight),
-                    build_fp16_blob(&conv_bias),
-                    build_fp16_blob(&gdn.a_log),
-                    build_fp16_blob(&gdn.dt_bias),
-                ];
-                let names: Vec<&str> = pre_r.weight_names.iter().copied().collect();
+
+                let (blobs, names): (Vec<Vec<u8>>, Vec<&str>) = if chunked {
+                    // Post-conv kernel: only a_log + dt_bias
+                    (
+                        vec![
+                            build_fp16_blob(&gdn.a_log),
+                            build_fp16_blob(&gdn.dt_bias),
+                        ],
+                        pre_r.weight_names.iter().copied().collect(),
+                    )
+                } else {
+                    // Fused kernel: conv_w + conv_b + a_log + dt_bias
+                    (
+                        vec![
+                            build_fp16_blob(&gdn.conv_weight),
+                            build_fp16_blob(&conv_bias),
+                            build_fp16_blob(&gdn.a_log),
+                            build_fp16_blob(&gdn.dt_bias),
+                        ],
+                        pre_r.weight_names.iter().copied().collect(),
+                    )
+                };
+
+                // Store conv weights for CPU conv in chunked mode
+                if chunked {
+                    conv_weights_per_layer.push((gdn.conv_weight.clone(), conv_bias));
+                }
+
                 let datas: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
                 match super::ane_bridge::AneKernel::compile_multi_weights(
                     &pre_r.mil_text, &names, &datas,
@@ -4074,26 +4359,34 @@ impl PrePackedWeights {
                 ) {
                     Ok(k) => kernels.push(Some(k)),
                     Err(e) => {
-                        eprintln!("GDN pre-recurrence layer {l} compile failed: {e}");
+                        tracing::warn!("GDN pre-recurrence layer {l} compile failed: {e}");
                         kernels.push(None);
                     }
                 }
             } else {
                 kernels.push(None);
+                if chunked {
+                    conv_weights_per_layer.push((vec![], vec![]));
+                }
             }
         }
 
         let count = kernels.iter().filter(|k| k.is_some()).count();
         let elapsed = t0.elapsed();
-        eprintln!("GDN pre-recurrence: {count}/{n_layers} per-layer kernels in {:.1}ms",
+        tracing::info!("GDN pre-recurrence: {count}/{n_layers} per-layer kernels in {:.1}ms",
             elapsed.as_secs_f64() * 1000.0);
         self.gdn_pre_recur_output_bytes = pre_r.output_bytes;
+        self.gdn_pre_recur_input_bytes = pre_r.input_bytes;
+        self.gdn_pre_recur_chunk = chunk_size;
+        self.gdn_pre_recur_overlap = overlap;
         self.gdn_pre_recur_per_layer = Some(kernels);
+        self.gdn_pre_recur_conv_weights = if chunked { Some(conv_weights_per_layer) } else { None };
     }
 
-    /// Evaluate fused GDN pre-recurrence on ANE (single dispatch).
+    /// Evaluate fused GDN pre-recurrence on ANE.
     ///
     /// Input: qkv|a|b concatenated `[in_ch, seq]` fp32.
+    /// For large seq_lens, automatically chunks into smaller pieces with conv overlap.
     /// Returns: (q_exp, k_exp, v, g, beta) — same as `cpu_gdn_pre_recurrence`.
     pub fn eval_gdn_pre_recurrence(
         &self,
@@ -4114,8 +4407,15 @@ impl PrePackedWeights {
         let value_dim = h_v * d_v;
         let qkv_dim = 2 * key_dim + value_dim;
         let seq = cfg.seq_len;
-        let in_ch = qkv_dim + 2 * h_v;
 
+        if self.gdn_pre_recur_chunk > 0 {
+            return self.eval_gdn_pre_recurrence_chunked(
+                kernel, qkv, a, b, cfg, qkv_dim, key_dim, value_dim, layer,
+            );
+        }
+
+        // Non-chunked path: single kernel call
+        let in_ch = qkv_dim + 2 * h_v;
         let mut input = Vec::with_capacity(in_ch * seq);
         input.extend_from_slice(qkv);
         input.extend_from_slice(a);
@@ -4137,7 +4437,6 @@ impl PrePackedWeights {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Unpack: q_exp[h_v*d_k,seq] | k_exp[h_v*d_k,seq] | v[value_dim,seq] | g[h_v,seq] | beta[h_v,seq]
         let q_dim = h_v * d_k;
         let mut offset = 0;
         let q_exp = out[offset..offset + q_dim * seq].to_vec();
@@ -4158,6 +4457,153 @@ impl PrePackedWeights {
             beta,
         }))
     }
+
+    /// Chunked eval: CPU conv+SiLU per-chunk with overlap, then ANE post-conv kernel.
+    ///
+    /// ANE can't run conv with pad=[0,0,0,0] (Program Inference error), so we run the
+    /// causal depthwise conv1d + SiLU on CPU with proper overlap context from previous
+    /// chunk data, then feed the post-SiLU QKV + A + B to the ANE post-conv kernel which
+    /// does RMSNorm + GQA expansion + decay/gate computation.
+    fn eval_gdn_pre_recurrence_chunked(
+        &self,
+        kernel: &super::ane_bridge::AneKernel,
+        qkv: &[f32],
+        a: &[f32],
+        b: &[f32],
+        cfg: &super::ane_mil::MilConfig,
+        qkv_dim: usize,
+        _key_dim: usize,
+        value_dim: usize,
+        layer: usize,
+    ) -> Option<Result<super::ane_forward::GdnPreRecurrenceOutput, String>> {
+        let h_v = cfg.linear_n_value_heads;
+        let d_k = cfg.linear_head_dim;
+        let seq = cfg.seq_len;
+        let chunk = self.gdn_pre_recur_chunk;
+        let overlap = self.gdn_pre_recur_overlap;
+        let conv_kernel = cfg.conv_kernel_size;
+
+        // Get conv weights for this layer
+        let conv_ws = self.gdn_pre_recur_conv_weights.as_ref()?;
+        let (conv_w, conv_b) = &conv_ws[layer];
+        if conv_w.is_empty() {
+            return None; // not a GDN layer
+        }
+
+        // Post-conv kernel input: [qkv_dim + 2*h_v, chunk] (qkv_silu | a | b)
+        let in_ch = qkv_dim + 2 * h_v;
+
+        // Output accumulators
+        let q_dim = h_v * d_k;
+        let out_ch = 2 * q_dim + value_dim + 2 * h_v;
+        let mut full_output = vec![0.0f32; out_ch * seq];
+
+        let n_chunks = (seq + chunk - 1) / chunk;
+        for ci in 0..n_chunks {
+            let chunk_start = ci * chunk;
+            let chunk_end = (chunk_start + chunk).min(seq);
+            let actual_chunk = chunk_end - chunk_start;
+
+            // 1. CPU: causal depthwise conv1d + SiLU on QKV for this chunk
+            //    with overlap context from previous timesteps
+            let mut qkv_silu = vec![0.0f32; qkv_dim * chunk];
+            for c in 0..qkv_dim {
+                for t in 0..actual_chunk {
+                    let global_t = chunk_start + t;
+                    let mut acc = 0.0f32;
+                    for ki in 0..conv_kernel {
+                        let src_t = global_t as isize - ki as isize;
+                        let val = if src_t >= 0 && (src_t as usize) < seq {
+                            qkv[c * seq + src_t as usize]
+                        } else {
+                            0.0
+                        };
+                        acc += val * conv_w[c * conv_kernel + ki];
+                    }
+                    if c < conv_b.len() {
+                        acc += conv_b[c];
+                    }
+                    // SiLU: x * sigmoid(x)
+                    qkv_silu[c * chunk + t] = acc / (1.0 + (-acc).exp());
+                }
+            }
+
+            // 2. Build post-conv ANE input: [qkv_dim + 2*h_v, chunk]
+            //    = qkv_silu | a_chunk | b_chunk
+            let mut chunk_input = Vec::with_capacity(in_ch * chunk);
+            chunk_input.extend_from_slice(&qkv_silu);
+            // A: [h_v, chunk]
+            for ch in 0..h_v {
+                for t in 0..chunk {
+                    let global_t = chunk_start + t;
+                    let val = if global_t < seq { a[ch * seq + global_t] } else { 0.0 };
+                    chunk_input.push(val);
+                }
+            }
+            // B: [h_v, chunk]
+            for ch in 0..h_v {
+                for t in 0..chunk {
+                    let global_t = chunk_start + t;
+                    let val = if global_t < seq { b[ch * seq + global_t] } else { 0.0 };
+                    chunk_input.push(val);
+                }
+            }
+
+            debug_assert_eq!(chunk_input.len(), in_ch * chunk);
+
+            // 3. ANE: post-conv kernel (RMSNorm + GQA + decay/gate)
+            let input_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk_input.as_ptr() as *const u8,
+                    chunk_input.len() * 4,
+                )
+            };
+            kernel.write_input(0, input_bytes);
+
+            if let Err(e) = kernel.eval() {
+                return Some(Err(format!(
+                    "pre-recurrence post-conv eval layer {layer} chunk {ci}: {e}"
+                )));
+            }
+
+            // Read chunk output: [out_ch, chunk]
+            let mut out_buf = vec![0u8; self.gdn_pre_recur_output_bytes];
+            kernel.read_output(0, &mut out_buf);
+            let chunk_out: Vec<f32> = out_buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            // Copy valid portion into full output
+            for ch in 0..out_ch {
+                let src_off = ch * chunk;
+                let dst_off = ch * seq + chunk_start;
+                full_output[dst_off..dst_off + actual_chunk]
+                    .copy_from_slice(&chunk_out[src_off..src_off + actual_chunk]);
+            }
+        }
+
+        // Unpack from full_output [out_ch, seq]
+        let mut offset = 0;
+        let q_exp = full_output[offset..offset + q_dim * seq].to_vec();
+        offset += q_dim * seq;
+        let k_exp = full_output[offset..offset + q_dim * seq].to_vec();
+        offset += q_dim * seq;
+        let v_raw = full_output[offset..offset + value_dim * seq].to_vec();
+        offset += value_dim * seq;
+        let g = full_output[offset..offset + h_v * seq].to_vec();
+        offset += h_v * seq;
+        let beta = full_output[offset..offset + h_v * seq].to_vec();
+
+        Some(Ok(super::ane_forward::GdnPreRecurrenceOutput {
+            q_exp,
+            k_exp,
+            v_raw,
+            g,
+            beta,
+        }))
+    }
+
 
     /// Evaluate fused GDN projections on per-layer kernel.
     /// Returns (qkv_raw, a_raw, b_raw, z) or None if not primed.
@@ -5138,6 +5584,140 @@ mod tests {
         assert!(
             nonzero > 0,
             "qkvb output is all zeros for over-parameterized attention"
+        );
+    }
+
+    /// Split QKV backward: 2 half-kernels produce same result as single kernel.
+    ///
+    /// Verifies the mathematical equivalence:
+    ///   dx_single = WQ^T@dQ + WK^T@dK + WV^T@dV
+    ///   dx_split  = (WQ_h0^T@dQ_first + WK^T@dK) + (WQ_h1^T@dQ_second + WV^T@dV)
+    #[test]
+    fn test_qkvb_split_matches_single() {
+        init_ane();
+
+        // Over-parameterized: qpd > ad (same as 35B structure)
+        let mut cfg = test_cfg();
+        cfg.dim = 64;
+        cfg.n_heads = 4;
+        cfg.head_dim_explicit = 32;
+        cfg.seq_len = 16;
+
+        let dim = cfg.dim;
+        let ad = cfg.attn_dim();   // 4 * 32 = 128
+        let qpd = cfg.q_proj_dim(); // 4 * 32 = 128 (same here, but split logic works regardless)
+        let seq = cfg.seq_len;
+        let half_qpd = qpd / 2;
+
+        // Random-ish weights (non-identity to test real matmul)
+        let wqt: Vec<f32> = (0..dim * qpd).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let wkt: Vec<f32> = (0..dim * ad).map(|i| ((i % 83) as f32 - 41.0) * 0.01).collect();
+        let wvt: Vec<f32> = (0..dim * ad).map(|i| ((i % 71) as f32 - 35.0) * 0.01).collect();
+
+        // Gradients
+        let dq: Vec<f32> = (0..qpd * seq).map(|i| ((i % 61) as f32 - 30.0) * 0.001).collect();
+        let dk: Vec<f32> = (0..ad * seq).map(|i| ((i % 47) as f32 - 23.0) * 0.001).collect();
+        let dv: Vec<f32> = (0..ad * seq).map(|i| ((i % 53) as f32 - 26.0) * 0.001).collect();
+
+        // --- Single kernel path ---
+        let single_mil = gen_qkvb_blob(&cfg);
+        let wqt_blob = build_fp16_blob(&wqt);
+        let wkt_blob = build_fp16_blob(&wkt);
+        let wvt_blob = build_fp16_blob(&wvt);
+        let names: Vec<&str> = single_mil.weight_names.iter().copied().collect();
+        let single_kernel = AneKernel::compile_multi_weights(
+            &single_mil.mil_text, &names, &[&wqt_blob, &wkt_blob, &wvt_blob],
+            &[single_mil.input_bytes], &[single_mil.output_bytes],
+        ).expect("single qkvb compile failed");
+
+        let mut single_input = Vec::with_capacity((qpd + 2 * ad) * seq);
+        single_input.extend_from_slice(&dq);
+        single_input.extend_from_slice(&dk);
+        single_input.extend_from_slice(&dv);
+        let single_bytes = unsafe {
+            std::slice::from_raw_parts(single_input.as_ptr() as *const u8, single_input.len() * 4)
+        };
+        single_kernel.write_input(0, single_bytes);
+        single_kernel.eval().expect("single qkvb eval failed");
+        let mut single_out = vec![0u8; dim * seq * 4];
+        single_kernel.read_output(0, &mut single_out);
+        let dx_single: Vec<f32> = single_out.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // --- Split kernel path ---
+        let mil_a = gen_qkvb_blob_split_half(&cfg, 0);
+        let mil_b = gen_qkvb_blob_split_half(&cfg, 1);
+
+        // Split Wq^T into halves along reduction axis (columns)
+        let wqt_h0: Vec<f32> = wqt.chunks_exact(qpd)
+            .flat_map(|row| &row[..half_qpd])
+            .copied()
+            .collect();
+        let wqt_h1: Vec<f32> = wqt.chunks_exact(qpd)
+            .flat_map(|row| &row[half_qpd..])
+            .copied()
+            .collect();
+        let wqt_h0_blob = build_fp16_blob(&wqt_h0);
+        let wqt_h1_blob = build_fp16_blob(&wqt_h1);
+
+        // Kernel A: Wq_h0 + Wk
+        let names_a: Vec<&str> = mil_a.weight_names.iter().copied().collect();
+        let kernel_a = AneKernel::compile_multi_weights(
+            &mil_a.mil_text, &names_a, &[&wqt_h0_blob, &wkt_blob],
+            &[mil_a.input_bytes], &[mil_a.output_bytes],
+        ).expect("split kernel A compile failed");
+
+        // Kernel B: Wq_h1 + Wv
+        let names_b: Vec<&str> = mil_b.weight_names.iter().copied().collect();
+        let kernel_b = AneKernel::compile_multi_weights(
+            &mil_b.mil_text, &names_b, &[&wqt_h1_blob, &wvt_blob],
+            &[mil_b.input_bytes], &[mil_b.output_bytes],
+        ).expect("split kernel B compile failed");
+
+        // Input A: dQ[0..half_qpd] | dK
+        let mut input_a = Vec::with_capacity((half_qpd + ad) * seq);
+        input_a.extend_from_slice(&dq[..half_qpd * seq]);
+        input_a.extend_from_slice(&dk);
+        let bytes_a = unsafe {
+            std::slice::from_raw_parts(input_a.as_ptr() as *const u8, input_a.len() * 4)
+        };
+        kernel_a.write_input(0, bytes_a);
+        kernel_a.eval().expect("split kernel A eval failed");
+
+        // Input B: dQ[half_qpd..qpd] | dV
+        let mut input_b = Vec::with_capacity((half_qpd + ad) * seq);
+        input_b.extend_from_slice(&dq[half_qpd * seq..]);
+        input_b.extend_from_slice(&dv);
+        let bytes_b = unsafe {
+            std::slice::from_raw_parts(input_b.as_ptr() as *const u8, input_b.len() * 4)
+        };
+        kernel_b.write_input(0, bytes_b);
+        kernel_b.eval().expect("split kernel B eval failed");
+
+        // Read and sum
+        let mut out_a = vec![0u8; dim * seq * 4];
+        let mut out_b = vec![0u8; dim * seq * 4];
+        kernel_a.read_output(0, &mut out_a);
+        kernel_b.read_output(0, &mut out_b);
+        let dx_split: Vec<f32> = out_a.chunks_exact(4)
+            .zip(out_b.chunks_exact(4))
+            .map(|(a, b)| {
+                f32::from_le_bytes([a[0], a[1], a[2], a[3]])
+                + f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            })
+            .collect();
+
+        // Verify equivalence (fp16 quantization allows small error)
+        assert_eq!(dx_single.len(), dx_split.len());
+        let max_err = dx_single.iter().zip(dx_split.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_val = dx_single.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_err < max_val * 0.01,
+            "split QKV backward diverges from single: max_err={max_err}, max_val={max_val}, ratio={:.4}",
+            max_err / max_val.max(1e-10),
         );
     }
 
