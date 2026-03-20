@@ -10,12 +10,54 @@
 
 use super::ane_forward::{cpu_matmul, cpu_quantized_matmul, rmsnorm, vec_add_inplace};
 use super::ane_mil::MilConfig;
-use super::ane_weights::{ModelWeights, QuantizedTensor};
+use super::ane_weights::{GdnLayerWeights, ModelWeights, QuantizedTensor};
 
 /// SiLU activation in-place: x[i] = x[i] * sigmoid(x[i]).
 fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = *v * (1.0 / (1.0 + (-*v).exp()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDN Decode State
+// ---------------------------------------------------------------------------
+
+/// Per-layer GDN decode state for single-token autoregressive generation.
+///
+/// Stores the recurrence state (linear attention memory) and causal conv1d
+/// buffer. The batch forward (`cpu_gdn_forward`) processes all tokens at once;
+/// this struct carries the equivalent state across individual decode steps.
+#[derive(Clone)]
+pub(crate) struct GdnLayerDecodeState {
+    /// Recurrence state: flat `[h_v * d_v * d_k]`.
+    /// Layout: `state[h * d_v * d_k + dv * d_k + dk]`.
+    recurrence: Vec<f32>,
+    /// Causal conv1d buffer: `[qkv_dim * (kernel_size - 1)]`.
+    /// Stores the last `kernel_size - 1` pre-conv QKV values per channel.
+    /// Layout: `buf[c * (kernel_size - 1) + lag]` where lag=0 is most recent.
+    conv_buf: Vec<f32>,
+    /// Conv kernel size (for buffer indexing).
+    kernel_size: usize,
+    /// QKV dimension (for buffer indexing).
+    qkv_dim: usize,
+}
+
+impl GdnLayerDecodeState {
+    fn new(cfg: &MilConfig) -> Self {
+        let h_v = cfg.linear_n_value_heads;
+        let d_k = cfg.linear_head_dim;
+        let d_v = cfg.linear_value_head_dim;
+        let key_dim = cfg.linear_n_heads * d_k;
+        let value_dim = h_v * d_v;
+        let qkv_dim = 2 * key_dim + value_dim;
+        let kernel = cfg.conv_kernel_size;
+        Self {
+            recurrence: vec![0.0f32; h_v * d_v * d_k],
+            conv_buf: vec![0.0f32; qkv_dim * (kernel - 1)],
+            kernel_size: kernel,
+            qkv_dim,
+        }
     }
 }
 
@@ -40,6 +82,8 @@ pub struct KvCache {
     n_kv_heads: usize,
     /// Per-head dimension.
     head_dim: usize,
+    /// GDN decode state per layer (None for MHA layers).
+    gdn: Vec<Option<GdnLayerDecodeState>>,
 }
 
 impl KvCache {
@@ -55,6 +99,19 @@ impl KvCache {
             max_seq,
             n_kv_heads,
             head_dim,
+            gdn: vec![None; n_layers],
+        }
+    }
+
+    /// Initialize GDN decode state for layers that have GDN weights.
+    ///
+    /// Call after construction to enable full GDN attention in decode steps.
+    /// Without this, GDN layers fall back to FFN-only (no attention).
+    pub fn init_gdn(&mut self, model: &ModelWeights) {
+        for (l, lw) in model.layers.iter().enumerate() {
+            if lw.gdn.is_some() {
+                self.gdn[l] = Some(GdnLayerDecodeState::new(&model.cfg));
+            }
         }
     }
 
@@ -213,6 +270,162 @@ pub struct DecodeResult {
     pub logits: Vec<f32>,
 }
 
+// ---------------------------------------------------------------------------
+// Single-token GDN decode
+// ---------------------------------------------------------------------------
+
+/// Single-token GDN linear attention for one layer.
+///
+/// Performs: projections → causal conv1d → QK norm → GQA expand →
+/// single-step recurrence → output gate → O projection.
+///
+/// Returns `[dim]` attention output to be added as residual.
+fn gdn_decode_single(
+    gdn_w: &GdnLayerWeights,
+    state: &mut GdnLayerDecodeState,
+    xnorm: &[f32], // [dim] — post-attention-RMSNorm input
+    cfg: &MilConfig,
+) -> Vec<f32> {
+    let dim = cfg.dim;
+    let h_k = cfg.linear_n_heads;
+    let d_k = cfg.linear_head_dim;
+    let h_v = cfg.linear_n_value_heads;
+    let d_v = cfg.linear_value_head_dim;
+    let key_dim = h_k * d_k;
+    let value_dim = h_v * d_v;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let kernel = cfg.conv_kernel_size;
+    let kv_repeat = h_v / h_k.max(1);
+
+    // 1. Project QKV, a, b, z — all [out_dim] for seq=1
+    let qkv_raw = cpu_matmul(&gdn_w.qkv_proj, xnorm, qkv_dim, dim, 1);
+    let a_raw = cpu_matmul(&gdn_w.a_proj, xnorm, h_v, dim, 1);
+    let b_raw = cpu_matmul(&gdn_w.b_proj, xnorm, h_v, dim, 1);
+    let z = cpu_matmul(&gdn_w.z_proj, xnorm, value_dim, dim, 1);
+
+    // 2. Causal conv1d + SiLU
+    let buf_stride = kernel - 1;
+    let mut qkv_conv = vec![0.0f32; qkv_dim];
+    for c in 0..qkv_dim {
+        let mut acc = qkv_raw[c] * gdn_w.conv_weight[c * kernel];
+        for ki in 1..kernel {
+            acc += state.conv_buf[c * buf_stride + ki - 1] * gdn_w.conv_weight[c * kernel + ki];
+        }
+        if c < gdn_w.conv_bias.len() {
+            acc += gdn_w.conv_bias[c];
+        }
+        qkv_conv[c] = acc / (1.0 + (-acc).exp()); // SiLU
+    }
+    // Shift buffer: oldest out, newest in
+    for c in 0..qkv_dim {
+        for lag in (1..buf_stride).rev() {
+            state.conv_buf[c * buf_stride + lag] = state.conv_buf[c * buf_stride + lag - 1];
+        }
+        state.conv_buf[c * buf_stride] = qkv_raw[c];
+    }
+
+    // 3. Split Q, K, V
+    let q_raw = &qkv_conv[0..key_dim];
+    let k_raw = &qkv_conv[key_dim..2 * key_dim];
+    let v_raw = &qkv_conv[2 * key_dim..qkv_dim];
+
+    // 4. Weight-free per-head RMSNorm on Q and K
+    let inv_scale = (d_k as f32).powf(-0.5);
+    let mut q = vec![0.0f32; key_dim];
+    let mut k = vec![0.0f32; key_dim];
+    for h in 0..h_k {
+        let base = h * d_k;
+        let mut q_ss = 0.0f32;
+        let mut k_ss = 0.0f32;
+        for d in 0..d_k {
+            q_ss += q_raw[base + d] * q_raw[base + d];
+            k_ss += k_raw[base + d] * k_raw[base + d];
+        }
+        let q_rms = (q_ss / d_k as f32 + 1e-6).sqrt();
+        let k_rms = (k_ss / d_k as f32 + 1e-6).sqrt();
+        for d in 0..d_k {
+            q[base + d] = q_raw[base + d] / q_rms * inv_scale * inv_scale;
+            k[base + d] = k_raw[base + d] / k_rms * inv_scale;
+        }
+    }
+
+    // 5. GQA expansion (replicate Q/K heads to match value heads)
+    let (q_exp, k_exp) = if kv_repeat > 1 {
+        let mut qe = vec![0.0f32; h_v * d_k];
+        let mut ke = vec![0.0f32; h_v * d_k];
+        for hk in 0..h_k {
+            for r in 0..kv_repeat {
+                let hv = hk * kv_repeat + r;
+                qe[hv * d_k..(hv + 1) * d_k].copy_from_slice(&q[hk * d_k..(hk + 1) * d_k]);
+                ke[hv * d_k..(hv + 1) * d_k].copy_from_slice(&k[hk * d_k..(hk + 1) * d_k]);
+            }
+        }
+        (qe, ke)
+    } else {
+        (q, k)
+    };
+
+    // 6. Decay (g) and write gate (beta) per value head
+    let mut g_vals = vec![0.0f32; h_v];
+    let mut beta_vals = vec![0.0f32; h_v];
+    for h in 0..h_v {
+        let a_val = a_raw[h] + gdn_w.dt_bias[h];
+        let sp = if a_val > 20.0 { a_val } else { a_val.exp().ln_1p() };
+        g_vals[h] = (-gdn_w.a_log[h].exp() * sp).exp();
+        beta_vals[h] = 1.0 / (1.0 + (-b_raw[h]).exp());
+    }
+
+    // 7. Single-step recurrence
+    let mut y = vec![0.0f32; value_dim];
+    for h in 0..h_v {
+        let g_t = g_vals[h];
+        let beta_t = beta_vals[h];
+        let state_base = h * d_v * d_k;
+        for dv in 0..d_v {
+            let row = state_base + dv * d_k;
+            let mut kv_mem = 0.0f32;
+            for dk in 0..d_k {
+                state.recurrence[row + dk] *= g_t;
+                kv_mem += state.recurrence[row + dk] * k_exp[h * d_k + dk];
+            }
+            let delta = (v_raw[h * d_v + dv] - kv_mem) * beta_t;
+            for dk in 0..d_k {
+                state.recurrence[row + dk] += k_exp[h * d_k + dk] * delta;
+            }
+            let mut y_val = 0.0f32;
+            for dk in 0..d_k {
+                y_val += state.recurrence[row + dk] * q_exp[h * d_k + dk];
+            }
+            y[h * d_v + dv] = y_val;
+        }
+    }
+
+    // 8. Output gate: SiLU(z) * RMSNorm(y)
+    let shared_norm = gdn_w.norm_weight.len() == d_v;
+    let mut gated = vec![0.0f32; value_dim];
+    for h in 0..h_v {
+        let mut ss = 0.0f32;
+        for d in 0..d_v {
+            let val = y[h * d_v + d];
+            ss += val * val;
+        }
+        let rms = (ss / d_v as f32 + 1e-6).sqrt();
+        for d in 0..d_v {
+            let norm_w = if shared_norm {
+                gdn_w.norm_weight[d]
+            } else {
+                gdn_w.norm_weight[h * d_v + d]
+            };
+            let z_val = z[h * d_v + d];
+            let silu_z = z_val / (1.0 + (-z_val).exp());
+            gated[h * d_v + d] = silu_z * (y[h * d_v + d] / rms * norm_w);
+        }
+    }
+
+    // 9. O projection: [dim, value_dim] @ [value_dim] → [dim]
+    cpu_matmul(&gdn_w.o_proj, &gated, dim, value_dim, 1)
+}
+
 /// Single-token forward pass with KV cache. Returns logits for next-token prediction.
 ///
 /// This is the CPU-only baseline. ANE acceleration is layered on top for FFN.
@@ -246,11 +459,16 @@ pub fn decode_step(
     for l in 0..n_layers {
         let lw = &model.layers[l];
 
-        // GDN (linear attention) layers: skip attention, do FFN only.
-        // Proper single-token GDN decode requires persistent recurrence state;
-        // for now, draft tokens from GDN layers are low quality but the
-        // speculative verify step on the target model ensures correct output.
-        if lw.gdn.is_some() {
+        // GDN (linear attention) layers
+        if let Some(ref gdn_w) = lw.gdn {
+            if let Some(ref mut gdn_state) = kv_cache.gdn[l] {
+                // Full GDN decode: attention + FFN
+                let mut xnorm = vec![0.0f32; dim];
+                rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
+                let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg);
+                vec_add_inplace(&mut x, &attn_out);
+            }
+            // FFN (always runs, with or without GDN attention)
             let mut x2norm = vec![0.0f32; dim];
             rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
             let hidden = cfg.hidden_dim;
@@ -843,8 +1061,16 @@ pub fn decode_step_blob(
     for l in 0..n_layers {
         let lw = &model.layers[l];
 
-        // GDN layers: skip attention, ANE FFN only
-        if lw.gdn.is_some() {
+        // GDN (linear attention) layers
+        if let Some(ref gdn_w) = lw.gdn {
+            if let Some(ref mut gdn_state) = kv_cache.gdn[l] {
+                // Full GDN decode: attention (CPU) + FFN (ANE)
+                let mut xnorm = vec![0.0f32; dim];
+                rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
+                let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg);
+                vec_add_inplace(&mut x, &attn_out);
+            }
+            // FFN (ANE with CPU fallback)
             x = kernels.eval_ffn(l, &x).unwrap_or_else(|e| {
                 tracing::warn!("ANE ffn layer {l} (GDN) failed: {e}, CPU fallback");
                 let mut x2norm = vec![0.0f32; dim];
@@ -1698,6 +1924,228 @@ mod tests {
         assert_ne!(
             r_with_context.logits, r_alone.logits,
             "KV cache has no effect — decode with prior context should differ from fresh decode"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GDN decode tests
+    // -----------------------------------------------------------------------
+
+    /// Build a tiny model with GDN layers for testing GDN decode.
+    /// 4 layers: [GDN, MHA, GDN, MHA]. dim=64, hidden=128.
+    fn make_tiny_gdn_model() -> ModelWeights {
+        let dim = 64;
+        let hidden = 128;
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = dim / n_heads; // 16
+        let vocab = 32;
+        let n_layers = 4;
+
+        // GDN config: h_k=2, d_k=16, h_v=4, d_v=16, conv_kernel=4
+        let h_k = 2;
+        let d_k = 16;
+        let h_v = 4;
+        let d_v = 16;
+        let key_dim = h_k * d_k;  // 32
+        let value_dim = h_v * d_v; // 64
+        let qkv_dim = 2 * key_dim + value_dim; // 128
+        let conv_kernel = 4;
+
+        let mut cfg = MilConfig::mha(dim, hidden, n_heads, 1);
+        cfg.n_kv_heads = n_kv_heads;
+        cfg.head_dim_explicit = head_dim;
+        cfg.linear_n_heads = h_k;
+        cfg.linear_head_dim = d_k;
+        cfg.linear_n_value_heads = h_v;
+        cfg.linear_value_head_dim = d_v;
+        cfg.conv_kernel_size = conv_kernel;
+
+        let mut seed = 42u64;
+        let mut rand = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.02 - 0.01
+        };
+        let make_vec = |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> {
+            (0..n).map(|_| r()).collect()
+        };
+
+        let q_proj_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        let make_gdn = |r: &mut dyn FnMut() -> f32| -> super::super::ane_weights::GdnLayerWeights {
+            super::super::ane_weights::GdnLayerWeights {
+                qkv_proj: make_vec(qkv_dim * dim, r),
+                a_proj: make_vec(h_v * dim, r),
+                b_proj: make_vec(h_v * dim, r),
+                z_proj: make_vec(value_dim * dim, r),
+                o_proj: make_vec(dim * value_dim, r),
+                a_log: make_vec(h_v, r),
+                dt_bias: make_vec(h_v, r),
+                norm_weight: make_vec(d_v, r).iter().map(|x| x.abs() + 0.1).collect(),
+                conv_weight: make_vec(qkv_dim * conv_kernel, r),
+                conv_bias: make_vec(qkv_dim, r),
+            }
+        };
+
+        let layers: Vec<LayerWeights> = (0..n_layers)
+            .map(|i| {
+                let is_gdn = i % 2 == 0;
+                LayerWeights {
+                    wq: make_vec(q_proj_dim * dim, &mut rand),
+                    wk: make_vec(kv_dim * dim, &mut rand),
+                    wv: make_vec(kv_dim * dim, &mut rand),
+                    wo: make_vec(dim * q_proj_dim, &mut rand),
+                    w1: make_vec(hidden * dim, &mut rand),
+                    w2: make_vec(dim * hidden, &mut rand),
+                    w3: make_vec(hidden * dim, &mut rand),
+                    rms_att: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                    rms_ffn: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+                    q_norm: None,
+                    k_norm: None,
+                    gdn: if is_gdn { Some(make_gdn(&mut rand)) } else { None },
+                }
+            })
+            .collect();
+
+        ModelWeights {
+            cfg,
+            layers,
+            rms_final: make_vec(dim, &mut rand).iter().map(|x| x.abs() + 0.1).collect(),
+            embed: make_vec(vocab * dim, &mut rand),
+            vocab_size: vocab,
+            lm_head: None,
+        }
+    }
+
+    #[test]
+    fn test_gdn_decode_produces_nonzero_logits() {
+        let model = make_tiny_gdn_model();
+        let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache.init_gdn(&model);
+
+        let result = decode_step(&model, 5, &mut cache);
+        assert_eq!(result.logits.len(), model.vocab_size);
+        assert!(
+            result.logits.iter().any(|&v| v.abs() > 1e-10),
+            "GDN decode produced all-zero logits"
+        );
+    }
+
+    #[test]
+    fn test_gdn_decode_state_accumulates() {
+        let model = make_tiny_gdn_model();
+
+        // Decode [5, 10] with GDN state
+        let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache.init_gdn(&model);
+        let _ = decode_step(&model, 5, &mut cache);
+        let r_with_context = decode_step(&model, 10, &mut cache);
+
+        // Decode [10] alone with fresh GDN state
+        let mut cache_alone = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache_alone.init_gdn(&model);
+        let r_alone = decode_step(&model, 10, &mut cache_alone);
+
+        assert_ne!(
+            r_with_context.logits, r_alone.logits,
+            "GDN state has no effect — decode with prior context should differ"
+        );
+    }
+
+    #[test]
+    fn test_gdn_decode_deterministic() {
+        let model = make_tiny_gdn_model();
+
+        let mut cache1 = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache1.init_gdn(&model);
+        let r1 = decode_step(&model, 3, &mut cache1);
+
+        let mut cache2 = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache2.init_gdn(&model);
+        let r2 = decode_step(&model, 3, &mut cache2);
+
+        assert_eq!(r1.logits, r2.logits, "GDN decode is not deterministic");
+    }
+
+    #[test]
+    fn test_gdn_decode_matches_batch_forward() {
+        use super::super::ane_forward::cpu_gdn_forward_bench;
+
+        let model = make_tiny_gdn_model();
+        let dim = model.cfg.dim;
+        let seq = 4;
+        let n_layers = model.layers.len();
+
+        // Generate per-token xnorm inputs (post-embedding, post-RMSNorm)
+        let mut seed = 99u64;
+        let mut rand = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 0.1 - 0.05
+        };
+        let xnorm_tokens: Vec<Vec<f32>> = (0..seq).map(|_| (0..dim).map(|_| rand()).collect()).collect();
+
+        // Test GDN layer 0 (first GDN layer)
+        let gdn_layer_idx = 0;
+        let gdn_w = model.layers[gdn_layer_idx].gdn.as_ref().unwrap();
+
+        // Batch forward: pack [dim, seq] channels-first, run batch GDN
+        let mut cfg_batch = model.cfg.clone();
+        cfg_batch.seq_len = seq;
+        let mut xnorm_batch = vec![0.0f32; dim * seq];
+        for t in 0..seq {
+            for d in 0..dim {
+                xnorm_batch[d * seq + t] = xnorm_tokens[t][d];
+            }
+        }
+        let batch_out = cpu_gdn_forward_bench(gdn_w, &xnorm_batch, &cfg_batch);
+        // batch_out is [dim, seq] channels-first
+
+        // Single-token decode: process one token at a time
+        let mut gdn_state = GdnLayerDecodeState::new(&model.cfg);
+        let mut decode_outputs: Vec<Vec<f32>> = Vec::new();
+        for t in 0..seq {
+            let out = gdn_decode_single(gdn_w, &mut gdn_state, &xnorm_tokens[t], &model.cfg);
+            decode_outputs.push(out);
+        }
+
+        // Compare at each position
+        for t in 0..seq {
+            for d in 0..dim {
+                let batch_val = batch_out[d * seq + t];
+                let decode_val = decode_outputs[t][d];
+                let diff = (batch_val - decode_val).abs();
+                let scale = batch_val.abs().max(decode_val.abs()).max(1e-6);
+                assert!(
+                    diff / scale < 1e-4,
+                    "Mismatch at t={t}, d={d}: batch={batch_val:.6}, decode={decode_val:.6}, rel_diff={:.6}",
+                    diff / scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gdn_decode_ffn_only_fallback() {
+        let model = make_tiny_gdn_model();
+
+        // Without init_gdn: FFN-only fallback
+        let mut cache_no_gdn = KvCache::new(&model.cfg, model.layers.len(), 64);
+        let r_no_gdn = decode_step(&model, 5, &mut cache_no_gdn);
+
+        // With init_gdn: full GDN attention
+        let mut cache_gdn = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache_gdn.init_gdn(&model);
+        let r_gdn = decode_step(&model, 5, &mut cache_gdn);
+
+        // Both should produce valid logits
+        assert_eq!(r_no_gdn.logits.len(), model.vocab_size);
+        assert_eq!(r_gdn.logits.len(), model.vocab_size);
+
+        // They should differ (GDN attention adds information that FFN-only misses)
+        assert_ne!(
+            r_no_gdn.logits, r_gdn.logits,
+            "GDN attention should produce different output than FFN-only"
         );
     }
 
@@ -3135,7 +3583,8 @@ impl SpeculativeDecoder {
         max_seq: usize,
     ) -> Self {
         let n_layers = draft_model.layers.len();
-        let kv_cache = KvCache::new(&draft_model.cfg, n_layers, max_seq);
+        let mut kv_cache = KvCache::new(&draft_model.cfg, n_layers, max_seq);
+        kv_cache.init_gdn(&draft_model);
         let decode_kernels = BlobDecodeKernels::compile(&draft_model, 1)
             .or_else(|| {
                 tracing::info!("SpeculativeDecoder: seq=1 failed, trying seq=16");
