@@ -2978,7 +2978,7 @@ impl MlxLoraModel {
     }
 
     /// Forward pass with layer caches for incremental generation.
-    fn forward_logits_cached(
+    pub(crate) fn forward_logits_cached(
         &mut self,
         tokens: &Array,
         caches: &mut [LayerCache],
@@ -3758,6 +3758,15 @@ impl PlainKvCache {
         self.len
     }
 
+    /// Roll back position to `pos`. Data beyond `pos` stays in the buffer
+    /// but is dead — `current_views()` slices to `..self.len`.
+    pub fn rollback_to(&mut self, pos: i32) {
+        debug_assert!(pos >= 0 && pos <= self.len);
+        self.len = pos;
+        self.len_array = None;
+        self.positions = None;
+    }
+
     fn promotion_config(&self) -> Option<QuantizedKvPromotionConfig> {
         self.promotion
             .filter(|promotion| self.len >= promotion.start)
@@ -4001,6 +4010,11 @@ impl QuantizedKvCache {
     pub fn len(&self) -> i32 {
         self.len
     }
+
+    pub fn rollback_to(&mut self, pos: i32) {
+        debug_assert!(pos >= 0 && pos <= self.len);
+        self.len = pos;
+    }
 }
 
 impl KvCache {
@@ -4063,6 +4077,13 @@ impl KvCache {
         }
     }
 
+    pub fn rollback_to(&mut self, pos: i32) {
+        match self {
+            KvCache::Plain(cache) => cache.rollback_to(pos),
+            KvCache::Quantized(cache) => cache.rollback_to(pos),
+        }
+    }
+
     #[cfg(test)]
     fn is_quantized(&self) -> bool {
         matches!(self, KvCache::Quantized(_))
@@ -4079,6 +4100,15 @@ impl GdnCache {
     }
 }
 
+impl LayerCache {
+    /// Roll back positional KV cache. No-op for recurrent (GDN) layers.
+    pub fn rollback_to(&mut self, pos: i32) {
+        if let LayerCache::FullAttn(kv) = self {
+            kv.rollback_to(pos);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PrefillState {
     pub caches: Vec<LayerCache>,
@@ -4086,7 +4116,7 @@ pub struct PrefillState {
     pub prompt_len: usize,
 }
 
-fn sample_next_token(logits: &Array, temperature: f32) -> Result<Array, Exception> {
+pub(crate) fn sample_next_token(logits: &Array, temperature: f32) -> Result<Array, Exception> {
     let token = if temperature <= 0.0 || temperature < 1e-6 {
         mlx_rs::ops::indexing::argmax_axis(logits, -1, false)?
     } else {
@@ -4323,18 +4353,15 @@ pub fn export_adapters(
     )
     .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
 
-    // Count LoRA layers (layers that have at least one trainable param)
-    let lora_layers = (0..model_config.n_layers)
-        .filter(|i| !model_config.is_linear_attn_layer(*i))
-        .count();
-
-    // Write adapter_config.json
+    // Write adapter_config.json (mlx_lm >= 0.24 requires `lora_parameters` dict)
+    let scale = config.alpha / config.rank as f32;
     let adapter_config = serde_json::json!({
-        "alpha": config.alpha,
-        "dropout": 0.0,
-        "keys": LORA_KEYS,
-        "lora_layers": lora_layers,
-        "rank": config.rank,
+        "lora_parameters": {
+            "rank": config.rank,
+            "scale": scale,
+            "dropout": 0.0,
+            "keys": LORA_KEYS,
+        },
         "num_layers": model_config.n_layers,
     });
     let config_path = output_dir.join("adapter_config.json");
@@ -4403,15 +4430,14 @@ pub fn export_ane_adapters(
     )
     .map_err(|e| anyhow::anyhow!("save safetensors: {e}"))?;
 
-    let lora_layers = (0..model_config.n_layers)
-        .filter(|i| !model_config.is_linear_attn_layer(*i))
-        .count();
+    let scale = lora.config.alpha / lora.config.rank as f32;
     let adapter_config = serde_json::json!({
-        "alpha": lora.config.alpha,
-        "dropout": 0.0,
-        "keys": LORA_KEYS,
-        "lora_layers": lora_layers,
-        "rank": lora.config.rank,
+        "lora_parameters": {
+            "rank": lora.config.rank,
+            "scale": scale,
+            "dropout": 0.0,
+            "keys": LORA_KEYS,
+        },
         "num_layers": model_config.n_layers,
     });
     let config_path = output_dir.join("adapter_config.json");
@@ -4966,21 +4992,24 @@ mod tests {
         let config = LoraConfig::default();
         let model_config = ModelConfig::qwen3_1_7b();
 
+        let scale = config.alpha / config.rank as f32;
         let adapter_config = serde_json::json!({
-            "alpha": config.alpha,
-            "dropout": 0.0,
-            "keys": LORA_KEYS,
-            "lora_layers": model_config.n_layers,
-            "rank": config.rank,
+            "lora_parameters": {
+                "rank": config.rank,
+                "scale": scale,
+                "dropout": 0.0,
+                "keys": LORA_KEYS,
+            },
             "num_layers": model_config.n_layers,
         });
 
         let json_str = serde_json::to_string_pretty(&adapter_config).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed["alpha"], 32.0);
-        assert_eq!(parsed["rank"], 32);
-        assert_eq!(parsed["lora_layers"], 28);
-        let keys: Vec<String> = parsed["keys"]
+        let lp = &parsed["lora_parameters"];
+        assert_eq!(lp["rank"], 32);
+        assert_eq!(lp["scale"], 1.0);
+        assert_eq!(parsed["num_layers"], 28);
+        let keys: Vec<String> = lp["keys"]
             .as_array()
             .unwrap()
             .iter()
@@ -5097,9 +5126,9 @@ mod tests {
         assert!(config_path.exists(), "adapter_config.json not found");
         let config_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(config_json["rank"], 32);
-        assert_eq!(config_json["alpha"], 32.0);
-        assert_eq!(config_json["lora_layers"], 28);
+        let lp = &config_json["lora_parameters"];
+        assert_eq!(lp["rank"], 32);
+        assert_eq!(lp["scale"], 1.0);
 
         eprintln!(
             "exported {} adapter tensors to {}",
@@ -5197,8 +5226,8 @@ mod tests {
             &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(config_json["lora_layers"], 6, "only 6 full-attn layers");
         assert_eq!(config_json["num_layers"], 24);
+        assert!(config_json["lora_parameters"].is_object(), "lora_parameters dict required");
 
         eprintln!("exported {} adapter tensors (Qwen3.5-2B)", n);
     }
@@ -5267,9 +5296,9 @@ mod tests {
             &std::fs::read_to_string(tmpdir.path().join("adapter_config.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(config_json["rank"], 32);
-        assert_eq!(config_json["alpha"], 32.0);
-        assert_eq!(config_json["lora_layers"], 6);
+        let lp = &config_json["lora_parameters"];
+        assert_eq!(lp["rank"], 32);
+        assert_eq!(lp["scale"], 1.0);
         assert_eq!(config_json["num_layers"], 24);
     }
 

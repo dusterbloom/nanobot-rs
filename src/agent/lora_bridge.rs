@@ -1154,13 +1154,20 @@ pub fn merge_lora_to_disk(
         &std::fs::read_to_string(&adapter_config_path)
             .with_context(|| format!("reading {}", adapter_config_path.display()))?,
     )?;
-    let rank = adapter_config["rank"].as_f64().unwrap_or(32.0);
-    let alpha = adapter_config["alpha"].as_f64().unwrap_or(rank);
-    let scale = alpha / rank;
+    // Support both old format (flat rank/alpha) and new format (lora_parameters dict)
+    let (rank, scale) = if let Some(lp) = adapter_config.get("lora_parameters") {
+        let r = lp["rank"].as_f64().unwrap_or(32.0);
+        let s = lp["scale"].as_f64().unwrap_or(1.0);
+        (r, s)
+    } else {
+        let r = adapter_config["rank"].as_f64().unwrap_or(32.0);
+        let a = adapter_config["alpha"].as_f64().unwrap_or(r);
+        (r, a / r)
+    };
 
     info!(
-        "LoRA merge: rank={}, alpha={}, scale={:.4}",
-        rank, alpha, scale
+        "LoRA merge: rank={}, scale={:.4}",
+        rank, scale
     );
 
     // 2. Load base model weights.
