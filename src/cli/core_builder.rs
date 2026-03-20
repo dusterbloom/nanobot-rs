@@ -538,11 +538,33 @@ pub(crate) fn start_mlx_provider(config: &Config) -> anyhow::Result<MlxHandle> {
         "MLX inference forced to external server"
     );
 
-    let provider = crate::providers::mlx::MlxProvider::start_with_mlx_lm(
+    for warning in config.agents.defaults.validate_speculative_config() {
+        tracing::warn!("{warning}");
+    }
+
+    let draft_model = config
+        .agents
+        .defaults
+        .draft_model
+        .as_ref()
+        .map(|s| crate::utils::helpers::expand_tilde(s));
+    let num_draft_tokens = config.agents.defaults.num_draft_tokens;
+    if draft_model.is_some() {
+        tracing::info!(
+            draft_model = ?draft_model,
+            num_draft_tokens = ?num_draft_tokens,
+            "speculative decoding enabled"
+        );
+    }
+
+    let provider = crate::providers::mlx::MlxProvider::start_with_options(
         model_dir,
         model_config,
         lora_config,
         mlx_lm_url,
+        draft_model,
+        num_draft_tokens,
+        config.agents.defaults.local_api_key.clone(),
     )?;
     Ok(MlxHandle {
         provider: Arc::new(provider),
@@ -1015,6 +1037,24 @@ fn create_agent_loop_inner(
                     "ANE standalone training: model dir resolved"
                 );
                 agent_loop.set_ane_model_dir(Some(model_dir));
+                // Wire separate training model if configured.
+                if let Some(ref training_model) = config.agents.defaults.training_model {
+                    let training_dir = crate::utils::helpers::expand_tilde(training_model);
+                    if training_dir.join("config.json").exists()
+                        && training_dir.join("tokenizer.json").exists()
+                    {
+                        tracing::info!(
+                            training_model_dir = %training_dir.display(),
+                            "ANE training: separate training model configured"
+                        );
+                        agent_loop.set_ane_training_model_dir(Some(training_dir));
+                    } else {
+                        tracing::warn!(
+                            training_model = %training_model,
+                            "ANE training: trainingModel dir missing config.json/tokenizer.json, ignoring"
+                        );
+                    }
+                }
                 // Auto-enable perplexity gate if not already enabled.
                 if !agent_loop.has_perplexity_gate() {
                     let mut gate_config = config.perplexity_gate.clone();

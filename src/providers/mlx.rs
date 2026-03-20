@@ -122,6 +122,8 @@ mod inner {
         thinking_model: bool,
         /// When set, chat() delegates to this mlx-lm server URL.
         mlx_lm_url: Option<String>,
+        /// API key for external server auth (Bearer token).
+        api_key: String,
         http_client: reqwest::Client,
         /// Managed mlx-lm subprocess (when mlxLmUrl is "auto").
         managed_server: Option<Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>>,
@@ -177,7 +179,7 @@ mod inner {
             lora_config: LoraConfig,
             mlx_lm_url: Option<String>,
         ) -> Result<Self> {
-            Self::start_with_options(model_dir, model_config, lora_config, mlx_lm_url, None, None)
+            Self::start_with_options(model_dir, model_config, lora_config, mlx_lm_url, None, None, String::new())
         }
 
         /// Start with optional mlx-lm server URL and draft model for speculative decoding.
@@ -188,6 +190,7 @@ mod inner {
             mlx_lm_url: Option<String>,
             draft_model: Option<PathBuf>,
             num_draft_tokens: Option<u32>,
+            api_key: String,
         ) -> Result<Self> {
             let tokenizer = MlxTokenizer::load(&model_dir).context("Failed to load tokenizer")?;
             let model_name = model_dir
@@ -322,8 +325,9 @@ mod inner {
             // The decoder runs on a background thread; LoRA updates arrive via draft_reload_tx.
             #[cfg(feature = "ane")]
             let (spec_decode_tx, draft_reload_tx, initial_draft_len) = match draft_model.as_ref() {
-                Some(draft_dir) if resolved_url.is_none() => {
-                    // In-process mode: load draft model for ANE speculative decode
+                Some(draft_dir) => {
+                    // Load draft model for ANE speculative decode (works with
+                    // both in-process and external server verification)
                     match crate::agent::ane_decode::load_draft_model(draft_dir) {
                         Ok(draft_weights) => {
                             let (reload_tx, reload_rx) = std::sync::mpsc::sync_channel(1);
@@ -367,6 +371,7 @@ mod inner {
                 api_base,
                 thinking_model,
                 mlx_lm_url: resolved_url,
+                api_key,
                 http_client: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(300))
                     .build()
@@ -506,7 +511,7 @@ mod inner {
                 self.inject_nothink(messages)
             };
             let mut body = serde_json::json!({
-                "model": &self.model_path,
+                "model": &self.model_name,
                 "messages": msgs,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -517,10 +522,11 @@ mod inner {
                 }
             }
 
-            let resp = self
-                .http_client
-                .post(&url)
-                .json(&body)
+            let mut req = self.http_client.post(&url).json(&body);
+            if !self.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            let resp = req
                 .send()
                 .await
                 .context("mlx-lm server request failed")?;
@@ -719,10 +725,10 @@ mod inner {
                     .await;
             };
 
-            // Only works for in-process inference
-            if self.mlx_lm_url.is_some() {
+            // HTTP verify: draft on ANE, verify via external server
+            if let Some(ref url) = self.mlx_lm_url {
                 return self
-                    .chat(messages, None, None, max_tokens, temperature, thinking_budget, None)
+                    .chat_speculative_http(url, messages, max_tokens, temperature, thinking_budget)
                     .await;
             }
 
@@ -776,6 +782,231 @@ mod inner {
                 usage,
             })
         }
+
+        /// HTTP-based speculative decode: ANE drafts → server verifies via
+        /// `/v1/completions`.
+        ///
+        /// Each round: draft N tokens on ANE, stuff them into the prompt, and
+        /// ask the server for a 1-token continuation. The server prefills the
+        /// draft tokens as a batch (fast, ~1000 tok/s) and generates 1 new token
+        /// (~20 tok/s). Net effect: N+1 tokens per round at the cost of ~1
+        /// decode step, giving ~Nx speedup over sequential generation.
+        ///
+        /// Works with any OpenAI-compatible server that exposes `/v1/completions`
+        /// (mlx-lm, LM Studio, oMLX).
+        #[cfg(feature = "ane")]
+        async fn chat_speculative_http(
+            &self,
+            base_url: &str,
+            messages: &[serde_json::Value],
+            max_tokens: u32,
+            temperature: f64,
+            thinking_budget: Option<u32>,
+        ) -> Result<LLMResponse> {
+            use crate::agent::ane_decode::SpecDecodeRequest;
+
+            let spec_tx = self
+                .spec_decode_tx
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("speculative decoder not available"))?;
+
+            let want_thinking = thinking_budget.map_or(false, |b| b > 0);
+            let chat_messages: Vec<crate::agent::mlx_server::ChatMessage> = messages
+                .iter()
+                .filter_map(|m| {
+                    let role = m.get("role")?.as_str()?.to_string();
+                    let content = m.get("content")?.as_str()?.to_string();
+                    Some(crate::agent::mlx_server::ChatMessage { role, content })
+                })
+                .collect();
+
+            let base_prompt = if self.thinking_model && !want_thinking {
+                crate::agent::mlx_server::apply_chat_template_nothink(&chat_messages)
+            } else {
+                crate::agent::mlx_server::apply_chat_template(&chat_messages)
+            };
+
+            // Reset draft model KV cache for new conversation
+            let _ = spec_tx.send(SpecDecodeRequest::Reset);
+
+            // Step 1: get first token from server (also warms server prompt cache)
+            let (first_text, first_finish, prompt_toks) = self
+                .http_completions(base_url, &base_prompt, 1, temperature)
+                .await?;
+
+            if first_text.is_empty() || first_finish == "stop" {
+                let text = strip_think_blocks(&first_text);
+                let mut usage = HashMap::new();
+                usage.insert("prompt_tokens".into(), prompt_toks as i64);
+                usage.insert("completion_tokens".into(), 1i64);
+                usage.insert("total_tokens".into(), (prompt_toks + 1) as i64);
+                return Ok(LLMResponse {
+                    content: Some(text),
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".into(),
+                    usage,
+                });
+            }
+
+            let first_ids = self
+                .tokenizer
+                .encode(&first_text)
+                .map_err(|e| anyhow::anyhow!("tokenize first: {e}"))?;
+            let mut last_token = *first_ids.last().unwrap_or(&0) as u32;
+
+            let mut generated = first_text;
+            let mut total_completion = 1usize;
+            let draft_n = self.draft_length.clamp(2, 8);
+            let t0 = std::time::Instant::now();
+
+            // Step 2: speculative decode loop
+            while total_completion < max_tokens as usize {
+                let n = draft_n.min(max_tokens as usize - total_completion);
+
+                // Draft on ANE
+                let (reply_tx, reply_rx) = oneshot::channel();
+                spec_tx
+                    .send(SpecDecodeRequest::Draft {
+                        last_token,
+                        n,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| anyhow::anyhow!("spec decode thread died"))?;
+                let (pre_draft_pos, drafts) = reply_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("draft reply dropped"))?;
+
+                // Detokenize draft tokens
+                let draft_ids: Vec<i32> = drafts.iter().map(|&t| t as i32).collect();
+                let draft_text = self
+                    .tokenizer
+                    .decode(&draft_ids)
+                    .map_err(|e| anyhow::anyhow!("decode drafts: {e}"))?;
+
+                // Verify: send full prompt + generated + drafts, ask for 1 continuation
+                let full_prompt = format!("{}{}{}", base_prompt, generated, draft_text);
+                let (cont_text, finish, _) = self
+                    .http_completions(base_url, &full_prompt, 1, temperature)
+                    .await?;
+
+                // Accept all drafts in the ANE draft model
+                let _ = spec_tx.send(SpecDecodeRequest::Accept {
+                    pre_draft_pos,
+                    n_accepted: drafts.len(),
+                });
+
+                generated.push_str(&draft_text);
+                total_completion += drafts.len();
+
+                if !cont_text.is_empty() {
+                    generated.push_str(&cont_text);
+                    total_completion += 1;
+
+                    let cont_ids = self
+                        .tokenizer
+                        .encode(&cont_text)
+                        .map_err(|e| anyhow::anyhow!("tokenize cont: {e}"))?;
+                    last_token = *cont_ids.last().unwrap_or(&0) as u32;
+                }
+
+                if finish == "stop" || cont_text.is_empty() {
+                    break;
+                }
+            }
+
+            let elapsed = t0.elapsed();
+            tracing::info!(
+                total_completion,
+                ms_per_tok = format!(
+                    "{:.0}",
+                    elapsed.as_millis() as f64 / total_completion.max(1) as f64
+                ),
+                draft_len = draft_n,
+                "HTTP spec decode done"
+            );
+
+            let text = strip_think_blocks(&generated);
+            // Parse tool calls from text (model generates them inline
+            // since /v1/completions has no tool schema support).
+            let (tool_calls, text) = parse_tool_calls_from_text(&text);
+            let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
+
+            let mut usage = HashMap::new();
+            usage.insert("prompt_tokens".into(), prompt_toks as i64);
+            usage.insert("completion_tokens".into(), total_completion as i64);
+            usage.insert(
+                "total_tokens".into(),
+                (prompt_toks + total_completion) as i64,
+            );
+
+            Ok(LLMResponse {
+                content: Some(text),
+                tool_calls,
+                finish_reason: finish_reason.into(),
+                usage,
+            })
+        }
+
+        /// Call `/v1/completions` on the external server.
+        ///
+        /// Returns `(generated_text, finish_reason, prompt_tokens)`.
+        #[cfg(feature = "ane")]
+        async fn http_completions(
+            &self,
+            base_url: &str,
+            prompt: &str,
+            max_tokens: u32,
+            temperature: f64,
+        ) -> Result<(String, String, usize)> {
+            let url = format!("{}/v1/completions", base_url.trim_end_matches('/'));
+            // Use leaf model name for compatibility with oMLX/LM Studio
+            // (they index by name, not full path).
+            let body = serde_json::json!({
+                "model": &self.model_name,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            });
+
+            let mut req = self.http_client.post(&url).json(&body);
+            if !self.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            let resp = req
+                .send()
+                .await
+                .context("completions request failed")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("completions returned {status}: {text}");
+            }
+
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .context("completions invalid JSON")?;
+
+            let text = json
+                .pointer("/choices/0/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let finish = json
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stop")
+                .to_string();
+
+            let prompt_tokens = json
+                .pointer("/usage/prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            Ok((text, finish, prompt_tokens))
+        }
     }
 
     #[async_trait]
@@ -792,6 +1023,17 @@ mod inner {
         ) -> Result<LLMResponse> {
             let want_thinking = thinking_budget.map_or(false, |b| b > 0);
 
+            // Spec decode: HTTP path uses /v1/completions (no tool schema),
+            // so fire even with tools present. In-process path skips when tools defined.
+            #[cfg(feature = "ane")]
+            if self.spec_decode_tx.is_some()
+                && (self.mlx_lm_url.is_some() || tools.map_or(true, |t| t.is_empty()))
+            {
+                return self
+                    .chat_speculative(messages, max_tokens, temperature, thinking_budget)
+                    .await;
+            }
+
             // Delegate to mlx-lm server when configured
             if let Some(ref url) = self.mlx_lm_url {
                 return self
@@ -803,14 +1045,6 @@ mod inner {
                         temperature,
                         thinking_budget,
                     )
-                    .await;
-            }
-
-            // Try speculative decode when draft model is available and no tools requested
-            #[cfg(feature = "ane")]
-            if self.spec_decode_tx.is_some() && tools.map_or(true, |t| t.is_empty()) {
-                return self
-                    .chat_speculative(messages, max_tokens, temperature, thinking_budget)
                     .await;
             }
 
@@ -885,6 +1119,24 @@ mod inner {
             // (reasoning_content/reasoning) handled independently.
             let starts_in_think = false;
 
+            // Spec decode: buffered response wrapped as stream.
+            // The HTTP path uses /v1/completions (no tool schema), so we fire
+            // even when tools are defined — tool calls are parsed from text.
+            #[cfg(feature = "ane")]
+            if self.spec_decode_tx.is_some()
+                && (self.mlx_lm_url.is_some() || tools.map_or(true, |t| t.is_empty()))
+            {
+                let response = self
+                    .chat_speculative(messages, max_tokens, temperature, thinking_budget)
+                    .await?;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                if let Some(ref content) = response.content {
+                    let _ = tx.send(StreamChunk::TextDelta(content.clone()));
+                }
+                let _ = tx.send(StreamChunk::Done(response));
+                return Ok(StreamHandle { rx });
+            }
+
             // Only stream when delegating to mlx-lm server
             let Some(ref base_url) = self.mlx_lm_url else {
                 // In-process: fall back to buffered default
@@ -914,7 +1166,7 @@ mod inner {
                 self.inject_nothink(messages)
             };
             let mut body = serde_json::json!({
-                "model": &self.model_path,
+                "model": &self.model_name,
                 "messages": msgs,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -926,10 +1178,11 @@ mod inner {
                 }
             }
 
-            let resp = self
-                .http_client
-                .post(&url)
-                .json(&body)
+            let mut req = self.http_client.post(&url).json(&body);
+            if !self.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            let resp = req
                 .send()
                 .await
                 .context("mlx-lm server stream request failed")?;
@@ -1555,6 +1808,7 @@ mod tests {
             None, // in-process inference (required for spec decode)
             Some(draft_model_dir()),
             Some(4), // draft 4 tokens per step
+            String::new(),
         )
         .expect("MlxProvider::start_with_options failed");
 
