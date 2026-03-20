@@ -104,7 +104,12 @@ pub(crate) fn strip_gguf_suffix(name: &str) -> &str {
 pub(super) fn local_base_url(config: &Config, fallback_port: &str) -> String {
     let custom = &config.agents.defaults.local_api_base;
     if !custom.is_empty() {
-        custom.clone()
+        let trimmed = custom.trim_end_matches('/');
+        if trimmed.ends_with("/v1") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/v1")
+        }
     } else {
         format!("http://localhost:{}/v1", fallback_port)
     }
