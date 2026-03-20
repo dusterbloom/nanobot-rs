@@ -806,6 +806,14 @@ mod inner {
                     .await;
             }
 
+            // Try speculative decode when draft model is available and no tools requested
+            #[cfg(feature = "ane")]
+            if self.spec_decode_tx.is_some() && tools.map_or(true, |t| t.is_empty()) {
+                return self
+                    .chat_speculative(messages, max_tokens, temperature, thinking_budget)
+                    .await;
+            }
+
             // In-process: apply chat template and generate
             let chat_messages: Vec<crate::agent::mlx_server::ChatMessage> = messages
                 .iter()
