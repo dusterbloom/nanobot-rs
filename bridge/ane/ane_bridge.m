@@ -25,6 +25,7 @@ static Class g_ANEIO = nil;
 static bool g_initialized = false;
 static int g_compile_count = 0;
 static int g_load_count = 0;
+static bool g_quiet = false;  // suppress compile/load error output
 
 // Persistent cache directory for compiled net.plist files.
 // ANE's unloadWithQoS: deletes its temp dir, so we copy net.plist
@@ -100,7 +101,25 @@ int ane_bridge_init(void) {
 
     g_initialized = true;
     g_compile_count = 0;
+
+    // Clear stale system ANE compilation cache on init.
+    // The e5bundlecache can hold failed compilations that block subsequent loads.
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *cachesDir = [NSSearchPathForDirectoriesInDomains(
+        NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (cachesDir) {
+        NSString *e5cache = [cachesDir stringByAppendingPathComponent:
+            @"com.apple.e5rt.e5bundlecache"];
+        if ([fm fileExistsAtPath:e5cache]) {
+            [fm removeItemAtPath:e5cache error:nil];
+        }
+    }
+
     return 0;
+}
+
+void ane_bridge_set_quiet(bool quiet) {
+    g_quiet = quiet;
 }
 
 // Default (cached) IOSurface — used for outputs where CPU reads need cache coherency.
@@ -248,7 +267,7 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             // Full compile (cold path)
             if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                     mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-                fprintf(stderr, "ane_bridge: ANE compile failed: %s\n",
+                if (!g_quiet) fprintf(stderr, "ane_bridge: ANE compile failed: %s\n",
                         e ? [[e description] UTF8String] : "unknown");
                 [fm removeItemAtPath:td error:nil];
                 return NULL;
@@ -260,7 +279,7 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
         BOOL loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                 mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
         if (!loaded) {
-            fprintf(stderr, "ane_bridge: ANE load %s (retrying in 100ms): %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: ANE load %s (retrying in 100ms): %s\n",
                     cached ? "cached" : "fresh",
                     e ? [[e description] UTF8String] : "unknown");
             if (cached) {
@@ -268,7 +287,7 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
                 e = nil;
                 if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                         mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-                    fprintf(stderr, "ane_bridge: ANE fallback compile failed: %s\n",
+                    if (!g_quiet) fprintf(stderr, "ane_bridge: ANE fallback compile failed: %s\n",
                             e ? [[e description] UTF8String] : "unknown");
                     [fm removeItemAtPath:td error:nil];
                     return NULL;
@@ -285,7 +304,7 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             }
         }
         if (!loaded) {
-            fprintf(stderr, "ane_bridge: ANE load failed after retry: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: ANE load failed after retry: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             [fm removeItemAtPath:td error:nil];
             return NULL;
@@ -467,7 +486,7 @@ ANEKernelHandle *ane_bridge_compile_direct(
             g_ane_client, @selector(compileModel:options:qos:error:),
             mdl, compileOpts, 21, &e);
         if (!compiled) {
-            fprintf(stderr, "ane_bridge: _ANEClient compile failed: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: _ANEClient compile failed: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             [fm removeItemAtPath:bundleDir error:nil];
             return NULL;
@@ -480,7 +499,7 @@ ANEKernelHandle *ane_bridge_compile_direct(
             g_ane_client, @selector(loadModel:options:qos:error:),
             mdl, @{}, 21, &e);
         if (!loaded) {
-            fprintf(stderr, "ane_bridge: _ANEClient load failed: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: _ANEClient load failed: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             return NULL;
         }
@@ -555,18 +574,23 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
     @autoreleasepool {
         if (!kernel || !kernel->model) return false;
         NSError *e = nil;
+        BOOL ok;
         if (kernel->direct && g_ane_client) {
             // _ANEClient path: evaluateWithModel:options:request:qos:error:
-            return ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+            ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
                 g_ane_client,
                 @selector(evaluateWithModel:options:request:qos:error:),
                 kernel->model, @{}, kernel->request, 21, &e);
         } else {
             // _ANEInMemoryModel path: evaluateWithQoS:options:request:error:
-            return ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+            ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
                 kernel->model, @selector(evaluateWithQoS:options:request:error:),
                 21, @{}, kernel->request, &e);
         }
+        if (!ok && e) {
+            NSLog(@"[ANE] eval failed: %@", e);
+        }
+        return ok;
     }
 }
 
@@ -613,6 +637,171 @@ void ane_bridge_read_output(ANEKernelHandle *kernel, int idx,
     IOSurfaceLock(kernel->ioOutputs[idx], kIOSurfaceLockReadOnly, NULL);
     memcpy(data, IOSurfaceGetBaseAddress(kernel->ioOutputs[idx]), bytes);
     IOSurfaceUnlock(kernel->ioOutputs[idx], kIOSurfaceLockReadOnly, NULL);
+}
+
+bool ane_bridge_share_surface(ANEKernelHandle *src, int out_idx,
+                               ANEKernelHandle *dst, int in_idx) {
+    @autoreleasepool {
+        if (!src || !dst) return false;
+        if (out_idx < 0 || out_idx >= src->nOutputs) return false;
+        if (in_idx < 0 || in_idx >= dst->nInputs) return false;
+
+        // Verify byte sizes match
+        if (src->outputBytes[out_idx] != dst->inputBytes[in_idx]) {
+            NSLog(@"[ANE] share_surface: size mismatch (src out=%zu, dst in=%zu)",
+                  src->outputBytes[out_idx], dst->inputBytes[in_idx]);
+            return false;
+        }
+
+        // Release dst's old input surface and point to src's output surface
+        CFRelease(dst->ioInputs[in_idx]);
+        dst->ioInputs[in_idx] = src->ioOutputs[out_idx];
+        CFRetain(dst->ioInputs[in_idx]);
+
+        // Rebuild dst's ANE request with the new IOSurface references
+        NSMutableArray *wIns = [NSMutableArray arrayWithCapacity:dst->nInputs];
+        NSMutableArray *iIdx = [NSMutableArray arrayWithCapacity:dst->nInputs];
+        for (int i = 0; i < dst->nInputs; i++) {
+            [wIns addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), dst->ioInputs[i])];
+            [iIdx addObject:@(i)];
+        }
+        NSMutableArray *wOuts = [NSMutableArray arrayWithCapacity:dst->nOutputs];
+        NSMutableArray *oIdx = [NSMutableArray arrayWithCapacity:dst->nOutputs];
+        for (int i = 0; i < dst->nOutputs; i++) {
+            [wOuts addObject:((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                g_ANEIO, @selector(objectWithIOSurface:), dst->ioOutputs[i])];
+            [oIdx addObject:@(i)];
+        }
+        dst->request = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
+            g_ANEReq,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+
+        return true;
+    }
+}
+
+bool ane_bridge_eval_chain(ANEKernelHandle **kernels, int n) {
+    @autoreleasepool {
+        if (!kernels || n <= 0) return false;
+        for (int i = 0; i < n; i++) {
+            ANEKernelHandle *k = kernels[i];
+            if (!k || !k->model) return false;
+            NSError *e = nil;
+            BOOL ok;
+            if (k->direct && g_ane_client) {
+                ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                    g_ane_client,
+                    @selector(evaluateWithModel:options:request:qos:error:),
+                    k->model, @{}, k->request, 21, &e);
+            } else {
+                ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+                    k->model, @selector(evaluateWithQoS:options:request:error:),
+                    21, @{}, k->request, &e);
+            }
+            if (!ok) {
+                if (e) NSLog(@"[ANE] eval_chain step %d failed: %@", i, e);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// Evaluate using the real-time path — lower dispatch overhead.
+// Requires beginRealTimeTask to be called first.
+static bool g_realtime_active = false;
+
+bool ane_bridge_begin_realtime(void) {
+    if (!g_ane_client) return false;
+    if (g_realtime_active) return true;
+    @try {
+        ((void(*)(id,SEL))objc_msgSend)(g_ane_client, @selector(beginRealTimeTask));
+        g_realtime_active = true;
+        return true;
+    } @catch (NSException *ex) {
+        if (!g_quiet) NSLog(@"[ANE] beginRealTimeTask exception: %@", ex);
+        return false;
+    }
+}
+
+void ane_bridge_end_realtime(void) {
+    if (!g_ane_client || !g_realtime_active) return;
+    @try {
+        ((void(*)(id,SEL))objc_msgSend)(g_ane_client, @selector(endRealTimeTask));
+    } @catch (NSException *ex) {
+        if (!g_quiet) NSLog(@"[ANE] endRealTimeTask exception: %@", ex);
+    }
+    g_realtime_active = false;
+}
+
+bool ane_bridge_eval_realtime(ANEKernelHandle *kernel) {
+    @autoreleasepool {
+        if (!kernel || !kernel->model || !g_ane_client) return false;
+        @try {
+            NSError *e = nil;
+            BOOL ok = ((BOOL(*)(id,SEL,id,id,id,NSError**))objc_msgSend)(
+                g_ane_client,
+                @selector(evaluateRealTimeWithModel:options:request:error:),
+                kernel->model, @{}, kernel->request, &e);
+            if (!ok && e && !g_quiet) NSLog(@"[ANE] eval_realtime failed: %@", e);
+            return ok;
+        } @catch (NSException *ex) {
+            if (!g_quiet) NSLog(@"[ANE] eval_realtime exception: %@", ex);
+            return false;
+        }
+    }
+}
+
+bool ane_bridge_eval_chain_realtime(ANEKernelHandle **kernels, int n) {
+    @autoreleasepool {
+        if (!kernels || n <= 0 || !g_ane_client) return false;
+        for (int i = 0; i < n; i++) {
+            ANEKernelHandle *k = kernels[i];
+            if (!k || !k->model) return false;
+            @try {
+                NSError *e = nil;
+                BOOL ok = ((BOOL(*)(id,SEL,id,id,id,NSError**))objc_msgSend)(
+                    g_ane_client,
+                    @selector(evaluateRealTimeWithModel:options:request:error:),
+                    k->model, @{}, k->request, &e);
+                if (!ok) {
+                    if (e && !g_quiet) NSLog(@"[ANE] eval_chain_realtime step %d failed: %@", i, e);
+                    return false;
+                }
+            } @catch (NSException *ex) {
+                if (!g_quiet) NSLog(@"[ANE] eval_chain_realtime step %d exception: %@", i, ex);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+bool ane_bridge_prepare_chain(ANEKernelHandle **kernels, int n) {
+    @autoreleasepool {
+        if (!kernels || n <= 0 || !g_ane_client) return false;
+        for (int i = 0; i < n; i++) {
+            ANEKernelHandle *k = kernels[i];
+            if (!k || !k->model) return false;
+            @try {
+                NSError *e = nil;
+                BOOL ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                    g_ane_client,
+                    @selector(prepareChainingWithModel:options:chainingReq:qos:error:),
+                    k->model, @{}, k->request, 21, &e);
+                if (!ok) {
+                    if (e && !g_quiet) NSLog(@"[ANE] prepare_chain step %d failed: %@", i, e);
+                    return false;
+                }
+            } @catch (NSException *ex) {
+                if (!g_quiet) NSLog(@"[ANE] prepare_chain step %d exception: %@", i, ex);
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 ANEKernelHandle *ane_bridge_clone_kernel(ANEKernelHandle *source) {
@@ -876,7 +1065,7 @@ bool ane_bridge_reload_weights(ANEKernelHandle *kernel,
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             newModel, @selector(loadWithQoS:options:error:), 21, @{}, &e);
         if (!ok) {
-            fprintf(stderr, "ane_bridge: reload_weights LOAD FAILED: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: reload_weights LOAD FAILED: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             return false;
         }
@@ -966,7 +1155,7 @@ bool ane_bridge_delta_reload(ANEKernelHandle *kernel,
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             kernel->model, @selector(loadWithQoS:options:error:), 21, @{}, &e);
         if (!ok) {
-            fprintf(stderr, "ane_bridge: delta_reload LOAD FAILED: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: delta_reload LOAD FAILED: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             return false;
         }
@@ -1099,7 +1288,7 @@ ANEKernelHandle *ane_bridge_patch_from_donor(
         BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
             mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
         if (!ok) {
-            fprintf(stderr, "ane_bridge: patch_from_donor LOAD FAILED: %s\n",
+            if (!g_quiet) fprintf(stderr, "ane_bridge: patch_from_donor LOAD FAILED: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             for (int i = 0; i < n_weights; i++) free(relPaths[i]);
             free(relPaths);
@@ -1234,6 +1423,10 @@ uint8_t *ane_bridge_build_weight_blob_transposed(const float *src, int rows, int
     return buf;
 }
 
+void ane_bridge_free_blob(void *ptr) {
+    free(ptr);
+}
+
 // ---------------------------------------------------------------------------
 // fp16-weight GEMM: C[M,N] = alpha * A_f16[M,K] @ B_f32[K,N] + beta * C
 //
@@ -1297,4 +1490,74 @@ void ane_bridge_gemm_f16(
     }
 
     free(tile_f32);
+}
+
+// ── Zero-copy IOSurface access (Orion-style) ─────────────────────────
+
+void *ane_bridge_get_input_base(ANEKernelHandle *kernel, int idx) {
+    if (!kernel || idx < 0 || idx >= kernel->nInputs) return NULL;
+    return IOSurfaceGetBaseAddress(kernel->ioInputs[idx]);
+}
+
+void *ane_bridge_get_output_base(ANEKernelHandle *kernel, int idx) {
+    if (!kernel || idx < 0 || idx >= kernel->nOutputs) return NULL;
+    return IOSurfaceGetBaseAddress(kernel->ioOutputs[idx]);
+}
+
+size_t ane_bridge_input_size(ANEKernelHandle *kernel, int idx) {
+    if (!kernel || idx < 0 || idx >= kernel->nInputs) return 0;
+    return kernel->inputBytes[idx];
+}
+
+size_t ane_bridge_output_size(ANEKernelHandle *kernel, int idx) {
+    if (!kernel || idx < 0 || idx >= kernel->nOutputs) return 0;
+    return kernel->outputBytes[idx];
+}
+
+// ── INT8 weight blob builders ────────────────────────────────────────
+
+uint8_t *ane_bridge_build_weight_blob_int8(const int8_t *src, int rows, int cols,
+                                            size_t *out_len) {
+    int wsize = rows * cols;  // 1 byte per int8 element
+    int total = 64 + wsize;   // 64-byte header + data
+    uint8_t *buf = (uint8_t *)calloc(total, 1);
+    if (!buf) { *out_len = 0; return NULL; }
+
+    // ANE int8 blob header (matches Orion format)
+    buf[0] = 0xEF; buf[1] = 0xBE; buf[2] = 0xAD; buf[3] = 0xDE;
+    buf[4] = 0x01;
+    buf[10] = 0x08;  // 8-bit element marker
+
+    memcpy(buf + 64, src, wsize);
+    *out_len = total;
+    return buf;
+}
+
+uint8_t *ane_bridge_build_weight_blob_quantized(const float *src, int rows, int cols,
+                                                 float *out_scale, size_t *out_len) {
+    int n = rows * cols;
+
+    // Find global max abs for symmetric quantization
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = src[i] < 0 ? -src[i] : src[i];
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = max_abs / 127.0f;
+    if (scale == 0.0f) scale = 1.0f;
+
+    // Quantize to int8
+    int8_t *qdata = (int8_t *)malloc(n);
+    if (!qdata) { *out_len = 0; *out_scale = 0; return NULL; }
+    for (int i = 0; i < n; i++) {
+        float v = src[i] / scale;
+        if (v > 127.0f) v = 127.0f;
+        if (v < -128.0f) v = -128.0f;
+        qdata[i] = (int8_t)(v + (v >= 0 ? 0.5f : -0.5f));
+    }
+
+    uint8_t *blob = ane_bridge_build_weight_blob_int8(qdata, rows, cols, out_len);
+    free(qdata);
+    *out_scale = scale;
+    return blob;
 }

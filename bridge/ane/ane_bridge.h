@@ -92,6 +92,40 @@ void ane_bridge_read_output(ANEKernelHandle *kernel, int idx,
 // source — the model is unloaded only when all clones + source are freed.
 ANEKernelHandle *ane_bridge_clone_kernel(ANEKernelHandle *source);
 
+// Wire kernel B's input[in_idx] to kernel A's output[out_idx].
+// After eval(A), eval(B) will read A's output directly — no CPU memcpy.
+// Rebuilds B's ANE request to reference the shared IOSurface.
+// Returns true on success.
+bool ane_bridge_share_surface(ANEKernelHandle *src, int out_idx,
+                               ANEKernelHandle *dst, int in_idx);
+
+// Evaluate N kernels back-to-back without reading intermediate results.
+// Much faster than eval+read+write for each kernel.
+// kernels: array of kernel handles
+// n: number of kernels
+// Returns true if ALL evaluations succeeded.
+bool ane_bridge_eval_chain(ANEKernelHandle **kernels, int n);
+
+// --- Real-time evaluation path ---
+
+// Begin real-time task mode (lower dispatch latency).
+// Must be called before eval_realtime. Returns true on success.
+bool ane_bridge_begin_realtime(void);
+
+// End real-time task mode.
+void ane_bridge_end_realtime(void);
+
+// Evaluate a single kernel using the real-time path.
+// Requires begin_realtime() to have been called.
+bool ane_bridge_eval_realtime(ANEKernelHandle *kernel);
+
+// Evaluate N kernels using real-time dispatch (lower latency per dispatch).
+bool ane_bridge_eval_chain_realtime(ANEKernelHandle **kernels, int n);
+
+// Prepare a chain of kernels for pipelined ANE execution.
+// Uses _ANEClient's prepareChainingWithModel: for batched dispatch.
+bool ane_bridge_prepare_chain(ANEKernelHandle **kernels, int n);
+
 // Free a compiled kernel and all associated resources
 void ane_bridge_free(ANEKernelHandle *kernel);
 
@@ -103,6 +137,10 @@ int ane_bridge_get_load_count(void);
 
 // Reset compile count
 void ane_bridge_reset_compile_count(void);
+
+// Suppress compile/load error output to stderr.
+// Use around expected-fail compilation attempts to keep TUI clean.
+void ane_bridge_set_quiet(bool quiet);
 
 // Clear the persistent compilation cache (~/.nanobot/ane_cache/).
 // Use in tests to ensure a cold-start compilation.
@@ -171,6 +209,32 @@ void ane_bridge_gemm_f16(
     const float *b_f32, int N,
     float *c_f32,
     float alpha, float beta);
+
+// ── Zero-copy IOSurface access (Orion-style dsb sy) ─────────────────
+// Get raw base address of input/output IOSurface without locking.
+// The caller MUST issue an ARM64 memory barrier (dsb sy) before eval
+// and after eval to ensure cache coherency.
+// Returns NULL if kernel/idx invalid.
+void *ane_bridge_get_input_base(ANEKernelHandle *kernel, int idx);
+void *ane_bridge_get_output_base(ANEKernelHandle *kernel, int idx);
+
+// Get the byte size of an input/output IOSurface
+size_t ane_bridge_input_size(ANEKernelHandle *kernel, int idx);
+size_t ane_bridge_output_size(ANEKernelHandle *kernel, int idx);
+
+// ── INT8 weight blob builders ───────────────────────────────────────
+// Build an int8 weight blob in ANE format (64-byte header + int8 data).
+// src: int8 weights [rows x cols]
+// For use with constexpr_affine_dequantize in MIL.
+// Returns allocated buffer and sets out_len. Caller must free via ane_bridge_free_blob().
+uint8_t *ane_bridge_build_weight_blob_int8(const int8_t *src, int rows, int cols,
+                                            size_t *out_len);
+
+// Quantize float32 weights to int8 and build ANE blob in one step.
+// Computes per-tensor symmetric scale: scale = max(abs) / 127.
+// Returns allocated buffer, sets out_scale and out_len. Caller must free via ane_bridge_free_blob().
+uint8_t *ane_bridge_build_weight_blob_quantized(const float *src, int rows, int cols,
+                                                 float *out_scale, size_t *out_len);
 
 #ifdef __cplusplus
 }
