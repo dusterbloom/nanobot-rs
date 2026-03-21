@@ -522,6 +522,8 @@ impl ReplContext {
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.local_backend = "omlx".to_string();
+                // No longer managed by LM Studio — prevent watchdog auto-restart.
+                self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
@@ -614,6 +616,8 @@ impl ReplContext {
                 self.config.agents.defaults.local_model = selected.id.clone();
                 self.config.agents.defaults.lms_main_model = selected.id.clone();
                 self.config.agents.defaults.local_backend = "omlx".to_string();
+                // No longer managed by LM Studio — prevent watchdog auto-restart.
+                self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(&selected.id);
                 self.persist_local_config();
                 self.apply_and_rebuild_with(true);
@@ -1254,8 +1258,10 @@ impl ReplContext {
                 self.srv.lms_managed = false;
                 self.srv.lms_binary = None;
             }
-            // Clear local endpoint so next restart doesn't force local mode.
+            // Clear local endpoint and backend so next /l doesn't inherit stale
+            // oMLX backend when LM Studio should start instead.
             self.config.agents.defaults.local_api_base.clear();
+            self.config.agents.defaults.local_backend = "lmstudio".to_string();
             self.config.agents.defaults.skip_jit_gate = false;
             self.srv.engine = super::super::InferenceEngine::None;
             self.stop_watchdog();

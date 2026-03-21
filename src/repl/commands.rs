@@ -386,7 +386,7 @@ impl ReplContext {
             let lms_port = self.config.agents.defaults.lms_port;
             let available = crate::lms::list_available("", lms_port).await;
             let loaded = crate::lms::list_loaded("", lms_port).await;
-            covered_endpoint = Some(format!("http://localhost:{}/v1", lms_port));
+            covered_endpoint = Some(format!("http://{}:{}/v1", crate::lms::api_host(), lms_port));
             for name in &available {
                 if name.to_lowercase().contains("embedding") {
                     continue;

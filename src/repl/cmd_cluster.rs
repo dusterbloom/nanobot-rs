@@ -210,6 +210,10 @@ impl ReplContext {
                 self.config.agents.defaults.local_api_base = peer_endpoint.clone();
                 self.config.agents.defaults.lms_main_model = model_id.clone();
                 self.config.agents.defaults.local_model = model_id.clone();
+                // Switch backend away from "mlx" (in-process) so rebuild uses
+                // the HTTP provider for this cluster peer endpoint.
+                self.config.agents.defaults.local_backend = "omlx".to_string();
+                self.srv.lms_managed = false;
                 self.current_model_path = PathBuf::from(model_id);
 
                 // Persist to disk.
