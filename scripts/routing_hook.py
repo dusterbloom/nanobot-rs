@@ -568,15 +568,18 @@ def main():
                     delta = np.abs(w - original_gates[layer_idx]).max()
                     print(f"  L{layer_idx}: max_delta={delta:.6f}, {len(targets)} targets")
 
-            # Save deltas to file for Rust merge (handles 3-bit packing correctly)
-            deltas_path = os.path.expanduser("~/.nanobot/router_deltas.npz")
-            delta_arrays = {}
-            for layer_idx, trained_w in trained_gates.items():
-                delta = trained_w - original_gates[layer_idx]
-                delta_arrays[f"layer_{layer_idx}"] = delta.astype(np.float32)
-            np.savez(deltas_path, **delta_arrays)
-            print(f"\n  Saved {len(delta_arrays)} layer deltas to {deltas_path}")
-            print(f"  To merge: cargo test --features ane,mlx --release --lib -- 'merge_router_deltas_from_npz' --nocapture --ignored")
+            # Save deltas as flat binary for Rust merge.
+            # Format: [n_layers: u32, ne: u32, dim: u32, then per layer:
+            #   layer_idx: u32, delta: f32 × ne × dim]
+            deltas_path = os.path.expanduser("~/.nanobot/router_deltas.bin")
+            with open(deltas_path, "wb") as f:
+                f.write(struct.pack("<III", len(trained_gates), ne, dim))
+                for layer_idx in sorted(trained_gates.keys()):
+                    delta = (trained_gates[layer_idx] - original_gates[layer_idx]).astype(np.float32)
+                    f.write(struct.pack("<I", layer_idx))
+                    f.write(delta.tobytes())
+            print(f"\n  Saved {len(trained_gates)} layer deltas to {deltas_path}")
+            print(f"  To merge: cargo test --features ane --release --lib -- 'test_merge_router_from_deltas' --nocapture --ignored")
 
             # Apply via MLX requantize: dequant → add delta → mx.quantize
             # Uses MLX's own quantization scheme for faithful roundtrip.

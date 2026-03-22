@@ -1218,4 +1218,215 @@ mod tests {
         buf.extend_from_slice(b_bytes);
         buf
     }
+
+    /// Merge REINFORCE router deltas from a binary file into model safetensors.
+    ///
+    /// The delta file is written by `routing_hook.py --eval`:
+    ///   [n_layers: u32, ne: u32, dim: u32, then per layer: layer_idx: u32, delta: f32 × ne × dim]
+    ///
+    /// This test reads deltas, loads original router weights from safetensors,
+    /// computes trained = original + delta, calls merge_router_into_safetensors.
+    ///
+    /// ```bash
+    /// # Step 1: Generate deltas
+    /// source .venv/bin/activate && python scripts/routing_hook.py --eval
+    ///
+    /// # Step 2: Merge into safetensors
+    /// cargo test --features ane --release --lib -- "test_merge_router_from_deltas" --nocapture --ignored
+    ///
+    /// # Step 3: Re-eval (Python reloads from disk)
+    /// python scripts/routing_hook.py --eval  # will use merged weights
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_merge_router_from_deltas() {
+        use std::io::Read;
+
+        let home = std::env::var("HOME").unwrap();
+        let deltas_path = format!("{home}/.nanobot/router_deltas.bin");
+
+        if !std::path::Path::new(&deltas_path).exists() {
+            eprintln!("SKIP: {deltas_path} not found. Run: python scripts/routing_hook.py --eval");
+            return;
+        }
+
+        // Read deltas file
+        let mut f = std::fs::File::open(&deltas_path).expect("open deltas");
+        let mut header = [0u8; 12];
+        f.read_exact(&mut header).expect("read header");
+        let n_delta_layers = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let ne = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        eprintln!("Deltas: {n_delta_layers} layers, {ne} experts, dim={dim}");
+
+        let mut layer_deltas: std::collections::HashMap<usize, Vec<f32>> =
+            std::collections::HashMap::new();
+        for _ in 0..n_delta_layers {
+            let mut idx_buf = [0u8; 4];
+            f.read_exact(&mut idx_buf).expect("read layer idx");
+            let layer_idx = u32::from_le_bytes(idx_buf) as usize;
+
+            let mut delta_buf = vec![0u8; ne * dim * 4];
+            f.read_exact(&mut delta_buf).expect("read delta");
+            let delta: Vec<f32> = delta_buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            layer_deltas.insert(layer_idx, delta);
+        }
+        eprintln!("Read {} layer deltas", layer_deltas.len());
+
+        // Find model dir
+        let model_dirs = [
+            format!("{home}/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit"),
+            format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit"),
+        ];
+        let model_dir = model_dirs
+            .iter()
+            .find(|d| std::path::Path::new(d).exists())
+            .expect("No 35B model found");
+        let model_path = std::path::Path::new(model_dir);
+        eprintln!("Model: {model_dir}");
+
+        // Detect bits from config
+        let config_str = std::fs::read_to_string(model_path.join("config.json"))
+            .expect("read config");
+        let config: serde_json::Value =
+            serde_json::from_str(&config_str).expect("parse config");
+        let quantization = config
+            .get("quantization")
+            .or_else(|| config.get("text_config").and_then(|tc| tc.get("quantization")));
+        let bits = quantization
+            .and_then(|q| q.get("bits").and_then(|b| b.as_u64()))
+            .unwrap_or(4) as usize;
+        let group_size = quantization
+            .and_then(|q| q.get("group_size").and_then(|g| g.as_u64()))
+            .unwrap_or(64) as usize;
+        eprintln!("Quantization: {bits}-bit, group_size={group_size}");
+
+        // Load original router weights by dequantizing from safetensors.
+        // Use MmapTensorStore to read gate tensors directly.
+        let n_layers = layer_deltas.keys().max().copied().unwrap_or(0) + 1;
+        eprintln!("Building original + trained weight vectors for {n_layers} layers...");
+
+        // Build original and trained weight vectors
+        // For layers WITHOUT deltas: empty vec (skipped by merge)
+        // For layers WITH deltas: load original from safetensors, compute trained = orig + delta
+        let mut original_weights: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+        let mut trained_weights: Vec<Vec<f32>> = vec![Vec::new(); n_layers];
+
+        // Read original gate weights from safetensors
+        let st_files = list_safetensors(model_path).expect("list safetensors");
+        for file_path in &st_files {
+            let raw = std::fs::read(file_path).expect("read safetensors");
+            if raw.len() < 8 { continue; }
+            let header_len = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+            let header_json: serde_json::Value =
+                serde_json::from_slice(&raw[8..8 + header_len]).expect("parse header");
+            let data_start = 8 + header_len;
+
+            if let Some(obj) = header_json.as_object() {
+                for (key, meta) in obj {
+                    if key == "__metadata__" { continue; }
+                    // Match "mlp.gate.weight" exactly — NOT "mlp.gate_proj.weight" (expert FFN)
+                    if !key.ends_with("mlp.gate.weight") { continue; }
+
+                    let layer_idx = key.split("layers.")
+                        .nth(1)
+                        .and_then(|s| s.split('.').next())
+                        .and_then(|s| s.parse::<usize>().ok());
+                    let Some(l) = layer_idx else { continue };
+                    if !layer_deltas.contains_key(&l) { continue; }
+
+                    let offsets = meta.get("data_offsets")
+                        .and_then(|v| v.as_array())
+                        .map(|a| (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize));
+                    let shape = meta.get("shape")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>());
+
+                    let Some((ds, de)) = offsets else { continue };
+                    let Some(shape) = shape else { continue };
+                    let rows = shape[0];
+                    // For 3-bit: packed_cols * 32 / 3 is not integer.
+                    // Use scales shape to get actual n_groups, then cols = n_groups * group_size.
+                    let s_shape = obj.get(&format!("{}.scales", key.trim_end_matches(".weight")))
+                        .and_then(|m| m.get("shape"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>());
+                    let n_groups = s_shape.as_ref().map(|s| s[1]).unwrap_or(dim / group_size);
+                    let cols = n_groups * group_size;
+
+                    let w_bytes = &raw[data_start + ds..data_start + de];
+
+                    // Find scales and biases
+                    let base_name = key.trim_end_matches(".weight");
+                    let s_key = format!("{base_name}.scales");
+                    let b_key = format!("{base_name}.biases");
+                    let s_meta = obj.get(&s_key);
+                    let b_meta = obj.get(&b_key);
+                    if s_meta.is_none() || b_meta.is_none() { continue; }
+
+                    let s_off = s_meta.unwrap().get("data_offsets").unwrap().as_array().unwrap();
+                    let b_off = b_meta.unwrap().get("data_offsets").unwrap().as_array().unwrap();
+                    let s_bytes = &raw[data_start + s_off[0].as_u64().unwrap() as usize
+                        ..data_start + s_off[1].as_u64().unwrap() as usize];
+                    let b_bytes = &raw[data_start + b_off[0].as_u64().unwrap() as usize
+                        ..data_start + b_off[1].as_u64().unwrap() as usize];
+
+                    let scales: Vec<f32> = s_bytes.chunks_exact(2)
+                        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                        .collect();
+                    let biases: Vec<f32> = b_bytes.chunks_exact(2)
+                        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                        .collect();
+
+                    let orig = super::super::ane_weights::dequant_nbit(
+                        w_bytes, &scales, &biases, rows, cols, group_size, bits,
+                    );
+
+                    let delta = &layer_deltas[&l];
+                    let trained: Vec<f32> = orig.iter().zip(delta.iter())
+                        .map(|(o, d)| o + d).collect();
+
+                    original_weights[l] = orig;
+                    trained_weights[l] = trained;
+                    eprintln!("  L{l}: loaded {rows}×{cols} gate, delta max={:.6}",
+                        delta.iter().map(|d| d.abs()).fold(0.0f32, f32::max));
+                }
+            }
+        }
+
+        let layers_loaded = original_weights.iter().filter(|w| !w.is_empty()).count();
+        eprintln!("Loaded {layers_loaded} original router gates");
+
+        if layers_loaded == 0 {
+            eprintln!("SKIP: No router gates found in safetensors");
+            return;
+        }
+
+        // Merge!
+        eprintln!("\nMerging router deltas into safetensors...");
+        let t0 = std::time::Instant::now();
+        let report = merge_router_into_safetensors(
+            model_path,
+            &trained_weights,
+            &original_weights,
+            ne,
+            dim,
+            bits,
+            group_size,
+        )
+        .expect("merge failed");
+
+        eprintln!(
+            "  Merged {} tensors in {} files, {:.1}s",
+            report.tensors_merged,
+            report.files_modified,
+            t0.elapsed().as_secs_f64()
+        );
+        eprintln!("  Backup: {}", if report.backup_created { "created" } else { "reused existing" });
+        eprintln!("\nDone! Re-run eval to measure effect:");
+        eprintln!("  python scripts/routing_hook.py --eval");
+    }
 }
