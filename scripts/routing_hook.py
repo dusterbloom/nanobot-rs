@@ -300,19 +300,181 @@ def main():
         print(f"  Time: {elapsed:.1f}s ({elapsed/len(HARD_PROBES):.1f}s/probe)")
         print(f"  Records: {collector.write_pos}")
 
-        # Save results + routing buffer path for Rust eval to consume
+        # ── REINFORCE training on router weights ──
+        ne = getattr(model.language_model.args, "num_experts", 256)
+        print(f"\n{'='*60}")
+        print(f"  REINFORCE TRAINING — {ne} experts × {dim} dim")
+        print(f"{'='*60}")
+
+        import mlx.core as mx
+
+        layers = model.language_model.layers
+        # Extract current router gate weights per layer (dequantized)
+        original_gates = {}
+        for i, layer in enumerate(layers):
+            mlp = layer.mlp
+            if hasattr(mlp, 'gate') and isinstance(mlp.gate, GateWrapper):
+                gate = mlp.gate._original
+                # Gate may be quantized (QuantizedLinear). Call it to get
+                # the effective weight, or access weight directly if dense.
+                if hasattr(gate, 'scales'):
+                    # Quantized: dequantize by running identity through it
+                    eye = mx.eye(dim)
+                    w = np.array(gate(eye).astype(mx.float32).T)  # [ne, dim]
+                else:
+                    w = np.array(gate.weight.astype(mx.float32))  # [ne, dim]
+                if w.shape != (ne, dim):
+                    print(f"  L{i}: gate shape {w.shape} != ({ne}, {dim}) — skipping")
+                    continue
+                original_gates[i] = w.copy()
+
+        if not original_gates:
+            print("  No gate weights found — skipping REINFORCE")
+        else:
+            # Group routing records by layer with rewards
+            # collector.records was flushed, but we kept results with per-probe rewards
+            # Re-collect: run probes again (fast, model is loaded)
+            print(f"  Re-running probes for routing collection...")
+
+            layer_targets = {l: [] for l in original_gates}
+            for probe_idx, (prompt, expected) in enumerate(HARD_PROBES):
+                collector.records.clear()
+                full_prompt = f"Answer in one word or number only. No explanation. {prompt}"
+                _ = generate(model, tokenizer, prompt=full_prompt,
+                            max_tokens=20, verbose=False)
+
+                reward = results[probe_idx]["reward"]
+                for (layer_idx, indices, probs, x_norm) in collector.records:
+                    if layer_idx in layer_targets:
+                        layer_targets[layer_idx].append({
+                            "x_norm": x_norm,
+                            "expert_indices": indices,
+                            "expert_probs": probs,
+                            "reward": reward,
+                        })
+                collector.records.clear()
+
+            total_targets = sum(len(v) for v in layer_targets.values())
+            print(f"  Collected {total_targets} routing targets across {len(original_gates)} layers")
+
+            # REINFORCE training: conservative — the original router was trained
+            # on trillions of tokens. We're nudging it, not replacing it.
+            lr = 0.0  # Zero LR = no training, just test dequant→dense replacement
+            n_steps = 1
+            trained_gates = {}
+
+            for layer_idx, targets in sorted(layer_targets.items()):
+                if not targets:
+                    continue
+
+                w = original_gates[layer_idx].copy()  # [ne, dim]
+                adam_m = np.zeros_like(w)
+                adam_v = np.zeros_like(w)
+
+                for step in range(n_steps):
+                    # Build batch
+                    x_batch = np.stack([t["x_norm"][:dim] for t in targets])  # [B, dim]
+                    rewards_batch = np.array([t["reward"] for t in targets])  # [B]
+
+                    # Normalize rewards
+                    r_mean = rewards_batch.mean()
+                    r_std = max(rewards_batch.std(), 1e-6)
+                    norm_rewards = (rewards_batch - r_mean) / r_std  # [B]
+
+                    # Forward: logits = x @ W^T → [B, ne]
+                    logits = x_batch @ w.T
+                    # Softmax
+                    logits_shifted = logits - logits.max(axis=1, keepdims=True)
+                    exp_l = np.exp(logits_shifted)
+                    probs = exp_l / exp_l.sum(axis=1, keepdims=True)  # [B, ne]
+
+                    # One-hot from selected experts
+                    one_hot = np.zeros_like(probs)
+                    for b, t in enumerate(targets):
+                        k_sel = len(t["expert_indices"])
+                        for idx in t["expert_indices"][:8]:
+                            if idx < ne:
+                                one_hot[b, idx] = 1.0 / k_sel
+
+                    # REINFORCE gradient: d_logits = reward * (probs - one_hot)
+                    d_logits = norm_rewards[:, None] * (probs - one_hot) / len(targets)
+
+                    # dW = d_logits^T @ x_batch → [ne, dim]
+                    dw = d_logits.T @ x_batch
+
+                    # Adam
+                    t_step = step + 1
+                    adam_m = 0.9 * adam_m + 0.1 * dw
+                    adam_v = 0.999 * adam_v + 0.001 * dw ** 2
+                    m_hat = adam_m / (1 - 0.9 ** t_step)
+                    v_hat = adam_v / (1 - 0.999 ** t_step)
+                    w -= lr * m_hat / (np.sqrt(v_hat) + 1e-8)
+
+                trained_gates[layer_idx] = w
+
+                if layer_idx == min(original_gates.keys()) or layer_idx == max(original_gates.keys()):
+                    delta = np.abs(w - original_gates[layer_idx]).max()
+                    print(f"  L{layer_idx}: max_delta={delta:.6f}, {len(targets)} targets")
+
+            # Apply trained weights: replace quantized gate with dense Linear
+            print(f"\n  Applying trained router weights...")
+            for layer_idx, trained_w in trained_gates.items():
+                layer = layers[layer_idx]
+                # Create a dense Linear to replace the quantized gate
+                import mlx.nn as nn
+                dense_gate = nn.Linear(dim, ne, bias=False)
+                dense_gate.weight = mx.array(trained_w.astype(np.float32))
+                # Replace the GateWrapper's original with the dense gate
+                layer.mlp.gate._original = dense_gate
+            mx.eval(*[layers[l].mlp.gate._original.weight for l in trained_gates])
+            print(f"  {len(trained_gates)} layers updated (quantized → dense)")
+
+            # Re-eval with trained router
+            print(f"\n{'='*60}")
+            print(f"  POST-REINFORCE EVAL")
+            print(f"{'='*60}")
+
+            post_correct = 0
+            for i, (prompt, expected) in enumerate(HARD_PROBES):
+                full_prompt = f"Answer in one word or number only. No explanation. {prompt}"
+                response = generate(model, tokenizer, prompt=full_prompt,
+                                   max_tokens=30, verbose=False)
+                answer = response.strip().lower()
+                hit = expected.lower() in answer
+                if hit:
+                    post_correct += 1
+                mark = "+" if hit else "-"
+                if i < 5 or i >= len(HARD_PROBES) - 2:
+                    print(f"  [{mark}] {prompt[:50]:<50} → {answer[:30]}")
+
+            post_pct = 100 * post_correct / len(HARD_PROBES)
+            delta_pct = post_pct - pct
+
+            print(f"\n{'='*60}")
+            print(f"  RESULTS")
+            print(f"{'='*60}")
+            print(f"  Before: {correct}/{len(HARD_PROBES)} ({pct:.0f}%)")
+            print(f"  After:  {post_correct}/{len(HARD_PROBES)} ({post_pct:.0f}%)")
+            print(f"  Delta:  {delta_pct:+.0f}%")
+            if delta_pct > 0:
+                print(f"  VERDICT: REINFORCE IMPROVED the model!")
+            elif delta_pct == 0:
+                print(f"  VERDICT: No change (need more data or steps)")
+            else:
+                print(f"  VERDICT: Regression ({delta_pct:.0f}%)")
+            print(f"{'='*60}")
+
+        # Save results
         eval_output = os.path.expanduser("~/.nanobot/eval_results.json")
         import json
         with open(eval_output, "w") as f:
             json.dump({
-                "score": correct,
+                "score_before": correct,
+                "score_after": post_correct if 'post_correct' in dir() else correct,
                 "total": len(HARD_PROBES),
-                "pct": pct,
-                "results": results,
                 "routing_file": args.output,
             }, f, indent=2)
-        print(f"  Results: {eval_output}")
-        print(f"{'='*60}")
+        print(f"  Saved: {eval_output}")
     else:
         prompt = "Explain the concept of quantum entanglement in simple terms."
         print(f"\nGenerating {args.tokens} tokens...")
