@@ -706,6 +706,146 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_merge_e2e_real_0_8b() {
+        // Qwen3.5-0.8B-8bit: 24 layers, dim=1024, hidden=3584, bits=8, group_size=64
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-0.8B-8bit");
+        if !model_dir.exists() {
+            eprintln!("Qwen3.5-0.8B not found, skipping E2E merge test");
+            return;
+        }
+
+        // Copy model to temp dir so we don't modify the real model.
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_dir = tmp.path();
+        for entry in std::fs::read_dir(&model_dir).unwrap() {
+            let e = entry.unwrap();
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".safetensors") || name_str == "config.json" {
+                std::fs::copy(e.path(), tmp_dir.join(&name)).unwrap();
+            }
+        }
+
+        // Snapshot original bytes for comparison.
+        let orig_bytes = std::fs::read(tmp_dir.join("model.safetensors")).unwrap();
+
+        // Build LoRA with one non-zero adapter: layer 0 down_proj [1024, 3584].
+        // Linear attn indices = [0..23] minus [3,7,11,15,19,23].
+        let linear_indices: Vec<usize> =
+            (0..24).filter(|i| ![3, 7, 11, 15, 19, 23].contains(i)).collect();
+
+        let n_layers = 24;
+        let mut layers = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            use super::super::ane_lora::{LoraAdapter, LoraLayerAdapters};
+            if i == 0 {
+                // down_proj: d_out=1024, d_in=3584, rank=4
+                let rank = 4usize;
+                let d_in = 3584usize;
+                let d_out = 1024usize;
+                // A = small random, B = small constant so delta is visible
+                let a: Vec<f32> = (0..rank * d_in)
+                    .map(|j| (j as f32 * 0.0001).sin() * 0.1)
+                    .collect();
+                let mut b = vec![0.0f32; d_out * rank];
+                // Set B[0,0] = 1.0 so row 0 of delta is non-zero
+                b[0] = 1.0;
+                layers.push(LoraLayerAdapters {
+                    wq: None,
+                    wv: None,
+                    wo: None,
+                    w2: Some(LoraAdapter { a, b, rank, d_in, d_out }),
+                });
+            } else {
+                layers.push(LoraLayerAdapters {
+                    wq: None, wv: None, wo: None, w2: None,
+                });
+            }
+        }
+        let lora = super::super::ane_lora::LoraModel {
+            layers,
+            config: super::super::ane_lora::LoraConfig {
+                rank: 4,
+                alpha: 4.0, // scale = alpha/rank = 1.0
+                target_modules: vec!["w2".into()],
+            },
+        };
+
+        // Run merge.
+        let report = merge_lora_into_base(
+            tmp_dir,
+            &lora,
+            "language_model.model",
+            &linear_indices,
+            8,  // bits
+            64, // group_size
+        )
+        .expect("merge failed");
+
+        eprintln!("Merge report: {report:?}");
+        assert!(report.tensors_merged > 0, "should have merged tensors");
+        assert!(report.files_modified > 0, "should have modified files");
+        assert!(report.backup_created, "should have created backup");
+
+        // Verify .premrg backup exists and matches original.
+        let premrg_file = tmp_dir.join("model.premrg.safetensors");
+        assert!(premrg_file.exists(), ".premrg backup should exist");
+        let premrg_bytes = std::fs::read(&premrg_file).unwrap();
+        assert_eq!(premrg_bytes, orig_bytes, ".premrg should match original");
+
+        // Verify merged file differs from original.
+        let merged_bytes = std::fs::read(tmp_dir.join("model.safetensors")).unwrap();
+        assert_ne!(merged_bytes, orig_bytes, "merged should differ from original");
+
+        // Read back merged down_proj and verify delta was applied.
+        let (hdr_size, entries) = parse_safetensors_header(&merged_bytes).unwrap();
+        let data_start = 8 + hdr_size;
+        let base_name = "language_model.model.layers.0.mlp.down_proj";
+        let w_e = &entries[&format!("{base_name}.weight")];
+        let s_e = &entries[&format!("{base_name}.scales")];
+        let b_e = &entries[&format!("{base_name}.biases")];
+
+        // Dequantize merged weight.
+        let rows = w_e.shape[0];
+        let cols = w_e.shape[1] * 32 / 8;
+        let merged_w = dequant_nbit(
+            &merged_bytes[data_start + w_e.data_start..data_start + w_e.data_end],
+            &bf16_to_f32_slice(&merged_bytes[data_start + s_e.data_start..data_start + s_e.data_end]),
+            &bf16_to_f32_slice(&merged_bytes[data_start + b_e.data_start..data_start + b_e.data_end]),
+            rows, cols, 64, 8,
+        );
+
+        // Dequantize original weight.
+        let orig_w = dequant_nbit(
+            &orig_bytes[data_start + w_e.data_start..data_start + w_e.data_end],
+            &bf16_to_f32_slice(&orig_bytes[data_start + s_e.data_start..data_start + s_e.data_end]),
+            &bf16_to_f32_slice(&orig_bytes[data_start + b_e.data_start..data_start + b_e.data_end]),
+            rows, cols, 64, 8,
+        );
+
+        // Row 0 should have changed (B[0,0]=1.0 makes delta non-zero in row 0).
+        let row0_diff: f32 = (0..cols)
+            .map(|c| (merged_w[c] - orig_w[c]).abs())
+            .sum();
+        eprintln!("Row 0 total absolute diff: {row0_diff:.6}");
+        assert!(row0_diff > 0.01, "row 0 should have visible delta, got {row0_diff}");
+
+        // Row 1 should be ~unchanged (B[1,0]=0).
+        let row1_diff: f32 = (0..cols)
+            .map(|c| (merged_w[cols + c] - orig_w[cols + c]).abs())
+            .sum();
+        eprintln!("Row 1 total absolute diff: {row1_diff:.6}");
+        // Allow small quantization noise but much less than row 0.
+        assert!(
+            row1_diff < row0_diff * 0.01,
+            "row 1 should be ~unchanged: {row1_diff} vs row0 {row0_diff}"
+        );
+
+        eprintln!("E2E merge verified: delta applied to real 0.8B model weights");
+    }
+
     /// Build a minimal safetensors buffer with weight/scales/biases tensors.
     fn build_test_safetensors(
         base_name: &str,
