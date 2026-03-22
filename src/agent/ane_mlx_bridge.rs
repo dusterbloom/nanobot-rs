@@ -5071,6 +5071,7 @@ mod tests {
                 x_norm,
                 expert_indices: top.iter().map(|&(i, _)| i).collect(),
                 expert_probs: probs,
+                reward: 0.0,
             });
         }
         eprintln!("generated {} routing targets from frozen router", targets.len());
@@ -5245,6 +5246,7 @@ mod tests {
                 x_norm,
                 expert_indices: top.iter().map(|&(i, _)| i).collect(),
                 expert_probs: probs,
+                reward: 0.0,
             });
         }
 
