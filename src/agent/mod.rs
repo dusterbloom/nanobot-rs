@@ -16,6 +16,8 @@ pub mod ane_backward;
 #[cfg(feature = "ane")]
 pub mod ane_bridge;
 #[cfg(feature = "ane")]
+pub mod ane_decode;
+#[cfg(feature = "ane")]
 pub mod ane_forward;
 #[cfg(feature = "ane")]
 pub mod ane_lora;
@@ -27,6 +29,8 @@ pub mod ane_mlx_bridge;
 pub mod ane_train;
 #[cfg(feature = "ane")]
 pub mod ane_weights;
+#[cfg(feature = "ane")]
+pub mod factored_vocab;
 pub mod anti_drift;
 pub mod audit;
 pub mod budget_calibrator;
