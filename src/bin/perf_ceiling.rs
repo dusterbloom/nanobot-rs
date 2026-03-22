@@ -402,6 +402,7 @@ fn single_layer_quantized_model(
         vocab_size: model.vocab_size,
         lm_head: model.lm_head.clone(),
         heads_per_group: model.heads_per_group,
+        moe: vec![model.moe[layer_idx].clone()],
     }
 }
 
@@ -1284,6 +1285,7 @@ fn bench_quantized_layer_forward_path() -> QuantizedLayerForwardBenchResult {
         vocab_size: vocab,
         lm_head: None,
         heads_per_group: cfg.heads_per_group(),
+        moe: vec![None; 1],
     };
     let dense_layer = quantized.dequantize_layer(0);
     let dense_model = BorrowedSingleLayerModel {

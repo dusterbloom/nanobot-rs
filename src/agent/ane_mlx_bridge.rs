@@ -791,7 +791,7 @@ impl AneTrainerSession {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".to_string())
         ));
-        let model = match QuantizedModelWeights::from_mlx_safetensors(
+        let mut model = match QuantizedModelWeights::from_mlx_safetensors(
             effective_dir,
             &cfg.mil_config,
         ) {
@@ -827,6 +827,35 @@ impl AneTrainerSession {
             }
             Err(e) => return Err(format!("failed to load weights: {e}")),
         };
+
+        // Load MoE experts (router + packed experts) if model has MoE config.
+        // This enables router training via ensure_router_trainer().
+        if let Ok(cfg_str) = std::fs::read_to_string(effective_dir.join("config.json")) {
+            if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                let tc = cfg_json.get("text_config").unwrap_or(&cfg_json);
+                let ne = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let nept = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mh = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if ne > 1 {
+                    let t_moe = std::time::Instant::now();
+                    match model.load_moe_experts(effective_dir, ne, nept, mh) {
+                        Ok(()) => {
+                            let moe_layers = (0..model.n_layers())
+                                .filter(|&l| model.layer(l).moe.is_some())
+                                .count();
+                            tracing::info!(
+                                "ANE train: loaded MoE experts in {}ms ({ne} experts, top-{nept}, {moe_layers} layers)",
+                                t_moe.elapsed().as_millis()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("MoE expert loading failed (router training disabled): {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         use std::sync::atomic::Ordering;
         stats.model_loads.fetch_add(1, Ordering::Relaxed);
 
@@ -4764,6 +4793,143 @@ mod tests {
 
     /// Test: one real ANE training step on Qwen3.5-35B-A3B.
     ///
+    /// E2E router training on real 35B: load model → simulate inference routing →
+    /// train router via distillation → verify loss decreases and weights change.
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "requires local Qwen3.5-35B-A3B checkpoint"]
+    fn test_35b_router_training_e2e() {
+        use crate::agent::ane_lora::{RouterTrainer, RouterTrainingBuffer, RouterRoutingTarget};
+        use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
+        use crate::agent::ane_forward::{cpu_matmul, rmsnorm};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: Qwen3.5-35B-A3B-4bit not found");
+            return;
+        }
+
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(32);
+
+        let t0 = std::time::Instant::now();
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg).expect("load");
+        eprintln!("loaded quantized in {}ms", t0.elapsed().as_millis());
+
+        let t0 = std::time::Instant::now();
+        let mut model = DenseCachedModel::auto(quantized);
+
+        // Load MoE experts (router + packed experts) via ModelWeights path
+        if let Ok(cfg_str) = std::fs::read_to_string(dir.join("config.json")) {
+            if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                let tc = cfg_json.get("text_config").unwrap_or(&cfg_json);
+                let ne = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let nept = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mh = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if ne > 1 {
+                    let t0 = std::time::Instant::now();
+                    model.load_moe_experts(&dir, ne, nept, mh).expect("load MoE");
+                    eprintln!("loaded MoE in {}ms ({ne} experts, top-{nept})", t0.elapsed().as_millis());
+                }
+            }
+        }
+        eprintln!("dense cache: {}/{} layers in {}ms", model.cached_layer_count(), model.n_layers(), t0.elapsed().as_millis());
+
+        // Find first MoE layer and extract router info
+        let mut moe_layer = None;
+        for l in 0..model.n_layers() {
+            let lw = model.layer(l);
+            if let Some(ref moe) = lw.moe {
+                eprintln!("MoE layer {l}: {} experts × {} dim, top-{}", moe.num_experts, mil_cfg.dim, moe.num_experts_per_tok);
+                moe_layer = Some(l);
+                break;
+            }
+        }
+        let moe_l = match moe_layer {
+            Some(l) => l,
+            None => { eprintln!("SKIP: no MoE layers"); return; }
+        };
+
+        // Generate routing targets by running frozen router on random-ish inputs
+        let dim = mil_cfg.dim;
+        let lw = model.layer(moe_l);
+        let moe = lw.moe.as_ref().unwrap();
+        let ne = moe.num_experts;
+        let k = moe.num_experts_per_tok;
+        let batch_size = 16;
+
+        let mut targets = Vec::new();
+        for t in 0..batch_size {
+            // Synthetic normalized input
+            let x_norm: Vec<f32> = (0..dim).map(|d| ((t * dim + d) as f32 * 0.0031).sin() * 0.3).collect();
+            // Teacher: frozen router logits
+            let mut logits = vec![0.0f32; ne];
+            for e in 0..ne {
+                for d in 0..dim {
+                    logits[e] += moe.router[e * dim + d] * x_norm[d];
+                }
+            }
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &indexed[..k];
+            let max_l = top[0].1;
+            let mut probs: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in &mut probs { *p /= sum; }
+            targets.push(RouterRoutingTarget {
+                x_norm,
+                expert_indices: top.iter().map(|&(i, _)| i).collect(),
+                expert_probs: probs,
+            });
+        }
+        eprintln!("generated {} routing targets from frozen router", targets.len());
+
+        // Initialize router trainer
+        let t0 = std::time::Instant::now();
+        let mut rt = RouterTrainer::new(&model, batch_size, 1e-3, 0.01).expect("router trainer");
+        eprintln!("RouterTrainer init: {}ms, {} experts × {} dim", t0.elapsed().as_millis(), rt.num_experts, rt.dim);
+
+        // Perturb student weights so initial loss > 0
+        for l in 0..rt.weights.len() {
+            for (i, w) in rt.weights[l].iter_mut().enumerate() {
+                *w += (i as f32 * 0.017).sin() * 0.02;
+            }
+        }
+
+        // Train and track loss
+        let mut losses = Vec::new();
+        for step in 0..10 {
+            let t0 = std::time::Instant::now();
+            if let Some((loss, n)) = rt.train_step(moe_l, &targets) {
+                let us = t0.elapsed().as_micros();
+                losses.push(loss);
+                if step < 3 || step == 9 {
+                    eprintln!("step {step}: loss={loss:.4}, tokens={n}, time={us}µs");
+                }
+            }
+        }
+
+        assert!(!losses.is_empty(), "should have trained");
+        assert!(
+            losses.last().unwrap() < losses.first().unwrap(),
+            "loss should decrease: {:.4} → {:.4}", losses[0], losses.last().unwrap()
+        );
+        let reduction = 1.0 - losses.last().unwrap() / losses[0];
+        eprintln!("loss reduction: {:.1}% ({:.4} → {:.4})", reduction * 100.0, losses[0], losses.last().unwrap());
+
+        // Verify weights actually changed
+        let lw2 = model.layer(moe_l);
+        let frozen = &lw2.moe.as_ref().unwrap().router;
+        let trained = &rt.weights[moe_l];
+        let max_delta: f32 = frozen.iter().zip(trained.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("max weight delta vs frozen: {max_delta:.6}");
+        assert!(max_delta > 1e-5, "weights should have changed from frozen");
+        eprintln!("✓ E2E router training on 35B passed");
+    }
+
     /// This exercises the actual bucketed ANE path used by `spawn_ane_training`:
     /// compile bucket kernels -> ANE forward -> ANE backward -> Adam update.
     #[cfg(feature = "mlx")]

@@ -5461,6 +5461,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             heads_per_group: cfg.heads_per_group(),
+            moe: vec![None; 1],
         };
 
         let dense = ModelWeights {
@@ -5606,6 +5607,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             heads_per_group: cfg.heads_per_group(),
+            moe: vec![None; 1],
         };
 
         let dense = ModelWeights {

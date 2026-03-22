@@ -2931,7 +2931,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
-                moe: Some(make_moe(&mut rand)),
+                moe: Some(std::sync::Arc::new(make_moe(&mut rand))),
             }
         }).collect();
 

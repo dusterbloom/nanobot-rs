@@ -7,6 +7,7 @@
 use crate::agent::ane_mil::MilConfig;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 fn bench_trace_enabled() -> bool {
     std::env::var("NANOBOT_ANE_BENCH_TRACE_PHASES")
@@ -237,7 +238,8 @@ pub struct LayerWeights {
     /// GDN weights — `Some` for linear attention layers, `None` for MHA layers.
     pub gdn: Option<GdnLayerWeights>,
     /// MoE weights — `Some` for MoE layers, `None` for dense FFN layers.
-    pub moe: Option<MoeLayerWeights>,
+    /// Wrapped in Arc to avoid cloning large packed expert data on dequantize.
+    pub moe: Option<Arc<MoeLayerWeights>>,
 }
 
 /// Full model weights.
@@ -1629,14 +1631,14 @@ impl ModelWeights {
             // Shared expert (optional, always in memory — small)
             let shared = load_expert_individual(&format!("{prefix}.mlp.shared_expert")).ok();
 
-            self.layers[l].moe = Some(MoeLayerWeights {
+            self.layers[l].moe = Some(Arc::new(MoeLayerWeights {
                 router,
                 packed_experts: packed,
                 shared_expert: shared,
                 num_experts,
                 num_experts_per_tok,
                 moe_hidden,
-            });
+            }));
 
             if l == 0 {
                 tracing::info!(
@@ -1902,6 +1904,7 @@ impl QuantizedModelWeights {
 
         let rms_final = get_bf16("model.norm.weight")?;
 
+        let n = layers.len();
         Ok(QuantizedModelWeights {
             cfg: cfg.clone(),
             layers,
@@ -1910,7 +1913,189 @@ impl QuantizedModelWeights {
             vocab_size,
             lm_head: None,
             heads_per_group: hpg,
+            moe: vec![None; n],
         })
+    }
+}
+
+impl QuantizedModelWeights {
+    /// Load MoE expert weights into the parallel `moe` vec.
+    ///
+    /// Same logic as `ModelWeights::load_moe_experts` but stores `Arc<MoeLayerWeights>`
+    /// alongside quantized layers so `dequantize_layer` can pass them through cheaply.
+    pub fn load_moe_experts(
+        &mut self,
+        dir: &Path,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        moe_hidden: usize,
+    ) -> io::Result<()> {
+        let store = MmapTensorStore::open(dir, false)?;
+
+        let config_path = dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        let meta = parse_mlx_checkpoint_meta(&config)?;
+        let default_group_size = meta.group_size;
+        let default_bits = meta.bits;
+
+        let tc = config.get("text_config").unwrap_or(&config);
+        let quant_section = tc.get("quantization").or_else(|| config.get("quantization"));
+        let get_tensor_bits = |tensor_key: &str| -> (usize, usize) {
+            if let Some(qs) = quant_section {
+                for key in &[tensor_key.to_string(), format!("language_model.{tensor_key}")] {
+                    if let Some(override_obj) = qs.get(key) {
+                        let b = override_obj.get("bits").and_then(|v| v.as_u64())
+                            .unwrap_or(default_bits as u64) as usize;
+                        let g = override_obj.get("group_size").and_then(|v| v.as_u64())
+                            .unwrap_or(default_group_size as u64) as usize;
+                        return (b, g);
+                    }
+                }
+            }
+            (default_bits, default_group_size)
+        };
+
+        fn bf16_to_f32(data: &[u8]) -> Vec<f32> {
+            data.chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+
+        let load_quantized = |base: &str, bits: usize, group_size: usize| -> io::Result<QuantizedTensor> {
+            let base = store.resolve_weight_base(base);
+            let w_key = format!("{base}.weight");
+            let s_key = format!("{base}.scales");
+            let b_key = format!("{base}.biases");
+            if let (Some(w), Some(s), Some(b)) =
+                (store.get(&w_key), store.get(&s_key), store.get(&b_key))
+            {
+                let (_, shape) = store.meta(&w_key).unwrap();
+                let rows = shape[0];
+                let cols = shape[1] * 32 / bits;
+                Ok(QuantizedTensor {
+                    data: w.to_vec(),
+                    scales: bf16_to_f32(s),
+                    biases: bf16_to_f32(b),
+                    rows,
+                    cols,
+                    group_size,
+                    bits,
+                })
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing quantized: {base}"),
+                ))
+            }
+        };
+
+        fn load_packed_projection(
+            store: &MmapTensorStore,
+            key_base: &str,
+            group_size: usize,
+            bits: usize,
+        ) -> io::Result<(Vec<u8>, Vec<f32>, Vec<f32>, usize, usize)> {
+            let base = store.resolve_weight_base(key_base);
+            let w_key = format!("{base}.weight");
+            let s_key = format!("{base}.scales");
+            let b_key = format!("{base}.biases");
+            let (w, s, b) = match (store.get(&w_key), store.get(&s_key), store.get(&b_key)) {
+                (Some(w), Some(s), Some(b)) => (w, s, b),
+                _ => return Err(io::Error::new(io::ErrorKind::NotFound, format!("missing: {base}"))),
+            };
+            let (_, shape) = store.meta(&w_key).unwrap();
+            let rows = shape[1];
+            let packed_cols = shape[2];
+            let cols = packed_cols * 32 / bits;
+            Ok((w.to_vec(), bf16_to_f32(s), bf16_to_f32(b), rows, cols))
+        }
+
+        let load_expert_individual = |prefix: &str| -> io::Result<MoeExpert> {
+            Ok(MoeExpert {
+                gate_proj: load_quantized(&format!("{prefix}.gate_proj"), default_bits, default_group_size)?,
+                up_proj: load_quantized(&format!("{prefix}.up_proj"), default_bits, default_group_size)?,
+                down_proj: load_quantized(&format!("{prefix}.down_proj"), default_bits, default_group_size)?,
+            })
+        };
+
+        let dim = self.cfg.dim;
+        let mut total_expert_bytes = 0usize;
+
+        for l in 0..self.layers.len() {
+            let prefix = format!("model.layers.{l}");
+            let gate_key = format!("{prefix}.mlp.gate");
+            let (gate_bits, gate_gs) = get_tensor_bits(&gate_key);
+            let router = if let Ok(qt) = load_quantized(&gate_key, gate_bits, gate_gs) {
+                qt.dequantize()
+            } else {
+                continue;
+            };
+            if router.len() != num_experts * dim {
+                tracing::warn!(
+                    "L{l}: router size {} != expected {} — skipping MoE",
+                    router.len(), num_experts * dim
+                );
+                continue;
+            }
+
+            let switch_prefix = format!("{prefix}.mlp.switch_mlp");
+            let expert_bits = default_bits;
+            let expert_gs = default_group_size;
+
+            let packed = if let Ok((gate_data, gate_scales, gate_biases, gate_rows, gate_cols)) =
+                load_packed_projection(&store, &format!("{switch_prefix}.gate_proj"), expert_gs, expert_bits)
+            {
+                let (up_data, up_scales, up_biases, _, _) =
+                    load_packed_projection(&store, &format!("{switch_prefix}.up_proj"), expert_gs, expert_bits)?;
+                let (down_data, down_scales, down_biases, down_rows, down_cols) =
+                    load_packed_projection(&store, &format!("{switch_prefix}.down_proj"), expert_gs, expert_bits)?;
+                total_expert_bytes += gate_data.len() + up_data.len() + down_data.len();
+                PackedMoeExperts {
+                    gate_data, gate_scales, gate_biases,
+                    up_data, up_scales, up_biases,
+                    down_data, down_scales, down_biases,
+                    n_experts: num_experts,
+                    gate_rows, gate_cols,
+                    down_rows, down_cols,
+                    group_size: expert_gs, bits: expert_bits,
+                }
+            } else {
+                tracing::warn!("L{l}: no switch_mlp, falling back to individual experts");
+                continue;
+            };
+
+            let shared = load_expert_individual(&format!("{prefix}.mlp.shared_expert")).ok();
+
+            self.moe[l] = Some(Arc::new(MoeLayerWeights {
+                router,
+                packed_experts: packed,
+                shared_expert: shared,
+                num_experts,
+                num_experts_per_tok,
+                moe_hidden,
+            }));
+
+            if l == 0 {
+                tracing::info!(
+                    "MoE L0: {num_experts} experts loaded, {num_experts_per_tok} active/token, \
+                     moe_hidden={moe_hidden}"
+                );
+            }
+        }
+
+        let moe_layers = self.moe.iter().filter(|m| m.is_some()).count();
+        tracing::info!(
+            "MoE loaded: {moe_layers}/{} layers, {:.1} MB quantized expert storage",
+            self.layers.len(),
+            total_expert_bytes as f64 / 1e6
+        );
+
+        Ok(())
     }
 }
 
@@ -2128,6 +2313,8 @@ pub struct QuantizedModelWeights {
     pub lm_head: Option<Vec<f32>>,
     /// GQA expansion factor: n_heads / n_kv_heads
     pub heads_per_group: usize,
+    /// MoE weights per layer — loaded separately via `load_moe_experts`.
+    pub moe: Vec<Option<Arc<MoeLayerWeights>>>,
 }
 
 impl QuantizedModelWeights {
@@ -2166,7 +2353,7 @@ impl QuantizedModelWeights {
                     conv_weight: gdn_q.conv_weight.clone(),
                     conv_bias: gdn_q.conv_bias.clone(),
                 }),
-                moe: None, // MoE handled separately
+                moe: self.moe[l].clone(),
             };
         }
 
@@ -2197,7 +2384,7 @@ impl QuantizedModelWeights {
             q_norm: ql.q_norm.clone(),
             k_norm: ql.k_norm.clone(),
             gdn: None,
-            moe: None,
+            moe: self.moe[l].clone(),
         }
     }
 
@@ -2537,6 +2724,24 @@ impl DenseCachedModel {
     fn physical_memory_bytes() -> usize {
         // Fallback: assume 16 GB
         16 * 1024 * 1024 * 1024
+    }
+
+    /// Load MoE experts into the quantized model and refresh cached layers.
+    pub fn load_moe_experts(
+        &mut self,
+        dir: &Path,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        moe_hidden: usize,
+    ) -> io::Result<()> {
+        self.quantized.load_moe_experts(dir, num_experts, num_experts_per_tok, moe_hidden)?;
+        // Patch cached layers with the newly loaded MoE data
+        for l in 0..self.cache.len() {
+            if let (Some(ref mut lw), Some(ref moe)) = (&mut self.cache[l], &self.quantized.moe[l]) {
+                lw.moe = Some(Arc::clone(moe));
+            }
+        }
+        Ok(())
     }
 }
 
