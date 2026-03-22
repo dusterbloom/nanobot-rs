@@ -5069,9 +5069,17 @@ mod tests {
         }).collect();
         let n_layers = model.n_layers();
 
-        // 4. Concurrent: inference + router training in background
+        // Clone for throttled phase (unthrottled thread will move the original)
+        let router_weights_throttled = router_weights.clone();
+
+        // Drop the full model (~7GB) before concurrent phase.
+        // We only need router_weights (~80MB) from here on.
+        // Without this, our copy + oMLX's copy = OOM → SIGKILL.
+        drop(model);
+
+        // 4. Unthrottled concurrent: inference + router training in background
         // RouterTrainer constructed INSIDE thread (ANE handles are !Send)
-        eprintln!("--- concurrent (inference + router training) ---");
+        eprintln!("--- concurrent (inference + unthrottled router training) ---");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = stop.clone();
         let targets2 = targets.clone();
@@ -5099,24 +5107,60 @@ mod tests {
                 steps
             }).expect("spawn train thread");
 
-        let concurrent = measure_toks("concurrent", 3);
+        let unthrottled = measure_toks("unthrottled", 3);
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let train_steps = train_handle.join().unwrap();
+        let unthrottled_steps = train_handle.join().unwrap();
 
-        // 5. Post-training baseline
+        // 5. Throttled concurrent: sleep between steps to simulate production duty cycle
+        eprintln!("--- concurrent (inference + throttled router training) ---");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let targets2 = targets.clone();
+        let throttled_handle = std::thread::Builder::new()
+            .name("router-train-throttled".into())
+            .spawn(move || {
+                let mut rt = RouterTrainer::from_weights(
+                    &router_weights_throttled, ne, dim, 16, 1e-3, 0.01,
+                ).expect("router trainer throttled");
+                for l in 0..rt.weights.len() {
+                    for (i, w) in rt.weights[l].iter_mut().enumerate() {
+                        *w += (i as f32 * 0.017).sin() * 0.02;
+                    }
+                }
+                let mut steps = 0u64;
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    for l in 0..n_layers {
+                        if rt.weights[l].is_empty() { continue; }
+                        rt.train_step(l, &targets2);
+                    }
+                    steps += 1;
+                    // ~100ms pause between full passes = ~10 steps/sec duty cycle
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                steps
+            }).expect("spawn throttled train thread");
+
+        let throttled = measure_toks("throttled", 3);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let throttled_steps = throttled_handle.join().unwrap();
+
+        // 6. Post-training baseline
         eprintln!("--- post-training baseline ---");
         let post = measure_toks("post", 2);
 
         // Report
-        let degradation = if baseline > 0.0 { (1.0 - concurrent / baseline) * 100.0 } else { 0.0 };
+        let unthrottled_deg = if baseline > 0.0 { (1.0 - unthrottled / baseline) * 100.0 } else { 0.0 };
+        let throttled_deg = if baseline > 0.0 { (1.0 - throttled / baseline) * 100.0 } else { 0.0 };
         let recovery = if baseline > 0.0 { (post / baseline) * 100.0 } else { 0.0 };
         eprintln!("\n=== RESULTS ===");
-        eprintln!("baseline:   {baseline:.1} tok/s");
-        eprintln!("concurrent: {concurrent:.1} tok/s ({degradation:+.1}% degradation)");
-        eprintln!("post:       {post:.1} tok/s ({recovery:.0}% of baseline)");
-        eprintln!("router training steps during inference: {train_steps}");
-        eprintln!("verdict: {}", if degradation.abs() < 5.0 { "NO DEGRADATION" } else if degradation < 15.0 { "MINOR DEGRADATION" } else { "SIGNIFICANT DEGRADATION" });
+        eprintln!("baseline:     {baseline:.1} tok/s");
+        eprintln!("unthrottled:  {unthrottled:.1} tok/s ({unthrottled_deg:+.1}% degradation, {unthrottled_steps} steps)");
+        eprintln!("throttled:    {throttled:.1} tok/s ({throttled_deg:+.1}% degradation, {throttled_steps} steps)");
+        eprintln!("post:         {post:.1} tok/s ({recovery:.0}% of baseline)");
+        eprintln!("verdict (unthrottled): {}", if unthrottled_deg.abs() < 5.0 { "NEGLIGIBLE" } else if unthrottled_deg < 15.0 { "MINOR" } else { "SIGNIFICANT" });
+        eprintln!("verdict (throttled):   {}", if throttled_deg.abs() < 5.0 { "NEGLIGIBLE" } else if throttled_deg < 15.0 { "MINOR" } else { "SIGNIFICANT" });
     }
 
     /// This exercises the actual bucketed ANE path used by `spawn_ane_training`:
