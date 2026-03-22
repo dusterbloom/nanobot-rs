@@ -2932,29 +2932,90 @@ impl RouterTrainer {
             d_logits[i] = (student_probs[i] - teacher_probs[i]) / seq as f32;
         }
 
-        // Backward: get dW (ANE if batch matches compiled seq, else CPU fallback)
+        // Backward: get dW via ANE (pad/chunk to match compiled seq)
         let dw = if let Some(ref chain) = self.chains[layer] {
-            if seq != chain.seq {
-                // Batch size doesn't match compiled chain — CPU fallback
-                let (_, dw) = router_backward_cpu(
-                    &self.weights[layer], &d_logits, &x_packed,
-                    ne, dim, seq,
-                );
-                dw
-            } else {
-            // Reload weights (in case they changed since last step)
+            let chain_seq = chain.seq;
             chain.load_weights(&self.weights[layer]);
-            match chain.backward(&self.weights[layer], &d_logits, &x_packed) {
-                Ok((_dx, dw)) => dw,
-                Err(e) => {
-                    tracing::debug!("Router ANE backward failed L{layer}: {e}");
-                    let (_, dw) = router_backward_cpu(
-                        &self.weights[layer], &d_logits, &x_packed,
-                        ne, dim, seq,
-                    );
-                    dw
+
+            if seq <= chain_seq {
+                // Pad d_logits and x_packed to chain_seq with zeros.
+                // Zero-padded positions contribute zero to the gradient sum.
+                let mut d_pad = vec![0.0f32; ne * chain_seq];
+                let mut x_pad = vec![0.0f32; dim * chain_seq];
+                for e in 0..ne {
+                    for t in 0..seq {
+                        d_pad[e * chain_seq + t] = d_logits[e * seq + t];
+                    }
                 }
-            }
+                for d in 0..dim {
+                    for t in 0..seq {
+                        x_pad[d * chain_seq + t] = x_packed[d * seq + t];
+                    }
+                }
+                match chain.backward(&self.weights[layer], &d_pad, &x_pad) {
+                    Ok((_dx, dw)) => dw,
+                    Err(e) => {
+                        tracing::debug!("Router ANE backward failed L{layer}: {e}");
+                        let (_, dw) = router_backward_cpu(
+                            &self.weights[layer], &d_logits, &x_packed,
+                            ne, dim, seq,
+                        );
+                        dw
+                    }
+                }
+            } else {
+                // Chunk: process chain_seq tokens at a time, accumulate dW
+                let mut dw_acc = vec![0.0f32; ne * dim];
+                let mut offset = 0;
+                while offset < seq {
+                    let chunk_len = (seq - offset).min(chain_seq);
+                    let mut d_pad = vec![0.0f32; ne * chain_seq];
+                    let mut x_pad = vec![0.0f32; dim * chain_seq];
+                    for e in 0..ne {
+                        for t in 0..chunk_len {
+                            d_pad[e * chain_seq + t] = d_logits[e * seq + offset + t];
+                        }
+                    }
+                    for d in 0..dim {
+                        for t in 0..chunk_len {
+                            x_pad[d * chain_seq + t] = x_packed[d * seq + offset + t];
+                        }
+                    }
+                    match chain.backward(&self.weights[layer], &d_pad, &x_pad) {
+                        Ok((_dx, chunk_dw)) => {
+                            for i in 0..dw_acc.len() {
+                                dw_acc[i] += chunk_dw[i];
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Router ANE chunk backward failed L{layer}: {e}");
+                            // Fall through to CPU for remaining chunks
+                            let remaining_seq = seq - offset;
+                            let mut d_rem = vec![0.0f32; ne * remaining_seq];
+                            let mut x_rem = vec![0.0f32; dim * remaining_seq];
+                            for e in 0..ne {
+                                for t in 0..remaining_seq {
+                                    d_rem[e * remaining_seq + t] = d_logits[e * seq + offset + t];
+                                }
+                            }
+                            for d in 0..dim {
+                                for t in 0..remaining_seq {
+                                    x_rem[d * remaining_seq + t] = x_packed[d * seq + offset + t];
+                                }
+                            }
+                            let (_, rem_dw) = router_backward_cpu(
+                                &self.weights[layer], &d_rem, &x_rem,
+                                ne, dim, remaining_seq,
+                            );
+                            for i in 0..dw_acc.len() {
+                                dw_acc[i] += rem_dw[i];
+                            }
+                            break;
+                        }
+                    }
+                    offset += chain_seq;
+                }
+                dw_acc
             }
         } else {
             let (_, dw) = router_backward_cpu(
