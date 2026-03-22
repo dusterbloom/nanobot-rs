@@ -33,6 +33,8 @@ pub mod ane_weights;
 pub mod factored_vocab;
 pub mod anti_drift;
 pub mod audit;
+#[cfg(feature = "ane")]
+pub mod router_adapter;
 #[cfg(test)]
 mod training_eval;
 pub mod budget_calibrator;
