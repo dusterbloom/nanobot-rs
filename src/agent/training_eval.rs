@@ -23,58 +23,62 @@ mod tests {
         ("What is the smallest prime number?", "2"),
     ];
 
-    /// Hard probes — designed to get 40-60% on Qwen3.5-35B-A3B-3bit.
-    /// Multi-digit arithmetic, obscure combinatorics, edge-case knowledge.
-    /// Graded by substring match on final answer (thinking stripped).
+    /// Hard probes — target 40-60% on Qwen3.5-35B-A3B-3bit.
+    ///
+    /// These require multi-step reasoning, cross-domain synthesis, and precise
+    /// computation where picking the WRONG expert pathway degrades quality.
+    /// NOT simple factual recall (model gets 88% on those).
     const HARD_PROBES: &[(&str, &str)] = &[
-        // Large arithmetic (5+ digits — models break down here)
-        ("What is 389 × 467? Just the number.", "181663"),
-        ("What is 1234 + 5678 + 9012? Just the number.", "15924"),
-        ("What is 31^3? Just the number.", "29791"),
-        ("What is 2^19? Just the number.", "524288"),
-        ("What is the sum of all integers from 1 to 137?", "9453"),
-        // Modular arithmetic / number theory
-        ("What is 7^4 mod 100? Just the number.", "1"),
-        ("What is the remainder when 10^10 is divided by 7?", "4"),
-        ("How many prime numbers are between 100 and 130?", "6"),
-        ("What is the smallest number divisible by both 12 and 18?", "36"),
-        ("Is 341 prime? Answer yes or no.", "no"),
-        // Combinatorics (models frequently get these wrong)
-        ("How many ways can you choose 3 items from 10? Just the number.", "120"),
-        ("How many 4-letter strings can be made from {A,B,C} with repetition?", "81"),
-        ("How many diagonals does a convex 12-gon have?", "54"),
-        ("How many ways can 8 people sit in a row?", "40320"),
-        ("In how many ways can you partition the set {1,2,3,4} into exactly 2 non-empty subsets?", "7"),
-        // Physics requiring precise multi-step computation
-        ("A 2kg ball is dropped from 45m. What is its speed on impact in m/s? Use g=10.", "30"),
-        ("What is the de Broglie wavelength of a proton moving at 1000 m/s, in picometers approximately?", "0.4"),
-        ("A circuit has a 12V battery and 4 ohms resistance. What is the power in watts?", "36"),
-        ("What is the orbital period of a satellite at altitude 300km above Earth in minutes? Approximately.", "90"),
-        ("If you compress an ideal gas at 300K to half its volume adiabatically (gamma=1.4), what is the final temperature in K approximately?", "396"),
-        // Obscure but precise facts
-        ("What is the population of Iceland to the nearest hundred thousand?", "400"),
-        ("In what year was the programming language Haskell first released?", "1990"),
-        ("What is the distance from Earth to the Sun in astronomical units?", "1"),
-        ("How many known moons does Uranus have as of 2024?", "27"),
-        ("What is the ISO 3166-1 alpha-2 country code for South Korea?", "KR"),
-        // Programming edge cases
-        ("In Python 3, what is the result of `True + True + True`?", "3"),
-        ("What is the maximum value of a signed 32-bit integer?", "2147483647"),
-        ("In JavaScript, what is `typeof NaN`?", "number"),
-        ("In C, what is `sizeof(char)` always equal to?", "1"),
-        ("What is the time complexity of finding an element in a balanced BST?", "log"),
-        // Multi-hop reasoning
-        ("If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly? Answer yes or no.", "no"),
-        ("Alice is taller than Bob. Charlie is shorter than Bob. Who is the tallest?", "Alice"),
-        ("A train leaves at 9:00 AM going 60 km/h. Another train leaves the same station at 10:00 AM going 90 km/h in the same direction. At what time does the second train catch up?", "12"),
-        ("If you reverse the digits of 2-digit number and subtract, the result is 27. The sum of digits is 9. What is the number?", "63"),
-        ("Three people share a $30 hotel room. The manager gives back $5, the bellboy keeps $2 and returns $1 each. Each person paid $9, totaling $27. The bellboy has $2. Where is the missing dollar?", "no"),
-        // Chemistry / biology edge cases
-        ("What is the oxidation state of Manganese in KMnO4?", "7"),
-        ("How many amino acids are coded by the genetic code?", "20"),
-        ("What is the pH of a 0.001 M HCl solution?", "3"),
-        ("What group on the periodic table are the noble gases?", "18"),
-        ("What is the bond angle in a methane molecule in degrees?", "109"),
+        // Multi-step arithmetic with carries (models fail at 6+ digits)
+        ("What is 7893 × 4567? Just the number.", "36047331"),
+        ("What is 123456 + 789012 + 345678? Just the number.", "1258146"),
+        ("What is 17^4? Just the number.", "83521"),
+        ("What is 2^23 - 2^20? Just the number.", "7340032"),
+        // Tricky modular / number theory
+        ("What is the remainder when 2^100 is divided by 7?", "2"),
+        ("What is the last two digits of 3^200?", "01"),
+        ("How many integers between 1 and 1000 are divisible by 3 but not by 5?", "267"),
+        ("What is the sum of divisors of 360?", "1170"),
+        // Combinatorics that require careful counting
+        ("How many 5-card poker hands contain exactly one pair?", "1098240"),
+        ("How many surjective functions from a 5-element set to a 3-element set?", "150"),
+        ("In how many ways can 12 people be divided into 3 groups of 4?", "5775"),
+        ("How many lattice paths from (0,0) to (6,4) using only right and up steps?", "210"),
+        // Multi-step physics requiring 3+ computations
+        ("A projectile launched at 45 degrees with speed 50m/s. How far does it land in meters? Use g=10.", "250"),
+        ("What is the escape velocity from Earth's surface in km/s? Use R=6400km, g=9.8.", "11.2"),
+        ("A capacitor of 10uF charged to 100V is connected to a 1kOhm resistor. What is the current in mA after 15ms?", "22"),
+        ("Two masses 3kg and 5kg connected by a string over a frictionless pulley. What is the acceleration in m/s^2? Use g=10.", "2.5"),
+        // Cross-domain synthesis (needs multiple expert specializations)
+        ("If a DNA sequence is 5'-ATGCGATCG-3', what is the mRNA sequence?", "AUGCGAUCG"),
+        ("A star has luminosity 100 times the Sun and temperature 2 times the Sun. What is its radius relative to the Sun?", "2.5"),
+        ("In information theory, a source emits A with probability 0.5, B with 0.25, C and D with 0.125 each. What is the entropy in bits?", "1.75"),
+        ("What is the pH of a buffer solution containing 0.1M acetic acid (Ka=1.8e-5) and 0.1M sodium acetate?", "4.74"),
+        // Logic and constraint satisfaction
+        ("If A→B, B→C, not C. What can we conclude about A? Answer 'not A' or 'A'.", "not A"),
+        ("A says 'B is a liar'. B says 'A and C are both liars'. C says 'A is truthful'. If exactly one is a liar, who is it?", "B"),
+        ("In a room of 23 people, what is the approximate probability that two share a birthday? Answer as a percentage.", "50"),
+        ("Five pirates divide 100 gold coins by voting. The most senior proposes and needs majority. How many coins does pirate 1 (most senior) keep?", "98"),
+        // Code execution traces (must simulate)
+        ("What does this print: x=1; for i in range(5): x = x*2+1; print(x)", "63"),
+        ("In Python: len(set('mississippi')). What is the answer?", "4"),
+        ("What is the output: x=[1,2,3]; x.append(x); len(x)?", "4"),
+        ("In Python: sum(1 for x in range(100) if x%3==0 or x%5==0). Answer?", "47"),
+        // Probability requiring careful conditional reasoning
+        ("You have 2 coins: fair and double-headed. Pick one at random, flip it, get heads. What is the probability the coin is fair?", "1/3"),
+        ("Three doors, one has a prize. You pick door 1, host opens door 3 (no prize). Should you switch? What is the probability of winning if you switch?", "2/3"),
+        ("A test is 99% accurate. Disease prevalence is 1%. You test positive. What is the probability you have the disease? Answer as approximate percentage.", "50"),
+        ("Roll two dice. Given that their sum is 7, what is the probability that one die shows 3?", "1/3"),
+        // Multi-step word problems with distractors
+        ("A snail climbs 3m each day and slides back 2m each night. How many days to reach the top of a 10m well?", "8"),
+        ("If 5 machines make 5 widgets in 5 minutes, how many minutes do 100 machines take to make 100 widgets?", "5"),
+        ("A lily pad doubles in size each day. It covers the whole pond on day 30. On what day does it cover half the pond?", "29"),
+        ("You have 12 balls, one weighs differently. Using a balance scale, what is the minimum number of weighings to find it?", "3"),
+        // Harder programming / algorithms
+        ("What is the maximum number of nodes in a binary tree of height 5?", "63"),
+        ("How many comparisons does merge sort need in the worst case for 8 elements?", "17"),
+        ("What is the output of: (lambda f: f(f))(lambda x: 42)?", "42"),
+        ("In a graph with 6 vertices and 15 edges, how many triangles at most?", "20"),
     ];
 
     /// Send a prompt to oMLX and check if the response contains the expected answer.
