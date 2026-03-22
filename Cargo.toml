@@ -167,6 +167,7 @@ knowledge-graph = ["dep:petgraph"]
 lora = ["dep:qlora-rs", "dep:candle-core"]
 ane = ["dep:half", "dep:memmap2", "dep:rayon"]  # Apple Neural Engine fine-tuning (macOS Apple Silicon only)
 mlx = ["dep:mlx-rs", "dep:tokenizers", "dep:axum"]  # MLX GPU LoRA training (macOS Apple Silicon)
+candle = ["dep:candle-core", "dep:candle-nn"]  # Candle Metal GPU inference (GQA attention layers)
 
 [dependencies.jack-voice]
 path = "../jack-voice/jack-voice"
@@ -183,6 +184,10 @@ optional = true
 features = ["gguf-export"]
 
 [dependencies.candle-core]
+version = "0.9"
+optional = true
+
+[dependencies.candle-nn]
 version = "0.9"
 optional = true
 
