@@ -716,6 +716,25 @@ fn gdn_decode_single(
 /// - `token`: input token ID
 /// - `kv_cache`: mutable KV cache (appended to during this call)
 pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> DecodeResult {
+    decode_step_inner(model, token, kv_cache, None)
+}
+
+/// Decode with optional GDN ANE kernels for accelerated GDN projections.
+pub fn decode_step_with_ane(
+    model: &ModelWeights,
+    token: u32,
+    kv_cache: &mut KvCache,
+    gdn_ane: Option<&GdnAneKernels>,
+) -> DecodeResult {
+    decode_step_inner(model, token, kv_cache, gdn_ane)
+}
+
+fn decode_step_inner(
+    model: &ModelWeights,
+    token: u32,
+    kv_cache: &mut KvCache,
+    gdn_ane: Option<&GdnAneKernels>,
+) -> DecodeResult {
     let cfg = &model.cfg;
     let dim = cfg.dim;
     let n_layers = model.layers.len();
@@ -742,7 +761,12 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
                 // Full GDN decode: attention + FFN
                 let mut xnorm = vec![0.0f32; dim];
                 rmsnorm(&mut xnorm, &x, &lw.rms_att, dim, 1, cfg.rms_eps);
-                let attn_out = gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg);
+                // ANE path: projections on ANE, recurrence on CPU
+                let attn_out = if let Some(kernels) = gdn_ane.and_then(|k| k.layers[l].as_ref()) {
+                    gdn_decode_single_ane(gdn_w, kernels, gdn_state, &xnorm, cfg)
+                } else {
+                    gdn_decode_single(gdn_w, gdn_state, &xnorm, cfg)
+                };
                 vec_add_inplace(&mut x, &attn_out);
             }
             // FFN: MoE or dense (always runs, with or without GDN attention)
@@ -915,11 +939,12 @@ pub fn generate_draft_tokens(
     kv_cache: &mut KvCache,
     prompt_token: u32,
     n_draft: usize,
+    gdn_ane: Option<&GdnAneKernels>,
 ) -> Vec<u32> {
     let mut drafts = Vec::with_capacity(n_draft);
     let mut token = prompt_token;
     for _ in 0..n_draft {
-        let result = decode_step(model, token, kv_cache);
+        let result = decode_step_with_ane(model, token, kv_cache, gdn_ane);
         token = sample_argmax(&result.logits);
         drafts.push(token);
     }
@@ -2605,7 +2630,7 @@ mod tests {
         let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
 
         // Generate from token 0
-        let drafts = generate_draft_tokens(&model, &mut cache, 0, 4);
+        let drafts = generate_draft_tokens(&model, &mut cache, 0, 4, None);
         assert_eq!(drafts.len(), 4);
         assert_eq!(cache.pos(), 4); // 4 decode_step calls (prompt_token + 3 sampled)
 
