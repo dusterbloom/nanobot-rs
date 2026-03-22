@@ -2108,7 +2108,7 @@ impl QuantizedModelWeights {
 /// Handles both 4-bit (8 values per u32) and 8-bit (4 values per u32).
 /// MLX stores quantized values as u32 words in little-endian byte order,
 /// with values packed LSB-first within each word.
-fn dequant_nbit(
+pub(crate) fn dequant_nbit(
     weight: &[u8],
     scales: &[f32],
     biases: &[f32],
@@ -2179,6 +2179,106 @@ fn dequant_nbit(
         }
     }
     out
+}
+
+/// Quantize f32 values to N-bit packed format (inverse of `dequant_nbit`).
+///
+/// Returns `(packed_data, scales, biases)` matching MLX quantization format.
+/// Round-trip: `dequant_nbit(quantize_nbit(v)) ≈ v` within quantization error.
+pub fn quantize_nbit(
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let max_qval = (1u32 << bits) - 1;
+    let n_groups = cols / group_size;
+    let packed_cols = (cols * bits + 31) / 32;
+
+    let mut data = vec![0u8; rows * packed_cols * 4];
+    let mut scales = vec![0.0f32; rows * n_groups];
+    let mut biases = vec![0.0f32; rows * n_groups];
+
+    let spans_words = (32 % bits) != 0;
+
+    for r in 0..rows {
+        for g in 0..n_groups {
+            let start = r * cols + g * group_size;
+            let group = &values[start..start + group_size];
+
+            let min = group.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+            let scale = if (max - min).abs() < f32::EPSILON {
+                0.0
+            } else {
+                (max - min) / max_qval as f32
+            };
+            scales[r * n_groups + g] = scale;
+            biases[r * n_groups + g] = min;
+        }
+
+        let row_byte_offset = r * packed_cols * 4;
+        for c in 0..cols {
+            let g = c / group_size;
+            let scale = scales[r * n_groups + g];
+            let bias = biases[r * n_groups + g];
+
+            let qval = if scale == 0.0 {
+                0u32
+            } else {
+                ((values[r * cols + c] - bias) / scale)
+                    .round()
+                    .clamp(0.0, max_qval as f32) as u32
+            };
+
+            if spans_words {
+                let bit_offset = c * bits;
+                let word_idx = bit_offset / 32;
+                let bit_within_word = bit_offset % 32;
+                let byte_off = row_byte_offset + word_idx * 4;
+
+                let existing = u32::from_le_bytes([
+                    data[byte_off],
+                    data[byte_off + 1],
+                    data[byte_off + 2],
+                    data[byte_off + 3],
+                ]);
+                data[byte_off..byte_off + 4]
+                    .copy_from_slice(&(existing | (qval << bit_within_word)).to_le_bytes());
+
+                if bit_within_word + bits > 32 {
+                    let hi_byte_off = byte_off + 4;
+                    let hi_existing = u32::from_le_bytes([
+                        data[hi_byte_off],
+                        data[hi_byte_off + 1],
+                        data[hi_byte_off + 2],
+                        data[hi_byte_off + 3],
+                    ]);
+                    let hi_val = qval >> (32 - bit_within_word);
+                    data[hi_byte_off..hi_byte_off + 4]
+                        .copy_from_slice(&(hi_existing | hi_val).to_le_bytes());
+                }
+            } else {
+                let elems_per_u32 = 32 / bits;
+                let word_idx = c / elems_per_u32;
+                let elem_idx = c % elems_per_u32;
+                let byte_off = row_byte_offset + word_idx * 4;
+
+                let existing = u32::from_le_bytes([
+                    data[byte_off],
+                    data[byte_off + 1],
+                    data[byte_off + 2],
+                    data[byte_off + 3],
+                ]);
+                data[byte_off..byte_off + 4]
+                    .copy_from_slice(&(existing | (qval << (elem_idx * bits))).to_le_bytes());
+            }
+        }
+    }
+
+    (data, scales, biases)
 }
 
 /// A single quantized weight matrix (8-bit or 4-bit with group scales/biases).

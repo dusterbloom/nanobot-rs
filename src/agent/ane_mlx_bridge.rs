@@ -1504,6 +1504,7 @@ impl AneTrainerSession {
             let effective_dir = cfg.effective_model_dir();
             match crate::agent::mlx_lora::ModelConfig::from_config_json(effective_dir) {
                 Some(model_cfg) => {
+                    // Export adapter safetensors (kept as backup/reference).
                     let adapter_dir = effective_dir.join("adapters");
                     match crate::agent::mlx_lora::export_ane_adapters(
                         &self.lora,
@@ -1520,6 +1521,29 @@ impl AneTrainerSession {
                         }
                         Err(e) => {
                             tracing::warn!("ANE train: failed to export mlx-lm adapters: {e}");
+                        }
+                    }
+
+                    // Merge LoRA deltas directly into base model safetensors.
+                    // This makes oMLX load the trained weights without adapter API support.
+                    match super::lora_merge::merge_lora_into_base(
+                        effective_dir,
+                        &self.lora,
+                        model_cfg.weight_prefix,
+                        &cfg.linear_attn_indices,
+                        model_cfg.bits as usize,
+                        model_cfg.group_size as usize,
+                    ) {
+                        Ok(report) => {
+                            tracing::info!(
+                                tensors = report.tensors_merged,
+                                files = report.files_modified,
+                                ms = report.elapsed_ms,
+                                "ANE train: merged LoRA into base weights"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("ANE train: LoRA merge failed: {e:#}");
                         }
                     }
                 }

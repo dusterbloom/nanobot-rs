@@ -56,6 +56,8 @@ pub mod lane;
 pub mod lcm;
 pub mod learn_loop;
 pub mod learning;
+#[cfg(feature = "ane")]
+pub mod lora_merge;
 pub mod lora_bridge;
 pub mod markers;
 pub mod memory;
