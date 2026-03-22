@@ -4930,6 +4930,195 @@ mod tests {
         eprintln!("✓ E2E router training on 35B passed");
     }
 
+    /// Benchmark: oMLX inference tok/s with and without concurrent router training.
+    /// Measures actual degradation from router training on unified memory bandwidth.
+    #[cfg(feature = "mlx")]
+    #[test]
+    #[ignore = "requires running oMLX server and 35B checkpoint"]
+    fn bench_router_training_inference_contention() {
+        use crate::agent::ane_lora::{RouterTrainer, RouterRoutingTarget};
+        use crate::agent::ane_weights::{DenseCachedModel, QuantizedModelWeights, WeightSource};
+        use crate::agent::mlx_lora::ModelConfig;
+
+        let api_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "omlx".into());
+        let api_base = std::env::var("OMLX_API_BASE")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".into());
+
+        // Verify oMLX is up
+        let check = std::process::Command::new("curl")
+            .args(["-s", "-H", &format!("Authorization: Bearer {api_key}"),
+                   &format!("{api_base}/models")])
+            .output();
+        if check.is_err() || !check.as_ref().unwrap().status.success() {
+            eprintln!("SKIP: oMLX not running at {api_base}");
+            return;
+        }
+
+        let dir: std::path::PathBuf = dirs::home_dir()
+            .unwrap()
+            .join(".cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("SKIP: 35B checkpoint not found");
+            return;
+        }
+
+        // Helper: measure tok/s from oMLX completion via curl
+        let measure_toks = |label: &str, n_runs: usize| -> f64 {
+            let mut total_toks = 0usize;
+            let mut total_ms = 0u128;
+            let body = serde_json::json!({
+                "model": "Qwen3.5-35B-A3B-4bit",
+                "messages": [{"role": "user", "content": "Count from 1 to 50, one number per line."}],
+                "max_tokens": 200,
+                "temperature": 0.0,
+            });
+            let body_str = body.to_string();
+            for run in 0..n_runs {
+                let t0 = std::time::Instant::now();
+                let out = std::process::Command::new("curl")
+                    .args(["-s", "-X", "POST",
+                           "-H", &format!("Authorization: Bearer {api_key}"),
+                           "-H", "Content-Type: application/json",
+                           "-d", &body_str,
+                           &format!("{api_base}/chat/completions")])
+                    .output();
+                let elapsed = t0.elapsed().as_millis();
+                if let Ok(out) = out {
+                    if let Ok(resp) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                        let toks = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0) as usize;
+                        total_toks += toks;
+                        total_ms += elapsed;
+                        if run == 0 {
+                            eprintln!("  {label} run {run}: {toks} tokens in {elapsed}ms = {:.1} tok/s",
+                                toks as f64 / (elapsed as f64 / 1000.0));
+                        }
+                    }
+                } else {
+                    eprintln!("  {label} run {run}: curl failed");
+                }
+            }
+            if total_ms == 0 { return 0.0; }
+            let tps = total_toks as f64 / (total_ms as f64 / 1000.0);
+            eprintln!("  {label} avg: {total_toks} tokens in {total_ms}ms = {tps:.1} tok/s");
+            tps
+        };
+
+        // 1. Warmup
+        eprintln!("--- warmup ---");
+        measure_toks("warmup", 1);
+
+        // 2. Baseline: inference only
+        eprintln!("--- baseline (inference only) ---");
+        let baseline = measure_toks("baseline", 3);
+
+        // 3. Load model + prepare router training
+        eprintln!("--- loading MoE for router training ---");
+        let mc = ModelConfig::from_config_json(&dir).expect("model config");
+        let mil_cfg = mc.to_mil_config(32);
+        let quantized = QuantizedModelWeights::from_mlx_safetensors(&dir, &mil_cfg).expect("load");
+        let mut model = DenseCachedModel::auto(quantized);
+
+        if let Ok(cfg_str) = std::fs::read_to_string(dir.join("config.json")) {
+            if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                let tc = cfg_json.get("text_config").unwrap_or(&cfg_json);
+                let ne = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let nept = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mh = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if ne > 1 {
+                    model.load_moe_experts(&dir, ne, nept, mh).expect("load MoE");
+                    eprintln!("MoE loaded: {ne} experts, top-{nept}");
+                }
+            }
+        }
+
+        // Find first MoE layer, build targets
+        let dim = mil_cfg.dim;
+        let moe_l = (0..model.n_layers())
+            .find(|&l| model.layer(l).moe.is_some())
+            .expect("no MoE layer");
+        let lw = model.layer(moe_l);
+        let moe = lw.moe.as_ref().unwrap();
+        let ne = moe.num_experts;
+        let k = moe.num_experts_per_tok;
+
+        let mut targets = Vec::new();
+        for t in 0..16 {
+            let x_norm: Vec<f32> = (0..dim).map(|d| ((t * dim + d) as f32 * 0.0031).sin() * 0.3).collect();
+            let mut logits = vec![0.0f32; ne];
+            for e in 0..ne { for d in 0..dim { logits[e] += moe.router[e * dim + d] * x_norm[d]; } }
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &indexed[..k];
+            let max_l = top[0].1;
+            let mut probs: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in &mut probs { *p /= sum; }
+            targets.push(RouterRoutingTarget {
+                x_norm,
+                expert_indices: top.iter().map(|&(i, _)| i).collect(),
+                expert_probs: probs,
+            });
+        }
+
+        drop(lw); // release Cow borrow
+
+        // Collect router weights for the spawned thread (Arc-wrapped, Send-safe)
+        let router_weights: Vec<Option<Vec<f32>>> = (0..model.n_layers()).map(|l| {
+            let lw = model.layer(l);
+            lw.moe.as_ref().map(|m| m.router.clone())
+        }).collect();
+        let n_layers = model.n_layers();
+
+        // 4. Concurrent: inference + router training in background
+        // RouterTrainer constructed INSIDE thread (ANE handles are !Send)
+        eprintln!("--- concurrent (inference + router training) ---");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let targets2 = targets.clone();
+        let train_handle = std::thread::Builder::new()
+            .name("router-train-bench".into())
+            .spawn(move || {
+                // Construct RouterTrainer inside thread so ANE handles stay local
+                let mut rt = RouterTrainer::from_weights(
+                    &router_weights, ne, dim, 16, 1e-3, 0.01,
+                ).expect("router trainer in thread");
+                // Perturb so training does real work
+                for l in 0..rt.weights.len() {
+                    for (i, w) in rt.weights[l].iter_mut().enumerate() {
+                        *w += (i as f32 * 0.017).sin() * 0.02;
+                    }
+                }
+                let mut steps = 0u64;
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    for l in 0..n_layers {
+                        if rt.weights[l].is_empty() { continue; }
+                        rt.train_step(l, &targets2);
+                    }
+                    steps += 1;
+                }
+                steps
+            }).expect("spawn train thread");
+
+        let concurrent = measure_toks("concurrent", 3);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let train_steps = train_handle.join().unwrap();
+
+        // 5. Post-training baseline
+        eprintln!("--- post-training baseline ---");
+        let post = measure_toks("post", 2);
+
+        // Report
+        let degradation = if baseline > 0.0 { (1.0 - concurrent / baseline) * 100.0 } else { 0.0 };
+        let recovery = if baseline > 0.0 { (post / baseline) * 100.0 } else { 0.0 };
+        eprintln!("\n=== RESULTS ===");
+        eprintln!("baseline:   {baseline:.1} tok/s");
+        eprintln!("concurrent: {concurrent:.1} tok/s ({degradation:+.1}% degradation)");
+        eprintln!("post:       {post:.1} tok/s ({recovery:.0}% of baseline)");
+        eprintln!("router training steps during inference: {train_steps}");
+        eprintln!("verdict: {}", if degradation.abs() < 5.0 { "NO DEGRADATION" } else if degradation < 15.0 { "MINOR DEGRADATION" } else { "SIGNIFICANT DEGRADATION" });
+    }
+
     /// This exercises the actual bucketed ANE path used by `spawn_ane_training`:
     /// compile bucket kernels -> ANE forward -> ANE backward -> Adam update.
     #[cfg(feature = "mlx")]

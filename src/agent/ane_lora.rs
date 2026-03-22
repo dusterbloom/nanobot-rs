@@ -2466,6 +2466,56 @@ impl RouterTrainer {
         })
     }
 
+    /// Initialize from pre-extracted router weight vectors (Send-safe, no model borrow).
+    /// `router_weights[l]` is `Some(router_vec)` for MoE layers, `None` for dense layers.
+    pub fn from_weights(
+        router_weights: &[Option<Vec<f32>>],
+        num_experts: usize,
+        dim: usize,
+        batch_size: usize,
+        lr: f32,
+        lb_alpha: f32,
+    ) -> Result<Self, String> {
+        let n_layers = router_weights.len();
+        let mut weights = Vec::with_capacity(n_layers);
+        let mut adam = Vec::with_capacity(n_layers);
+        let mut chains = Vec::with_capacity(n_layers);
+        let mut found_moe = false;
+
+        for (l, rw) in router_weights.iter().enumerate() {
+            if let Some(ref router) = rw {
+                found_moe = true;
+                weights.push(router.clone());
+                adam.push(RouterAdamState::new(num_experts, dim));
+                let chain = RouterBackwardChain::compile(num_experts, dim, batch_size).ok();
+                if l == 0 {
+                    if chain.is_some() {
+                        tracing::info!("RouterTrainer: ANE chain compiled ({num_experts}×{dim}, seq={batch_size})");
+                    } else {
+                        tracing::warn!("RouterTrainer: ANE chain failed, using CPU fallback");
+                    }
+                }
+                chains.push(chain);
+            } else {
+                weights.push(Vec::new());
+                adam.push(RouterAdamState::new(0, 0));
+                chains.push(None);
+            }
+        }
+
+        if !found_moe {
+            return Err("No MoE layers found".into());
+        }
+
+        // num_experts_per_tok not available here — default to 8 (Qwen3.5 standard)
+        Ok(Self {
+            weights, adam, chains,
+            num_experts, dim,
+            num_experts_per_tok: 8,
+            lb_alpha, lr,
+        })
+    }
+
     /// Run one training step for a single layer on a batch of routing targets.
     ///
     /// Returns (loss, num_tokens) or None if the layer has no MoE.
