@@ -186,6 +186,7 @@ features = ["gguf-export"]
 [dependencies.candle-core]
 version = "0.9"
 optional = true
+features = ["metal"]
 
 [dependencies.candle-nn]
 version = "0.9"

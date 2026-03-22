@@ -3362,6 +3362,110 @@ mod tests {
         assert_eq!(result2.logits.len(), model.vocab_size);
     }
 
+    /// Hybrid decode: GDN on ANE + GQA on Candle Metal + MoE on CPU.
+    /// Benchmark: tok/s with full heterogeneous compute.
+    ///
+    /// cargo test --features ane,mlx,candle --release --lib -- "test_hybrid_35b" --nocapture --ignored --test-threads=1
+    #[cfg(feature = "candle")]
+    #[test]
+    #[ignore]
+    fn test_hybrid_35b() {
+        let model_dir = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit");
+        if !model_dir.exists() {
+            eprintln!("SKIP: 35B not found");
+            return;
+        }
+
+        // Load model
+        eprintln!("Loading 35B...");
+        let cfg = super::super::mlx_lora::ModelConfig::from_config_json(&model_dir)
+            .expect("config");
+        let mil_cfg = cfg.to_mil_config(1);
+        let mut model = ModelWeights::from_mlx_safetensors(&model_dir, &mil_cfg)
+            .expect("weights");
+
+        // Load MoE experts
+        let config_str = std::fs::read_to_string(model_dir.join("config.json")).unwrap();
+        let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let tc = config_json.get("text_config").unwrap_or(&config_json);
+        let ne = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+        let nept = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let mh = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+        model.load_moe_experts(&model_dir, ne, nept, mh).expect("MoE");
+        eprintln!("  Model loaded");
+
+        // Try loading router adapter
+        if let Ok(Some(adapter)) = super::super::router_adapter::RouterAdapter::load(&model_dir) {
+            eprintln!("  Router adapter loaded: {} layers", adapter.n_trained());
+            model.router_adapter = Some(adapter);
+        }
+
+        // Compile GDN ANE kernels
+        eprintln!("  Compiling GDN ANE kernels...");
+        let gdn_ane = GdnAneKernels::compile(&model);
+        let gdn_status = if gdn_ane.is_some() { "OK" } else { "FAILED (CPU fallback)" };
+        eprintln!("  GDN ANE: {gdn_status}");
+
+        // Initialize Candle Metal GQA
+        eprintln!("  Initializing Candle Metal GQA...");
+        let mut candle_gqa = match super::super::candle_attn::CandleGqaLayers::from_model(&model) {
+            Ok(c) => {
+                eprintln!("  Candle GQA: {} layers on Metal", c.n_layers());
+                c
+            }
+            Err(e) => {
+                eprintln!("  Candle GQA FAILED: {e} — using CPU fallback");
+                // Can't run hybrid without Candle — fall back to CPU-only
+                let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+                cache.init_gdn(&model);
+                let t0 = std::time::Instant::now();
+                let _ = decode_step_with_ane(&model, 1, &mut cache, gdn_ane.as_ref());
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("  CPU+ANE only: {ms:.1}ms/token ({:.1} tok/s)", 1000.0 / ms);
+                return;
+            }
+        };
+
+        // KV cache
+        let mut cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache.init_gdn(&model);
+
+        // Warmup
+        eprintln!("\n── Hybrid decode benchmark ──");
+        let _ = decode_step_hybrid(&model, 1, &mut cache, gdn_ane.as_ref(), &mut candle_gqa);
+
+        // Reset
+        cache = KvCache::new(&model.cfg, model.layers.len(), 64);
+        cache.init_gdn(&model);
+        candle_gqa.reset_caches();
+
+        // Benchmark: 5 tokens
+        let n_tokens = 5;
+        let mut token = 1u32;
+        let t0 = std::time::Instant::now();
+        for i in 0..n_tokens {
+            let t_start = std::time::Instant::now();
+            let result = decode_step_hybrid(&model, token, &mut cache, gdn_ane.as_ref(), &mut candle_gqa);
+            let ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            token = sample_argmax(&result.logits);
+            eprintln!("  Token {}: {ms:.1}ms → id={token}", i + 1);
+        }
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let tps = n_tokens as f64 / (total_ms / 1000.0);
+
+        eprintln!("\n  ── Results ──");
+        eprintln!("  {n_tokens} tokens in {total_ms:.0}ms = {tps:.1} tok/s");
+        eprintln!("  GDN: ANE ({gdn_status})");
+        eprintln!("  GQA: Candle Metal ({} layers)", candle_gqa.n_layers());
+        eprintln!("  MoE: CPU ({ne} experts, top-{nept})");
+        if model.router_adapter.is_some() {
+            eprintln!("  Router: fp32 adapter (REINFORCE trained)");
+        }
+
+        assert!(tps > 0.01, "hybrid decode should produce non-zero throughput");
+    }
+
     #[test]
     fn test_moe_different_tokens_give_different_logits() {
         let model = make_tiny_moe_model();
