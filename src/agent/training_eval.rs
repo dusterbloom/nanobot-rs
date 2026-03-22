@@ -55,16 +55,35 @@ mod tests {
     /// Send a prompt to oMLX and check if the response contains the expected answer.
     fn grade_prompt(client: &reqwest::blocking::Client, base_url: &str, prompt: &str, expected: &str) -> (bool, String) {
         let url = format!("{}/v1/chat/completions", base_url);
+
+        // Detect model name from oMLX /v1/models endpoint
+        let model_name = client
+            .get(&format!("{}/v1/models", base_url))
+            .header("Authorization", "Bearer omlx")
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|j| {
+                j["data"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|m| m["id"].as_str().map(String::from))
+            })
+            .unwrap_or_else(|| "Qwen3.5-35B-A3B-3bit".to_string());
+
         let body = serde_json::json!({
-            "model": "default",
+            "model": model_name,
             "messages": [
-                {"role": "user", "content": format!("Answer in one word or number: {}", prompt)}
+                {"role": "user", "content": format!("Answer in one word or number only. No explanation. {}", prompt)}
             ],
             "max_tokens": 30,
             "temperature": 0.0,
         });
 
-        let resp = match client.post(&url).json(&body).send() {
+        let resp = match client.post(&url)
+            .header("Authorization", "Bearer omlx")
+            .json(&body)
+            .send() {
             Ok(r) => r,
             Err(e) => return (false, format!("HTTP error: {e}")),
         };
@@ -247,6 +266,9 @@ mod tests {
 
         // Find model directory
         let home = std::env::var("HOME").unwrap();
+        // Train the 35B directly. ANE compiles FFN kernels (shared expert fits
+        // in 32 MB SRAM). Attention kernels may fail (head_dim=256 too large) —
+        // strict_ane=false falls back to CPU for those, training still works.
         let model_dirs = [
             format!("{home}/.cache/lm-studio/models/NexVeridian/Qwen3.5-35B-A3B-3bit"),
             format!("{home}/.cache/lm-studio/models/mlx-community/Qwen3.5-35B-A3B-4bit"),

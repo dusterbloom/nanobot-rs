@@ -261,6 +261,11 @@ impl BucketKernels {
         let ensure_start = std::time::Instant::now();
         let compile_count_before = super::ane_bridge::compile_count();
 
+        // Suppress ANE error output during kernel compilation — for large models
+        // (35B, head_dim=256), some kernels exceed ANE limits. The fallback to CPU
+        // is graceful (strict_ane=false), but the errors pollute the TUI.
+        super::ane_bridge::set_quiet(true);
+
         for bucket_seq in &needed {
             let bucket_start = std::time::Instant::now();
             let cc_before = super::ane_bridge::compile_count();
@@ -324,6 +329,7 @@ impl BucketKernels {
             self.buckets.push((*bucket_seq, fwd, bwd));
             compiled += 1;
         }
+        super::ane_bridge::set_quiet(false);
         self.buckets.sort_by_key(|(bucket_seq, _, _)| *bucket_seq);
 
         let total_compiles = super::ane_bridge::compile_count() - compile_count_before;
