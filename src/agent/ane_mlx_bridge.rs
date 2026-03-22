@@ -2267,16 +2267,16 @@ impl AneTrainerSession {
         tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
 
         // Router training: distill from inference routing decisions.
-        // The buffer collects (x_norm, expert_indices, probs) during moe_forward().
-        // Train the router to match these decisions, then merge into safetensors.
+        // Two sources: (1) in-process RouterTrainingBuffer from moe_forward(),
+        //              (2) shared file from oMLX's Python routing hook.
         if let Some(ref mut rt) = self.router_trainer {
-            if let Some(buf) = super::ane_decode::router_training_buffer() {
-                let batch_size = 16;
-                let mut total_loss = 0.0f32;
-                let mut total_tokens = 0usize;
-                let mut steps = 0usize;
+            let batch_size = 16;
+            let mut total_loss = 0.0f32;
+            let mut total_tokens = 0usize;
+            let mut steps = 0usize;
 
-                // Train with 100ms sleep between layer sweeps (0.2% degradation)
+            // Source 1: in-process buffer (from Rust moe_forward)
+            if let Some(buf) = super::ane_decode::router_training_buffer() {
                 loop {
                     let (loss, tokens) = rt.train_from_buffer(buf, batch_size);
                     if tokens == 0 {
@@ -2287,17 +2287,48 @@ impl AneTrainerSession {
                     steps += 1;
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+            }
 
-                if total_tokens > 0 {
-                    let avg_loss = total_loss / total_tokens as f32;
-                    tracing::info!(
-                        "Router training: {steps} steps, loss={avg_loss:.4}, tokens={total_tokens}"
-                    );
-                    // Store trained weights for merge in save_and_publish
-                    self.router_trained_weights = Some(
-                        rt.weights.iter().map(|w| w.clone()).collect()
-                    );
+            // Source 2: shared file from oMLX routing hook
+            let routing_file = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".nanobot/routing_targets.bin");
+            if routing_file.exists() {
+                if let Some(targets) = super::ane_decode::drain_routing_targets_from_file(&routing_file) {
+                    // Group targets by layer, feed to router trainer
+                    let mut by_layer: std::collections::HashMap<usize, Vec<super::ane_lora::RouterRoutingTarget>> =
+                        std::collections::HashMap::new();
+                    for (layer, target) in targets {
+                        by_layer.entry(layer).or_default().push(target);
+                    }
+
+                    for (layer, batch) in &by_layer {
+                        if let Some((loss, tokens)) = rt.train_step(*layer, batch) {
+                            total_loss += loss * tokens as f32;
+                            total_tokens += tokens;
+                            steps += 1;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+
+                    if !by_layer.is_empty() {
+                        tracing::info!(
+                            "Router training (oMLX file): {} layers, {} total targets",
+                            by_layer.len(),
+                            by_layer.values().map(|v| v.len()).sum::<usize>()
+                        );
+                    }
                 }
+            }
+
+            if total_tokens > 0 {
+                let avg_loss = total_loss / total_tokens as f32;
+                tracing::info!(
+                    "Router training: {steps} steps, loss={avg_loss:.4}, tokens={total_tokens}"
+                );
+                self.router_trained_weights = Some(
+                    rt.weights.iter().map(|w| w.clone()).collect()
+                );
             }
         }
 

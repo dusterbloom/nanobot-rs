@@ -49,6 +49,91 @@ pub fn router_training_buffer() -> Option<&'static std::sync::Arc<super::ane_lor
     ROUTER_TRAINING_BUF.get()
 }
 
+/// Read routing targets from the shared mmap file populated by oMLX's Python hook.
+///
+/// Returns targets grouped by layer. Updates the read position so the same
+/// records aren't processed twice.
+///
+/// File format (see scripts/routing_hook.py):
+///   Header (32 bytes): write_pos(u64), read_pos(u64), n_layers(u32), dim(u32), k(u32), capacity(u32)
+///   Records: [layer(u16), k(u16), indices(u16×k), probs(f32×k), x_norm(f32×dim)]
+pub fn drain_routing_targets_from_file(
+    path: &std::path::Path,
+) -> Option<Vec<(usize, super::ane_lora::RouterRoutingTarget)>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
+
+    // Read header
+    let mut header = [0u8; 32];
+    f.read_exact(&mut header).ok()?;
+
+    let write_pos = u64::from_le_bytes(header[0..8].try_into().unwrap()) as usize;
+    let read_pos = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+    let _n_layers = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
+    let k = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
+    let capacity = u32::from_le_bytes(header[28..32].try_into().unwrap()) as usize;
+
+    if write_pos <= read_pos || dim == 0 || k == 0 || capacity == 0 {
+        return None; // nothing new
+    }
+
+    let rec_size = 4 + k * 2 + k * 4 + dim * 4; // layer(2)+k(2) + indices + probs + x_norm
+    let n_new = (write_pos - read_pos).min(capacity); // don't read more than capacity
+
+    let mut targets = Vec::with_capacity(n_new);
+
+    for i in 0..n_new {
+        let idx = (read_pos + i) % capacity;
+        let offset = 32 + idx * rec_size; // 32 = header size
+
+        let mut rec = vec![0u8; rec_size];
+        f.seek(SeekFrom::Start(offset as u64)).ok()?;
+        f.read_exact(&mut rec).ok()?;
+
+        let layer = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+        let rec_k = u16::from_le_bytes([rec[2], rec[3]]) as usize;
+
+        if rec_k != k {
+            continue; // corrupt record
+        }
+
+        let mut expert_indices = Vec::with_capacity(k);
+        for j in 0..k {
+            let off = 4 + j * 2;
+            expert_indices.push(u16::from_le_bytes([rec[off], rec[off + 1]]) as usize);
+        }
+
+        let probs_offset = 4 + k * 2;
+        let mut expert_probs = Vec::with_capacity(k);
+        for j in 0..k {
+            let off = probs_offset + j * 4;
+            expert_probs.push(f32::from_le_bytes(rec[off..off + 4].try_into().unwrap()));
+        }
+
+        let xnorm_offset = probs_offset + k * 4;
+        let mut x_norm = Vec::with_capacity(dim);
+        for d in 0..dim {
+            let off = xnorm_offset + d * 4;
+            x_norm.push(f32::from_le_bytes(rec[off..off + 4].try_into().unwrap()));
+        }
+
+        targets.push((layer, super::ane_lora::RouterRoutingTarget {
+            x_norm,
+            expert_indices,
+            expert_probs,
+        }));
+    }
+
+    // Update read position
+    let new_read = (read_pos + n_new) as u64;
+    f.seek(SeekFrom::Start(8)).ok()?;
+    f.write_all(&new_read.to_le_bytes()).ok()?;
+
+    Some(targets)
+}
+
 /// MoE FFN forward: router gate → top-k expert selection → weighted expert sum.
 ///
 /// Replaces the dense FFN (w1/w2/w3) for MoE layers. Expert weights stay
