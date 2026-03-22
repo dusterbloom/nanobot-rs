@@ -123,6 +123,7 @@ pub fn drain_routing_targets_from_file(
             x_norm,
             expert_indices,
             expert_probs,
+            reward: 0.0,
         }));
     }
 
@@ -202,6 +203,7 @@ fn moe_forward_inner(
             x_norm: xnorm.clone(),
             expert_indices,
             expert_probs,
+            reward: 0.0, // set later from outcome signal
         });
     }
 

@@ -2631,6 +2631,11 @@ pub struct RouterRoutingTarget {
     pub expert_indices: Vec<usize>,
     /// Softmax probabilities for the top-k experts (same order as indices).
     pub expert_probs: Vec<f32>,
+    /// Outcome reward for REINFORCE training.
+    /// +1.0 = good outcome (correct answer, tool success, positive feedback).
+    /// -1.0 = bad outcome (wrong answer, tool failure, negative feedback).
+    ///  0.0 = neutral / unknown (falls back to self-distillation gradient).
+    pub reward: f32,
 }
 
 /// Thread-safe ring buffer collecting routing decisions from inference.
@@ -3049,6 +3054,192 @@ impl RouterTrainer {
         }
 
         Some((total_loss, seq))
+    }
+
+    /// REINFORCE training step: reward-weighted gradient from outcome signals.
+    ///
+    /// Instead of distilling from the teacher's routing decisions (self-imitation),
+    /// this uses outcome rewards to push the router toward expert combinations
+    /// that produced good results.
+    ///
+    /// Gradient: d_logits[e,t] = reward[t] * (student_probs[e,t] - one_hot_selected[e,t])
+    /// Same shape as distillation, same ANE kernel, different learning signal.
+    ///
+    /// Returns (mean_reward, num_tokens) or None if layer has no MoE.
+    pub fn train_step_reinforce(
+        &mut self,
+        layer: usize,
+        batch: &[RouterRoutingTarget],
+    ) -> Option<(f32, usize)> {
+        if self.weights[layer].is_empty() || batch.is_empty() {
+            return None;
+        }
+
+        // Filter to targets with non-zero reward
+        let rewarded: Vec<&RouterRoutingTarget> = batch.iter()
+            .filter(|t| t.reward.abs() > 1e-6)
+            .collect();
+        if rewarded.is_empty() {
+            return None;
+        }
+
+        let seq = rewarded.len();
+        let ne = self.num_experts;
+        let dim = self.dim;
+
+        // Pack batch into [dim, seq] column-major
+        let mut x_packed = vec![0.0f32; dim * seq];
+        for (t, target) in rewarded.iter().enumerate() {
+            for d in 0..dim {
+                x_packed[d * seq + t] = target.x_norm[d];
+            }
+        }
+
+        // Forward: student_logits = router @ x_packed → [ne, seq]
+        let student_logits = cpu_matmul_generic(
+            &self.weights[layer], &x_packed, ne, dim, seq,
+        );
+
+        // Softmax per token
+        let mut student_probs = vec![0.0f32; ne * seq];
+        for t in 0..seq {
+            let mut max_l = f32::NEG_INFINITY;
+            for e in 0..ne {
+                max_l = max_l.max(student_logits[e * seq + t]);
+            }
+            let mut sum_exp = 0.0f32;
+            for e in 0..ne {
+                let v = (student_logits[e * seq + t] - max_l).exp();
+                student_probs[e * seq + t] = v;
+                sum_exp += v;
+            }
+            for e in 0..ne {
+                student_probs[e * seq + t] /= sum_exp;
+            }
+        }
+
+        // Build one-hot target from selected experts [ne, seq]
+        let mut one_hot = vec![0.0f32; ne * seq];
+        for (t, target) in rewarded.iter().enumerate() {
+            let k = target.expert_indices.len();
+            for (i, &idx) in target.expert_indices.iter().enumerate() {
+                if idx < ne {
+                    // Distribute evenly among selected experts
+                    one_hot[idx * seq + t] = 1.0 / k as f32;
+                }
+            }
+        }
+
+        // Normalize rewards: (r - mean) / std for variance reduction
+        let rewards: Vec<f32> = rewarded.iter().map(|t| t.reward).collect();
+        let mean_r: f32 = rewards.iter().sum::<f32>() / seq as f32;
+        let var_r: f32 = rewards.iter().map(|r| (r - mean_r).powi(2)).sum::<f32>() / seq as f32;
+        let std_r = var_r.sqrt().max(1e-6);
+        let norm_rewards: Vec<f32> = rewards.iter().map(|r| (r - mean_r) / std_r).collect();
+
+        // REINFORCE gradient:
+        // d_logits[e,t] = normalized_reward[t] * (student_probs[e,t] - one_hot[e,t])
+        // Positive reward → push toward selected experts (decrease student - one_hot)
+        // Negative reward → push away from selected experts
+        let mut d_logits = vec![0.0f32; ne * seq];
+        for t in 0..seq {
+            let r = norm_rewards[t];
+            for e in 0..ne {
+                d_logits[e * seq + t] = r * (student_probs[e * seq + t] - one_hot[e * seq + t]) / seq as f32;
+            }
+        }
+
+        // Backward: reuse same ANE pad/chunk infrastructure
+        let dw = if let Some(ref chain) = self.chains[layer] {
+            let chain_seq = chain.seq;
+            chain.load_weights(&self.weights[layer]);
+
+            if seq <= chain_seq {
+                let mut d_pad = vec![0.0f32; ne * chain_seq];
+                let mut x_pad = vec![0.0f32; dim * chain_seq];
+                for e in 0..ne {
+                    for t in 0..seq {
+                        d_pad[e * chain_seq + t] = d_logits[e * seq + t];
+                    }
+                }
+                for d in 0..dim {
+                    for t in 0..seq {
+                        x_pad[d * chain_seq + t] = x_packed[d * seq + t];
+                    }
+                }
+                match chain.backward(&self.weights[layer], &d_pad, &x_pad) {
+                    Ok((_dx, dw)) => dw,
+                    Err(_) => {
+                        let (_, dw) = router_backward_cpu(
+                            &self.weights[layer], &d_logits, &x_packed, ne, dim, seq,
+                        );
+                        dw
+                    }
+                }
+            } else {
+                // Chunk for large batches
+                let mut dw_acc = vec![0.0f32; ne * dim];
+                let mut offset = 0;
+                while offset < seq {
+                    let chunk_len = (seq - offset).min(chain_seq);
+                    let mut d_pad = vec![0.0f32; ne * chain_seq];
+                    let mut x_pad = vec![0.0f32; dim * chain_seq];
+                    for e in 0..ne {
+                        for t in 0..chunk_len {
+                            d_pad[e * chain_seq + t] = d_logits[e * seq + offset + t];
+                        }
+                    }
+                    for d_idx in 0..dim {
+                        for t in 0..chunk_len {
+                            x_pad[d_idx * chain_seq + t] = x_packed[d_idx * seq + offset + t];
+                        }
+                    }
+                    if let Ok((_dx, chunk_dw)) = chain.backward(&self.weights[layer], &d_pad, &x_pad) {
+                        for i in 0..dw_acc.len() { dw_acc[i] += chunk_dw[i]; }
+                    } else {
+                        let rem = seq - offset;
+                        let mut d_rem = vec![0.0f32; ne * rem];
+                        let mut x_rem = vec![0.0f32; dim * rem];
+                        for e in 0..ne { for t in 0..rem { d_rem[e * rem + t] = d_logits[e * seq + offset + t]; } }
+                        for d_idx in 0..dim { for t in 0..rem { x_rem[d_idx * rem + t] = x_packed[d_idx * seq + offset + t]; } }
+                        let (_, rem_dw) = router_backward_cpu(&self.weights[layer], &d_rem, &x_rem, ne, dim, rem);
+                        for i in 0..dw_acc.len() { dw_acc[i] += rem_dw[i]; }
+                        break;
+                    }
+                    offset += chain_seq;
+                }
+                dw_acc
+            }
+        } else {
+            let (_, dw) = router_backward_cpu(
+                &self.weights[layer], &d_logits, &x_packed, ne, dim, seq,
+            );
+            dw
+        };
+
+        // Adam update
+        let state = &mut self.adam[layer];
+        state.step += 1;
+        let beta1 = 0.9f32;
+        let beta2 = 0.999f32;
+        let eps = 1e-8f32;
+        let bc1 = 1.0 - beta1.powi(state.step as i32);
+        let bc2 = 1.0 - beta2.powi(state.step as i32);
+
+        let w = &mut self.weights[layer];
+        for i in 0..w.len() {
+            state.m[i] = beta1 * state.m[i] + (1.0 - beta1) * dw[i];
+            state.v[i] = beta2 * state.v[i] + (1.0 - beta2) * dw[i] * dw[i];
+            let m_hat = state.m[i] / bc1;
+            let v_hat = state.v[i] / bc2;
+            w[i] -= self.lr * m_hat / (v_hat.sqrt() + eps);
+        }
+
+        if let Some(ref chain) = self.chains[layer] {
+            chain.load_weights(&self.weights[layer]);
+        }
+
+        Some((mean_r, seq))
     }
 
     /// Train all MoE layers from the buffer. Returns (total_loss, total_tokens).
@@ -5289,6 +5480,7 @@ mod tests {
                 x_norm,
                 expert_indices: top.iter().map(|&(i, _)| i).collect(),
                 expert_probs: probs,
+                reward: 0.0,
             });
         }
 
@@ -5395,6 +5587,99 @@ mod tests {
         let reduction = 1.0 - losses.last().unwrap() / losses[0];
         eprintln!("Loss reduction: {:.1}%", reduction * 100.0);
         assert!(reduction > 0.1, "expected >10% loss reduction, got {:.1}%", reduction * 100.0);
+    }
+
+    /// REINFORCE: positive-rewarded targets increase probability of selected experts,
+    /// negative-rewarded targets decrease it. Weights should diverge from initial.
+    #[test]
+    fn test_reinforce_moves_weights() {
+        let num_experts = 32;
+        let dim = 64;
+        let k = 4;
+
+        let frozen_router: Vec<f32> = (0..num_experts * dim)
+            .map(|i| (i as f32 * 0.007).sin() * 0.1)
+            .collect();
+
+        // Generate targets with explicit rewards:
+        // - Tokens 0-7: reward=+1 (good outcome → reinforce these routing decisions)
+        // - Tokens 8-15: reward=-1 (bad outcome → push away from these decisions)
+        let mut targets = Vec::new();
+        for t in 0..16 {
+            let x_norm: Vec<f32> = (0..dim)
+                .map(|d| ((t * dim + d) as f32 * 0.013).cos() * 0.5)
+                .collect();
+            let mut logits = vec![0.0f32; num_experts];
+            for e in 0..num_experts {
+                for d in 0..dim {
+                    logits[e] += frozen_router[e * dim + d] * x_norm[d];
+                }
+            }
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &indexed[..k];
+            let max_l = top[0].1;
+            let mut probs: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in &mut probs { *p /= sum; }
+
+            let reward = if t < 8 { 1.0 } else { -1.0 };
+            targets.push(RouterRoutingTarget {
+                x_norm,
+                expert_indices: top.iter().map(|&(i, _)| i).collect(),
+                expert_probs: probs,
+                reward,
+            });
+        }
+
+        // Create RouterTrainer with perturbed weights
+        let mut rt = RouterTrainer {
+            weights: vec![frozen_router.iter()
+                .enumerate()
+                .map(|(i, &w)| w + (i as f32 * 0.031).sin() * 0.05)
+                .collect()],
+            adam: vec![RouterAdamState::new(num_experts, dim)],
+            chains: vec![None], // CPU-only for test
+            num_experts,
+            dim,
+            num_experts_per_tok: k,
+            lb_alpha: 0.0,
+            lr: 0.01,
+        };
+
+        let weights_before = rt.weights[0].clone();
+
+        // Train 20 REINFORCE steps
+        for _ in 0..20 {
+            let result = rt.train_step_reinforce(0, &targets);
+            assert!(result.is_some(), "train_step_reinforce should return Some");
+        }
+
+        // Weights should have changed
+        let max_delta: f32 = rt.weights[0].iter().zip(weights_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("REINFORCE max weight delta: {max_delta:.6}");
+        assert!(max_delta > 1e-4, "REINFORCE should move weights, got delta={max_delta}");
+
+        // Check that positive-reward tokens' experts got higher probability
+        // Forward the positive-reward inputs through the trained router
+        let mut pos_prob_increase = 0usize;
+        for t in 0..8 {
+            let x = &targets[t].x_norm;
+            let selected = targets[t].expert_indices[0]; // top expert
+
+            // Before: logit from frozen+perturbed
+            let before_logit: f32 = (0..dim).map(|d| weights_before[selected * dim + d] * x[d]).sum();
+            // After: logit from trained
+            let after_logit: f32 = (0..dim).map(|d| rt.weights[0][selected * dim + d] * x[d]).sum();
+
+            if after_logit > before_logit {
+                pos_prob_increase += 1;
+            }
+        }
+        eprintln!("Positive-reward tokens with increased expert logit: {pos_prob_increase}/8");
+        assert!(pos_prob_increase >= 4, "REINFORCE should increase logits for positive-reward experts");
     }
 }
 
