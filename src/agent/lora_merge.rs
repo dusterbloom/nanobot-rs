@@ -460,6 +460,232 @@ fn apply_delta_to_buffer(
 }
 
 // ---------------------------------------------------------------------------
+// Router merge: bake trained MoE gate weights into safetensors
+// ---------------------------------------------------------------------------
+
+/// Merge trained router gate weights into the base model's safetensors on disk.
+///
+/// Unlike LoRA merge (which applies δW = scale * B @ A), router merge applies
+/// a full-rank delta: `new_gate = original_gate + (trained - frozen)`.
+///
+/// The router is stored as quantized `mlp.gate` tensors in safetensors.
+/// Process: dequantize → add delta → requantize → write back.
+pub fn merge_router_into_safetensors(
+    model_dir: &Path,
+    trained_weights: &[Vec<f32>],    // per-layer [num_experts * dim]
+    original_weights: &[Vec<f32>],   // frozen router weights (snapshot at init)
+    num_experts: usize,
+    dim: usize,
+    bits: usize,
+    group_size: usize,
+) -> Result<MergeReport> {
+    let start = std::time::Instant::now();
+
+    // Compute per-layer deltas
+    let mut layer_deltas: HashMap<usize, Vec<f32>> = HashMap::new();
+    for (l, (trained, original)) in trained_weights.iter().zip(original_weights.iter()).enumerate() {
+        if trained.is_empty() || original.is_empty() {
+            continue; // non-MoE layer
+        }
+        let delta: Vec<f32> = trained.iter().zip(original.iter()).map(|(t, o)| t - o).collect();
+        let max_delta = delta.iter().map(|d| d.abs()).fold(0.0f32, f32::max);
+        if max_delta < 1e-8 {
+            continue; // no meaningful change
+        }
+        debug!("Router L{l}: max_delta={max_delta:.6}");
+        layer_deltas.insert(l, delta);
+    }
+
+    if layer_deltas.is_empty() {
+        info!("Router merge: no layers changed, skipping");
+        return Ok(MergeReport {
+            tensors_merged: 0,
+            files_modified: 0,
+            backup_created: false,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+    info!("Router merge: {} layers with deltas", layer_deltas.len());
+
+    let st_files = list_safetensors(model_dir)?;
+    let mut tensors_merged = 0usize;
+    let mut files_modified = 0usize;
+    let mut backup_created = false;
+
+    for file_path in &st_files {
+        // Parse header to find mlp.gate tensors in this file
+        let raw = std::fs::read(file_path)
+            .with_context(|| format!("read {}", file_path.display()))?;
+        if raw.len() < 8 {
+            continue;
+        }
+        let header_len = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&raw[8..8 + header_len])
+                .with_context(|| "parse safetensors header")?;
+        let data_start = 8 + header_len;
+
+        // Find gate tensors and their layer indices
+        let mut gate_entries: Vec<(usize, String, TensorEntry)> = Vec::new();
+        if let Some(obj) = header_json.as_object() {
+            for (key, meta) in obj {
+                if key == "__metadata__" { continue; }
+                // Match keys like "model.layers.5.mlp.gate" or "language_model.model.layers.5.mlp.gate"
+                if !key.contains("mlp.gate") || key.ends_with(".scales") || key.ends_with(".biases") {
+                    continue;
+                }
+                if !key.ends_with(".weight") {
+                    continue;
+                }
+                // Extract layer index from key
+                let layer_idx = key.split("layers.")
+                    .nth(1)
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                let Some(l) = layer_idx else { continue };
+
+                if !layer_deltas.contains_key(&l) {
+                    continue; // no delta for this layer
+                }
+
+                let offsets = meta.get("data_offsets")
+                    .and_then(|v| v.as_array())
+                    .map(|a| (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize));
+                let shape = meta.get("shape")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect::<Vec<_>>());
+                let dtype = meta.get("dtype").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                if let (Some((ds, de)), Some(shape)) = (offsets, shape) {
+                    gate_entries.push((l, key.clone(), TensorEntry {
+                        dtype, shape,
+                        data_start: ds,
+                        data_end: de,
+                    }));
+                }
+            }
+        }
+
+        if gate_entries.is_empty() {
+            continue;
+        }
+
+        // Backup original
+        let premrg = premrg_path(file_path);
+        let source_path = if premrg.exists() { &premrg } else { file_path };
+        if !premrg.exists() {
+            std::fs::copy(file_path, &premrg)
+                .with_context(|| format!("backup {}", file_path.display()))?;
+            backup_created = true;
+        }
+
+        // Read from pristine backup
+        let mut data = std::fs::read(source_path)
+            .with_context(|| format!("read {}", source_path.display()))?;
+
+        for (l, key, entry) in &gate_entries {
+            let delta = &layer_deltas[l];
+            let abs_start = data_start + entry.data_start;
+            let abs_end = data_start + entry.data_end;
+
+            // Dequantize the gate tensor
+            let tensor_bytes = &data[abs_start..abs_end];
+
+            // Need scales and biases from the same file
+            let base_name = key.trim_end_matches(".weight");
+            let scales_key = format!("{base_name}.scales");
+            let biases_key = format!("{base_name}.biases");
+
+            let scales_entry = header_json.get(&scales_key);
+            let biases_entry = header_json.get(&biases_key);
+
+            if scales_entry.is_none() || biases_entry.is_none() {
+                debug!("Router L{l}: no scales/biases for {key}, skipping");
+                continue;
+            }
+
+            let s_offsets = scales_entry.unwrap().get("data_offsets")
+                .and_then(|v| v.as_array())
+                .map(|a| (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize))
+                .unwrap();
+            let b_offsets = biases_entry.unwrap().get("data_offsets")
+                .and_then(|v| v.as_array())
+                .map(|a| (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize))
+                .unwrap();
+
+            let scales_bytes = &data[data_start + s_offsets.0..data_start + s_offsets.1];
+            let biases_bytes = &data[data_start + b_offsets.0..data_start + b_offsets.1];
+
+            // BF16 → f32
+            let scales: Vec<f32> = scales_bytes.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let biases: Vec<f32> = biases_bytes.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+
+            let rows = entry.shape[0]; // num_experts
+            let packed_cols = entry.shape[1];
+            let cols = packed_cols * 32 / bits;
+
+            // Dequantize
+            let mut weight_f32 = super::ane_weights::dequant_nbit(
+                tensor_bytes, &scales, &biases, rows, cols, group_size, bits,
+            );
+
+            // Apply delta
+            assert_eq!(weight_f32.len(), delta.len(),
+                "Router L{l}: weight len {} != delta len {}", weight_f32.len(), delta.len());
+            for i in 0..weight_f32.len() {
+                weight_f32[i] += delta[i];
+            }
+
+            // Requantize
+            let (new_data, new_scales, new_biases) = super::ane_weights::quantize_nbit(
+                &weight_f32, rows, cols, group_size, bits,
+            );
+
+            // Write back weight data
+            data[abs_start..abs_end].copy_from_slice(&new_data);
+
+            // Write back scales (f32 → bf16)
+            let scales_bf16: Vec<u8> = new_scales.iter().flat_map(|&s| {
+                let bits16 = (s.to_bits() >> 16) as u16;
+                bits16.to_le_bytes().to_vec()
+            }).collect();
+            data[data_start + s_offsets.0..data_start + s_offsets.1]
+                .copy_from_slice(&scales_bf16);
+
+            // Write back biases (f32 → bf16)
+            let biases_bf16: Vec<u8> = new_biases.iter().flat_map(|&b| {
+                let bits16 = (b.to_bits() >> 16) as u16;
+                bits16.to_le_bytes().to_vec()
+            }).collect();
+            data[data_start + b_offsets.0..data_start + b_offsets.1]
+                .copy_from_slice(&biases_bf16);
+
+            tensors_merged += 1;
+            debug!("Router L{l}: merged delta into {key}");
+        }
+
+        // Write modified file
+        std::fs::write(file_path, &data)
+            .with_context(|| format!("write {}", file_path.display()))?;
+        files_modified += 1;
+    }
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    info!("Router merge: {tensors_merged} tensors in {files_modified} files, {elapsed}ms");
+
+    Ok(MergeReport {
+        tensors_merged,
+        files_modified,
+        backup_created,
+        elapsed_ms: elapsed,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

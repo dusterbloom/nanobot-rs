@@ -772,6 +772,10 @@ struct AneTrainerSession {
     pre_recur_primed: bool,
     /// MoE router trainer (distillation from inference routing decisions).
     router_trainer: Option<super::ane_lora::RouterTrainer>,
+    /// Original (frozen) router weights for delta computation during merge.
+    router_original_weights: Option<Vec<Vec<f32>>>,
+    /// Trained router weights after distillation (set by train_with_progress).
+    router_trained_weights: Option<Vec<Vec<f32>>>,
 }
 
 #[cfg(feature = "mlx")]
@@ -888,6 +892,8 @@ impl AneTrainerSession {
             cls_blob: None,
             pre_recur_primed: false,
             router_trainer: None,
+            router_original_weights: None,
+            router_trained_weights: None,
         })
     }
 
@@ -925,6 +931,8 @@ impl AneTrainerSession {
                     "Router trainer initialized: {} experts × {} dim, batch={}",
                     rt.num_experts, rt.dim, batch_size
                 );
+                // Save original weights for delta computation during merge
+                self.router_original_weights = Some(rt.weights.clone());
                 self.router_trainer = Some(rt);
             }
             Err(e) => {
@@ -1566,6 +1574,38 @@ impl AneTrainerSession {
                         }
                         Err(e) => {
                             tracing::warn!("ANE train: LoRA merge failed: {e:#}");
+                        }
+                    }
+
+                    // Merge router gate deltas into base model safetensors.
+                    if let (Some(ref trained), Some(ref original)) =
+                        (&self.router_trained_weights, &self.router_original_weights)
+                    {
+                        let ne = trained.iter().find(|w| !w.is_empty())
+                            .map(|w| w.len() / cfg.mil_config.dim)
+                            .unwrap_or(0);
+                        if ne > 0 {
+                            match super::lora_merge::merge_router_into_safetensors(
+                                effective_dir,
+                                trained,
+                                original,
+                                ne,
+                                cfg.mil_config.dim,
+                                model_cfg.bits as usize,
+                                model_cfg.group_size as usize,
+                            ) {
+                                Ok(report) => {
+                                    tracing::info!(
+                                        tensors = report.tensors_merged,
+                                        files = report.files_modified,
+                                        ms = report.elapsed_ms,
+                                        "ANE train: merged router into base weights"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("ANE train: router merge failed: {e:#}");
+                                }
+                            }
                         }
                     }
                 }
@@ -2225,6 +2265,41 @@ impl AneTrainerSession {
             );
         }
         tracing::info!("ANE train: done in {train_ms}ms, best_loss={best_loss:.4}");
+
+        // Router training: distill from inference routing decisions.
+        // The buffer collects (x_norm, expert_indices, probs) during moe_forward().
+        // Train the router to match these decisions, then merge into safetensors.
+        if let Some(ref mut rt) = self.router_trainer {
+            if let Some(buf) = super::ane_decode::router_training_buffer() {
+                let batch_size = 16;
+                let mut total_loss = 0.0f32;
+                let mut total_tokens = 0usize;
+                let mut steps = 0usize;
+
+                // Train with 100ms sleep between layer sweeps (0.2% degradation)
+                loop {
+                    let (loss, tokens) = rt.train_from_buffer(buf, batch_size);
+                    if tokens == 0 {
+                        break;
+                    }
+                    total_loss += loss * tokens as f32;
+                    total_tokens += tokens;
+                    steps += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+
+                if total_tokens > 0 {
+                    let avg_loss = total_loss / total_tokens as f32;
+                    tracing::info!(
+                        "Router training: {steps} steps, loss={avg_loss:.4}, tokens={total_tokens}"
+                    );
+                    // Store trained weights for merge in save_and_publish
+                    self.router_trained_weights = Some(
+                        rt.weights.iter().map(|w| w.clone()).collect()
+                    );
+                }
+            }
+        }
 
         // _quiet_guard drops here, re-enabling ANE bridge stderr.
         self.save_and_publish(cfg, mlx_tx, runtime_counters, draft_reload_tx)
