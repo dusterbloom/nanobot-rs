@@ -2407,25 +2407,26 @@ pub struct RouterTrainer {
 
 impl RouterTrainer {
     /// Initialize from frozen model weights. Compiles ANE chains for seq=batch_size.
-    pub fn new(
-        model: &super::ane_weights::ModelWeights,
+    pub fn new<W: ane_weights::WeightSource>(
+        model: &W,
         batch_size: usize,
         lr: f32,
         lb_alpha: f32,
     ) -> Result<Self, String> {
-        let n_layers = model.layers.len();
+        let n_layers = model.n_layers();
         let mut weights = Vec::with_capacity(n_layers);
         let mut adam = Vec::with_capacity(n_layers);
         let mut chains = Vec::with_capacity(n_layers);
         let mut num_experts = 0usize;
-        let mut dim = model.cfg.dim;
+        let mut dim = model.cfg().dim;
         let mut num_experts_per_tok = 0usize;
 
         for l in 0..n_layers {
-            if let Some(ref moe) = model.layers[l].moe {
+            let lw = model.layer(l);
+            if let Some(ref moe) = lw.moe {
                 num_experts = moe.num_experts;
                 num_experts_per_tok = moe.num_experts_per_tok;
-                dim = model.cfg.dim;
+                dim = model.cfg().dim;
                 weights.push(moe.router.clone());
                 adam.push(RouterAdamState::new(num_experts, dim));
                 let chain = RouterBackwardChain::compile(num_experts, dim, batch_size).ok();

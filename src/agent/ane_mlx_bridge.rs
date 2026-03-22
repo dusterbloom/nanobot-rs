@@ -768,6 +768,8 @@ struct AneTrainerSession {
     cls_blob: Option<super::ane_forward::ClassifierBlobKernel>,
     /// Whether GDN pre-recurrence kernels have been primed (compiled at loads=0).
     pre_recur_primed: bool,
+    /// MoE router trainer (distillation from inference routing decisions).
+    router_trainer: Option<super::ane_lora::RouterTrainer>,
 }
 
 #[cfg(feature = "mlx")]
@@ -853,7 +855,50 @@ impl AneTrainerSession {
             prepacked_weights: Vec::new(),
             cls_blob: None,
             pre_recur_primed: false,
+            router_trainer: None,
         })
+    }
+
+    /// Initialize router trainer if model has MoE layers and buffer isn't installed yet.
+    fn ensure_router_trainer(&mut self) {
+        if self.router_trainer.is_some() {
+            return;
+        }
+        // Check if any layer has MoE weights
+        let has_moe = (0..self.model.n_layers())
+            .any(|l| {
+                let lw = self.model.layer(l);
+                lw.moe.is_some()
+            });
+        if !has_moe {
+            return;
+        }
+
+        // Need the underlying ModelWeights for RouterTrainer::new.
+        // Use DenseCachedModel's deref to get at it.
+        let batch_size = 16; // matches "every 16 tokens" target collection
+        match super::ane_lora::RouterTrainer::new(
+            &self.model,
+            batch_size,
+            1e-3,  // lr
+            0.01,  // lb_alpha
+        ) {
+            Ok(rt) => {
+                // Install global buffer for inference to collect targets
+                let buf = std::sync::Arc::new(
+                    super::ane_lora::RouterTrainingBuffer::new(self.model.n_layers(), 256)
+                );
+                super::ane_decode::install_router_training_buffer(buf);
+                tracing::info!(
+                    "Router trainer initialized: {} experts × {} dim, batch={}",
+                    rt.num_experts, rt.dim, batch_size
+                );
+                self.router_trainer = Some(rt);
+            }
+            Err(e) => {
+                tracing::debug!("Router trainer not available: {e}");
+            }
+        }
     }
 
     fn matches_config(&self, cfg: &AneTrainingConfig) -> bool {
@@ -1509,6 +1554,9 @@ impl AneTrainerSession {
         use super::ane_forward;
         use super::ane_lora::{lora_adam_update, lora_adam_update_split_lr, lora_muon_update_ane};
 
+        // Initialize router trainer on first train call (if model has MoE)
+        self.ensure_router_trainer();
+
         let t0 = std::time::Instant::now();
         let sample_lens: Vec<usize> = samples.iter().map(|(tokens, _, _)| tokens.len()).collect();
         bench_trace(format!(
@@ -1947,6 +1995,18 @@ impl AneTrainerSession {
                 // Reload chain weights after optimizer updated LoRA params
                 for (_, chains) in bucket_lora_bwd_chains.iter() {
                     chains.reload_all_weights(lora);
+                }
+
+                // Router training: consume buffered inference routing decisions
+                if let Some(ref mut rt) = self.router_trainer {
+                    if let Some(buf) = super::ane_decode::router_training_buffer() {
+                        let (rl, rn) = rt.train_from_buffer(buf, 16);
+                        if rn > 0 && opt_step <= 2 {
+                            tracing::info!(
+                                "router train: step={opt_step} loss={rl:.4} tokens={rn}"
+                            );
+                        }
+                    }
                 }
 
                 total_opt_us += t_opt.elapsed().as_micros() as u64;
