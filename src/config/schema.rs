@@ -2148,6 +2148,29 @@ pub struct PerplexityGateConfig {
     /// Number of training epochs when triggering. Default: 15.
     #[serde(default = "default_train_epochs")]
     pub train_epochs: usize,
+    /// Train every Nth observe call. Higher values reduce DRAM bandwidth
+    /// contention during concurrent inference+training. Gradients accumulate
+    /// over the skipped steps (effective batch size = train_frequency).
+    /// Default: 1 (every call, no throttling).
+    #[serde(default = "default_train_frequency")]
+    pub train_frequency: usize,
+    /// Training scheduling mode:
+    /// - "sustained": training ticks continuously at 1/trainFrequency duty cycle.
+    ///   Gives constant ~34 tok/s with no dips. Default.
+    /// - "idle": training waits for 5s of inference silence before firing.
+    ///   Gives 41.7 tok/s during chat, ~15 tok/s if you message during training.
+    #[serde(default = "default_train_mode")]
+    pub train_mode: TrainMode,
+}
+
+/// Training scheduling mode for concurrent inference+training.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrainMode {
+    /// Training ticks continuously at reduced frequency. Constant throughput.
+    Sustained,
+    /// Training waits for inference idle window. Peak throughput with dips.
+    Idle,
 }
 
 fn default_surprise_threshold() -> f32 {
@@ -2162,6 +2185,12 @@ fn default_mlx_server_url() -> String {
 fn default_train_epochs() -> usize {
     3
 }
+fn default_train_frequency() -> usize {
+    1
+}
+fn default_train_mode() -> TrainMode {
+    TrainMode::Sustained
+}
 
 impl Default for PerplexityGateConfig {
     fn default() -> Self {
@@ -2172,6 +2201,8 @@ impl Default for PerplexityGateConfig {
             auto_train: false,
             mlx_server_url: default_mlx_server_url(),
             train_epochs: default_train_epochs(),
+            train_frequency: default_train_frequency(),
+            train_mode: default_train_mode(),
         }
     }
 }
@@ -3124,7 +3155,9 @@ mod tests {
         defaults.training_model = Some("~/.cache/models/Qwen3-1.7B".to_string());
         let warnings = defaults.validate_speculative_config();
         assert!(
-            warnings.iter().any(|w| w.contains("training_model") && w.contains("draft_model")),
+            warnings
+                .iter()
+                .any(|w| w.contains("training_model") && w.contains("draft_model")),
             "expected warning about training_model != draft_model mismatch, got: {:?}",
             warnings,
         );

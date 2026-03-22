@@ -105,6 +105,8 @@ pub(crate) struct AgentLoopShared {
     /// Resolved model directory for standalone ANE training.
     /// Set when inference backend is oMLX/LM Studio (no in-process MLX).
     pub(crate) ane_model_dir: Option<std::path::PathBuf>,
+    /// Separate model directory for ANE training (e.g. 0.8B on 32GB machines).
+    pub(crate) ane_training_model_dir: Option<std::path::PathBuf>,
     #[cfg(all(feature = "ane", feature = "mlx"))]
     pub(crate) ane_trainer:
         Option<std::sync::Arc<crate::agent::ane_mlx_bridge::PersistentAneTrainer>>,
@@ -124,6 +126,7 @@ impl AgentLoopShared {
             mlx_provider: self.mlx_provider.clone(),
             training_counters: Some(self.core_handle.counters.clone()),
             ane_model_dir: self.ane_model_dir.clone(),
+            ane_training_model_dir: self.ane_training_model_dir.clone(),
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_trainer: self.ane_trainer.clone(),
             #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -132,6 +135,12 @@ impl AgentLoopShared {
             ane_lr_override: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_strict_ane: false,
+            #[cfg(all(feature = "ane", feature = "mlx"))]
+            draft_reload_tx: self
+                .mlx_provider
+                .as_ref()
+                .and_then(|mlx| mlx.draft_reload_tx()),
+            observe_count: std::sync::atomic::AtomicUsize::new(0),
         });
     }
 }

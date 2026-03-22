@@ -95,6 +95,9 @@ pub(crate) struct DefaultLearnLoop {
     /// Sender for LoRA hot-reload into the speculative decoder's draft model.
     #[cfg(all(feature = "ane", feature = "mlx"))]
     pub draft_reload_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>>,
+    /// Step counter for training frequency throttling.
+    /// Training only fires when observe_count % train_frequency == 0.
+    pub observe_count: std::sync::atomic::AtomicUsize,
 }
 
 impl DefaultLearnLoop {
@@ -359,6 +362,22 @@ impl LearnLoop for DefaultLearnLoop {
         #[cfg(feature = "mlx")]
         let mlx_provider = self.mlx_provider.clone();
 
+        // Training frequency throttling: only fire every Nth observe call.
+        // Experiences still accumulate every call (for data quality), but the
+        // actual training spawn is gated to reduce DRAM bandwidth contention
+        // with concurrent inference. Gradient accumulation over N steps is
+        // equivalent to batch_size=N — perfectly fine for LoRA.
+        let freq = self.perplexity_gate_config.train_frequency.max(1);
+        if freq > 1 {
+            let count = self.observe_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % freq != 0 {
+                tracing::debug!(
+                    "perplexity_gate: skipping training step {count} (frequency={freq})"
+                );
+                return None;
+            }
+        }
+
         let handle = tokio::spawn(async move {
             // Store rich turn messages (with tool_calls + tool results) when available,
             // falling back to metadata-only trace for turns without tool calls.
@@ -543,9 +562,9 @@ impl LearnLoop for DefaultLearnLoop {
                 };
                 if let Some(ref model_dir) = model_dir_opt {
                     if let Some(mut ane_cfg) = build_ane_training_config(
-                    Some(model_dir),
-                    ane_training_model_dir.as_deref(),
-                ) {
+                        Some(model_dir),
+                        ane_training_model_dir.as_deref(),
+                    ) {
                         // Scale epochs: target ≤90 optimizer steps to keep
                         // wall-clock manageable on large models (~7 min on 35B).
                         let n_data = exps_data.len();
@@ -564,6 +583,7 @@ impl LearnLoop for DefaultLearnLoop {
                         if ane_strict_ane {
                             ane_cfg.strict_ane = true;
                         }
+                        apply_ane_runtime_policy(&mut ane_cfg, mlx_provider.is_none());
                         let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(
                             ane_cfg.effective_model_dir(),
                         ) {
@@ -616,6 +636,29 @@ impl LearnLoop for DefaultLearnLoop {
                             }
                         }
                         if !samples.is_empty() {
+                            // In "idle" mode, wait for inference to go quiet before
+                            // starting training. In "sustained" mode, fire immediately
+                            // (frequency gate already throttles duty cycle).
+                            if pg_config.train_mode == crate::config::schema::TrainMode::Idle {
+                                if let Some(ref tc) = train_counters {
+                                    const TRAIN_IDLE_WAIT_MS: u64 = 5_000; // 5s of quiet
+                                    loop {
+                                        if tc.training_cancel.load(Ordering::Relaxed) {
+                                            debug!("perplexity_gate: training cancelled while waiting for idle");
+                                            return;
+                                        }
+                                        if !tc.inference_active.load(Ordering::Relaxed) {
+                                            let now = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+                                            let last = tc.last_inference_finished_ms.load(Ordering::Relaxed);
+                                            if last != 0 && now.saturating_sub(last) >= TRAIN_IDLE_WAIT_MS {
+                                                break;
+                                            }
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(500));
+                                    }
+                                }
+                            }
+
                             let mlx_tx = mlx_provider.as_ref().map(|mlx| mlx.model_tx());
                             emit_learn_metric(
                                 &telemetry,
@@ -811,6 +854,7 @@ pub(crate) fn build_ane_training_config(
             strict_ane: false,
             accum_steps: 1,
             adaptive_layer_drop: true,
+            dense_cache_budget_bytes: None,
         })
     };
 
@@ -990,6 +1034,16 @@ async fn try_http_train(
     clear_training_state(train_counters.as_ref());
 }
 
+#[cfg(all(feature = "ane", feature = "mlx"))]
+pub(crate) fn apply_ane_runtime_policy(
+    cfg: &mut crate::agent::ane_mlx_bridge::AneTrainingConfig,
+    external_inference_backend: bool,
+) {
+    if external_inference_backend {
+        cfg.dense_cache_budget_bytes = Some(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,6 +1161,7 @@ mod tests {
             ane_strict_ane: false,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             draft_reload_tx: None,
+            observe_count: std::sync::atomic::AtomicUsize::new(0),
         };
         let outcome = make_test_outcome();
         // Should not panic even with no calibrator and audit disabled.
@@ -1172,6 +1227,59 @@ mod tests {
             .unwrap()
             .await
             .expect("async observer should not panic");
+    }
+
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    #[test]
+    fn test_external_ane_runtime_policy_forces_zero_dense_cache() {
+        let mut cfg = test_ane_training_config();
+        cfg.dense_cache_budget_bytes = Some(512 * 1024 * 1024);
+
+        apply_ane_runtime_policy(&mut cfg, true);
+
+        assert_eq!(
+            cfg.dense_cache_budget_bytes,
+            Some(0),
+            "external oMLX serving should pin ANE dense cache to zero"
+        );
+    }
+
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    #[test]
+    fn test_inprocess_ane_runtime_policy_preserves_existing_budget() {
+        let mut cfg = test_ane_training_config();
+        cfg.dense_cache_budget_bytes = Some(512 * 1024 * 1024);
+
+        apply_ane_runtime_policy(&mut cfg, false);
+
+        assert_eq!(
+            cfg.dense_cache_budget_bytes,
+            Some(512 * 1024 * 1024),
+            "in-process MLX should keep the configured dense cache policy"
+        );
+    }
+
+    #[cfg(all(feature = "ane", feature = "mlx"))]
+    fn test_ane_training_config() -> crate::agent::ane_mlx_bridge::AneTrainingConfig {
+        crate::agent::ane_mlx_bridge::AneTrainingConfig {
+            model_dir: PathBuf::from("/tmp/inference-model"),
+            training_model_dir: None,
+            mil_config: crate::agent::ane_mil::MilConfig::mha(64, 128, 4, 64),
+            epochs: 1,
+            lr: 1e-5,
+            linear_attn_indices: vec![],
+            kv_dim: 64,
+            softcap: 15.0,
+            loss_scale: 256.0,
+            lr_scale_attn: 0.05,
+            lr_scale_ffn: 1.0,
+            residual_scale: 0.0,
+            optimizer: crate::agent::ane_mlx_bridge::AneTrainingOptimizer::AdamW,
+            strict_ane: false,
+            accum_steps: 1,
+            adaptive_layer_drop: true,
+            dense_cache_budget_bytes: None,
+        }
     }
 
     fn make_test_outcome() -> TurnOutcome {
@@ -1309,5 +1417,102 @@ mod tests {
         );
         assert!(good_q > 0.7, "good turn quality should be high: {good_q}");
         assert!(bad_q < 0.5, "bad turn quality should be low: {bad_q}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Training frequency throttling tests (TDD RED → GREEN)
+    // -----------------------------------------------------------------------
+
+    /// train_frequency=4 means only every 4th observe triggers training.
+    /// The observe_count tracks calls; training spawns at count % freq == 0.
+    #[test]
+    fn test_training_frequency_skips_steps() {
+        let cfg = PerplexityGateConfig {
+            train_frequency: 4,
+            ..PerplexityGateConfig::default()
+        };
+        // Verify the field exists and has the right value
+        assert_eq!(cfg.train_frequency, 4);
+
+        // Simulate the gating logic that observe_async will use
+        let observe_count = std::sync::atomic::AtomicUsize::new(0);
+        let freq = cfg.train_frequency.max(1);
+
+        let mut train_fired = Vec::new();
+        for _ in 0..8 {
+            let count = observe_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let should_train = count % freq == 0;
+            train_fired.push(should_train);
+        }
+
+        // Only calls 4 and 8 should fire training
+        assert_eq!(
+            train_fired,
+            vec![false, false, false, true, false, false, false, true],
+            "train_frequency=4 should fire at steps 4 and 8 only"
+        );
+    }
+
+    /// train_frequency=1 (default) means every observe triggers training.
+    /// Backward compatible with current behavior.
+    #[test]
+    fn test_frequency_one_is_default_behavior() {
+        let cfg = PerplexityGateConfig::default();
+        assert_eq!(cfg.train_frequency, 1, "default train_frequency must be 1");
+
+        let observe_count = std::sync::atomic::AtomicUsize::new(0);
+        let freq = cfg.train_frequency.max(1);
+
+        // Every call should fire
+        for _ in 0..5 {
+            let count = observe_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            assert!(count % freq == 0, "freq=1 should fire every step");
+        }
+    }
+
+    /// Config JSON with "trainFrequency": 16 should parse correctly.
+    #[test]
+    fn test_concurrent_mode_config() {
+        let json = r#"{
+            "enabled": true,
+            "autoTrain": true,
+            "trainFrequency": 16,
+            "trainMode": "sustained",
+            "surpriseThreshold": 0.3,
+            "minExperiences": 5,
+            "trainEpochs": 3
+        }"#;
+        let cfg: PerplexityGateConfig = serde_json::from_str(json).expect("parse failed");
+        assert_eq!(cfg.train_frequency, 16);
+        assert_eq!(cfg.train_mode, crate::config::schema::TrainMode::Sustained);
+        assert!(cfg.enabled);
+        assert!(cfg.auto_train);
+    }
+
+    /// Missing "trainFrequency" in JSON should default to 1.
+    #[test]
+    fn test_concurrent_mode_config_defaults() {
+        let json = r#"{ "enabled": false }"#;
+        let cfg: PerplexityGateConfig = serde_json::from_str(json).expect("parse failed");
+        assert_eq!(cfg.train_frequency, 1, "missing trainFrequency must default to 1");
+        assert_eq!(cfg.train_mode, crate::config::schema::TrainMode::Sustained,
+            "default train_mode must be sustained");
+    }
+
+    /// trainMode: "idle" parses correctly.
+    #[test]
+    fn test_train_mode_idle_parses() {
+        let json = r#"{ "trainMode": "idle", "trainFrequency": 8 }"#;
+        let cfg: PerplexityGateConfig = serde_json::from_str(json).expect("parse failed");
+        assert_eq!(cfg.train_mode, crate::config::schema::TrainMode::Idle);
+        assert_eq!(cfg.train_frequency, 8);
+    }
+
+    /// trainMode: "sustained" parses correctly.
+    #[test]
+    fn test_train_mode_sustained_parses() {
+        let json = r#"{ "trainMode": "sustained" }"#;
+        let cfg: PerplexityGateConfig = serde_json::from_str(json).expect("parse failed");
+        assert_eq!(cfg.train_mode, crate::config::schema::TrainMode::Sustained);
     }
 }

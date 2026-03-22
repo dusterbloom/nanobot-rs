@@ -233,6 +233,7 @@ impl AgentLoop {
                 mlx_provider: None,
                 training_counters: None,
                 ane_model_dir: None,
+                ane_training_model_dir: None,
                 #[cfg(all(feature = "ane", feature = "mlx"))]
                 ane_trainer: None,
                 #[cfg(all(feature = "ane", feature = "mlx"))]
@@ -241,6 +242,9 @@ impl AgentLoop {
                 ane_lr_override: None,
                 #[cfg(all(feature = "ane", feature = "mlx"))]
                 ane_strict_ane: false,
+                #[cfg(all(feature = "ane", feature = "mlx"))]
+                draft_reload_tx: None,
+                observe_count: std::sync::atomic::AtomicUsize::new(0),
             }),
             #[cfg(feature = "cluster")]
             cluster_router: None,
@@ -254,6 +258,7 @@ impl AgentLoop {
             #[cfg(feature = "mlx")]
             mlx_provider: None,
             ane_model_dir: None,
+            ane_training_model_dir: None,
             #[cfg(all(feature = "ane", feature = "mlx"))]
             ane_trainer: Some(Arc::new(
                 crate::agent::ane_mlx_bridge::PersistentAneTrainer::new(),
@@ -298,6 +303,14 @@ impl AgentLoop {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("set_ane_model_dir called after shared Arc was cloned");
         shared.ane_model_dir = dir;
+        shared.rebuild_learn_loop();
+    }
+
+    /// Set a separate training model dir (e.g. 0.8B for 32GB machines).
+    pub fn set_ane_training_model_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("set_ane_training_model_dir called after shared Arc was cloned");
+        shared.ane_training_model_dir = dir;
         shared.rebuild_learn_loop();
     }
 
