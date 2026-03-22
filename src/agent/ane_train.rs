@@ -792,6 +792,7 @@ pub fn load_checkpoint(
         vocab_size,
         lm_head: None,
         vocab_clusters: None,
+        router_adapter: None,
     };
 
     // Adam states
@@ -872,6 +873,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         }
     }
 

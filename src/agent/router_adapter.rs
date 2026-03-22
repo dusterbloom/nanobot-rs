@@ -15,6 +15,7 @@ use std::path::Path;
 const ADAPTER_FILENAME: &str = "router_adapter.bin";
 
 /// Loaded router adapter with per-layer fp32 gate weights.
+#[derive(Debug, Clone)]
 pub struct RouterAdapter {
     gates: Vec<Option<Vec<f32>>>,
     pub num_experts: usize,

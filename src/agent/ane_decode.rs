@@ -166,6 +166,17 @@ fn moe_forward_inner(
     cfg: &MilConfig,
     layer: usize,
 ) {
+    moe_forward_with_adapter(moe, x, rms_ffn, cfg, layer, None);
+}
+
+fn moe_forward_with_adapter(
+    moe: &MoeLayerWeights,
+    x: &mut Vec<f32>,
+    rms_ffn: &[f32],
+    cfg: &MilConfig,
+    layer: usize,
+    adapter: Option<&super::router_adapter::RouterAdapter>,
+) {
     let dim = cfg.dim;
     let hidden = moe.moe_hidden;
 
@@ -173,8 +184,12 @@ fn moe_forward_inner(
     let mut xnorm = vec![0.0f32; dim];
     rmsnorm(&mut xnorm, x, rms_ffn, dim, 1, cfg.rms_eps);
 
-    // Router: logits = router[num_experts, dim] @ xnorm[dim]
-    let router_logits = cpu_matmul(&moe.router, &xnorm, moe.num_experts, dim, 1);
+    // Router: use fp32 adapter gate if available, else quantized base
+    let router_logits = if let Some(gate) = adapter.and_then(|a| a.gate_for_layer(layer)) {
+        cpu_matmul(gate, &xnorm, moe.num_experts, dim, 1)
+    } else {
+        cpu_matmul(&moe.router, &xnorm, moe.num_experts, dim, 1)
+    };
 
     // Top-k selection + softmax
     let k = moe.num_experts_per_tok;
@@ -732,7 +747,7 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
             }
             // FFN: MoE or dense (always runs, with or without GDN attention)
             if let Some(ref moe_w) = lw.moe {
-                moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, cfg, l);
+                moe_forward_with_adapter(moe_w, &mut x, &lw.rms_ffn, cfg, l, model.router_adapter.as_ref());
             } else {
                 let mut x2norm = vec![0.0f32; dim];
                 rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
@@ -844,7 +859,7 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
 
         // FFN: MoE or dense
         if let Some(ref moe_w) = lw.moe {
-            moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, cfg, l);
+            moe_forward_with_adapter(moe_w, &mut x, &lw.rms_ffn, cfg, l, model.router_adapter.as_ref());
         } else {
             let mut x2norm = vec![0.0f32; dim];
             rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
@@ -2526,6 +2541,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         }
     }
 
@@ -2739,6 +2755,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         }
     }
 
@@ -3030,6 +3047,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         }
     }
 
@@ -3187,7 +3205,7 @@ mod tests {
             // FFN (MoE)
             if let Some(ref moe_w) = lw.moe {
                 let t = std::time::Instant::now();
-                moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, &cfg, l);
+                moe_forward_with_adapter(moe_w, &mut x, &lw.rms_ffn, &cfg, l, model.router_adapter.as_ref());
                 moe_us += t.elapsed().as_micros();
             }
         }
@@ -4625,6 +4643,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         }
     }
 
@@ -4892,6 +4911,7 @@ mod tests {
                 vocab_size: 32,
                 lm_head: None,
                 vocab_clusters: None,
+                router_adapter: None,
             };
 
             let gdn_kernels = match GdnAneKernels::compile(&model) {

@@ -254,6 +254,10 @@ pub struct ModelWeights {
     /// Factored vocabulary clusters for fast lm_head projection.
     /// Loaded from sidecar file `vocab_clusters.bin` next to model weights.
     pub vocab_clusters: Option<super::factored_vocab::VocabClusters>,
+    /// Trained MoE router adapter (fp32 gate weights).
+    /// When present, moe_forward uses these instead of the quantized base gates.
+    /// Loaded from sidecar file `router_adapter.bin` next to model weights.
+    pub router_adapter: Option<super::router_adapter::RouterAdapter>,
 }
 
 impl ModelWeights {
@@ -1207,6 +1211,7 @@ impl ModelWeights {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         })
     }
 
@@ -1449,6 +1454,7 @@ impl ModelWeights {
             vocab_size,
             lm_head: None, // tied embeddings
             vocab_clusters: None,
+            router_adapter: None,
         })
     }
 
@@ -2540,6 +2546,7 @@ impl QuantizedModelWeights {
             vocab_size: self.vocab_size,
             lm_head: self.lm_head.clone(),
             vocab_clusters: None, // not cloned — reclustered if needed
+            router_adapter: None,
         }
     }
 
@@ -5973,6 +5980,7 @@ impl ModelWeights {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         })
     }
 }
@@ -6882,6 +6890,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let current = ModelWeights {
@@ -6892,6 +6901,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tmp = tempfile::NamedTempFile::new().expect("tmpfile");

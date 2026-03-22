@@ -5472,6 +5472,7 @@ mod tests {
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens = vec![1u16, 2, 3];
@@ -5618,6 +5619,7 @@ mod tests {
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens = vec![1u16, 2, 3];
@@ -5955,6 +5957,7 @@ mod tests {
             vocab_size: 256,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         // Compile forward kernels (template with zero weights)
@@ -6106,6 +6109,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -6178,6 +6182,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7191,6 +7196,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7270,6 +7276,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7430,6 +7437,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7528,6 +7536,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         // LoRA with rank=16 (ANE requires multiple of 16)
@@ -7628,6 +7637,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         // LoRA rank=16 (ANE alignment), targets: wo + w2
@@ -7815,6 +7825,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();

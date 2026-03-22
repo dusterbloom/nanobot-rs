@@ -3908,6 +3908,7 @@ mod tests {
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let lora = LoraModel::with_kv_dim(
@@ -4030,6 +4031,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let lora = LoraModel::with_full_dims(
@@ -4143,6 +4145,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4216,6 +4219,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4337,6 +4341,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4467,6 +4472,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: Some(make_small(vocab * dim, 9000)), // untied!
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4578,6 +4584,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let lora = LoraModel::new(
@@ -4711,6 +4718,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let lora = super::super::ane_lora::LoraModel::with_full_dims(
@@ -4913,6 +4921,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let lora = LoraModel::new(
@@ -5262,6 +5271,7 @@ mod tests {
             vocab_size: vocab,
             lm_head: None,
             vocab_clusters: None,
+            router_adapter: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
