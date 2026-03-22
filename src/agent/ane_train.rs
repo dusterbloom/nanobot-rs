@@ -780,6 +780,7 @@ pub fn load_checkpoint(
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         });
     }
 
@@ -790,6 +791,7 @@ pub fn load_checkpoint(
         embed,
         vocab_size,
         lm_head: None,
+        vocab_clusters: None,
     };
 
     // Adam states
@@ -859,6 +861,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
 
         ModelWeights {
@@ -868,6 +871,7 @@ mod tests {
             embed: mk(vocab * dim),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         }
     }
 

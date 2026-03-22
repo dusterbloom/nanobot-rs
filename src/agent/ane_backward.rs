@@ -39,7 +39,12 @@ pub fn rmsnorm_bwd(
     // This can happen when an upstream ANE kernel (delta_reload) fails
     // and returns empty/wrong-sized data, or from layer-drop (empty activations).
     let expected = dim * seq;
-    if dx.len() != expected || dy.len() != expected || x.len() != expected || dw.len() != dim || w.len() != dim {
+    if dx.len() != expected
+        || dy.len() != expected
+        || x.len() != expected
+        || dw.len() != dim
+        || w.len() != dim
+    {
         use std::sync::atomic::{AtomicU64, Ordering};
         static MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
         let n = MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1547,8 +1552,7 @@ fn mha_backward_fused_sdpa_dx_attn(
             for t in 0..seq {
                 for d in 0..hd {
                     let dst_row = kv_h * hd + d;
-                    dv[dst_row * seq + t] +=
-                        dv_all[src_h * head_stride + t * hd + d] * inv_hpg;
+                    dv[dst_row * seq + t] += dv_all[src_h * head_stride + t * hd + d] * inv_hpg;
                 }
             }
         }
@@ -2639,7 +2643,9 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             // DynMatmul: weight packed into input (slowest, always works)
             let fused_result = prepacked.as_ref().and_then(|pp| {
                 pp.eval_fused_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq)
-                    .or_else(|| pp.eval_fused_ffn_bwd_hotswap(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq))
+                    .or_else(|| {
+                        pp.eval_fused_ffn_bwd_hotswap(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq)
+                    })
                     .or_else(|| pp.eval_split_ffn_bwd(l, &dffn, &ac.h1, &ac.h3, dim, hidden, seq))
             });
             let (dsilu, fused_dx_ffn) = match fused_result {
@@ -2755,7 +2761,16 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             result
         } else {
             let mut dx = vec![0.0f32; dim * seq];
-            rmsnorm_bwd(&mut dx, &mut vec![0.0f32; dim], &dx_ffn, &ac.x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
+            rmsnorm_bwd(
+                &mut dx,
+                &mut vec![0.0f32; dim],
+                &dx_ffn,
+                &ac.x2,
+                &lw.rms_ffn,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
             dx
         };
         ane_forward::vec_add_inplace(&mut dx2, &dz_ffn);
@@ -2888,19 +2903,46 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                         for h in 0..heads {
                             for t in 0..seq {
                                 for d in 0..hd {
-                                    dq[(h * hd + d) * seq + t] = output[h * head_stride + t * hd + d];
-                                    dk[(h * hd + d) * seq + t] = output[heads * head_stride + h * head_stride + t * hd + d];
+                                    dq[(h * hd + d) * seq + t] =
+                                        output[h * head_stride + t * hd + d];
+                                    dk[(h * hd + d) * seq + t] =
+                                        output[heads * head_stride + h * head_stride + t * hd + d];
                                 }
                             }
                         }
 
                         // RoPE + QK-norm backward (CPU)
-                        ane_forward::rope_backward(&mut dq, &mut dk, heads, hd, seq, cfg.rope_theta);
+                        ane_forward::rope_backward(
+                            &mut dq,
+                            &mut dk,
+                            heads,
+                            hd,
+                            seq,
+                            cfg.rope_theta,
+                        );
                         if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
-                            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; hd], q_pre, q_nw, heads, hd, seq, cfg.rms_eps);
+                            ane_forward::qk_rmsnorm_bwd(
+                                &mut dq,
+                                &mut vec![0.0f32; hd],
+                                q_pre,
+                                q_nw,
+                                heads,
+                                hd,
+                                seq,
+                                cfg.rms_eps,
+                            );
                         }
                         if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
-                            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; hd], k_pre, k_nw, heads, hd, seq, cfg.rms_eps);
+                            ane_forward::qk_rmsnorm_bwd(
+                                &mut dk,
+                                &mut vec![0.0f32; hd],
+                                k_pre,
+                                k_nw,
+                                heads,
+                                hd,
+                                seq,
+                                cfg.rms_eps,
+                            );
                         }
 
                         // GQA-reduce dK, dV
@@ -2909,19 +2951,28 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                         for kv_h in 0..kv_heads {
                             for rep in 0..hpg {
                                 let src_h = kv_h * hpg + rep;
-                                for c in 0..hd { for t in 0..seq {
-                                    dk_r[(kv_h * hd + c) * seq + t] += dk[(src_h * hd + c) * seq + t] * inv_hpg;
-                                }}
+                                for c in 0..hd {
+                                    for t in 0..seq {
+                                        dk_r[(kv_h * hd + c) * seq + t] +=
+                                            dk[(src_h * hd + c) * seq + t] * inv_hpg;
+                                    }
+                                }
                             }
                         }
                         let mut dv = vec![0.0f32; kvd * seq];
                         for kv_h in 0..kv_heads {
                             for rep in 0..hpg {
                                 let src_h = kv_h * hpg + rep;
-                                for t in 0..seq { for d in 0..hd {
-                                    dv[(kv_h * hd + d) * seq + t] +=
-                                        output[2 * heads * head_stride + src_h * head_stride + t * hd + d] * inv_hpg;
-                                }}
+                                for t in 0..seq {
+                                    for d in 0..hd {
+                                        dv[(kv_h * hd + d) * seq + t] +=
+                                            output[2 * heads * head_stride
+                                                + src_h * head_stride
+                                                + t * hd
+                                                + d]
+                                                * inv_hpg;
+                                    }
+                                }
                             }
                         }
 
@@ -2946,24 +2997,40 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                         // Re-expand for QKV backward
                         let dk_exp = if hpg > 1 {
                             let mut exp = vec![0.0f32; ad * seq];
-                            for kv_h in 0..kv_heads { for rep in 0..hpg {
-                                let dst_h = kv_h * hpg + rep;
-                                for c in 0..hd {
-                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
-                                        .copy_from_slice(&dk_r[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                            for kv_h in 0..kv_heads {
+                                for rep in 0..hpg {
+                                    let dst_h = kv_h * hpg + rep;
+                                    for c in 0..hd {
+                                        exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                            .copy_from_slice(
+                                                &dk_r[(kv_h * hd + c) * seq
+                                                    ..(kv_h * hd + c + 1) * seq],
+                                            );
+                                    }
                                 }
-                            }} exp
-                        } else { dk_r };
+                            }
+                            exp
+                        } else {
+                            dk_r
+                        };
                         let dv_exp = if hpg > 1 {
                             let mut exp = vec![0.0f32; ad * seq];
-                            for kv_h in 0..kv_heads { for rep in 0..hpg {
-                                let dst_h = kv_h * hpg + rep;
-                                for c in 0..hd {
-                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
-                                        .copy_from_slice(&dv[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                            for kv_h in 0..kv_heads {
+                                for rep in 0..hpg {
+                                    let dst_h = kv_h * hpg + rep;
+                                    for c in 0..hd {
+                                        exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                            .copy_from_slice(
+                                                &dv[(kv_h * hd + c) * seq
+                                                    ..(kv_h * hd + c + 1) * seq],
+                                            );
+                                    }
                                 }
-                            }} exp
-                        } else { dv };
+                            }
+                            exp
+                        } else {
+                            dv
+                        };
 
                         // Per-layer QKV backward (BLOBFILE, dispatch 2 of 2)
                         let qpd = cfg.q_proj_dim();
@@ -3031,15 +3098,20 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
 
                     let fused_kernel = bwd_kernels.fused_attn_gqa_bwd.as_ref().unwrap();
                     let input_bytes = unsafe {
-                        std::slice::from_raw_parts(sdpa_input.as_ptr() as *const u8, sdpa_input.len() * 4)
+                        std::slice::from_raw_parts(
+                            sdpa_input.as_ptr() as *const u8,
+                            sdpa_input.len() * 4,
+                        )
                     };
                     fused_kernel.write_input(0, input_bytes);
                     if let Ok(()) = fused_kernel.eval() {
                         let out_elems = 3 * heads * seq * hd;
                         let mut out_buf = vec![0u8; out_elems * 4];
                         fused_kernel.read_output(0, &mut out_buf);
-                        let output: Vec<f32> = out_buf.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        let output: Vec<f32> = out_buf
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
 
                         let head_stride = seq * hd;
                         let mut dq = vec![0.0f32; ad * seq];
@@ -3047,19 +3119,46 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                         for h in 0..heads {
                             for t in 0..seq {
                                 for d in 0..hd {
-                                    dq[(h * hd + d) * seq + t] = output[h * head_stride + t * hd + d];
-                                    dk[(h * hd + d) * seq + t] = output[heads * head_stride + h * head_stride + t * hd + d];
+                                    dq[(h * hd + d) * seq + t] =
+                                        output[h * head_stride + t * hd + d];
+                                    dk[(h * hd + d) * seq + t] =
+                                        output[heads * head_stride + h * head_stride + t * hd + d];
                                 }
                             }
                         }
 
                         // RoPE + QK-norm backward (CPU)
-                        ane_forward::rope_backward(&mut dq, &mut dk, heads, hd, seq, cfg.rope_theta);
+                        ane_forward::rope_backward(
+                            &mut dq,
+                            &mut dk,
+                            heads,
+                            hd,
+                            seq,
+                            cfg.rope_theta,
+                        );
                         if let (Some(q_pre), Some(q_nw)) = (&ac.q_pre_norm, &lw.q_norm) {
-                            ane_forward::qk_rmsnorm_bwd(&mut dq, &mut vec![0.0f32; hd], q_pre, q_nw, heads, hd, seq, cfg.rms_eps);
+                            ane_forward::qk_rmsnorm_bwd(
+                                &mut dq,
+                                &mut vec![0.0f32; hd],
+                                q_pre,
+                                q_nw,
+                                heads,
+                                hd,
+                                seq,
+                                cfg.rms_eps,
+                            );
                         }
                         if let (Some(k_pre), Some(k_nw)) = (&ac.k_pre_norm, &lw.k_norm) {
-                            ane_forward::qk_rmsnorm_bwd(&mut dk, &mut vec![0.0f32; hd], k_pre, k_nw, heads, hd, seq, cfg.rms_eps);
+                            ane_forward::qk_rmsnorm_bwd(
+                                &mut dk,
+                                &mut vec![0.0f32; hd],
+                                k_pre,
+                                k_nw,
+                                heads,
+                                hd,
+                                seq,
+                                cfg.rms_eps,
+                            );
                         }
 
                         // GQA-reduce dK, dV
@@ -3068,48 +3167,75 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
                         for kv_h in 0..kv_heads {
                             for rep in 0..hpg {
                                 let src_h = kv_h * hpg + rep;
-                                for c in 0..hd { for t in 0..seq {
-                                    dk_r[(kv_h * hd + c) * seq + t] += dk[(src_h * hd + c) * seq + t] * inv_hpg;
-                                }}
+                                for c in 0..hd {
+                                    for t in 0..seq {
+                                        dk_r[(kv_h * hd + c) * seq + t] +=
+                                            dk[(src_h * hd + c) * seq + t] * inv_hpg;
+                                    }
+                                }
                             }
                         }
                         let mut dv = vec![0.0f32; kvd * seq];
                         for kv_h in 0..kv_heads {
                             for rep in 0..hpg {
                                 let src_h = kv_h * hpg + rep;
-                                for t in 0..seq { for d in 0..hd {
-                                    dv[(kv_h * hd + d) * seq + t] +=
-                                        output[2 * heads * head_stride + src_h * head_stride + t * hd + d] * inv_hpg;
-                                }}
+                                for t in 0..seq {
+                                    for d in 0..hd {
+                                        dv[(kv_h * hd + d) * seq + t] +=
+                                            output[2 * heads * head_stride
+                                                + src_h * head_stride
+                                                + t * hd
+                                                + d]
+                                                * inv_hpg;
+                                    }
+                                }
                             }
                         }
 
                         // Merge gate into dQ if needed
                         let dq_for_wq = if let Some(dg) = &d_gate {
                             ane_forward::merge_q_gate(&dq, dg, heads, hd, seq)
-                        } else { dq };
+                        } else {
+                            dq
+                        };
 
                         // Re-expand for QKV backward
                         let dk_exp = if hpg > 1 {
                             let mut exp = vec![0.0f32; ad * seq];
-                            for kv_h in 0..kv_heads { for rep in 0..hpg {
-                                let dst_h = kv_h * hpg + rep;
-                                for c in 0..hd {
-                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
-                                        .copy_from_slice(&dk_r[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                            for kv_h in 0..kv_heads {
+                                for rep in 0..hpg {
+                                    let dst_h = kv_h * hpg + rep;
+                                    for c in 0..hd {
+                                        exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                            .copy_from_slice(
+                                                &dk_r[(kv_h * hd + c) * seq
+                                                    ..(kv_h * hd + c + 1) * seq],
+                                            );
+                                    }
                                 }
-                            }} exp
-                        } else { dk_r };
+                            }
+                            exp
+                        } else {
+                            dk_r
+                        };
                         let dv_exp = if hpg > 1 {
                             let mut exp = vec![0.0f32; ad * seq];
-                            for kv_h in 0..kv_heads { for rep in 0..hpg {
-                                let dst_h = kv_h * hpg + rep;
-                                for c in 0..hd {
-                                    exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
-                                        .copy_from_slice(&dv[(kv_h * hd + c) * seq..(kv_h * hd + c + 1) * seq]);
+                            for kv_h in 0..kv_heads {
+                                for rep in 0..hpg {
+                                    let dst_h = kv_h * hpg + rep;
+                                    for c in 0..hd {
+                                        exp[(dst_h * hd + c) * seq..(dst_h * hd + c + 1) * seq]
+                                            .copy_from_slice(
+                                                &dv[(kv_h * hd + c) * seq
+                                                    ..(kv_h * hd + c + 1) * seq],
+                                            );
+                                    }
                                 }
-                            }} exp
-                        } else { dv };
+                            }
+                            exp
+                        } else {
+                            dv
+                        };
 
                         // Per-layer QKV backward (BLOBFILE, no DynMatmul packing)
                         let qpd = cfg.q_proj_dim();
@@ -3165,7 +3291,16 @@ fn backward_lora_ane_impl<W: ane_weights::WeightSource>(
             result
         } else {
             let mut dx = vec![0.0f32; dim * seq];
-            rmsnorm_bwd(&mut dx, &mut vec![0.0f32; dim], &dx_attn, &ac.layer_in, &lw.rms_att, dim, seq, cfg.rms_eps);
+            rmsnorm_bwd(
+                &mut dx,
+                &mut vec![0.0f32; dim],
+                &dx_attn,
+                &ac.layer_in,
+                &lw.rms_att,
+                dim,
+                seq,
+                cfg.rms_eps,
+            );
             dx
         };
         ane_forward::vec_add_inplace(&mut dy, &dx2);
@@ -3634,6 +3769,7 @@ mod tests {
             embed: quantized.embed.clone(),
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
+            vocab_clusters: None,
         };
 
         let lora = LoraModel::with_kv_dim(
@@ -3749,11 +3885,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let lora = LoraModel::with_full_dims(
@@ -3860,11 +3998,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -3931,11 +4071,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4050,11 +4192,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4178,11 +4322,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: Some(make_small(vocab * dim, 9000)), // untied!
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -4287,11 +4433,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_vals(vocab * dim, 700),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let lora = LoraModel::new(
@@ -4418,11 +4566,13 @@ mod tests {
                 q_norm: Some(vec![1.0; head_dim]),
                 k_norm: Some(vec![1.0; head_dim]),
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let lora = super::super::ane_lora::LoraModel::with_full_dims(
@@ -4618,11 +4768,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_weight(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let lora = LoraModel::new(
@@ -4936,9 +5088,8 @@ mod tests {
             }
         };
 
-        let bwd_kernels =
-            BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
-                .expect("compile_backward failed");
+        let bwd_kernels = BackwardKernels::compile_backward(&cfg, &fwd_kernels.mask_blob)
+            .expect("compile_backward failed");
 
         if bwd_kernels.fused_attn_gqa_bwd.is_none() {
             eprintln!("Skipping: fused_attn_gqa_bwd kernel did not compile");
@@ -4966,11 +5117,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -5002,6 +5155,9 @@ mod tests {
             "fused SDPA backward max error too large: {max_err:.6}"
         );
         assert!(cpu_norm > 1e-8, "CPU dx_attn is zero: norm={cpu_norm}");
-        assert!(fused_norm > 1e-8, "Fused dx_attn is zero: norm={fused_norm}");
+        assert!(
+            fused_norm > 1e-8,
+            "Fused dx_attn is zero: norm={fused_norm}"
+        );
     }
 }

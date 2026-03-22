@@ -102,22 +102,13 @@ extern "C" {
         in_idx: c_int,
     ) -> bool;
 
-    fn ane_bridge_eval_chain(
-        kernels: *mut *mut ANEKernelHandle,
-        n: c_int,
-    ) -> bool;
+    fn ane_bridge_eval_chain(kernels: *mut *mut ANEKernelHandle, n: c_int) -> bool;
 
     fn ane_bridge_begin_realtime() -> bool;
     fn ane_bridge_end_realtime();
     fn ane_bridge_eval_realtime(kernel: *mut ANEKernelHandle) -> bool;
-    fn ane_bridge_eval_chain_realtime(
-        kernels: *mut *mut ANEKernelHandle,
-        n: c_int,
-    ) -> bool;
-    fn ane_bridge_prepare_chain(
-        kernels: *mut *mut ANEKernelHandle,
-        n: c_int,
-    ) -> bool;
+    fn ane_bridge_eval_chain_realtime(kernels: *mut *mut ANEKernelHandle, n: c_int) -> bool;
+    fn ane_bridge_prepare_chain(kernels: *mut *mut ANEKernelHandle, n: c_int) -> bool;
 
     fn ane_bridge_free(kernel: *mut ANEKernelHandle);
 
@@ -329,7 +320,10 @@ pub fn build_weight_blob_int8(weights: &[i8], rows: usize, cols: usize) -> Vec<u
             &mut out_len,
         )
     };
-    assert!(!ptr.is_null(), "ane_bridge_build_weight_blob_int8 returned NULL");
+    assert!(
+        !ptr.is_null(),
+        "ane_bridge_build_weight_blob_int8 returned NULL"
+    );
     let blob = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
     unsafe { ane_bridge_free_blob(ptr as *mut c_void) };
     blob
@@ -353,7 +347,10 @@ pub fn build_weight_blob_quantized(weights: &[f32], rows: usize, cols: usize) ->
             &mut out_len,
         )
     };
-    assert!(!ptr.is_null(), "ane_bridge_build_weight_blob_quantized returned NULL");
+    assert!(
+        !ptr.is_null(),
+        "ane_bridge_build_weight_blob_quantized returned NULL"
+    );
     let blob = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
     unsafe { ane_bridge_free_blob(ptr as *mut c_void) };
     (blob, scale)
@@ -587,14 +584,20 @@ impl AneKernel {
     ///
     /// After `self.eval()`, calling `dst.eval()` will read directly from
     /// self's output IOSurface — no CPU memcpy. Rebuilds dst's ANE request.
-    pub fn share_output_to(&self, out_idx: usize, dst: &AneKernel, in_idx: usize) -> Result<(), String> {
+    pub fn share_output_to(
+        &self,
+        out_idx: usize,
+        dst: &AneKernel,
+        in_idx: usize,
+    ) -> Result<(), String> {
         let ok = unsafe {
-            ane_bridge_share_surface(
-                self.handle, out_idx as c_int,
-                dst.handle, in_idx as c_int,
-            )
+            ane_bridge_share_surface(self.handle, out_idx as c_int, dst.handle, in_idx as c_int)
         };
-        if ok { Ok(()) } else { Err("share_surface failed".into()) }
+        if ok {
+            Ok(())
+        } else {
+            Err("share_surface failed".into())
+        }
     }
 
     /// Evaluate a chain of kernels back-to-back without intermediate reads.
@@ -604,10 +607,12 @@ impl AneKernel {
     /// output need CPU I/O.
     pub fn eval_chain(kernels: &[&AneKernel]) -> Result<(), String> {
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
-        let ok = unsafe {
-            ane_bridge_eval_chain(handles.as_mut_ptr(), handles.len() as c_int)
-        };
-        if ok { Ok(()) } else { Err("eval_chain failed".into()) }
+        let ok = unsafe { ane_bridge_eval_chain(handles.as_mut_ptr(), handles.len() as c_int) };
+        if ok {
+            Ok(())
+        } else {
+            Err("eval_chain failed".into())
+        }
     }
 
     /// Enter real-time dispatch mode (lower per-dispatch latency).
@@ -623,25 +628,34 @@ impl AneKernel {
     /// Evaluate using real-time dispatch (requires begin_realtime).
     pub fn eval_realtime(&self) -> Result<(), String> {
         let ok = unsafe { ane_bridge_eval_realtime(self.handle) };
-        if ok { Ok(()) } else { Err("eval_realtime failed".into()) }
+        if ok {
+            Ok(())
+        } else {
+            Err("eval_realtime failed".into())
+        }
     }
 
     /// Evaluate chain using real-time dispatch.
     pub fn eval_chain_realtime(kernels: &[&AneKernel]) -> Result<(), String> {
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
-        let ok = unsafe {
-            ane_bridge_eval_chain_realtime(handles.as_mut_ptr(), handles.len() as c_int)
-        };
-        if ok { Ok(()) } else { Err("eval_chain_realtime failed".into()) }
+        let ok =
+            unsafe { ane_bridge_eval_chain_realtime(handles.as_mut_ptr(), handles.len() as c_int) };
+        if ok {
+            Ok(())
+        } else {
+            Err("eval_chain_realtime failed".into())
+        }
     }
 
     /// Prepare chain for pipelined ANE execution.
     pub fn prepare_chain(kernels: &[&AneKernel]) -> Result<(), String> {
         let mut handles: Vec<*mut ANEKernelHandle> = kernels.iter().map(|k| k.handle).collect();
-        let ok = unsafe {
-            ane_bridge_prepare_chain(handles.as_mut_ptr(), handles.len() as c_int)
-        };
-        if ok { Ok(()) } else { Err("prepare_chain failed".into()) }
+        let ok = unsafe { ane_bridge_prepare_chain(handles.as_mut_ptr(), handles.len() as c_int) };
+        if ok {
+            Ok(())
+        } else {
+            Err("prepare_chain failed".into())
+        }
     }
 
     /// Read data from output tensor at `idx` into `buf`.
@@ -697,7 +711,9 @@ impl AneKernel {
     pub fn write_input_zerocopy(&self, idx: usize, x: &[f32], n_ch: usize, spatial: usize) {
         debug_assert_eq!(x.len(), n_ch);
         let base = self.get_input_base(idx) as *mut f32;
-        if base.is_null() { return; }
+        if base.is_null() {
+            return;
+        }
         unsafe {
             // Zero the entire IOSurface (clears stale spatial padding)
             std::ptr::write_bytes(base, 0, n_ch * spatial);
@@ -717,7 +733,9 @@ impl AneKernel {
     /// Returns `Vec<f32>` of length `n_ch`. ~2x faster than `read_output()`.
     pub fn read_output_zerocopy(&self, idx: usize, n_ch: usize, spatial: usize) -> Vec<f32> {
         let base = self.get_output_base(idx) as *const f32;
-        if base.is_null() { return vec![0.0; n_ch]; }
+        if base.is_null() {
+            return vec![0.0; n_ch];
+        }
         unsafe {
             // ARM64 full memory barrier — ensures ANE DMA writes are visible to CPU
             #[cfg(target_arch = "aarch64")]
@@ -1090,7 +1108,9 @@ mod tests {
 
             // Verify kernel still produces correct output
             kernel.write_input(0, &input_bytes);
-            kernel.eval().expect(&format!("eval after delta_reload round {round} failed"));
+            kernel
+                .eval()
+                .expect(&format!("eval after delta_reload round {round} failed"));
 
             let mut output_bytes = vec![0u8; tensor_bytes];
             kernel.read_output(0, &mut output_bytes);
@@ -1248,7 +1268,10 @@ mod tests {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_eq!(input_f32, out_f32, "cold compile should produce correct output");
+        assert_eq!(
+            input_f32, out_f32,
+            "cold compile should produce correct output"
+        );
 
         // Drop kernel — tmpDir with net.plist persists on disk
         drop(kernel);
@@ -1383,7 +1406,11 @@ mod tests {
         // Test build_weight_blob_int8
         let int8_data: Vec<i8> = (0..16).map(|i| (i * 8 - 64) as i8).collect();
         let blob = build_weight_blob_int8(&int8_data, 4, 4);
-        assert_eq!(blob.len(), 64 + 16, "int8 blob should be 64-byte header + 16 bytes data");
+        assert_eq!(
+            blob.len(),
+            64 + 16,
+            "int8 blob should be 64-byte header + 16 bytes data"
+        );
         // Check header magic
         assert_eq!(blob[0], 0xEF);
         assert_eq!(blob[1], 0xBE);
@@ -1391,7 +1418,11 @@ mod tests {
         assert_eq!(blob[3], 0xDE);
         // Check data content
         for i in 0..16 {
-            assert_eq!(blob[64 + i] as i8, int8_data[i], "int8 data mismatch at {i}");
+            assert_eq!(
+                blob[64 + i] as i8,
+                int8_data[i],
+                "int8 data mismatch at {i}"
+            );
         }
 
         // Test build_weight_blob_quantized

@@ -587,7 +587,7 @@ bool ane_bridge_eval(ANEKernelHandle *kernel) {
                 kernel->model, @selector(evaluateWithQoS:options:request:error:),
                 21, @{}, kernel->request, &e);
         }
-        if (!ok && e) {
+        if (!ok && e && !g_quiet) {
             NSLog(@"[ANE] eval failed: %@", e);
         }
         return ok;

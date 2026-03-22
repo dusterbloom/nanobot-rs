@@ -434,17 +434,43 @@ fn fused_ce_pass1_logsumexp(
             if let Some(blob) = ane_blob {
                 super::ane_bridge::gemm_f16(
                     &blob.embed_f16[v_start * dim..(v_start + tile_rows) * dim],
-                    tile_rows, dim, x_final, seq, tile_slice, 1.0, 0.0,
+                    tile_rows,
+                    dim,
+                    x_final,
+                    seq,
+                    tile_slice,
+                    1.0,
+                    0.0,
                 );
             } else {
-                cpu_gemm(tile_slice, &embed[v_start * dim..(v_start + tile_rows) * dim],
-                    false, x_final, false, tile_rows, seq, dim, 1.0, 0.0);
+                cpu_gemm(
+                    tile_slice,
+                    &embed[v_start * dim..(v_start + tile_rows) * dim],
+                    false,
+                    x_final,
+                    false,
+                    tile_rows,
+                    seq,
+                    dim,
+                    1.0,
+                    0.0,
+                );
             }
             #[cfg(not(feature = "ane"))]
             {
                 let _ = ane_blob;
-                cpu_gemm(tile_slice, &embed[v_start * dim..(v_start + tile_rows) * dim],
-                    false, x_final, false, tile_rows, seq, dim, 1.0, 0.0);
+                cpu_gemm(
+                    tile_slice,
+                    &embed[v_start * dim..(v_start + tile_rows) * dim],
+                    false,
+                    x_final,
+                    false,
+                    tile_rows,
+                    seq,
+                    dim,
+                    1.0,
+                    0.0,
+                );
             }
         }
 
@@ -510,21 +536,33 @@ fn fused_ce_pass2_grad<T: TokenId>(
                 Ok(()) => true,
                 Err(_) => false,
             }
-        } else { false };
+        } else {
+            false
+        };
         if !used_ane {
             #[cfg(feature = "ane")]
             if let Some(blob) = ane_blob {
                 super::ane_bridge::gemm_f16(
                     &blob.embed_f16[v_start * dim..(v_start + tile_rows) * dim],
-                    tile_rows, dim, x_final, seq, tile_slice, 1.0, 0.0,
+                    tile_rows,
+                    dim,
+                    x_final,
+                    seq,
+                    tile_slice,
+                    1.0,
+                    0.0,
                 );
             } else {
-                cpu_gemm(tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0);
+                cpu_gemm(
+                    tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0,
+                );
             }
             #[cfg(not(feature = "ane"))]
             {
                 let _ = ane_blob;
-                cpu_gemm(tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0);
+                cpu_gemm(
+                    tile_slice, embed_tile, false, x_final, false, tile_rows, seq, dim, 1.0, 0.0,
+                );
             }
         }
 
@@ -1152,12 +1190,13 @@ impl ClassifierBlobKernel {
         let kernel = &self.kernels[tile];
 
         // Write x_final input
-        let bytes = unsafe {
-            std::slice::from_raw_parts(x_final.as_ptr() as *const u8, x_final.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(x_final.as_ptr() as *const u8, x_final.len() * 4) };
         kernel.write_input(0, bytes);
 
-        kernel.eval().map_err(|e| format!("classifier tile {tile} eval: {e}"))?;
+        kernel
+            .eval()
+            .map_err(|e| format!("classifier tile {tile} eval: {e}"))?;
 
         // Read output [tile_size, seq] as f32 directly (reinterpret bytes → f32)
         let n_out = self.tile_size * self.seq;
@@ -1176,17 +1215,23 @@ impl ClassifierBlobKernel {
     /// Evaluate one tile directly into caller's buffer (zero extra allocation).
     ///
     /// Writes logits[tile_rows × seq] into `out`. `out` must have length >= tile_rows * seq.
-    pub fn eval_tile_into(&self, tile: usize, x_final: &[f32], out: &mut [f32]) -> Result<(), String> {
+    pub fn eval_tile_into(
+        &self,
+        tile: usize,
+        x_final: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), String> {
         let v_start = tile * self.tile_size;
         let tile_rows = self.tile_size.min(self.vocab - v_start);
         let kernel = &self.kernels[tile];
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(x_final.as_ptr() as *const u8, x_final.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(x_final.as_ptr() as *const u8, x_final.len() * 4) };
         kernel.write_input(0, bytes);
 
-        kernel.eval().map_err(|e| format!("classifier tile {tile} eval: {e}"))?;
+        kernel
+            .eval()
+            .map_err(|e| format!("classifier tile {tile} eval: {e}"))?;
 
         // Read directly into output buffer (tile_size × seq, trim to tile_rows × seq)
         let full_bytes = self.tile_size * self.seq * 4;
@@ -1369,7 +1414,10 @@ impl GdnProjForwardKernels {
         let (qkv_raw, a_raw, b_raw, z) = self.eval_inputs(xnorm, gdn)?;
         let _proj_us = _t0.elapsed().as_micros();
         if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-            eprintln!("  GDN projections (4x ANE): {:.2}ms", _proj_us as f64 / 1000.0);
+            eprintln!(
+                "  GDN projections (4x ANE): {:.2}ms",
+                _proj_us as f64 / 1000.0
+            );
         }
         let mut o_err = None;
         let out = cpu_gdn_forward_post_proj(
@@ -1430,7 +1478,8 @@ impl CompiledKernels {
     /// Automatically selects between fused (fits in SRAM) and tiled (exceeds SRAM) FFN.
     /// SDPA compilation is best-effort (None if it exceeds SRAM — attention uses CPU anyway).
     pub fn compile_forward(cfg: &MilConfig) -> Result<Self, String> {
-        ane_bridge::ane_init()?;
+        ane_bridge::ane_init()
+            .map_err(|e| format!("ane_init failed for seq_len={}: {e}", cfg.seq_len))?;
 
         let mask_blob = ane_mil::build_causal_mask_blob(cfg.seq_len);
         let (rope_cos_blob, rope_sin_blob) =
@@ -1562,7 +1611,17 @@ impl CompiledKernels {
                 None,
                 &[oc_spec.input_bytes],
                 &[oc_spec.output_bytes],
-            )?;
+            )
+            .map_err(|e| {
+                format!(
+                    "FFN tiled oc compile failed (seq_len={}, dim={}, hidden={}, oc_tile={}, oc_tiles={}): {e}",
+                    cfg.seq_len,
+                    cfg.dim,
+                    cfg.hidden_dim,
+                    oc_plan.tile_size,
+                    oc_plan.n_tiles
+                )
+            })?;
             let ic_spec = KernelSpec::for_kernel(
                 cfg,
                 KernelType::DynMatmul {
@@ -1575,7 +1634,17 @@ impl CompiledKernels {
                 None,
                 &[ic_spec.input_bytes],
                 &[ic_spec.output_bytes],
-            )?;
+            )
+            .map_err(|e| {
+                format!(
+                    "FFN tiled ic compile failed (seq_len={}, dim={}, hidden={}, ic_tile={}, ic_tiles={}): {e}",
+                    cfg.seq_len,
+                    cfg.dim,
+                    cfg.hidden_dim,
+                    ic_plan.tile_size,
+                    ic_plan.n_tiles
+                )
+            })?;
             tracing::debug!(
                 "ANE FFN: tiled (oc_tile={}, {} tiles; ic_tile={}, {} tiles)",
                 oc_plan.tile_size,
@@ -2107,6 +2176,310 @@ pub(crate) fn cpu_quantized_matmul_into(
 ///
 /// The weight matrix is dequantized in row blocks so we avoid materializing the
 /// full dense matrix for each projection.
+/// Zero-copy quantized matmul from raw packed slices.
+///
+/// `data`, `scales`, `biases` are slices into a packed 3D tensor for ONE expert.
+/// This is the hot path for MoE: 960 calls per token. No allocation except output.
+pub fn cpu_quantized_matmul_raw(
+    data: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+    x: &[f32],
+    s: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), cols * s);
+    let mut out = vec![0.0f32; rows * s];
+
+    let n_groups = cols / group_size;
+    let mask = (1u32 << bits) - 1;
+    let packed_cols = (cols * bits + 31) / 32;
+    let row_bytes = packed_cols * 4;
+    let spans_words = (32 % bits) != 0;
+    let block_rows = QUANTIZED_MATMUL_ROW_BLOCK.min(rows.max(1));
+
+    let mut dense_block = vec![0.0f32; block_rows * cols];
+
+    for row_start in (0..rows).step_by(block_rows) {
+        let row_count = (rows - row_start).min(block_rows);
+
+        // Dequantize directly from raw slices
+        for local_row in 0..row_count {
+            let row = row_start + local_row;
+            let row_byte_offset = row * row_bytes;
+            let out_row = &mut dense_block[local_row * cols..(local_row + 1) * cols];
+
+            for col in 0..cols {
+                let qval = if spans_words {
+                    let bit_offset = col * bits;
+                    let word_idx = bit_offset / 32;
+                    let bit_within_word = bit_offset % 32;
+                    let byte_off = row_byte_offset + word_idx * 4;
+                    let lo_word = u32::from_le_bytes([
+                        data[byte_off], data[byte_off + 1],
+                        data[byte_off + 2], data[byte_off + 3],
+                    ]);
+                    if bit_within_word + bits <= 32 {
+                        ((lo_word >> bit_within_word) & mask) as f32
+                    } else {
+                        let lo_bits = 32 - bit_within_word;
+                        let hi_byte_off = byte_off + 4;
+                        let hi_word = u32::from_le_bytes([
+                            data[hi_byte_off], data[hi_byte_off + 1],
+                            data[hi_byte_off + 2], data[hi_byte_off + 3],
+                        ]);
+                        let lo = lo_word >> bit_within_word;
+                        let hi = hi_word & ((1u32 << (bits - lo_bits)) - 1);
+                        (lo | (hi << lo_bits)) as f32
+                    }
+                } else {
+                    let elems_per_u32 = 32 / bits;
+                    let word_idx = col / elems_per_u32;
+                    let elem_idx = col % elems_per_u32;
+                    let byte_off = row_byte_offset + word_idx * 4;
+                    let u32_val = u32::from_le_bytes([
+                        data[byte_off], data[byte_off + 1],
+                        data[byte_off + 2], data[byte_off + 3],
+                    ]);
+                    ((u32_val >> (elem_idx * bits)) & mask) as f32
+                };
+
+                let group = col / group_size;
+                let sb_idx = row * n_groups + group;
+                out_row[col] = qval * scales[sb_idx] + biases[sb_idx];
+            }
+        }
+
+        cpu_gemm(
+            &mut out[row_start * s..(row_start + row_count) * s],
+            &dense_block[..row_count * cols],
+            false,
+            x,
+            false,
+            row_count,
+            s,
+            cols,
+            1.0,
+            0.0,
+        );
+    }
+
+    out
+}
+
+/// Fused dequant-dot matvec for 4-bit quantized data.
+///
+/// Processes 4 rows at a time to amortize x[] reads. Each group of 8
+/// elements is extracted from one u32 word with bias pre-accumulated
+/// as a separate sum (bias * sum_x_in_group) to reduce FMAs.
+///
+/// ONLY for 4-bit quantization and s=1 (single-token decode).
+pub fn cpu_quantized_matvec_4bit(
+    data: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), cols);
+    let mut out = vec![0.0f32; rows];
+
+    let n_groups = cols / group_size;
+    let row_bytes = (cols / 8) * 4; // 4-bit: 8 elems per u32 word, 4 bytes per word
+
+    // Pre-compute per-group x sums for bias term: bias * sum(x[group])
+    let mut group_x_sums = vec![0.0f32; n_groups];
+    for g in 0..n_groups {
+        let base = g * group_size;
+        let mut s = 0.0f32;
+        for i in 0..group_size {
+            s += x[base + i];
+        }
+        group_x_sums[g] = s;
+    }
+
+    // Per-row fused dequant-dot with 8 independent accumulators to break
+    // the serial dependency chain. ARM FP has 4-cycle FMA latency, so 8
+    // accumulators keep the pipeline fully utilized.
+    for row in 0..rows {
+        let row_off = row * row_bytes;
+        let mut a = [0.0f32; 8]; // 8 independent accumulators
+
+        for g in 0..n_groups {
+            let scale = scales[row * n_groups + g];
+            let col_start = g * group_size;
+            let words_per_group = group_size / 8;
+
+            for w_idx in 0..words_per_group {
+                let byte_off = row_off + (col_start / 8 + w_idx) * 4;
+                let word = u32::from_le_bytes([
+                    data[byte_off], data[byte_off + 1],
+                    data[byte_off + 2], data[byte_off + 3],
+                ]);
+                let bc = col_start + w_idx * 8;
+
+                // 8 elements → 8 independent accumulators (no dependency chain)
+                a[0] += (word & 0xF) as f32 * x[bc];
+                a[1] += ((word >> 4) & 0xF) as f32 * x[bc + 1];
+                a[2] += ((word >> 8) & 0xF) as f32 * x[bc + 2];
+                a[3] += ((word >> 12) & 0xF) as f32 * x[bc + 3];
+                a[4] += ((word >> 16) & 0xF) as f32 * x[bc + 4];
+                a[5] += ((word >> 20) & 0xF) as f32 * x[bc + 5];
+                a[6] += ((word >> 24) & 0xF) as f32 * x[bc + 6];
+                a[7] += ((word >> 28) & 0xF) as f32 * x[bc + 7];
+            }
+
+            // Apply scale for this group + bias contribution
+            let raw_sum = a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7];
+            // Reset accumulators for next group, carry scaled result
+            let bias = biases[row * n_groups + g];
+            out[row] += scale * raw_sum + bias * group_x_sums[g];
+            a = [0.0f32; 8];
+        }
+    }
+
+    out
+}
+
+/// Fused dequant-dot matvec for 3-bit quantized data.
+///
+/// Two-phase approach:
+/// 1. Dequantize 3-bit → raw u8 values (0-7) for one row at a time
+/// 2. Accumulate: sum(raw[i] * x[i]) per group, apply scale+bias
+///
+/// The dequantization to u8 is fast (no float conversion), and the dot product
+/// uses integer multiply-accumulate which the CPU pipeline handles efficiently.
+/// On Apple Silicon M-series, the compiler can use sdot-style instructions for
+/// the inner loop.
+pub fn cpu_quantized_matvec_3bit(
+    data: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+) -> Vec<f32> {
+    debug_assert_eq!(x.len(), cols);
+    let mut out = vec![0.0f32; rows];
+
+    let n_groups = (cols + group_size - 1) / group_size;
+    let packed_cols_u32 = (cols * 3 + 31) / 32;
+    let row_bytes = packed_cols_u32 * 4;
+
+    // Pre-compute per-group x sums for bias term
+    let mut group_x_sums = vec![0.0f32; n_groups];
+    for g in 0..n_groups {
+        let base = g * group_size;
+        let end = (base + group_size).min(cols);
+        let mut s = 0.0f32;
+        for i in base..end {
+            s += x[i];
+        }
+        group_x_sums[g] = s;
+    }
+
+    // Fused dequant+dot: extract 3-bit values and accumulate against x in one pass.
+    // The key insight: dequantize a group_size chunk of 3-bit values into a small
+    // stack buffer, then NEON FMA the chunk against x. The buffer fits in L1.
+    //
+    // For group_size=64: 64 bytes for the u8 buffer (one cache line).
+    // Extract 64 3-bit values = 192 bits = 6 U32 words.
+    // Then 4 NEON iterations of 16-wide FMA = done.
+
+    let mut group_buf = [0u8; 256]; // max group_size
+
+    for row in 0..rows {
+        let row_off = row * row_bytes;
+        let mut acc = 0.0f32;
+
+        for g in 0..n_groups {
+            let col_start = g * group_size;
+            let col_end = (col_start + group_size).min(cols);
+            let gs = col_end - col_start;
+            let scale = scales[row * n_groups + g];
+            let bias = biases[row * n_groups + g];
+
+            // Extract 3-bit values for this group into stack buffer
+            for i in 0..gs {
+                let col = col_start + i;
+                let bit_off = col * 3;
+                let byte_off = row_off + (bit_off / 32) * 4;
+                let shift = bit_off & 31;
+                let lo = u32::from_le_bytes([
+                    data[byte_off], data[byte_off + 1], data[byte_off + 2], data[byte_off + 3],
+                ]);
+                group_buf[i] = if shift <= 29 {
+                    ((lo >> shift) & 7) as u8
+                } else {
+                    let hi = u32::from_le_bytes([
+                        data[byte_off+4], data[byte_off+5], data[byte_off+6], data[byte_off+7],
+                    ]);
+                    (((lo >> shift) | (hi << (32 - shift))) & 7) as u8
+                };
+            }
+
+            // Dot product: sum(group_buf[i] * x[col_start+i]) for i in 0..gs
+            #[cfg(target_arch = "aarch64")]
+            let raw_dot = unsafe {
+                use std::arch::aarch64::*;
+                let mut sum_vec = vdupq_n_f32(0.0);
+                let mut i = 0usize;
+                let xp = x.as_ptr().add(col_start);
+                let bp = group_buf.as_ptr();
+
+                while i + 16 <= gs {
+                    // Load 16 u8 → 4×4 f32 via zero-extend chain
+                    let q = vld1q_u8(bp.add(i));
+                    let lo = vmovl_u8(vget_low_u8(q));
+                    let hi = vmovl_u8(vget_high_u8(q));
+
+                    sum_vec = vfmaq_f32(sum_vec,
+                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))),
+                        vld1q_f32(xp.add(i)));
+                    sum_vec = vfmaq_f32(sum_vec,
+                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo))),
+                        vld1q_f32(xp.add(i + 4)));
+                    sum_vec = vfmaq_f32(sum_vec,
+                        vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))),
+                        vld1q_f32(xp.add(i + 8)));
+                    sum_vec = vfmaq_f32(sum_vec,
+                        vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi))),
+                        vld1q_f32(xp.add(i + 12)));
+                    i += 16;
+                }
+
+                let mut s = vaddvq_f32(sum_vec);
+                while i < gs {
+                    s += group_buf[i] as f32 * x[col_start + i];
+                    i += 1;
+                }
+                s
+            };
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let raw_dot = {
+                let mut s = 0.0f32;
+                for i in 0..gs {
+                    s += group_buf[i] as f32 * x[col_start + i];
+                }
+                s
+            };
+
+            acc += scale * raw_dot + bias * group_x_sums[g];
+        }
+
+        out[row] = acc;
+    }
+
+    out
+}
+
 pub fn cpu_quantized_matmul(w: &ane_weights::QuantizedTensor, x: &[f32], s: usize) -> Vec<f32> {
     assert_eq!(
         x.len(),
@@ -2294,7 +2667,14 @@ fn precompute_rope_table(seq: usize, head_dim: usize, theta: f64) -> (Vec<f32>, 
 ///
 /// q/k: `[dim, seq]` where `dim = n_heads * head_dim`.
 /// Modifies q and k in-place. Uses precomputed sin/cos tables shared across heads.
-pub(crate) fn cpu_rope(q: &mut [f32], k: &mut [f32], n_heads: usize, head_dim: usize, seq: usize, theta: f64) {
+pub(crate) fn cpu_rope(
+    q: &mut [f32],
+    k: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+    theta: f64,
+) {
     let half_hd = head_dim / 2;
     let (cos_tab, sin_tab) = precompute_rope_table(seq, head_dim, theta);
 
@@ -2650,11 +3030,11 @@ pub fn cpu_gdn_recurrence_bench(
 
 /// Intermediate state between GDN pre-recurrence and recurrence phases.
 pub struct GdnPreRecurrenceOutput {
-    pub(crate) q_exp: Vec<f32>,  // [h_v*d_k, seq]
-    pub(crate) k_exp: Vec<f32>,  // [h_v*d_k, seq]
-    pub(crate) v_raw: Vec<f32>,  // [value_dim, seq] (from conv output, owned)
-    pub(crate) g: Vec<f32>,      // [h_v, seq]
-    pub(crate) beta: Vec<f32>,   // [h_v, seq]
+    pub(crate) q_exp: Vec<f32>, // [h_v*d_k, seq]
+    pub(crate) k_exp: Vec<f32>, // [h_v*d_k, seq]
+    pub(crate) v_raw: Vec<f32>, // [value_dim, seq] (from conv output, owned)
+    pub(crate) g: Vec<f32>,     // [h_v, seq]
+    pub(crate) beta: Vec<f32>,  // [h_v, seq]
 }
 
 /// GDN pre-recurrence: conv1d+SiLU, Q/K RMSNorm, GQA expansion, decay+gate.
@@ -2662,13 +3042,13 @@ pub struct GdnPreRecurrenceOutput {
 /// Prepares all inputs needed by `gdn_recurrence`. The recurrence itself is
 /// separated so callers can control scheduling (e.g. overlap with ANE work).
 pub(crate) fn cpu_gdn_pre_recurrence(
-    qkv_raw: &[f32],    // [qkv_dim, seq]
-    a_raw: &[f32],      // [h_v, seq]
-    b_raw: &[f32],      // [h_v, seq]
-    a_log: &[f32],      // [h_v]
-    dt_bias: &[f32],    // [h_v]
+    qkv_raw: &[f32],     // [qkv_dim, seq]
+    a_raw: &[f32],       // [h_v, seq]
+    b_raw: &[f32],       // [h_v, seq]
+    a_log: &[f32],       // [h_v]
+    dt_bias: &[f32],     // [h_v]
     conv_weight: &[f32], // [qkv_dim, kernel_size]
-    conv_bias: &[f32],  // [qkv_dim]
+    conv_bias: &[f32],   // [qkv_dim]
     cfg: &MilConfig,
 ) -> GdnPreRecurrenceOutput {
     let h_k = cfg.linear_n_heads;
@@ -2784,11 +3164,11 @@ pub(crate) fn cpu_gdn_pre_recurrence(
 /// With h_v=32 heads on M4's 10+ cores, this gives ~3× speedup over the sequential
 /// version which processes heads one at a time within each timestep.
 fn gdn_recurrence_parallel(
-    q_exp: &[f32],  // [h_k * d_k, seq] (GQA expanded to h_v heads)
-    k_exp: &[f32],  // [h_k * d_k, seq]
-    v_raw: &[f32],  // [h_v * d_v, seq]
-    g: &[f32],      // [h_v, seq]
-    beta: &[f32],   // [h_v, seq]
+    q_exp: &[f32], // [h_k * d_k, seq] (GQA expanded to h_v heads)
+    k_exp: &[f32], // [h_k * d_k, seq]
+    v_raw: &[f32], // [h_v * d_v, seq]
+    g: &[f32],     // [h_v, seq]
+    beta: &[f32],  // [h_v, seq]
     h_v: usize,
     d_k: usize,
     d_v: usize,
@@ -2907,13 +3287,21 @@ fn gdn_recurrence_parallel(
                 {
                     for dv in 0..d_v {
                         let row = dv * d_k;
-                        for dk in 0..d_k { state[row + dk] *= g_t; }
+                        for dk in 0..d_k {
+                            state[row + dk] *= g_t;
+                        }
                         let mut kv_mem = 0.0f32;
-                        for dk in 0..d_k { kv_mem += state[row + dk] * k_buf[dk]; }
+                        for dk in 0..d_k {
+                            kv_mem += state[row + dk] * k_buf[dk];
+                        }
                         let delta = (v_raw[(h * d_v + dv) * seq + t] - kv_mem) * beta_t;
-                        for dk in 0..d_k { state[row + dk] += k_buf[dk] * delta; }
+                        for dk in 0..d_k {
+                            state[row + dk] += k_buf[dk] * delta;
+                        }
                         let mut y_val = 0.0f32;
-                        for dk in 0..d_k { y_val += state[row + dk] * q_buf[dk]; }
+                        for dk in 0..d_k {
+                            y_val += state[row + dk] * q_buf[dk];
+                        }
                         head_y[dv * seq + t] = y_val;
                     }
                 }
@@ -2950,22 +3338,24 @@ fn cpu_gdn_run_recurrence(pre: &GdnPreRecurrenceOutput, cfg: &MilConfig) -> Vec<
     // With h_v=32 heads on M4's 10+ cores, ~3× speedup from head-level parallelism.
     let y = if h_v >= 4 {
         gdn_recurrence_parallel(
-            &pre.q_exp, &pre.k_exp, &pre.v_raw,
-            &pre.g, &pre.beta, h_v, d_k, d_v, seq,
+            &pre.q_exp, &pre.k_exp, &pre.v_raw, &pre.g, &pre.beta, h_v, d_k, d_v, seq,
         )
     } else {
         let mut state = vec![0.0f32; h_v * d_v * d_k];
         let mut y = vec![0.0f32; value_dim * seq];
         gdn_recurrence(
-            &mut state, &mut y, &pre.q_exp, &pre.k_exp, &pre.v_raw,
-            &pre.g, &pre.beta, h_v, d_k, d_v, seq,
+            &mut state, &mut y, &pre.q_exp, &pre.k_exp, &pre.v_raw, &pre.g, &pre.beta, h_v, d_k,
+            d_v, seq,
         );
         y
     };
 
     let _rec_us = _t_rec.elapsed().as_micros();
     if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-        eprintln!("  GDN recurrence: {:.2}ms (h_v={h_v}, d_k={d_k}, d_v={d_v}, seq={seq})", _rec_us as f64 / 1000.0);
+        eprintln!(
+            "  GDN recurrence: {:.2}ms (h_v={h_v}, d_k={d_k}, d_v={d_v}, seq={seq})",
+            _rec_us as f64 / 1000.0
+        );
     }
     y
 }
@@ -2974,8 +3364,8 @@ fn cpu_gdn_run_recurrence(pre: &GdnPreRecurrenceOutput, cfg: &MilConfig) -> Vec<
 ///
 /// Applied after the recurrence to produce the input for the O projection.
 fn cpu_gdn_output_gate(
-    y: &[f32],          // [value_dim, seq]
-    z: &[f32],          // [value_dim, seq]
+    y: &[f32],           // [value_dim, seq]
+    z: &[f32],           // [value_dim, seq]
     norm_weight: &[f32], // [d_v] or [value_dim]
     cfg: &MilConfig,
 ) -> Vec<f32> {
@@ -3034,7 +3424,10 @@ fn cpu_gdn_forward_post_proj(
 ) -> Vec<f32> {
     let h_v = cfg.linear_n_value_heads;
     let d_v = cfg.linear_value_head_dim;
-    debug_assert_eq!(qkv_raw.len(), (2 * cfg.linear_n_heads * cfg.linear_head_dim + h_v * d_v) * cfg.seq_len);
+    debug_assert_eq!(
+        qkv_raw.len(),
+        (2 * cfg.linear_n_heads * cfg.linear_head_dim + h_v * d_v) * cfg.seq_len
+    );
     debug_assert_eq!(a_raw.len(), h_v * cfg.seq_len);
     debug_assert_eq!(b_raw.len(), h_v * cfg.seq_len);
     debug_assert_eq!(z.len(), h_v * d_v * cfg.seq_len);
@@ -3043,10 +3436,20 @@ fn cpu_gdn_forward_post_proj(
     assert!(
         norm_weight.len() == d_v || norm_weight.len() == h_v * d_v,
         "GDN norm weight must have length d_v ({d_v}) or value_dim ({}), got {}",
-        h_v * d_v, norm_weight.len()
+        h_v * d_v,
+        norm_weight.len()
     );
 
-    let pre = cpu_gdn_pre_recurrence(qkv_raw, a_raw, b_raw, a_log, dt_bias, conv_weight, conv_bias, cfg);
+    let pre = cpu_gdn_pre_recurrence(
+        qkv_raw,
+        a_raw,
+        b_raw,
+        a_log,
+        dt_bias,
+        conv_weight,
+        conv_bias,
+        cfg,
+    );
     let y = cpu_gdn_run_recurrence(&pre, cfg);
     let gated = cpu_gdn_output_gate(&y, z, norm_weight, cfg);
     apply_o_proj(&gated)
@@ -3715,13 +4118,21 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
             layer_acts.push(LayerActivations {
                 layer_in: x_cur.clone(),
                 xnorm: empty.clone(),
-                q: empty.clone(), k: empty.clone(), v: empty.clone(),
-                attn_out: empty.clone(), o_out: empty.clone(),
-                x2: empty.clone(), x2norm: empty.clone(),
-                h1: empty.clone(), h3: empty.clone(),
-                gate: empty.clone(), ffn_out: empty.clone(),
-                q_pre_norm: None, k_pre_norm: None,
-                attn_gate: None, attn_pre_gate: None,
+                q: empty.clone(),
+                k: empty.clone(),
+                v: empty.clone(),
+                attn_out: empty.clone(),
+                o_out: empty.clone(),
+                x2: empty.clone(),
+                x2norm: empty.clone(),
+                h1: empty.clone(),
+                h3: empty.clone(),
+                gate: empty.clone(),
+                ffn_out: empty.clone(),
+                q_pre_norm: None,
+                k_pre_norm: None,
+                attn_gate: None,
+                attn_pre_gate: None,
             });
             lora_acts_vec.push(super::ane_lora::LoraLayerActivations::empty());
             continue;
@@ -3747,20 +4158,28 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     let mut off = 0;
                     // xout is the first dim*seq — that's next_x (already extracted)
                     off += dim * s;
-                    let xnorm = acts[off..off + dim * s].to_vec(); off += dim * s;
-                    let q = acts[off..off + dim * s].to_vec(); off += dim * s;
-                    let k = acts[off..off + dim * s].to_vec(); off += dim * s;
-                    let v = acts[off..off + dim * s].to_vec(); off += dim * s;
-                    let x2 = acts[off..off + dim * s].to_vec(); off += dim * s;
-                    let h1 = acts[off..off + hidden * s].to_vec(); off += hidden * s;
+                    let xnorm = acts[off..off + dim * s].to_vec();
+                    off += dim * s;
+                    let q = acts[off..off + dim * s].to_vec();
+                    off += dim * s;
+                    let k = acts[off..off + dim * s].to_vec();
+                    off += dim * s;
+                    let v = acts[off..off + dim * s].to_vec();
+                    off += dim * s;
+                    let x2 = acts[off..off + dim * s].to_vec();
+                    off += dim * s;
+                    let h1 = acts[off..off + hidden * s].to_vec();
+                    off += hidden * s;
                     let h3 = acts[off..off + hidden * s].to_vec();
 
                     // Extract base activations from kernel outputs
                     // x2_kernel = layer_in + o_out_base (kernel's Wo, no LoRA)
-                    let mut o_out: Vec<f32> = x2.iter().zip(layer_in.iter()).map(|(a, b)| a - b).collect();
+                    let mut o_out: Vec<f32> =
+                        x2.iter().zip(layer_in.iter()).map(|(a, b)| a - b).collect();
                     let attn_out = o_out.clone();
                     // ffn_out_base = next_x_kernel - x2_kernel (kernel's W2, no LoRA)
-                    let mut ffn_out: Vec<f32> = next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
+                    let mut ffn_out: Vec<f32> =
+                        next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
 
                     // LoRA on Wo (applied AFTER kernel extraction, on CPU)
                     if let Some(ll) = lora_layer {
@@ -3773,17 +4192,25 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     }
 
                     // Recompute x2 with LoRA-adjusted o_out
-                    let x2: Vec<f32> = layer_in.iter().zip(o_out.iter()).map(|(a, b)| a + b).collect();
+                    let x2: Vec<f32> = layer_in
+                        .iter()
+                        .zip(o_out.iter())
+                        .map(|(a, b)| a + b)
+                        .collect();
 
                     // Compute derived activations needed by backward
                     let hidden = cfg.hidden_dim;
                     let mut x2norm = vec![0.0f32; dim * seq];
                     rmsnorm(&mut x2norm, &x2, &lw.rms_ffn, dim, seq, cfg.rms_eps);
                     // gate = silu(h1) * h3
-                    let gate: Vec<f32> = h1.iter().zip(h3.iter()).map(|(&a, &b)| {
-                        let sig = 1.0 / (1.0 + (-a).exp());
-                        a * sig * b
-                    }).collect();
+                    let gate: Vec<f32> = h1
+                        .iter()
+                        .zip(h3.iter())
+                        .map(|(&a, &b)| {
+                            let sig = 1.0 / (1.0 + (-a).exp());
+                            a * sig * b
+                        })
+                        .collect();
 
                     // LoRA on W2 (applied AFTER kernel extraction, on CPU)
                     if let Some(ll) = lora_layer {
@@ -3796,7 +4223,8 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     }
 
                     // Recompute next_x with LoRA-adjusted ffn_out
-                    let next_x: Vec<f32> = x2.iter().zip(ffn_out.iter()).map(|(a, b)| a + b).collect();
+                    let next_x: Vec<f32> =
+                        x2.iter().zip(ffn_out.iter()).map(|(a, b)| a + b).collect();
 
                     layer_acts.push(LayerActivations {
                         layer_in: layer_in.clone(),
@@ -3836,8 +4264,9 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                         // or CPU BLAS — avoids 22x error amplification from fused fp16 Wo.
                         let ad = cfg.attn_dim();
                         let mut o_out = if let Some(mha) = kernels.mha_proj_fwd.as_ref() {
-                            mha.eval_o(&attn.attn_out, lw)
-                                .unwrap_or_else(|_| cpu_matmul(&lw.wo, &attn.attn_out, dim, ad, seq))
+                            mha.eval_o(&attn.attn_out, lw).unwrap_or_else(|_| {
+                                cpu_matmul(&lw.wo, &attn.attn_out, dim, ad, seq)
+                            })
                         } else {
                             cpu_matmul(&lw.wo, &attn.attn_out, dim, ad, seq)
                         };
@@ -3854,7 +4283,8 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                         }
 
                         // CPU: residual add
-                        let x2: Vec<f32> = x_cur.iter().zip(o_out.iter()).map(|(a, b)| a + b).collect();
+                        let x2: Vec<f32> =
+                            x_cur.iter().zip(o_out.iter()).map(|(a, b)| a + b).collect();
 
                         // ANE dispatch 2: fused FFN (RMSNorm + W1×SiLU×W3 + W2 + residual)
                         if let Some(Ok((next_x, ffn_acts))) = pp.eval_fused_ffn_fwd(l, &x2, cfg) {
@@ -3864,24 +4294,34 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                             let x2norm = ffn_acts[..dim * s].to_vec();
                             let h1 = ffn_acts[dim * s..dim * s + hidden * s].to_vec();
                             let h3 = ffn_acts[dim * s + hidden * s..].to_vec();
-                            let gate: Vec<f32> = h1.iter().zip(h3.iter()).map(|(&a, &b)| {
-                                let sig = 1.0 / (1.0 + (-a).exp());
-                                a * sig * b
-                            }).collect();
-                            let mut ffn_out: Vec<f32> = next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
+                            let gate: Vec<f32> = h1
+                                .iter()
+                                .zip(h3.iter())
+                                .map(|(&a, &b)| {
+                                    let sig = 1.0 / (1.0 + (-a).exp());
+                                    a * sig * b
+                                })
+                                .collect();
+                            let mut ffn_out: Vec<f32> =
+                                next_x.iter().zip(x2.iter()).map(|(a, b)| a - b).collect();
 
                             // LoRA on W2 (applied AFTER fused FFN, on CPU)
                             if let Some(ll) = lora_layer {
                                 if let Some(w2_adapter) = ll.w2.as_ref() {
                                     let (w2_delta, w2_h) = w2_adapter.forward_cpu(&gate, seq);
-                                    super::ane_lora::vec_add_scaled(&mut ffn_out, &w2_delta, lora_scale);
+                                    super::ane_lora::vec_add_scaled(
+                                        &mut ffn_out,
+                                        &w2_delta,
+                                        lora_scale,
+                                    );
                                     lora_layer_acts.w2_x = Some(gate.clone());
                                     lora_layer_acts.w2_h = Some(w2_h);
                                 }
                             }
 
                             // Recompute next_x with LoRA-adjusted ffn_out
-                            let next_x: Vec<f32> = x2.iter().zip(ffn_out.iter()).map(|(a, b)| a + b).collect();
+                            let next_x: Vec<f32> =
+                                x2.iter().zip(ffn_out.iter()).map(|(a, b)| a + b).collect();
 
                             layer_acts.push(LayerActivations {
                                 layer_in: layer_in.clone(),
@@ -3970,16 +4410,28 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     .and_then(|pp| pp.eval_gdn_pre_recurrence(l, &qkv, &a, &b, cfg))
                 {
                     if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-                        eprintln!("  GDN pre_recur: {:.2}ms (ANE)", _t_pre.elapsed().as_micros() as f64 / 1000.0);
+                        eprintln!(
+                            "  GDN pre_recur: {:.2}ms (ANE)",
+                            _t_pre.elapsed().as_micros() as f64 / 1000.0
+                        );
                     }
                     ane_pre
                 } else {
                     let cpu_pre = cpu_gdn_pre_recurrence(
-                        &qkv, &a, &b, &gdn_w.a_log, &gdn_w.dt_bias,
-                        &gdn_w.conv_weight, &gdn_w.conv_bias, cfg,
+                        &qkv,
+                        &a,
+                        &b,
+                        &gdn_w.a_log,
+                        &gdn_w.dt_bias,
+                        &gdn_w.conv_weight,
+                        &gdn_w.conv_bias,
+                        cfg,
                     );
                     if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-                        eprintln!("  GDN pre_recur: {:.2}ms (CPU)", _t_pre.elapsed().as_micros() as f64 / 1000.0);
+                        eprintln!(
+                            "  GDN pre_recur: {:.2}ms (CPU)",
+                            _t_pre.elapsed().as_micros() as f64 / 1000.0
+                        );
                     }
                     cpu_pre
                 };
@@ -3992,13 +4444,19 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     .and_then(|pp| pp.eval_gdn_o_proj(l, &gated, dim, seq))
                 {
                     if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-                        eprintln!("  GDN o_proj: {:.2}ms (ANE)", _t_oproj.elapsed().as_micros() as f64 / 1000.0);
+                        eprintln!(
+                            "  GDN o_proj: {:.2}ms (ANE)",
+                            _t_oproj.elapsed().as_micros() as f64 / 1000.0
+                        );
                     }
                     out
                 } else {
                     let out = cpu_matmul(&gdn_w.o_proj, &gated, dim, value_dim, seq);
                     if std::env::var("NANOBOT_PROFILE_GDN").is_ok() {
-                        eprintln!("  GDN o_proj: {:.2}ms (CPU)", _t_oproj.elapsed().as_micros() as f64 / 1000.0);
+                        eprintln!(
+                            "  GDN o_proj: {:.2}ms (CPU)",
+                            _t_oproj.elapsed().as_micros() as f64 / 1000.0
+                        );
                     }
                     out
                 };
@@ -4038,15 +4496,19 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                     std::slice::from_raw_parts(xnorm.as_ptr() as *const u8, xnorm.len() * 4)
                 };
                 fused_k.write_input(0, xnorm_bytes);
-                fused_k.eval().map_err(|e| format!("layer {l} fused_attn_gqa eval failed: {e}"))?;
+                fused_k
+                    .eval()
+                    .map_err(|e| format!("layer {l} fused_attn_gqa eval failed: {e}"))?;
                 let ad = cfg.attn_dim();
                 let kvd = cfg.kv_dim();
-                let out_ch = if cfg.attn_output_gate { dim + 4 * ad + 2 * kvd } else { dim + 2 * ad + 2 * kvd };
+                let out_ch = if cfg.attn_output_gate {
+                    dim + 4 * ad + 2 * kvd
+                } else {
+                    dim + 2 * ad + 2 * kvd
+                };
                 let mut buf = vec![0u8; out_ch * seq * 4];
                 fused_k.read_output(0, &mut buf);
-                ane_weights::unpack_fused_attn_gqa(
-                    &buf, cfg, cfg.attn_output_gate, false,
-                )
+                ane_weights::unpack_fused_attn_gqa(&buf, cfg, cfg.attn_output_gate, false)
             };
 
             let mut o_out = u.o_out;
@@ -4062,7 +4524,17 @@ pub fn forward_ane_generic_prepacked<T: TokenId, W: ane_weights::WeightSource>(
                 }
             }
 
-            (u.q, u.k, u.v, attn_out, o_out, u.q_pre_norm, u.k_pre_norm, u.attn_gate, u.attn_pre_gate)
+            (
+                u.q,
+                u.k,
+                u.v,
+                attn_out,
+                o_out,
+                u.q_pre_norm,
+                u.k_pre_norm,
+                u.attn_gate,
+                u.attn_pre_gate,
+            )
         } else {
             let ad = cfg.attn_dim();
             let qpd = cfg.q_proj_dim();
@@ -4792,10 +5264,23 @@ mod tests {
         let mut cpu_dy = vec![0.0f32; dim * seq];
         let t_cpu = std::time::Instant::now();
         let cpu_loss = fused_classifier_ce(
-            &mut cpu_dy, &embed, &x_final, &targets, vocab, dim, seq, 0.0, 1.0, None, None,
+            &mut cpu_dy,
+            &embed,
+            &x_final,
+            &targets,
+            vocab,
+            dim,
+            seq,
+            0.0,
+            1.0,
+            None,
+            None,
         );
         let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("classifier CPU: {:.2}ms (vocab={}, dim={}, seq={})", cpu_ms, vocab, dim, seq);
+        eprintln!(
+            "classifier CPU: {:.2}ms (vocab={}, dim={}, seq={})",
+            cpu_ms, vocab, dim, seq
+        );
 
         // BLOBFILE path (only on ANE hardware)
         #[cfg(feature = "ane")]
@@ -4811,8 +5296,17 @@ mod tests {
                     // Warmup (first-time compiles)
                     let mut warmup_dy = vec![0.0f32; dim * seq];
                     let _ = fused_classifier_ce(
-                        &mut warmup_dy, &embed, &x_final, &targets,
-                        vocab, dim, seq, 0.0, 1.0, None, Some(&blob),
+                        &mut warmup_dy,
+                        &embed,
+                        &x_final,
+                        &targets,
+                        vocab,
+                        dim,
+                        seq,
+                        0.0,
+                        1.0,
+                        None,
+                        Some(&blob),
                     );
 
                     // Timed run (delta cache hits)
@@ -4836,7 +5330,10 @@ mod tests {
                     let loss_err = (cpu_loss - blob_loss).abs();
                     eprintln!(
                         "classifier BLOBFILE: {:.2}ms (vs CPU {:.2}ms, {:.1}x), err={:.6}",
-                        blob_ms, cpu_ms, cpu_ms / blob_ms, loss_err
+                        blob_ms,
+                        cpu_ms,
+                        cpu_ms / blob_ms,
+                        loss_err
                     );
                     assert!(
                         loss_err < 0.01,
@@ -4973,6 +5470,7 @@ mod tests {
             embed: quantized.embed.clone(),
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
+            vocab_clusters: None,
         };
 
         let tokens = vec![1u16, 2, 3];
@@ -5117,6 +5615,7 @@ mod tests {
             embed: quantized.embed.clone(),
             vocab_size: quantized.vocab_size,
             lm_head: quantized.lm_head.clone(),
+            vocab_clusters: None,
         };
 
         let tokens = vec![1u16, 2, 3];
@@ -5334,9 +5833,8 @@ mod tests {
         let input: Vec<f32> = (0..dim * seq)
             .map(|i| ((i + 42) as f32 * 0.0037).sin() * 0.1)
             .collect();
-        let input_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
-        };
+        let input_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
         kernel.write_input(0, input_bytes);
         kernel.eval().expect("fused_attn_gqa eval failed");
 
@@ -5373,9 +5871,7 @@ mod tests {
         assert_eq!(unpacked.attn_gate.unwrap().len(), ad * seq);
         assert!(unpacked.q_pre_norm.is_none(), "no qk_norm → None");
         assert!(unpacked.k_pre_norm.is_none(), "no qk_norm → None");
-        eprintln!(
-            "fused_attn_gqa via CompiledKernels OK: out_ch={out_ch}, unpack verified"
-        );
+        eprintln!("fused_attn_gqa via CompiledKernels OK: out_ch={out_ch}, unpack verified");
     }
 
     // Round 3c: PrePackedWeights for fused_attn_gqa — per-layer kernels with real weights
@@ -5445,6 +5941,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             });
         }
 
@@ -5455,11 +5952,15 @@ mod tests {
             embed: vec![0.0; 256 * dim],
             vocab_size: 256,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         // Compile forward kernels (template with zero weights)
         let kernels = CompiledKernels::compile_forward(&cfg).expect("compile_forward failed");
-        assert!(kernels.fused_attn_gqa.is_some(), "need fused_attn_gqa template");
+        assert!(
+            kernels.fused_attn_gqa.is_some(),
+            "need fused_attn_gqa template"
+        );
 
         // Build PrePackedWeights and prime attention kernels
         let mut pp = PrePackedWeights::build_empty(seq, model.n_layers());
@@ -5490,9 +5991,8 @@ mod tests {
 
         // Eval layer 0 via template (zero weights) for comparison
         let template = kernels.fused_attn_gqa.as_ref().unwrap();
-        let input_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4)
-        };
+        let input_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
         template.write_input(0, input_bytes);
         template.eval().expect("template eval failed");
         let out_ch = dim + 4 * ad + 2 * kvd;
@@ -5502,7 +6002,10 @@ mod tests {
 
         // Prepacked output should be non-zero
         let pp_energy: f32 = result.o_out.iter().map(|x| x * x).sum();
-        assert!(pp_energy > 1e-10, "prepacked o_out should be non-zero, got energy={pp_energy}");
+        assert!(
+            pp_energy > 1e-10,
+            "prepacked o_out should be non-zero, got energy={pp_energy}"
+        );
 
         // Prepacked output should differ from template (which has zero weights)
         let diff: f32 = result
@@ -5590,6 +6093,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
 
         let model = ModelWeights {
@@ -5599,6 +6103,7 @@ mod tests {
             embed: make_small(vocab * dim),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -5660,6 +6165,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
 
         let model = ModelWeights {
@@ -5669,6 +6175,7 @@ mod tests {
             embed: make_small(vocab * dim, 14000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -6580,6 +7087,7 @@ mod tests {
             q_norm: None,
             k_norm: None,
             gdn: None,
+            moe: None,
         };
         let xnorm = make_small(dim * seq, 7000);
         let attn_out = make_small(ad * seq, 8000);
@@ -6674,11 +7182,13 @@ mod tests {
                     conv_weight: make_small(qkv_dim * kernel, 11000),
                     conv_bias: make_small(qkv_dim, 12000),
                 }),
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 13000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -6751,11 +7261,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -6909,11 +7421,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7005,11 +7519,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         // LoRA with rank=16 (ANE requires multiple of 16)
@@ -7103,11 +7619,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             }],
             rms_final: vec![1.0; dim],
             embed: make_small(vocab * dim, 7000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         // LoRA rank=16 (ANE alignment), targets: wo + w2
@@ -7261,7 +7779,9 @@ mod tests {
         }
 
         let make_weight = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.0031).sin() * 0.05).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.0031).sin() * 0.05)
+                .collect()
         };
 
         // Build model — wk/wv EXPANDED to [attn_dim, dim] (matching real model
@@ -7282,6 +7802,7 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 gdn: None,
+                moe: None,
             });
         }
         let model = ModelWeights {
@@ -7291,6 +7812,7 @@ mod tests {
             embed: make_weight(vocab * dim, 9000),
             vocab_size: vocab,
             lm_head: None,
+            vocab_clusters: None,
         };
 
         let tokens: Vec<u16> = (0..seq).map(|i| (i % vocab) as u16).collect();
@@ -7302,25 +7824,34 @@ mod tests {
         eprintln!("\n=== PART 1: Forward-only loss comparison (no LoRA) ===");
 
         // Baseline: multi-dispatch (no prepacked)
-        let fwd_base = forward_ane_generic(
-            &fwd_kernels, &model, None,
-            &tokens, &targets, 0.0, 1.0,
-        ).expect("baseline forward failed");
+        let fwd_base = forward_ane_generic(&fwd_kernels, &model, None, &tokens, &targets, 0.0, 1.0)
+            .expect("baseline forward failed");
 
         // 3-dispatch: prepacked
         let mut pp = PrePackedWeights::build_empty(seq, n_layers);
         pp.prime_attn_kernels(
-            &cfg, &model,
-            &fwd_kernels.rope_cos_blob, &fwd_kernels.rope_sin_blob, &fwd_kernels.mask_blob,
-        ).expect("prime_attn_kernels failed");
+            &cfg,
+            &model,
+            &fwd_kernels.rope_cos_blob,
+            &fwd_kernels.rope_sin_blob,
+            &fwd_kernels.mask_blob,
+        )
+        .expect("prime_attn_kernels failed");
         pp.prime_fused_ffn_fwd(&cfg, &model, true)
             .expect("prime_fused_ffn_fwd failed");
 
         let fwd_3d = forward_ane_generic_prepacked(
-            &fwd_kernels, &model, None,
-            &tokens, &targets, 0.0, 1.0,
-            Some(&mut pp), None,
-        ).expect("3-dispatch forward failed");
+            &fwd_kernels,
+            &model,
+            None,
+            &tokens,
+            &targets,
+            0.0,
+            1.0,
+            Some(&mut pp),
+            None,
+        )
+        .expect("3-dispatch forward failed");
 
         let loss_base = fwd_base.base.loss;
         let loss_3d = fwd_3d.base.loss;
@@ -7337,9 +7868,16 @@ mod tests {
         // PART 2: Per-layer hidden state comparison
         // ====================================================================
         eprintln!("\n=== PART 2: Per-layer hidden state L∞ ===");
-        let n_act_layers = fwd_base.base.layer_acts.len().min(fwd_3d.base.layer_acts.len());
+        let n_act_layers = fwd_base
+            .base
+            .layer_acts
+            .len()
+            .min(fwd_3d.base.layer_acts.len());
         let linf = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
         };
         let mut max_hidden_err: f32 = 0.0;
         for l in 0..n_act_layers {
