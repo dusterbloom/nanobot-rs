@@ -5076,10 +5076,13 @@ impl SpeculativeDecoder {
         let n_layers = draft_model.layers.len();
         let mut kv_cache = KvCache::new(&draft_model.cfg, n_layers, max_seq);
         kv_cache.init_gdn(&draft_model);
+        // Suppress ANE error logs during probe — Bug 14 (seq=1 fails, seq=16 fallback)
+        super::ane_bridge::set_quiet(true);
         let decode_kernels = BlobDecodeKernels::compile(&draft_model, 1).or_else(|| {
             tracing::info!("SpeculativeDecoder: seq=1 failed, trying seq=16");
             BlobDecodeKernels::compile(&draft_model, 16)
         });
+        super::ane_bridge::set_quiet(false);
         if decode_kernels.is_some() {
             tracing::info!("SpeculativeDecoder: ANE decode kernels compiled");
         } else {
