@@ -578,17 +578,38 @@ def main():
             print(f"\n  Saved {len(delta_arrays)} layer deltas to {deltas_path}")
             print(f"  To merge: cargo test --features ane,mlx --release --lib -- 'merge_router_deltas_from_npz' --nocapture --ignored")
 
-            # For now, apply trained weights directly (lossy but instant feedback)
-            # The merge-on-disk path through Rust is the production path.
-            print(f"\n  Applying trained router weights (in-memory, lossy)...")
-            import mlx.nn as nn_mod
+            # Apply via MLX requantize: dequant → add delta → mx.quantize
+            # Uses MLX's own quantization scheme for faithful roundtrip.
+            print(f"\n  Applying trained router weights (requantized)...")
+            applied = 0
             for layer_idx, trained_w in trained_gates.items():
-                layer = layers[layer_idx]
-                dense_gate = nn_mod.Linear(dim, ne, bias=False)
-                dense_gate.weight = mx.array(trained_w.astype(np.float32))
-                layer.mlp.gate._original = dense_gate
-            mx.eval(*[layers[l].mlp.gate._original.weight for l in trained_gates])
-            print(f"  {len(trained_gates)} layers updated")
+                gate = layers[layer_idx].mlp.gate._original
+                if not hasattr(gate, 'scales'):
+                    continue  # not quantized, skip
+
+                delta = trained_w - original_gates[layer_idx]
+                delta_mx = mx.array(delta.astype(np.float32))
+
+                # Dequant original via gate(eye)
+                eye = mx.eye(dim)
+                w_orig = gate(eye).T  # [ne, dim]
+
+                # Add delta
+                w_new = w_orig + delta_mx
+
+                # Requantize with same params
+                g_size = gate.group_size
+                g_bits = gate.bits
+                q_new, s_new, b_new = mx.quantize(w_new, group_size=g_size, bits=g_bits)
+
+                # Replace quantized weights in-place
+                gate.weight = q_new
+                gate.scales = s_new
+                gate.biases = b_new
+                applied += 1
+
+            mx.eval(*[layers[l].mlp.gate._original.weight for l in trained_gates if hasattr(layers[l].mlp.gate._original, 'scales')])
+            print(f"  {applied} layers requantized")
 
             # Re-eval with trained router
             print(f"\n{'='*60}")
