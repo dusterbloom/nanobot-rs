@@ -2932,8 +2932,16 @@ impl RouterTrainer {
             d_logits[i] = (student_probs[i] - teacher_probs[i]) / seq as f32;
         }
 
-        // Backward: get dW
+        // Backward: get dW (ANE if batch matches compiled seq, else CPU fallback)
         let dw = if let Some(ref chain) = self.chains[layer] {
+            if seq != chain.seq {
+                // Batch size doesn't match compiled chain — CPU fallback
+                let (_, dw) = router_backward_cpu(
+                    &self.weights[layer], &d_logits, &x_packed,
+                    ne, dim, seq,
+                );
+                dw
+            } else {
             // Reload weights (in case they changed since last step)
             chain.load_weights(&self.weights[layer]);
             match chain.backward(&self.weights[layer], &d_logits, &x_packed) {
@@ -2946,6 +2954,7 @@ impl RouterTrainer {
                     );
                     dw
                 }
+            }
             }
         } else {
             let (_, dw) = router_backward_cpu(
