@@ -51,6 +51,10 @@ pub struct MlxLmServerOptions {
     pub decode_concurrency: Option<usize>,
     pub prompt_concurrency: Option<usize>,
     pub chat_template_args: Option<String>,
+    /// Path to a smaller draft model for speculative decoding.
+    pub draft_model: Option<PathBuf>,
+    /// Number of draft tokens per speculative decoding step.
+    pub num_draft_tokens: Option<u32>,
 }
 
 /// Options specific to vllm-mlx backend.
@@ -209,7 +213,9 @@ impl MlxLmServer {
             .arg("127.0.0.1");
 
         if let Some(ref adapter) = self.adapter_path {
-            if adapter.join("adapters.safetensors").exists() {
+            if adapter.join("adapters.safetensors").exists()
+                && adapter.join("adapter_config.json").exists()
+            {
                 cmd.arg("--adapter-path").arg(adapter);
             }
         }
@@ -221,6 +227,12 @@ impl MlxLmServer {
         }
         if let Some(ref value) = self.options.chat_template_args {
             cmd.arg("--chat-template-args").arg(value);
+        }
+        if let Some(ref draft) = self.options.draft_model {
+            cmd.arg("--draft-model").arg(draft);
+        }
+        if let Some(n) = self.options.num_draft_tokens {
+            cmd.arg("--num-draft-tokens").arg(n.to_string());
         }
         cmd
     }

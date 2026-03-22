@@ -5227,7 +5227,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config_json["num_layers"], 24);
-        assert!(config_json["lora_parameters"].is_object(), "lora_parameters dict required");
+        assert!(
+            config_json["lora_parameters"].is_object(),
+            "lora_parameters dict required"
+        );
 
         eprintln!("exported {} adapter tensors (Qwen3.5-2B)", n);
     }

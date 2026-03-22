@@ -1010,16 +1010,17 @@ impl ReplContext {
         }
 
         // 3. Build ANE training config.
-        let ane_cfg = match crate::agent::learn_loop::build_ane_training_config(Some(&model_dir)) {
-            Some(cfg) => cfg,
-            None => {
-                println!(
-                    "\n  Failed to build ANE training config for {}\n",
-                    model_dir.display()
-                );
-                return;
-            }
-        };
+        let ane_cfg =
+            match crate::agent::learn_loop::build_ane_training_config(Some(&model_dir), None) {
+                Some(cfg) => cfg,
+                None => {
+                    println!(
+                        "\n  Failed to build ANE training config for {}\n",
+                        model_dir.display()
+                    );
+                    return;
+                }
+            };
 
         // 4. Load tokenizer and tokenize pending experiences.
         let tokenizer = match crate::agent::mlx_lora::MlxTokenizer::load(&model_dir) {
@@ -1114,12 +1115,19 @@ impl ReplContext {
         if n_samples > 0 && n_samples * ane_cfg.epochs > max_steps_target {
             ane_cfg.epochs = (max_steps_target / n_samples).max(1);
         }
+        crate::agent::learn_loop::apply_ane_runtime_policy(&mut ane_cfg, self.mlx_handle.is_none());
         let epochs_used = ane_cfg.epochs;
         let total_steps = n_samples * epochs_used;
 
         let tc = counters.clone();
         let handle = if let Some(trainer) = self.agent_loop.ane_trainer() {
-            trainer.spawn_training_with_progress(ane_cfg, samples, mlx_tx, Some(counters.clone()))
+            trainer.spawn_training_with_progress(
+                ane_cfg,
+                samples,
+                mlx_tx,
+                Some(counters.clone()),
+                None,
+            )
         } else {
             crate::agent::ane_mlx_bridge::spawn_ane_training(ane_cfg, samples, mlx_tx)
         };

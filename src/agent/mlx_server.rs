@@ -216,6 +216,26 @@ pub enum ModelRequest {
         deltas: super::ane_mlx_bridge::LoraDeltas,
         reply: Option<oneshot::Sender<Result<usize, String>>>,
     },
+    /// Verify draft tokens against the target model in a single forward pass.
+    /// Returns per-position logits so the speculative decoder can accept/reject.
+    #[cfg(feature = "ane")]
+    VerifyDraft {
+        /// Token IDs: [context_token, draft_0, ..., draft_N]
+        tokens: Vec<i32>,
+        /// Per-position logits: Vec<Vec<f32>> with len = tokens.len(), each inner vec = vocab_size
+        reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+    },
+    /// Speculative decoding chat: prefill target model, then loop
+    /// draft (ANE) → verify (GPU) → accept/reject until done.
+    #[cfg(feature = "ane")]
+    ChatSpeculative {
+        prompt: String,
+        max_tokens: usize,
+        temperature: f32,
+        draft_length: usize,
+        spec_tx: std::sync::mpsc::SyncSender<super::ane_decode::SpecDecodeRequest>,
+        reply: oneshot::Sender<Result<(String, usize, usize), String>>,
+    },
 }
 
 fn get_prefill_state(
@@ -584,6 +604,205 @@ pub fn run_model_worker(
                 if let Some(tx) = reply {
                     let _ = tx.send(result);
                 }
+            }
+            #[cfg(feature = "ane")]
+            ModelRequest::VerifyDraft { tokens, reply } => {
+                // Invalidate prompt cache — draft tokens are speculative, not real context.
+                prompt_cache = None;
+                let result = (|| {
+                    let m = model.as_mut().ok_or("in-process model not loaded")?;
+                    use mlx_rs::Array;
+                    let seq_len = tokens.len();
+                    let tok_arr = Array::from_slice(&tokens, &[1, seq_len as i32]);
+                    let logits = m
+                        .forward_logits(&tok_arr)
+                        .map_err(|e| format!("verify forward: {e}"))?;
+                    // logits shape: [1, seq_len, vocab_size] — extract per-position
+                    let logits_data: Vec<f32> = logits.as_slice().to_vec();
+                    let shape = logits.shape();
+                    let vocab = *shape.last().unwrap_or(&0) as usize;
+                    let mut per_pos = Vec::with_capacity(seq_len);
+                    for p in 0..seq_len {
+                        let start = p * vocab;
+                        per_pos.push(logits_data[start..start + vocab].to_vec());
+                    }
+                    Ok(per_pos)
+                })();
+                let _ = reply.send(result);
+            }
+            #[cfg(feature = "ane")]
+            ModelRequest::ChatSpeculative {
+                prompt,
+                max_tokens,
+                temperature,
+                draft_length,
+                spec_tx,
+                reply,
+            } => {
+                prompt_cache = None;
+                let result = (|| -> Result<(String, usize, usize), String> {
+                    let m = model.as_mut().ok_or("in-process model not loaded")?;
+                    let prompt_tokens = tokenizer
+                        .encode(&prompt)
+                        .map_err(|e| format!("encode: {e}"))?;
+                    let prompt_len = prompt_tokens.len();
+                    tracing::debug!(prompt_len, max_tokens, draft_length, "speculative generate");
+                    let t0 = std::time::Instant::now();
+
+                    // 1. Prefill target model — builds KV caches
+                    let prefill = m
+                        .prefill(&prompt_tokens, max_tokens)
+                        .map_err(|e| format!("prefill: {e}"))?;
+                    let mut caches = prefill.caches;
+
+                    // Sample first token from prefill logits
+                    let first_tok_arr =
+                        super::mlx_lora::sample_next_token(&prefill.last_logits, temperature)
+                            .map_err(|e| format!("sample: {e}"))?;
+                    first_tok_arr.eval().map_err(|e| format!("eval: {e}"))?;
+                    let mut last_token = first_tok_arr.as_slice::<i32>()[0];
+                    let mut generated = vec![last_token];
+
+                    if stop_tokens.contains(&last_token) || max_tokens <= 1 {
+                        let text = tokenizer
+                            .decode(&generated)
+                            .map_err(|e| format!("decode: {e}"))?;
+                        return Ok((text, prompt_len, generated.len()));
+                    }
+
+                    // Reset draft model KV for this conversation
+                    let _ = spec_tx.send(super::ane_decode::SpecDecodeRequest::Reset);
+
+                    // 2. Speculative decode loop
+                    let mut acceptance_stats = super::ane_decode::AcceptanceStats::new();
+                    let mut current_draft_len = draft_length.clamp(1, 8);
+
+                    while generated.len() < max_tokens {
+                        let n = current_draft_len.min(max_tokens - generated.len());
+
+                        // Draft on ANE
+                        let (draft_reply_tx, draft_reply_rx) = tokio::sync::oneshot::channel();
+                        spec_tx
+                            .send(super::ane_decode::SpecDecodeRequest::Draft {
+                                last_token: last_token as u32,
+                                n,
+                                reply: draft_reply_tx,
+                            })
+                            .map_err(|_| "spec decode thread died".to_string())?;
+                        let (pre_draft_pos, drafts) = draft_reply_rx
+                            .blocking_recv()
+                            .map_err(|_| "draft reply dropped".to_string())?;
+
+                        // Verify on GPU: cached forward on [last_token, d0, ..., dN]
+                        let kv_pos_before = caches
+                            .iter()
+                            .find_map(|c| {
+                                if let super::mlx_lora::LayerCache::FullAttn(kv) = c {
+                                    Some(kv.len())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        let mut verify_tokens = Vec::with_capacity(1 + drafts.len());
+                        verify_tokens.push(last_token);
+                        for &d in &drafts {
+                            verify_tokens.push(d as i32);
+                        }
+                        let tok_arr = mlx_rs::Array::from_slice(
+                            &verify_tokens,
+                            &[1, verify_tokens.len() as i32],
+                        );
+                        let logits = m
+                            .forward_logits_cached(&tok_arr, &mut caches)
+                            .map_err(|e| format!("verify forward: {e}"))?;
+                        logits.eval().map_err(|e| format!("eval: {e}"))?;
+
+                        let logits_data: Vec<f32> = logits.as_slice().to_vec();
+                        let shape = logits.shape();
+                        let vocab = *shape.last().unwrap_or(&0) as usize;
+
+                        // Accept/reject: greedy prefix match
+                        // n_draft_matched = how many draft tokens matched (for stats + draft KV rollback)
+                        // accepted_tokens = tokens to emit (matched drafts + 1 correction or bonus)
+                        let mut n_draft_matched = 0usize;
+                        let mut accepted_tokens = Vec::new();
+                        for (i, &draft_token) in drafts.iter().enumerate() {
+                            let verified = {
+                                let start = i * vocab;
+                                super::ane_decode::sample_argmax(&logits_data[start..start + vocab])
+                            };
+                            if verified == draft_token {
+                                accepted_tokens.push(draft_token as i32);
+                                n_draft_matched += 1;
+                            } else {
+                                // First mismatch — take the verified token instead
+                                accepted_tokens.push(verified as i32);
+                                break;
+                            }
+                        }
+                        // Bonus token when all drafts matched
+                        if n_draft_matched == drafts.len() && verify_tokens.len() > drafts.len() {
+                            let bonus_start = drafts.len() * vocab;
+                            let bonus = super::ane_decode::sample_argmax(
+                                &logits_data[bonus_start..bonus_start + vocab],
+                            );
+                            accepted_tokens.push(bonus as i32);
+                        }
+
+                        // Rollback target KV cache: keep prompt + first_token + accepted
+                        let keep = kv_pos_before + accepted_tokens.len() as i32;
+                        for cache in &mut caches {
+                            cache.rollback_to(keep);
+                        }
+
+                        // Rollback draft KV cache: only matched drafts stay
+                        // (the correction/bonus token doesn't exist in draft KV)
+                        let _ = spec_tx.send(super::ane_decode::SpecDecodeRequest::Accept {
+                            pre_draft_pos,
+                            n_accepted: n_draft_matched,
+                        });
+
+                        // Adaptive draft length
+                        acceptance_stats.update(drafts.len(), n_draft_matched);
+                        let rate = acceptance_stats.recent_rate();
+                        if rate > 0.85 && current_draft_len < 8 {
+                            current_draft_len += 1;
+                        }
+                        if rate < 0.50 && current_draft_len > 2 {
+                            current_draft_len -= 1;
+                        }
+
+                        // Append accepted tokens
+                        for &t in &accepted_tokens {
+                            generated.push(t);
+                            if stop_tokens.contains(&t) {
+                                break;
+                            }
+                        }
+                        if generated.last().map_or(false, |t| stop_tokens.contains(t)) {
+                            break;
+                        }
+                        last_token = *generated.last().unwrap();
+                    }
+
+                    let elapsed = t0.elapsed();
+                    let gen_len = generated.len();
+                    tracing::debug!(
+                        gen_len,
+                        secs = format!("{:.1}", elapsed.as_secs_f64()),
+                        ms_per_tok =
+                            format!("{:.0}", elapsed.as_millis() as f64 / gen_len.max(1) as f64),
+                        accept_rate = format!("{:.1}%", acceptance_stats.lifetime_rate() * 100.0),
+                        "speculative generate done"
+                    );
+                    let text = tokenizer
+                        .decode(&generated)
+                        .map_err(|e| format!("decode: {e}"))?;
+                    Ok((text, prompt_len, gen_len))
+                })();
+                let _ = reply.send(result);
             }
         }
     }

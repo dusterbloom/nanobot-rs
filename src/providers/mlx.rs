@@ -129,7 +129,8 @@ mod inner {
         managed_server: Option<Arc<parking_lot::Mutex<crate::agent::mlx_lm::MlxLmServer>>>,
         /// Channel to the speculative decoder's dedicated thread.
         #[cfg(feature = "ane")]
-        spec_decode_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_decode::SpecDecodeRequest>>,
+        spec_decode_tx:
+            Option<std::sync::mpsc::SyncSender<crate::agent::ane_decode::SpecDecodeRequest>>,
         /// Sender for LoRA hot-reload into the draft model's decode kernels.
         #[cfg(feature = "ane")]
         draft_reload_tx: Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>>,
@@ -150,7 +151,9 @@ mod inner {
         /// LoRA model through this channel. The speculative decoder picks it up
         /// and recompiles its decode kernels with the merged weights.
         #[cfg(feature = "ane")]
-        pub fn draft_reload_tx(&self) -> Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>> {
+        pub fn draft_reload_tx(
+            &self,
+        ) -> Option<std::sync::mpsc::SyncSender<crate::agent::ane_lora::LoraModel>> {
             self.draft_reload_tx.clone()
         }
 
@@ -179,7 +182,15 @@ mod inner {
             lora_config: LoraConfig,
             mlx_lm_url: Option<String>,
         ) -> Result<Self> {
-            Self::start_with_options(model_dir, model_config, lora_config, mlx_lm_url, None, None, String::new())
+            Self::start_with_options(
+                model_dir,
+                model_config,
+                lora_config,
+                mlx_lm_url,
+                None,
+                None,
+                String::new(),
+            )
         }
 
         /// Start with optional mlx-lm server URL and draft model for speculative decoding.
@@ -349,7 +360,9 @@ mod inner {
                                         reload_rx,
                                         4096,
                                     );
-                                    crate::agent::ane_decode::run_spec_decode_worker(decoder, sd_rx);
+                                    crate::agent::ane_decode::run_spec_decode_worker(
+                                        decoder, sd_rx,
+                                    );
                                 })
                                 .expect("failed to spawn spec-decode thread");
                             (Some(sd_tx), Some(reload_tx), initial_draft_len)
@@ -526,10 +539,7 @@ mod inner {
             if !self.api_key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let resp = req
-                .send()
-                .await
-                .context("mlx-lm server request failed")?;
+            let resp = req.send().await.context("mlx-lm server request failed")?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -721,7 +731,15 @@ mod inner {
         ) -> Result<LLMResponse> {
             let Some(ref spec_tx) = self.spec_decode_tx else {
                 return self
-                    .chat(messages, None, None, max_tokens, temperature, thinking_budget, None)
+                    .chat(
+                        messages,
+                        None,
+                        None,
+                        max_tokens,
+                        temperature,
+                        thinking_budget,
+                        None,
+                    )
                     .await;
             };
 
@@ -929,7 +947,11 @@ mod inner {
             // Parse tool calls from text (model generates them inline
             // since /v1/completions has no tool schema support).
             let (tool_calls, text) = parse_tool_calls_from_text(&text);
-            let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
+            let finish_reason = if !tool_calls.is_empty() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
 
             let mut usage = HashMap::new();
             usage.insert("prompt_tokens".into(), prompt_toks as i64);
@@ -972,10 +994,7 @@ mod inner {
             if !self.api_key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let resp = req
-                .send()
-                .await
-                .context("completions request failed")?;
+            let resp = req.send().await.context("completions request failed")?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -983,10 +1002,7 @@ mod inner {
                 anyhow::bail!("completions returned {status}: {text}");
             }
 
-            let json: serde_json::Value = resp
-                .json()
-                .await
-                .context("completions invalid JSON")?;
+            let json: serde_json::Value = resp.json().await.context("completions invalid JSON")?;
 
             let text = json
                 .pointer("/choices/0/text")
@@ -1659,8 +1675,12 @@ mod tests {
         let provider = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("start failed");
 
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1687,8 +1707,10 @@ mod tests {
             .await
             .expect("chat failed");
 
-        eprintln!("in-process response: content={:?}, tool_calls={:?}",
-            resp.content, resp.tool_calls);
+        eprintln!(
+            "in-process response: content={:?}, tool_calls={:?}",
+            resp.content, resp.tool_calls
+        );
 
         // The in-process path should be able to produce tool calls.
         // If this fails, it proves in-process inference is NOT on par with
@@ -1726,16 +1748,24 @@ mod tests {
         let inproc = MlxProvider::start(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
-        ).expect("in-process start failed");
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
+        )
+        .expect("in-process start failed");
 
         // mlx-lm provider
         let mlx_lm = MlxProvider::start_with_mlx_lm(
             model_dir(),
             ModelConfig::qwen3_5_2b(),
-            LoraConfig { lr: 1e-5, ..LoraConfig::default() },
+            LoraConfig {
+                lr: 1e-5,
+                ..LoraConfig::default()
+            },
             Some(mlx_lm_url.clone()),
-        ).expect("mlx-lm start failed");
+        )
+        .expect("mlx-lm start failed");
 
         let messages = vec![serde_json::json!({
             "role": "user",
@@ -1759,13 +1789,20 @@ mod tests {
         eprintln!("mlx-lm:     {text_mlx_lm:?}");
 
         // Both should produce "4" (or contain "4") for this trivial prompt.
-        assert!(text_inproc.contains('4'), "in-process didn't answer '4': {text_inproc:?}");
-        assert!(text_mlx_lm.contains('4'), "mlx-lm didn't answer '4': {text_mlx_lm:?}");
+        assert!(
+            text_inproc.contains('4'),
+            "in-process didn't answer '4': {text_inproc:?}"
+        );
+        assert!(
+            text_mlx_lm.contains('4'),
+            "mlx-lm didn't answer '4': {text_mlx_lm:?}"
+        );
 
         // The outputs should match exactly at temperature=0 with same model.
         // If they don't, the chat templates diverge.
         assert_eq!(
-            text_inproc.trim(), text_mlx_lm.trim(),
+            text_inproc.trim(),
+            text_mlx_lm.trim(),
             "PARITY FAILURE: in-process and mlx-lm produce different outputs for the same prompt. \
              This means the hardcoded ChatML template diverges from mlx-lm's Jinja template."
         );

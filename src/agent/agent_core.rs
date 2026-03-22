@@ -279,12 +279,19 @@ impl RuntimeCounters {
 
     pub fn mark_inference_started(&self) {
         self.inference_active.store(true, Ordering::Relaxed);
+        // Only cancel training if it's actually running — avoids leaving
+        // training_cancel stuck at true when no training is active.
+        if self.training_active.load(Ordering::Relaxed) {
+            self.training_cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn mark_inference_finished(&self) {
         self.inference_active.store(false, Ordering::Relaxed);
         self.last_inference_finished_ms
             .store(Self::now_epoch_ms(), Ordering::Relaxed);
+        // Reset training_cancel so the next idle window can start training.
+        self.training_cancel.store(false, Ordering::Relaxed);
     }
 
     /// Update trio state, logging only on transitions.

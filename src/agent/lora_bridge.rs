@@ -1165,10 +1165,7 @@ pub fn merge_lora_to_disk(
         (r, a / r)
     };
 
-    info!(
-        "LoRA merge: rank={}, scale={:.4}",
-        rank, scale
-    );
+    info!("LoRA merge: rank={}, scale={:.4}", rank, scale);
 
     // 2. Load base model weights.
     let base_weights = crate::agent::mlx_lora::load_weights(base_model_dir)
