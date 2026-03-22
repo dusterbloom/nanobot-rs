@@ -31,8 +31,23 @@ fn silu_inplace(x: &mut [f32]) {
 }
 
 // ---------------------------------------------------------------------------
-// MoE Forward
+// MoE Forward + Router Training Target Collection
 // ---------------------------------------------------------------------------
+
+/// Global router training buffer. Set by RouterTrainer::install_buffer(),
+/// read by moe_forward() during inference to collect routing decisions.
+static ROUTER_TRAINING_BUF: std::sync::OnceLock<std::sync::Arc<super::ane_lora::RouterTrainingBuffer>> =
+    std::sync::OnceLock::new();
+
+/// Install a router training buffer so inference collects routing decisions.
+pub fn install_router_training_buffer(buf: std::sync::Arc<super::ane_lora::RouterTrainingBuffer>) {
+    let _ = ROUTER_TRAINING_BUF.set(buf);
+}
+
+/// Get the installed buffer (if any).
+pub fn router_training_buffer() -> Option<&'static std::sync::Arc<super::ane_lora::RouterTrainingBuffer>> {
+    ROUTER_TRAINING_BUF.get()
+}
 
 /// MoE FFN forward: router gate → top-k expert selection → weighted expert sum.
 ///
@@ -43,6 +58,27 @@ fn moe_forward(
     x: &mut Vec<f32>,
     rms_ffn: &[f32],
     cfg: &MilConfig,
+) {
+    moe_forward_inner(moe, x, rms_ffn, cfg, 0);
+}
+
+/// MoE forward with layer index (for routing target collection).
+fn moe_forward_layer(
+    moe: &MoeLayerWeights,
+    x: &mut Vec<f32>,
+    rms_ffn: &[f32],
+    cfg: &MilConfig,
+    layer: usize,
+) {
+    moe_forward_inner(moe, x, rms_ffn, cfg, layer);
+}
+
+fn moe_forward_inner(
+    moe: &MoeLayerWeights,
+    x: &mut Vec<f32>,
+    rms_ffn: &[f32],
+    cfg: &MilConfig,
+    layer: usize,
 ) {
     let dim = cfg.dim;
     let hidden = moe.moe_hidden;
@@ -71,6 +107,17 @@ fn moe_forward(
     }
     for w in &mut weights {
         *w /= exp_sum;
+    }
+
+    // Record routing decision for router training (if buffer installed)
+    if let Some(buf) = ROUTER_TRAINING_BUF.get() {
+        let expert_indices: Vec<usize> = top_k.iter().map(|&(idx, _)| idx).collect();
+        let expert_probs = weights.clone();
+        buf.push(layer, super::ane_lora::RouterRoutingTarget {
+            x_norm: xnorm.clone(),
+            expert_indices,
+            expert_probs,
+        });
     }
 
     // Parallel expert FFN — 8 experts run on 8 cores simultaneously.
@@ -598,7 +645,7 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
             }
             // FFN: MoE or dense (always runs, with or without GDN attention)
             if let Some(ref moe_w) = lw.moe {
-                moe_forward(moe_w, &mut x, &lw.rms_ffn, cfg);
+                moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, cfg, l);
             } else {
                 let mut x2norm = vec![0.0f32; dim];
                 rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
@@ -710,7 +757,7 @@ pub fn decode_step(model: &ModelWeights, token: u32, kv_cache: &mut KvCache) -> 
 
         // FFN: MoE or dense
         if let Some(ref moe_w) = lw.moe {
-            moe_forward(moe_w, &mut x, &lw.rms_ffn, cfg);
+            moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, cfg, l);
         } else {
             let mut x2norm = vec![0.0f32; dim];
             rmsnorm(&mut x2norm, &x, &lw.rms_ffn, dim, 1, cfg.rms_eps);
@@ -3053,7 +3100,7 @@ mod tests {
             // FFN (MoE)
             if let Some(ref moe_w) = lw.moe {
                 let t = std::time::Instant::now();
-                moe_forward(moe_w, &mut x, &lw.rms_ffn, &cfg);
+                moe_forward_layer(moe_w, &mut x, &lw.rms_ffn, &cfg, l);
                 moe_us += t.elapsed().as_micros();
             }
         }

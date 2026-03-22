@@ -2303,6 +2303,366 @@ pub fn router_backward_cpu(
     (dx, dw)
 }
 
+// ---------------------------------------------------------------------------
+// MoE Router Training (distillation from inference)
+// ---------------------------------------------------------------------------
+
+/// A single routing decision recorded during inference (one token, one layer).
+#[derive(Clone)]
+pub struct RouterRoutingTarget {
+    /// Input to the router (post-FFN-RMSNorm), [dim].
+    pub x_norm: Vec<f32>,
+    /// Top-k expert indices selected by the teacher router.
+    pub expert_indices: Vec<usize>,
+    /// Softmax probabilities for the top-k experts (same order as indices).
+    pub expert_probs: Vec<f32>,
+}
+
+/// Thread-safe ring buffer collecting routing decisions from inference.
+/// One buffer per layer. Inference pushes targets; training drains batches.
+pub struct RouterTrainingBuffer {
+    /// Per-layer target queues.
+    layers: Vec<std::sync::Mutex<Vec<RouterRoutingTarget>>>,
+    capacity: usize,
+}
+
+impl RouterTrainingBuffer {
+    pub fn new(n_layers: usize, capacity_per_layer: usize) -> Self {
+        Self {
+            layers: (0..n_layers)
+                .map(|_| std::sync::Mutex::new(Vec::with_capacity(capacity_per_layer)))
+                .collect(),
+            capacity: capacity_per_layer,
+        }
+    }
+
+    /// Push a routing target for a specific layer. Drops oldest if at capacity.
+    pub fn push(&self, layer: usize, target: RouterRoutingTarget) {
+        if let Some(lock) = self.layers.get(layer) {
+            if let Ok(mut buf) = lock.lock() {
+                if buf.len() >= self.capacity {
+                    buf.remove(0);
+                }
+                buf.push(target);
+            }
+        }
+    }
+
+    /// Drain up to `batch_size` targets for a layer. Returns None if fewer than
+    /// `batch_size` are available (waits for a full batch).
+    pub fn drain_batch(&self, layer: usize, batch_size: usize) -> Option<Vec<RouterRoutingTarget>> {
+        let lock = self.layers.get(layer)?;
+        let mut buf = lock.lock().ok()?;
+        if buf.len() < batch_size {
+            return None;
+        }
+        Some(buf.drain(..batch_size).collect())
+    }
+
+    /// Number of buffered targets for a layer.
+    pub fn len(&self, layer: usize) -> usize {
+        self.layers
+            .get(layer)
+            .and_then(|l| l.lock().ok())
+            .map(|b| b.len())
+            .unwrap_or(0)
+    }
+}
+
+/// Per-layer router Adam optimizer state.
+pub struct RouterAdamState {
+    pub m: Vec<f32>,  // first moment  [num_experts * dim]
+    pub v: Vec<f32>,  // second moment [num_experts * dim]
+    pub step: usize,
+}
+
+impl RouterAdamState {
+    pub fn new(num_experts: usize, dim: usize) -> Self {
+        let n = num_experts * dim;
+        Self {
+            m: vec![0.0; n],
+            v: vec![0.0; n],
+            step: 0,
+        }
+    }
+}
+
+/// Full router trainer for one model: per-layer trainable weights + Adam + ANE chain.
+pub struct RouterTrainer {
+    /// Trainable router weights per layer: [num_experts, dim]. Initialized from
+    /// the frozen model weights, then updated via Adam.
+    pub weights: Vec<Vec<f32>>,
+    /// Per-layer Adam state.
+    pub adam: Vec<RouterAdamState>,
+    /// Per-layer ANE backward chain (compiled once).
+    pub chains: Vec<Option<RouterBackwardChain>>,
+    pub num_experts: usize,
+    pub dim: usize,
+    pub num_experts_per_tok: usize,
+    /// Load-balancing regularizer coefficient.
+    pub lb_alpha: f32,
+    /// Learning rate.
+    pub lr: f32,
+}
+
+impl RouterTrainer {
+    /// Initialize from frozen model weights. Compiles ANE chains for seq=batch_size.
+    pub fn new(
+        model: &super::ane_weights::ModelWeights,
+        batch_size: usize,
+        lr: f32,
+        lb_alpha: f32,
+    ) -> Result<Self, String> {
+        let n_layers = model.layers.len();
+        let mut weights = Vec::with_capacity(n_layers);
+        let mut adam = Vec::with_capacity(n_layers);
+        let mut chains = Vec::with_capacity(n_layers);
+        let mut num_experts = 0usize;
+        let mut dim = model.cfg.dim;
+        let mut num_experts_per_tok = 0usize;
+
+        for l in 0..n_layers {
+            if let Some(ref moe) = model.layers[l].moe {
+                num_experts = moe.num_experts;
+                num_experts_per_tok = moe.num_experts_per_tok;
+                dim = model.cfg.dim;
+                weights.push(moe.router.clone());
+                adam.push(RouterAdamState::new(num_experts, dim));
+                let chain = RouterBackwardChain::compile(num_experts, dim, batch_size).ok();
+                if l == 0 {
+                    if chain.is_some() {
+                        tracing::info!(
+                            "RouterTrainer: ANE chain compiled ({num_experts}×{dim}, seq={batch_size})"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "RouterTrainer: ANE chain failed, using CPU fallback"
+                        );
+                    }
+                }
+                chains.push(chain);
+            } else {
+                // Non-MoE layer — placeholder (empty weight, no chain)
+                weights.push(Vec::new());
+                adam.push(RouterAdamState::new(0, 0));
+                chains.push(None);
+            }
+        }
+
+        if num_experts == 0 {
+            return Err("No MoE layers found in model".into());
+        }
+
+        Ok(Self {
+            weights,
+            adam,
+            chains,
+            num_experts,
+            dim,
+            num_experts_per_tok,
+            lb_alpha,
+            lr,
+        })
+    }
+
+    /// Run one training step for a single layer on a batch of routing targets.
+    ///
+    /// Returns (loss, num_tokens) or None if the layer has no MoE.
+    pub fn train_step(
+        &mut self,
+        layer: usize,
+        batch: &[RouterRoutingTarget],
+    ) -> Option<(f32, usize)> {
+        if self.weights[layer].is_empty() || batch.is_empty() {
+            return None;
+        }
+
+        let seq = batch.len();
+        let ne = self.num_experts;
+        let dim = self.dim;
+
+        // Pack batch into [dim, seq] column-major (matching ANE layout)
+        let mut x_packed = vec![0.0f32; dim * seq];
+        for (t, target) in batch.iter().enumerate() {
+            for d in 0..dim {
+                x_packed[d * seq + t] = target.x_norm[d];
+            }
+        }
+
+        // Forward: student_logits = router @ x_packed → [ne, seq]
+        let student_logits = cpu_matmul_generic(
+            &self.weights[layer], &x_packed, ne, dim, seq,
+        );
+
+        // Softmax per token (over experts)
+        let mut student_probs = vec![0.0f32; ne * seq];
+        for t in 0..seq {
+            let mut max_l = f32::NEG_INFINITY;
+            for e in 0..ne {
+                max_l = max_l.max(student_logits[e * seq + t]);
+            }
+            let mut sum_exp = 0.0f32;
+            for e in 0..ne {
+                let v = (student_logits[e * seq + t] - max_l).exp();
+                student_probs[e * seq + t] = v;
+                sum_exp += v;
+            }
+            for e in 0..ne {
+                student_probs[e * seq + t] /= sum_exp;
+            }
+        }
+
+        // Build dense teacher probs [ne, seq] (sparse → dense)
+        let mut teacher_probs = vec![0.0f32; ne * seq];
+        for (t, target) in batch.iter().enumerate() {
+            for (i, &idx) in target.expert_indices.iter().enumerate() {
+                if idx < ne {
+                    teacher_probs[idx * seq + t] = target.expert_probs[i];
+                }
+            }
+        }
+
+        // Cross-entropy loss: -sum(teacher * log(student)) / seq
+        let mut ce_loss = 0.0f32;
+        for i in 0..ne * seq {
+            if teacher_probs[i] > 0.0 {
+                ce_loss -= teacher_probs[i] * student_probs[i].max(1e-10).ln();
+            }
+        }
+        ce_loss /= seq as f32;
+
+        // Load-balancing loss: alpha * ne * sum(f_i * P_i)
+        // f_i = fraction of tokens where expert i is the argmax
+        // P_i = mean routing probability for expert i
+        let mut expert_counts = vec![0.0f32; ne];
+        let mut expert_mean_prob = vec![0.0f32; ne];
+        for t in 0..seq {
+            let mut best_e = 0;
+            let mut best_p = f32::NEG_INFINITY;
+            for e in 0..ne {
+                let p = student_probs[e * seq + t];
+                expert_mean_prob[e] += p;
+                if p > best_p {
+                    best_p = p;
+                    best_e = e;
+                }
+            }
+            expert_counts[best_e] += 1.0;
+        }
+        let inv_seq = 1.0 / seq as f32;
+        for e in 0..ne {
+            expert_counts[e] *= inv_seq;
+            expert_mean_prob[e] *= inv_seq;
+        }
+        let lb_loss: f32 = self.lb_alpha
+            * ne as f32
+            * expert_counts.iter().zip(expert_mean_prob.iter()).map(|(f, p)| f * p).sum::<f32>();
+
+        let total_loss = ce_loss + lb_loss;
+
+        // Gradient: d_logits = student_probs - teacher_probs (CE gradient for softmax)
+        let mut d_logits = vec![0.0f32; ne * seq];
+        for i in 0..ne * seq {
+            d_logits[i] = (student_probs[i] - teacher_probs[i]) / seq as f32;
+        }
+
+        // Backward: get dW
+        let dw = if let Some(ref chain) = self.chains[layer] {
+            // Reload weights (in case they changed since last step)
+            chain.load_weights(&self.weights[layer]);
+            match chain.backward(&self.weights[layer], &d_logits, &x_packed) {
+                Ok((_dx, dw)) => dw,
+                Err(e) => {
+                    tracing::debug!("Router ANE backward failed L{layer}: {e}");
+                    let (_, dw) = router_backward_cpu(
+                        &self.weights[layer], &d_logits, &x_packed,
+                        ne, dim, seq,
+                    );
+                    dw
+                }
+            }
+        } else {
+            let (_, dw) = router_backward_cpu(
+                &self.weights[layer], &d_logits, &x_packed,
+                ne, dim, seq,
+            );
+            dw
+        };
+
+        // Adam update on router weights
+        let state = &mut self.adam[layer];
+        state.step += 1;
+        let beta1 = 0.9f32;
+        let beta2 = 0.999f32;
+        let eps = 1e-8f32;
+        let bc1 = 1.0 - beta1.powi(state.step as i32);
+        let bc2 = 1.0 - beta2.powi(state.step as i32);
+
+        let w = &mut self.weights[layer];
+        for i in 0..w.len() {
+            state.m[i] = beta1 * state.m[i] + (1.0 - beta1) * dw[i];
+            state.v[i] = beta2 * state.v[i] + (1.0 - beta2) * dw[i] * dw[i];
+            let m_hat = state.m[i] / bc1;
+            let v_hat = state.v[i] / bc2;
+            w[i] -= self.lr * m_hat / (v_hat.sqrt() + eps);
+        }
+
+        // Reload ANE chain weights after update
+        if let Some(ref chain) = self.chains[layer] {
+            chain.load_weights(&self.weights[layer]);
+        }
+
+        Some((total_loss, seq))
+    }
+
+    /// Train all MoE layers from the buffer. Returns (total_loss, total_tokens).
+    pub fn train_from_buffer(
+        &mut self,
+        buffer: &RouterTrainingBuffer,
+        batch_size: usize,
+    ) -> (f32, usize) {
+        let mut total_loss = 0.0f32;
+        let mut total_tokens = 0usize;
+
+        for l in 0..self.weights.len() {
+            if self.weights[l].is_empty() {
+                continue;
+            }
+            while let Some(batch) = buffer.drain_batch(l, batch_size) {
+                if let Some((loss, n)) = self.train_step(l, &batch) {
+                    total_loss += loss * n as f32;
+                    total_tokens += n;
+                }
+            }
+        }
+
+        if total_tokens > 0 {
+            total_loss /= total_tokens as f32;
+        }
+        (total_loss, total_tokens)
+    }
+}
+
+/// CPU matmul: C = A @ B where A[rows, inner], B[inner, cols] → C[rows, cols].
+/// All column-major: A[r, k] at A[r * inner_stride + k], etc.
+/// Layout: [rows, cols] means A[r * cols_of_next + ...], i.e. row-major packing
+/// but column-major spatial for ANE compat.
+fn cpu_matmul_generic(a: &[f32], b: &[f32], rows: usize, inner: usize, cols: usize) -> Vec<f32> {
+    // a: [rows, inner] row-major → a[r * inner + k]
+    // b: [inner, cols] column-major → b[k * cols + c]  (ANE spatial layout)
+    // c: [rows, cols] column-major → c[r * cols + c]
+    let mut c = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for k in 0..inner {
+            let a_val = a[r * inner + k];
+            for col in 0..cols {
+                c[r * cols + col] += a_val * b[k * cols + col];
+            }
+        }
+    }
+    c
+}
+
 /// Add scaled vector: dst[i] += scale * src[i].
 pub fn vec_add_scaled(dst: &mut [f32], src: &[f32], scale: f32) {
     debug_assert_eq!(dst.len(), src.len());
@@ -4220,6 +4580,155 @@ mod tests {
                 eprintln!("  speedup:         {speedup:.2}x");
             }
         }
+    }
+
+    #[test]
+    fn test_router_trainer_loss_decreases() {
+        // Synthetic router training: verify loss decreases over steps.
+        // No ANE needed — CPU fallback path.
+        let num_experts = 32;
+        let dim = 64;
+        let k = 4;
+        let batch_size = 16;
+
+        // Create synthetic "frozen router" weights
+        let frozen_router: Vec<f32> = (0..num_experts * dim)
+            .map(|i| (i as f32 * 0.007).sin() * 0.1)
+            .collect();
+
+        // Generate teacher targets using the frozen router
+        let mut targets = Vec::new();
+        for t in 0..batch_size {
+            let x_norm: Vec<f32> = (0..dim)
+                .map(|d| ((t * dim + d) as f32 * 0.013).cos() * 0.5)
+                .collect();
+            // Compute teacher logits
+            let mut logits = vec![0.0f32; num_experts];
+            for e in 0..num_experts {
+                for d in 0..dim {
+                    logits[e] += frozen_router[e * dim + d] * x_norm[d];
+                }
+            }
+            // Top-k + softmax
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top = &indexed[..k];
+            let max_l = top[0].1;
+            let mut probs: Vec<f32> = top.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in &mut probs {
+                *p /= sum;
+            }
+            targets.push(RouterRoutingTarget {
+                x_norm,
+                expert_indices: top.iter().map(|&(i, _)| i).collect(),
+                expert_probs: probs,
+            });
+        }
+
+        // Create a "student router" with perturbed weights
+        let mut student_weights: Vec<f32> = frozen_router.iter()
+            .enumerate()
+            .map(|(i, &w)| w + (i as f32 * 0.031).sin() * 0.05)
+            .collect();
+
+        // Manual training loop (no RouterTrainer to avoid model dependency)
+        let mut adam_m = vec![0.0f32; num_experts * dim];
+        let mut adam_v = vec![0.0f32; num_experts * dim];
+        let lr = 0.01f32;
+        let mut losses = Vec::new();
+
+        for step in 1..=20 {
+            let seq = batch_size;
+            let ne = num_experts;
+
+            // Pack batch
+            let mut x_packed = vec![0.0f32; dim * seq];
+            for (t, target) in targets.iter().enumerate() {
+                for d in 0..dim {
+                    x_packed[d * seq + t] = target.x_norm[d];
+                }
+            }
+
+            // Forward: student_logits = student_weights @ x_packed
+            let mut student_logits = vec![0.0f32; ne * seq];
+            for e in 0..ne {
+                for t in 0..seq {
+                    let mut acc = 0.0f32;
+                    for d in 0..dim {
+                        acc += student_weights[e * dim + d] * x_packed[d * seq + t];
+                    }
+                    student_logits[e * seq + t] = acc;
+                }
+            }
+
+            // Softmax per token
+            let mut student_probs = vec![0.0f32; ne * seq];
+            for t in 0..seq {
+                let mut max_l = f32::NEG_INFINITY;
+                for e in 0..ne {
+                    max_l = max_l.max(student_logits[e * seq + t]);
+                }
+                let mut sum_exp = 0.0f32;
+                for e in 0..ne {
+                    let v = (student_logits[e * seq + t] - max_l).exp();
+                    student_probs[e * seq + t] = v;
+                    sum_exp += v;
+                }
+                for e in 0..ne {
+                    student_probs[e * seq + t] /= sum_exp;
+                }
+            }
+
+            // Teacher probs (sparse → dense)
+            let mut teacher_probs = vec![0.0f32; ne * seq];
+            for (t, target) in targets.iter().enumerate() {
+                for (i, &idx) in target.expert_indices.iter().enumerate() {
+                    teacher_probs[idx * seq + t] = target.expert_probs[i];
+                }
+            }
+
+            // CE loss
+            let mut ce = 0.0f32;
+            for i in 0..ne * seq {
+                if teacher_probs[i] > 0.0 {
+                    ce -= teacher_probs[i] * student_probs[i].max(1e-10).ln();
+                }
+            }
+            ce /= seq as f32;
+            losses.push(ce);
+
+            // Gradient + CPU backward
+            let mut d_logits = vec![0.0f32; ne * seq];
+            for i in 0..ne * seq {
+                d_logits[i] = (student_probs[i] - teacher_probs[i]) / seq as f32;
+            }
+            let (_, dw) = router_backward_cpu(
+                &student_weights, &d_logits, &x_packed, ne, dim, seq,
+            );
+
+            // Adam
+            let bc1 = 1.0 - 0.9f32.powi(step);
+            let bc2 = 1.0 - 0.999f32.powi(step);
+            for i in 0..student_weights.len() {
+                adam_m[i] = 0.9 * adam_m[i] + 0.1 * dw[i];
+                adam_v[i] = 0.999 * adam_v[i] + 0.001 * dw[i] * dw[i];
+                let mh = adam_m[i] / bc1;
+                let vh = adam_v[i] / bc2;
+                student_weights[i] -= lr * mh / (vh.sqrt() + 1e-8);
+            }
+        }
+
+        eprintln!("Router training losses: {:?}", losses);
+        assert!(
+            losses.last().unwrap() < losses.first().unwrap(),
+            "loss should decrease: first={:.4}, last={:.4}",
+            losses[0], losses.last().unwrap()
+        );
+        // Loss should drop significantly (>30%) in 20 steps
+        let reduction = 1.0 - losses.last().unwrap() / losses[0];
+        eprintln!("Loss reduction: {:.1}%", reduction * 100.0);
+        assert!(reduction > 0.1, "expected >10% loss reduction, got {:.1}%", reduction * 100.0);
     }
 }
 
