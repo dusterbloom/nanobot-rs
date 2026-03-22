@@ -3225,6 +3225,61 @@ mod tests {
         assert_ne!(r1.logits, r2.logits, "Different tokens should produce different logits");
     }
 
+    /// Read routing targets written by scripts/routing_hook.py.
+    /// Requires the hook to have been run first (creates ~/.nanobot/routing_targets.bin).
+    ///
+    /// cargo test --features ane --release --lib -- "test_drain_routing_file" --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn test_drain_routing_file() {
+        let path = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".nanobot/routing_targets.bin");
+        if !path.exists() {
+            eprintln!("SKIP: no routing_targets.bin — run scripts/routing_hook.py first");
+            return;
+        }
+
+        let targets = drain_routing_targets_from_file(&path);
+        match targets {
+            Some(ref t) if !t.is_empty() => {
+                eprintln!("Drained {} routing targets from {}", t.len(), path.display());
+
+                // Verify structure
+                let (layer, ref target) = t[0];
+                eprintln!("  First: layer={layer}, experts={:?}, probs={:?}, x_norm len={}",
+                    &target.expert_indices[..target.expert_indices.len().min(4)],
+                    &target.expert_probs[..target.expert_probs.len().min(4)],
+                    target.x_norm.len());
+
+                // Verify layer indices are reasonable (0-39 for 40-layer model)
+                let max_layer = t.iter().map(|(l, _)| *l).max().unwrap();
+                let unique_layers: std::collections::HashSet<usize> = t.iter().map(|(l, _)| *l).collect();
+                eprintln!("  Layers: {} unique, max={max_layer}", unique_layers.len());
+
+                assert!(max_layer < 100, "layer index too large: {max_layer}");
+                assert!(!target.expert_indices.is_empty(), "expert indices empty");
+                assert!(!target.expert_probs.is_empty(), "expert probs empty");
+                assert!(target.x_norm.len() > 100, "x_norm too short: {}", target.x_norm.len());
+
+                // Verify probs sum to ~1
+                let prob_sum: f32 = target.expert_probs.iter().sum();
+                assert!((prob_sum - 1.0).abs() < 0.01,
+                    "probs don't sum to 1: {prob_sum}");
+
+                eprintln!("  All checks passed!");
+
+                // Second drain should return None (read_pos updated)
+                let targets2 = drain_routing_targets_from_file(&path);
+                assert!(targets2.is_none() || targets2.as_ref().map_or(true, |t| t.is_empty()),
+                    "Second drain should return empty (read_pos was updated)");
+                eprintln!("  Second drain: empty (as expected)");
+            }
+            _ => {
+                eprintln!("No targets in file — run scripts/routing_hook.py --tokens 30 first");
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // GDN ANE projection kernel tests
     // -----------------------------------------------------------------------

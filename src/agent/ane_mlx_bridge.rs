@@ -2122,15 +2122,41 @@ impl AneTrainerSession {
                     mc.reload_all_weights(lora);
                 }
 
-                // Router training: consume buffered inference routing decisions
+                // Router training: consume routing decisions from two sources:
+                // 1. In-memory buffer (from in-process moe_forward)
+                // 2. File buffer (from oMLX inference via scripts/routing_hook.py)
                 if let Some(ref mut rt) = self.router_trainer {
+                    let mut total_tokens = 0usize;
+                    let mut total_loss = 0.0f32;
+
+                    // Source 1: in-memory buffer
                     if let Some(buf) = super::ane_decode::router_training_buffer() {
                         let (rl, rn) = rt.train_from_buffer(buf, 16);
-                        if rn > 0 && opt_step <= 2 {
-                            tracing::info!(
-                                "router train: step={opt_step} loss={rl:.4} tokens={rn}"
-                            );
+                        total_tokens += rn;
+                        total_loss += rl * rn as f32;
+                    }
+
+                    // Source 2: file buffer from oMLX routing hook
+                    let routing_file = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                        .join(".nanobot/routing_targets.bin");
+                    if routing_file.exists() {
+                        if let Some(targets) = super::ane_decode::drain_routing_targets_from_file(&routing_file) {
+                            for (layer, target) in &targets {
+                                if *layer < rt.weights.len() && !rt.weights[*layer].is_empty() {
+                                    if let Some((loss, n)) = rt.train_step(*layer, std::slice::from_ref(target)) {
+                                        total_tokens += n;
+                                        total_loss += loss * n as f32;
+                                    }
+                                }
+                            }
                         }
+                    }
+
+                    if total_tokens > 0 && opt_step <= 2 {
+                        let avg_loss = total_loss / total_tokens as f32;
+                        tracing::info!(
+                            "router train: step={opt_step} loss={avg_loss:.4} tokens={total_tokens}"
+                        );
                     }
                 }
 
