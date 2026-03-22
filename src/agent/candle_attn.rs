@@ -336,6 +336,11 @@ impl CandleGqaLayers {
     pub fn n_layers(&self) -> usize {
         self.layers.len()
     }
+
+    /// Get the Metal device for MoE dispatch.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 #[cfg(test)]
